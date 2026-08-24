@@ -2,9 +2,8 @@
 
 use std::{
     collections::BTreeMap,
-    io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -28,21 +27,6 @@ use flotilla_resources::{
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
-use tracing::instrument::WithSubscriber;
-#[derive(Clone)]
-struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for LogCaptureWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("log capture lock should be healthy").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
     std::fs::write(dir.join("daemon.toml"), "machine_id = \"test-project-cli\"\n").expect("write daemon config");
@@ -281,7 +265,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
 }
 
 #[tokio::test]
-async fn declaration_adoption_survives_whole_repository_project_reconciliation() {
+async fn declaration_adoption_survives_repository_tracking() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let checkout = tmp.path().join("flotilla");
     std::fs::create_dir(&checkout).expect("checkout dir");
@@ -323,8 +307,6 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
             "unexpected command result: {result:?}"
         );
     }
-
-    daemon.materialize_tracked_repo_projects().await.expect("whole-repository reconciliation");
 
     let reconciled = projects.get("flotilla").await.expect("reconciled project");
     assert_eq!(reconciled.metadata.resource_version, registered.metadata.resource_version);
@@ -629,25 +611,15 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
 }
 
 #[tokio::test]
-async fn tracking_repo_materializes_whole_repo_project() {
+async fn tracking_repo_does_not_materialize_whole_repo_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
-    let repository_key = track_repository(&daemon, &tmp, "tracked", "https://github.com/org/tracked.git").await;
+    track_repository(&daemon, &tmp, "tracked", "https://github.com/org/tracked.git").await;
 
-    let project = backend.using::<Project>("flotilla").get("tracked").await.expect("whole-repository project should exist");
-    assert_eq!(project.spec.display_name, "tracked");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
-    assert_eq!(project.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
-    assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
-        repo: repository_key,
-        alias: None,
-        roles: Default::default(),
-        subpath: None,
-        default_branch: None,
-    }]);
+    assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
 }
 
 #[tokio::test]
-async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_custom_fields() {
+async fn tracked_repo_does_not_reconcile_existing_project() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
@@ -656,7 +628,7 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
     let repository_key = repository_spec.key();
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
-        vec![checkout_path],
+        vec![checkout_path.clone()],
         config,
         git_process_discovery(false),
         HostName::new("local"),
@@ -666,15 +638,6 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
-    let log_output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCaptureWriter(Arc::clone(&log_output));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_target(false)
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(move || writer.clone())
-        .finish();
     projects
         .create(
             &InputMeta::builder()
@@ -697,35 +660,16 @@ async fn tracked_repo_reconciles_generator_owned_project_fields_and_preserves_cu
         .await
         .expect("stale whole-repository Project should be created");
 
-    daemon.materialize_tracked_repo_projects().with_subscriber(subscriber).await.expect("tracked Project reconciliation should succeed");
-
-    let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
-    assert_eq!(reconciled.spec.display_name, "My Tracked Repository");
-    assert_eq!(reconciled.spec.issue_source, Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }));
-    assert_eq!(reconciled.spec.default_workflow_ref, "single-agent-trusted");
-    assert_eq!(reconciled.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
-        repo: RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec").key(),
-        alias: None,
-        roles: Default::default(),
-        subpath: None,
-        default_branch: None,
-    }]);
-    assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
-    assert_eq!(reconciled.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
-    let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
-    assert!(
-        logs.contains("stored generator-owned whole-repository Project fields diverged; overwriting"),
-        "expected generator-field divergence warning; captured logs: {logs:?}"
-    );
-    assert!(logs.contains("tracked"), "expected warning to identify project `tracked`; captured logs: {logs:?}");
-
-    daemon.materialize_tracked_repo_projects().await.expect("steady-state reconciliation should succeed");
-    let unchanged = projects.get("tracked").await.expect("tracked Project should remain");
-    assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
+    let before = projects.get("tracked").await.expect("tracked Project should exist");
+    daemon.add_repo(&checkout_path).await.expect("track repository");
+    let after = projects.get("tracked").await.expect("tracked Project should remain");
+    assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
+    assert_eq!(after.metadata.labels, before.metadata.labels);
+    assert_eq!(after.spec, before.spec);
 }
 
 #[tokio::test]
-async fn tracked_repo_labels_matching_unlabelled_project_once() {
+async fn tracked_repo_does_not_claim_matching_unlabelled_project() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
@@ -734,7 +678,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
     let repository_key = repository_spec.key();
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
-        vec![checkout_path],
+        vec![checkout_path.clone()],
         config,
         fake_discovery(false),
         HostName::new("local"),
@@ -763,18 +707,15 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
         .expect("matching unlabelled Project should be created");
     let unlabelled = projects.get("tracked").await.expect("Project should exist");
 
-    daemon.materialize_tracked_repo_projects().await.expect("ownership reconciliation should succeed");
-    let labelled = projects.get("tracked").await.expect("Project should remain");
-    assert_ne!(labelled.metadata.resource_version, unlabelled.metadata.resource_version);
-    assert_eq!(labelled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
-
-    daemon.materialize_tracked_repo_projects().await.expect("steady-state reconciliation should succeed");
+    daemon.add_repo(&checkout_path).await.expect("track repository");
     let unchanged = projects.get("tracked").await.expect("Project should remain");
-    assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
+    assert_eq!(unchanged.metadata.resource_version, unlabelled.metadata.resource_version);
+    assert_eq!(unchanged.metadata.labels, unlabelled.metadata.labels);
+    assert_eq!(unchanged.spec, unlabelled.spec);
 }
 
 #[tokio::test]
-async fn retracking_path_after_remote_appears_migrates_repository_identity() {
+async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("andamento");
@@ -836,8 +777,8 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
     });
 
     let projects = backend.definitions::<Project>("flotilla").list().await.expect("project list");
-    assert_eq!(projects.len(), 1, "identity migration must not leave a disambiguated twin");
-    assert_eq!(projects[0].metadata.name, "andamento");
+    assert_eq!(projects.len(), 1, "identity refresh must not create another Project");
+    assert_eq!(projects[0].metadata.name, "github-com-flotilla-org-andamento");
     assert_eq!(projects[0].spec.repositories[0].repo, remote_key);
     let repositories = backend.using::<Repository>("flotilla").list().await.expect("repository list");
     assert_eq!(repositories.items.len(), 1, "superseded repository identities should be garbage-collected");
@@ -865,7 +806,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
                 inputs: Vec::new(),
                 repository_url: None,
                 r#ref: None,
-                project_ref: Some("andamento".into()),
+                project_ref: Some("github-com-flotilla-org-andamento".into()),
                 placement_policy: None,
                 adopted_checkout: None,
             },
@@ -876,7 +817,7 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
 }
 
 #[tokio::test]
-async fn tracking_after_custom_project_identity_change_does_not_create_generated_twin() {
+async fn tracking_after_custom_project_identity_change_does_not_modify_the_explicit_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("custom-repo");
@@ -915,11 +856,11 @@ async fn tracking_after_custom_project_identity_change_does_not_create_generated
     assert_eq!(projects.items.len(), 1, "identity migration must not create a generated twin for a custom-named project");
     assert_eq!(projects.items[0].metadata.name, "my-custom-project");
     assert_eq!(projects.items[0].spec.display_name, "My Custom Project");
-    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+    assert_ne!(projects.items[0].spec.repositories[0].repo, remote_key);
 }
 
 #[tokio::test]
-async fn identity_change_preserves_migrated_project_when_local_and_remote_names_differ() {
+async fn identity_change_preserves_existing_project_without_ambient_migration() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("z-local-name");
@@ -973,14 +914,14 @@ async fn identity_change_preserves_migrated_project_when_local_and_remote_names_
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
 
     let projects = backend.definitions::<Project>("flotilla").list().await.expect("project list");
-    assert_eq!(projects.len(), 1, "the pre-existing remote twin should be removed");
-    assert_eq!(projects[0].metadata.name, "z-local-name", "the migrated Project should retain its identity");
-    assert_eq!(projects[0].spec.display_name, "z-local-name");
+    assert_eq!(projects.len(), 1, "identity refresh must not create or remove Projects");
+    assert_eq!(projects[0].metadata.name, "a-remote-name");
+    assert_eq!(projects[0].spec.display_name, "a-remote-name");
     assert_eq!(projects[0].spec.repositories[0].repo, remote_key);
 }
 
 #[tokio::test]
-async fn refresh_surfaces_and_reconciles_repository_identity_change() {
+async fn refresh_surfaces_repository_identity_change_without_materializing_a_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let checkout_path = tmp.path().join("refreshed");
@@ -1020,8 +961,8 @@ async fn refresh_surfaces_and_reconciles_repository_identity_change() {
             current_display: "https://github.com/flotilla-org/refreshed".to_string(),
         }],
     });
-    let project = backend.using::<Project>("flotilla").get("refreshed").await.expect("migrated project");
-    assert_eq!(project.spec.repositories[0].repo, remote_key);
+    assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
+    assert!(backend.using::<Repository>("flotilla").get(&remote_key.to_string()).await.is_ok());
 }
 
 #[tokio::test]
@@ -1079,7 +1020,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
 }
 
 #[tokio::test]
-async fn tracking_repo_fails_when_its_project_cannot_be_materialized() {
+async fn tracking_repo_fails_when_repository_inspection_fails() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
     let checkout_path = tmp.path().join("uninspectable");
@@ -1093,7 +1034,7 @@ async fn tracking_repo_fails_when_its_project_cannot_be_materialized() {
 }
 
 #[tokio::test]
-async fn daemon_start_backfills_project_idempotently_and_preserves_edits_to_generated_name_occupant() {
+async fn daemon_start_and_restart_do_not_backfill_projects() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("backfilled");
@@ -1108,7 +1049,6 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits_to_gene
     )
     .await;
     let repository_spec = RepositorySpec::remote("https://github.com/org/backfilled.git").expect("repository spec");
-    let repository_key = repository_spec.key();
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
     let options = RuntimeOptions {
         namespace: "flotilla".to_string(),
@@ -1122,40 +1062,15 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits_to_gene
         DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options.clone()).await.expect("runtime start");
 
     let projects = backend.clone().using::<Project>("flotilla");
-    let project = projects.get("backfilled").await.expect("backfilled project should exist");
-    assert_eq!(project.spec.repositories[0].repo, repository_key);
-    let mut evolved = project.spec;
-    evolved.display_name = "Backfilled product".to_string();
-    evolved.default_workflow_ref = "custom-workflow".to_string();
-    evolved.issue_source = Some(IssueSource { service: "linear".to_string(), scope: "BACK".to_string() });
-    evolved.repositories.push(flotilla_resources::ProjectRepositorySpec {
-        repo: RepositoryKey("second-repository".to_string()),
-        alias: None,
-        roles: Default::default(),
-        subpath: None,
-        default_branch: None,
-    });
-    projects
-        .update(&InputMeta::builder().name("backfilled".to_string()).build(), &project.metadata.resource_version, &evolved)
-        .await
-        .expect("evolve project");
+    assert!(projects.list().await.expect("project list").items.is_empty());
     drop(runtime);
 
     let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
-
-    assert_eq!(projects.get("backfilled").await.expect("evolved project").spec, evolved);
-    let materialized = projects.list().await.expect("project list");
-    assert_eq!(materialized.items.len(), 2);
-    assert!(materialized.items.iter().any(|project| {
-        matches!(
-            project.spec.repositories.as_slice(),
-            [entry] if entry.repo == repository_key && entry.subpath.is_none()
-        )
-    }));
+    assert!(projects.list().await.expect("project list").items.is_empty());
 }
 
 #[tokio::test]
-async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_project_during_identity_change() {
+async fn daemon_restart_does_not_create_project_while_preserving_applied_project() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("flotilla");
@@ -1184,7 +1099,7 @@ async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_proje
         DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options.clone()).await.expect("runtime start");
 
     let projects = backend.clone().using::<Project>("flotilla");
-    projects.get("flotilla").await.expect("whole-repository project should exist before overlap");
+    assert!(projects.list().await.expect("project list").items.is_empty());
     let second_key = RepositoryKey("second-repository".to_string());
     let mut rx = daemon.subscribe();
     let apply_id = daemon
@@ -1202,7 +1117,6 @@ async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_proje
         .await
         .expect("apply execute");
     assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "presentation".into() });
-    projects.get("flotilla").await.expect("whole-repository project should survive applying the overlap");
 
     let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("remote repository spec");
     let remote_key = remote_spec.key();
@@ -1212,10 +1126,9 @@ async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_proje
     let _restarted =
         DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
 
-    let whole_repo = projects.get("flotilla").await.expect("whole-repository project should survive restart");
-    assert_eq!(whole_repo.spec.repositories[0].repo, remote_key);
     let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
-    assert_eq!(presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<Vec<_>>(), [&second_key, &remote_key]);
+    assert_eq!(presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<Vec<_>>(), [&local_key, &second_key]);
+    assert_ne!(local_key, remote_key);
 }
 
 #[tokio::test]
@@ -1244,7 +1157,7 @@ async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
 }
 
 #[tokio::test]
-async fn tracking_repo_widens_project_name_without_overwriting_custom_project() {
+async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
     let custom_spec = flotilla_resources::ProjectSpec {
@@ -1261,15 +1174,14 @@ async fn tracking_repo_widens_project_name_without_overwriting_custom_project() 
         }],
     };
     projects.create(&InputMeta::builder().name("shared".to_string()).build(), &custom_spec).await.expect("custom project create");
-    let repository_key = track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
+    track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
 
     assert_eq!(projects.get("shared").await.expect("custom project").spec, custom_spec);
-    let generated = projects.get("github-com-org-b-shared").await.expect("collision-aware project should exist");
-    assert_eq!(generated.spec.repositories[0].repo, repository_key);
+    assert_eq!(projects.list().await.expect("project list").items.len(), 1);
 }
 
 #[tokio::test]
-async fn tracking_repo_uses_repository_key_when_slug_candidates_collide() {
+async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
     for (name, repo_ref) in [("shared", "first-repository"), ("github-com-org-b-shared", "second-repository")] {
@@ -1290,12 +1202,9 @@ async fn tracking_repo_uses_repository_key_when_slug_candidates_collide() {
             .await
             .expect("occupied project create");
     }
-    let repository_key = track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
+    track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
 
-    let key_prefix = repository_key.0.chars().take(8).collect::<String>();
-    let generated_name = format!("github-com-org-b-shared-{key_prefix}");
-    let generated = projects.get(&generated_name).await.expect("key-disambiguated project should exist");
-    assert_eq!(generated.spec.repositories[0].repo, repository_key);
+    assert_eq!(projects.list().await.expect("project list").items.len(), 2);
 }
 
 #[tokio::test]

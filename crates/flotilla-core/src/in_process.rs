@@ -3374,21 +3374,6 @@ fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKe
     )
 }
 
-fn whole_repository_project_names(repository_spec: &RepositorySpec) -> Result<Vec<String>, String> {
-    let repository_key = repository_spec.key();
-    let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
-    let catalog_name = normalize_project_name(&repository_spec.catalog_slug())?;
-    let key_suffix = repository_key.0.chars().take(8).collect::<String>();
-    let disambiguated_name = format!("{catalog_name}-{key_suffix}");
-    let mut candidates = Vec::new();
-    for candidate in [display_name, catalog_name, disambiguated_name] {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    Ok(candidates)
-}
-
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
         flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
@@ -5466,7 +5451,7 @@ impl InProcessDaemon {
         Ok(project_name)
     }
 
-    async fn reconcile_whole_repository_project(
+    async fn reconcile_tracked_repository(
         &self,
         inspection: &crate::repository_inspection::RepositoryInspection,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
@@ -5535,67 +5520,6 @@ impl InProcessDaemon {
             .collect::<BTreeSet<_>>();
         let migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
 
-        let mut project_objects = projects.list().await.map_err(|error| error.to_string())?;
-        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
-        let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
-        let mut generated_display_names = BTreeSet::from([display_name.clone()]);
-        for key in &migratable_keys {
-            if let Some(spec) = repository_specs.get(key) {
-                generated_names.extend(whole_repository_project_names(spec)?);
-                generated_display_names.insert(normalize_project_name(&spec.leaf_slug())?);
-            }
-        }
-        let mut migrated_project_names = BTreeSet::new();
-        for project in &mut project_objects {
-            if is_declaration_backed_project(project) {
-                continue;
-            }
-            let mut updated = project.spec.clone();
-            let mut changed = false;
-            for entry in &mut updated.repositories {
-                if migratable_keys.contains(&entry.repo) {
-                    entry.repo = repository_key.clone();
-                    changed = true;
-                }
-            }
-            if changed {
-                updated = normalize_project_spec(updated)?;
-                projects.apply(&InputMeta::from(&project.metadata), &updated).await.map_err(|error| error.to_string())?;
-                project.spec = updated;
-                migrated_project_names.insert(project.metadata.name.clone());
-            }
-        }
-
-        let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
-        let primary_name = project_objects
-            .iter()
-            .filter(|project| is_whole_repository_project(&project.spec, &repository_key))
-            .min_by_key(|project| {
-                (
-                    !migrated_project_names.contains(&project.metadata.name),
-                    generated_names.contains(&project.metadata.name),
-                    project.metadata.name.as_str(),
-                )
-            })
-            .map(|project| project.metadata.name.clone());
-        if let Some(primary_name) = &primary_name {
-            let primary = project_objects
-                .iter_mut()
-                .find(|project| project.metadata.name == *primary_name)
-                .expect("selected primary Project should remain in the listed objects");
-            *primary = reconcile_whole_repository_project_definition(&projects, primary.clone(), &spec).await?;
-            for duplicate in project_objects.iter().filter(|project| {
-                project.metadata.name != *primary_name
-                    && generated_names.contains(&project.metadata.name)
-                    && generated_display_names.contains(&project.spec.display_name)
-                    && project.spec.default_workflow_ref == spec.default_workflow_ref
-                    && project.spec.issue_source == spec.issue_source
-                    && project.spec.repositories == spec.repositories
-            }) {
-                projects.delete(&duplicate.metadata.name).await.map_err(|error| error.to_string())?;
-            }
-        }
-
         let remaining_projects = projects.list().await.map_err(|error| error.to_string())?;
         let durable_checkouts =
             self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
@@ -5631,24 +5555,7 @@ impl InProcessDaemon {
             previous_display: repository_identity_display(previous),
             current_display: repository_identity_display(repository_spec),
         });
-        if primary_name.is_some() {
-            return Ok(identity_change);
-        }
-
-        for project_name in whole_repository_project_names(repository_spec)? {
-            match projects.create(&whole_repository_project_meta(project_name.clone()), &spec).await {
-                Ok(_) => return Ok(identity_change),
-                Err(ResourceError::Conflict { .. }) => {
-                    let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
-                    if is_whole_repository_project(&existing.spec, &repository_key) {
-                        reconcile_whole_repository_project_definition(&projects, existing, &spec).await?;
-                        return Ok(identity_change);
-                    }
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        Err(format!("could not allocate a deterministic Project name for repository {repository_key}"))
+        Ok(identity_change)
     }
 
     async fn reconcile_repository_config(
@@ -5668,22 +5575,6 @@ impl InProcessDaemon {
                 .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, repository_spec)
                 .await
                 .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
-    pub async fn materialize_tracked_repo_projects(&self) -> Result<(), String> {
-        for repo_path in self.tracked_repo_paths().await {
-            let inspection = match self.inspect_repository_path(&repo_path, None).await {
-                Ok(inspection) => inspection,
-                Err(error) => {
-                    warn!(repo = %repo_path.display(), %error, "skipping Project backfill because repository identity resolution failed");
-                    continue;
-                }
-            };
-            self.reconcile_whole_repository_project(&inspection)
-                .await
-                .map_err(|error| format!("materialize whole-repository Project for {}: {error}", repo_path.display()))?;
         }
         Ok(())
     }
@@ -5729,7 +5620,7 @@ impl InProcessDaemon {
             Ok(inspection) => {
                 let key_changed = self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key());
                 let identity_change = if key_changed {
-                    self.reconcile_whole_repository_project(&inspection).await?
+                    self.reconcile_tracked_repository(&inspection).await?
                 } else {
                     let namespace = self.provisioning_namespace().await;
                     self.reconcile_repository_config(&namespace, &inspection.key(), &inspection.spec).await?;
@@ -5831,7 +5722,7 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
         let repository_key = Some(repository_inspection.key());
-        let identity_change = self.reconcile_whole_repository_project(&repository_inspection).await?;
+        let identity_change = self.reconcile_tracked_repository(&repository_inspection).await?;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
                 let key_became_available = {
