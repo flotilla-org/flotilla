@@ -5949,6 +5949,14 @@ impl InProcessDaemon {
                     spec.workflow_ref
                 )
             })?;
+            if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|owner| owner != project_name) {
+                return Err(format!(
+                    "{} ensure `{name}` references workflow template {} materialized by project {}",
+                    meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
+                    spec.workflow_ref,
+                    workflow.metadata.annotations[MATERIALIZED_PROJECT_ANNOTATION]
+                ));
+            }
             if workflow.spec.exit.is_some() {
                 return Err(format!(
                     "{} ensure `{name}` references workflow template {} with an exit declaration",
