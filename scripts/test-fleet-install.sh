@@ -464,6 +464,34 @@ grep -Fq 'not reachable through the login shell' "$test_root/login-path.out" \
   || fail 'login-shell PATH failure was unclear'
 grep -Fq '~/.zshenv' "$test_root/login-path.out" || fail 'zsh PATH failure omitted ~/.zshenv'
 
+first_install_home="$test_root/first-install-home"
+mkdir -p "$first_install_home/.config/flotilla"
+cp "$test_root/home/.config/flotilla/fleet-reader-token" "$first_install_home/.config/flotilla/fleet-reader-token"
+HOME="$first_install_home" PATH="$first_install_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT="$fixture_root" \
+  XDG_CONFIG_HOME="$first_install_home/.config" SHELL="$fake_bin/zsh" \
+  LOGIN_SHELL_PATH="$first_install_home/.local/bin:$fake_bin:/usr/bin:/bin" \
+  SYSTEMCTL_LOG="$test_root/first-install-systemctl.log" LOGINCTL_LOG="$test_root/first-install-loginctl.log" \
+  DAEMON_RUNNING=1 STOP_FAIL=1 \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/first-install-failed.out" 2>&1 \
+  && fail 'first install ignored a failed staged daemon stop'
+first_install_cli="$first_install_home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla"
+grep -Fq "run \`$first_install_cli daemon stop\`, then retry" "$test_root/first-install-failed.out" \
+  || fail 'first install daemon refusal did not name its staged CLI'
+test -x "$first_install_cli" || fail 'first install daemon refusal named a non-executable CLI'
+HOME="$first_install_home" PATH="$first_install_home/.local/bin:$fake_bin:$PATH" FIXTURE_ROOT="$fixture_root" \
+  XDG_CONFIG_HOME="$first_install_home/.config" SHELL="$fake_bin/zsh" \
+  LOGIN_SHELL_PATH="$first_install_home/.local/bin:$fake_bin:/usr/bin:/bin" \
+  SYSTEMCTL_LOG="$test_root/first-install-systemctl.log" LOGINCTL_LOG="$test_root/first-install-loginctl.log" \
+  DAEMON_RUNNING=1 STOP_FAIL=0 \
+  FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+  FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
+  "$installer" "$generation_one" >"$test_root/first-install-retry.out"
+grep -Fq 'daemon stop requested' "$test_root/first-install-retry.out" || fail 'first-install retry did not stop the daemon with its staged CLI'
+test "$(link_generation "$first_install_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'first-install retry did not select the generation'
+
 run_installer "$generation_one" >"$test_root/install-one.out"
 grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
   || fail 'healthy Linux install was not confirmed'
