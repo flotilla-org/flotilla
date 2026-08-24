@@ -2247,6 +2247,22 @@ impl InProcessDaemon {
         let environment_manager =
             Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
+        let local_host_bag =
+            environment_manager.environment_bag(&local_environment_id).expect("local direct environment bag should always be available");
+        let local_runner = environment_manager
+            .environment_runner(&local_environment_id)
+            .expect("local direct environment runner should always be available");
+        discovery
+            .host_scoped_providers
+            .discover_for_environment(
+                &local_environment_id,
+                &local_host_bag,
+                &discovery.factories,
+                &config,
+                &ExecutionEnvironmentPath::new(config.base_path().as_ref()),
+                local_runner,
+            )
+            .await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
         let startup_repository_inspector = GitRepositoryInspector::new(discovery.runner.clone(), local_host_id.to_string());
 

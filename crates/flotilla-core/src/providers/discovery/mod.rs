@@ -512,37 +512,49 @@ pub(crate) struct HostScopedProviderCache {
     environments: Mutex<HashMap<EnvironmentId, Arc<AsyncOnceCell<HostScopedDiscovery>>>>,
 }
 
+/// Provider capabilities constructed from host detector assertions and shared
+/// by every repository in that environment.
 #[derive(Clone, Default, bon::Builder)]
-pub(crate) struct HostScopedProviders {
-    issue_trackers: Vec<(ProviderDescriptor, Arc<dyn IssueProvider>)>,
-    cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
-    presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
-    terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
+pub(crate) struct HostRegistry {
+    pub(crate) agent_adapters: AgentAdapterRegistry,
+    pub(crate) cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
+    pub(crate) ai_utilities: Vec<(ProviderDescriptor, Arc<dyn AiUtility>)>,
+    pub(crate) presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
+    pub(crate) terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
+    pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn crate::providers::environment::EnvironmentProvider>)>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct HostScopedDiscovery {
-    providers: HostScopedProviders,
+    issue_trackers: Vec<(ProviderDescriptor, Arc<dyn IssueProvider>)>,
+    registry: HostRegistry,
     unmet: Vec<(String, UnmetRequirement)>,
 }
 
 impl HostScopedDiscovery {
     pub(crate) fn issue_provider_for(&self, source: &flotilla_protocol::IssueSource) -> Option<Arc<dyn IssueProvider>> {
-        provider_for_source(self.providers.issue_trackers.iter().map(|(_, provider)| provider), source)
+        provider_for_source(self.issue_trackers.iter().map(|(_, provider)| provider), source)
     }
 
     fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
-        for (descriptor, provider) in &self.providers.issue_trackers {
+        for (descriptor, provider) in &self.issue_trackers {
             registry.issue_trackers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
-        for (descriptor, provider) in &self.providers.cloud_agents {
+        registry.agent_adapters = self.registry.agent_adapters.clone();
+        for (descriptor, provider) in &self.registry.cloud_agents {
             registry.cloud_agents.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
-        for (descriptor, provider) in &self.providers.presentation_managers {
+        for (descriptor, provider) in &self.registry.ai_utilities {
+            registry.ai_utilities.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        for (descriptor, provider) in &self.registry.presentation_managers {
             registry.presentation_managers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
-        for (descriptor, provider) in &self.providers.terminal_pools {
+        for (descriptor, provider) in &self.registry.terminal_pools {
             registry.terminal_pools.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        for (descriptor, provider) in &self.registry.environment_providers {
+            registry.environment_providers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
         unmet.extend(self.unmet.iter().cloned());
     }
@@ -601,6 +613,9 @@ impl HostScopedProviderCache {
             let (cloud_agents, cloud_agent_unmet) =
                 probe_host_category(&factories.cloud_agents, host_bag, config, probe_root, &runner, |provider| provider).await;
             unmet.extend(cloud_agent_unmet);
+            let (ai_utilities, ai_utility_unmet) =
+                probe_host_category(&factories.ai_utilities, host_bag, config, probe_root, &runner, |provider| provider).await;
+            unmet.extend(ai_utility_unmet);
             let (presentation_managers, presentation_unmet) =
                 probe_host_category(&factories.presentation_managers, host_bag, config, probe_root, &runner, |provider| {
                     Arc::new(SharedPresentationManager::new(provider, HOST_SCAN_CACHE_TTL))
@@ -613,13 +628,19 @@ impl HostScopedProviderCache {
                 })
                 .await;
             unmet.extend(terminal_unmet);
+            let (environment_providers, environment_provider_unmet) =
+                probe_host_category(&factories.environment_providers, host_bag, config, probe_root, &runner, |provider| provider).await;
+            unmet.extend(environment_provider_unmet);
 
             HostScopedDiscovery {
-                providers: HostScopedProviders::builder()
-                    .issue_trackers(issue_trackers)
+                issue_trackers,
+                registry: HostRegistry::builder()
+                    .agent_adapters(AgentAdapterRegistry::discover(host_bag, Arc::clone(&runner)))
                     .cloud_agents(cloud_agents)
+                    .ai_utilities(ai_utilities)
                     .presentation_managers(presentation_managers)
                     .terminal_pools(terminal_pools)
+                    .environment_providers(environment_providers)
                     .build(),
                 unmet,
             }
@@ -782,10 +803,12 @@ async fn discover_providers_inner(
         })
         .await;
     }
-    probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.ai_utilities.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
+    if host_scoped.is_none() {
+        probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.ai_utilities.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+    }
     if host_scoped.is_none() {
         probe_all(&factories.presentation_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
             registry.presentation_managers.insert(desc.implementation.clone(), desc, provider);
@@ -796,10 +819,12 @@ async fn discover_providers_inner(
         })
         .await;
     }
-    probe_all(&factories.environment_providers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.environment_providers.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
+    if host_scoped.is_none() {
+        probe_all(&factories.environment_providers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.environment_providers.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+    }
 
     if let Some(host_scoped) = host_scoped {
         host_scoped.install(&mut registry, &mut unmet);

@@ -92,6 +92,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").expect("daemon config");
     let runner = Arc::new(MockRunner::new(vec![
         Ok("git version 2.43.0".to_string()),
+        Ok("git version 2.43.0".to_string()),
         Ok("archived".to_string()),
         Err("remote rejected".to_string()),
         Ok("archived stale head".to_string()),

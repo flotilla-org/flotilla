@@ -170,6 +170,22 @@ struct EnvVarEchoHostDetector {
     assertion_key: &'static str,
 }
 
+struct FixedEnvVarHostDetector {
+    key: &'static str,
+    value: &'static str,
+}
+
+#[async_trait]
+impl HostDetector for FixedEnvVarHostDetector {
+    async fn detect(
+        &self,
+        _runner: &dyn CommandRunner,
+        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        vec![EnvironmentAssertion::env_var(self.key, self.value)]
+    }
+}
+
 #[async_trait]
 impl HostDetector for EnvVarEchoHostDetector {
     async fn detect(
@@ -323,6 +339,7 @@ impl AiUtility for SlowAiUtility {
 
 struct SlowAiUtilityFactory {
     utility: Arc<SlowAiUtility>,
+    probes: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -341,13 +358,16 @@ impl Factory for SlowAiUtilityFactory {
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        if let Some(probes) = &self.probes {
+            probes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
 }
 
 fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
-    runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility }));
+    runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility, probes: None }));
     runtime
 }
 
@@ -722,6 +742,28 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+#[tokio::test]
+async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repositories() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_a).expect("create first repo");
+    std::fs::create_dir_all(&repo_b).expect("create second repo");
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let mut discovery = fake_discovery(false);
+    discovery
+        .factories
+        .ai_utilities
+        .push(Box::new(SlowAiUtilityFactory { utility: Arc::new(SlowAiUtility::new()), probes: Some(Arc::clone(&probes)) }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo_a, repo_b], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+
+    assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "host provider construction must not scale with repository count");
 }
 
 #[tokio::test]
@@ -2763,7 +2805,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let mut discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
     );
-    discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility) }));
+    discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility), probes: None }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, Some(reference.source.clone())).await;
@@ -4837,12 +4879,10 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
         .factories
         .terminal_pools
         .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_MANAGER_TERMINALS", pool: terminal_pool }));
+    discovery.host_detectors.push(Box::new(FixedEnvVarHostDetector { key: "ENABLE_MANAGER_TERMINALS", value: "1" }));
     let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::local()).await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("provider-discovery".to_string()))).await;
 
-    daemon
-        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("ENABLE_MANAGER_TERMINALS", "1")))
-        .expect("replace local environment bag");
     daemon.add_repo(&repo).await.expect("add repo");
 
     let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo.clone())).await.expect("get_repo_providers");
