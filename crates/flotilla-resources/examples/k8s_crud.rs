@@ -122,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("updating convoy status");
     let updated_convoy = convoy_resolver
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
+            provisioning: None,
             placement_decision: None,
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,

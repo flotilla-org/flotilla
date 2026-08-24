@@ -219,6 +219,7 @@ fn pending_brief() -> PendingBrief {
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: None,

@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::TimeZone;
 use flotilla_resources::{
-    controller_patches, ConvoyEnsureStatus, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant, CredentialGrantSelector,
-    CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
-    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment, EnvironmentPhase,
-    EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, HostCondition, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, Selector,
-    Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, AUTHORITY_LABEL, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    controller_patches, ConvoyEnsureStatus, ConvoyProvisioningState, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
+    EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, HostCondition,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy,
+    PlacementPolicySpec, Selector, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
+    VirtualClock, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, AUTHORITY_LABEL, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -1494,6 +1495,73 @@ async fn standing_ensure_admission_reads_project_and_repositories_from_root_repl
         .next()
         .expect("admitted convoy on root B");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
+}
+
+#[tokio::test]
+async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_started() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let convoy_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .expect("ensure status")
+        .convoy_ref
+        .expect("convoy ref");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
+    let convoy = convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
+            finished_at: Some(clock.now()),
+            ..Default::default()
+        })
+        .await
+        .expect("record post-provisioning failure");
+
+    let refusal = daemon
+        .verify_standing_convoy_resource_backing_dead(&convoy)
+        .await
+        .expect_err("missing backing evidence after provisioning must remain conservative");
+
+    assert_eq!(refusal, "no backing environment evidence is available");
+}
+
+#[tokio::test]
+async fn standing_ensure_retries_convoy_that_failed_before_provisioning() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .expect("ensure status")
+        .convoy_ref
+        .expect("convoy ref");
+    let convoy = convoys.get(&convoy_ref).await.expect("standing convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            provisioning: Some(ConvoyProvisioningState::NotStarted),
+            message: Some("workflow validation failed".to_string()),
+            finished_at: Some(clock.now()),
+            ..Default::default()
+        })
+        .await
+        .expect("record pre-provisioning failure");
+
+    let events = daemon.reconcile_convoy_ensures_once("flotilla").await.expect("reconcile terminal convoy");
+
+    assert!(events.iter().any(|event| event.contains("backing off")), "unexpected events: {events:?}");
+    let ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
+    assert!(ensure.status.expect("ensure status").retry_at.is_some());
+    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("demands").items.is_empty());
 }
 
 #[tokio::test]

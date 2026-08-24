@@ -49,12 +49,12 @@ use flotilla_resources::{
     BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
-    CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand,
-    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
+    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
+    Environment as ResourceEnvironment, EnvironmentPhase, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend,
+    InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
@@ -5060,6 +5060,9 @@ impl InProcessDaemon {
             .filter(|environment| environment.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name))
             .collect::<Vec<_>>();
         if environments.is_empty() {
+            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+                return Ok(());
+            }
             return Err("no backing environment evidence is available".to_string());
         }
         let not_dead = environments
