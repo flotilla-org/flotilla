@@ -28,10 +28,10 @@ use flotilla_manifest::entity;
 use flotilla_protocol::arg::Arg;
 use flotilla_resources::{
     controller::Reconciler, Convoy, ConvoyRepositorySpec, ConvoySpec, Environment, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec,
-    PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch, TerminalSession,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL,
+    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, LifecycleAuthority, Presentation,
+    PresentationSpec, PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch,
+    TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, AUTHORITY_LABEL, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -162,6 +162,42 @@ async fn no_sessions_and_no_observed_workspace_is_in_sync() {
 
     assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::InSync));
     assert!(outcome.patch.is_none());
+    assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
+    assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_runtime() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let presentation = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(PresentationStatusPatch::MarkFailed { ref message }) if message == "convoy 'missing-convoy' no longer exists"
+    ));
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
 }
