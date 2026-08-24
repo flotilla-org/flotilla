@@ -10,7 +10,7 @@ use flotilla_resources::{
     Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    AGENT_ADAPTERS_CAPABILITY, AUTHORITY_LABEL, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -1590,6 +1590,44 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
     assert!(generations.iter().any(|convoy| convoy.metadata.name == first_ref && convoy.spec.generation == 1));
     assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
     assert_eq!(backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 1);
+}
+
+#[tokio::test]
+async fn convoy_teardown_removes_its_managed_presentations() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let convoy_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("convoy ref");
+    let presentations = backend.using::<ResourcePresentation>("flotilla");
+    presentations
+        .create(
+            &InputMeta::builder()
+                .name("quartermaster-work".to_string())
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), convoy_ref.clone()),
+                ]))
+                .build(),
+            &flotilla_resources::PresentationSpec {
+                convoy_ref: convoy_ref.clone(),
+                presentation_policy_ref: "default".to_string(),
+                name: "quartermaster".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_ref.clone())]),
+            },
+        )
+        .await
+        .expect("presentation");
+
+    daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("convoy teardown");
+
+    assert!(matches!(presentations.get("quartermaster-work").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]

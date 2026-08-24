@@ -23,8 +23,9 @@ use flotilla_manifest::{entity, stamp::WorkspaceStamp};
 use flotilla_protocol::{arg, CanonicalHostId, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, VESSEL_LABEL,
+    Convoy, Environment, Host, LifecycleAuthority, Presentation, PresentationPhase, PresentationStatus, PresentationStatusPatch,
+    ResourceBackend, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, AUTHORITY_LABEL, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -203,6 +204,7 @@ impl HopChainContext {
 
 pub struct PresentationReconciler<R> {
     runtime: Arc<R>,
+    convoys: TypedResolver<Convoy>,
     terminal_sessions: TypedResolver<TerminalSession>,
     environments: TypedResolver<Environment>,
     hosts: TypedResolver<Host>,
@@ -220,6 +222,7 @@ impl<R> PresentationReconciler<R> {
     ) -> Self {
         Self {
             runtime,
+            convoys: backend.clone().using::<Convoy>(namespace),
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             hosts: backend.clone().using::<Host>(namespace),
@@ -351,6 +354,36 @@ where
     type Prepared = PresentationPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if obj.metadata.labels.get(AUTHORITY_LABEL).map(String::as_str) == Some(LifecycleAuthority::Managed.as_label_value()) {
+            match self.convoys.get(&obj.spec.convoy_ref).await {
+                Ok(_) => {}
+                Err(ResourceError::NotFound { .. }) => {
+                    if let Some(previous) = previous_workspace(obj.status.as_ref()) {
+                        return Ok(match self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await {
+                            Ok(()) => PresentationPrepared::TornDown {
+                                message: Some(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)),
+                            },
+                            Err(error) => PresentationPrepared::TornDown {
+                                message: Some(format!(
+                                    "convoy '{}' no longer exists; presentation teardown failed: {error}",
+                                    obj.spec.convoy_ref
+                                )),
+                            },
+                        });
+                    }
+                    if obj
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| matches!(status.phase, PresentationPhase::TornDown | PresentationPhase::Failed))
+                    {
+                        return Ok(PresentationPrepared::InSync);
+                    }
+                    return Ok(PresentationPrepared::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         let listed = self.terminal_sessions.list_matching_labels(&obj.spec.process_selector).await?;
         let mut sessions: Vec<_> = listed
             .items
@@ -434,7 +467,15 @@ where
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         if let Some(previous) = previous_workspace(obj.status.as_ref()) {
-            self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await.map_err(ResourceError::other)?;
+            if let Err(error) = self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await {
+                warn!(
+                    presentation = %obj.metadata.name,
+                    presentation_manager = %previous.presentation_manager,
+                    workspace_ref = %previous.workspace_ref,
+                    %error,
+                    "presentation teardown failed during finalization; allowing resource deletion"
+                );
+            }
         }
         Ok(())
     }
