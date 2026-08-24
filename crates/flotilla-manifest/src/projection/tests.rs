@@ -258,43 +258,46 @@ fn truncated_awareness_summary_reports_exact_omitted_count() {
 }
 
 #[test]
-fn project_awareness_with_remote_governor_projects_catalog_entities() {
-    let reference = convoy_ref("flotilla", "governor").on_host(HostName::new("udder"));
-    let convoy_row = ConvoyRow::builder()
-        .resource(reference)
-        .name("governor")
-        .workflow_ref("standing-governor")
-        .phase(ConvoyPhase::Active)
-        .project_ref("andamento")
-        .build();
-    let governor = AwarenessEntry::builder()
-        .id("convoy/flotilla/governor".to_owned())
-        .kind(AwarenessKind::Convoy)
-        .label("governor".to_owned())
-        .state(AwarenessState::Active)
-        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), "governor".to_owned())]))
-        .build();
-    let node = AwarenessNode::builder()
-        .id("project/flotilla/andamento".to_owned())
-        .kind(AwarenessKind::Project)
-        .label("andamento".to_owned())
-        .scope(flotilla_protocol::QueryScope::new("flotilla", "andamento"))
-        .state(AwarenessState::Active)
-        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .counts(AwarenessCounts::builder().total(1).convoys(1).build())
-        .entries(vec![governor])
-        .build();
+fn same_role_remote_governors_project_as_distinct_catalog_entities() {
+    let governor = |resource_name: &str, project: &str| {
+        ConvoyRow::builder()
+            .resource(convoy_ref("flotilla", resource_name).on_host(HostName::new("udder")))
+            .name("governor")
+            .workflow_ref("standing-governor")
+            .phase(ConvoyPhase::Active)
+            .project_ref(project)
+            .build()
+    };
+    let awareness = |resource_name: &str, project: &str| {
+        AwarenessNode::builder()
+            .id(format!("project/flotilla/{project}"))
+            .kind(AwarenessKind::Project)
+            .label(project.to_owned())
+            .scope(flotilla_protocol::QueryScope::new("flotilla", project))
+            .state(AwarenessState::Active)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(1).convoys(1).build())
+            .entries(vec![AwarenessEntry::builder()
+                .id(format!("convoy/flotilla/{resource_name}"))
+                .kind(AwarenessKind::Convoy)
+                .label("governor".to_owned())
+                .state(AwarenessState::Active)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), "governor".to_owned())]))
+                .build()])
+            .build()
+    };
+    let convoys = [governor("governor-andamento-01234567", "andamento"), governor("governor-wheelhouse-89abcdef", "wheelhouse")];
+    let awareness = [awareness("governor-andamento-01234567", "andamento"), awareness("governor-wheelhouse-89abcdef", "wheelhouse")];
 
     let patches =
-        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy_row], independents: &[] }, &mint()).reassert_patches();
-    let project = find_entity(&patches, &entity::project("flotilla", "andamento", "fleet"));
-    let governor = find_entity(&patches, &entity::convoy("flotilla", "governor", "udder"));
-
-    assert_eq!(text(project, SEGMENT_PROJECT), "flotilla/andamento@fleet");
-    assert_eq!(text(governor, SEGMENT_PROJECT), "flotilla/andamento@fleet");
-    assert_eq!(text(governor, KEY_CONVOY), "flotilla/governor@udder");
-    assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
+        project_catalog(&CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[] }, &mint()).reassert_patches();
+    for (resource_name, project) in [("governor-andamento-01234567", "andamento"), ("governor-wheelhouse-89abcdef", "wheelhouse")] {
+        let governor = find_entity(&patches, &entity::convoy("flotilla", resource_name, "udder"));
+        assert_eq!(text(governor, SEGMENT_PROJECT), format!("flotilla/{project}@fleet"));
+        assert_eq!(text(governor, KEY_CONVOY), format!("flotilla/{resource_name}@udder"));
+        assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
+    }
 }
 
 #[test]

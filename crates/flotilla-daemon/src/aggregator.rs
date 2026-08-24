@@ -2462,13 +2462,16 @@ mod tests {
             .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("udder-node-id", "udder")));
         let now = Utc::now();
         let provenance = ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("udder-node-id"), last_synced_at: now };
-        let mut convoy = convoy_with_vessel("governor").await;
+        let mut convoy = convoy_with_vessel("governor-andamento-01234567").await;
+        convoy.spec.role = "governor".to_string();
         convoy.spec.project_ref = Some("andamento".to_string());
         aggregator.replace_replica_convoys(vec![ReadResourceObject { object: convoy, provenance: provenance.clone() }]).await;
 
         let mut session = session_object("terminal-governor-implement-coder").await;
-        session.metadata.labels =
-            BTreeMap::from([(CONVOY_LABEL.to_string(), "governor".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        session.metadata.labels = BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "governor-andamento-01234567".to_string()),
+            (VESSEL_LABEL.to_string(), "implement".to_string()),
+        ]);
         session.status.as_mut().expect("running status").attention =
             Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
         aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
@@ -2486,9 +2489,16 @@ mod tests {
         let nodes = result.rows.as_awareness().expect("awareness rows");
         let node = nodes.iter().find(|node| node.scope.as_ref() == Some(&QueryScope::new("flotilla", "andamento"))).expect("project group");
         assert!(
-            node.entries.iter().any(|entry| entry.kind == flotilla_protocol::AwarenessKind::Convoy && entry.label == "governor"),
+            node.entries.iter().any(|entry| {
+                entry.kind == flotilla_protocol::AwarenessKind::Convoy
+                    && entry.id == "convoy/flotilla/governor-andamento-01234567"
+                    && entry.label == "governor"
+            }),
             "an idle standing convoy remains an awareness entry"
         );
+        assert!(node.entries.iter().any(|entry| {
+            entry.kind == flotilla_protocol::AwarenessKind::Vessel && entry.id == "vessel/flotilla/governor-andamento-01234567/implement"
+        }));
     }
 
     #[tokio::test]

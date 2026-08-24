@@ -75,7 +75,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .collect::<Vec<_>>();
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
-                .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name))
+                .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name))
                 .kind(AwarenessKind::Convoy)
                 .label(convoy_label(convoy))
                 .state(convoy_state(convoy.phase, convoy.initializing))
@@ -95,7 +95,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             ancestors.extend(project_ancestors.clone());
             group.add_entry(enrich_salience(
                 AwarenessEntry::builder()
-                    .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.name, vessel.name))
+                    .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.resource.name, vessel.name))
                     .kind(AwarenessKind::Vessel)
                     .label(vessel.name.clone())
                     .state(work_state(vessel.phase))
@@ -380,7 +380,9 @@ fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> Grou
                 )
             })
         }
-        AwarenessGrouping::Convoy => GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name), convoy.name.clone()),
+        AwarenessGrouping::Convoy => {
+            GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name), convoy.name.clone())
+        }
     }
 }
 
@@ -690,6 +692,34 @@ mod tests {
 
         assert_eq!(project_nodes.len(), 1);
         assert_eq!(convoy_nodes.len(), 2);
+    }
+
+    #[test]
+    fn same_role_convoys_use_resource_identity_in_awareness_ids() {
+        let mut andamento = convoy(Some("flotilla/andamento"), "governor", ConvoyPhase::Active);
+        andamento.resource.name = "governor-andamento-01234567".to_owned();
+        let mut wheelhouse = convoy(Some("flotilla/wheelhouse"), "governor", ConvoyPhase::Active);
+        wheelhouse.resource.name = "governor-wheelhouse-89abcdef".to_owned();
+
+        let (nodes, _) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Project,
+            convoys: vec![andamento, wheelhouse],
+            ..AwarenessInput::default()
+        });
+
+        let ids = nodes
+            .iter()
+            .flat_map(|node| &node.entries)
+            .filter(|entry| entry.kind == AwarenessKind::Convoy)
+            .map(|entry| (entry.id.as_str(), entry.label.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                ("convoy/flotilla/governor-andamento-01234567", "governor"),
+                ("convoy/flotilla/governor-wheelhouse-89abcdef", "governor"),
+            ])
+        );
     }
 
     #[test]

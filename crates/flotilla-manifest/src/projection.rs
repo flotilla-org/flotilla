@@ -319,13 +319,14 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let row = find_convoy(convoys, namespace, convoy_name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let convoy = entity::convoy(namespace, convoy_name, &origin);
+            let convoy_label = row.map(|row| row.name.as_str()).unwrap_or(convoy_name);
             let vessel_origin = find_vessel(convoys, namespace, convoy_name, vessel_name)
                 .map(|vessel| vessel.host.to_string())
                 .unwrap_or_else(|| origin.clone());
             let entity = entity::vessel(namespace, convoy_name, vessel_name, &vessel_origin);
             let mut facts = vec![
                 (KEY_CONVOY, MetadataValue::text(convoy.id)),
-                (KEY_CONVOY_NAME, MetadataValue::text(convoy_name)),
+                (KEY_CONVOY_NAME, MetadataValue::text(convoy_label)),
                 (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
                 (KEY_VESSEL_NAME, MetadataValue::text(label.clone())),
             ];
@@ -423,7 +424,7 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
 }
 
 fn find_convoy<'a>(convoys: &'a [ConvoyRow], namespace: &str, name: &str) -> Option<&'a ConvoyRow> {
-    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.name == name)
+    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.resource.name == name)
 }
 
 fn find_vessel<'a>(convoys: &'a [ConvoyRow], namespace: &str, convoy_name: &str, vessel_name: &str) -> Option<&'a VesselRow> {
