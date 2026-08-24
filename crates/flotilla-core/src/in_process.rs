@@ -3603,12 +3603,12 @@ async fn ensure_prepared_workflow_snapshot(
     name: &str,
     spec: &WorkflowTemplateSpec,
 ) -> Result<(), String> {
-    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
+    let templates = backend.definitions::<WorkflowTemplate>(namespace);
     match templates.get(name).await {
         Ok(existing) if existing.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared workflow snapshot {name} already exists with different contents")),
         Err(ResourceError::NotFound { .. }) => templates
-            .create(
+            .apply(
                 &InputMeta::builder()
                     .name(name.to_string())
                     .labels(BTreeMap::from([(

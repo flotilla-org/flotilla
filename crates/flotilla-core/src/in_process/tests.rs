@@ -66,6 +66,26 @@ fn test_meta(name: &str) -> InputMeta {
 }
 
 #[tokio::test]
+async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
+    let home_root = NodeId::new("snapshot-home");
+    let driver_root = NodeId::new("snapshot-driver");
+    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
+    let spec = flotilla_resources::single_agent_contained_workflow_spec();
+    let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
+
+    ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
+    driver
+        .replica_writer::<WorkflowTemplate>(home_root, "flotilla")
+        .replace(&home.using::<WorkflowTemplate>("flotilla").list().await.expect("home workflow log"), Utc::now())
+        .await
+        .expect("replicate snapshot to driver");
+
+    ensure_prepared_workflow_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
+    assert!(driver.using::<WorkflowTemplate>("flotilla").list().await.expect("driver local workflow log").items.is_empty());
+}
+
+#[tokio::test]
 async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").expect("daemon config");
