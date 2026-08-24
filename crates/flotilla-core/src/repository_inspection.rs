@@ -124,8 +124,8 @@ impl GitRepositoryInspector {
         self.git(cwd, &["config", "--get-all", &key])
             .await?
             .lines()
-            .next()
-            .filter(|url| !url.is_empty())
+            .map(str::trim)
+            .find(|url| !url.is_empty())
             .map(str::to_string)
             .ok_or_else(|| format!("remote `{remote}` has no configured URL"))
     }
