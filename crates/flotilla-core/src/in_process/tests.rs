@@ -1320,6 +1320,20 @@ async fn declared_driver_admission_failures_back_off_escalate_and_clear_legacy_s
     assert!(demand.metadata.annotations[RECLAIM_REFUSAL_REASON_ANNOTATION].contains("missing-workflow"));
     clock.advance(ChronoDuration::hours(1));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("active demand holds retries").is_empty());
+
+    apply_resource_status_patch(
+        &backend.using::<ResourceDemand>("flotilla"),
+        "ensure-attention-quartermaster",
+        &DemandStatusPatch::Acknowledge { as_of: clock.now(), authority: "operator".to_string() },
+    )
+    .await
+    .expect("acknowledge admission demand");
+    let ensure = ensures.get("quartermaster").await.expect("failed ensure");
+    let mut recovered_spec = ensure.spec.clone();
+    recovered_spec.workflow_ref = "quartermaster".to_string();
+    ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &recovered_spec).await.expect("repair admission");
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("acknowledged demand resumes admission").len(), 1);
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("recovered convoy").items.len(), 1);
 }
 
 #[tokio::test]

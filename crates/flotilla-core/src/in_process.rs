@@ -4636,6 +4636,11 @@ impl InProcessDaemon {
         backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<Vec<String>, String> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
+        let ensure_names = ensures.iter().map(|ensure| ensure.metadata.name.clone()).collect::<HashSet<_>>();
+        self.driver_ensure_retries
+            .lock()
+            .await
+            .retain(|(retry_namespace, retry_name), _| retry_namespace != namespace || ensure_names.contains(retry_name));
         let local_projects = self.resource_backend.clone().using::<Project>(namespace);
         let mut changes = Vec::new();
         let mut errors = Vec::new();
@@ -4838,7 +4843,7 @@ impl InProcessDaemon {
             }
             if !resolved_escalation {
                 if let Some(retry) = retries.get(&retry_key) {
-                    if retry.consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES || retry.retry_at > self.clock.now() {
+                    if retry.retry_at > self.clock.now() {
                         return Ok(None);
                     }
                 }
@@ -4875,15 +4880,15 @@ impl InProcessDaemon {
             }
             Err(error) => {
                 let now = self.clock.now();
-                let (consecutive_failures, retry_at) = {
+                let (admission_failures, retry_at) = {
                     let mut retries = self.driver_ensure_retries.lock().await;
-                    let consecutive_failures = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_failures.saturating_add(1));
-                    let retry_at = now + ensure_retry_delay(consecutive_failures - 1);
-                    retries.insert(retry_key, DriverEnsureRetry { config_hash, consecutive_failures, retry_at });
-                    (consecutive_failures, retry_at)
+                    let admission_failures = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_failures.saturating_add(1));
+                    let retry_at = now + ensure_retry_delay(admission_failures - 1);
+                    retries.insert(retry_key, DriverEnsureRetry { config_hash, consecutive_failures: admission_failures, retry_at });
+                    (admission_failures, retry_at)
                 };
-                if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-                    let failure = format!("driver admission failed {consecutive_failures} consecutive times: {error}");
+                if admission_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+                    let failure = format!("driver admission failed {admission_failures} consecutive times: {error}");
                     self.raise_driver_admission_attention(namespace, ensure, &failure, now + ENSURE_ESCALATION_AFTER).await?;
                     return Ok(Some(format!("ConvoyEnsure/{} exhausted driver admission retry budget", ensure.metadata.name)));
                 }
@@ -4909,7 +4914,14 @@ impl InProcessDaemon {
         let mut spec =
             DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
         spec.expiry = Some(DemandExpiry { deadline: escalation_deadline, disposition: DemandExpiryDisposition::Escalate });
-        demands.create(&meta, &spec).await.map(|_| ()).map_err(|error| error.to_string())
+        match demands.create(&meta, &spec).await {
+            Ok(_) => Ok(()),
+            Err(ResourceError::Conflict { .. }) => {
+                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
+                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     async fn set_ensure_driver_condition(
