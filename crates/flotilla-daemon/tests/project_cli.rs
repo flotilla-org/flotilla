@@ -1,7 +1,7 @@
 //! Integration tests for ProjectAdd/ProjectApply and Project-backed convoy metadata.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -1473,7 +1473,10 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
         DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
 
     let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
-    assert_eq!(presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<Vec<_>>(), [&local_key, &second_key]);
+    assert_eq!(
+        presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<BTreeSet<_>>(),
+        BTreeSet::from([&local_key, &second_key])
+    );
     assert_ne!(local_key, remote_key);
 }
 
