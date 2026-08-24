@@ -400,6 +400,11 @@ pub enum InputValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
+    /// Durable evidence of whether this convoy reached provisioning. An absent
+    /// value means the evidence predates this field and must be treated as
+    /// unknown rather than as `NotStarted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning: Option<ConvoyProvisioningState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +439,13 @@ pub struct ConvoyStatus {
     pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<ConvoyAttention>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum ConvoyProvisioningState {
+    NotStarted,
+    Started { started_at: DateTime<Utc> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -783,6 +795,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }
             Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at } => {
+                status.provisioning.get_or_insert(ConvoyProvisioningState::NotStarted);
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());
                 status.observed_workflows = Some(observed_workflows.clone());
@@ -807,6 +820,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::FailInit { phase, message, finished_at } => {
+                status.provisioning.get_or_insert(ConvoyProvisioningState::NotStarted);
                 status.phase = *phase;
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
@@ -815,6 +829,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::AdvanceWorkToReady { ready } => {
+                if !matches!(status.provisioning, Some(ConvoyProvisioningState::Started { .. })) {
+                    if let Some(started_at) = ready.values().min() {
+                        status.provisioning = Some(ConvoyProvisioningState::Started { started_at: *started_at });
+                    }
+                }
                 for (work, ready_at) in ready {
                     if let Some(state) = status.work.get_mut(work) {
                         state.phase = WorkPhase::Ready;

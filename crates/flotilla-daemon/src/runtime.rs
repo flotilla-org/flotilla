@@ -40,15 +40,15 @@ use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, No
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, ChangeRequest,
     ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy,
-    ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
-    EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard,
-    ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock,
-    TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS,
-    SLEEP_INHIBITION_CONDITION_TYPE,
+    ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
+    DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
+    EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
+    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
+    ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -782,6 +782,9 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             .filter(|environment| environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) == Some(&convoy.metadata.name))
             .collect::<Vec<_>>();
         if environments.is_empty() {
+            if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
+                return Ok(());
+            }
             return Err("no backing environment evidence is available".to_string());
         }
         if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
@@ -5033,6 +5036,48 @@ mod tests {
             .expect("restart teardown should rediscover and destroy the container");
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
+    }
+
+    #[tokio::test]
+    async fn standing_backing_inspection_accepts_durable_pre_provisioning_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"standing-pre-provision-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("dinghy"),
+        )
+        .await;
+        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
+            .await
+            .expect("convoy");
+        let convoy = convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Failed,
+                provisioning: Some(ConvoyProvisioningState::NotStarted),
+                message: Some("workflow validation failed".to_string()),
+                finished_at: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await
+            .expect("failed convoy status");
+        let state = ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(ProviderRegistry::new()),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        );
+
+        state.verify_backing_dead(&convoy).await.expect("provisioning never started, so no backing can be live");
     }
 
     #[tokio::test]
