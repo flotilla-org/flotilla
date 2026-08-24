@@ -816,7 +816,7 @@ async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &Term
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct AgentAdapterRegistry {
     adapters: BTreeMap<String, Arc<dyn AgentAdapter>>,
 }

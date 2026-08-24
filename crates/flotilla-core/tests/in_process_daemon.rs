@@ -265,6 +265,7 @@ impl CloudAgentService for SlowCloudAgent {
 
 struct SlowCloudAgentFactory {
     agent: Arc<SlowCloudAgent>,
+    probes: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -283,13 +284,16 @@ impl Factory for SlowCloudAgentFactory {
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        if let Some(probes) = &self.probes {
+            probes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
 }
 
 fn slow_cloud_agent_discovery(agent: Arc<SlowCloudAgent>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
-    runtime.factories.cloud_agents.push(Box::new(SlowCloudAgentFactory { agent }));
+    runtime.factories.cloud_agents.push(Box::new(SlowCloudAgentFactory { agent, probes: None }));
     runtime
 }
 
@@ -722,6 +726,28 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+#[tokio::test]
+async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repositories() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_a).expect("create first repo");
+    std::fs::create_dir_all(&repo_b).expect("create second repo");
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let mut discovery = fake_discovery(false);
+    discovery
+        .factories
+        .cloud_agents
+        .push(Box::new(SlowCloudAgentFactory { agent: Arc::new(SlowCloudAgent::new()), probes: Some(Arc::clone(&probes)) }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo_a, repo_b], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+
+    assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "host provider construction must not scale with repository count");
 }
 
 #[tokio::test]
