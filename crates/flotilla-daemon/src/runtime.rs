@@ -507,7 +507,6 @@ impl DaemonRuntime {
                     daemon.resource_backend(),
                     options.namespace.clone(),
                     manifests,
-                    profile.host_id.clone(),
                     MANIFEST_RECONCILE_INTERVAL,
                     options.controller_supervision.clone(),
                     runtime_health.clone(),
@@ -577,7 +576,6 @@ fn spawn_manifest_reconciler_task(
     backend: ResourceBackend,
     namespace: String,
     manifests: flotilla_core::config::ResourceManifestsConfig,
-    reconciler_root: String,
     interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
@@ -585,7 +583,7 @@ fn spawn_manifest_reconciler_task(
     tokio::spawn(async move {
         supervise_controller("manifest", supervision, runtime_health, move || {
             let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), manifests.dir.clone())
-                .with_declared_source(manifests.source.clone(), reconciler_root.clone());
+                .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
             async move { reconciler.run(interval).await }
         })
         .await;

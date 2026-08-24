@@ -582,7 +582,7 @@ fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>,
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{process::Command, time::Duration};
 
     use chrono::Utc;
     use flotilla_protocol::NodeId;
@@ -598,6 +598,23 @@ mod tests {
 
     fn write(path: &Path, content: &str) {
         std::fs::write(path, content).expect("write manifest");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").args(args).current_dir(dir).output().expect("run git fixture command");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).expect("git fixture output is UTF-8").trim().to_string()
+    }
+
+    fn committed_manifest_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("git tempdir");
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.name", "Manifest Test"]);
+        git(dir.path(), &["config", "user.email", "manifest-test@example.com"]);
+        write(&dir.path().join("policy.yaml"), &manifest("versioned", "current"));
+        git(dir.path(), &["add", "policy.yaml"]);
+        git(dir.path(), &["commit", "-m", "manifest"]);
+        dir
     }
 
     fn manifest(name: &str, pool: &str) -> String {
@@ -676,6 +693,32 @@ mod tests {
         assert_eq!(object.spec.pool, "current");
         assert_eq!(object.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str), Some("kiwi"));
         assert_eq!(object.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("current-revision"));
+    }
+
+    #[test]
+    fn clean_manifest_tree_resolves_head_revision() {
+        let dir = committed_manifest_repo();
+
+        assert_eq!(resolve_clean_git_revision(dir.path()).expect("clean revision"), git(dir.path(), &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
+        let dir = committed_manifest_repo();
+        write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("dirty tree must be rejected");
+
+        assert!(error.contains("changes not represented by a Git revision"), "{error}");
+    }
+
+    #[test]
+    fn manifest_tree_outside_git_is_rejected() {
+        let dir = tempfile::tempdir_in("/tmp").expect("non-git tempdir");
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("non-repository must be rejected");
+
+        assert!(error.contains("git status"), "{error}");
     }
 
     #[tokio::test]
