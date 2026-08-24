@@ -212,6 +212,10 @@ pub struct ResolvedCheckoutConfig {
 pub struct RepoFileConfig {
     #[allow(dead_code)] // Required field so TOML parsing accepts existing repo files
     pub path: String,
+    /// Repository transport remotes, canonical first. When present this
+    /// declaration is the authority for Repository identity.
+    #[serde(default)]
+    pub remotes: Vec<String>,
     #[serde(default)]
     pub vcs: RepoVcsConfig,
     #[serde(default)]
@@ -712,6 +716,9 @@ impl ConfigStore {
         let Some(repo_cfg) = self.load_repo_file_config(repo_root) else {
             return Ok(spec);
         };
+        if !repo_cfg.remotes.is_empty() {
+            spec = spec.with_remotes(repo_cfg.remotes)?;
+        }
         if let Some(upstream) = repo_cfg.upstream {
             spec = spec.with_upstream(upstream.url, upstream.relation)?;
         }

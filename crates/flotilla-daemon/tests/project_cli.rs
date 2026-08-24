@@ -2,31 +2,52 @@
 
 use std::{
     collections::BTreeMap,
+    io,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     ops_entry::{
-        ENSURED_FROM_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
-        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
+        MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
+        SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
+    path_context::ExecutionEnvironmentPath,
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector};
+use flotilla_protocol::{
+    commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
+};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, ConvoySpec, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
+    Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
     ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
     WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
+use tracing::instrument::WithSubscriber;
+
+#[derive(Clone)]
+struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log capture lock should be healthy").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
     std::fs::write(dir.join("daemon.toml"), "machine_id = \"test-project-cli\"\n").expect("write daemon config");
@@ -65,6 +86,27 @@ struct FixedInspector {
 #[derive(Clone)]
 struct MutableInspector {
     spec: Arc<RwLock<RepositorySpec>>,
+}
+
+#[derive(Clone)]
+struct PerPathInspector {
+    specs: BTreeMap<PathBuf, RepositorySpec>,
+}
+
+#[async_trait]
+impl RepositoryInspector for PerPathInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.specs.get(path).ok_or_else(|| format!("unexpected checkout path {}", path.display()))?.clone(),
+            checkout: LocalCheckoutInspection {
+                path: path.to_path_buf(),
+                host_ref: if path.ends_with("mirror-root") { "host-mirror" } else { "host-github" }.to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: None,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -169,6 +211,99 @@ async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir
     repository_key
 }
 
+#[tokio::test]
+async fn replicated_remote_declaration_resolves_and_keeps_mirror_residue_retired_across_refreshes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let kiwi_root = NodeId::new("kiwi-root");
+    let feta_root = NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let canonical = "https://github.com/flotilla-org/flotilla";
+    let mirror = "https://forgejo.lab/lab/flotilla";
+    let declared =
+        RepositorySpec::remote(mirror).expect("mirror repository").with_remotes([canonical, mirror]).expect("remote declaration");
+    let canonical_key = declared.key();
+    let mirror_spec = RepositorySpec::remote(mirror).expect("provisional mirror repository");
+    let mirror_key = mirror_spec.key();
+
+    kiwi.using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(canonical_key.to_string()).build(), &declared)
+        .await
+        .expect("author declaration on kiwi");
+    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
+    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
+        .replace(&kiwi_repositories, Utc::now())
+        .await
+        .expect("replicate declaration to feta");
+
+    feta.using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(mirror_key.to_string()).build(), &mirror_spec)
+        .await
+        .expect("seed provisional mirror repository");
+    feta.definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("flotilla-lab".to_string())
+                .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "whole-repository-project".to_string())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("flotilla".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(mirror_key).build()])
+                .build(),
+        )
+        .await
+        .expect("seed retired mirror Project residue");
+
+    let daemon =
+        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("feta"), feta.clone())
+            .await;
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: mirror_spec, host_ref: "feta".to_string() })).await;
+    let checkout_path = tmp.path().join("mirror-checkout");
+    std::fs::create_dir(&checkout_path).expect("mirror checkout dir");
+    daemon.add_repo(&checkout_path).await.expect("track mirror checkout on feta");
+
+    let repositories = feta.using::<Repository>("flotilla").list().await.expect("list feta repositories");
+    assert_eq!(repositories.items.len(), 2);
+    let projects = feta.definitions::<Project>("flotilla").list().await.expect("list feta Projects");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].metadata.name, "flotilla-lab");
+    assert_ne!(projects[0].spec.repositories[0].repo, canonical_key);
+}
+
+#[tokio::test]
+async fn independently_observed_same_repository_remains_resolvable_after_replication() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let kiwi_root = NodeId::new("kiwi-root");
+    let feta_root = NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(feta_root);
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    let repository_key = repository_spec.key();
+    let meta = InputMeta::builder().name(repository_key.to_string()).build();
+    kiwi.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on kiwi");
+    feta.using::<Repository>("flotilla").create(&meta, &repository_spec).await.expect("observe repository on feta");
+    let kiwi_repositories = kiwi.using::<Repository>("flotilla").list().await.expect("list kiwi repositories");
+    feta.replica_writer::<Repository>(kiwi_root, "flotilla")
+        .replace(&kiwi_repositories, Utc::now())
+        .await
+        .expect("replicate kiwi observation to feta");
+
+    let daemon =
+        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("feta"), feta.clone())
+            .await;
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "feta".to_string() })).await;
+    let checkout_path = tmp.path().join("canonical-checkout");
+    std::fs::create_dir(&checkout_path).expect("canonical checkout dir");
+    daemon.add_repo(&checkout_path).await.expect("refresh independently observed repository on feta");
+
+    let repositories = feta.using::<Repository>("flotilla").list().await.expect("list feta repositories");
+    assert_eq!(repositories.items.len(), 1);
+    assert_eq!(repositories.items[0].metadata.name, repository_key.to_string());
+}
+
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -190,17 +325,16 @@ async fn execute_project_add(
     display_name: Option<&str>,
 ) -> CommandValue {
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectAdd {
-                target,
-                name: name.map(str::to_string),
-                display_name: display_name.map(str::to_string),
-                remote: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectAdd {
+                    target,
+                    name: name.map(str::to_string),
+                    display_name: display_name.map(str::to_string),
+                    remote: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
     await_command_result(rx, id).await
@@ -211,7 +345,7 @@ async fn execute_project_command(
     rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
     action: CommandAction,
 ) -> CommandValue {
-    let id = daemon.execute(Command { node_id: None, provisioning_target: None, context_repo: None, action }).await.expect("execute");
+    let id = daemon.execute(Command::builder().action(action).build()).await.expect("execute");
     await_command_result(rx, id).await
 }
 
@@ -234,6 +368,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "flotilla".to_string(), members: 1 }
     );
     let flotilla = backend.using::<Project>("flotilla").get("flotilla").await.expect("flotilla project");
+    assert_eq!(flotilla.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(
         flotilla.spec.repositories[0].roles,
@@ -244,7 +379,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
 
     std::fs::write(
         tmp.path().join("project.yaml"),
-        "name: split\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: split\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("write declaration");
     assert_eq!(
@@ -253,6 +388,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "split".to_string(), members: 2 }
     );
     let split = backend.using::<Project>("flotilla").get("split").await.expect("split project");
+    assert_eq!(split.spec.default_workflow_ref, "single-agent-trusted");
     assert_eq!(split.spec.repositories.iter().map(|member| member.alias.as_deref()).collect::<Vec<_>>(), vec![
         Some("app"),
         Some("operations")
@@ -265,7 +401,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
 }
 
 #[tokio::test]
-async fn declaration_adoption_survives_repository_tracking() {
+async fn declaration_adoption_survives_whole_repository_project_reconciliation() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let checkout = tmp.path().join("flotilla");
     std::fs::create_dir(&checkout).expect("checkout dir");
@@ -342,22 +478,35 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     *commit.write().expect("commit lock should not be poisoned") = "commit-two".to_string();
     std::fs::write(
         &declaration_path,
-        "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: demo\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("update declaration");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: true, changes: vec!["Project/demo".to_string()] }
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 2,
+            converged: true,
+            changes: vec!["Project/demo".to_string()],
+            operational_entries: vec!["operational entries refused: an ops member has no local checkout on this host".to_string()],
+        }
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
     assert_eq!(refreshed.spec.display_name, "demo");
+    assert_eq!(refreshed.spec.default_workflow_ref, "single-agent-trusted");
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");
     assert_eq!(app.repo, app_key, "alias should preserve the rename-stable RepositoryKey");
     assert!(app.roles.contains(&ProjectRepositoryRole::Knowledge));
     assert_eq!(refreshed.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("commit-two"));
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
-        CommandValue::ProjectRefreshed { name: "demo".to_string(), members: 2, converged: false, changes: Vec::new() }
+        CommandValue::ProjectRefreshed {
+            name: "demo".to_string(),
+            members: 2,
+            converged: false,
+            changes: Vec::new(),
+            operational_entries: vec!["operational entries refused: an ops member has no local checkout on this host".to_string()],
+        }
     );
 }
 
@@ -392,7 +541,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let ensure_path = tmp.path().join("quartermaster.entry");
     std::fs::write(
         &ensure_path,
-        "---\nkind: ensure\nname: quartermaster\nrepos: [app]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
     )
     .expect("write standing convoy ensure");
 
@@ -405,6 +554,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let project = backend.using::<Project>("flotilla").get("demo").await.expect("project");
     let app = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app");
     let docs = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("docs")).expect("docs");
+    let operations = project.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("operations")).expect("operations");
     let workflows = backend.using::<WorkflowTemplate>("flotilla");
     let scoped = workflows.get("scoped").await.expect("scoped workflow");
     assert_eq!(scoped.spec.vessels[0].repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
@@ -421,13 +571,36 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     assert_eq!(app_repository.spec.verification_commands().get("test").map(String::as_str), Some("cargo test --workspace"));
     assert!(docs_repository.spec.verification_commands().is_empty());
     let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
-    let ensure = ensures.get("quartermaster").await.expect("materialized standing convoy ensure");
+    let ensure = ensures.list().await.expect("list ensures").into_iter().next().expect("materialized standing convoy ensure");
+    let ensure_name = ensure.metadata.name.clone();
     assert_eq!(ensure.spec.project_ref, "demo");
+    assert_eq!(ensure.spec.role, "quartermaster");
     assert_eq!(ensure.spec.workflow_ref, "all-code");
-    assert_eq!(ensure.spec.repositories, vec![app.repo.clone()]);
+    assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
     assert_eq!(ensure.spec.stance, Some(Stance::Trusted));
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
+
+    let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
+    for source in repositories.list().await.expect("list repositories").items {
+        repositories
+            .update_status(&source.metadata.name, &source.metadata.resource_version, &flotilla_resources::RepositoryStatus {
+                default_branch: Some("main".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("resolve repository default branch");
+    }
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("start ensured standing convoy");
+    let ensured_convoy_ref = ensures
+        .get(&ensure_name)
+        .await
+        .expect("reconciled ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("ensured convoy ref");
+    let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
+    convoys.get(&ensured_convoy_ref).await.expect("ensured standing convoy record");
 
     workflows
         .update(
@@ -444,21 +617,16 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             members: 3,
             converged: true,
             changes: vec!["WorkflowTemplate/scoped".to_string()],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                format!("quartermaster.entry: ConvoyEnsure/{ensure_name} accepted"),
+                "test-command.entry: verification command `test` accepted".to_string(),
+                "verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            ],
         }
     );
     assert_eq!(workflows.get("scoped").await.expect("converged workflow").spec, scoped.spec);
 
-    backend
-        .using::<Convoy>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("quartermaster".to_string())
-                .annotations(BTreeMap::from([(ENSURED_FROM_ANNOTATION.to_string(), "quartermaster".to_string())]))
-                .build(),
-            &ConvoySpec::builder().workflow_ref("all-code".to_string()).build(),
-        )
-        .await
-        .expect("simulated ensured convoy");
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
@@ -466,14 +634,19 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["deleted ConvoyEnsure/quartermaster".to_string()],
+            changes: vec![format!("deleted ConvoyEnsure/{ensure_name}"),],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "test-command.entry: verification command `test` accepted".to_string(),
+                "verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
+            ],
         }
     );
-    assert!(matches!(ensures.get("quartermaster").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
-    assert!(matches!(
-        backend.using::<Convoy>("flotilla").get("quartermaster").await,
-        Err(flotilla_resources::ResourceError::NotFound { .. })
-    ));
+    assert!(matches!(ensures.get(&ensure_name).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    assert!(
+        matches!(convoys.get(&ensured_convoy_ref).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "removing the ops entry must tear down its live standing convoy"
+    );
 
     std::fs::remove_file(misleading_directory.join("this-is-a-workflow.md")).expect("remove workflow entry");
     assert_eq!(
@@ -483,6 +656,10 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             members: 3,
             converged: true,
             changes: vec!["deleted WorkflowTemplate/scoped".to_string()],
+            operational_entries: vec![
+                "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
+                "test-command.entry: verification command `test` accepted".to_string(),
+            ],
         }
     );
     assert!(matches!(workflows.get("scoped").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
@@ -502,6 +679,114 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let released = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("released repository");
     assert!(released.spec.verification_commands().is_empty());
     assert!(!released.metadata.annotations.contains_key(VERIFICATION_PROJECT_ANNOTATION));
+}
+
+#[tokio::test]
+async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: ops_spec.clone(),
+            commit: Arc::new(RwLock::new("replica-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: replicated\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("replicated.entry"),
+        "---\nkind: workflow_template\nname: replica-authored\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write operational entry");
+
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("project-home"));
+    let mut annotations = BTreeMap::new();
+    annotations.insert(BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), ops_spec.key().to_string());
+    annotations.insert(BOOTSTRAP_COMMIT_ANNOTATION.to_string(), "replica-commit".to_string());
+    annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), tmp.path().to_string_lossy().into_owned());
+    let app = RepositorySpec::remote("https://github.com/example/app").expect("app spec");
+    authority
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder().name("replicated".to_string()).annotations(annotations).build(),
+            &ProjectSpec::builder()
+                .display_name("replicated".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![
+                    flotilla_resources::ProjectRepositorySpec {
+                        repo: app.key(),
+                        alias: Some("app".to_string()),
+                        roles: [ProjectRepositoryRole::Code].into_iter().collect(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                    flotilla_resources::ProjectRepositorySpec {
+                        repo: ops_spec.key(),
+                        alias: Some("operations".to_string()),
+                        roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
+                        subpath: None,
+                        default_branch: None,
+                    },
+                ])
+                .build(),
+        )
+        .await
+        .expect("author Project at its home");
+    let snapshot = authority.using::<Project>("flotilla").list().await.expect("list home Project");
+    backend
+        .replica_writer::<Project>(NodeId::new("project-home"), "flotilla")
+        .replace(&snapshot, Utc::now())
+        .await
+        .expect("replicate Project");
+
+    let log_output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCaptureWriter(Arc::clone(&log_output));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "replicated".to_string() })
+        .with_subscriber(subscriber)
+        .await;
+
+    assert_eq!(result, CommandValue::ProjectRefreshed {
+        name: "replicated".to_string(),
+        members: 2,
+        converged: false,
+        changes: Vec::new(),
+        operational_entries: Vec::new(),
+    });
+    assert!(
+        matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "refreshing a replica must not establish local Project authorship"
+    );
+    assert!(matches!(
+        backend.using::<WorkflowTemplate>("flotilla").get("replica-authored").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
+    assert!(backend.using::<ConvoyEnsure>("flotilla").list().await.expect("list ensures").items.is_empty());
+    let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
+    assert!(logs.contains("skipping project materialization away from its home"), "captured logs: {logs:?}");
+    assert!(logs.contains("replicated"), "skip log should identify the Project: {logs:?}");
+
+    let register =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() })
+            .await;
+    assert!(
+        matches!(&register, CommandValue::Error { message } if message.contains("homed by another root") && message.contains("at its home")),
+        "replica-only registration should identify the Project's remote home: {register:?}"
+    );
+    assert!(
+        matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+        "registration at a replica root must not establish local Project authorship"
+    );
 }
 
 #[tokio::test]
@@ -543,7 +828,7 @@ async fn ops_entry_rejects_a_hand_applied_workflow_name_collision() {
 
 #[tokio::test]
 async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() {
-    let (daemon, _backend, _config, _runtime, tmp) = start_daemon().await;
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
@@ -573,6 +858,10 @@ async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() 
                 && message.contains("without the code role")),
         "unexpected command result: {result:?}"
     );
+    let project = backend.definitions::<Project>("flotilla").get("demo").await.expect("project remains inspectable after refusal");
+    let condition = project.status.expect("project status").operational_entries.expect("operational entry condition");
+    assert!(!condition.ready);
+    assert!(condition.message.contains("invalid-command.entry"));
 }
 
 #[tokio::test]
@@ -592,7 +881,7 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
     .expect("write declaration");
     std::fs::write(
         tmp.path().join("invalid-ensure.entry"),
-        "---\nkind: ensure\nname: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
+        "---\nkind: ensure\nrole: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
     )
     .expect("write ensure entry");
 
@@ -614,12 +903,11 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
 async fn tracking_repo_does_not_materialize_whole_repo_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     track_repository(&daemon, &tmp, "tracked", "https://github.com/org/tracked.git").await;
-
     assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
 }
 
 #[tokio::test]
-async fn tracked_repo_does_not_reconcile_existing_project() {
+async fn tracked_repo_labels_materialized_project_without_overwriting_user_fields() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
@@ -638,38 +926,139 @@ async fn tracked_repo_does_not_reconcile_existing_project() {
     daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
 
     let projects = backend.definitions::<Project>("flotilla");
+    let user_spec = ProjectSpec::builder()
+        .display_name("My Tracked Repository".to_string())
+        .default_workflow_ref("single-agent-contained".to_string())
+        .maybe_issue_source(Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }))
+        .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+            repo: repository_key,
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: Some("release".to_string()),
+        }])
+        .build();
     projects
-        .create(
+        .apply(
             &InputMeta::builder()
                 .name("tracked".to_string())
                 .labels(BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())]))
                 .build(),
-            &ProjectSpec::builder()
-                .display_name("My Tracked Repository".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
-                .maybe_issue_source(Some(IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }))
-                .repositories(vec![flotilla_resources::ProjectRepositorySpec {
-                    repo: repository_key,
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: Some("release".to_string()),
-                }])
-                .build(),
+            &user_spec,
         )
         .await
         .expect("stale whole-repository Project should be created");
 
-    let before = projects.get("tracked").await.expect("tracked Project should exist");
+    let reconciled = projects.get("tracked").await.expect("tracked Project should remain");
     daemon.add_repo(&checkout_path).await.expect("track repository");
-    let after = projects.get("tracked").await.expect("tracked Project should remain");
-    assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
-    assert_eq!(after.metadata.labels, before.metadata.labels);
-    assert_eq!(after.spec, before.spec);
+    let unchanged = projects.get("tracked").await.expect("tracked Project should remain");
+    assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
+    assert_eq!(unchanged.spec, user_spec);
 }
 
 #[tokio::test]
-async fn tracked_repo_does_not_claim_matching_unlabelled_project() {
+async fn mirror_and_canonical_roots_materialize_one_repository_and_project() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mirror_root = tmp.path().join("mirror-root");
+    let github_root = tmp.path().join("github-root");
+    std::fs::create_dir_all(&mirror_root).expect("mirror checkout");
+    std::fs::create_dir_all(&github_root).expect("GitHub checkout");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let config_dir = tmp.path().join("config");
+    let config = test_config(config_dir.clone());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+
+    let canonical_url = "https://github.com/flotilla-org/flotilla";
+    let mirror_url = "https://forgejo.lab/lab/flotilla";
+    let canonical = RepositorySpec::remote(mirror_url)
+        .expect("mirror observation")
+        .with_remotes([canonical_url, mirror_url])
+        .expect("canonical declaration");
+    let mirror = RepositorySpec::remote(mirror_url).expect("old mirror repository");
+    let fork = RepositorySpec::remote("https://forgejo.lab/forks/zellij")
+        .expect("fork repository")
+        .with_upstream("https://github.com/zellij-org/zellij", flotilla_resources::RepositoryRelation::Fork)
+        .expect("fork provenance");
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    for spec in [&canonical, &mirror, &fork] {
+        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("seed repository");
+    }
+    backend
+        .clone()
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("flotilla-lab".to_string())
+                .labels(BTreeMap::from([(MANAGED_BY_LABEL.to_string(), "whole-repository-project".to_string())]))
+                .build(),
+            &ProjectSpec::builder()
+                .display_name("flotilla-lab".to_string())
+                .default_workflow_ref("single-agent-trusted".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(mirror.key()).build()])
+                .build(),
+        )
+        .await
+        .expect("old mirror project");
+    daemon
+        .set_repository_inspector(Arc::new(PerPathInspector {
+            specs: BTreeMap::from([
+                (mirror_root, RepositorySpec::remote(mirror_url).expect("mirror clone")),
+                (github_root, RepositorySpec::remote(canonical_url).expect("GitHub clone")),
+            ]),
+        }))
+        .await;
+
+    let resolved_mirror = daemon.inspect_repository_path(tmp.path().join("mirror-root").as_path(), None).await.expect("resolve mirror");
+    assert_eq!(resolved_mirror.spec, canonical);
+    let mut events = daemon.subscribe();
+    for path in [tmp.path().join("mirror-root"), tmp.path().join("github-root")] {
+        let command_id =
+            daemon.execute(Command::builder().action(CommandAction::TrackRepoPath { path }).build()).await.expect("track root");
+        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::RepoTracked { .. }));
+    }
+
+    let projects = backend.clone().definitions::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(
+        projects.len(),
+        1,
+        "remaining projects: {:?}",
+        projects.iter().map(|project| (&project.metadata.name, &project.spec.repositories)).collect::<Vec<_>>()
+    );
+    assert_eq!(projects[0].spec.repositories[0].repo, mirror.key());
+    assert_eq!(projects[0].metadata.name, "flotilla-lab");
+    let repository_items = repositories.list().await.expect("repository list");
+    assert_eq!(repository_items.items.len(), 3, "existing repository records remain durable");
+    assert!(repositories.get(&mirror.key().to_string()).await.is_ok(), "provisional mirror repository remains referenced");
+    assert!(repositories.get(&fork.key().to_string()).await.expect("fork remains").spec.is_fork());
+    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("mirror-root")).await, Some(canonical.key()));
+    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("github-root")).await, Some(canonical.key()));
+
+    let mirror_path = tmp.path().join("mirror-root");
+    config.save_repo(&ExecutionEnvironmentPath::new(mirror_path.clone()));
+    let repo_config_path = std::fs::read_dir(config_dir.join("repos"))
+        .expect("repo config directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .is_ok_and(|contents| contents.lines().any(|line| line == format!("path = \"{}\"", mirror_path.display())))
+        })
+        .expect("mirror repo config");
+    std::fs::write(repo_config_path, format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\"]\n", mirror_path.display()))
+        .expect("conflicting mirror declaration");
+    let error = daemon.inspect_repository_path(&mirror_path, None).await.expect_err("canonical order must not flap across roots");
+    assert!(error.contains("changes the canonical remote of an existing declaration"));
+}
+
+#[tokio::test]
+async fn tracked_repo_labels_matching_unlabelled_project_once() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("tracked");
@@ -693,7 +1082,7 @@ async fn tracked_repo_does_not_claim_matching_unlabelled_project() {
             &InputMeta::builder().name("tracked".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("tracked".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
                     repo: repository_key,
                     alias: None,
@@ -710,8 +1099,7 @@ async fn tracked_repo_does_not_claim_matching_unlabelled_project() {
     daemon.add_repo(&checkout_path).await.expect("track repository");
     let unchanged = projects.get("tracked").await.expect("Project should remain");
     assert_eq!(unchanged.metadata.resource_version, unlabelled.metadata.resource_version);
-    assert_eq!(unchanged.metadata.labels, unlabelled.metadata.labels);
-    assert_eq!(unchanged.spec, unlabelled.spec);
+    assert!(!unchanged.metadata.labels.contains_key(MANAGED_BY_LABEL));
 }
 
 #[tokio::test]
@@ -726,12 +1114,7 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
 
     let first_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, first_id).await, CommandValue::RepoTracked { .. }));
@@ -751,7 +1134,7 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
             &InputMeta::builder().name("github-com-flotilla-org-andamento".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("andamento".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -759,12 +1142,7 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         .expect("stale disambiguated project twin");
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("repo add after remote appears");
     assert_eq!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked {
@@ -796,24 +1174,25 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         .await
         .expect("repository status update");
     let convoy_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "identity-migrated".into(),
-                workflow_ref: "scratch".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("github-com-flotilla-org-andamento".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "identity-migrated".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("github-com-flotilla-org-andamento".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("convoy create");
-    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated".into() });
+    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated {
+        name: "identity-migrated@github-com-flotilla-org-andamento".into()
+    });
 }
 
 #[tokio::test]
@@ -842,12 +1221,7 @@ async fn tracking_after_custom_project_identity_change_does_not_modify_the_expli
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let track_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("track repo after remote appears");
     assert!(matches!(await_command_result(&mut rx, track_id).await, CommandValue::RepoTracked { .. }));
@@ -869,12 +1243,7 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
     let inspected_spec = Arc::new(RwLock::new(local_spec));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -894,7 +1263,7 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
             &InputMeta::builder().name("a-remote-name".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("a-remote-name".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -903,12 +1272,7 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
 
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("repo add after remote appears");
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
@@ -931,12 +1295,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
     ));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -945,12 +1304,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let refresh_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(checkout_path.clone())) },
-        })
+        .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(checkout_path.clone())) }).build())
         .await
         .expect("refresh command");
 
@@ -976,12 +1330,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
     let inspected_spec = Arc::new(RwLock::new(local_spec));
     daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
     let add_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("initial repo add");
     assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
@@ -1005,12 +1354,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
     let remote_key = remote_spec.key();
     *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
     let second_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::TrackRepoPath { path: checkout_path },
-        })
+        .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path }).build())
         .await
         .expect("repo add after remote appears");
     assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
@@ -1020,7 +1364,7 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
 }
 
 #[tokio::test]
-async fn tracking_repo_fails_when_repository_inspection_fails() {
+async fn tracking_repo_fails_when_its_project_cannot_be_materialized() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
     let checkout_path = tmp.path().join("uninspectable");
@@ -1066,6 +1410,7 @@ async fn daemon_start_and_restart_do_not_backfill_projects() {
     drop(runtime);
 
     let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
+
     assert!(projects.list().await.expect("project list").items.is_empty());
 }
 
@@ -1103,17 +1448,14 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let second_key = RepositoryKey("second-repository".to_string());
     let mut rx = daemon.subscribe();
     let apply_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply {
+        .execute(Command::builder()
+    .action(CommandAction::ProjectApply {
                 name: "presentation".into(),
                 spec_yaml: format!(
                     "display_name: Presentation\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {local_key}\n  - repo: {second_key}\n"
                 ),
-            },
-        })
+            })
+    .build())
         .await
         .expect("apply execute");
     assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "presentation".into() });
@@ -1203,7 +1545,6 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
             .expect("occupied project create");
     }
     track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
-
     assert_eq!(projects.list().await.expect("project list").items.len(), 2);
 }
 
@@ -1229,7 +1570,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(checkouts.items.len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
         alias: None,
@@ -1395,16 +1736,15 @@ async fn concurrent_project_adds_of_one_identity_converge_on_one_verified_reposi
     std::fs::create_dir(&second).expect("second checkout");
     let mut first_rx = daemon.subscribe();
     let mut second_rx = daemon.subscribe();
-    let command = |target: &Path, name: &str| Command {
-        node_id: None,
-        provisioning_target: None,
-        context_repo: None,
-        action: CommandAction::ProjectAdd {
-            target: target.to_string_lossy().into_owned(),
-            name: Some(name.to_string()),
-            display_name: None,
-            remote: None,
-        },
+    let command = |target: &Path, name: &str| {
+        Command::builder()
+            .action(CommandAction::ProjectAdd {
+                target: target.to_string_lossy().into_owned(),
+                name: Some(name.to_string()),
+                display_name: None,
+                remote: None,
+            })
+            .build()
     };
 
     let (first_id, second_id) = tokio::join!(daemon.execute(command(&first, "first")), daemon.execute(command(&second, "second")));
@@ -1419,7 +1759,7 @@ async fn concurrent_project_adds_of_one_identity_converge_on_one_verified_reposi
 }
 
 #[tokio::test]
-async fn repeated_project_add_reconciles_owned_fields_and_preserves_custom_fields() {
+async fn repeated_project_add_preserves_user_edits_to_materialized_project() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
     let key = spec.key();
@@ -1448,9 +1788,7 @@ async fn repeated_project_add_reconciles_owned_fields_and_preserves_custom_field
         name: "core".into()
     });
     let reconciled = projects.get("core").await.expect("project");
-    assert_eq!(reconciled.spec.display_name, "Evolved");
-    assert_eq!(reconciled.spec.issue_source, evolved.issue_source);
-    assert_eq!(reconciled.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(reconciled.spec, evolved);
     assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
     assert!(matches!(
         execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), Some("Contradiction")).await,
@@ -1472,12 +1810,7 @@ repositories:
 "#;
 
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "cross".into(), spec_yaml: yaml.into() },
-        })
+        .execute(Command::builder().action(CommandAction::ProjectApply { name: "cross".into(), spec_yaml: yaml.into() }).build())
         .await
         .expect("execute");
 
@@ -1527,12 +1860,7 @@ repositories:
 "#;
 
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "labelled".into(), spec_yaml: yaml.into() },
-        })
+        .execute(Command::builder().action(CommandAction::ProjectApply { name: "labelled".into(), spec_yaml: yaml.into() }).build())
         .await
         .expect("execute");
 
@@ -1570,25 +1898,32 @@ async fn convoy_create_carries_project_ref() {
         CommandValue::ProjectAdded { name: "my-project".into() }
     );
     let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "linked".into(),
-                workflow_ref: "scratch".into(),
-                inputs: vec![],
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("my-project".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "linked".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("my-project".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("execute");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked".into() });
-    let convoy = backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy");
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked@my-project".into() });
+    let convoy = backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "linked".to_string())]))
+        .await
+        .expect("list convoys")
+        .items
+        .into_iter()
+        .next()
+        .expect("convoy");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
     assert_eq!(convoy.spec.repositories.len(), 1);
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
@@ -1600,36 +1935,35 @@ async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
     let apply_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply {
-                name: "waiting".into(),
-                spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n".into(),
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectApply {
+                    name: "waiting".into(),
+                    spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n"
+                        .into(),
+                })
+                .build(),
+        )
         .await
         .expect("apply execute");
     assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "waiting".into() });
     assert!(backend.using::<Project>("flotilla").get("waiting").await.is_ok(), "definition should persist before its referent");
 
     let convoy_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "blocked".into(),
-                workflow_ref: "scratch".into(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: Some("waiting".into()),
-                placement_policy: None,
-                adopted_checkout: None,
-            },
-        })
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyCreate {
+                    name: "blocked".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: Some("waiting".into()),
+                    placement_policy: None,
+                    adopted_checkout: None,
+                })
+                .build(),
+        )
         .await
         .expect("convoy execute");
     assert!(matches!(
@@ -1648,12 +1982,7 @@ async fn project_apply_rejects_invalid_or_incomplete_definitions() {
         "display_name: Empty repos\ndefault_workflow_ref: wf\nrepositories: []\n",
     ] {
         let id = daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ProjectApply { name: "broken".into(), spec_yaml: spec_yaml.into() },
-            })
+            .execute(Command::builder().action(CommandAction::ProjectApply { name: "broken".into(), spec_yaml: spec_yaml.into() }).build())
             .await
             .expect("execute");
         assert!(matches!(await_command_result(&mut rx, id).await, CommandValue::Error { .. }));

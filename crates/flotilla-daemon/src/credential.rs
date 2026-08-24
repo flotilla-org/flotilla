@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+use crate::vessel_config::{
+    agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
+};
 
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
@@ -141,6 +143,7 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -152,7 +155,17 @@ struct GithubAppDelivery {
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     expires_at: DateTime<Utc>,
+    refresh_failures: usize,
 }
+
+#[derive(Debug)]
+pub(crate) struct CredentialRefreshError {
+    pub(crate) environment_ref: String,
+    pub(crate) message: String,
+    pub(crate) should_surface: bool,
+}
+
+const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug)]
 struct ResolvedMaterial {
@@ -217,7 +230,7 @@ impl GitCredentialPreflight {
                             &git_config_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                         material.as_bytes(),
                     )
                     .await
@@ -235,7 +248,7 @@ impl GitCredentialPreflight {
                         &git_config_path,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -253,7 +266,7 @@ impl GitCredentialPreflight {
                         host,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -319,6 +332,7 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_adoption_failures: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -521,6 +535,7 @@ impl CredentialStore {
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
                         expires_at,
+                        refresh_failures: 0,
                     },
                 );
             }
@@ -545,10 +560,11 @@ impl CredentialStore {
             let mut fragments_by_environment = self.git_config_fragments.lock().await;
             let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
             composed_fragments.extend(new_git_config_fragments);
-            let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
-                Ok(gitconfig) => gitconfig,
-                Err(error) => return Err(format!("compose shared Git config: {error}")),
-            };
+            let gitconfig =
+                match compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(composed_fragments.values().cloned())) {
+                    Ok(gitconfig) => gitconfig,
+                    Err(error) => return Err(format!("compose shared Git config: {error}")),
+                };
             let delivery_paths = delivery_paths.as_ref().expect("Git credential adapters resolve delivery paths");
             if let Err(error) = runner.write_file(&delivery_paths.git_config, &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
@@ -571,6 +587,56 @@ impl CredentialStore {
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
+    }
+
+    /// Rebuild refresh registrations for an already-running environment from
+    /// its durable credential requirements. Reconciliation calls this on every
+    /// pass, so a live registration makes the operation a no-op.
+    pub(crate) async fn adopt_github_app_deliveries(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), CredentialRefreshError> {
+        let mut github_app_refs = BTreeSet::new();
+        for name in credential_refs {
+            let spec = match self.spec(name).await {
+                Ok(spec) => spec,
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+            };
+            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                github_app_refs.insert(name.clone());
+            }
+        }
+        let deliveries = self.github_app_deliveries.lock().await;
+        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
+        drop(deliveries);
+        if github_app_refs.is_empty() || already_adopted {
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
+            return Ok(());
+        }
+        let github_app_scopes = credential_scopes
+            .iter()
+            .filter(|(name, _)| github_app_refs.contains(*name))
+            .map(|(name, scopes)| (name.clone(), scopes.clone()))
+            .collect();
+        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
+            return Err(self.record_adoption_failure(environment_ref, message).await);
+        }
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
+        Ok(())
+    }
+
+    async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
+        let mut failures = self.github_app_adoption_failures.lock().await;
+        let failures = failures.entry(environment_ref.to_string()).or_default();
+        *failures += 1;
+        CredentialRefreshError {
+            environment_ref: environment_ref.to_string(),
+            message,
+            should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+        }
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -621,13 +687,13 @@ impl CredentialStore {
                     "docker",
                     &["--config", &config, "login", "--username", username, "--password-stdin", registry],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                     material.as_bytes(),
                 )
                 .await
                 .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
             self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Noop)
+                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
         }
@@ -649,6 +715,7 @@ impl CredentialStore {
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
         self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -659,7 +726,7 @@ impl CredentialStore {
     /// Re-mint and atomically replace GitHub App files that are approaching
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
-    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<String> {
+    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
         let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
         let due = self
             .github_app_deliveries
@@ -674,12 +741,18 @@ impl CredentialStore {
             let token = match self.github_app_minter.mint(&delivery.request).await {
                 Ok(token) => token,
                 Err(error) => {
-                    errors.push(format!("credential `{}` adapter `github-app`: {error}", key.1));
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        should_surface,
+                    });
                     continue;
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                errors.push(error);
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -687,12 +760,28 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                errors.push(bounded_adapter_error(&key.1, "github-app", &error));
+                current.refresh_failures += 1;
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    message: bounded_adapter_error(&key.1, "github-app", &error),
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() >= current.expires_at,
+                });
                 continue;
             }
             current.expires_at = token.expires_at;
+            current.refresh_failures = 0;
         }
         errors
+    }
+
+    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+            return false;
+        };
+        current.refresh_failures += 1;
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -733,7 +822,7 @@ impl CredentialStore {
             CredentialSource::IssueCommand { command, args } => {
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                 self.host_runner
-                    .run(command, &args, Path::new("/"), &ChannelLabel::Noop)
+                    .run(command, &args, Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|_| "issue command failed".to_string())?
             }
@@ -787,8 +876,7 @@ impl CredentialStore {
         }
         let repositories = self
             .backend
-            .clone()
-            .using::<Repository>(&self.namespace)
+            .including_replicas::<Repository>(&self.namespace)
             .list()
             .await
             .map_err(|error| format!("list repository identities: {error}"))?;
@@ -797,9 +885,9 @@ impl CredentialStore {
             let repository = repositories
                 .items
                 .iter()
-                .find(|repository| repository.spec.key() == *key)
+                .find(|repository| repository.object.spec.key() == *key)
                 .ok_or_else(|| format!("repository scope references missing repository `{key}`"))?;
-            let forge = repository.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
+            let forge = repository.object.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
             let service = Url::parse(&forge.service_url).map_err(|error| format!("repository `{key}` has invalid forge URL: {error}"))?;
             if service.host_str() != Some("github.com") {
                 return Err(format!("repository `{key}` is not hosted on github.com"));
@@ -862,7 +950,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api user --silent"],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -881,7 +969,7 @@ impl CredentialStore {
                 write_github_app_token_file(&*runner, &token_file, material).await?;
                 let token_file = token_file.to_string_lossy().into_owned();
                 let gh_path = runner
-                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("locate gh binary: {error}"))?;
                 let gh_path = gh_path.trim();
@@ -889,7 +977,7 @@ impl CredentialStore {
                     return Err("locate gh binary: command returned an empty path".to_string());
                 }
                 let path = runner
-                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("read executable search path: {error}"))?;
                 let gh_wrapper = credential_dir.join("gh");
@@ -913,7 +1001,7 @@ impl CredentialStore {
                             &gh_wrapper_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
@@ -947,7 +1035,7 @@ impl CredentialStore {
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
                     let helper = format!(
@@ -959,7 +1047,7 @@ impl CredentialStore {
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                     runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
@@ -969,7 +1057,7 @@ impl CredentialStore {
                         sanitize_curl_config(&url)
                     );
                     runner
-                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, curl_config.as_bytes())
+                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, curl_config.as_bytes())
                         .await
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
@@ -1020,7 +1108,7 @@ impl CredentialStore {
                 if !already_prepared {
                     let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
                     runner
-                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable config directory: {error}"))?;
                     // Preflight: a trivial `claude -p` request under the token.
@@ -1048,7 +1136,7 @@ impl CredentialStore {
                                 &config_dir,
                             ],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1068,7 +1156,7 @@ impl CredentialStore {
                     // persistent-base fallback would otherwise accumulate
                     // whatever `claude -p` writes for the daemon's lifetime,
                     // and removal guarantees the next probe starts empty.
-                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Noop).await {
+                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Default).await {
                         tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
                     }
                     probe?;
@@ -1084,7 +1172,7 @@ impl CredentialStore {
                 let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner
-                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable login cache: {error}"))?;
                     runner
@@ -1092,7 +1180,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login --with-api-key", "flotilla-codex-login", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1102,7 +1190,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login status", "flotilla-codex-status", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await
                         .map_err(|error| format!("login preflight failed: {error}"))?;
@@ -1142,7 +1230,7 @@ async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, to
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect token file: {error}"))
@@ -1152,7 +1240,7 @@ async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &st
     runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect {context}: {error}"))
@@ -1175,7 +1263,7 @@ async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&s
     }
     config.push_str(&format!("url = \"{}\"\n", sanitize_curl_config(url)));
     runner
-        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, config.as_bytes())
+        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, config.as_bytes())
         .await
         .map(|_| ())
         .map_err(|error| format!("authentication preflight failed: {error}"))
@@ -1191,9 +1279,13 @@ async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
 
 /// The claude CLI writes millisecond epochs; treat implausibly-large
 /// second values as milliseconds so either unit decodes to the same instant.
+/// Non-positive values are sentinels for absent metadata, not dates.
 fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
     const MILLISECOND_THRESHOLD: i64 = 100_000_000_000;
-    if value.abs() >= MILLISECOND_THRESHOLD {
+    if value <= 0 {
+        return None;
+    }
+    if value >= MILLISECOND_THRESHOLD {
         DateTime::from_timestamp_millis(value)
     } else {
         DateTime::from_timestamp(value, 0)
@@ -1273,7 +1365,7 @@ mod tests {
     }
 
     struct FakeGithubAppTokenMinter {
-        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        tokens: StdMutex<VecDeque<Result<GithubAppToken, String>>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
     }
 
@@ -1304,7 +1396,7 @@ mod tests {
     impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
         async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
             self.requests.lock().expect("GitHub App requests lock").push(request.clone());
-            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
+            self.tokens.lock().expect("GitHub App tokens lock").pop_front().unwrap_or_else(|| Err("no fake token available".to_string()))
         }
     }
 
@@ -1451,6 +1543,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambient_claude_expiry_probe_treats_non_positive_timestamps_as_absent() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        tokio::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":0,"refreshTokenExpiresAt":-1}}"#)
+            .await
+            .expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_preserves_live_metadata_alongside_a_sentinel() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        let refresh_expires_at_ms: i64 = 1_756_000_000_000;
+        let credentials = format!(r#"{{"claudeAiOauth":{{"expiresAt":0,"refreshTokenExpiresAt":{refresh_expires_at_ms}}}}}"#);
+        tokio::fs::write(claude_dir.join(".credentials.json"), credentials).await.expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, None);
+        assert_eq!(ambient.refresh_expires_at, DateTime::from_timestamp_millis(refresh_expires_at_ms));
+    }
+
+    #[tokio::test]
     async fn github_app_mints_a_repository_scoped_token_on_every_prepare_through_replayed_http() {
         let state = tempfile::tempdir().expect("create state directory");
         let app_id_path = state.path().join("github-app.id");
@@ -1544,25 +1666,40 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_delivery_rotates_the_file_before_expiry_without_restarting_the_environment() {
+    async fn github_app_delivery_uses_replicated_scope_rebuilds_after_store_restart_and_rotates() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
-                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
+                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("temporary adoption outage one".to_string()),
+                Err("temporary adoption outage two".to_string()),
+                Err("persistent adoption outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Err("temporary outage one".to_string()),
+                Err("temporary outage two".to_string()),
+                Err("persistent outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_root = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
-        backend
+        repository_root
             .clone()
             .using::<Repository>("flotilla")
             .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
             .await
             .expect("create repository");
+        let repositories = repository_root.using::<Repository>("flotilla").list().await.expect("list repository source");
+        backend
+            .replica_writer::<Repository>(NodeId::new("repository-root"), "flotilla")
+            .replace(&repositories, Utc::now())
+            .await
+            .expect("replicate repository to minting root");
+        assert!(backend.using::<Repository>("flotilla").list().await.expect("list local repositories").items.is_empty());
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
@@ -1579,7 +1716,7 @@ interactions:
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            backend,
+            backend.clone(),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -1603,31 +1740,75 @@ interactions:
         assert_eq!(environment.get("PATH"), Some(&"/state/credentials/github-app:/usr/bin:/bin".to_string()));
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 1);
 
-        clock.advance(Duration::minutes(54));
-        assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "fresh material must not be re-minted");
+        drop(store);
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            assert_eq!(error.should_surface, expected_surface);
+        }
+        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
-        clock.advance(Duration::minutes(1));
+        clock.advance(Duration::minutes(115));
+        let first_failure = store.refresh_due_github_app_tokens().await;
+        assert_eq!(first_failure.len(), 1);
+        assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
+        let second_failure = store.refresh_due_github_app_tokens().await;
+        assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        let third_failure = store.refresh_due_github_app_tokens().await;
+        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "material is re-minted at the refresh margin");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
-        assert_eq!(token_writes.len(), 2);
+        assert_eq!(token_writes.len(), 3);
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
-        assert_eq!(token_writes[0].0, token_writes[1].0, "rotation replaces the file observed by the standing vessel");
-        let writes = runner.writes.lock().expect("writes lock");
-        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
-        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        let git_helper =
-            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
-        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        drop(writes);
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(command, args, _)| {
-            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
-        }));
-        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        assert!(token_writes[2].1.contains("installation-token-three"));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
+        {
+            let writes = runner.writes.lock().expect("writes lock");
+            let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+            assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+            let git_helper =
+                writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+            assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        }
+        {
+            let calls = runner.calls.lock().expect("calls lock");
+            assert!(calls.iter().any(|(command, args, _)| {
+                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+            }));
+            assert!(calls
+                .iter()
+                .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        }
+
+        let missing_store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error = missing_store
+                .adopt_github_app_deliveries("missing-github-app", &refs, &scopes, runner.clone())
+                .await
+                .expect_err("missing scoped GitHub App declaration must remain visible");
+            assert_eq!(error.should_surface, expected_surface);
+        }
     }
 
     #[tokio::test]
@@ -2259,7 +2440,7 @@ interactions:
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
+            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -2422,7 +2603,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
+                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");

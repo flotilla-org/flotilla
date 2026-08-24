@@ -249,6 +249,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
     let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
     workspaces
         .update_status("convoy-stage4a-implement", &workspace.metadata.resource_version, &VesselStatus {
+            wait_reason: None,
             placement_decision: None,
             phase: VesselPhase::Ready,
             message: None,

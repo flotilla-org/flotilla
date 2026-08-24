@@ -8,9 +8,9 @@ We are in a **no backwards compatibility** phase. Protocol types, snapshot forma
 
 ### Plane-A freeze (transition in progress)
 
-Flotilla is mid-transition from a fleet *observer* (providers → correlation → WorkItems → snapshots → TUI) to a *control plane* (k8s-isomorphic resources → reconcilers → convoys). See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
+Flotilla is consolidating its provider integrations and k8s-isomorphic control plane around resources. Provider refreshes still gather adapter data, while discovered checkout facts are projected into a second, ephemeral `ResourceBackend` by `crates/flotilla-core/src/observed_resources.rs`. The Aggregator combines observed and durable resources into query result sets for the TUI. See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
 
-**Plane A is bugfix-only.** Do not add net-new features to: correlation / union-find, `WorkItem`, the `ProviderData → WorkItem → Snapshot` core pipeline, or the peer-merge subsystem (`flotilla-daemon/src/peer`). These are slated for deletion (the observer reshape moves providers to *observed resources* + an on-demand Aggregator; multi-host moves to resource-store federation). Bugfixes and tests are fine; new capability belongs on the control-plane side. If a change feels like it grows Plane A, stop and check the roadmap.
+**The remaining Plane-A peer layer is bugfix-only.** Do not add net-new features to the peer-merge subsystem (`crates/flotilla-daemon/src/peer/`); it is slated for deletion as multi-host behavior finishes moving to resource-store federation. Bugfixes and tests are fine. New multi-host capability belongs in resource replication and the eventual Tender. If a change feels like it grows peer-merge, stop and check the roadmap.
 
 The TUI is *factored, not frozen* — keep it maintained, but extract the surface-agnostic view-model rather than duplicating presentation logic per surface.
 
@@ -51,7 +51,7 @@ cargo test -p flotilla-core --locked --features test-support --test in_process_d
 - Keep real-backed implementations covered too, but verify them against the same behavioral contract instead of forcing all behavior tests through the real backing store.
 - Favor reusable test harnesses over ad hoc setup. The goal is to make new multi-step scenarios cheap to express and debug.
 - For multi-host orchestration logic, prefer `InProcessDaemon`-level tests unless the bug specifically depends on real process or transport boundaries.
-- **Snapshot tests are a signal, not a formality.** Never run `cargo insta accept` or update snapshots just because a test failed. A failing snapshot means the rendered output changed — investigate *why* it changed. If the change is an intended consequence of the current work, accept it with a clear justification. If the change is unintended, it's a bug — fix the code, don't update the snapshot.
+- **The `insta` snapshots in `crates/flotilla-tui/src/widgets/table.rs` are a signal, not a formality.** Never run `cargo insta accept` or update those snapshots just because a test failed. A failing snapshot means the rendered output changed — investigate *why* it changed. If the change is an intended consequence of the current work, accept it with a clear justification. If the change is unintended, it's a bug — fix the code, don't update the snapshot.
 
 ## Claude Code Web (changedirection/flotilla fork)
 
@@ -62,27 +62,31 @@ This fork exists for Claude Code Web sessions. Two things to be aware of:
 
 ## Architecture
 
-Provider-based plugin system with data correlation:
+Provider observations and control-plane resources meet at the Aggregator:
 
 ```
 Providers (git, wt, github, claude, codex, cursor, cmux, tmux, zellij, cleat, shpool)
-  → RepoModel (providers, health, correlation groups)
-    → Correlation engine (union-find groups items by shared keys)
-      → WorkItems (correlated work units)
-        → UI (ratatui widget tree) / CLI / daemon events
+  → provider refresh / adapters
+    → observed Checkout resources → ephemeral ResourceBackend ─┐
+                                                            ├→ Aggregator → result sets/events → TUI
+Desired state → durable ResourceBackend → reconcilers/leaf engine ─┘
 ```
 
-User actions flow: **Intent → Command → Executor → Provider call → Refresh**
+User actions flow: **TableIntent/UI action → Command → daemon executor → provider or resource operation → refresh/watch update**
 
 ### Crate Structure
 
 | Crate | Role |
 |-------|------|
-| `flotilla-core` | Providers, correlation, refresh, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` |
-| `flotilla-protocol` | Serde-only types: commands, results, snapshots, events, envelope |
+| `flotilla-core` | Providers, refresh, observed-resource projection, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` |
+| `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
-| `flotilla-daemon` | Socket server, peer networking, multi-host command routing |
+| `flotilla-daemon` | Runtime, Aggregator, socket server, resource replication, peer networking, multi-host command routing |
+| `flotilla-resources` | Resource kinds, typed resolvers, lifecycle authority, and storage backends |
+| `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior |
+| `flotilla-commands` | Resource-oriented command preparation and execution |
+| `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `cleat` | Terminal I/O: PTY management, VT engine, session persistence |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 
@@ -93,28 +97,32 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 | `src/main.rs` | Entry point, CLI dispatch |
 | `crates/flotilla-core/src/daemon.rs` | `DaemonHandle` trait |
 | `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` implementation |
-| `crates/flotilla-core/src/executor.rs` | Executes commands against providers, returns `CommandResult` |
+| `crates/flotilla-core/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
 | `crates/flotilla-core/src/executor/` | Executor submodules: checkout, workspace, terminals, session actions |
-| `crates/flotilla-core/src/model.rs` | `AppModel` (repos, labels), `RepoModel` (per-repo data) |
-| `crates/flotilla-core/src/data.rs` | `WorkItem`, `TableEntry`, correlation + table building |
+| `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |
+| `crates/flotilla-core/src/data.rs` | Checkout status inspection |
+| `crates/flotilla-core/src/observed_resources.rs` | Projects discovered and adopted Checkouts into the ephemeral observed-resource store |
 | `crates/flotilla-core/src/step.rs` | Step planning and execution system |
 | `crates/flotilla-core/src/agents/` | Agent hook handling and state management |
 | `crates/flotilla-core/src/attachable/` | Attachable session set management |
 | `crates/flotilla-core/src/convert.rs` | Core-to-protocol type conversion |
-| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, correlation |
+| `crates/flotilla-core/src/providers/` | Provider traits, implementations, registry, discovery, and replay support |
 | `crates/flotilla-core/src/config.rs` | Persistence to `~/.config/flotilla/` |
 | `crates/flotilla-core/src/template.rs` | `.flotilla/workspace.yaml` pane templates |
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
-| `crates/flotilla-protocol/src/commands.rs` | `ProtoCommand`, `CommandResult` |
-| `crates/flotilla-protocol/src/snapshot.rs` | `Snapshot`, `ProtoWorkItem`, `RepoInfo` |
+| `crates/flotilla-protocol/src/commands.rs` | `Command`, `CommandAction`, and `CommandValue` |
+| `crates/flotilla-protocol/src/result_set.rs` | Aggregator query rows, result sets, and deltas |
+| `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, `RepoSnapshot`, provider errors and labels |
 | `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
 | `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
+| `crates/flotilla-daemon/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
+| `crates/flotilla-daemon/src/server/replicator.rs` | Federates resource stores over `HttpBackend` |
 | `crates/flotilla-tui/src/app/mod.rs` | `App` struct, key/mouse dispatch, mode transitions |
-| `crates/flotilla-tui/src/app/intent.rs` | `Intent` enum, resolves to `ProtoCommand` |
 | `crates/flotilla-tui/src/app/executor.rs` | Thin executor: routes to core, interprets results into UI state |
 | `crates/flotilla-tui/src/app/key_handlers.rs` | Key handling logic per binding mode |
 | `crates/flotilla-tui/src/app/navigation.rs` | Navigation logic |
-| `crates/flotilla-tui/src/app/ui_state.rs` | `UiState`, `TabId`, `UiMode`, per-repo UI state |
+| `crates/flotilla-tui/src/app/ui_state.rs` | App-global layout, tab, status, drag, and pending-action state |
+| `crates/flotilla-tui/src/table_view.rs` | Surface-agnostic table projection, state, and `TableIntent` action model |
 | `crates/flotilla-tui/src/binding_table.rs` | `BindingModeId`, flat keybinding table |
 | `crates/flotilla-tui/src/keymap.rs` | Keymap management, configurable key bindings |
 | `crates/flotilla-tui/src/cli.rs` | CLI subcommand parsing |
@@ -125,17 +133,17 @@ User actions flow: **Intent → Command → Executor → Provider call → Refre
 
 ### Provider Traits
 
-Each trait lives in `crates/flotilla-core/src/providers/<category>/mod.rs` with implementations alongside:
+Each trait lives under `crates/flotilla-core/src/providers/` with implementations alongside:
 
-- **Vcs** + **CheckoutManager** (`vcs/git.rs`, `vcs/wt.rs`)
-- **ChangeRequestTracker** (`change_request/github.rs`)
-- **IssueProvider** (`issue_tracker/github.rs`)
-- **CloudAgentService** (`coding_agent/claude.rs`, `coding_agent/codex.rs`, `coding_agent/cursor.rs`)
-- **AiUtility** (`ai_utility/claude.rs`)
-- **WorkspaceManager** (`workspace/cmux.rs`, `workspace/tmux.rs`, `workspace/zellij.rs`)
-- **TerminalPool** (`terminal/cleat.rs`, `terminal/shpool.rs`, `terminal/passthrough.rs`)
+- **Vcs** + **CheckoutManager** (`crates/flotilla-core/src/providers/vcs/git.rs`, `crates/flotilla-core/src/providers/vcs/wt.rs`)
+- **ChangeRequestTracker** (`crates/flotilla-core/src/providers/change_request/github.rs`)
+- **IssueProvider** (`crates/flotilla-core/src/providers/issue_tracker/github.rs`)
+- **CloudAgentService** (`crates/flotilla-core/src/providers/coding_agent/claude.rs`, `crates/flotilla-core/src/providers/coding_agent/codex.rs`, `crates/flotilla-core/src/providers/coding_agent/cursor.rs`)
+- **AiUtility** (`crates/flotilla-core/src/providers/ai_utility/claude_api.rs`, `crates/flotilla-core/src/providers/ai_utility/claude_cli.rs`)
+- **PresentationManager** (`crates/flotilla-core/src/providers/presentation/cmux.rs`, `crates/flotilla-core/src/providers/presentation/tmux.rs`, `crates/flotilla-core/src/providers/presentation/zellij.rs`)
+- **TerminalPool** (`crates/flotilla-core/src/providers/terminal/cleat.rs`, `crates/flotilla-core/src/providers/terminal/shpool.rs`, `crates/flotilla-core/src/providers/terminal/passthrough.rs`)
 
-Every provider trait has label methods: `section_label()`, `item_noun()`, `abbreviation()`, `display_name()`. Override defaults in implementations for custom terminology.
+Provider labels and implementation names live in the `ProviderDescriptor` registered alongside each implementation: `section_label`, `item_noun`, `abbreviation`, and `display_name`.
 
 ### Discovery and Provider Construction
 
@@ -148,16 +156,16 @@ Providers are constructed via **factories** (`discovery/factories/`) that receiv
 
 **Why injected collaborators?** The daemon may run discovery for remote hosts or container environments where the host process's own env vars and binaries are wrong. The `EnvVars` trait and `CommandRunner` trait abstract this so tests can inject values and environments can provide their own. Never use `std::env` or `std::process::Command` directly in providers — always go through the injected `EnvVars` and `CommandRunner`.
 
-### Correlation
+### Observed resources and aggregation
 
-Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `AttachableSet`, `ChangeRequestRef`, `SessionRef`). Items sharing any key merge into a single `WorkItem`. Issues link post-correlation via `AssociationKey` (don't cause merges). Tests in `crates/flotilla-core/src/providers/correlation.rs`.
+Provider refreshes publish discovered checkout facts into the daemon's ephemeral observed-resource backend. Durable resources remain authoritative for desired and adopted state. The Aggregator watches both stores, applies durable-over-observed precedence where a resource is present in both, and emits named-query result sets and deltas for surfaces.
 
 ## Conventions
 
 - **Commits**: `type: lowercase description` — types: feat, fix, refactor, chore, docs. Present tense, no period.
 - **Errors**: Provider methods return `Result<T, String>`. App-level uses `color_eyre::Result`.
 - **Async**: `async-trait` for provider traits, `tokio::join!` for parallel refresh.
-- **Enums over bools**: Prefer enum variants for state (e.g. `UiMode`, `Intent`, `WorkItemKind`).
+- **Enums over bools**: Prefer enum variants for state (e.g. `BindingModeId`, `TableIntent`, `LifecycleAuthority`).
 - **Formatting**: `cargo +nightly-2026-03-12 fmt` — uses `max_width=140`, `imports_granularity="Crate"`, `group_imports="StdExternalCrate"`. See `rustfmt.toml`.
 - **Inline paths**: Prefer `use` imports over long inline `crate::`/`self::`/`super::` paths (>3 segments). Enforced by a Dylint lint (`cargo dylint --all -- --all-targets`). Config in `dylint.toml`.
 - **Imports**: std first, external crates, then `use crate::...`.
@@ -183,11 +191,11 @@ This complements (does not replace) the "do not add features no one asked for" i
 
 ## UI Modes
 
-`UiMode` has three variants: `Normal`, `Config`, `IssueSearch`. Most modal behaviour is driven by `BindingModeId` in the binding table:
+Modal and page behavior is driven by `BindingModeId` in `crates/flotilla-tui/src/binding_table.rs`:
 
-`Shared`, `Normal`, `Overview`, `Help`, `ActionMenu`, `DeleteConfirm`, `CloseConfirm`, `BranchInput`, `IssueSearch`, `CommandPalette`, `FilePicker`, `SearchActive`
+`Shared`, `Normal`, `Overview`, `TabPage`, `TabShell`, `Convoys`, `Project`, `DemandTable`, `ConvoyVessels`, `Help`, `ActionMenu`, `DeleteConfirm`, `DispatchConfirm`, `FindInput`, `CommandPalette`, `FilePicker`
 
-Key bindings are configurable via TOML. Defaults: `j/k` navigate, `Enter` execute, `Space` multi-select, `.` action menu, `d` delete, `p` open PR, `n` new branch, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `:` command palette, `/` search, `q` quit, `?` help.
+Key bindings are configurable via TOML. Defaults include: `j/k` navigate, `Enter` confirm or drill in, `Space` multi-select in demand tables, `.` action menu, `r` refresh, `[/]` switch tabs, `{/}` reorder tabs, `:` command palette, `/` find, `q` quit, and `h` help.
 
 ## Config
 

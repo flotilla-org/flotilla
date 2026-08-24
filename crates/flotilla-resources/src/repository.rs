@@ -13,6 +13,7 @@ define_resource!(
     RepositorySpec,
     RepositoryStatus,
     RepositoryStatusPatch,
+    replication = crate::ReplicationClass::ConvergentFacts,
     validate_spec_update = validate_repository_spec_update
 );
 
@@ -32,6 +33,8 @@ pub struct ForgeIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositorySpec {
     identity: RepositoryIdentity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remotes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forge: Option<ForgeIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +54,7 @@ impl RepositorySpec {
         let canonical_remote = crate::canonicalize_repo_url(&remote)?;
         let forge = forge_from_canonical_remote(&canonical_remote)?;
         Ok(Self {
+            remotes: vec![canonical_remote.clone()],
             identity: RepositoryIdentity::Remote { canonical_remote },
             forge: Some(forge),
             upstream: None,
@@ -72,6 +76,7 @@ impl RepositorySpec {
         let normalized = normalize_absolute_path(path)?;
         Ok(Self {
             identity: RepositoryIdentity::Local { host_ref, git_common_dir: normalized },
+            remotes: Vec::new(),
             forge: None,
             upstream: None,
             allow_reviewless_workflows: false,
@@ -90,6 +95,40 @@ impl RepositorySpec {
 
     pub fn identity(&self) -> &RepositoryIdentity {
         &self.identity
+    }
+
+    /// Declared transport remotes, canonical first. The first remote alone
+    /// defines Repository identity; the remaining entries are aliases for
+    /// attribution and lookup.
+    pub fn remotes(&self) -> &[String] {
+        &self.remotes
+    }
+
+    pub fn with_remotes(mut self, remotes: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, String> {
+        let remotes = remotes.into_iter().map(|remote| crate::canonicalize_repo_url(&remote.into())).collect::<Result<Vec<_>, _>>()?;
+        if remotes.is_empty() {
+            return Err("repository remotes cannot be empty".to_string());
+        }
+        let mut unique = BTreeSet::new();
+        if remotes.iter().any(|remote| !unique.insert(remote.clone())) {
+            return Err("repository remotes must be unique".to_string());
+        }
+        let observed = match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
+            RepositoryIdentity::Local { .. } => return Err("a local Repository cannot declare transport remotes".to_string()),
+        };
+        if !remotes.contains(observed) {
+            return Err(format!("declared remotes do not include observed remote `{observed}`"));
+        }
+        let canonical_remote = remotes[0].clone();
+        self.forge = Some(forge_from_canonical_remote(&canonical_remote)?);
+        self.identity = RepositoryIdentity::Remote { canonical_remote };
+        self.remotes = remotes;
+        Ok(self)
+    }
+
+    pub fn declares_remote(&self, remote: &str) -> bool {
+        crate::canonicalize_repo_url(remote).is_ok_and(|remote| self.remotes.contains(&remote))
     }
 
     pub fn forge(&self) -> Option<&ForgeIdentity> {
@@ -313,6 +352,8 @@ impl<'de> Deserialize<'de> for RepositorySpec {
         struct StoredRepositorySpec {
             identity: RepositoryIdentity,
             #[serde(default)]
+            remotes: Vec<String>,
+            #[serde(default)]
             forge: Option<ForgeIdentity>,
             #[serde(default)]
             upstream: Option<RepositoryUpstream>,
@@ -323,8 +364,14 @@ impl<'de> Deserialize<'de> for RepositorySpec {
         }
 
         let stored = StoredRepositorySpec::deserialize(deserializer)?;
+        if matches!(stored.identity, RepositoryIdentity::Local { .. }) && !stored.remotes.is_empty() {
+            return Err(serde::de::Error::custom("a local Repository cannot declare transport remotes"));
+        }
         let mut normalized = match &stored.identity {
-            RepositoryIdentity::Remote { canonical_remote } => RepositorySpec::remote(canonical_remote),
+            RepositoryIdentity::Remote { canonical_remote } => RepositorySpec::remote(canonical_remote).and_then(|spec| {
+                let remotes = if stored.remotes.is_empty() { vec![canonical_remote.clone()] } else { stored.remotes.clone() };
+                spec.with_remotes(remotes)
+            }),
             RepositoryIdentity::Local { host_ref, git_common_dir } => RepositorySpec::local(host_ref, git_common_dir),
         }
         .map_err(serde::de::Error::custom)?;

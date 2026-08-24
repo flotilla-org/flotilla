@@ -137,11 +137,14 @@ enum SubCommand {
     Ls,
     /// Attach to a running convoy crew session
     Attach {
+        /// Observe without taking the controller seat from another client
+        #[arg(long, conflicts_with_all = ["strict", "take"])]
+        watch: bool,
         /// Refuse when another attachment holds the controller seat
-        #[arg(long, conflicts_with = "take")]
+        #[arg(long, conflicts_with_all = ["watch", "take"])]
         strict: bool,
         /// Take control and demote the current controller to watcher
-        #[arg(long, conflicts_with = "strict")]
+        #[arg(long, conflicts_with_all = ["watch", "strict"])]
         take: bool,
         /// Convoy, vessel, role, terminal session, or unique prefix
         reference: String,
@@ -226,6 +229,19 @@ enum SubCommand {
 enum DaemonSubCommand {
     /// Gracefully stop the running daemon
     Stop,
+    /// Toggle the fleet launchd agent for local daemon development
+    DevMode {
+        #[command(subcommand)]
+        command: DevModeSubCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum DevModeSubCommand {
+    /// Disable and stop the fleet agent so a dev-built daemon may spawn
+    Enable,
+    /// Re-enable and start the fleet agent
+    Disable,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -295,14 +311,27 @@ enum ResourceSubCommand {
     List(ResourceListArgs),
     /// Create or update a raw resource document
     Apply(ResourceApplyArgs),
+    /// Make the manifest overwrite a drifted live spec
+    Sync(ResourceManifestResolutionArgs),
+    /// Write the live spec back to its manifest
+    Adopt(ResourceManifestResolutionArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
+    /// Remove standing multi-authored Host and PlacementPolicy records from non-home roots
+    DedupSweep(ResourceDedupSweepArgs),
     /// Watch resources of a kind
     Watch(ResourceWatchArgs),
+}
+
+#[derive(clap::Args)]
+struct ResourceDedupSweepArgs {
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
 }
 
 #[derive(clap::Args, bon::Builder)]
@@ -333,6 +362,20 @@ struct ResourceGetArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceManifestResolutionArgs {
+    /// Exact resource kind or plural name
+    kind: String,
+    /// Exact resource name
+    name: String,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the mutation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -515,11 +558,22 @@ async fn connect_cli_socket(
     state_dir: &Path,
     require_host_daemon: bool,
 ) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
+    let surface =
+        cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref());
     if require_host_daemon {
-        flotilla_tui::socket::connect_required_host_daemon(socket_path).await
+        flotilla_tui::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
     } else {
-        flotilla_tui::socket::connect_or_spawn(socket_path, config_dir, state_dir).await
+        flotilla_tui::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
     }
+}
+
+fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotilla_protocol::SurfaceDeclaration {
+    let namespace = namespace.unwrap_or("flotilla");
+    let principal_ref = match crew_role.filter(|role| !role.trim().is_empty()) {
+        Some(role) => flotilla_protocol::PrincipalRef { namespace: namespace.to_string(), name: format!("{role} agent") },
+        None => flotilla_protocol::PrincipalRef::implicit_for_namespace(namespace),
+    };
+    flotilla_protocol::SurfaceDeclaration { principal_ref, character: flotilla_protocol::SurfaceCharacter::Focal }
 }
 
 #[tokio::main]
@@ -544,6 +598,7 @@ async fn main() -> Result<()> {
             run_tui(cli, Some(address)).await
         }
         Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. }) => run_daemon_stop(&cli).await,
+        Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command }), .. }) => run_daemon_dev_mode(&cli, command).await,
         Some(SubCommand::Daemon { command: None, timeout }) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
@@ -554,8 +609,8 @@ async fn main() -> Result<()> {
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
-        Some(SubCommand::Attach { reference, strict, take, transient, host }) => {
-            run_attach(&cli, &reference, attach_mode(strict, take), transient, host.as_deref(), format).await
+        Some(SubCommand::Attach { reference, watch, strict, take, transient, host }) => {
+            run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
@@ -909,6 +964,12 @@ async fn run_daemon_stop(cli: &Cli) -> Result<()> {
     flotilla_tui::socket::shutdown_existing(&socket_path)
         .await
         .map_err(|error| color_eyre::eyre::eyre!("could not stop daemon at {}: {error}", socket_path.display()))?;
+    wait_for_socket_removal(&socket_path).await?;
+    println!("Daemon stopped.");
+    Ok(())
+}
+
+async fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         while socket_path.exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -916,8 +977,36 @@ async fn run_daemon_stop(cli: &Cli) -> Result<()> {
     })
     .await
     .map_err(|_| color_eyre::eyre::eyre!("daemon accepted shutdown but did not exit within 30s"))?;
-    println!("Daemon stopped.");
     Ok(())
+}
+
+async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()> {
+    match command {
+        DevModeSubCommand::Enable => {
+            // Disable first. Even if graceful shutdown fails, launchd cannot
+            // resurrect the fleet daemon while we finish unloading the job.
+            flotilla_tui::socket::launchd::set_agent_enabled(false).map_err(|error| color_eyre::eyre::eyre!(error))?;
+            let socket_path = cli.socket_path();
+            let shutdown_error =
+                if socket_path.exists() { flotilla_tui::socket::shutdown_existing(&socket_path).await.err() } else { None };
+            flotilla_tui::socket::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            if socket_path.exists() {
+                wait_for_socket_removal(&socket_path).await?;
+            }
+            if let Some(error) = shutdown_error {
+                tracing::debug!(%error, "fleet daemon did not accept graceful shutdown before launchd bootout");
+            }
+            println!("Daemon dev mode enabled; the fleet launchd agent is disabled and stopped.");
+            Ok(())
+        }
+        DevModeSubCommand::Disable => {
+            flotilla_tui::socket::launchd::set_agent_enabled(true).map_err(|error| color_eyre::eyre::eyre!(error))?;
+            flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            println!("Daemon dev mode disabled; the fleet launchd agent is enabled and started.");
+            Ok(())
+        }
+    }
 }
 
 fn resolve_flotillad_binary() -> Result<PathBuf> {
@@ -1091,12 +1180,13 @@ fn exit_command_error(message: String, format: OutputFormat) -> ! {
     std::process::exit(1);
 }
 
-fn attach_mode(strict: bool, take: bool) -> flotilla_protocol::commands::AttachMode {
-    match (strict, take) {
-        (true, false) => flotilla_protocol::commands::AttachMode::Strict,
-        (false, true) => flotilla_protocol::commands::AttachMode::Take,
-        (false, false) => flotilla_protocol::commands::AttachMode::Default,
-        (true, true) => unreachable!("clap rejects --strict with --take"),
+fn attach_mode(watch: bool, strict: bool, take: bool) -> flotilla_protocol::commands::AttachMode {
+    match (watch, strict, take) {
+        (true, false, false) => flotilla_protocol::commands::AttachMode::Default,
+        (false, true, false) => flotilla_protocol::commands::AttachMode::Strict,
+        (false, false, true) => flotilla_protocol::commands::AttachMode::Take,
+        (false, false, false) => flotilla_protocol::commands::AttachMode::PreferTake,
+        _ => unreachable!("clap rejects conflicting attach seat options"),
     }
 }
 
@@ -1110,12 +1200,16 @@ async fn run_attach(
 ) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
+    let context_repo = match resolve_repo_from_env(cli) {
+        Some(repo) => Some(repo),
+        None => startup_repo_roots(&[]).await.into_iter().next().map(RepoSelector::Path),
+    };
     let result = daemon
         .execute_query(
             Command {
                 node_id: None,
                 provisioning_target: None,
-                context_repo: None,
+                context_repo,
                 action: if transient {
                     CommandAction::AttachTransient {
                         reference: reference.to_string(),
@@ -1269,6 +1363,8 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             )
             .await
         }
+        ResourceSubCommand::Sync(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Sync, format).await,
+        ResourceSubCommand::Adopt(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Adopt, format).await,
         ResourceSubCommand::PatchStatus(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let raw = std::fs::read_to_string(&args.file)
@@ -1306,8 +1402,65 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             )
             .await
         }
+        ResourceSubCommand::DedupSweep(args) => {
+            let daemon = connect_daemon(cli).await?;
+            let report = flotilla_client::resource::ResourceClient::new(daemon)
+                .dedup_single_home_records(&args.namespace)
+                .await
+                .map_err(color_eyre::eyre::Report::msg)?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    flotilla_protocol::output::json_pretty(&serde_json::json!({
+                        "inspected_roots": report.inspected_roots,
+                        "duplicate_records": report.duplicate_records,
+                        "deletions": report.deletions.iter().map(|deletion| serde_json::json!({
+                            "kind": deletion.kind,
+                            "name": deletion.name,
+                            "deleted_root": deletion.deleted_root,
+                            "home_root": deletion.home_root,
+                        })).collect::<Vec<_>>(),
+                    }))
+                ),
+                OutputFormat::Human => {
+                    println!(
+                        "inspected {} roots; found {} duplicated records; deleted {} non-home copies",
+                        report.inspected_roots,
+                        report.duplicate_records,
+                        report.deletions.len()
+                    );
+                    for deletion in report.deletions {
+                        println!(
+                            "deleted {}/{} from root {} (home: {})",
+                            deletion.kind, deletion.name, deletion.deleted_root, deletion.home_root
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
+}
+
+async fn run_manifest_resolution(
+    cli: &Cli,
+    args: ResourceManifestResolutionArgs,
+    resolution: flotilla_protocol::ManifestResolution,
+    format: OutputFormat,
+) -> Result<()> {
+    let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+    run_control_command(
+        cli,
+        Command {
+            node_id,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceManifestResolve { namespace: args.namespace, kind: args.kind, name: args.name, resolution },
+        },
+        format,
+    )
+    .await
 }
 
 async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Option<flotilla_protocol::NodeId>> {
@@ -1975,13 +2128,28 @@ mod tests {
     };
 
     use super::{
-        client_dirs_from, confirm_command, daemon_paths_from, default_project_landing, format_human_resource_value,
-        host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment, replace_host_ids,
-        run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
+        attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
+        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
+        replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceStatusPatchArgs, ResourceSubCommand,
-        ResourceWatchArgs, SubCommand,
+        DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
+
+    #[test]
+    fn crew_cli_surface_identifies_the_agent_role() {
+        let surface = cli_surface_from(Some("governor"), Some("fleet"));
+
+        assert_eq!(surface.principal_ref.namespace, "fleet");
+        assert_eq!(surface.principal_ref.name, "governor agent");
+    }
+
+    #[test]
+    fn human_cli_surface_uses_the_implicit_principal() {
+        let surface = cli_surface_from(None, Some("fleet"));
+
+        assert_eq!(surface.principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("fleet"));
+    }
 
     #[test]
     fn default_convoy_start_does_not_auto_attach_non_interactively() {
@@ -2262,6 +2430,23 @@ mod tests {
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
         ));
 
+        let sync = Cli::try_parse_from(["flotilla", "resource", "sync", "projects", "cleat", "--namespace", "ops"])
+            .expect("manifest sync should parse");
+        assert!(matches!(
+            sync.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Sync(ResourceManifestResolutionArgs { kind, name, namespace, host: None })
+            }) if kind == "projects" && name == "cleat" && namespace == "ops"
+        ));
+        let adopt = Cli::try_parse_from(["flotilla", "resource", "adopt", "projects", "cleat", "--namespace", "ops"])
+            .expect("manifest adopt should parse");
+        assert!(matches!(
+            adopt.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Adopt(ResourceManifestResolutionArgs { kind, name, namespace, host: None })
+            }) if kind == "projects" && name == "cleat" && namespace == "ops"
+        ));
+
         let delete =
             Cli::try_parse_from(["flotilla", "resource", "delete", "workflowtemplates", "scratch", "--namespace", "ops", "--host", "feta"])
                 .expect("resource delete should parse");
@@ -2402,9 +2587,10 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
+        assert_eq!(attach_mode(false, false, false), flotilla_protocol::commands::AttachMode::PreferTake);
     }
 
     #[test]
@@ -2413,16 +2599,25 @@ mod tests {
             Cli::try_parse_from(["flotilla", "attach", "--strict", "convoy-a/implement/coder"]).expect("strict attach cli should parse");
         assert!(matches!(
             strict.command,
-            Some(SubCommand::Attach { reference, strict: true, take: false, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: true, take: false, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
         let take = Cli::try_parse_from(["flotilla", "attach", "--take", "convoy-a/implement/coder"]).expect("take attach cli should parse");
         assert!(matches!(
             take.command,
-            Some(SubCommand::Attach { reference, strict: false, take: true, transient: false, host: None })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: true, transient: false, host: None })
                 if reference == "convoy-a/implement/coder"
         ));
+        let watch =
+            Cli::try_parse_from(["flotilla", "attach", "--watch", "convoy-a/implement/coder"]).expect("watch attach cli should parse");
+        assert!(matches!(
+            watch.command,
+            Some(SubCommand::Attach { reference, watch: true, strict: false, take: false, transient: false, host: None })
+                if reference == "convoy-a/implement/coder"
+        ));
+        assert_eq!(attach_mode(true, false, false), flotilla_protocol::commands::AttachMode::Default);
         assert!(Cli::try_parse_from(["flotilla", "attach", "--strict", "--take", "convoy-a/implement/coder"]).is_err());
+        assert!(Cli::try_parse_from(["flotilla", "attach", "--watch", "--take", "convoy-a/implement/coder"]).is_err());
     }
 
     #[test]
@@ -2517,6 +2712,18 @@ mod tests {
 
         let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
         assert!(matches!(foreground.command, Some(SubCommand::Daemon { command: None, timeout: 0 })));
+
+        let dev_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "enable"]).expect("daemon dev-mode enable should parse");
+        assert!(matches!(
+            dev_mode.command,
+            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Enable }), .. })
+        ));
+
+        let fleet_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "disable"]).expect("daemon dev-mode disable should parse");
+        assert!(matches!(
+            fleet_mode.command,
+            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Disable }), .. })
+        ));
     }
 
     #[test]
@@ -2565,7 +2772,7 @@ mod tests {
             .expect("transient attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: true, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: true, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }
@@ -2576,7 +2783,7 @@ mod tests {
             .expect("host-qualified attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, strict: false, take: false, transient: false, host: Some(host) })
+            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }

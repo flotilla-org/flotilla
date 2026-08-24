@@ -170,7 +170,7 @@ impl App {
                 self.proto_commands.push(self.command(CommandAction::AttachTransient {
                     reference,
                     host: Some(host),
-                    mode: flotilla_protocol::commands::AttachMode::Default,
+                    mode: flotilla_protocol::commands::AttachMode::PreferTake,
                 }));
                 return;
             }

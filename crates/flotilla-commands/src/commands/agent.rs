@@ -82,13 +82,12 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::CommandAction;
 
     use super::AgentNoun;
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
     };
 
     fn parse(args: &[&str]) -> AgentNoun {
@@ -98,65 +97,49 @@ mod tests {
     #[test]
     fn agent_teleport_no_flags() {
         let resolved = parse(&["agent", "claude-1", "teleport"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: None, checkout_key: None },
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::TeleportSession { session_id: "claude-1".into(), branch: None, checkout_key: None },
+            RepoContext::Inferred,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn agent_teleport_with_branch() {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: Some("feat".into()), checkout_key: None },
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::TeleportSession { session_id: "claude-1".into(), branch: Some("feat".into()), checkout_key: None },
+            RepoContext::Inferred,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn agent_teleport_with_branch_and_checkout() {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat", "--checkout", "/tmp/wt"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::TeleportSession {
-                    session_id: "claude-1".into(),
-                    branch: Some("feat".into()),
-                    checkout_key: Some(PathBuf::from("/tmp/wt")),
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::TeleportSession {
+                session_id: "claude-1".into(),
+                branch: Some("feat".into()),
+                checkout_key: Some(PathBuf::from("/tmp/wt")),
             },
-            repo: RepoContext::Inferred,
-            host: HostResolution::Local,
-        });
+            RepoContext::Inferred,
+            HostResolution::Local,
+        );
     }
 
     #[test]
     fn agent_archive() {
         let resolved = parse(&["agent", "claude-1", "archive"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ArchiveSession { session_id: "claude-1".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::ArchiveSession { session_id: "claude-1".into() },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
