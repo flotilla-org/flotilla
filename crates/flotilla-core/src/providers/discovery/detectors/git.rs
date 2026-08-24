@@ -52,16 +52,6 @@ impl RepoDetector for VcsRepoDetector {
 /// 3. First remote with a valid URL
 pub struct RemoteHostDetector;
 
-async fn configured_remote_url(repo_root: &Path, runner: &dyn CommandRunner, remote: &str) -> Option<String> {
-    let key = format!("remote.{remote}.url");
-    run!(runner, "git", &["config", "--get-all", &key], repo_root)
-        .ok()?
-        .lines()
-        .map(str::trim)
-        .find(|url| !url.is_empty())
-        .map(str::to_string)
-}
-
 /// Get the URL of the remote for the current tracking branch.
 async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Option<(String, String)> {
     let upstream = run!(runner, "git", &["rev-parse", "--abbrev-ref", "@{upstream}"], repo_root,).ok()?;
@@ -78,7 +68,11 @@ async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Op
     if remote_name.is_empty() {
         return None;
     }
-    let url = configured_remote_url(repo_root, runner, remote_name).await?;
+    let url = run!(runner, "git", &["remote", "get-url", remote_name], repo_root).ok()?;
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
     Some((remote_name.to_string(), url))
 }
 
@@ -95,15 +89,21 @@ async fn preferred_remote(repo_root: &Path, runner: &dyn CommandRunner) -> Optio
 
     // 2. Prefer "origin" if it exists
     if remotes.contains(&"origin") {
-        if let Some(url) = configured_remote_url(repo_root, runner, "origin").await {
-            return Some(("origin".to_string(), url));
+        if let Ok(url) = run!(runner, "git", &["remote", "get-url", "origin"], repo_root) {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                return Some(("origin".to_string(), url));
+            }
         }
     }
 
     // 3. Fall back to first remote with a valid URL
     for remote in &remotes {
-        if let Some(url) = configured_remote_url(repo_root, runner, remote).await {
-            return Some((remote.to_string(), url));
+        if let Ok(url) = run!(runner, "git", &["remote", "get-url", remote], repo_root) {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                return Some((remote.to_string(), url));
+            }
         }
     }
     None
@@ -239,7 +239,7 @@ mod tests {
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("git@github.com:owner/repo.git\n".into()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("git@github.com:owner/repo.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
@@ -260,7 +260,7 @@ mod tests {
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("upstream/main\n".into()))
             .on_run("git", &["remote"], Ok("origin\nupstream\n".into()))
-            .on_run("git", &["config", "--get-all", "remote.upstream.url"], Ok("https://github.com/upstream-owner/repo.git\n".into()))
+            .on_run("git", &["remote", "get-url", "upstream"], Ok("https://github.com/upstream-owner/repo.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
@@ -281,7 +281,7 @@ mod tests {
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/owner/repo.git\n".into()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/owner/repo.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
@@ -313,7 +313,7 @@ mod tests {
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://gitlab.example.com/org/project.git\n".into()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://gitlab.example.com/org/project.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
@@ -334,7 +334,7 @@ mod tests {
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
             .on_run("git", &["remote"], Ok("origin\n".into()))
-            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://bitbucket.org/owner/repo.git\n".into()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://bitbucket.org/owner/repo.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
