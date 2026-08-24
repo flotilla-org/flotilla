@@ -12,7 +12,7 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, patch_resource_annotation, resource_document_spec_hash, ResourceBackend,
+    apply_manifest_resource_document, get_resource_kind, patch_resource_annotations, resource_document_spec_hash, ResourceBackend,
     ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
 };
 use serde::Deserialize;
@@ -303,16 +303,15 @@ impl ResourceManifestReconciler {
             return Ok(());
         }
         let identity = document_identity(existing, &self.default_namespace)?;
-        for (key, value) in [
-            (MANIFEST_REFUSAL_ANNOTATION, reason),
-            (MANIFEST_LIVE_HASH_ANNOTATION, live_hash),
-            (MANIFEST_BASELINE_HASH_ANNOTATION, baseline_hash),
-            (MANIFEST_DESIRED_HASH_ANNOTATION, desired_hash),
-        ] {
-            patch_resource_annotation(&self.backend, &identity.namespace, &identity.kind, &identity.name, key, value)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        let refusal_annotations = BTreeMap::from([
+            (MANIFEST_REFUSAL_ANNOTATION.to_string(), reason.to_string()),
+            (MANIFEST_LIVE_HASH_ANNOTATION.to_string(), live_hash.to_string()),
+            (MANIFEST_BASELINE_HASH_ANNOTATION.to_string(), baseline_hash.to_string()),
+            (MANIFEST_DESIRED_HASH_ANNOTATION.to_string(), desired_hash.to_string()),
+        ]);
+        patch_resource_annotations(&self.backend, &identity.namespace, &identity.kind, &identity.name, &refusal_annotations)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -525,7 +524,7 @@ mod tests {
     use std::time::Duration;
 
     use flotilla_resources::{
-        InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchStart, WorkflowTemplate,
+        InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchEvent, WatchStart, WorkflowTemplate,
     };
     use futures::StreamExt;
 
@@ -718,6 +717,41 @@ mod tests {
         assert!(object.metadata.annotations.contains_key(MANIFEST_LIVE_HASH_ANNOTATION));
         assert!(object.metadata.annotations.contains_key(MANIFEST_BASELINE_HASH_ANNOTATION));
         assert!(object.metadata.annotations.contains_key(MANIFEST_DESIRED_HASH_ANNOTATION));
+    }
+
+    #[tokio::test]
+    async fn drift_refusal_annotations_are_observable_as_one_complete_patch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.yaml");
+        write(&path, &manifest("atomic-refusal", "one"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend, NAMESPACE, dir.path());
+        reconciler.reconcile_once().await.expect("initial pass");
+        let applied = resolver.get("atomic-refusal").await.expect("policy");
+        resolver
+            .update(
+                &InputMeta::from(&applied.metadata),
+                &applied.metadata.resource_version,
+                &PlacementPolicySpec::builder().pool("live-edit".to_string()).build(),
+            )
+            .await
+            .expect("edit live spec");
+        write(&path, &manifest("atomic-refusal", "manifest-edit"));
+        let mut events = resolver.watch(WatchStart::Now).await.expect("watch refusal patch");
+
+        reconciler.reconcile_once().await.expect("drift pass");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("refusal event")
+            .expect("watch remains open")
+            .expect("refusal event decodes");
+        let WatchEvent::Modified(refused) = event else { panic!("expected refusal modification, got {event:?}") };
+        for key in REFUSAL_ANNOTATIONS {
+            assert!(refused.metadata.annotations.contains_key(key), "refusal patch omitted {key}");
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(20), events.next()).await.is_err(), "refusal used more than one patch");
     }
 
     #[tokio::test]

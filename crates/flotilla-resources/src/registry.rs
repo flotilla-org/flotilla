@@ -502,30 +502,40 @@ pub async fn patch_resource_annotation(
     key: &str,
     value: &str,
 ) -> Result<DynamicResourceObject, ResourceError> {
+    let annotations = BTreeMap::from([(key.to_string(), value.to_string())]);
+    patch_resource_annotations(backend, namespace, requested_kind, name, &annotations).await
+}
+
+pub async fn patch_resource_annotations(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    annotations: &BTreeMap<String, String>,
+) -> Result<DynamicResourceObject, ResourceError> {
     dispatch_resource_kind!(
         lookup_resource_kind(requested_kind)?.resource,
-        patch_annotation_typed(backend, namespace, name, key, value).await
+        patch_annotations_typed(backend, namespace, name, annotations).await
     )
 }
 
-async fn patch_annotation_typed<T: Resource>(
+async fn patch_annotations_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
     name: &str,
-    key: &str,
-    value: &str,
+    annotations: &BTreeMap<String, String>,
 ) -> Result<DynamicResourceObject, ResourceError> {
     let updated = if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
         let resolver = backend.definitions::<T>(namespace);
         let existing = resolver.get(name).await?;
         let mut meta = InputMeta::from(&existing.metadata);
-        meta.annotations.insert(key.to_string(), value.to_string());
+        meta.annotations.extend(annotations.clone());
         resolver.apply(&meta, &existing.spec).await?
     } else {
         let resolver = backend.using::<T>(namespace);
         let existing = resolver.get(name).await?;
         let mut meta = InputMeta::from(&existing.metadata);
-        meta.annotations.insert(key.to_string(), value.to_string());
+        meta.annotations.extend(annotations.clone());
         resolver.update(&meta, &existing.metadata.resource_version, &existing.spec).await?
     };
     Ok(DynamicResourceObject {
