@@ -42,11 +42,16 @@ struct FakePresentationRuntime {
     apply_calls: Mutex<Vec<PresentationPlan>>,
     tear_down_calls: Mutex<Vec<(String, String)>>,
     apply_results: Mutex<VecDeque<Result<AppliedPresentation, ApplyPresentationError>>>,
+    tear_down_results: Mutex<VecDeque<Result<(), String>>>,
 }
 
 impl FakePresentationRuntime {
     fn with_results(results: Vec<Result<AppliedPresentation, ApplyPresentationError>>) -> Self {
         Self { apply_results: Mutex::new(results.into()), ..Default::default() }
+    }
+
+    fn with_tear_down_results(results: Vec<Result<(), String>>) -> Self {
+        Self { tear_down_results: Mutex::new(results.into()), ..Default::default() }
     }
 }
 
@@ -66,7 +71,7 @@ impl PresentationRuntime for FakePresentationRuntime {
 
     async fn tear_down(&self, manager: &str, workspace_ref: &str) -> Result<(), String> {
         self.tear_down_calls.lock().expect("tear down calls lock").push((manager.to_string(), workspace_ref.to_string()));
-        Ok(())
+        self.tear_down_results.lock().expect("tear down results lock").pop_front().unwrap_or(Ok(()))
     }
 }
 
@@ -589,6 +594,31 @@ async fn finalizer_tears_down_recorded_workspace() {
 
     assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
         "fake-manager".to_string(),
+        "workspace-a".to_string()
+    )]);
+}
+
+#[tokio::test]
+async fn finalizer_allows_deletion_when_the_recorded_manager_is_unavailable() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentation = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
+        phase: flotilla_resources::PresentationPhase::Active,
+        observed_workspace_ref: Some("workspace-a".to_string()),
+        observed_presentation_manager: Some("zellij".to_string()),
+        observed_spec_hash: Some("hash-a".to_string()),
+        message: None,
+        ready_at: Some(Utc::now()),
+    })
+    .await;
+    let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
+        "presentation manager 'zellij' no longer available".to_string()
+    )]));
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    reconciler.run_finalizer(&presentation).await.expect("manager loss must not block presentation deletion");
+
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
+        "zellij".to_string(),
         "workspace-a".to_string()
     )]);
 }

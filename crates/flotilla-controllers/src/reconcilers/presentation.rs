@@ -457,7 +457,15 @@ where
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         if let Some(previous) = previous_workspace(obj.status.as_ref()) {
-            self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await.map_err(ResourceError::other)?;
+            if let Err(error) = self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await {
+                warn!(
+                    presentation = %obj.metadata.name,
+                    presentation_manager = %previous.presentation_manager,
+                    workspace_ref = %previous.workspace_ref,
+                    %error,
+                    "presentation teardown failed during finalization; allowing resource deletion"
+                );
+            }
         }
         Ok(())
     }
