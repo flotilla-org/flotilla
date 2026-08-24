@@ -23,8 +23,9 @@ use flotilla_manifest::{entity, stamp::WorkspaceStamp};
 use flotilla_protocol::{arg, CanonicalHostId, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    Convoy, Environment, Host, LifecycleAuthority, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend,
-    ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, AUTHORITY_LABEL, CONVOY_LABEL, VESSEL_LABEL,
+    Convoy, Environment, Host, LifecycleAuthority, Presentation, PresentationPhase, PresentationStatus, PresentationStatusPatch,
+    ResourceBackend, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, AUTHORITY_LABEL, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -362,11 +363,16 @@ where
                             Ok(()) => PresentationPrepared::TornDown {
                                 message: Some(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)),
                             },
-                            Err(error) => PresentationPrepared::Failed(format!(
-                                "convoy '{}' no longer exists; presentation teardown failed: {error}",
-                                obj.spec.convoy_ref
-                            )),
+                            Err(error) => PresentationPrepared::TornDown {
+                                message: Some(format!(
+                                    "convoy '{}' no longer exists; presentation teardown failed: {error}",
+                                    obj.spec.convoy_ref
+                                )),
+                            },
                         });
+                    }
+                    if obj.status.as_ref().is_some_and(|status| status.phase == PresentationPhase::TornDown) {
+                        return Ok(PresentationPrepared::InSync);
                     }
                     return Ok(PresentationPrepared::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));
                 }

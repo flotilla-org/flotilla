@@ -258,6 +258,62 @@ async fn active_managed_presentation_without_its_convoy_is_torn_down_once() {
 }
 
 #[tokio::test]
+async fn active_managed_orphan_does_not_retry_failed_teardown_on_resync() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let created = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let presentation = presentations
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Active,
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_presentation_manager: Some("zellij".to_string()),
+            observed_spec_hash: Some("hash-a".to_string()),
+            message: None,
+            ready_at: Some(Utc::now()),
+        })
+        .await
+        .expect("presentation status update should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
+        "presentation manager 'zellij' no longer available".to_string()
+    )]));
+    let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
+
+    let prepared = reconciler.prepare(&presentation).await.expect("presentation should prepare");
+    let outcome = reconciler.reconcile(&presentation, &prepared, Utc::now());
+    let patch = outcome.patch.expect("orphan should receive a terminal patch");
+    assert!(matches!(
+        patch,
+        PresentationStatusPatch::MarkTornDown { ref message }
+            if message.as_deref() == Some(
+                "convoy 'missing-convoy' no longer exists; presentation teardown failed: presentation manager 'zellij' no longer available"
+            )
+    ));
+    let torn_down = update_presentation_status(&backend, &presentation, patch).await;
+
+    let resynced = reconciler.prepare(&torn_down).await.expect("resync should remain terminal");
+
+    assert!(matches!(resynced, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").len(), 1);
+}
+
+#[tokio::test]
 async fn first_apply_marks_presentation_active() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
