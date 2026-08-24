@@ -357,6 +357,17 @@ where
             match self.convoys.get(&obj.spec.convoy_ref).await {
                 Ok(_) => {}
                 Err(ResourceError::NotFound { .. }) => {
+                    if let Some(previous) = previous_workspace(obj.status.as_ref()) {
+                        return Ok(match self.runtime.tear_down(&previous.presentation_manager, &previous.workspace_ref).await {
+                            Ok(()) => PresentationPrepared::TornDown {
+                                message: Some(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)),
+                            },
+                            Err(error) => PresentationPrepared::Failed(format!(
+                                "convoy '{}' no longer exists; presentation teardown failed: {error}",
+                                obj.spec.convoy_ref
+                            )),
+                        });
+                    }
                     return Ok(PresentationPrepared::Failed(format!("convoy '{}' no longer exists", obj.spec.convoy_ref)));
                 }
                 Err(error) => return Err(error),

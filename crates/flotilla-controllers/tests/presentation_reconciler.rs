@@ -203,6 +203,56 @@ async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_r
 }
 
 #[tokio::test]
+async fn active_managed_presentation_without_its_convoy_is_torn_down_once() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let created = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let presentation = presentations
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Active,
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_presentation_manager: Some("fake-manager".to_string()),
+            observed_spec_hash: Some("hash-a".to_string()),
+            message: None,
+            ready_at: Some(Utc::now()),
+        })
+        .await
+        .expect("presentation status update should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    let prepared = reconciler.prepare(&presentation).await.expect("presentation should prepare");
+    let outcome = reconciler.reconcile(&presentation, &prepared, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(PresentationStatusPatch::MarkTornDown { ref message })
+            if message.as_deref() == Some("convoy 'missing-convoy' no longer exists")
+    ));
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
+        "fake-manager".to_string(),
+        "workspace-a".to_string()
+    )]);
+}
+
+#[tokio::test]
 async fn first_apply_marks_presentation_active() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
