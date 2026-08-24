@@ -34,7 +34,7 @@ use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
     delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
     InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
+    TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
     VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
@@ -44,6 +44,50 @@ use tokio::time::{timeout, Duration};
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
+}
+
+#[tokio::test]
+async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_once() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("initial store"));
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("wheelhouse-governor".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy hand-applied workflow");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("workflow-snapshot-stray".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy stray snapshot");
+    drop(backend);
+    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    connection
+        .execute("DELETE FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1'", [])
+        .expect("simulate pre-migration store");
+    drop(connection);
+
+    let migrated = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("migrate store"));
+    assert!(migrated.using::<WorkflowTemplate>("flotilla").list().await.expect("list templates").items.is_empty());
+
+    migrated
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(
+            &InputMeta::builder().name("single-agent-contained".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("new global definition");
+    drop(migrated);
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen migrated store"));
+    assert!(reopened.definitions::<WorkflowTemplate>("flotilla").get("single-agent-contained").await.is_ok());
 }
 
 #[tokio::test]

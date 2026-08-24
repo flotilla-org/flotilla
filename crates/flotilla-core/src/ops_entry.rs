@@ -11,6 +11,14 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 
+/// Store identity for a project-owned workflow template.
+///
+/// Operational entries keep using their short name. The project prefix keeps
+/// independently-authored definitions out of the same merge record.
+pub fn materialized_workflow_name(project: &str, workflow: &str) -> String {
+    format!("{project}--{workflow}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalEntryFile {
     pub path: String,

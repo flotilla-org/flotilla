@@ -5899,10 +5899,13 @@ impl InProcessDaemon {
             )?;
         }
 
-        let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
+        let templates = self.resource_backend.clone().definitions::<WorkflowTemplate>(&namespace);
         let mut changes = Vec::new();
         for (name, (meta, spec)) in &workflows {
-            let current = match templates.get(name).await {
+            let stored_name = crate::ops_entry::materialized_workflow_name(project_name, name);
+            let mut stored_meta = meta.clone();
+            stored_meta.name.clone_from(&stored_name);
+            let current = match templates.get(&stored_name).await {
                 Ok(current) => Some(current),
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
@@ -5915,28 +5918,31 @@ impl InProcessDaemon {
                 }
             }
             if current.as_ref().is_none_or(|current| current.spec != *spec || current.metadata.annotations != meta.annotations) {
-                match current {
-                    Some(current) => {
-                        templates.update(meta, &current.metadata.resource_version, spec).await.map_err(|error| error.to_string())?;
-                    }
-                    None => {
-                        templates.create(meta, spec).await.map_err(|error| error.to_string())?;
-                    }
-                }
+                templates.apply(&stored_meta, spec).await.map_err(|error| error.to_string())?;
                 changes.push(format!("WorkflowTemplate/{name}"));
             }
         }
-        for stale in templates.list().await.map_err(|error| error.to_string())?.items.into_iter().filter(|template| {
+        let desired_workflow_names =
+            workflows.keys().map(|name| crate::ops_entry::materialized_workflow_name(project_name, name)).collect::<BTreeSet<_>>();
+        let project_workflow_prefix = format!("{project_name}--");
+        for stale in templates.list().await.map_err(|error| error.to_string())?.into_iter().filter(|template| {
             template.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
-                && !workflows.contains_key(&template.metadata.name)
+                && !desired_workflow_names.contains(&template.metadata.name)
         }) {
             templates.delete(&stale.metadata.name).await.map_err(|error| error.to_string())?;
-            changes.push(format!("deleted WorkflowTemplate/{}", stale.metadata.name));
+            let logical_name = stale.metadata.name.strip_prefix(&project_workflow_prefix).unwrap_or(&stale.metadata.name);
+            changes.push(format!("deleted WorkflowTemplate/{logical_name}"));
         }
 
         let convoy_ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
         for (name, (meta, spec)) in &ensures {
-            let workflow = templates.get(&spec.workflow_ref).await.map_err(|error| {
+            let stored_workflow_ref = crate::ops_entry::materialized_workflow_name(project_name, &spec.workflow_ref);
+            let workflow = match templates.get(&stored_workflow_ref).await {
+                Ok(workflow) => Ok(workflow),
+                Err(ResourceError::NotFound { .. }) => templates.get(&spec.workflow_ref).await,
+                Err(error) => Err(error),
+            }
+            .map_err(|error| {
                 format!(
                     "{} ensure `{name}` references workflow template {}: {error}",
                     meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).map(String::as_str).unwrap_or("operational entry"),
