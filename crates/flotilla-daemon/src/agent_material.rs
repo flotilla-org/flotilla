@@ -30,6 +30,8 @@ const CODEX_POOL_REF: &str = "codex-login";
 pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
+const PRIVATE_SKILL_REPOSITORY: &str = "mattpocock-skills";
+const PUBLIC_SKILL_REPOSITORY: &str = "rjw-skills";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +273,9 @@ impl SkillBundle {
                 ],
                 failure_context: "generation-pinned skill source preflight failed".to_string(),
             },
-            github_repository_grants: BTreeSet::from(["mattpocock-skills".to_string()]),
+            // The App token is deliberately limited to the private fork. The
+            // other pinned source must remain publicly readable.
+            github_repository_grants: BTreeSet::from([PRIVATE_SKILL_REPOSITORY.to_string()]),
         })
     }
 
@@ -352,8 +356,8 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
     let manifest = serde_json::from_str::<SkillBundleManifest>(&manifest)
         .map_err(|error| format!("decode skill bundle manifest {}: {error}", manifest_path.display()))?;
     let expected = BTreeMap::from([
-        ("mattpocock-skills", "https://github.com/flotilla-org/mattpocock-skills.git"),
-        ("rjw-skills", "https://github.com/rjwittams/rjw-skills.git"),
+        (PRIVATE_SKILL_REPOSITORY, "https://github.com/flotilla-org/mattpocock-skills.git"),
+        (PUBLIC_SKILL_REPOSITORY, "https://github.com/rjwittams/rjw-skills.git"),
     ]);
     let actual = manifest.sources.iter().map(|source| (source.name.as_str(), source.repository.as_str())).collect::<BTreeMap<_, _>>();
     if manifest.schema_version != 1 || actual != expected || manifest.sources.len() != expected.len() {

@@ -4202,7 +4202,7 @@ mod tests {
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            if self.1.is_some() || cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
+            if cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
                 Ok(String::new())
             } else {
                 self.0.run(cmd, args, cwd, label).await
@@ -4210,11 +4210,7 @@ mod tests {
         }
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            if self.1.is_some() {
-                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
-            } else {
-                self.0.run_output(cmd, args, cwd, label).await
-            }
+            self.0.run_output(cmd, args, cwd, label).await
         }
 
         async fn run_with_input(
