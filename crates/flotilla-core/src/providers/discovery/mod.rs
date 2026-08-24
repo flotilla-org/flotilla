@@ -919,7 +919,7 @@ mod orchestrator_tests {
                     Ok(repo_root.join(".git").to_string_lossy().into_owned()),
                 )
                 .on_run("git", &["remote"], Ok("origin".into()))
-                .on_run("git", &["remote", "get-url", "origin"], Ok("git@github.com:testowner/testrepo.git".into()))
+                .on_run("git", &["config", "--get", "remote.origin.url"], Ok("git@github.com:testowner/testrepo.git".into()))
                 .build(),
         )
     }
