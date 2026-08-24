@@ -35,9 +35,10 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
 #[tokio::test]
 async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let github = RepositorySpec::remote("https://github.com/acme/app").expect("repository");
-    repositories.create(&InputMeta::builder().name(github.key().to_string()).build(), &github).await.expect("create repository");
+    repository_writer.create(&InputMeta::builder().name(github.key().to_string()).build(), &github).await.expect("create repository");
     let github_source = IssueSource { service: "https://github.com".into(), scope: "acme/app".into() };
     let forgejo_source = IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() };
     let project = ProjectSpec {
@@ -122,7 +123,10 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_sources: Vec::new(),
+        issue_sources: vec![IssueSourceBindingSpec::builder()
+            .source(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() })
+            .filter(IssueFilter { match_fields: BTreeMap::from([("labels".into(), IssueFieldValue::One("ready".into()))]) })
+            .build()],
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
@@ -157,6 +161,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
         &IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
     ]);
     assert_eq!(bindings.iter().map(|binding| binding.alias.as_str()).collect::<Vec<_>>(), vec!["api", "core"]);
+    assert!(bindings.iter().find(|binding| binding.alias == "core").expect("filtered derived binding").creatable);
 }
 
 #[tokio::test]

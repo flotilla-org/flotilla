@@ -396,6 +396,8 @@ async fn refresh_window(
     if matches!(query, QueryId::Issues { search: Some(_), .. })
         || window.sources.iter().any(|source| !source.query_params.match_fields.is_empty())
     {
+        // Provider-specific fields are not all present in normalized Issues,
+        // so changed-since results cannot be safely filtered client-side.
         *window = load_window(query, generation, resolver, state, event_tx).await;
         return;
     }

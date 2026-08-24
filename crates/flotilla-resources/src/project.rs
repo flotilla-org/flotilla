@@ -38,9 +38,8 @@ pub struct IssueSourceBindingSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[builder(default)]
     pub create_with: BTreeMap<String, IssueFieldValue>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[builder(default)]
-    pub creatable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creatable: Option<bool>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[builder(default)]
     pub exclude: bool,
@@ -48,7 +47,7 @@ pub struct IssueSourceBindingSpec {
 
 impl From<IssueSource> for IssueSourceBindingSpec {
     fn from(source: IssueSource) -> Self {
-        Self { source, alias: None, filter: IssueFilter::default(), create_with: BTreeMap::new(), creatable: false, exclude: false }
+        Self { source, alias: None, filter: IssueFilter::default(), create_with: BTreeMap::new(), creatable: None, exclude: false }
     }
 }
 
@@ -236,7 +235,7 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
                     .unwrap_or_else(|| repository.object.spec.leaf_slug()),
                 filter: declaration.map_or_else(IssueFilter::default, |binding| binding.filter.clone()),
                 create_with: declaration.map_or_else(BTreeMap::new, |binding| binding.create_with.clone()),
-                creatable: declaration.is_none_or(|binding| binding.creatable),
+                creatable: declaration.and_then(|binding| binding.creatable).unwrap_or(true),
             });
         }
     }
@@ -255,7 +254,7 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
             alias,
             filter: declaration.filter.clone(),
             create_with: declaration.create_with.clone(),
-            creatable: declaration.creatable,
+            creatable: declaration.creatable.unwrap_or(false),
         });
     }
 
@@ -283,10 +282,10 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         if binding.filter.match_fields.keys().chain(binding.create_with.keys()).any(|field| field.eq_ignore_ascii_case("state")) {
             return Err("issue source bindings cannot configure state".to_string());
         }
-        if binding.exclude && (!binding.filter.is_empty() || !binding.create_with.is_empty() || binding.creatable) {
+        if binding.exclude && (!binding.filter.is_empty() || !binding.create_with.is_empty() || binding.creatable.is_some()) {
             return Err("excluded issue source binding cannot declare filter, create_with, or creatable".to_string());
         }
-        if binding.creatable {
+        if binding.creatable == Some(true) {
             for (field, expected) in &binding.filter.match_fields {
                 let Some(actual) = binding.create_with.get(field) else {
                     return Err(format!("creatable issue source binding create_with does not satisfy filter field `{field}`"));

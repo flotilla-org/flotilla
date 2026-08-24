@@ -2204,7 +2204,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
-                        issues: vec![IssueSelector::Reference(reference.clone())],
+                        issues: vec![IssueSelector::Alias { alias: "planning".into(), id: reference.id.clone() }],
                         name: Some("issue-732".into()),
                         branch: Some("fix/issue-732".into()),
                         workflow_ref: Some("single-agent-contained".into()),
@@ -2251,6 +2251,33 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted_issue.snapshot.title, issue.title);
     assert_eq!(persisted_issue.snapshot.body, issue.body);
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
+
+    let bare_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        change_request: None,
+                        issues: vec![IssueSelector::Id(reference.id.clone())],
+                        name: Some("ambiguous-issue".into()),
+                        branch: Some("fix/ambiguous-issue".into()),
+                        workflow_ref: Some("single-agent-contained".into()),
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        agent_overrides: Vec::new(),
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                    }),
+                })
+                .build(),
+        )
+        .await
+        .expect("bare issue command accepted");
+    assert_eq!(recv_command_finished(&mut events, bare_id).await, CommandValue::Error {
+        message: "issue 732 requires an alias because project flotilla has 2 issue sources".into()
+    });
 
     let default_id = daemon
         .execute(
