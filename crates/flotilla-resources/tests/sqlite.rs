@@ -854,7 +854,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .await
         .expect("terminal child should be created");
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
@@ -878,7 +878,7 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");

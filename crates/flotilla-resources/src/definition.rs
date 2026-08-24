@@ -43,6 +43,9 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        if matches!(&self.backend, ResourceBackend::Http(_)) {
+            return self.backend.using::<T>(&self.namespace).get(name).await;
+        }
         let sources = self.sources_for_name(name).await?;
         if sources.is_empty() {
             return Err(ResourceError::not_found(name));
@@ -56,6 +59,9 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn list(&self) -> Result<Vec<ResourceObject<T>>, ResourceError> {
         ensure_definitions::<T>()?;
+        if matches!(&self.backend, ResourceBackend::Http(_)) {
+            return self.backend.using::<T>(&self.namespace).list().await.map(|list| list.items);
+        }
         let mut by_name = BTreeMap::<String, Vec<DefinitionSource<T>>>::new();
         for source in self.sources().await? {
             by_name.entry(source.object.metadata.name.clone()).or_default().push(source);

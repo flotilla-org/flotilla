@@ -315,7 +315,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
 
     reconciler.run_finalizer(&implement).await.expect("vessel finalization");
     checkouts.get(&checkout_meta.name).await.expect("vessel finalization must preserve convoy checkout");
-    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
         .with_checkouts(checkouts.clone())
         .run_finalizer(&convoy)
         .await
@@ -2064,7 +2064,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .expect("vessel finalizer and convoy label should be recorded");
     create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed = convoys.get("convoy-finalizer").await.expect("completed convoy should exist");

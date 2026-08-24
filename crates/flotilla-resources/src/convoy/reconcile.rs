@@ -28,8 +28,9 @@ use crate::{
     terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    ChangeRequest, ChangeRequestLeafSubject, Clock, EnvironmentWaitReason, InputMeta, InputValue, OwnerReference, PlacementStatus,
-    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
+    ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, EnvironmentWaitReason, InputMeta, InputValue, OwnerReference,
+    PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue,
+    TypedResolver,
 };
 
 #[async_trait]
@@ -69,7 +70,7 @@ pub enum ConvoyEvent {
 
 #[derive(Clone)]
 pub struct ConvoyReconciler {
-    templates: TypedResolver<WorkflowTemplate>,
+    templates: DefinitionResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
     federated_vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
@@ -95,7 +96,7 @@ pub struct ConvoyPrepared {
 }
 
 impl ConvoyReconciler {
-    pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
+    pub fn new(templates: DefinitionResolver<WorkflowTemplate>) -> Self {
         Self {
             templates,
             vessels: None,

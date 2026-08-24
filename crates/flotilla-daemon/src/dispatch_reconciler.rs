@@ -217,7 +217,7 @@ impl DispatchReconciler {
     ) -> Result<usize, String> {
         let queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
         let observations = self.backend.clone().using::<DispatchObservation>(&project.metadata.namespace);
-        let workflows = self.backend.clone().using::<WorkflowTemplate>(&project.metadata.namespace);
+        let workflows = self.backend.definitions::<WorkflowTemplate>(&project.metadata.namespace);
         let mut recorded = 0;
         for convoy in convoys {
             for issue in &convoy.spec.issues {
@@ -549,12 +549,19 @@ mod tests {
         let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, _, clock, reconciler) = harness(vec![ready.clone()], vec![], policy(300)).await;
         reconciler.reconcile_once().await.expect("queue pass");
-        backend
-            .clone()
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
+        let workflow_root = flotilla_protocol::NodeId::new("workflow-authority");
+        let workflow_authority = ResourceBackend::InMemory(Default::default()).with_local_root(workflow_root.clone());
+        workflow_authority
+            .definitions::<WorkflowTemplate>(NAMESPACE)
+            .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
             .await
             .expect("workflow");
+        backend
+            .replica_writer::<WorkflowTemplate>(workflow_root, NAMESPACE)
+            .replace(&workflow_authority.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("workflow authority log"), Utc::now())
+            .await
+            .expect("replicate workflow");
+        assert!(backend.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("local workflows").items.is_empty());
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)

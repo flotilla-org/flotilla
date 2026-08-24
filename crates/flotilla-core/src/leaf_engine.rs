@@ -1126,7 +1126,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1424,7 +1424,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1492,7 +1492,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")),
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")),
                 resync_interval: Duration::from_secs(3600),
                 backend,
             }
@@ -1565,7 +1565,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1727,7 +1727,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
                     .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"))
                     .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),

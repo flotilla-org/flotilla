@@ -2038,7 +2038,7 @@ fn spawn_controller_loops(
                 secondaries.push(daemon.reconciler_wake_watch());
                 (
                     secondaries,
-                    ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
+                    ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
@@ -3811,7 +3811,7 @@ mod tests {
 
         // The checkout authority's `OwnerTerminal` cascade already collected
         // the managed checkout: no checkout record exists for this pass.
-        let reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE))
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
             .with_vessels(vessels)
             .with_checkouts(backend.clone().using::<ResourceCheckout>(NAMESPACE))
             .with_teardown_runtime(Arc::new(DaemonConvoyTeardownRuntime::new(Arc::clone(&daemon))));
@@ -6660,7 +6660,7 @@ mod tests {
     #[tokio::test]
     async fn startup_seeding_reconciles_existing_builtin_template_definition() {
         let backend = ResourceBackend::InMemory(Default::default());
-        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
         let mut stale = flotilla_resources::single_agent_contained_workflow_spec();
         stale.vessels[0].stance = Stance::Trusted;
         templates
@@ -6726,7 +6726,7 @@ mod tests {
     async fn startup_seeding_labels_matching_unlabelled_builtin_template_once() {
         const NAMESPACE: &str = "test";
         let backend = ResourceBackend::InMemory(Default::default());
-        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
         templates
             .create(&empty_meta("single-agent-contained"), &flotilla_resources::single_agent_contained_workflow_spec())
             .await
@@ -7231,7 +7231,7 @@ mod tests {
             .await
             .expect("replicate fresh CR evidence to convoy authority A");
         let current = convoys.get("cross-host").await.expect("get Landing convoy");
-        let reconciler = ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>(NAMESPACE))
+        let reconciler = ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>(NAMESPACE))
             .with_federated_checkouts(authority.including_replicas::<Checkout>(NAMESPACE))
             .with_change_requests(
                 authority.including_replicas::<flotilla_resources::ChangeRequest>(NAMESPACE),
