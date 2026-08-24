@@ -4251,6 +4251,56 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
     assert!(projects.items.is_empty());
 }
 
+#[tokio::test]
+async fn associated_checkout_remote_move_updates_repository_in_place() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    let fresh = temp.path().join("fresh");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    std::fs::create_dir_all(&fresh).expect("create fresh dir");
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let remote = Arc::new(std::sync::RwLock::new("old-repo".to_string()));
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&remote) }));
+    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::clone(&remote)).await;
+    daemon.add_repo(&repo).await.expect("track old remote");
+
+    let original = RepositorySpec::remote("https://github.com/owner/old-repo").expect("old spec");
+    let original_key = original.key();
+    *remote.write().expect("remote lock") = "new-repo".to_string();
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh moved remote");
+
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let items = repositories.list().await.expect("list repositories").items;
+    assert_eq!(items.len(), 1, "remote move must not mint a sibling Repository");
+    let updated = &items[0];
+    assert_eq!(updated.metadata.name, original_key.to_string());
+    assert_eq!(updated.spec.remotes(), ["https://github.com/owner/new-repo", "https://github.com/owner/old-repo"]);
+    assert_eq!(updated.spec.forge().expect("live forge").repository, "owner/new-repo");
+
+    let fresh_inspection = daemon.inspect_repository_path(&fresh, None).await.expect("inspect fresh moved checkout");
+    assert_eq!(fresh_inspection.key(), original_key, "declared moved remote must resolve to the birth identity");
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectAdd {
+                    target: fresh.to_string_lossy().into_owned(),
+                    name: Some("moved-project".to_string()),
+                    display_name: None,
+                    remote: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("project add moved checkout");
+    assert!(matches!(recv_command_finished(&mut events, command_id).await, CommandValue::ProjectAdded { .. }));
+    assert_eq!(repositories.list().await.expect("repositories after project add").items.len(), 1);
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts");
+    assert!(observed.items.iter().all(|checkout| checkout.spec.repo_ref() == &original_key));
+}
+
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
     tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.expect("timeout waiting for event").expect("recv error")
 }

@@ -212,8 +212,8 @@ pub struct ResolvedCheckoutConfig {
 pub struct RepoFileConfig {
     #[allow(dead_code)] // Required field so TOML parsing accepts existing repo files
     pub path: String,
-    /// Repository transport remotes, canonical first. When present this
-    /// declaration is the authority for Repository identity.
+    /// Repository transport remotes. The first declaration establishes
+    /// identity for a new Repository; existing Repository identity is stable.
     #[serde(default)]
     pub remotes: Vec<String>,
     #[serde(default)]
@@ -717,12 +717,30 @@ impl ConfigStore {
         repo_root: &ExecutionEnvironmentPath,
         mut spec: RepositorySpec,
     ) -> Result<RepositorySpec, String> {
-        let Some(repo_cfg) = self.load_repo_file_config(repo_root) else {
+        let Some(mut repo_cfg) = self.load_repo_file_config(repo_root) else {
             return Ok(spec);
         };
         if !repo_cfg.remotes.is_empty() {
-            spec = spec.with_remotes(repo_cfg.remotes)?;
+            spec = spec.with_remotes(std::mem::take(&mut repo_cfg.remotes))?;
         }
+        Self::apply_repository_properties(spec, repo_cfg)
+    }
+
+    pub fn configure_repository_declarations(
+        &self,
+        mut spec: RepositorySpec,
+        repo_root: &ExecutionEnvironmentPath,
+    ) -> Result<RepositorySpec, String> {
+        let Some(mut repo_cfg) = self.load_repo_file_config(repo_root) else {
+            return Ok(spec);
+        };
+        if !repo_cfg.remotes.is_empty() {
+            spec = spec.with_declared_remotes(std::mem::take(&mut repo_cfg.remotes))?;
+        }
+        Self::apply_repository_properties(spec, repo_cfg)
+    }
+
+    fn apply_repository_properties(mut spec: RepositorySpec, repo_cfg: RepoFileConfig) -> Result<RepositorySpec, String> {
         if let Some(upstream) = repo_cfg.upstream {
             spec = spec.with_upstream(upstream.url, upstream.relation)?;
         }

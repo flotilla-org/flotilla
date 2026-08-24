@@ -2451,6 +2451,34 @@ impl InProcessDaemon {
     }
 
     async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        if let Some(repository_key) = self.repository_keys_by_path.read().await.get(path).cloned() {
+            let namespace = self.provisioning_namespace().await;
+            let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+            if let Ok(stored) = repositories.get(&repository_key.to_string()).await {
+                if !matches!(stored.spec.identity(), flotilla_resources::RepositoryIdentity::Remote { .. })
+                    || !matches!(spec.identity(), flotilla_resources::RepositoryIdentity::Remote { .. })
+                {
+                    return self.configure_unassociated_repository(path, spec).await;
+                }
+                let live_remote = spec.live_remote().map(str::to_string);
+                let stable_spec = spec.with_stable_identity_from(&stored.spec)?;
+                let mut updated = self.config.configure_repository_declarations(stable_spec, &ExecutionEnvironmentPath::new(path))?;
+                if let Some(live_remote) = live_remote {
+                    updated = updated.update_remotes(live_remote)?;
+                }
+                if updated != stored.spec {
+                    repositories
+                        .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &updated)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                return Ok(updated);
+            }
+        }
+        self.configure_unassociated_repository(path, spec).await
+    }
+
+    async fn configure_unassociated_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
         let resolved_spec = self.resolve_declared_repository(spec).await?;
         let configured_spec = self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(path), resolved_spec.clone())?;
         if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
@@ -2509,13 +2537,13 @@ impl InProcessDaemon {
         }
         let declared = matches.iter().filter(|repository| repository.spec.remotes().len() > 1).collect::<Vec<_>>();
         match declared.as_slice() {
-            [repository] => return observed.with_remotes(repository.spec.remotes().iter().cloned()),
+            [repository] => return repository.spec.clone().update_remotes(canonical_remote),
             [_, _, ..] => return Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
             [] => {}
         }
         match matches.as_slice() {
             [] => Ok(observed),
-            [repository] => observed.with_remotes(repository.spec.remotes().iter().cloned()),
+            [repository] => repository.spec.clone().update_remotes(canonical_remote),
             _ => Err(format!("remote `{canonical_remote}` is declared by multiple Repositories")),
         }
     }
@@ -3444,10 +3472,10 @@ impl InProcessDaemon {
                 Err(ResourceError::NotFound { .. }) => continue,
                 Err(error) => return Err(error.to_string()),
             };
-            let flotilla_resources::RepositoryIdentity::Remote { canonical_remote } = repository.object.spec.identity() else {
+            let Some(live_remote) = repository.object.spec.live_remote() else {
                 continue;
             };
-            let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(canonical_remote, change_request_id)? else {
+            let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(live_remote, change_request_id)? else {
                 unreachable!("change_request_address always returns a change-request address")
             };
             let record_name = change_request_record_name(&service, &scope, number);
@@ -5549,9 +5577,9 @@ impl InProcessDaemon {
                         unresolved.push(error);
                         continue;
                     }
-                    let url = match repository.spec.identity() {
-                        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
-                        flotilla_resources::RepositoryIdentity::Local { .. } => {
+                    let url = match repository.spec.live_remote() {
+                        Some(remote) => remote.to_string(),
+                        None => {
                             unresolved.push(format!("repository {} has no transport remote", entry.repo));
                             continue;
                         }
@@ -5746,6 +5774,8 @@ impl InProcessDaemon {
                     .await
                     .map_err(|error| format!("project member alias `{}` refers to unavailable repository {key}: {error}", member.alias))?
             };
+            let live_remote = declared_spec.live_remote().expect("remote RepositorySpec has a live remote");
+            let updated_spec = repository.spec.clone().update_remotes(live_remote)?;
             let mut repository_meta = InputMeta::from(&repository.metadata);
             for (annotation, value) in &provenance {
                 if repository_meta.annotations.get(annotation) != Some(value) {
@@ -5753,9 +5783,10 @@ impl InProcessDaemon {
                     repository_meta.annotations.insert(annotation.clone(), value.clone());
                 }
             }
-            if repository_meta.annotations != repository.metadata.annotations {
+            if repository_meta.annotations != repository.metadata.annotations || updated_spec != repository.spec {
+                converged = true;
                 repository = repositories
-                    .update(&repository_meta, &repository.metadata.resource_version, &repository.spec)
+                    .update(&repository_meta, &repository.metadata.resource_version, &updated_spec)
                     .await
                     .map_err(|error| error.to_string())?;
             }
@@ -6187,7 +6218,7 @@ impl InProcessDaemon {
         let path_is_explicit = target_syntax == ProjectTargetSyntax::ExplicitPath;
         let qualified_slug = target_syntax == ProjectTargetSyntax::QualifiedSlug;
         let path_candidate = if !qualified_slug && target_path.exists() {
-            Some(self.repository_inspector().await?.inspect_path(target_path, remote).await?)
+            Some(self.inspect_repository_path(target_path, remote).await?)
         } else if path_is_explicit {
             return Err(format!("repository path {} does not exist", target_path.display()));
         } else {
@@ -6456,6 +6487,7 @@ impl InProcessDaemon {
                 } else {
                     let namespace = self.provisioning_namespace().await;
                     self.reconcile_repository_config(&namespace, &inspection.key(), &inspection.spec).await?;
+                    self.reconcile_project_checkouts(&namespace, &inspection.key(), &inspection.spec, inspection.checkout.clone()).await?;
                     None
                 };
                 if key_changed {
@@ -9547,9 +9579,9 @@ impl InProcessDaemon {
             } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.resolve_repository_remote(&url).await?;
-                    let canonical_url = match repository_spec.identity() {
-                        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
-                        flotilla_resources::RepositoryIdentity::Local { .. } => {
+                    let canonical_url = match repository_spec.live_remote() {
+                        Some(remote) => remote.to_string(),
+                        None => {
                             return Err(format!("repository {url} did not resolve to a remote identity"));
                         }
                     };

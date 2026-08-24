@@ -497,6 +497,9 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");
     assert_eq!(app.repo, app_key, "alias should preserve the rename-stable RepositoryKey");
     assert!(app.roles.contains(&ProjectRepositoryRole::Knowledge));
+    let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("renamed app repository");
+    assert_eq!(app_repository.spec.live_remote(), Some("https://github.com/example/app-renamed"));
+    assert_eq!(app_repository.spec.forge().expect("live forge").repository, "example/app-renamed");
     assert_eq!(refreshed.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("commit-two"));
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
@@ -977,6 +980,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
 
     let canonical_url = "https://github.com/flotilla-org/flotilla";
     let mirror_url = "https://forgejo.lab/lab/flotilla";
+    let archive_url = "https://archive.example/flotilla-org/flotilla";
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")
         .with_remotes([canonical_url, mirror_url])
@@ -1016,7 +1020,8 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         .await;
 
     let resolved_mirror = daemon.inspect_repository_path(tmp.path().join("mirror-root").as_path(), None).await.expect("resolve mirror");
-    assert_eq!(resolved_mirror.spec, canonical);
+    assert_eq!(resolved_mirror.spec.key(), canonical.key());
+    assert_eq!(resolved_mirror.spec.live_remote(), Some(mirror_url));
     let mut events = daemon.subscribe();
     for path in [tmp.path().join("mirror-root"), tmp.path().join("github-root")] {
         let command_id =
@@ -1051,10 +1056,15 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
                 .is_ok_and(|contents| contents.lines().any(|line| line == format!("path = \"{}\"", mirror_path.display())))
         })
         .expect("mirror repo config");
-    std::fs::write(repo_config_path, format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\"]\n", mirror_path.display()))
-        .expect("conflicting mirror declaration");
-    let error = daemon.inspect_repository_path(&mirror_path, None).await.expect_err("canonical order must not flap across roots");
-    assert!(error.contains("changes the canonical remote of an existing declaration"));
+    std::fs::write(
+        repo_config_path,
+        format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\", \"{archive_url}\"]\n", mirror_path.display()),
+    )
+    .expect("conflicting mirror declaration");
+    let configured = daemon.inspect_repository_path(&mirror_path, None).await.expect("live order may differ from stable identity");
+    assert_eq!(configured.spec.key(), canonical.key());
+    assert_eq!(configured.spec.live_remote(), Some(mirror_url));
+    assert!(configured.spec.declares_remote(archive_url), "refresh must apply a newly configured remote declaration");
 }
 
 #[tokio::test]
