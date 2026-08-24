@@ -1293,7 +1293,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
 fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
     let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.to_string() },
-        DetailField { label: "Convoy", value: row.convoy.to_string() },
+        DetailField { label: "Convoy", value: row.convoy_name.to_string() },
         DetailField { label: "Vessel", value: row.vessel.name.clone() },
         DetailField { label: "Depends on", value: row.vessel.depends_on.join(", ") },
         DetailField { label: "Phase", value: vessel_phase(row).text },
