@@ -265,7 +265,6 @@ impl CloudAgentService for SlowCloudAgent {
 
 struct SlowCloudAgentFactory {
     agent: Arc<SlowCloudAgent>,
-    probes: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -284,16 +283,13 @@ impl Factory for SlowCloudAgentFactory {
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
-        if let Some(probes) = &self.probes {
-            probes.fetch_add(1, Ordering::SeqCst);
-        }
         Ok(Arc::clone(&self.agent) as Arc<dyn CloudAgentService>)
     }
 }
 
 fn slow_cloud_agent_discovery(agent: Arc<SlowCloudAgent>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
-    runtime.factories.cloud_agents.push(Box::new(SlowCloudAgentFactory { agent, probes: None }));
+    runtime.factories.cloud_agents.push(Box::new(SlowCloudAgentFactory { agent }));
     runtime
 }
 
@@ -327,6 +323,7 @@ impl AiUtility for SlowAiUtility {
 
 struct SlowAiUtilityFactory {
     utility: Arc<SlowAiUtility>,
+    probes: Option<Arc<AtomicUsize>>,
 }
 
 #[async_trait]
@@ -345,13 +342,16 @@ impl Factory for SlowAiUtilityFactory {
         _: &ExecutionEnvironmentPath,
         _: Arc<dyn flotilla_core::providers::CommandRunner>,
     ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        if let Some(probes) = &self.probes {
+            probes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
     }
 }
 
 fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
-    runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility }));
+    runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility, probes: None }));
     runtime
 }
 
@@ -740,8 +740,8 @@ async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repos
     let mut discovery = fake_discovery(false);
     discovery
         .factories
-        .cloud_agents
-        .push(Box::new(SlowCloudAgentFactory { agent: Arc::new(SlowCloudAgent::new()), probes: Some(Arc::clone(&probes)) }));
+        .ai_utilities
+        .push(Box::new(SlowAiUtilityFactory { utility: Arc::new(SlowAiUtility::new()), probes: Some(Arc::clone(&probes)) }));
 
     let daemon =
         InProcessDaemon::new(vec![repo_a, repo_b], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
@@ -2789,7 +2789,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let mut discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
     );
-    discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility) }));
+    discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility), probes: None }));
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, Some(reference.source.clone())).await;
