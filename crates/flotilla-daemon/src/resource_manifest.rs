@@ -21,6 +21,9 @@ use tracing::{info, warn};
 
 pub const MANIFEST_MANAGED_BY_VALUE: &str = "manifest";
 pub const MANIFEST_SOURCE_ANNOTATION: &str = "flotilla.work/manifest-source";
+pub const MANIFEST_PATH_ANNOTATION: &str = "flotilla.work/manifest-path";
+pub const MANIFEST_REVISION_ANNOTATION: &str = "flotilla.work/manifest-revision";
+pub const MANIFEST_RECONCILER_ROOT_ANNOTATION: &str = "flotilla.work/manifest-reconciler-root";
 pub const LAST_APPLIED_HASH_ANNOTATION: &str = "flotilla.work/last-applied-hash";
 pub const MANIFEST_REFUSAL_ANNOTATION: &str = "flotilla.work/manifest-refusal";
 pub const MANIFEST_LIVE_HASH_ANNOTATION: &str = "flotilla.work/manifest-live-hash";
@@ -72,19 +75,38 @@ pub struct ResourceManifestReconciler {
     backend: ResourceBackend,
     default_namespace: String,
     root: PathBuf,
+    source: String,
+    reconciler_root: String,
+    fixed_revision: Option<String>,
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
 }
 
 impl ResourceManifestReconciler {
-    pub fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
+            source: "local".to_string(),
+            reconciler_root: "local".to_string(),
+            fixed_revision: Some("unversioned".to_string()),
             warned_unmanaged: HashSet::new(),
             warned_drift: HashSet::new(),
         }
+    }
+
+    pub fn with_declared_source(mut self, source: impl Into<String>, reconciler_root: impl Into<String>) -> Self {
+        self.source = source.into();
+        self.reconciler_root = reconciler_root.into();
+        self.fixed_revision = None;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.fixed_revision = Some(revision.into());
+        self
     }
 
     pub async fn run(mut self, interval: Duration) -> Result<(), ResourceError> {
@@ -126,6 +148,15 @@ impl ResourceManifestReconciler {
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
+        let revision = match &self.fixed_revision {
+            Some(revision) => revision.clone(),
+            None => {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || resolve_clean_git_revision(&root))
+                    .await
+                    .map_err(|error| format!("manifest revision task failed: {error}"))??
+            }
+        };
         let root = self.root.clone();
         let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
             .await
@@ -141,7 +172,7 @@ impl ResourceManifestReconciler {
                 }
             };
             for (index, document) in documents.into_iter().enumerate() {
-                if let Err(reason) = self.reconcile_document(&relative, document, &mut report).await {
+                if let Err(reason) = self.reconcile_document(&relative, &revision, document, &mut report).await {
                     let path = if index == 0 { relative.clone() } else { PathBuf::from(format!("{}#{}", relative.display(), index + 1)) };
                     report.errors.push(ManifestDocumentError { path, reason });
                 }
@@ -150,10 +181,16 @@ impl ResourceManifestReconciler {
         Ok(report)
     }
 
-    async fn reconcile_document(&mut self, source: &Path, mut document: Value, report: &mut ManifestPassReport) -> Result<(), String> {
+    async fn reconcile_document(
+        &mut self,
+        path: &Path,
+        revision: &str,
+        mut document: Value,
+        report: &mut ManifestPassReport,
+    ) -> Result<(), String> {
         let identity = document_identity(&document, &self.default_namespace)?;
         let desired_hash = resource_document_spec_hash(&document).map_err(|error| format!("{identity}: {error}"))?;
-        stamp_manifest_metadata(&mut document, source, &desired_hash)?;
+        stamp_manifest_metadata(&mut document, &self.source, path, revision, &self.reconciler_root, &desired_hash)?;
 
         let existing = match get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name).await {
             Ok(existing) => Some(existing.value),
@@ -180,11 +217,13 @@ impl ResourceManifestReconciler {
         // write changes metadata only, so it is always safe to repair ownership
         // and record the spec that is already present.
         if live_hash == desired_hash {
-            let source_value = source.to_string_lossy();
             let labels = string_map(&existing, "labels")?;
             let settled = last_applied == live_hash
                 && labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
-                && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(source_value.as_ref())
+                && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
+                && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
+                && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
+                && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.reconciler_root.as_str())
                 && resolution.is_none()
                 && REFUSAL_ANNOTATIONS.iter().all(|key| !annotations.contains_key(*key));
             if settled {
@@ -212,7 +251,7 @@ impl ResourceManifestReconciler {
             if refreshed_annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str) != Some("adopt") {
                 return Err(format!("{identity}: adopt resolution changed while reconciling; retrying on the next pass"));
             }
-            self.adopt_live_spec(source, &identity, &existing).await?;
+            self.adopt_live_spec(path, &identity, &existing).await?;
 
             // The manifest rewrite crosses an await boundary and can take long
             // enough for another writer to change the object. Never clear the
@@ -229,8 +268,7 @@ impl ResourceManifestReconciler {
             }
 
             let mut adopted = existing;
-            set_annotation(&mut adopted, LAST_APPLIED_HASH_ANNOTATION, &live_hash)?;
-            stamp_manifest_ownership(&mut adopted, source)?;
+            stamp_manifest_metadata(&mut adopted, &self.source, path, revision, &self.reconciler_root, &live_hash)?;
             clear_manifest_state(&mut adopted)?;
             self.apply_manifest_document(adopted).await.map_err(|error| format!("{identity}: {error}"))?;
             self.clear_warnings(&identity);
@@ -241,7 +279,7 @@ impl ResourceManifestReconciler {
         let labels = string_map(&existing, "labels")?;
         if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANIFEST_MANAGED_BY_VALUE) {
             if self.warned_unmanaged.insert(identity.clone()) {
-                warn!(object = %identity, source = %source.display(), "manifest names an unmanaged object; refusing adoption");
+                warn!(object = %identity, source = %self.source, path = %path.display(), "manifest names an unmanaged object; refusing adoption");
             }
             self.record_refusal(&existing, "unmanaged", &live_hash, &last_applied, &desired_hash).await?;
             report.unmanaged += 1;
@@ -264,10 +302,12 @@ impl ResourceManifestReconciler {
             return Ok(());
         }
 
-        let source_value = source.to_string_lossy();
         if resolution.is_none()
             && desired_hash == last_applied
-            && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(source_value.as_ref())
+            && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
+            && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
+            && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
+            && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.reconciler_root.as_str())
         {
             report.unchanged += 1;
             return Ok(());
@@ -390,6 +430,30 @@ impl ResourceManifestReconciler {
     }
 }
 
+fn resolve_clean_git_revision(root: &Path) -> Result<String, String> {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", "."])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("run git status in {}: {error}", root.display()))?;
+    if !status.status.success() {
+        return Err(format!("git status in {} failed: {}", root.display(), String::from_utf8_lossy(&status.stderr).trim()));
+    }
+    if !status.stdout.is_empty() {
+        return Err(format!("manifest directory {} has changes not represented by a Git revision", root.display()));
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("resolve manifest revision in {}: {error}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!("resolve manifest revision in {}: {}", root.display(), String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let revision = String::from_utf8(output.stdout).map_err(|error| format!("manifest Git revision is not UTF-8: {error}"))?;
+    Ok(revision.trim().to_string())
+}
+
 fn manifest_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
         let entries = std::fs::read_dir(dir).map_err(|error| format!("read manifest directory {}: {error}", dir.display()))?;
@@ -455,25 +519,22 @@ fn document_identity(document: &Value, default_namespace: &str) -> Result<Object
     Ok(ObjectIdentity { kind, namespace, name })
 }
 
-fn stamp_manifest_metadata(document: &mut Value, source: &Path, hash: &str) -> Result<(), String> {
+fn stamp_manifest_metadata(
+    document: &mut Value,
+    source: &str,
+    path: &Path,
+    revision: &str,
+    reconciler_root: &str,
+    hash: &str,
+) -> Result<(), String> {
     let metadata =
         document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
     insert_metadata_value(metadata, "labels", MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)?;
-    insert_metadata_value(metadata, "annotations", MANIFEST_SOURCE_ANNOTATION, &source.to_string_lossy())?;
+    insert_metadata_value(metadata, "annotations", MANIFEST_SOURCE_ANNOTATION, source)?;
+    insert_metadata_value(metadata, "annotations", MANIFEST_PATH_ANNOTATION, &path.to_string_lossy())?;
+    insert_metadata_value(metadata, "annotations", MANIFEST_REVISION_ANNOTATION, revision)?;
+    insert_metadata_value(metadata, "annotations", MANIFEST_RECONCILER_ROOT_ANNOTATION, reconciler_root)?;
     insert_metadata_value(metadata, "annotations", LAST_APPLIED_HASH_ANNOTATION, hash)
-}
-
-fn stamp_manifest_ownership(document: &mut Value, source: &Path) -> Result<(), String> {
-    let metadata =
-        document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
-    insert_metadata_value(metadata, "labels", MANAGED_BY_LABEL, MANIFEST_MANAGED_BY_VALUE)?;
-    insert_metadata_value(metadata, "annotations", MANIFEST_SOURCE_ANNOTATION, &source.to_string_lossy())
-}
-
-fn set_annotation(document: &mut Value, key: &str, value: &str) -> Result<(), String> {
-    let metadata =
-        document.get_mut("metadata").and_then(Value::as_object_mut).ok_or_else(|| "missing or non-object metadata".to_string())?;
-    insert_metadata_value(metadata, "annotations", key, value)
 }
 
 fn clear_manifest_state(document: &mut Value) -> Result<(), String> {
@@ -521,7 +582,7 @@ fn string_map(document: &Value, field: &str) -> Result<BTreeMap<String, String>,
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{process::Command, time::Duration};
 
     use chrono::Utc;
     use flotilla_protocol::NodeId;
@@ -537,6 +598,23 @@ mod tests {
 
     fn write(path: &Path, content: &str) {
         std::fs::write(path, content).expect("write manifest");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").args(args).current_dir(dir).output().expect("run git fixture command");
+        assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).expect("git fixture output is UTF-8").trim().to_string()
+    }
+
+    fn committed_manifest_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("git tempdir");
+        git(dir.path(), &["init"]);
+        git(dir.path(), &["config", "user.name", "Manifest Test"]);
+        git(dir.path(), &["config", "user.email", "manifest-test@example.com"]);
+        write(&dir.path().join("policy.yaml"), &manifest("versioned", "current"));
+        git(dir.path(), &["add", "policy.yaml"]);
+        git(dir.path(), &["commit", "-m", "manifest"]);
+        dir
     }
 
     fn manifest(name: &str, pool: &str) -> String {
@@ -579,7 +657,10 @@ mod tests {
         for (name, source) in [("alpha", "nested/policies.yaml"), ("gamma", "nested/policies.yaml"), ("beta", "beta.json")] {
             let object = backend.using::<PlacementPolicy>(NAMESPACE).get(name).await.expect("manifest object");
             assert_eq!(object.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(MANIFEST_MANAGED_BY_VALUE));
-            assert_eq!(object.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some(source));
+            assert_eq!(object.metadata.annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str), Some("local"));
+            assert_eq!(object.metadata.annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str), Some(source));
+            assert_eq!(object.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("unversioned"));
+            assert_eq!(object.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str), Some("local"));
             assert_eq!(
                 object.metadata.annotations.get(LAST_APPLIED_HASH_ANNOTATION),
                 Some(
@@ -589,6 +670,68 @@ mod tests {
             );
         }
         assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("beta").await.expect("beta policy").spec.priority, 100);
+    }
+
+    #[tokio::test]
+    async fn divergent_trees_only_write_when_the_declared_root_runs() {
+        let kiwi_dir = tempfile::tempdir().expect("kiwi tempdir");
+        let feta_dir = tempfile::tempdir().expect("feta tempdir");
+        write(&kiwi_dir.path().join("policy.yaml"), &manifest("shared", "current"));
+        write(&feta_dir.path().join("policy.yaml"), &manifest("shared", "stale"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+
+        let mut kiwi = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, kiwi_dir.path())
+            .with_declared_source("project-map", "kiwi")
+            .with_revision("current-revision");
+        kiwi.reconcile_once().await.expect("declared root pass");
+
+        assert!(super::super::runtime::manifest_reconciler_enabled("kiwi", "kiwi"));
+        assert!(!super::super::runtime::manifest_reconciler_enabled("kiwi", "feta"));
+        // The false eligibility result means runtime never constructs or runs
+        // a reconciler against feta_dir, regardless of its stale contents.
+        let object = backend.using::<PlacementPolicy>(NAMESPACE).get("shared").await.expect("replicated manifest object");
+        assert_eq!(object.spec.pool, "current");
+        assert_eq!(object.metadata.annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str), Some("kiwi"));
+        assert_eq!(object.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("current-revision"));
+    }
+
+    #[test]
+    fn clean_manifest_tree_resolves_head_revision() {
+        let dir = committed_manifest_repo();
+
+        assert_eq!(resolve_clean_git_revision(dir.path()).expect("clean revision"), git(dir.path(), &["rev-parse", "HEAD"]));
+    }
+
+    #[test]
+    fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
+        let dir = committed_manifest_repo();
+        write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("dirty tree must be rejected");
+
+        assert!(error.contains("changes not represented by a Git revision"), "{error}");
+    }
+
+    #[test]
+    fn ignored_manifest_is_rejected_as_unversioned_input() {
+        let dir = committed_manifest_repo();
+        write(&dir.path().join(".gitignore"), "*.local.yaml\n");
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-m", "ignore local manifests"]);
+        write(&dir.path().join("draft.local.yaml"), &manifest("draft", "ignored"));
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("ignored manifest must be rejected");
+
+        assert!(error.contains("changes not represented by a Git revision"), "{error}");
+    }
+
+    #[test]
+    fn manifest_tree_outside_git_is_rejected() {
+        let dir = tempfile::tempdir_in("/tmp").expect("non-git tempdir");
+
+        let error = resolve_clean_git_revision(dir.path()).expect_err("non-repository must be rejected");
+
+        assert!(error.contains("git status"), "{error}");
     }
 
     #[tokio::test]
@@ -608,6 +751,27 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(before.metadata.resource_version, after.metadata.resource_version);
         assert!(tokio::time::timeout(Duration::from_millis(20), events.next()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_source_revision_does_not_rewrite_unchanged_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("steady-revision", "one"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path())
+            .with_declared_source("project-map", "kiwi")
+            .with_revision("revision-one");
+        reconciler.reconcile_once().await.expect("initial pass");
+        let before = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+
+        reconciler.fixed_revision = Some("revision-two".to_string());
+        let report = reconciler.reconcile_once().await.expect("unrelated revision pass");
+        let after = backend.using::<PlacementPolicy>(NAMESPACE).get("steady-revision").await.expect("policy");
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.updated, 0);
+        assert_eq!(after.metadata.resource_version, before.metadata.resource_version);
+        assert_eq!(after.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("revision-one"));
     }
 
     #[tokio::test]

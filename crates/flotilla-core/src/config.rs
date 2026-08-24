@@ -376,6 +376,10 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourceManifestsConfig {
     pub dir: PathBuf,
+    /// Stable identity of the manifest tree (normally its forge repository URL).
+    pub source: String,
+    /// Stable Host resource name of the sole daemon allowed to reconcile it.
+    pub reconciler_root: String,
 }
 
 /// Host-local structured daemon logging settings.

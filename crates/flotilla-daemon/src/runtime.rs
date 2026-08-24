@@ -502,14 +502,23 @@ impl DaemonRuntime {
             ),
         ];
         if let Some(manifests) = manifests {
-            tasks.push(spawn_manifest_reconciler_task(
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                manifests.dir,
-                MANIFEST_RECONCILE_INTERVAL,
-                options.controller_supervision.clone(),
-                runtime_health.clone(),
-            ));
+            if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
+                tasks.push(spawn_manifest_reconciler_task(
+                    daemon.resource_backend(),
+                    options.namespace.clone(),
+                    manifests,
+                    MANIFEST_RECONCILE_INTERVAL,
+                    options.controller_supervision.clone(),
+                    runtime_health.clone(),
+                ));
+            } else {
+                warn!(
+                    source = %manifests.source,
+                    declared_root = %manifests.reconciler_root,
+                    local_root = %profile.host_id,
+                    "manifest source belongs to another root; reconciliation disabled"
+                );
+            }
         }
 
         if options.start_controllers {
@@ -559,17 +568,22 @@ impl DaemonRuntime {
     }
 }
 
+pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str) -> bool {
+    declared_root == local_root
+}
+
 fn spawn_manifest_reconciler_task(
     backend: ResourceBackend,
     namespace: String,
-    root: PathBuf,
+    manifests: flotilla_core::config::ResourceManifestsConfig,
     interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         supervise_controller("manifest", supervision, runtime_health, move || {
-            let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), root.clone());
+            let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), manifests.dir.clone())
+                .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
             async move { reconciler.run(interval).await }
         })
         .await;

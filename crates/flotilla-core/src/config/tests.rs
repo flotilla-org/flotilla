@@ -666,11 +666,18 @@ fn load_daemon_config_from_file() {
 #[test]
 fn load_daemon_manifest_directory() {
     let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("daemon.toml"), "[manifests]\ndir = \"/srv/flotilla/manifests\"\n").unwrap();
+    std::fs::write(
+        dir.path().join("daemon.toml"),
+        "[manifests]\ndir = \"/srv/flotilla/manifests\"\nsource = \"https://github.com/example/project-map\"\nreconciler_root = \"kiwi-id\"\n",
+    )
+    .unwrap();
 
     let config = ConfigStore::with_base(dir.path()).load_daemon_config().expect("daemon config");
 
-    assert_eq!(config.manifests.expect("manifest config").dir, std::path::PathBuf::from("/srv/flotilla/manifests"));
+    let manifests = config.manifests.expect("manifest config");
+    assert_eq!(manifests.dir, std::path::PathBuf::from("/srv/flotilla/manifests"));
+    assert_eq!(manifests.source, "https://github.com/example/project-map");
+    assert_eq!(manifests.reconciler_root, "kiwi-id");
 }
 
 #[test]
