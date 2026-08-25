@@ -232,6 +232,25 @@ impl RepositorySpec {
         self.forge.as_ref()
     }
 
+    /// Forge identity used for issue-source derivation.
+    ///
+    /// A live transport may use an SSH alias host while retaining the same
+    /// repository path. In that case the stable remote supplies the canonical
+    /// service. A changed repository path is a real move and continues to use
+    /// the live forge identity.
+    pub fn issue_source_forge(&self) -> Option<ForgeIdentity> {
+        let live = self.forge.as_ref()?;
+        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
+            return Some(live.clone());
+        };
+        let stable = forge_from_canonical_remote(canonical_remote).ok()?;
+        if stable.repository == live.repository {
+            Some(stable)
+        } else {
+            Some(live.clone())
+        }
+    }
+
     pub fn upstream(&self) -> Option<&RepositoryUpstream> {
         self.upstream.as_ref()
     }
