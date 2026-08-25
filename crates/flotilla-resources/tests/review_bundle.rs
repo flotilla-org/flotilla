@@ -63,6 +63,24 @@ fn rejects_an_unanswered_finding() {
 }
 
 #[test]
+fn rejects_a_ref_pair_that_differs_from_the_bundle() {
+    let bundle = write_bundle(&index(FindingResolution::Addressed { fix_reference: "commit:abc123".to_string() }, "sha256:reviewed-head"));
+    let claim = SettlementClaimEvidence::builder()
+        .refs(ReviewRefPair::builder().base("refs/heads/release".to_string()).head("refs/heads/topic".to_string()).build())
+        .bundle_url("https://objects.example/reviews/project/convoy/1/".to_string())
+        .claimed_head_digest("sha256:reviewed-head".to_string())
+        .build();
+
+    let error = validate_settlement_claim(&claim, bundle.path()).expect_err("wrong reviewable unit must be refused");
+
+    assert!(matches!(
+        error,
+        ClaimAdmissibilityError::RefPairMismatch { ref claimed, ref bundled }
+            if claimed.base == "refs/heads/release" && bundled.base == "refs/heads/main"
+    ));
+}
+
+#[test]
 fn rejects_a_claimed_head_digest_that_differs_from_the_bundle() {
     let bundle = write_bundle(&index(
         FindingResolution::RejectedWithRationale { rationale: "The reported behavior is required".to_string() },

@@ -8,8 +8,8 @@ use crate::{
     resource::define_resource,
     status_patch::StatusPatch,
     workflow_template::{ExitDeclaration, SubjectVariable, TurnDeliveryRule, VesselRequirement},
-    ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceObject, ResourceProvenance, ACTUATOR_HOST_REF_ANNOTATION,
-    CONVOY_LABEL,
+    ReadResourceObject, ReplicationClass, RepositoryKey, Resource, ResourceObject, ResourceProvenance, SettlementClaimEvidence,
+    ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
 };
 
 mod reconcile;
@@ -626,7 +626,7 @@ pub struct CrewWorkState {
     /// Review evidence for this settlement claim. Kept optional while claim
     /// producers migrate onto the evidence-backed protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim_evidence: Option<crate::SettlementClaimEvidence>,
+    pub claim_evidence: Option<SettlementClaimEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
