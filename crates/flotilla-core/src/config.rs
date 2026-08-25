@@ -1,10 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 
-use flotilla_protocol::{IssueSource, NodeId, RepositoryRelation};
+use flotilla_protocol::NodeId;
 use flotilla_resources::RepositorySpec;
 use serde::{Deserialize, Serialize};
 
@@ -201,66 +201,10 @@ pub enum RepoViewLayoutConfig {
     Below,
 }
 
-/// Resolved checkout configuration (strategy + path) after merging per-repo overrides with global.
+/// Resolved checkout configuration from host defaults.
 pub struct ResolvedCheckoutConfig {
     pub strategy: String,
     pub path: String,
-}
-
-/// Full repo config file including optional overrides.
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoFileConfig {
-    #[allow(dead_code)] // Required field so TOML parsing accepts existing repo files
-    pub path: String,
-    /// Repository transport remotes. The first declaration establishes
-    /// identity for a new Repository; existing Repository identity is stable.
-    #[serde(default)]
-    pub remotes: Vec<String>,
-    #[serde(default)]
-    pub vcs: RepoVcsConfig,
-    #[serde(default)]
-    pub issue_tracker: RepoIssueTrackerConfig,
-    #[serde(default)]
-    pub upstream: Option<RepoUpstreamConfig>,
-    #[serde(default)]
-    pub workflow: RepoWorkflowConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoVcsConfig {
-    #[serde(default)]
-    pub git: RepoGitConfig,
-}
-
-/// Per-repo git overrides. Fields are Option so we can distinguish
-/// "not set" from "explicitly set to the default value."
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoGitConfig {
-    pub checkout_strategy: Option<String>,
-    pub checkout_path: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoIssueTrackerConfig {
-    #[serde(default)]
-    pub forgejo: Option<RepoForgejoIssueTrackerConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoForgejoIssueTrackerConfig {
-    pub scope: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RepoUpstreamConfig {
-    pub url: String,
-    pub relation: RepositoryRelation,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RepoWorkflowConfig {
-    #[serde(default)]
-    pub allow_reviewless: bool,
 }
 
 /// Global SSH settings for remote host connections.
@@ -457,9 +401,13 @@ pub struct StaticEnvironmentConfig {
     pub flotilla_command: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct RepoConfig {
-    path: String,
+/// Host-local observation seed. Intentionally incapable of carrying per-path
+/// configuration: unknown fields fail the entire file.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationRootsFile {
+    #[serde(default)]
+    paths: Vec<PathBuf>,
 }
 
 /// One persisted open View (ADR 0013). The address stays a raw string here:
@@ -478,27 +426,6 @@ struct OpenViewsFile {
     views: Vec<OpenViewEntry>,
 }
 
-fn repo_file_key(path: &Path) -> String {
-    let key = urlencoding::encode(&path.to_string_lossy()).into_owned();
-    if key.len() > 200 {
-        tracing::warn!(key_len = key.len(), path = %path.display(), "repo config filename key is close to filesystem limit");
-    }
-    key
-}
-
-fn migrate_repo_file(source: &Path, canonical: &Path) {
-    if source == canonical {
-        return;
-    }
-    let canonical_exists = canonical.exists();
-    let result = if canonical_exists { std::fs::remove_file(source) } else { std::fs::rename(source, canonical) };
-    if let Err(err) = result {
-        tracing::warn!(from = %source.display(), to = %canonical.display(), %err, "failed to migrate repo config filename");
-    } else if canonical_exists {
-        tracing::info!(legacy = %source.display(), canonical = %canonical.display(), "removed duplicate legacy repo config");
-    }
-}
-
 /// Owns daemon-side paths and caches the global `FlotillaConfig`.
 ///
 /// NOTE: This struct is accumulating path responsibilities beyond pure config.
@@ -507,13 +434,21 @@ pub struct ConfigStore {
     base: DaemonHostPath,
     state_dir: DaemonHostPath,
     global_config: OnceLock<Mutex<FlotillaConfig>>,
+    observation_roots: Mutex<()>,
+    repository_specs: Mutex<HashMap<PathBuf, RepositorySpec>>,
 }
 
 impl ConfigStore {
     /// Create a ConfigStore with explicit config and state directories.
     /// Production callers should pass paths from `PathPolicy`.
     pub fn new(base: DaemonHostPath, state_dir: DaemonHostPath) -> Self {
-        Self { base, state_dir, global_config: OnceLock::new() }
+        Self {
+            base,
+            state_dir,
+            global_config: OnceLock::new(),
+            observation_roots: Mutex::new(()),
+            repository_specs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Test constructor — uses provided base path for both config and state.
@@ -532,59 +467,56 @@ impl ConfigStore {
         &self.base
     }
 
-    fn repos_dir(&self) -> DaemonHostPath {
-        self.base.join("repos")
+    fn observation_roots_file(&self) -> DaemonHostPath {
+        self.base.join("observation-roots.toml")
     }
 
-    /// Load all persisted repo paths, migrating noncanonical filenames and sorting by path.
-    pub fn load_and_migrate_repos(&self) -> Vec<ExecutionEnvironmentPath> {
-        let dir = self.repos_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
+    pub fn load_observation_roots(&self) -> Result<Vec<ExecutionEnvironmentPath>, String> {
+        let file = self.observation_roots_file();
+        let content = match std::fs::read_to_string(file.as_path()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("failed to read {file}: {error}")),
         };
-        let files: Vec<PathBuf> =
-            entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "toml")).map(|e| e.path()).collect();
-        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = files
+        let roots: ObservationRootsFile = toml::from_str(&content).map_err(|error| format!("failed to parse {file}: {error}"))?;
+        let mut paths = roots.paths;
+        paths.sort();
+        paths.dedup();
+        Ok(paths.into_iter().map(ExecutionEnvironmentPath::new).collect())
+    }
+
+    pub fn add_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
+        let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
+        let mut paths = self.load_observation_roots()?.into_iter().map(ExecutionEnvironmentPath::into_path_buf).collect::<Vec<_>>();
+        paths.push(path.as_path().to_path_buf());
+        self.save_observation_roots(paths)
+    }
+
+    pub fn remove_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
+        let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
+        let paths = self
+            .load_observation_roots()?
             .into_iter()
-            .filter_map(|source| {
-                let content = std::fs::read_to_string(&source).ok()?;
-                let config: RepoConfig = toml::from_str(&content).ok()?;
-                let path = PathBuf::from(&config.path);
-                let canonical = dir.join(format!("{}.toml", repo_file_key(&path)));
-                migrate_repo_file(&source, canonical.as_path());
-                if path.is_dir() {
-                    Some((config.path, ExecutionEnvironmentPath::new(path)))
-                } else {
-                    None
-                }
-            })
+            .map(ExecutionEnvironmentPath::into_path_buf)
+            .filter(|candidate| candidate != path.as_path())
             .collect();
-        repos.sort_by(|a, b| a.0.cmp(&b.0));
-        repos.dedup_by(|a, b| a.0 == b.0);
-        repos.into_iter().map(|(_, path)| path).collect()
+        self.save_observation_roots(paths)
     }
 
-    /// Persist a repo path to config. No-op if already persisted.
-    pub fn save_repo(&self, path: &ExecutionEnvironmentPath) {
-        let dir = self.repos_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let key = repo_file_key(path.as_path());
-        let file = dir.join(format!("{key}.toml"));
-        if file.as_path().exists() {
-            return;
+    fn save_observation_roots(&self, mut paths: Vec<PathBuf>) -> Result<(), String> {
+        paths.sort();
+        paths.dedup();
+        std::fs::create_dir_all(self.base.as_path()).map_err(|error| format!("failed to create {}: {error}", self.base))?;
+        let file = self.observation_roots_file();
+        let content =
+            toml::to_string_pretty(&ObservationRootsFile { paths }).map_err(|error| format!("failed to encode {file}: {error}"))?;
+        let temporary = file.as_path().with_extension(format!("toml.tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, content).map_err(|error| format!("failed to write temporary observation roots file: {error}"))?;
+        if let Err(error) = std::fs::rename(&temporary, file.as_path()) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("failed to replace {file}: {error}"));
         }
-        let config = RepoConfig { path: path.as_path().to_string_lossy().to_string() };
-        if let Ok(content) = toml::to_string(&config) {
-            let _ = std::fs::write(file.as_path(), content);
-        }
-    }
-
-    /// Remove a repo's config file.
-    pub fn remove_repo(&self, path: &ExecutionEnvironmentPath) {
-        let dir = self.repos_dir();
-        let key = repo_file_key(path.as_path());
-        let file = dir.join(format!("{key}.toml"));
-        let _ = std::fs::remove_file(file.as_path());
+        Ok(())
     }
 
     fn open_views_file(&self) -> DaemonHostPath {
@@ -675,96 +607,31 @@ impl ConfigStore {
         }
     }
 
-    /// Resolve checkout config for a repo: per-repo override > global > defaults.
+    pub fn set_repository_spec(&self, repo_root: &ExecutionEnvironmentPath, spec: RepositorySpec) {
+        self.repository_specs.lock().expect("repository specs mutex poisoned").insert(repo_root.as_path().to_path_buf(), spec);
+    }
+
+    pub fn remove_repository_spec(&self, repo_root: &ExecutionEnvironmentPath) {
+        self.repository_specs.lock().expect("repository specs mutex poisoned").remove(repo_root.as_path());
+    }
+
     pub fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
         let global = self.load_config();
-        if let Some(repo_cfg) = self.load_repo_file_config(repo_root) {
-            return ResolvedCheckoutConfig {
-                strategy: repo_cfg.vcs.git.checkout_strategy.unwrap_or_else(|| global.vcs.git.checkout_strategy.clone()),
-                path: repo_cfg.vcs.git.checkout_path.unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
-            };
+        let specs = self.repository_specs.lock().expect("repository specs mutex poisoned");
+        let git = specs.get(repo_root.as_path()).map(RepositorySpec::vcs).map(|vcs| &vcs.git);
+        ResolvedCheckoutConfig {
+            strategy: git.and_then(|git| git.checkout_strategy.clone()).unwrap_or_else(|| global.vcs.git.checkout_strategy.clone()),
+            path: git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
         }
-        ResolvedCheckoutConfig { strategy: global.vcs.git.checkout_strategy.clone(), path: global.vcs.git.checkout_path.clone() }
     }
 
-    pub fn resolve_repo_issue_source(&self, repo_root: &ExecutionEnvironmentPath) -> Option<IssueSource> {
-        let repo_cfg = self.load_repo_file_config(repo_root)?;
-        let forgejo = repo_cfg.issue_tracker.forgejo?;
-        let scope = forgejo.scope?.trim().to_string();
-        if scope.is_empty() {
-            tracing::warn!(repo = %repo_root.as_path().display(), "repo Forgejo issue source scope is empty");
-            return None;
-        }
-        let service = self
-            .load_config()
-            .issue_tracker
-            .forgejo
-            .and_then(|config| config.service_url)
-            .map(|url| url.trim_end_matches('/').to_string())
-            .filter(|url| !url.is_empty());
-        let Some(service) = service else {
-            tracing::warn!(
-                repo = %repo_root.as_path().display(),
-                "repo has a Forgejo issue binding but [issue_tracker.forgejo].service_url is not configured"
-            );
-            return None;
-        };
-        Some(IssueSource { service, scope })
-    }
-
-    pub fn configure_repository_spec(
-        &self,
-        repo_root: &ExecutionEnvironmentPath,
-        mut spec: RepositorySpec,
-    ) -> Result<RepositorySpec, String> {
-        let Some(mut repo_cfg) = self.load_repo_file_config(repo_root) else {
-            return Ok(spec);
-        };
-        if !repo_cfg.remotes.is_empty() {
-            spec = spec.with_remotes(std::mem::take(&mut repo_cfg.remotes))?;
-        }
-        Self::apply_repository_properties(spec, repo_cfg)
-    }
-
-    pub fn configure_repository_declarations(
-        &self,
-        mut spec: RepositorySpec,
-        repo_root: &ExecutionEnvironmentPath,
-    ) -> Result<RepositorySpec, String> {
-        let Some(mut repo_cfg) = self.load_repo_file_config(repo_root) else {
-            return Ok(spec);
-        };
-        if !repo_cfg.remotes.is_empty() {
-            spec = spec.with_declared_remotes(std::mem::take(&mut repo_cfg.remotes))?;
-        }
-        Self::apply_repository_properties(spec, repo_cfg)
-    }
-
-    fn apply_repository_properties(mut spec: RepositorySpec, repo_cfg: RepoFileConfig) -> Result<RepositorySpec, String> {
-        if let Some(upstream) = repo_cfg.upstream {
-            spec = spec.with_upstream(upstream.url, upstream.relation)?;
-        }
-        Ok(spec.with_allow_reviewless_workflows(repo_cfg.workflow.allow_reviewless))
-    }
-
-    fn load_repo_file_config(&self, repo_root: &ExecutionEnvironmentPath) -> Option<RepoFileConfig> {
-        let key = repo_file_key(repo_root.as_path());
-        let repo_file = self.repos_dir().join(format!("{key}.toml"));
-        if let Ok(content) = std::fs::read_to_string(repo_file.as_path()) {
-            match toml::from_str::<RepoFileConfig>(&content) {
-                Ok(repo_cfg) => {
-                    if repo_cfg.path != repo_root.as_path().to_string_lossy() {
-                        tracing::warn!(path = %repo_file, expected = %repo_root.as_path().display(), actual = %repo_cfg.path, "repo config path mismatch");
-                        return None;
-                    }
-                    return Some(repo_cfg);
-                }
-                Err(e) => {
-                    tracing::warn!(path = %repo_file, err = %e, "failed to parse");
-                }
-            }
-        }
-        None
+    pub fn resolve_change_request_backend(&self, repo_root: &ExecutionEnvironmentPath) -> Option<String> {
+        self.repository_specs
+            .lock()
+            .expect("repository specs mutex poisoned")
+            .get(repo_root.as_path())
+            .and_then(|spec| spec.change_request().backend.clone())
+            .or_else(|| self.load_config().change_request.preference.backend)
     }
 }
 

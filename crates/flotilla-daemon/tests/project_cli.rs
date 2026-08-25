@@ -18,7 +18,6 @@ use flotilla_core::{
         materialized_workflow_name, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
         SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
-    path_context::ExecutionEnvironmentPath,
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
     providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
@@ -971,8 +970,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     std::fs::create_dir_all(&mirror_root).expect("mirror checkout");
     std::fs::create_dir_all(&github_root).expect("GitHub checkout");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let config_dir = tmp.path().join("config");
-    let config = test_config(config_dir.clone());
+    let config = test_config(tmp.path().join("config"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -984,7 +982,6 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
 
     let canonical_url = "https://github.com/flotilla-org/flotilla";
     let mirror_url = "https://forgejo.lab/lab/flotilla";
-    let archive_url = "https://archive.example/flotilla-org/flotilla";
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")
         .with_remotes([canonical_url, mirror_url])
@@ -1050,25 +1047,9 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     assert_eq!(daemon.repository_key_for_path(&tmp.path().join("github-root")).await, Some(canonical.key()));
 
     let mirror_path = tmp.path().join("mirror-root");
-    config.save_repo(&ExecutionEnvironmentPath::new(mirror_path.clone()));
-    let repo_config_path = std::fs::read_dir(config_dir.join("repos"))
-        .expect("repo config directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            std::fs::read_to_string(path)
-                .is_ok_and(|contents| contents.lines().any(|line| line == format!("path = \"{}\"", mirror_path.display())))
-        })
-        .expect("mirror repo config");
-    std::fs::write(
-        repo_config_path,
-        format!("path = \"{}\"\nremotes = [\"{mirror_url}\", \"{canonical_url}\", \"{archive_url}\"]\n", mirror_path.display()),
-    )
-    .expect("conflicting mirror declaration");
     let configured = daemon.inspect_repository_path(&mirror_path, None).await.expect("live order may differ from stable identity");
     assert_eq!(configured.spec.key(), canonical.key());
     assert_eq!(configured.spec.live_remote(), Some(mirror_url));
-    assert!(configured.spec.declares_remote(archive_url), "refresh must apply a newly configured remote declaration");
 }
 
 #[tokio::test]

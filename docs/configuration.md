@@ -4,25 +4,21 @@
 
 Stored in `~/.config/flotilla/`:
 
-- `repos/*.toml` — one file per tracked repo, containing `path = "..."`
+- `observation-roots.toml` — a flat `paths = [...]` list of checkouts observed by this host
 - `open-views.toml` — the ordered set of Views opened by the TUI
 
 Repos are added interactively from within flotilla using the `a` key.
+The observation-roots schema rejects every field except `paths`; repository
+configuration belongs in replicated Repository and Project specs.
 
 ### Fork provenance
 
 Repositories that are maintained as forks declare their upstream provenance in
-the tracked repo's TOML file:
+the replicated Repository spec. Issue-source bindings belong to the Project
+spec's `issue_sources` list, not the host's observation roots:
 
-```toml
-path = "/home/alice/dev/zellij"
-
-[upstream]
-url = "https://github.com/zellij-org/zellij"
-relation = "fork"
-
-[issue_tracker.forgejo]
-scope = "fork-issues/zellij"
+```json
+{ "upstream": { "url": "https://github.com/zellij-org/zellij", "relation": "fork" } }
 ```
 
 Fork-stance provisioning clones only the repository's own URL as `origin`; it
@@ -30,9 +26,8 @@ does not add the upstream as a remote. Convoy admission requires a workflow
 with an in-crew reviewer, such as `implement-review`. A deliberate per-repo
 override can admit review-less workflows:
 
-```toml
-[workflow]
-allow_reviewless = true
+```json
+{ "allow_reviewless_workflows": true }
 ```
 
 ## Convoy start attachment
@@ -203,11 +198,10 @@ Flotilla auto-detects available tools. Nothing is strictly required beyond git, 
 
 ## Checkout manager
 
-The checkout manager provider can be configured per-repo in `~/.config/flotilla/repos/<slug>.toml`:
+The checkout manager provider can be configured fleet-wide in the Repository spec:
 
-```toml
-[checkouts]
-provider = "wt"    # "wt", "git", or "auto" (default)
+```json
+{ "vcs": { "git": { "checkout_strategy": "wt" } } }
 ```
 
 - `auto`: uses `wt` if available, falls back to plain git worktrees

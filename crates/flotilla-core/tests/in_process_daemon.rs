@@ -3912,36 +3912,28 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
 }
 
 #[tokio::test]
-async fn refresh_syncs_fork_stance_without_whole_project_migration_and_clears_removed_config() {
-    let (temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+async fn refresh_preserves_repository_spec_fork_stance_and_explicit_removal() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
-    ConfigStore::with_base(temp.path().join("config")).save_repo(&ExecutionEnvironmentPath::new(repo.clone()));
-    let repo_config = std::fs::read_dir(temp.path().join("config/repos"))
-        .expect("repo config directory")
-        .find_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().is_some_and(|extension| extension == "toml")).then_some(path)
-        })
-        .expect("persisted repo config");
-    let path = repo.to_string_lossy();
-    std::fs::write(
-        &repo_config,
-        format!("path = \"{path}\"\n\n[upstream]\nurl = \"https://github.com/upstream/repo\"\nrelation = \"fork\"\n"),
-    )
-    .expect("write fork config");
-
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork config");
-
     let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("materialize repository");
     let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
-    assert!(stored.spec.is_fork(), "refresh should apply fork provenance without changing repository identity");
+    let fork = stored.spec.clone().with_upstream("https://github.com/upstream/repo", RepositoryRelation::Fork).expect("fork stance");
+    repositories.update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &fork).await.expect("set fork stance");
 
-    std::fs::write(&repo_config, format!("path = \"{path}\"\n")).expect("remove fork config");
-    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh removed fork config");
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork repository");
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.is_fork(), "refresh should preserve replicated fork provenance");
+
+    repositories
+        .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &repository)
+        .await
+        .expect("remove fork stance");
+    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh repository after explicit removal");
 
     let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
-    assert!(stored.spec.upstream().is_none(), "authoritative per-repository config removal should clear previously stored fork provenance");
+    assert!(stored.spec.upstream().is_none(), "refresh should preserve explicit fork provenance removal");
 }
 
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
@@ -4685,6 +4677,58 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 
     let repos = daemon.list_repos().await.expect("list_repos after remove");
     assert!(repos.is_empty());
+}
+
+#[tokio::test]
+async fn remove_repo_persistence_failure_leaves_repo_tracked() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    init_git_repo(&repo);
+
+    let config_dir = temp.path().join("config");
+    let config = test_config_store(config_dir.clone());
+    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+    daemon.add_repo(&repo).await.expect("track repo");
+
+    let roots_file = config_dir.join("observation-roots.toml");
+    std::fs::remove_file(&roots_file).expect("remove roots file");
+    std::fs::create_dir(&roots_file).expect("replace roots file with directory");
+
+    let error = daemon.remove_repo(&repo).await.expect_err("persistence failure should abort removal");
+    assert!(error.contains("failed to read"), "unexpected error: {error}");
+    assert!(daemon.tracked_repo_identity_for_path(&repo).await.is_some(), "repo should remain tracked");
+    assert_eq!(daemon.list_repos().await.expect("list repos").len(), 1);
+}
+
+#[tokio::test]
+async fn remove_repo_command_cleans_up_an_untracked_observation_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let unavailable = temp.path().join("unavailable-repo");
+    let config = test_config_store(temp.path().join("config"));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&unavailable)).expect("persist observation root");
+    let daemon = InProcessDaemon::new(vec![], Arc::clone(&config), fake_discovery(false), HostName::local()).await;
+    let mut rx = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("unavailable-repo".into()) }).build())
+        .await
+        .expect("remove observation root command");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(DaemonEvent::CommandFinished { command_id: finished_id, result, .. }) = rx.recv().await {
+                if finished_id == command_id {
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for remove command");
+
+    assert!(matches!(result, CommandValue::RepoUntracked { ref path } if *path == unavailable));
+    assert!(config.load_observation_roots().expect("load observation roots").is_empty());
 }
 
 #[tokio::test]

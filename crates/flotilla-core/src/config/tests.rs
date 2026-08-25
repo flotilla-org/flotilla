@@ -1,4 +1,10 @@
+use std::{
+    path::Path,
+    sync::{Arc, Barrier},
+};
+
 use flotilla_protocol::NodeId;
+use flotilla_resources::{RepositoryGitSpec, RepositoryProviderPreference, RepositorySpec, RepositoryVcsSpec};
 use tempfile::tempdir;
 
 use super::*;
@@ -13,293 +19,59 @@ fn ee(path: impl Into<PathBuf>) -> ExecutionEnvironmentPath {
     ExecutionEnvironmentPath::new(path.into())
 }
 
-fn write_repo_file(base: &Path, filename: &str, content: &str) {
-    let repos_dir = base.join("repos");
-    std::fs::create_dir_all(&repos_dir).unwrap();
-    std::fs::write(repos_dir.join(filename), content).unwrap();
-}
-
-fn write_forgejo_config(base: &Path, service_url: &str) {
-    std::fs::write(base.join("config.toml"), format!("[issue_tracker.forgejo]\nservice_url = \"{service_url}\"\n")).unwrap();
-}
-
-fn legacy_path_to_slug(path: &Path) -> String {
-    let raw = path.to_string_lossy().to_lowercase();
-    let mut prev_hyphen = false;
-    let slug: String = raw
-        .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                prev_hyphen = false;
-                Some(c)
-            } else if !prev_hyphen {
-                prev_hyphen = true;
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .collect();
-    slug.trim_matches('-').to_string()
-}
-
-fn colliding_repo_paths(base: &Path) -> (PathBuf, PathBuf) {
-    let repo_a = make_dir(&make_dir(base, "a-b"), "c");
-    let repo_b = make_dir(&make_dir(base, "a"), "b-c");
-    assert_eq!(legacy_path_to_slug(&repo_a), legacy_path_to_slug(&repo_b), "test setup should produce a legacy slug collision");
-    (repo_a, repo_b)
-}
-
 #[test]
-fn legacy_path_to_slug_covers_core_shapes() {
-    let cases = [
-        ("/Users/alice/dev/myrepo", "users-alice-dev-myrepo"),
-        ("relative/path", "relative-path"),
-        ("/Users/Bob Smith/my repo", "users-bob-smith-my-repo"),
-        ("/opt/my-project_v2.0", "opt-my-project_v2.0"),
-        ("/tmp/my__project", "tmp-my__project"),
-        ("/", ""),
-        (".", "."),
-    ];
-    for (input, expected) in cases {
-        assert_eq!(legacy_path_to_slug(Path::new(input)), expected, "unexpected slug for input: {input}");
-    }
-}
-
-#[test]
-fn save_repo_roundtrip_is_idempotent_and_removable() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    let repo = make_dir(base, "repo");
-    let repo_ee = ee(&repo);
-
-    let store = ConfigStore::with_base(base);
-    store.save_repo(&repo_ee);
-    store.save_repo(&repo_ee);
-    assert_eq!(store.load_and_migrate_repos(), vec![repo_ee.clone()]);
-
-    store.remove_repo(&repo_ee);
-    assert!(store.load_and_migrate_repos().is_empty());
-}
-
-#[test]
-fn load_and_migrate_repos_migrates_legacy_file_and_preserves_overrides() {
+fn observation_roots_roundtrip_and_reject_configuration() {
     let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "legacy-repo");
-    let legacy_filename = format!("{}.toml", legacy_path_to_slug(&repo));
-    let content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
-    write_repo_file(base, &legacy_filename, &content);
-
-    let store = ConfigStore::with_base(base);
-
-    assert_eq!(store.load_and_migrate_repos(), vec![ee(&repo)]);
-    assert!(!base.join("repos").join(legacy_filename).exists());
-    assert_eq!(
-        std::fs::read_to_string(base.join("repos").join(format!("{}.toml", repo_file_key(&repo)))).expect("read migrated repo config"),
-        content
-    );
-    assert_eq!(store.resolve_checkout_config(&ee(&repo)).strategy, "git");
-
-    store.remove_repo(&ee(&repo));
-    assert!(store.load_and_migrate_repos().is_empty());
-}
-
-#[test]
-fn resolve_repo_issue_source_reads_forgejo_binding() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "forgejo-repo");
-    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"fork-issues/zellij\"\n", repo.display());
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-    write_forgejo_config(base, "https://forgejo.example.test");
-
-    let store = ConfigStore::with_base(base);
-    let source = store.resolve_repo_issue_source(&ee(repo)).expect("repo issue source");
-
-    assert_eq!(source.service, "https://forgejo.example.test");
-    assert_eq!(source.scope, "fork-issues/zellij");
-}
-
-#[test]
-fn configure_repository_spec_reads_fork_stance_and_reviewless_override() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "zellij");
-    let content = format!(
-        "path = \"{}\"\n[upstream]\nurl = \"https://github.com/zellij-org/zellij.git\"\nrelation = \"fork\"\n[workflow]\nallow_reviewless = true\n",
-        repo.display()
-    );
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-
-    let store = ConfigStore::with_base(base);
-    let configured = store
-        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij").expect("fork repository"))
-        .expect("repository config");
-
-    assert_eq!(
-        configured.upstream(),
-        Some(&flotilla_protocol::RepositoryUpstream {
-            url: "https://github.com/zellij-org/zellij".to_string(),
-            relation: flotilla_protocol::RepositoryRelation::Fork,
-        })
-    );
-    assert!(configured.allows_reviewless_workflows());
-}
-
-#[test]
-fn configure_repository_spec_reads_canonical_first_remotes() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "flotilla-mirror");
-    let content = format!(
-        "path = \"{}\"\nremotes = [\"https://github.com/flotilla-org/flotilla\", \"https://forgejo.lab/lab/flotilla.git\"]\n",
-        repo.display()
-    );
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-
-    let configured = ConfigStore::with_base(base)
-        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror repository"))
-        .expect("repository config");
-
-    assert_eq!(configured.remotes(), ["https://github.com/flotilla-org/flotilla", "https://forgejo.lab/lab/flotilla"]);
-    assert_eq!(configured.key(), RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("canonical repository").key());
-}
-
-#[test]
-fn configure_repository_spec_rejects_remotes_without_the_observed_remote() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "flotilla-mirror");
-    let content = format!("path = \"{}\"\nremotes = [\"https://github.com/flotilla-org/flotilla\"]\n", repo.display());
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-
-    let error = ConfigStore::with_base(base)
-        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror repository"))
-        .expect_err("declaration must include observed remote");
-
-    assert!(error.contains("do not include observed remote"));
-}
-
-#[test]
-fn resolve_repo_issue_source_requires_global_forgejo_service_url() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "forgejo-repo");
-    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"team/widgets\"\n", repo.display());
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-
-    let store = ConfigStore::with_base(base);
-
-    assert!(store.resolve_repo_issue_source(&ee(repo)).is_none());
-}
-
-#[test]
-fn resolve_repo_issue_source_ignores_mismatched_repo_file() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "forgejo-repo");
-    let other = make_dir(base, "other-repo");
-    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"fork-issues/zellij\"\n", other.display());
-    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
-
-    let store = ConfigStore::with_base(base);
-
-    assert!(store.resolve_repo_issue_source(&ee(repo)).is_none());
-}
-
-#[test]
-fn load_and_migrate_repos_keeps_canonical_config_when_legacy_duplicate_exists() {
-    let dir = tempdir().expect("create config tempdir");
-    let base = dir.path();
-    let repo = make_dir(base, "duplicate-repo");
-    let canonical_content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"wt\"\n", repo.display());
-    let legacy_content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
-    let canonical_filename = format!("{}.toml", repo_file_key(&repo));
-    let legacy_filename = format!("{}.toml", legacy_path_to_slug(&repo));
-    write_repo_file(base, &canonical_filename, &canonical_content);
-    write_repo_file(base, &legacy_filename, &legacy_content);
-
-    let store = ConfigStore::with_base(base);
-
-    assert_eq!(store.load_and_migrate_repos(), vec![ee(&repo)]);
-    assert_eq!(
-        std::fs::read_to_string(base.join("repos").join(canonical_filename)).expect("read canonical repo config"),
-        canonical_content
-    );
-    assert!(!base.join("repos").join(legacy_filename).exists());
-    assert_eq!(store.resolve_checkout_config(&ee(repo)).strategy, "wt");
-}
-
-#[test]
-fn save_repo_tracks_paths_with_same_legacy_slug_independently() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    let (repo_a, repo_b) = colliding_repo_paths(base);
-
-    let store = ConfigStore::with_base(base);
-    store.save_repo(&ee(&repo_a));
-    store.save_repo(&ee(&repo_b));
-
-    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a), ee(repo_b)]);
-}
-
-#[test]
-fn remove_repo_only_removes_matching_path_when_legacy_slugs_collide() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    let (repo_a, repo_b) = colliding_repo_paths(base);
-
-    let store = ConfigStore::with_base(base);
-    store.save_repo(&ee(&repo_a));
-
-    store.remove_repo(&ee(&repo_b));
-
-    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a)]);
-}
-
-#[test]
-fn save_repo_creates_repos_dir_if_missing() {
-    let dir = tempdir().unwrap();
-    let base = dir.path().join("deep/nested/config");
-    let repo = make_dir(dir.path(), "myrepo");
-    let repo_ee = ee(&repo);
-
-    let store = ConfigStore::with_base(&base);
-    store.save_repo(&repo_ee);
-
-    assert!(base.join("repos").exists());
-    assert_eq!(store.load_and_migrate_repos(), vec![repo_ee]);
-}
-
-#[test]
-fn load_and_migrate_repos_sorts_and_skips_invalid_entries() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    let repo_a = make_dir(base, "alpha");
-    let repo_b = make_dir(base, "bravo");
-
-    let store = ConfigStore::with_base(base);
-    store.save_repo(&ee(&repo_b));
-    store.save_repo(&ee(&repo_a));
-
-    std::fs::write(base.join("repos").join("notes.txt"), "ignore me").unwrap();
-    write_repo_file(base, "broken.toml", "not valid toml");
-    write_repo_file(base, "missing-path.toml", "[section]\nkey = \"value\"\n");
-    write_repo_file(base, "ghost.toml", "path = \"/nonexistent/ghost\"\n");
-
-    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a), ee(repo_b)]);
-    assert!(base.join("repos/broken.toml").exists());
-    assert!(base.join("repos/missing-path.toml").exists());
-    assert!(!base.join("repos/ghost.toml").exists());
-    assert!(base.join("repos/%2Fnonexistent%2Fghost.toml").exists());
-}
-
-#[test]
-fn load_and_migrate_repos_returns_empty_when_dir_missing() {
-    let dir = tempdir().unwrap();
+    let repo = make_dir(dir.path(), "repo");
     let store = ConfigStore::with_base(dir.path());
-    assert!(store.load_and_migrate_repos().is_empty());
+
+    store.add_observation_root(&ee(&repo)).expect("add observation root");
+    store.add_observation_root(&ee(&repo)).expect("add duplicate observation root");
+    assert_eq!(store.load_observation_roots().expect("load observation roots"), vec![ee(&repo)]);
+    store.remove_observation_root(&ee(&repo)).expect("remove observation root");
+    assert!(store.load_observation_roots().expect("load empty observation roots").is_empty());
+
+    std::fs::write(dir.path().join("observation-roots.toml"), format!("paths = [\"{}\"]\nper_path = {{}}\n", repo.display()))
+        .expect("write invalid roots");
+    assert!(store.load_observation_roots().expect_err("per-path config must be rejected").contains("unknown field"));
+}
+
+#[test]
+fn unavailable_observation_roots_remain_declared() {
+    let dir = tempdir().expect("create config tempdir");
+    let unavailable = ee(dir.path().join("temporarily-unavailable"));
+    let store = ConfigStore::with_base(dir.path());
+
+    store.add_observation_root(&unavailable).expect("add unavailable observation root");
+
+    assert_eq!(store.load_observation_roots().expect("load observation roots"), vec![unavailable]);
+}
+
+#[test]
+fn concurrent_observation_root_updates_preserve_every_root() {
+    let dir = tempdir().expect("create config tempdir");
+    let store = Arc::new(ConfigStore::with_base(dir.path()));
+    let paths = (0..8).map(|index| make_dir(dir.path(), &format!("repo-{index}"))).collect::<Vec<_>>();
+    let mut expected = paths.iter().cloned().map(ee).collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(paths.len()));
+
+    let threads = paths
+        .into_iter()
+        .map(|path| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.add_observation_root(&ee(path)).expect("add observation root");
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().expect("observation root update thread");
+    }
+
+    expected.sort();
+    assert_eq!(store.load_observation_roots().expect("load observation roots"), expected);
 }
 
 #[test]
@@ -357,6 +129,34 @@ fn load_config_parses_full_overrides() {
     let cfg = store.load_config();
     assert_eq!(cfg.vcs.git.checkout_path, "/custom/{{ branch }}");
     assert_eq!(cfg.vcs.git.checkout_strategy, "worktree");
+}
+
+#[test]
+fn repository_provider_overrides_merge_with_global_defaults() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[vcs.git]\ncheckout_path = \"/global/{{ branch }}\"\ncheckout_strategy = \"clone\"\n[change_request]\nbackend = \"github\"\n",
+    )
+    .unwrap();
+    let store = ConfigStore::with_base(dir.path());
+    let overridden = ee(dir.path().join("overridden"));
+    let fallback = ee(dir.path().join("fallback"));
+    let spec = RepositorySpec::remote("https://git.example/acme/widgets")
+        .expect("repository spec")
+        .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_strategy: Some("worktree".into()), checkout_path: None } })
+        .with_change_request(RepositoryProviderPreference { backend: Some("forgejo".into()) });
+    store.set_repository_spec(&overridden, spec);
+
+    let resolved = store.resolve_checkout_config(&overridden);
+    assert_eq!(resolved.strategy, "worktree");
+    assert_eq!(resolved.path, "/global/{{ branch }}");
+    assert_eq!(store.resolve_change_request_backend(&overridden).as_deref(), Some("forgejo"));
+
+    let fallback_checkout = store.resolve_checkout_config(&fallback);
+    assert_eq!(fallback_checkout.strategy, "clone");
+    assert_eq!(fallback_checkout.path, "/global/{{ branch }}");
+    assert_eq!(store.resolve_change_request_backend(&fallback).as_deref(), Some("github"));
 }
 
 #[test]
@@ -430,85 +230,10 @@ fn load_config_is_cached() {
 }
 
 #[test]
-fn resolve_checkout_config_uses_global_when_repo_file_missing_or_invalid() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"/global/path\"\ncheckout_strategy = \"wt\"\n").unwrap();
-
-    let repo = make_dir(base, "repo");
-    let repo_ee = ee(&repo);
-    let store = ConfigStore::with_base(base);
-
-    let from_global = store.resolve_checkout_config(&repo_ee);
-    assert_eq!(from_global.path, "/global/path");
-    assert_eq!(from_global.strategy, "wt");
-
-    let key = repo_file_key(&repo);
-    write_repo_file(base, &format!("{key}.toml"), "{{invalid toml!!!");
-    let from_invalid = store.resolve_checkout_config(&repo_ee);
-    assert_eq!(from_invalid.path, "/global/path");
-    assert_eq!(from_invalid.strategy, "wt");
-}
-
-#[test]
-fn resolve_checkout_config_does_not_apply_override_from_different_colliding_path() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"/global/path\"\ncheckout_strategy = \"wt\"\n").unwrap();
-
-    let (repo_a, repo_b) = colliding_repo_paths(base);
-    let store = ConfigStore::with_base(base);
-    let key = repo_file_key(&repo_a);
-    let repo_toml = format!("path = \"{}\"\n[vcs.git]\ncheckout_path = \"/repo-a/path\"\n", repo_a.display());
-    write_repo_file(base, &format!("{key}.toml"), &repo_toml);
-
-    let resolved = store.resolve_checkout_config(&ee(&repo_b));
-    assert_eq!(resolved.path, "/global/path");
-    assert_eq!(resolved.strategy, "wt");
-}
-
-#[test]
-fn resolve_checkout_config_repo_override_merges_with_global() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"/global/path\"\ncheckout_strategy = \"wt\"\n").unwrap();
-
-    let repo = make_dir(base, "repo");
-    let repo_ee = ee(&repo);
-    let store = ConfigStore::with_base(base);
-    let key = repo_file_key(&repo);
-
-    // Override path only — strategy inherited from global
-    let repo_toml = format!("path = \"{}\"\n[vcs.git]\ncheckout_path = \"/repo/path\"\n", repo.display());
-    write_repo_file(base, &format!("{key}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo_ee);
-    assert_eq!(resolved.path, "/repo/path");
-    assert_eq!(resolved.strategy, "wt");
-
-    // Override strategy only — path inherited from global
-    let repo_toml = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
-    write_repo_file(base, &format!("{key}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo_ee);
-    assert_eq!(resolved.path, "/global/path");
-    assert_eq!(resolved.strategy, "git");
-
-    // No overrides — both from global
-    let repo_toml = format!("path = \"{}\"\n", repo.display());
-    write_repo_file(base, &format!("{key}.toml"), &repo_toml);
-    let resolved = store.resolve_checkout_config(&repo_ee);
-    assert_eq!(resolved.path, "/global/path");
-    assert_eq!(resolved.strategy, "wt");
-}
-
-#[test]
 fn defaults_have_expected_values_and_base_path_roundtrips() {
     let git_config = GitConfig::default();
     assert_eq!(git_config.checkout_path, "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}");
     assert_eq!(git_config.checkout_strategy, "auto");
-
-    let repo_override = RepoGitConfig::default();
-    assert!(repo_override.checkout_path.is_none());
-    assert!(repo_override.checkout_strategy.is_none());
 
     let dir = tempdir().unwrap();
     let store = ConfigStore::with_base(dir.path());

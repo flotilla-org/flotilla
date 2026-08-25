@@ -6,14 +6,15 @@ first in `spec.remotes` and defines forge attribution, credential scope, issue
 source, and change-request lookup. Observing any declared remote resolves to the
 same Repository.
 
-Declare the remotes in the tracked checkout's `repos/*.toml` file:
+Declare remotes in the replicated Repository spec:
 
-```toml
-path = "/absolute/path/to/flotilla"
-remotes = [
-  "https://github.com/flotilla-org/flotilla",
-  "https://forgejo.example/lab/flotilla",
-]
+```json
+{
+  "remotes": [
+    "https://github.com/flotilla-org/flotilla",
+    "https://forgejo.example/lab/flotilla"
+  ]
+}
 ```
 
 The observed checkout remote must appear in the list. Remotes are normalized

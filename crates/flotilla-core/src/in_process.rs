@@ -1422,14 +1422,6 @@ fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
 }
 
-fn configured_repo_identity_or_bag_or_path(config: &ConfigStore, path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
-    let repo_root = ExecutionEnvironmentPath::new(path);
-    config
-        .resolve_repo_issue_source(&repo_root)
-        .map(|source| flotilla_protocol::RepoIdentity { authority: source.service, path: source.scope })
-        .unwrap_or_else(|| repo_identity_from_bag_or_path(path, bag))
-}
-
 async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
     discovery: &DiscoveryRuntime,
@@ -2270,6 +2262,21 @@ impl InProcessDaemon {
             if path_identities.contains_key(&path) {
                 continue;
             }
+            let startup_inspection = startup_repository_inspector.inspect_path(&path, None).await;
+            if let Ok(inspection) = &startup_inspection {
+                let mut spec = inspection.spec.clone();
+                if let Some(live_remote) = spec.live_remote() {
+                    if let Ok(repositories) = resource_backend.including_replicas::<Repository>(DEFAULT_PROVISIONING_NAMESPACE).list().await
+                    {
+                        if let Some(declared) =
+                            repositories.items.into_iter().find(|repository| repository.object.spec.declares_remote(live_remote))
+                        {
+                            spec = declared.object.spec;
+                        }
+                    }
+                }
+                config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), spec);
+            }
             let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
                 &environment_manager,
                 &discovery,
@@ -2284,8 +2291,8 @@ impl InProcessDaemon {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
 
-            let identity = configured_repo_identity_or_bag_or_path(&config, &path, &host_repo_bag);
-            match startup_repository_inspector.inspect_path(&path, None).await {
+            let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+            match startup_inspection {
                 Ok(inspection) => {
                     repository_keys_by_path.insert(path.clone(), inspection.key());
                 }
@@ -2486,8 +2493,7 @@ impl InProcessDaemon {
                     return self.configure_unassociated_repository(path, spec).await;
                 }
                 let live_remote = spec.live_remote().map(str::to_string);
-                let stable_spec = spec.with_stable_identity_from(&stored.spec)?;
-                let mut updated = self.config.configure_repository_declarations(stable_spec, &ExecutionEnvironmentPath::new(path))?;
+                let mut updated = stored.spec.clone();
                 if let Some(live_remote) = live_remote {
                     updated = updated.update_remotes(live_remote)?;
                 }
@@ -2503,13 +2509,8 @@ impl InProcessDaemon {
         self.configure_unassociated_repository(path, spec).await
     }
 
-    async fn configure_unassociated_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-        let resolved_spec = self.resolve_declared_repository(spec).await?;
-        let configured_spec = self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(path), resolved_spec.clone())?;
-        if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
-            return Err(format!("repository config for {} changes the canonical remote of an existing declaration", path.display()));
-        }
-        Ok(configured_spec)
+    async fn configure_unassociated_repository(&self, _path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        self.resolve_declared_repository(spec).await
     }
 
     pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
@@ -3203,10 +3204,6 @@ impl InProcessDaemon {
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
-        let repo_root = ExecutionEnvironmentPath::new(repo_path);
-        if let Some(source) = self.config.resolve_repo_issue_source(&repo_root) {
-            return flotilla_protocol::RepoIdentity { authority: source.service, path: source.scope };
-        }
         match discover_repo_for_environment(
             &self.environment_manager,
             &self.discovery,
@@ -3252,6 +3249,18 @@ impl InProcessDaemon {
                 .get(identity)
                 .map(|state| state.preferred_path().to_path_buf())
                 .ok_or_else(|| format!("repo not tracked: {identity}")),
+        }
+    }
+
+    fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+        let roots = self.config.load_observation_roots()?;
+        match selector {
+            flotilla_protocol::RepoSelector::Path(path) if roots.iter().any(|root| root.as_path() == path) => Ok(path.clone()),
+            flotilla_protocol::RepoSelector::Path(path) => Err(format!("repo not observed: {}", path.display())),
+            flotilla_protocol::RepoSelector::Query(query) => {
+                crate::resolve::resolve_repo(query, roots.iter().map(|root| (root.as_path(), None))).map_err(|error| error.to_string())
+            }
+            flotilla_protocol::RepoSelector::Identity(identity) => Err(format!("repo not tracked: {identity}")),
         }
     }
 
@@ -6791,6 +6800,19 @@ impl InProcessDaemon {
     pub async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String> {
         let (path, resolved_from) = self.normalize_repo_path(path).await;
 
+        // Observation is host-local and intentionally precedes inspection: a
+        // temporarily unavailable checkout remains adopted and is retried on
+        // the next daemon start.
+        self.config.add_observation_root(&ExecutionEnvironmentPath::new(&path))?;
+
+        // Resolve fleet-agreed Repository intent before checkout provider
+        // construction so provider preferences are identical on every host.
+        let repository_inspection = self
+            .inspect_repository_path(&path, None)
+            .await
+            .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
+        self.config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), repository_inspection.spec.clone());
+
         // Create the model outside the lock (spawns provider detection and refresh)
         let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
             &self.environment_manager,
@@ -6804,15 +6826,11 @@ impl InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
-        let identity = configured_repo_identity_or_bag_or_path(&self.config, &path, &host_repo_bag);
+        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
         // Resolve the storage identity before publishing RepoTracked so a
         // surface can subscribe to issues{repository} immediately. The
         // background refresh also reconciles the Repository resource and
         // observed Checkouts.
-        let repository_inspection = self
-            .inspect_repository_path(&path, None)
-            .await
-            .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
         let repository_key = Some(repository_inspection.key());
         let identity_change = self.reconcile_tracked_repository(&repository_inspection).await?;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
@@ -6887,8 +6905,6 @@ impl InProcessDaemon {
 
         // Persist to config. Tab order is Surface-owned (open-views.toml,
         // ADR 0013) — the daemon only tracks registration.
-        self.config.save_repo(&ExecutionEnvironmentPath::new(&path));
-
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
             let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
@@ -6901,11 +6917,18 @@ impl InProcessDaemon {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
+        let tracked = self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path));
+        // Persist first so both tracked repositories and observation roots
+        // whose initial inspection failed remain removable and retryable.
+        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
+        if !tracked {
+            self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
+            return Ok(());
+        }
         let repository_key = match self.repository_keys_by_path.read().await.get(&path).cloned() {
             Some(key) => Some(key),
             None => self.inspect_repository_path(&path, None).await.ok().map(|inspection| inspection.key()),
         };
-
         let mut removed_identity = false;
         let removed_final_local_root;
         {
@@ -6945,9 +6968,7 @@ impl InProcessDaemon {
         }
         drop(observed_reconciliation);
 
-        // Persist to config. Tab order is Surface-owned (open-views.toml,
-        // ADR 0013) — the daemon only tracks registration.
-        self.config.remove_repo(&ExecutionEnvironmentPath::new(&path));
+        self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
@@ -10117,10 +10138,12 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
-            let repo_path = self.resolve_repo_selector(repo).await?;
+            let repo_path = match self.resolve_repo_selector(repo).await {
+                Ok(path) => path,
+                Err(tracked_error) => self.resolve_observation_root_selector(repo).map_err(|_| tracked_error)?,
+            };
             let description = command.description().to_string();
-            let repo_identity =
-                self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+            let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
