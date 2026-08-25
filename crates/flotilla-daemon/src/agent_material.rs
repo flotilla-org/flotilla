@@ -1,19 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use flotilla_core::providers::{
     discovery::EnvVars,
-    environment::{runner::CONTAINED_CODEX_HOME, ProvisionedMount, ProvisionedMountMode},
+    environment::{
+        runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
+        ProvisionedMount, ProvisionedMountMode,
+    },
+    ChannelLabel, CommandRunner,
 };
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoolUnitSpec, Resource, ResourceBackend};
 use tokio::fs;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
@@ -21,7 +25,13 @@ use crate::{
 };
 
 const CODEX_ADAPTER_ID: &str = "codex";
+const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
 const CODEX_POOL_REF: &str = "codex-login";
+pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
+const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
+const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
+const PRIVATE_SKILL_REPOSITORY: &str = "mattpocock-skills";
+const PUBLIC_SKILL_REPOSITORY: &str = "rjw-skills";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +45,7 @@ pub(crate) struct AgentMaterialPreflight {
 pub(crate) struct AgentMaterialDelivery {
     pub(crate) mount: ProvisionedMount,
     pub(crate) preflight: AgentMaterialPreflight,
+    pub(crate) github_repository_grants: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,7 @@ pub(crate) struct AgentMaterialRegistry {
     namespace: String,
     pools: Arc<MaterialPoolManager>,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
+    skills: SkillBundle,
 }
 
 impl AgentMaterialRegistry {
@@ -67,9 +79,10 @@ impl AgentMaterialRegistry {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
             .join(".config/flotilla/credentials/codex-pool");
+        let skills = SkillBundle::new(env.get(FLOTILLA_SKILLS_DIR_ENV).map(PathBuf::from));
         let codex: Arc<dyn AgentMaterialAdapter> =
             Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, cfg!(any(target_os = "linux", test))));
-        Self { namespace: namespace.to_string(), pools, adapters: BTreeMap::from([(codex.id(), codex)]) }
+        Self { namespace: namespace.to_string(), pools, adapters: BTreeMap::from([(codex.id(), codex)]), skills }
     }
 
     pub(crate) async fn prepare(
@@ -93,7 +106,21 @@ impl AgentMaterialRegistry {
                 Err(message) => return Err(AgentMaterialPrepareError::Failed(message)),
             }
         }
+        if SkillBundle::is_required_for_prepare(required_adapters, environment) {
+            let delivery = self.skills.prepare().await.map_err(AgentMaterialPrepareError::Failed)?;
+            deliveries.push(delivery);
+        }
         Ok(deliveries)
+    }
+
+    pub(crate) async fn stage_skills(
+        &self,
+        environment_ref: &str,
+        required_adapters: &BTreeSet<String>,
+        environment: &[(String, String)],
+        runner: &dyn CommandRunner,
+    ) -> Result<(), String> {
+        self.skills.stage(environment_ref, required_adapters, environment, runner).await
     }
 
     pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
@@ -175,6 +202,186 @@ impl CodexMaterialAdapter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct SkillBundleManifest {
+    schema_version: u32,
+    sources: Vec<SkillSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct SkillSource {
+    name: String,
+    repository: String,
+    revision: String,
+}
+
+#[derive(Debug, Clone)]
+struct SkillBundle {
+    source: Option<PathBuf>,
+}
+
+impl SkillBundle {
+    fn new(source: Option<PathBuf>) -> Self {
+        Self { source }
+    }
+
+    fn is_required(required_adapters: &BTreeSet<String>) -> bool {
+        required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) || required_adapters.contains(CODEX_ADAPTER_ID)
+    }
+
+    fn is_required_for_prepare(required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> bool {
+        required_adapters.contains(CLAUDE_CODE_ADAPTER_ID)
+            || (required_adapters.contains(CODEX_ADAPTER_ID) && !environment.contains_key("CODEX_HOME"))
+    }
+
+    async fn prepare(&self) -> Result<AgentMaterialDelivery, String> {
+        let source = self
+            .source
+            .clone()
+            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
+        tokio::task::spawn_blocking({
+            let source = source.clone();
+            move || inspect_skill_sources(&source)
+        })
+        .await
+        .map_err(|error| format!("inspect generation-pinned skill bundle task failed: {error}"))??;
+        Ok(AgentMaterialDelivery {
+            mount: ProvisionedMount::new(source, CONTAINER_SKILLS_SOURCE, ProvisionedMountMode::Ro),
+            preflight: AgentMaterialPreflight {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "test -f \"$1/.flotilla-sources.json\"".to_string(),
+                    "flotilla-skills-preflight".to_string(),
+                    CONTAINER_SKILLS_SOURCE.to_string(),
+                ],
+                failure_context: "generation-pinned skill source preflight failed".to_string(),
+            },
+            // The App token is deliberately limited to the private fork. The
+            // other pinned source must remain publicly readable.
+            github_repository_grants: BTreeSet::from([PRIVATE_SKILL_REPOSITORY.to_string()]),
+        })
+    }
+
+    async fn stage(
+        &self,
+        environment_ref: &str,
+        required_adapters: &BTreeSet<String>,
+        environment: &[(String, String)],
+        runner: &dyn CommandRunner,
+    ) -> Result<(), String> {
+        if !Self::is_required(required_adapters) {
+            return Ok(());
+        }
+        if !required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) && !environment.iter().any(|(name, _)| name == "CODEX_HOME") {
+            return Ok(());
+        }
+        let config_base = runner
+            .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
+            .await
+            .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
+        let (adapter, destination) = skill_target(required_adapters, environment, &config_base)?;
+        let git_config = environment
+            .iter()
+            .find(|(name, _)| name == "GIT_CONFIG_GLOBAL")
+            .map(|(_, value)| value)
+            .ok_or_else(|| "contained agent skill staging requires a prepared Git credential configuration".to_string())?;
+        let github_token_file = environment.iter().find(|(name, _)| name == "GITHUB_TOKEN_FILE").map(|(_, value)| value);
+        let github_token = environment.iter().find(|(name, _)| name == "GH_TOKEN").map(|(_, value)| value);
+        let token_mode = if github_token_file.is_some() {
+            "token-file"
+        } else if github_token.is_some() {
+            "stdin-token"
+        } else {
+            return Err("contained agent skill staging requires a prepared GitHub credential".to_string());
+        };
+        let source = self
+            .source
+            .clone()
+            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
+        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
+            .await
+            .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
+        let mut args = vec![
+            "-c".to_string(),
+            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nshift 5\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  shift 3\n  checkout=\"$sources/$name\"\n  git -C \"$sources\" init \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" fetch --depth=1 origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --detach FETCH_HEAD >/dev/null\n  find \"$checkout\" -type f -name SKILL.md >\"$sources/skill-files\"\n  while IFS= read -r skill_file; do\n    skill_dir=${skill_file%/SKILL.md}\n    skill_name=${skill_dir##*/}\n    target=\"$staged/$skill_name\"\n    if [ -e \"$target\" ]; then\n      echo \"duplicate skill name $skill_name from $repository\" >&2\n      exit 1\n    fi\n    mkdir -p \"$target\"\n    cp -R \"$skill_dir\"/. \"$target\"/\n  done <\"$sources/skill-files\"\ndone\nfor required in wayfinder grilling domain-modeling to-issues research triage-issues lab-hub cleat-sessions pr-shepherd; do\n  test -f \"$staged/$required/SKILL.md\" || { echo \"pinned skill sources are missing required skill $required\" >&2; exit 1; }\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
+            "flotilla-stage-skills".to_string(),
+            git_config.clone(),
+            token_mode.to_string(),
+            github_token_file.cloned().unwrap_or_default(),
+            format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
+            destination.to_string_lossy().into_owned(),
+        ];
+        for source in &inspection.sources {
+            args.extend([source.name.clone(), source.repository.clone(), source.revision.clone()]);
+        }
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let result = match github_token {
+            Some(token) if github_token_file.is_none() => {
+                runner.run_with_input("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default, token.as_bytes()).await
+            }
+            _ => runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await,
+        };
+        result.map_err(|error| format!("stage generation-pinned skills for {environment_ref}: {error}"))?;
+        info!(
+            environment = environment_ref,
+            adapter,
+            sources = ?inspection.sources,
+            "staged generation-pinned contained agent skills"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillBundleInspection {
+    sources: Vec<SkillSource>,
+}
+
+fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String> {
+    let manifest_path = source.join(SKILL_BUNDLE_MANIFEST);
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("read skill bundle manifest {}: {error}", manifest_path.display()))?;
+    let manifest = serde_json::from_str::<SkillBundleManifest>(&manifest)
+        .map_err(|error| format!("decode skill bundle manifest {}: {error}", manifest_path.display()))?;
+    let expected = BTreeMap::from([
+        (PRIVATE_SKILL_REPOSITORY, "https://github.com/flotilla-org/mattpocock-skills.git"),
+        (PUBLIC_SKILL_REPOSITORY, "https://github.com/rjwittams/rjw-skills.git"),
+    ]);
+    let actual = manifest.sources.iter().map(|source| (source.name.as_str(), source.repository.as_str())).collect::<BTreeMap<_, _>>();
+    if manifest.schema_version != 1 || actual != expected || manifest.sources.len() != expected.len() {
+        return Err(format!("skill source manifest {} must name exactly the supported repositories", manifest_path.display()));
+    }
+    if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
+    }
+    Ok(SkillBundleInspection { sources: manifest.sources })
+}
+
+fn skill_target(
+    required_adapters: &BTreeSet<String>,
+    environment: &[(String, String)],
+    config_base: &Path,
+) -> Result<(&'static str, PathBuf), String> {
+    let (adapter, variable) = if required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) {
+        (CLAUDE_CODE_ADAPTER_ID, "CLAUDE_CONFIG_DIR")
+    } else {
+        (CODEX_ADAPTER_ID, "CODEX_HOME")
+    };
+    let config_dir = environment
+        .iter()
+        .find(|(name, _)| name == variable)
+        .map(|(_, value)| PathBuf::from(value))
+        .ok_or_else(|| format!("contained {adapter} skill staging requires seam-resolved `{variable}`"))?;
+    if adapter == CODEX_ADAPTER_ID && config_dir != Path::new(CONTAINER_CODEX_HOME) {
+        return Err(format!("contained Codex skill staging requires Flotilla-managed `CODEX_HOME` {CONTAINER_CODEX_HOME}"));
+    }
+    if adapter == CLAUDE_CODE_ADAPTER_ID && !config_dir.starts_with(config_base) {
+        return Err(format!("contained {adapter} skill target {} is outside {}", config_dir.display(), config_base.display()));
+    }
+    Ok((adapter, config_dir.join("skills")))
+}
+
 #[async_trait]
 impl AgentMaterialAdapter for CodexMaterialAdapter {
     fn id(&self) -> &'static str {
@@ -208,6 +415,7 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
                     args: vec!["login".to_string(), "status".to_string()],
                     failure_context: "Codex login preflight failed".to_string(),
                 },
+                github_repository_grants: BTreeSet::new(),
             })),
             MaterialLeaseOutcome::Waiting { unit_count } => Ok(AgentMaterialOutcome::Waiting {
                 pool_ref: CODEX_POOL_REF.to_string(),
@@ -243,6 +451,38 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingRunner(Mutex<Vec<(String, Vec<String>)>>);
+
+    #[async_trait]
+    impl CommandRunner for RecordingRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.0
+                .lock()
+                .expect("recording runner lock should be healthy")
+                .push((cmd.to_string(), args.iter().map(|arg| (*arg).to_string()).collect()));
+            Ok(String::new())
+        }
+
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+        ) -> Result<flotilla_core::providers::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| flotilla_core::providers::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                success: true,
+            })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+    }
+
     fn write_named_slot(root: &Path, name: &str, number: u64) -> PathBuf {
         let slot = root.join(name);
         std::fs::create_dir_all(&slot).expect("create slot");
@@ -256,9 +496,28 @@ mod tests {
         write_named_slot(root, &format!("slot-{number}"), number)
     }
 
+    fn write_skill_sources(root: &Path) -> PathBuf {
+        let skills = root.join("generation/skills");
+        std::fs::create_dir_all(&skills).expect("create skill bundle");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":1,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        )
+        .expect("write skill bundle manifest");
+        skills
+    }
+
     fn registry(home: &Path) -> AgentMaterialRegistry {
+        let skills = write_skill_sources(home);
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        AgentMaterialRegistry::new(backend, "flotilla", Arc::new(TestEnvVars::new([("HOME", home.to_string_lossy().into_owned())])))
+        AgentMaterialRegistry::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnvVars::new([
+                ("HOME", home.to_string_lossy().into_owned()),
+                (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
+            ])),
+        )
     }
 
     #[tokio::test]
@@ -270,8 +529,16 @@ mod tests {
         let deliveries =
             registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await.expect("prepare");
 
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].mount, ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].mount, ProvisionedMount::new(&slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+        assert_eq!(
+            deliveries[1].mount,
+            ProvisionedMount::new(
+                registry.skills.source.clone().expect("generation skill source"),
+                CONTAINER_SKILLS_SOURCE,
+                ProvisionedMountMode::Ro,
+            )
+        );
         let composed = crate::vessel_config::compose(
             crate::vessel_config::TargetId::AgentEnvironment,
             registry.fragments(&BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()),
@@ -279,6 +546,111 @@ mod tests {
         .expect("compose Codex home");
         assert_eq!(composed.environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
         assert!(composed.contents.contains("# fragment: agent-material/codex codex-login"));
+    }
+
+    #[tokio::test]
+    async fn codex_login_material_is_leased_per_holder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
+        let first = write_slot(&pool, 0);
+        let second = write_slot(&pool, 1);
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+
+        registry.prepare("crew-alice", &required, &BTreeMap::new()).await.expect("prepare Alice");
+        registry.prepare("crew-bob", &required, &BTreeMap::new()).await.expect("prepare Bob");
+
+        assert_ne!(first, second, "each holder must receive its own config home");
+    }
+
+    #[tokio::test]
+    async fn pinned_skills_are_staged_to_the_seam_resolved_claude_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]);
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/tmp/flotilla-config/credentials/claude-max/claude".to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/tmp/flotilla-config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-alice", &required, &environment, &runner).await.expect("stage pinned skills");
+
+        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sh");
+        assert!(calls[0].1.contains(&format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}")));
+        assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
+        assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
+        assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pinned_skills_are_staged_to_the_seam_resolved_codex_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+        let environment = vec![
+            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-codex", &required, &environment, &runner).await.expect("stage pinned skills");
+
+        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sh");
+        assert!(calls[0].1.contains(&format!("{CONTAINER_CODEX_HOME}/skills")));
+        assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
+        assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
+    }
+
+    #[tokio::test]
+    async fn externally_managed_codex_home_skips_skill_staging() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+        let environment = vec![
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-codex", &required, &environment, &runner).await.expect("skip external Codex home");
+
+        assert!(runner.0.lock().expect("recording runner lock should be healthy").is_empty());
+    }
+
+    #[test]
+    fn staged_skill_source_revisions_are_reported() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let inspection = inspect_skill_sources(&skills).expect("inspect skill sources");
+        info!(
+            environment = "crew-alice",
+            adapter = CLAUDE_CODE_ADAPTER_ID,
+            sources = ?inspection.sources,
+            "staged generation-pinned contained agent skills"
+        );
+
+        let logs = String::from_utf8(output.lock().expect("log capture lock should be healthy").clone()).expect("UTF-8 logs");
+        assert!(logs.contains("staged generation-pinned contained agent skills"), "missing provisioning event: {logs}");
+        assert!(logs.contains("crew-alice"), "provisioning event must identify its holder: {logs}");
+        assert!(logs.contains("1111111111111111111111111111111111111111"), "provisioning event must report source pins: {logs}");
     }
 
     #[tokio::test]
@@ -329,6 +701,31 @@ mod tests {
         let second = write_slot(&pool, 1);
         let delivery = registry.prepare("env-b", &required, &BTreeMap::new()).await.expect("lease new unit");
         assert_eq!(delivery[0].mount, ProvisionedMount::new(second, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+    }
+
+    #[tokio::test]
+    async fn missing_generation_skill_sources_fail_before_agent_container_creation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let registry = AgentMaterialRegistry::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])),
+        );
+
+        let error = registry
+            .prepare("env-a", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("contained Claude must require pinned skill sources");
+
+        assert!(matches!(error, AgentMaterialPrepareError::Failed(message) if message.contains(FLOTILLA_SKILLS_DIR_ENV)));
+
+        let codex_error = registry
+            .prepare("env-b", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("contained Codex must require pinned skill sources");
+        assert!(matches!(codex_error, AgentMaterialPrepareError::Failed(message) if message.contains(FLOTILLA_SKILLS_DIR_ENV)));
     }
 
     #[tokio::test]

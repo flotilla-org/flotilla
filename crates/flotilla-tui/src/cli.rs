@@ -555,6 +555,32 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    output.push_str("\nDecision ledgers:\n");
+    if explanation.decision_ledgers.is_empty() {
+        output.push_str("  (no settlement claims)\n");
+    } else {
+        for ledger in &explanation.decision_ledgers {
+            if ledger.missing {
+                let _ = writeln!(
+                    output,
+                    "  - {}/{} claimed_at={} MISSING (flagged; claim accepted)",
+                    ledger.vessel,
+                    ledger.role,
+                    ledger.claimed_at.as_deref().unwrap_or("-")
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  - {}/{} claimed_at={} comment={}",
+                    ledger.vessel,
+                    ledger.role,
+                    ledger.claimed_at.as_deref().unwrap_or("-"),
+                    ledger.comment_url.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
+
     output.push_str("\nExpected checkouts:\n");
     if explanation.checkouts.is_empty() {
         output.push_str("  (none; artifact-less claim exit)\n");
@@ -592,6 +618,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 request.freshness,
                 fields
             );
+            if let Some(error) = &request.observation_error {
+                let _ = writeln!(output, "    observation_error={error}");
+            }
         }
     }
 
@@ -644,6 +673,16 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
+            format!("brief delivered now; displaced pending brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefDelivered { displaced: None } => "brief delivered now".to_string(),
+        CommandValue::ConvoyBriefQueued { displaced: Some(displaced) } => {
+            format!("brief queued for turn end; displaced brief:\n{displaced}")
+        }
+        CommandValue::ConvoyBriefQueued { displaced: None } => "brief queued for turn end".to_string(),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: Some(withdrawn) } => format!("pending brief withdrawn:\n{withdrawn}"),
+        CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {
             let mut output = match resolved_from {
                 Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
@@ -732,6 +771,21 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
+        CommandValue::ConvoyAbandoned { name, archives } => {
+            let mut output = format!("convoy abandoned: {name}");
+            for archive in archives {
+                let result = match archive.status {
+                    flotilla_protocol::CheckoutArchiveStatus::Archived => "archived".to_string(),
+                    flotilla_protocol::CheckoutArchiveStatus::NothingToArchive => "nothing to archive".to_string(),
+                    flotilla_protocol::CheckoutArchiveStatus::Failed => match archive.detail.as_deref() {
+                        Some(detail) if !detail.is_empty() => format!("failed to archive: {detail}"),
+                        _ => "failed to archive".to_string(),
+                    },
+                };
+                output.push_str(&format!("\n  {}: {result}", archive.checkout));
+            }
+            output
+        }
         CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             format!("convoy started: {name}{}", if attach_plan.is_some() { " (crew ready)" } else { "" })
         }
@@ -739,9 +793,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
         CommandValue::ProjectRegistered { name, members } => format!("project registered: {name} ({members} members)"),
-        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
+        CommandValue::ProjectRefreshed { name, members, converged, changes, operational_entries } => {
             let outcome = if *converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
-            format!("project refreshed: {name} ({members} members, {outcome})")
+            let entries = if operational_entries.is_empty() { String::new() } else { format!("\n{}", operational_entries.join("\n")) };
+            format!("project refreshed: {name} ({members} members, {outcome}){entries}")
         }
     }
 }

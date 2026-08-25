@@ -56,7 +56,7 @@ fn read_etc_machine_id() -> Option<String> {
 
 /// Query macOS `IOPlatformUUID` via the injected `CommandRunner`.
 async fn read_macos_platform_uuid(runner: &dyn CommandRunner) -> Option<String> {
-    let output = runner.run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Path::new("/"), &ChannelLabel::Noop).await.ok()?;
+    let output = runner.run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Path::new("/"), &ChannelLabel::Default).await.ok()?;
 
     for line in output.lines() {
         if line.contains("IOPlatformUUID") {
@@ -455,7 +455,7 @@ async fn resolve_or_create_remote_host_id_at(runner: &dyn CommandRunner, state_d
     let target = state_dir.join("host-id");
     let target_str = target.to_string_lossy().into_owned();
 
-    if let Ok(content) = runner.run("cat", &[&target_str], Path::new("/"), &ChannelLabel::Noop).await {
+    if let Ok(content) = runner.run("cat", &[&target_str], Path::new("/"), &ChannelLabel::Default).await {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Err(format!("remote host-id file is empty: {}", target.display()));
@@ -478,7 +478,7 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
     let target = state_dir.join("environment-id");
     let target_str = target.to_string_lossy().into_owned();
 
-    if let Ok(content) = runner.run("cat", &[&target_str], Path::new("/"), &ChannelLabel::Noop).await {
+    if let Ok(content) = runner.run("cat", &[&target_str], Path::new("/"), &ChannelLabel::Default).await {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Err(format!("remote environment-id file is empty: {}", target.display()));

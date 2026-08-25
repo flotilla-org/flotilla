@@ -11,12 +11,20 @@ on:
         description: Exact 40-character commit from flotilla-org/cleat
         required: true
         type: string
+      mattpocock_skills_sha:
+        description: Exact 40-character commit from the lab mattpocock-skills fork
+        required: true
+        type: string
+      rjw_skills_sha:
+        description: Exact 40-character commit from the lab rjw-skills fork
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: fleet-candidates-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}
+  group: fleet-candidates-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}-${{ inputs.mattpocock_skills_sha }}-${{ inputs.rjw_skills_sha }}
   cancel-in-progress: false
 
 env:
@@ -24,6 +32,8 @@ env:
   FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}
   FLEET_FLOTILLA_SHA: ${{ inputs.flotilla_sha }}
   FLEET_CLEAT_SHA: ${{ inputs.cleat_sha }}
+  FLEET_MATTPOCOCK_SKILLS_SHA: ${{ inputs.mattpocock_skills_sha }}
+  FLEET_RJW_SKILLS_SHA: ${{ inputs.rjw_skills_sha }}
 
 jobs:
   linux:

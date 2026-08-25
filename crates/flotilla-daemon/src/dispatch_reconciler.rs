@@ -9,8 +9,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchObservation, DispatchObservationSpec, DispatchPolicy,
-    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend,
+    ResourceError, ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
 use tracing::{info, warn};
 
@@ -36,15 +36,14 @@ impl DaemonDispatchIssueSource {
 impl DispatchIssueSource for DaemonDispatchIssueSource {
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
         let scope = QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-        let sources = self.daemon.resolve_issue_sources(&scope).await?;
+        let bindings = self.daemon.resolve_issue_source_bindings(&scope).await?;
         let mut issues = Vec::new();
-        for source in sources {
-            let provider = self.daemon.issue_provider_for_source(&source).await?;
+        for binding in bindings {
+            let provider = self.daemon.issue_provider_for_source(&binding.source).await?;
+            let query = ready_issue_query(&binding);
             let mut page = 1;
             loop {
-                let result = provider
-                    .query(&source, &IssueQuery { search: None, label: Some(READY_ISSUE_LABEL.to_string()) }, page, ISSUE_PAGE_SIZE)
-                    .await?;
+                let result = provider.query(&binding.source, &query, page, ISSUE_PAGE_SIZE).await?;
                 issues.extend(result.items);
                 if !result.has_more {
                     break;
@@ -57,6 +56,14 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
 
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
         self.daemon.fetch_issue_by_ref(reference).await
+    }
+}
+
+fn ready_issue_query(binding: &ResolvedIssueSourceBinding) -> IssueQuery {
+    IssueQuery {
+        search: None,
+        label: Some(READY_ISSUE_LABEL.to_string()),
+        match_fields: binding.filter.match_fields.iter().map(|(field, value)| (field.clone(), value.to_values())).collect(),
     }
 }
 
@@ -217,7 +224,7 @@ impl DispatchReconciler {
     ) -> Result<usize, String> {
         let queued = previous_queue.iter().map(|entry| (&entry.issue, entry)).collect::<BTreeMap<_, _>>();
         let observations = self.backend.clone().using::<DispatchObservation>(&project.metadata.namespace);
-        let workflows = self.backend.clone().using::<WorkflowTemplate>(&project.metadata.namespace);
+        let workflows = self.backend.definitions::<WorkflowTemplate>(&project.metadata.namespace);
         let mut recorded = 0;
         for convoy in convoys {
             for issue in &convoy.spec.issues {
@@ -443,6 +450,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ready_issue_queries_preserve_each_bindings_tracker_fields() {
+        let binding = ResolvedIssueSourceBinding {
+            source: source(),
+            alias: "widgets".to_string(),
+            filter: flotilla_resources::IssueFilter {
+                match_fields: BTreeMap::from([("component".to_string(), flotilla_resources::IssueFieldValue::One("terminal".to_string()))]),
+            },
+            create_with: BTreeMap::new(),
+            creatable: true,
+        };
+
+        assert_eq!(ready_issue_query(&binding), IssueQuery {
+            search: None,
+            label: Some(READY_ISSUE_LABEL.to_string()),
+            match_fields: BTreeMap::from([("component".to_string(), vec!["terminal".to_string()])]),
+        });
+    }
+
     async fn harness(
         ready: Vec<Issue>,
         blockers: Vec<Issue>,
@@ -455,7 +481,10 @@ mod tests {
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
                 display_name: "Widgets".to_string(),
                 default_workflow_ref: "implement".to_string(),
-                issue_source: Some(source()),
+                issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                    .source(source())
+                    .alias("widgets".to_string())
+                    .build()],
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
                     repo: RepositoryKey("acme/widgets".to_string()),
                     alias: None,
@@ -549,16 +578,25 @@ mod tests {
         let ready = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
         let (backend, _, clock, reconciler) = harness(vec![ready.clone()], vec![], policy(300)).await;
         reconciler.reconcile_once().await.expect("queue pass");
-        backend
-            .clone()
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
+        let workflow_root = flotilla_protocol::NodeId::new("workflow-authority");
+        let workflow_authority = ResourceBackend::InMemory(Default::default()).with_local_root(workflow_root.clone());
+        workflow_authority
+            .definitions::<WorkflowTemplate>(NAMESPACE)
+            .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
             .await
             .expect("workflow");
+        backend
+            .replica_writer::<WorkflowTemplate>(workflow_root, NAMESPACE)
+            .replace(&workflow_authority.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("workflow authority log"), Utc::now())
+            .await
+            .expect("replicate workflow");
+        assert!(backend.using::<WorkflowTemplate>(NAMESPACE).list().await.expect("local workflows").items.is_empty());
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: "review-and-fix".to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::<String, InputValue>::new(),
@@ -620,6 +658,8 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
+                role: String::new(),
+                generation: 1,
                 workflow_ref: "deleted-workflow".to_string(),
                 dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::<String, InputValue>::new(),

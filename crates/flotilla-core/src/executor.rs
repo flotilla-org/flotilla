@@ -144,9 +144,29 @@ fn no_workspace_manager_error() -> CommandValue {
     CommandValue::Error { message: no_workspace_manager_error_message() }
 }
 
+#[derive(Debug)]
+pub struct PlannerRefusal {
+    message: String,
+}
+
+impl PlannerRefusal {
+    fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+
+    pub fn into_command_value(self) -> CommandValue {
+        CommandValue::Error { message: self.message }
+    }
+
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// Build a step plan for a command.
 ///
-/// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(CommandValue)`
+/// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(PlannerRefusal)`
 /// for daemon-level commands that should never reach this function and for
 /// pre-resolution errors (e.g. teleport with an unknown checkout key).
 #[allow(clippy::too_many_arguments)]
@@ -160,7 +180,7 @@ pub async fn build_plan(
     daemon_socket_path: Option<DaemonHostPath>,
     local_node_id: NodeId,
     local_host: HostName,
-) -> Result<StepPlan, CommandValue> {
+) -> Result<StepPlan, PlannerRefusal> {
     let Command { node_id, provisioning_target, action, .. } = cmd;
     let target_node_id = node_id.unwrap_or_else(|| local_node_id.clone());
     let checkout_host = StepExecutionContext::Host(target_node_id.clone());
@@ -172,10 +192,11 @@ pub async fn build_plan(
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
+        | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. }
         | CommandAction::ResourceWatch { .. } => {
-            Err(CommandValue::Error { message: "resource commands should be handled by the daemon resource dispatcher".to_string() })
+            Err(PlannerRefusal::new("resource commands should be handled by the daemon resource dispatcher"))
         }
         CommandAction::Checkout { target, issue_ids, .. } => {
             match provisioning_target {
@@ -260,7 +281,7 @@ pub async fn build_plan(
                 }
                 Err(message) => {
                     error!(%message, %target_node_id, %local_host, "checkout resolution failed");
-                    Err(CommandValue::Error { message })
+                    Err(PlannerRefusal::new(message))
                 }
             }
         }
@@ -331,7 +352,7 @@ pub async fn build_plan(
 
         CommandAction::MergeChangeRequest { id, confirmed } => {
             if !confirmed {
-                return Err(CommandValue::Error { message: format!("merging change request {id} requires explicit confirmation") });
+                return Err(PlannerRefusal::new(format!("merging change request {id} requires explicit confirmation")));
             }
             Ok(StepPlan::new(vec![Step {
                 description: format!("Merge change request {id}"),
@@ -357,6 +378,7 @@ pub async fn build_plan(
         | CommandAction::ConvoyDelete { .. }
         | CommandAction::ConvoyAbandon { .. }
         | CommandAction::ConvoyResume { .. }
+        | CommandAction::ConvoyWithdrawPendingBrief { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewHandoff { .. }
@@ -385,9 +407,7 @@ pub async fn build_plan(
         | CommandAction::AttachTransient { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }
-        | CommandAction::QueryIssueOpenInBrowser { .. } => {
-            Err(CommandValue::Error { message: "bug: daemon-level command reached per-repo executor".to_string() })
-        }
+        | CommandAction::QueryIssueOpenInBrowser { .. } => Err(PlannerRefusal::new("bug: daemon-level command reached per-repo executor")),
     }
 }
 
@@ -596,7 +616,7 @@ async fn build_teleport_session_plan(
     daemon_socket_path: Option<DaemonHostPath>,
     local_node_id: NodeId,
     local_host: flotilla_protocol::HostName,
-) -> Result<StepPlan, CommandValue> {
+) -> Result<StepPlan, PlannerRefusal> {
     let checkout_key_ee = checkout_key.map(ExecutionEnvironmentPath::new);
     let teleport_flow = TeleportFlow::new(
         &repo_root,
@@ -613,7 +633,7 @@ async fn build_teleport_session_plan(
     );
     let initial_path = match teleport_flow.initial_checkout_path().await {
         Ok(path) => path,
-        Err(message) => return Err(CommandValue::Error { message }),
+        Err(message) => return Err(PlannerRefusal::new(message)),
     };
 
     let steps = vec![
@@ -901,7 +921,7 @@ impl StepResolver for ExecutorStepResolver {
                 let container_name =
                     context_environment_id.as_ref().and_then(|env_id| self.environment_manager.environment_container_name(env_id));
 
-                Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
+                Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(Box::new(PreparedWorkspace {
                     label,
                     target_node_id: self.local_node_id.clone(),
                     display_host,
@@ -912,7 +932,7 @@ impl StepResolver for ExecutorStepResolver {
                     container_name,
                     template_yaml,
                     prepared_commands,
-                })))
+                }))))
             }
             StepAction::AttachWorkspace => {
                 let prepared = prior
@@ -1090,19 +1110,19 @@ impl StepResolver for ExecutorStepResolver {
                     effective_runner.as_ref(),
                 )
                 .await;
-                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(info)))
+                Ok(StepOutcome::CompletedWith(CommandValue::CheckoutStatus(Box::new(info))))
             }
             StepAction::OpenChangeRequest { id } => {
                 debug!(%id, "opening change request in browser");
                 if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.open_in_browser(self.repo.root.as_path(), &id).await;
+                    let _ = cr.open_in_browser(&id).await;
                 }
                 Ok(StepOutcome::Completed)
             }
             StepAction::CloseChangeRequest { id } => {
                 debug!(%id, "closing change request");
                 if let Some(cr) = self.registry.change_requests.preferred() {
-                    let _ = cr.close_change_request(self.repo.root.as_path(), &id).await;
+                    let _ = cr.close_change_request(&id).await;
                 }
                 Ok(StepOutcome::Completed)
             }
@@ -1113,7 +1133,7 @@ impl StepResolver for ExecutorStepResolver {
                     .change_requests
                     .preferred()
                     .ok_or_else(|| "no change request provider is active for this repository".to_string())?;
-                cr.merge_change_request(self.repo.root.as_path(), &id).await?;
+                cr.merge_change_request(&id).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::OpenIssue { id } => {
@@ -1173,7 +1193,7 @@ impl StepResolver for ExecutorStepResolver {
                         "git",
                         &["show", "HEAD:.flotilla/environment.yaml"],
                         self.repo.root.as_path(),
-                        &crate::providers::ChannelLabel::Noop,
+                        &crate::providers::ChannelLabel::Default,
                     )
                     .await
                     .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
@@ -1240,7 +1260,7 @@ impl ExecutorStepResolver {
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
         let result = self
             .runner
-            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Noop)
+            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Default)
             .await;
         match result {
             Ok(path) => {

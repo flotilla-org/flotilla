@@ -148,6 +148,40 @@ fn configure_repository_spec_reads_fork_stance_and_reviewless_override() {
 }
 
 #[test]
+fn configure_repository_spec_reads_canonical_first_remotes() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "flotilla-mirror");
+    let content = format!(
+        "path = \"{}\"\nremotes = [\"https://github.com/flotilla-org/flotilla\", \"https://forgejo.lab/lab/flotilla.git\"]\n",
+        repo.display()
+    );
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+
+    let configured = ConfigStore::with_base(base)
+        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror repository"))
+        .expect("repository config");
+
+    assert_eq!(configured.remotes(), ["https://github.com/flotilla-org/flotilla", "https://forgejo.lab/lab/flotilla"]);
+    assert_eq!(configured.key(), RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("canonical repository").key());
+}
+
+#[test]
+fn configure_repository_spec_rejects_remotes_without_the_observed_remote() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "flotilla-mirror");
+    let content = format!("path = \"{}\"\nremotes = [\"https://github.com/flotilla-org/flotilla\"]\n", repo.display());
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+
+    let error = ConfigStore::with_base(base)
+        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror repository"))
+        .expect_err("declaration must include observed remote");
+
+    assert!(error.contains("do not include observed remote"));
+}
+
+#[test]
 fn resolve_repo_issue_source_requires_global_forgejo_service_url() {
     let dir = tempdir().expect("create config tempdir");
     let base = dir.path();
@@ -632,11 +666,18 @@ fn load_daemon_config_from_file() {
 #[test]
 fn load_daemon_manifest_directory() {
     let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("daemon.toml"), "[manifests]\ndir = \"/srv/flotilla/manifests\"\n").unwrap();
+    std::fs::write(
+        dir.path().join("daemon.toml"),
+        "[manifests]\ndir = \"/srv/flotilla/manifests\"\nsource = \"https://github.com/example/project-map\"\nreconciler_root = \"kiwi-id\"\n",
+    )
+    .unwrap();
 
     let config = ConfigStore::with_base(dir.path()).load_daemon_config().expect("daemon config");
 
-    assert_eq!(config.manifests.expect("manifest config").dir, std::path::PathBuf::from("/srv/flotilla/manifests"));
+    let manifests = config.manifests.expect("manifest config");
+    assert_eq!(manifests.dir, std::path::PathBuf::from("/srv/flotilla/manifests"));
+    assert_eq!(manifests.source, "https://github.com/example/project-map");
+    assert_eq!(manifests.reconciler_root, "kiwi-id");
 }
 
 #[test]

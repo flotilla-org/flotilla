@@ -32,10 +32,10 @@ control plane.
 
 **The reconcile function is already pure.** `Reconciler` in
 `crates/flotilla-resources/src/controller/mod.rs` splits into an async
-`fetch_dependencies(&obj) -> Deps` and a *synchronous, total* 
+`prepare(&obj) -> Prepared` and a *synchronous, total*
 
 ```rust
-fn reconcile(&self, obj: &ResourceObject<Self::Resource>, deps: &Self::Dependencies, now: DateTime<Utc>)
+fn reconcile(&self, obj: &ResourceObject<Self::Resource>, prepared: &Self::Prepared, now: DateTime<Utc>)
     -> ReconcileOutcome<Self::Resource>;
 ```
 

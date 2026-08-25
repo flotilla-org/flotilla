@@ -21,6 +21,10 @@ grep -Fq 'runs-on: darwin-aarch64' "$workflow"
 # shellcheck disable=SC2016
 grep -Fq 'FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}' "$workflow"
 # shellcheck disable=SC2016
+grep -Fq 'FLEET_MATTPOCOCK_SKILLS_SHA: ${{ inputs.mattpocock_skills_sha }}' "$workflow"
+# shellcheck disable=SC2016
+grep -Fq 'FLEET_RJW_SKILLS_SHA: ${{ inputs.rjw_skills_sha }}' "$workflow"
+# shellcheck disable=SC2016
 test "$(grep -Fc 'git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"' "$workflow")" -eq 2
 if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_SHA'; then
   echo 'orchestration checkout must not use the selected Flotilla source SHA' >&2
@@ -30,6 +34,10 @@ grep -Fq 'retention-days: 7' "$workflow"
 grep -Fq 'actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 grep -Fq 'actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 test "$(grep -Fc 'actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32' "$workflow")" -eq 2
+if grep -Fq 'repository: ${{ forgejo.repository_owner }}/' "$workflow"; then
+  echo 'fleet candidate workflow cannot use its repository-scoped token for private sibling repositories' >&2
+  exit 1
+fi
 
 # shellcheck disable=SC1090,SC1091
 source "$builder"

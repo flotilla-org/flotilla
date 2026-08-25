@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use flotilla_controllers::reconcilers::{
-    checkout::{CheckoutDeps, CheckoutReconciler},
+    checkout::{CheckoutPrepared, CheckoutReconciler},
     CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_resources::{
@@ -159,9 +159,9 @@ impl ReconcileStep<CheckoutWorld> for CheckoutStep {
         let deps = if self.broken_freshness_latch && has_observation {
             // Deliberately re-broken #1163-style variant: once an observation
             // exists, trust it forever instead of consulting the injected clock.
-            CheckoutDeps::None
+            CheckoutPrepared::None
         } else {
-            world.reconciler.fetch_dependencies(&world.current).await.map_err(|error| error.to_string())?
+            world.reconciler.prepare(&world.current).await.map_err(|error| error.to_string())?
         };
         let outcome = world.reconciler.reconcile(&world.current, &deps, world.reconciler_clock_now());
         Ok(LivenessStep::new(None, outcome.patch.into_iter().collect()))
@@ -377,7 +377,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
             .map_err(|error| error.to_string())?;
         backend.reset_writes();
 
-        let reconciler = ConvoyReconciler::new(inner.using(NAMESPACE))
+        let reconciler = ConvoyReconciler::new(inner.definitions(NAMESPACE))
             .with_checkouts(inner.using(NAMESPACE))
             .with_change_requests(inner.including_replicas(NAMESPACE), LANDING_TTL.to_std().expect("positive TTL"))
             .with_clock(self.clock.clone() as Arc<dyn Clock>);
@@ -415,7 +415,7 @@ impl ReconcileStep<ConvoyWorld> for ConvoyStep {
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        let deps = world.reconciler.fetch_dependencies(&world.current).await.map_err(|error| error.to_string())?;
+        let deps = world.reconciler.prepare(&world.current).await.map_err(|error| error.to_string())?;
         let outcome = world.reconciler.reconcile(&world.current, &deps, world.clock.now());
         world.passes += 1;
         Ok(LivenessStep::new(outcome.patch, outcome.actuations))

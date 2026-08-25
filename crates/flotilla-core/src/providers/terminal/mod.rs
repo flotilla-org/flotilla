@@ -11,6 +11,24 @@ use crate::path_context::ExecutionEnvironmentPath;
 /// Environment variables to inject into the terminal session.
 pub type TerminalEnvVars = Vec<(String, String)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+impl TerminalSize {
+    pub const fn new(columns: u16, rows: u16) -> Self {
+        Self { columns, rows }
+    }
+}
+
+impl std::fmt::Display for TerminalSize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}x{}", self.columns, self.rows)
+    }
+}
+
 /// Raw session data returned by a terminal pool CLI adapter.
 /// No AttachableId — the manager handles identity mapping.
 #[derive(Debug, Clone, bon::Builder)]
@@ -100,6 +118,20 @@ pub trait TerminalPool: Send + Sync {
         tags: &[TerminalSessionTag],
     ) -> Result<(), String>;
 
+    /// Ensure a session with an explicit initial terminal size when supported.
+    /// Pools without launch-time sizing retain their normal behavior.
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
+        _initial_size: Option<TerminalSize>,
+    ) -> Result<(), String> {
+        self.ensure_session(session_name, command, cwd, env_vars, tags).await
+    }
+
     /// Returns a structured `Arg` tree representing the attach command.
     /// Callers that need a flat string can use `flatten(&args, 0)`.
     fn attach_args(
@@ -113,7 +145,7 @@ pub trait TerminalPool: Send + Sync {
     /// Verify that the resolved pool supports the requested seat semantics.
     async fn preflight_attach(&self, mode: AttachMode) -> Result<(), String> {
         match mode {
-            AttachMode::Default => Ok(()),
+            AttachMode::Default | AttachMode::PreferTake => Ok(()),
             AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
         }
     }
@@ -128,7 +160,7 @@ pub trait TerminalPool: Send + Sync {
         mode: AttachMode,
     ) -> Result<Vec<Arg>, String> {
         match mode {
-            AttachMode::Default => self.attach_args(session_name, command, cwd, env_vars),
+            AttachMode::Default | AttachMode::PreferTake => self.attach_args(session_name, command, cwd, env_vars),
             AttachMode::Strict | AttachMode::Take => Err("terminal pool does not support controller-seat attach options".to_string()),
         }
     }
@@ -155,9 +187,15 @@ pub trait TerminalPool: Send + Sync {
         Ok(None)
     }
 
-    /// Deliver text to a running session. This trait grows only for concrete
-    /// flotilla consumers; it is not intended to mirror a pool backend's API.
-    async fn deliver(&self, _session_name: &str, _text: &str, _submit: bool) -> Result<(), String> {
+    /// Deliver and submit machinery text to a running agent session. This
+    /// operation must use the pool's reliable TUI-composer submission path.
+    async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
         Err("terminal pool does not support delivery".to_string())
+    }
+
+    /// Retry a delivery whose text is still present in a TUI composer. Pools
+    /// with keyboard-level control should clear that text before resubmitting.
+    async fn retry_delivery(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.deliver(session_name, text).await
     }
 }

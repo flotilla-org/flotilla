@@ -40,6 +40,8 @@ fn updated_workflow_spec() -> WorkflowTemplateSpec {
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     ConvoySpec {
+        role: String::new(),
+        generation: 1,
         workflow_ref: workflow_ref.to_string(),
         dispatching_principal_ref: Default::default(),
         inputs: [
@@ -120,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("updating convoy status");
     let updated_convoy = convoy_resolver
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
+            provisioning: None,
             placement_decision: None,
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,

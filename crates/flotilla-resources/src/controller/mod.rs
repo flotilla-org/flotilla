@@ -36,18 +36,15 @@ pub type Event = String;
 #[allow(async_fn_in_trait)]
 pub trait Reconciler: Send + Sync + 'static {
     type Resource: Resource;
-    type Dependencies;
+    type Prepared;
 
-    /// Gather or prepare the dependency state needed for `reconcile()`.
-    ///
-    /// Reconcilers may use this hook for idempotent preparation work when the
-    /// dependency result depends on performing that step first.
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError>;
+    /// Prepare the state needed for `reconcile()`; this method may perform effects and must be idempotent, while `reconcile()` must be pure.
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError>;
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource>;
 
@@ -63,7 +60,7 @@ pub trait Reconciler: Send + Sync + 'static {
     }
 
     /// Persist a resource-specific degraded condition once the reconcile
-    /// error budget is exhausted.
+    /// error threshold is reached.
     fn reconcile_degraded_patch(
         &self,
         _obj: &ResourceObject<Self::Resource>,
@@ -72,13 +69,15 @@ pub trait Reconciler: Send + Sync + 'static {
         None
     }
 
-    /// A persisted degraded condition survives controller restarts and parks
-    /// the object until an explicit resource transition clears it.
+    /// Report whether a persisted degraded condition is present. A `Park`
+    /// policy uses this to survive controller restarts; a `Retry` policy keeps
+    /// reconciling the object with backoff.
     fn is_reconcile_degraded(&self, _obj: &ResourceObject<Self::Resource>) -> bool {
         false
     }
 
     /// Allow a lifecycle change to wake an otherwise parked degraded object.
+    /// This is consulted only for `Park` policies.
     async fn degraded_object_needs_reconcile(&self, _obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
         Ok(false)
     }
@@ -98,9 +97,21 @@ pub trait Reconciler: Send + Sync + 'static {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileErrorPolicy {
+    /// Number of identical consecutive failures before the degraded condition
+    /// is persisted and `exhaustion` takes effect.
     pub max_consecutive_failures: u32,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub exhaustion: ReconcileErrorExhaustion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileErrorExhaustion {
+    /// Persist the degraded condition and stop reconciling until a lifecycle
+    /// change explicitly wakes the resource.
+    Park,
+    /// Persist the degraded condition but keep retrying at the capped backoff.
+    Retry,
 }
 
 impl ReconcileErrorPolicy {
@@ -150,6 +161,8 @@ pub enum Actuation {
     RetryClone { name: String, failed_at: DateTime<Utc> },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
+    CreateDemand { meta: InputMeta, spec: crate::DemandSpec },
+    DeleteDemand { name: String },
     RestartTerminalSession { name: String },
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
@@ -486,6 +499,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
             }
+            Actuation::CreateDemand { meta, spec } => {
+                let resolver = backend.using::<crate::Demand>(namespace);
+                Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::DeleteDemand { name } => {
+                let resolver = backend.using::<crate::Demand>(namespace);
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
+            }
             Actuation::RestartTerminalSession { name } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 crate::apply_status_patch(&resolver, &name, &crate::TerminalSessionStatusPatch::MarkStarting).await.map(|_| ())
@@ -713,9 +734,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if !lifecycle_owned {
                         return Ok(());
                     }
-                    let degraded_needs_reconcile =
-                        reconciler.is_reconcile_degraded(&object) && reconciler.degraded_object_needs_reconcile(&object).await?;
-                    if reconciler.is_reconcile_degraded(&object) && !degraded_needs_reconcile {
+                    let degraded_is_parked = reconciler.is_reconcile_degraded(&object)
+                        && reconciler.reconcile_error_policy().is_none_or(|policy| policy.exhaustion == ReconcileErrorExhaustion::Park);
+                    let degraded_needs_reconcile = degraded_is_parked && reconciler.degraded_object_needs_reconcile(&object).await?;
+                    if degraded_is_parked && !degraded_needs_reconcile {
                         return Ok(());
                     }
                     if object_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
@@ -727,8 +749,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                         }
                     }
                     attempted_reconcile = true;
-                    let deps = reconciler.fetch_dependencies(&object).await?;
-                    let outcome = reconciler.reconcile(&object, &deps, Utc::now());
+                    let prepared = reconciler.prepare(&object).await?;
+                    let outcome = reconciler.reconcile(&object, &prepared, Utc::now());
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }
@@ -767,9 +789,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                                     .filter(|previous| previous.failure.message == message)
                                     .map_or(1, |previous| previous.failure.consecutive_failures.saturating_add(1));
                                 let failure = ReconcileFailure { message, consecutive_failures };
-                                terminal = consecutive_failures >= policy.max_consecutive_failures;
+                                let exhausted = consecutive_failures >= policy.max_consecutive_failures;
+                                terminal = exhausted && policy.exhaustion == ReconcileErrorExhaustion::Park;
                                 let delay = policy.backoff(consecutive_failures);
-                                if terminal {
+                                if exhausted {
                                     if let Some(patch) = reconciler.reconcile_degraded_patch(&object, &failure) {
                                         match apply_status_patch(&primary, &name, &patch).await {
                                             Ok(_) => {}
@@ -779,7 +802,6 @@ impl<R: Reconciler> ControllerLoop<R> {
                                             }
                                             Err(patch_error) => {
                                                 terminal = false;
-                                                retry_after = Some(delay);
                                                 warn!(
                                                     resource_kind = R::Resource::API_PATHS.kind,
                                                     resource = %name,
@@ -790,9 +812,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                                         }
                                     } else {
                                         terminal = false;
-                                        retry_after = Some(delay);
                                     }
-                                } else {
+                                }
+                                if !terminal {
                                     retry_after = Some(delay);
                                 }
                                 object_failures.insert(name.clone(), ObjectFailure {

@@ -151,7 +151,7 @@ fn convoy_claims_checkout(convoy: &ResourceObject<Convoy>, checkout_name: &str) 
     flotilla_resources::expected_checkout_refs(convoy).is_ok_and(|expected| expected.contains(checkout_name))
 }
 
-pub enum CheckoutDeps {
+pub enum CheckoutPrepared {
     None,
     OwnerTerminal,
     Ready { prepared: PreparedCheckout },
@@ -177,10 +177,8 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
-fn convoy_needs_terminal_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
-    convoy.and_then(|convoy| convoy.status.as_ref()).is_some_and(|status| {
-        matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled)
-    })
+fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
+    convoy.is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| status.phase != ConvoyPhase::Abandoned))
 }
 
 impl<R> Reconciler for CheckoutReconciler<R>
@@ -188,9 +186,9 @@ where
     R: CheckoutRuntime + 'static,
 {
     type Resource = Checkout;
-    type Dependencies = CheckoutDeps;
+    type Prepared = CheckoutPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let lifecycle_authority = obj.metadata.lifecycle_authority()?;
         let has_convoy_owner = obj.metadata.labels.contains_key(CONVOY_LABEL)
             || obj.metadata.owner_references.iter().any(|owner| owner.kind == Convoy::API_PATHS.kind);
@@ -199,99 +197,99 @@ where
             && has_convoy_owner
             && convoy.as_ref().is_some_and(convoy_sanctions_checkout_reclaim)
         {
-            return Ok(CheckoutDeps::OwnerTerminal);
+            return Ok(CheckoutPrepared::OwnerTerminal);
         }
 
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            let terminal_evidence = convoy_needs_terminal_evidence(convoy.as_ref());
-            let refresh_after = if terminal_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
+            let delete_evidence = convoy_needs_delete_evidence(convoy.as_ref());
+            let refresh_after = if delete_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
             let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj));
             if obj.status.as_ref().is_some_and(|status| {
                 status.phase == CheckoutPhase::Ready
                     && (!integration_is_fresh(status, self.clock.now(), refresh_after)
-                        || (terminal_evidence && checkout_observation_lacks_convoy_association(&status.integration))
+                        || (delete_evidence && checkout_observation_lacks_convoy_association(&status.integration))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))
             }) {
                 return Ok(match self.runtime.inspect_integration(obj, convoy.as_ref()).await {
-                    Ok(status) => CheckoutDeps::Integration { status: Box::new(status) },
-                    Err(err) => CheckoutDeps::Failed(err),
+                    Ok(status) => CheckoutPrepared::Integration { status: Box::new(status) },
+                    Err(err) => CheckoutPrepared::Failed(err),
                 });
             }
-            return Ok(CheckoutDeps::None);
+            return Ok(CheckoutPrepared::None);
         }
 
         match &obj.spec {
             CheckoutSpec::Worktree(spec) => {
                 let clone = match self.clones.get(&spec.clone_ref).await {
                     Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => return Ok(CheckoutDeps::Waiting),
+                    Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
                     Err(err) => return Err(err),
                 };
                 if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
                     let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
                     if failed_at <= obj.metadata.creation_timestamp {
-                        return Ok(CheckoutDeps::RetryClone { clone_name: clone.metadata.name, failed_at });
+                        return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
                     }
                     let detail = clone
                         .status
                         .as_ref()
                         .and_then(|status| status.message.as_deref())
                         .map_or(String::new(), |message| format!(": {message}"));
-                    return Ok(CheckoutDeps::Failed(format!(
+                    return Ok(CheckoutPrepared::Failed(format!(
                         "clone {} is Failed since {}{detail}",
                         clone.metadata.name,
                         failed_at.to_rfc3339()
                     )));
                 }
                 if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                    return Ok(CheckoutDeps::Waiting);
+                    return Ok(CheckoutPrepared::Waiting);
                 }
                 if clone.spec.env_ref != spec.env_ref {
-                    return Ok(CheckoutDeps::Failed("worktree clone env_ref mismatch".to_string()));
+                    return Ok(CheckoutPrepared::Failed("worktree clone env_ref mismatch".to_string()));
                 }
                 Ok(match self.runtime.create_worktree(&clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
-                    Ok(prepared) => CheckoutDeps::Ready { prepared },
-                    Err(err) => CheckoutDeps::Failed(err),
+                    Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                    Err(err) => CheckoutPrepared::Failed(err),
                 })
             }
             CheckoutSpec::FreshClone(spec) => {
                 Ok(match self.runtime.create_fresh_clone(&spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
-                    Ok(prepared) => CheckoutDeps::Ready { prepared },
-                    Err(err) => CheckoutDeps::Failed(err),
+                    Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                    Err(err) => CheckoutPrepared::Failed(err),
                 })
             }
             // Observed checkouts are facts from the observed-resource backend.
             // The managed checkout reconciler must not actuate or patch them.
-            CheckoutSpec::Observed(_) => Ok(CheckoutDeps::None),
+            CheckoutSpec::Observed(_) => Ok(CheckoutPrepared::None),
         }
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending {
-            match deps {
-                CheckoutDeps::Ready { prepared } => obj.spec.target_path().map(|path| CheckoutStatusPatch::MarkReady {
+            match prepared {
+                CheckoutPrepared::Ready { prepared } => obj.spec.target_path().map(|path| CheckoutStatusPatch::MarkReady {
                     path: path.to_string(),
                     commit: prepared.commit.clone(),
                     branch_provenance: prepared.branch_provenance,
                 }),
-                CheckoutDeps::Integration { .. } | CheckoutDeps::OwnerTerminal => None,
-                CheckoutDeps::RetryClone { .. } => None,
-                CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
-                CheckoutDeps::Waiting | CheckoutDeps::None => None,
+                CheckoutPrepared::Integration { .. } | CheckoutPrepared::OwnerTerminal => None,
+                CheckoutPrepared::RetryClone { .. } => None,
+                CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
+                CheckoutPrepared::Waiting | CheckoutPrepared::None => None,
             }
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
-            match deps {
-                CheckoutDeps::Integration { status } => {
+            match prepared {
+                CheckoutPrepared::Integration { status } => {
                     Some(CheckoutStatusPatch::UpdateIntegration { integration: Box::new(status.as_ref().clone()) })
                 }
-                CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
+                CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
                     integration: Box::new(CheckoutIntegrationStatus {
                         clean: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
@@ -312,26 +310,26 @@ where
                         change_request: None,
                     }),
                 }),
-                CheckoutDeps::None
-                | CheckoutDeps::OwnerTerminal
-                | CheckoutDeps::Ready { .. }
-                | CheckoutDeps::RetryClone { .. }
-                | CheckoutDeps::Waiting => None,
+                CheckoutPrepared::None
+                | CheckoutPrepared::OwnerTerminal
+                | CheckoutPrepared::Ready { .. }
+                | CheckoutPrepared::RetryClone { .. }
+                | CheckoutPrepared::Waiting => None,
             }
         } else {
             None
         };
 
-        let actuations = match deps {
-            CheckoutDeps::OwnerTerminal => vec![Actuation::DeleteCheckout { name: obj.metadata.name.clone() }],
-            CheckoutDeps::RetryClone { clone_name, failed_at } => {
+        let actuations = match prepared {
+            CheckoutPrepared::OwnerTerminal => vec![Actuation::DeleteCheckout { name: obj.metadata.name.clone() }],
+            CheckoutPrepared::RetryClone { clone_name, failed_at } => {
                 vec![Actuation::RetryClone { name: clone_name.clone(), failed_at: *failed_at }]
             }
             _ => Vec::new(),
         };
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending
-            && !matches!(deps, CheckoutDeps::Failed(_))
+            && !matches!(prepared, CheckoutPrepared::Failed(_))
         {
             outcome.requeue_after = Some(CHECKOUT_PROVISIONING_REQUEUE_AFTER);
         }

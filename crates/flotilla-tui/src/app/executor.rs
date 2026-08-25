@@ -127,7 +127,10 @@ pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, a
 /// Called when a `CommandFinished` event arrives from the daemon.
 pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
-        CommandValue::Ok => {}
+        CommandValue::Ok
+        | CommandValue::ConvoyBriefDelivered { .. }
+        | CommandValue::ConvoyBriefQueued { .. }
+        | CommandValue::ConvoyBriefWithdrawn { .. } => {}
         CommandValue::RepoTracked { path, .. } => {
             info!(path = %path.display(), "tracked repo");
         }
@@ -184,6 +187,17 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "convoy created");
             app.set_status_message(Some(format!("Convoy created: {name}")));
         }
+        CommandValue::ConvoyAbandoned { name, archives } => {
+            let failed = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Failed).count();
+            let archived = archives.iter().filter(|archive| archive.status == flotilla_protocol::CheckoutArchiveStatus::Archived).count();
+            info!(%name, %archived, %failed, "convoy abandoned");
+            let warning = match failed {
+                0 => String::new(),
+                1 => " (1 archive warning)".to_string(),
+                count => format!(" ({count} archive warnings)"),
+            };
+            app.set_status_message(Some(format!("Convoy abandoned: {name}{warning}")));
+        }
         CommandValue::ConvoyStarted { name, attach_plan, .. } => {
             info!(%name, "convoy started");
             app.set_status_message(Some(format!("Convoy started: {name}")));
@@ -207,10 +221,11 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, %members, "project registered from declaration");
             app.set_status_message(Some(format!("Project registered: {name} ({members} members)")));
         }
-        CommandValue::ProjectRefreshed { name, members, converged, changes } => {
-            info!(%name, %members, %converged, ?changes, "project declaration refreshed");
+        CommandValue::ProjectRefreshed { name, members, converged, changes, operational_entries } => {
+            info!(%name, %members, %converged, ?changes, ?operational_entries, "project declaration refreshed");
             let outcome = if converged { format!("changed: {}", changes.join(", ")) } else { "already current".to_string() };
-            app.set_status_message(Some(format!("Project refreshed: {name} ({members} members, {outcome})")));
+            let entries = if operational_entries.is_empty() { String::new() } else { format!("; {}", operational_entries.join("; ")) };
+            app.set_status_message(Some(format!("Project refreshed: {name} ({members} members, {outcome}){entries}")));
         }
     }
 }

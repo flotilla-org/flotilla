@@ -8,10 +8,19 @@ readonly FLEET_PACKAGE_URL="${FLEET_INSTALL_PACKAGE_URL:-https://forgejo.lab.flo
 readonly FLEET_ROOT="${FLEET_INSTALL_ROOT:-$HOME/.local/opt/flotilla-fleet}"
 readonly FLEET_BIN_DIR="${FLEET_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 readonly FLEET_TOKEN_FILE="${FLEET_INSTALL_TOKEN_FILE:-$HOME/.config/flotilla/fleet-reader-token}"
+readonly SYSTEMD_USER_DIR="${FLEET_INSTALL_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+readonly LAUNCH_AGENT_DIR="${FLEET_INSTALL_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}"
+readonly LAUNCH_AGENT_LABEL="work.flotilla.flotillad"
+readonly DAEMON_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flotilla"
+readonly DAEMON_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/flotilla"
+readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
+readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
+readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
+readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
 WORK_DIR=""
@@ -19,6 +28,10 @@ READ_ONLY=0
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
+DARWIN_AGENT_DISABLED=0
+CONFIRMATION_PID=""
+CONFIRMATION_LOG=""
+CONFIRMATION_DONE=""
 readonly GENERATION_INCOMPLETE_EXIT=20
 
 die() {
@@ -41,6 +54,7 @@ except FileNotFoundError:
     pass
 PY
   fi
+  [[ -z "$CONFIRMATION_DONE" ]] || touch -- "$CONFIRMATION_DONE"
 }
 trap cleanup EXIT
 
@@ -240,7 +254,7 @@ if manifest.get("generation") != generation:
 sources = manifest.get("sources")
 if (
     not isinstance(sources, dict)
-    or set(sources) != {"flotilla", "cleat"}
+    or set(sources) != {"flotilla", "cleat", "mattpocock-skills", "rjw-skills"}
     or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in sources.values())
     or sources["flotilla"][:12] != identity.group(1)
     or sources["cleat"][:12] != identity.group(2)
@@ -489,14 +503,33 @@ actual = {
 }
 if actual != expected:
     raise SystemExit("release files do not match the manifest")
-required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh"}
+required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "share/flotilla/skills/.flotilla-sources.json"}
 if not required.issubset(expected):
     raise SystemExit("release is missing a required payload")
+skill_manifest = json.loads((root / "share/flotilla/skills/.flotilla-sources.json").read_text())
+expected_skill_sources = [
+    {
+        "name": "mattpocock-skills",
+        "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
+        "revision": outer["sources"]["mattpocock-skills"],
+    },
+    {
+        "name": "rjw-skills",
+        "repository": "https://github.com/rjwittams/rjw-skills.git",
+        "revision": outer["sources"]["rjw-skills"],
+    },
+]
+if skill_manifest != {"schema_version": 1, "sources": expected_skill_sources}:
+    raise SystemExit("skill bundle source pins do not match the fleet generation")
 for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
     if not os.access(root / rel, os.X_OK):
         raise SystemExit(f"release binary is not executable: {rel}")
 if platform == "darwin-aarch64":
-    allowed = required | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
+    allowed = (
+        required
+        | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
+        | {rel for rel in expected if rel.startswith("share/flotilla/skills/")}
+    )
     if expected != allowed:
         raise SystemExit("signed Darwin derivative contains an unexpected payload set")
 PY
@@ -579,6 +612,54 @@ except (OSError, ValueError):
 PY
 }
 
+show_fleet_spread() {
+  if ! pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1; then
+    printf 'fleet:   unavailable (daemon not running)\n'
+    return
+  fi
+  if [[ ! -x "$CURRENT_LINK/bin/flotilla" ]]; then
+    printf 'fleet:   unavailable (no current fleet CLI)\n'
+    return
+  fi
+
+  local response="$WORK_DIR/fleet-health.json"
+  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json host list >"$response" 2>/dev/null; then
+    printf 'fleet:   unavailable (daemon query failed)\n'
+    return
+  fi
+  if ! python3 - "$response" <<'PY'
+import json
+import sys
+
+try:
+    response = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(response, dict) or response.get("kind") != "fleet_health":
+    raise SystemExit(1)
+hosts = response.get("hosts")
+if not isinstance(hosts, list):
+    raise SystemExit(1)
+
+spread = {}
+for host in hosts:
+    if not isinstance(host, dict) or not isinstance(host.get("host"), str):
+        raise SystemExit(1)
+    generation = host.get("daemon_generation")
+    if not isinstance(generation, str) or not generation:
+        generation = "unknown"
+    name = host["host"] + (" (local)" if host.get("is_local") is True else "")
+    spread.setdefault(generation, []).append(name)
+
+print("fleet wire generations:")
+for generation in sorted(spread, key=lambda value: (value == "unknown", value)):
+    print(f"  {generation}: {', '.join(sorted(spread[generation]))}")
+PY
+  then
+    printf 'fleet:   unavailable (invalid daemon response)\n'
+  fi
+}
+
 write_launcher() {
   local name="$1"
   local launcher="$FLEET_BIN_DIR/$name"
@@ -594,9 +675,24 @@ write_launcher() {
 }
 
 ensure_launchers_and_path() {
-  local name resolved expected
+  local name
   for name in flotilla flotillad cleat; do
     write_launcher "$name"
+  done
+
+  local login_shell="${SHELL:-/bin/sh}"
+  local init_file
+  case "${login_shell##*/}" in
+    zsh) init_file='~/.zshenv' ;;
+    fish) init_file='~/.config/fish/config.fish' ;;
+    *) init_file='~/.profile' ;;
+  esac
+
+  local resolved expected
+  for name in flotilla flotillad cleat; do
+    resolved="$( (unset PATH; "$login_shell" -l -c "command -v $name") 2>/dev/null || true)"
+    [[ -n "$resolved" ]] \
+      || die "$name is not reachable through the login shell; add $FLEET_BIN_DIR to PATH in $init_file before installing"
     expected="$(python3 - "$FLEET_BIN_DIR/$name" <<'PY'
 import os
 import sys
@@ -604,8 +700,6 @@ import sys
 print(os.path.realpath(sys.argv[1]))
 PY
 )"
-    resolved="$(command -v "$name" || true)"
-    [[ -n "$resolved" ]] || die "$name is not reachable through PATH; add $FLEET_BIN_DIR before installing"
     resolved="$(python3 - "$resolved" <<'PY'
 import os
 import sys
@@ -613,21 +707,334 @@ import sys
 print(os.path.realpath(sys.argv[1]))
 PY
 )"
-    [[ "$resolved" == "$expected" ]] || die "PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first"
+    [[ "$resolved" == "$expected" ]] \
+      || die "the login shell PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first in $init_file"
   done
 }
 
+write_systemd_user_unit() {
+  [[ "$PLATFORM" == linux-* ]] || return 0
+  local unit="$SYSTEMD_USER_DIR/flotillad.service"
+  local temporary daemon_path fleet_bin_path cargo_bin_path skills_path
+  daemon_path="$(systemd_path "$FLEET_ROOT/current/bin/flotillad")"
+  fleet_bin_path="$(systemd_path "$FLEET_BIN_DIR")"
+  cargo_bin_path="$(systemd_path "$HOME/.cargo/bin")"
+  skills_path="$(systemd_path "$FLEET_ROOT/current/share/flotilla/skills")"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  temporary="$(mktemp "$SYSTEMD_USER_DIR/.flotillad.service.fleet-install.XXXXXX")"
+  cat >"$temporary" <<UNIT
+# managed by fleet-install
+[Unit]
+Description=Flotilla daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="$daemon_path"
+Environment="PATH=$fleet_bin_path:$cargo_bin_path:/usr/local/bin:/usr/bin:/bin"
+Environment="FLOTILLA_SKILLS_DIR=$skills_path"
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$unit"
+}
+
+systemd_path() {
+  python3 - "$1" "$HOME" <<'PY'
+import os
+import sys
+
+path, home = sys.argv[1:]
+if "\n" in path or "\r" in path:
+    raise SystemExit("systemd path contains a line break")
+if path == home:
+    print("%h")
+elif path.startswith(home + os.sep):
+    relative = path[len(home) + 1 :].replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    print(f"%h/{relative}")
+else:
+    print(path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"))
+PY
+}
+
+prepare_linux_daemon_service() {
+  [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v loginctl >/dev/null || die 'cannot install flotillad.service: loginctl is not available'
+  command -v systemctl >/dev/null || die 'cannot install flotillad.service: systemctl is not available'
+  write_systemd_user_unit
+  # Re-enabling linger can be denied by polkit outside a login session even
+  # when linger is already on; only attempt the transition that is needed.
+  local user
+  user="$(id -un)"
+  if [[ "$(loginctl show-user "$user" --property Linger --value 2>/dev/null)" != yes ]]; then
+    loginctl enable-linger "$user" || true
+    [[ "$(loginctl show-user "$user" --property Linger --value 2>/dev/null)" == yes ]] \
+      || die "cannot enable linger for $user; run: sudo loginctl enable-linger $user"
+  fi
+  systemctl --user daemon-reload
+  systemctl --user enable flotillad.service
+}
+
+restart_linux_daemon_service() {
+  [[ "$PLATFORM" == linux-* ]] || return 0
+  command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
+  systemctl --user restart flotillad.service
+}
+
+write_launchd_agent() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
+  local temporary daemon_path daemon_path_value skills_path stderr_path stdout_path
+  daemon_path="$FLEET_ROOT/current/bin/flotillad"
+  daemon_path_value="$FLEET_BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  skills_path="$FLEET_ROOT/current/share/flotilla/skills"
+  stderr_path="$LAUNCH_LOG_DIR/flotillad.stderr.log"
+  stdout_path="$LAUNCH_LOG_DIR/flotillad.stdout.log"
+  mkdir -p "$LAUNCH_AGENT_DIR" "$LAUNCH_LOG_DIR"
+  temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
+  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" "$skills_path" \
+    "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path" <<'PY'
+import plistlib
+import sys
+
+destination, label, daemon, path, skills, config_dir, state_dir, socket, stderr_path, stdout_path = sys.argv[1:]
+content = {
+    "Label": label,
+    "ProgramArguments": [
+        daemon,
+        "--config-dir",
+        config_dir,
+        "--state-dir",
+        state_dir,
+        "--socket",
+        socket,
+    ],
+    "EnvironmentVariables": {"PATH": path, "FLOTILLA_SKILLS_DIR": skills},
+    "StandardErrorPath": stderr_path,
+    "StandardOutPath": stdout_path,
+    "RunAtLoad": True,
+    "KeepAlive": {"SuccessfulExit": False},
+}
+with open(destination, "wb") as output:
+    plistlib.dump(content, output, sort_keys=False)
+PY
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$plist"
+}
+
+prepare_darwin_daemon_service() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  command -v launchctl >/dev/null || die "cannot install $LAUNCH_AGENT_LABEL: launchctl is not available"
+  local domain="gui/$(id -u)"
+  local disabled_services
+  disabled_services="$(launchctl print-disabled "$domain")" \
+    || die "cannot determine whether $LAUNCH_AGENT_LABEL is disabled"
+  if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
+    DARWIN_AGENT_DISABLED=1
+  fi
+  # Unload before publishing the refreshed plist. Enabled clients then defer
+  # to launchd, whose kickstart cannot race the generation flip while the job
+  # is absent from the domain.
+  launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
+  write_launchd_agent
+}
+
+restart_darwin_daemon_service() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  if ((DARWIN_AGENT_DISABLED)); then
+    printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
+    return 0
+  fi
+  command -v launchctl >/dev/null || die "cannot restart $LAUNCH_AGENT_LABEL: launchctl is not available"
+  local domain="gui/$(id -u)"
+  local target="$domain/$LAUNCH_AGENT_LABEL"
+  local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
+  launchctl enable "$target"
+  launchctl bootstrap "$domain" "$plist"
+  launchctl kickstart -k "$target"
+}
+
+probe_daemon_health() {
+  local response="$WORK_DIR/daemon-health.json"
+  # This candidate CLI's socket hello requires an exact build and protocol
+  # fingerprint match. A successful fleet query therefore proves both that
+  # the selected daemon answered and that its control plane is ready.
+  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json fleet >"$response" 2>/dev/null; then
+    return 1
+  fi
+  python3 - "$response" <<'PY'
+import json
+import sys
+
+try:
+    response = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(response, dict) or response.get("kind") != "fleet_health":
+    raise SystemExit(1)
+hosts = response.get("hosts")
+if not isinstance(hosts, list):
+    raise SystemExit(1)
+if not any(isinstance(host, dict) and host.get("is_local") is True for host in hosts):
+    raise SystemExit(1)
+PY
+}
+
+wait_for_daemon_generation() {
+  local generation="$1"
+  [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
+    || die "health confirmation timeout must be a non-negative integer: $CONFIRM_TIMEOUT_SECONDS"
+  local deadline=$((SECONDS + CONFIRM_TIMEOUT_SECONDS))
+  while true; do
+    if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health; then
+      return 0
+    fi
+    ((SECONDS < deadline)) || return 1
+    sleep 1
+  done
+}
+
+arm_health_confirmation() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  local temporary="$FLEET_ROOT/.pending-confirmation.new.$$"
+  printf 'candidate=%s\nrollback=%s\ntoken=%s\n' "$generation" "$rollback_generation" "$token" >"$temporary"
+  mv -f "$temporary" "$PENDING_CONFIRMATION"
+}
+
+confirmation_is_armed() {
+  local token="$1"
+  [[ -f "$PENDING_CONFIRMATION" ]] && grep -Fxq "token=$token" "$PENDING_CONFIRMATION"
+}
+
+disarm_health_confirmation() {
+  local token="$1"
+  python3 - "$PENDING_CONFIRMATION" "$token" <<'PY'
+import os
+import sys
+
+path, token = sys.argv[1:]
+try:
+    with open(path) as source:
+        armed = any(line.rstrip("\n") == f"token={token}" for line in source)
+    if armed:
+        os.unlink(path)
+except FileNotFoundError:
+    pass
+PY
+}
+
+automatic_rollback() {
+  local failed_generation="$1"
+  local rollback_generation="$2"
+  [[ -n "$rollback_generation" ]] || return 1
+  [[ -d "$RELEASES_DIR/$rollback_generation" ]] || return 1
+  [[ -f "$RELEASES_DIR/$rollback_generation/.generation.json" ]] || return 1
+  verify_installed_release "$RELEASES_DIR/$rollback_generation" "$RELEASES_DIR/$rollback_generation/.generation.json" || return 1
+  # launchd must unload the candidate before the symlink flip. systemd has no
+  # equivalent race and its stable unit was already refreshed by the parent.
+  prepare_darwin_daemon_service || return 1
+  atomic_link "releases/$rollback_generation" "$CURRENT_LINK" || return 1
+  atomic_link "releases/$failed_generation" "$PREVIOUS_LINK" || return 1
+  restart_linux_daemon_service || return 1
+  restart_darwin_daemon_service || return 1
+  wait_for_daemon_generation "$rollback_generation" || return 1
+}
+
+confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  make_work_dir
+  local activation_deadline=$((SECONDS + 10))
+  while [[ "$(current_generation)" != "$generation" ]]; do
+    confirmation_is_armed "$token" || return 0
+    if ((SECONDS >= activation_deadline)); then
+      disarm_health_confirmation "$token"
+      return 0
+    fi
+    sleep 0.1
+  done
+  if wait_for_daemon_generation "$generation"; then
+    disarm_health_confirmation "$token"
+    printf 'fleet-install: generation %s confirmed healthy\n' "$generation"
+    return 0
+  fi
+  confirmation_is_armed "$token" || return 0
+  local parent_pid="${token%%-*}"
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    # The foreground installer normally holds this lock for the watchdog's
+    # lifetime. If it died, reclaim that protection before mutating links so
+    # a replacement install cannot race the orphaned rollback.
+    acquire_install_lock
+    confirmation_is_armed "$token" || return 0
+  fi
+  if automatic_rollback "$generation" "$rollback_generation"; then
+    disarm_health_confirmation "$token"
+    printf 'fleet-install: generation %s failed health confirmation; rolled back to %s\n' "$generation" "$rollback_generation" >&2
+    return 10
+  fi
+  printf 'fleet-install: generation %s failed health confirmation and no healthy previous generation could be restored\n' "$generation" >&2
+  return 1
+}
+
+start_confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local token="$3"
+  local installer
+  installer="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  # A detached watchdog keeps its log as an audit trail if the foreground
+  # installer dies. Prune only logs whose watchdog marked them complete.
+  local completed_log
+  for completed_log in "$FLEET_ROOT"/.confirmation.*.log.done; do
+    [[ -f "$completed_log" ]] || continue
+    rm -f -- "${completed_log%.done}" "$completed_log"
+  done
+  CONFIRMATION_LOG="$FLEET_ROOT/.confirmation.$token.log"
+  nohup "$installer" __confirm "$generation" "$rollback_generation" "$token" >"$CONFIRMATION_LOG" 2>&1 </dev/null &
+  CONFIRMATION_PID=$!
+}
+
+await_confirmation_watchdog() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local result
+  if wait "$CONFIRMATION_PID"; then
+    result=0
+  else
+    result=$?
+  fi
+  [[ ! -f "$CONFIRMATION_LOG" ]] || cat "$CONFIRMATION_LOG"
+  rm -f -- "$CONFIRMATION_LOG" "$CONFIRMATION_LOG.done"
+  CONFIRMATION_LOG=""
+  case "$result" in
+    0) return 0 ;;
+    10) die "generation $generation failed health confirmation; rolled back to $rollback_generation" ;;
+    *) die "generation $generation failed health confirmation and no healthy previous generation could be restored" ;;
+  esac
+}
+
 daemon_preflight() {
+  local generation="$1"
   pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1 || return 0
-  local cli
+  local cli invocation
   if [[ -x "$CURRENT_LINK/bin/flotilla" ]]; then
     cli="$CURRENT_LINK/bin/flotilla"
+  elif [[ -x "$RELEASES_DIR/$generation/bin/flotilla" ]]; then
+    cli="$RELEASES_DIR/$generation/bin/flotilla"
   else
     cli="$(command -v flotilla || true)"
   fi
   [[ -n "$cli" ]] || die 'flotillad is running; install a usable flotilla command and run `flotilla daemon stop`'
   if ! "$cli" daemon stop; then
-    die 'flotillad is running and could not be stopped; run `flotilla daemon stop`, then retry'
+    printf -v invocation '%q daemon stop' "$cli"
+    die "flotillad is running and could not be stopped; run \`$invocation\`, then retry"
   fi
 }
 
@@ -647,10 +1054,22 @@ PY
 
 switch_to() {
   local generation="$1"
+  local rollback_generation="$2"
+  local confirmation_token="$3"
   local old
   old="$(current_generation)"
-  [[ "$old" != "$generation" ]] || return 0
-  daemon_preflight
+  if [[ "$old" == "$generation" ]]; then
+    arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
+    if ((!DARWIN_AGENT_DISABLED)); then
+      start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
+    fi
+    return 0
+  fi
+  daemon_preflight "$generation"
+  arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
+  if ((!DARWIN_AGENT_DISABLED)); then
+    start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
+  fi
   if [[ -n "$old" ]]; then
     atomic_link "releases/$old" "$PREVIOUS_LINK"
   fi
@@ -662,8 +1081,23 @@ install_generation() {
   require_generation "$generation"
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
-  local old
+  local old rollback_generation confirmation_token
   old="$(current_generation)"
+  rollback_generation="$old"
+  if [[ "$old" == "$generation" && -L "$PREVIOUS_LINK" ]]; then
+    local previous_target
+    previous_target="$(readlink "$PREVIOUS_LINK")"
+    if [[ "$previous_target" =~ ^releases/[^/]+$ ]]; then
+      rollback_generation="${previous_target#releases/}"
+    fi
+  fi
+  [[ "$rollback_generation" != "$generation" ]] || rollback_generation=""
+  confirmation_token="$$-$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_hex(8))
+PY
+)"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
     make_work_dir
@@ -671,7 +1105,17 @@ install_generation() {
     require_generation_manifest "$generation" "$installed_outer"
     verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
     ensure_launchers_and_path
-    switch_to "$generation"
+    prepare_linux_daemon_service
+    prepare_darwin_daemon_service
+    switch_to "$generation" "$rollback_generation" "$confirmation_token"
+    restart_linux_daemon_service
+    restart_darwin_daemon_service
+    if ((DARWIN_AGENT_DISABLED)); then
+      disarm_health_confirmation "$confirmation_token"
+      printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+    else
+      await_confirmation_watchdog "$generation" "$rollback_generation"
+    fi
     printf 'fleet-install: generation %s is installed\n' "$generation"
     return
   fi
@@ -695,7 +1139,17 @@ install_generation() {
   mv "$unpack/release" "$RELEASES_DIR/$generation"
   chmod -R a-w "$RELEASES_DIR/$generation"
   ensure_launchers_and_path
-  switch_to "$generation"
+  prepare_linux_daemon_service
+  prepare_darwin_daemon_service
+  switch_to "$generation" "$rollback_generation" "$confirmation_token"
+  restart_linux_daemon_service
+  restart_darwin_daemon_service
+  if ((DARWIN_AGENT_DISABLED)); then
+    disarm_health_confirmation "$confirmation_token"
+    printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+  else
+    await_confirmation_watchdog "$generation" "$rollback_generation"
+  fi
   printf 'fleet-install: generation %s is installed\n' "$generation"
 }
 
@@ -710,6 +1164,7 @@ show_status() {
   target_version="$(manifest_value "$target_manifest" peer_protocol_version)"
   printf 'current: %s (peer protocol %s)\n' "${current:-<none>}" "${current_version:-unknown}"
   printf 'latest:  %s (peer protocol %s)\n' "$latest" "$target_version"
+  show_fleet_spread
   if [[ -n "$current_version" && "$current_version" != "$target_version" ]]; then
     printf 'warning: peer protocol changes from %s to %s; mixed generations may not peer\n' "$current_version" "$target_version"
   fi
@@ -731,9 +1186,13 @@ rollback() {
   make_work_dir
   verify_installed_release "$RELEASES_DIR/$previous" "$RELEASES_DIR/$previous/.generation.json"
   printf 'fleet-install: %s -> %s (rollback)\n' "$current" "$previous"
-  daemon_preflight
+  prepare_linux_daemon_service
+  prepare_darwin_daemon_service
+  daemon_preflight "$previous"
   atomic_link "releases/$previous" "$CURRENT_LINK"
   atomic_link "releases/$current" "$PREVIOUS_LINK"
+  restart_linux_daemon_service
+  restart_darwin_daemon_service
 }
 
 usage() {
@@ -742,6 +1201,13 @@ usage() {
 }
 
 main() {
+  if [[ "${1:-}" == __confirm ]]; then
+    [[ $# -eq 4 ]] || usage
+    PLATFORM="$(host_platform)"
+    CONFIRMATION_DONE="$FLEET_ROOT/.confirmation.$4.log.done"
+    confirmation_watchdog "$2" "$3" "$4"
+    return
+  fi
   [[ $# -eq 1 ]] || usage
   PLATFORM="$(host_platform)"
   case "$1" in

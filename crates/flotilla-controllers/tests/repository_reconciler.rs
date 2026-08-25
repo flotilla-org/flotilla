@@ -112,7 +112,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
 
     let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE)
         .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
-    let status = reconciler.fetch_dependencies(&repository).await.expect("status projection");
+    let status = reconciler.prepare(&repository).await.expect("status projection");
 
     assert_eq!(status.checkouts_by_host["host-a"][0].checkout_ref, "managed-worktree");
     assert_eq!(status.checkouts_by_host["host-a"][0].kind, RepositoryCheckoutKind::Worktree);
@@ -132,7 +132,7 @@ async fn repository_with_no_checkouts_projects_empty_status_without_deletion() {
         durable.clone().using::<Repository>(NAMESPACE).create(&meta(&spec.key().to_string()), &spec).await.expect("repository create");
 
     let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE);
-    let status = reconciler.fetch_dependencies(&repository).await.expect("status projection");
+    let status = reconciler.prepare(&repository).await.expect("status projection");
 
     assert!(status.checkouts_by_host.is_empty());
     assert_eq!(status.default_branch, None);
