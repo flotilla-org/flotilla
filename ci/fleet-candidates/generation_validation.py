@@ -79,7 +79,7 @@ def validate_skill_bundle(document, sources):
             raise ValidationError(f"skill source {name} has invalid or duplicate paths")
         for path in paths:
             pure = PurePosixPath(path) if isinstance(path, str) else None
-            if (pure is None or not path or pure.is_absolute() or path.endswith("/") or "\\" in path
+            if (pure is None or not path or pure.is_absolute() or path.endswith("/") or any(c in path for c in "\\\r\n*?[]")
                     or any(part in {"", ".", ".."} for part in path.split("/"))):
                 raise ValidationError(f"skill source {name} has invalid path: {path}")
         names.add(name)

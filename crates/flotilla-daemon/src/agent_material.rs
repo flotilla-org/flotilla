@@ -409,6 +409,7 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
                         || path.starts_with('/')
                         || path.ends_with('/')
                         || path.contains('\\')
+                        || path.chars().any(|character| matches!(character, '\r' | '\n' | '*' | '?' | '[' | ']'))
                         || path.split('/').any(|component| component.is_empty() || component == "." || component == "..")
                 })
         })
@@ -807,7 +808,18 @@ mod tests {
         assert_eq!(inspection.sources[0].paths, ["skills"]);
         assert_eq!(inspection.sources[1].paths, ["plugins/rjw-sdlc/skills"]);
 
-        for invalid in ["", "../skills", "plugins/../skills", "/skills", "skills/", r"plugins\skills"] {
+        for invalid in [
+            "",
+            "../skills",
+            "plugins/../skills",
+            "/skills",
+            "skills/",
+            r"plugins\skills",
+            "skills\nother",
+            "skills/*",
+            "skills/[ab]",
+            "skills?",
+        ] {
             let encoded = serde_json::to_string(invalid).expect("encode invalid fixture path");
             std::fs::write(&manifest_path, manifest.replace(r#"["plugins/rjw-sdlc/skills"]"#, &format!("[{encoded}]")))
                 .expect("write invalid-path fixture manifest");
