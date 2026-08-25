@@ -4,25 +4,21 @@
 
 Stored in `~/.config/flotilla/`:
 
-- `repos/*.toml` — one file per tracked repo, containing `path = "..."`
+- `observation-roots.toml` — a flat `paths = [...]` list of checkouts observed by this host
 - `open-views.toml` — the ordered set of Views opened by the TUI
 
 Repos are added interactively from within flotilla using the `a` key.
+The observation-roots schema rejects every field except `paths`; repository
+configuration belongs in replicated Repository and Project specs.
 
 ### Fork provenance
 
 Repositories that are maintained as forks declare their upstream provenance in
-the tracked repo's TOML file:
+the replicated Repository spec. Issue-source bindings belong to the Project
+spec's `issue_sources` list, not the host's observation roots:
 
-```toml
-path = "/home/alice/dev/zellij"
-
-[upstream]
-url = "https://github.com/zellij-org/zellij"
-relation = "fork"
-
-[issue_tracker.forgejo]
-scope = "fork-issues/zellij"
+```json
+{ "upstream": { "url": "https://github.com/zellij-org/zellij", "relation": "fork" } }
 ```
 
 Fork-stance provisioning clones only the repository's own URL as `origin`; it
@@ -30,9 +26,8 @@ does not add the upstream as a remote. Convoy admission requires a workflow
 with an in-crew reviewer, such as `implement-review`. A deliberate per-repo
 override can admit review-less workflows:
 
-```toml
-[workflow]
-allow_reviewless = true
+```json
+{ "allow_reviewless_workflows": true }
 ```
 
 ## Convoy start attachment
@@ -169,14 +164,21 @@ documents as additive desired state:
 ```toml
 [manifests]
 dir = "/home/alice/dev/project-map/flotilla"
+source = "https://github.com/example/project-map"
+reconciler_root = "01J..." # stable Host resource name
 ```
 
 Each file contains one or more full resource envelopes (`apiVersion`, `kind`,
-`metadata`, and `spec`). The daemon labels created objects as managed by the
-manifest reconciler and records the relative source path and last-applied spec
-digest. It fast-forwards a changed manifest only while the live spec still
+`metadata`, and `spec`). Only the daemon whose Host identity matches
+`reconciler_root` starts the loop; other daemons apply nothing even if a stale
+clone remains on disk. Remove `[manifests]` entirely from hosts that are not the
+declared root. The daemon labels created objects as managed by the manifest
+reconciler and records the declared source, relative source path, clean Git
+revision, reconciling root, and last-applied spec digest. It fast-forwards a
+changed manifest only while the live spec still
 matches that digest; live drift and collisions with unmanaged objects are
-reported and left untouched.
+reported and left untouched. The manifest directory must be tracked and clean;
+files with changes not represented by `HEAD` are not applied.
 
 This first manifest-reconciliation slice is deliberately additive: removing a
 file does not delete its object, and existing unmanaged objects are never
@@ -196,11 +198,10 @@ Flotilla auto-detects available tools. Nothing is strictly required beyond git, 
 
 ## Checkout manager
 
-The checkout manager provider can be configured per-repo in `~/.config/flotilla/repos/<slug>.toml`:
+The checkout manager provider can be configured fleet-wide in the Repository spec:
 
-```toml
-[checkouts]
-provider = "wt"    # "wt", "git", or "auto" (default)
+```json
+{ "vcs": { "git": { "checkout_strategy": "wt" } } }
 ```
 
 - `auto`: uses `wt` if available, falls back to plain git worktrees

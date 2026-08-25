@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+use crate::vessel_config::{
+    agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
+};
 
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
@@ -32,12 +34,19 @@ struct GithubAppJwtClaims {
 #[derive(Serialize)]
 struct GithubAppTokenRequest {
     repositories: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct GithubAppTokenResponse {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct GithubAppInstallationResponse {
+    id: u64,
 }
 
 #[derive(Clone)]
@@ -52,11 +61,34 @@ struct GithubAppMintRequest {
     app_id_path: String,
     private_key_path: String,
     repositories: Vec<String>,
+    permissions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GithubAppInstallationRequest {
+    repository: String,
+    app_id_path: String,
+    private_key_path: String,
+}
+
+#[derive(Debug)]
+enum GithubAppMintError {
+    InstallationNotFound(String),
+    Other(String),
+}
+
+impl std::fmt::Display for GithubAppMintError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstallationNotFound(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
 }
 
 #[async_trait]
 trait GithubAppTokenMinter: Send + Sync {
-    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String>;
+    async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String>;
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError>;
 }
 
 struct RealGithubAppTokenMinter {
@@ -72,11 +104,84 @@ struct GithubAppMinting {
 
 #[async_trait]
 impl GithubAppTokenMinter for RealGithubAppTokenMinter {
-    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
-        let app_id = tokio::fs::read_to_string(expand_path(&*self.env, &request.app_id_path))
+    async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String> {
+        let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await?;
+        let url = format!("https://api.github.com/repos/{}/installation", request.repository);
+        let http_request = flotilla_resources::tls::client()
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .build()
+            .map_err(|error| format!("build installation resolution request: {error}"))?;
+        let label = ChannelLabel::http_from_url(&url);
+        let response = self.http.execute(http_request, &label).await.map_err(|error| format!("resolve installation: {error}"))?;
+        if !response.status().is_success() {
+            let detail = String::from_utf8_lossy(response.body());
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!(
+                    "GitHub App is not installed on repository `{}` (HTTP {}): {detail}",
+                    request.repository,
+                    response.status()
+                ));
+            }
+            return Err(format!(
+                "failed to resolve GitHub App installation for repository `{}` (HTTP {}): {detail}",
+                request.repository,
+                response.status()
+            ));
+        }
+        serde_json::from_slice::<GithubAppInstallationResponse>(response.body())
+            .map(|response| response.id)
+            .map_err(|error| format!("decode installation resolution response for `{}`: {error}", request.repository))
+    }
+
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
+        let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await.map_err(GithubAppMintError::Other)?;
+        let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
+        let http_request = flotilla_resources::tls::client()
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&GithubAppTokenRequest { repositories: request.repositories.clone(), permissions: request.permissions.clone() })
+            .build()
+            .map_err(|error| GithubAppMintError::Other(format!("build installation token request: {error}")))?;
+        let label = ChannelLabel::http_from_url(&url);
+        let response = self
+            .http
+            .execute(http_request, &label)
+            .await
+            .map_err(|error| GithubAppMintError::Other(format!("mint installation token: {error}")))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let detail = String::from_utf8_lossy(response.body());
+            return Err(GithubAppMintError::InstallationNotFound(format!(
+                "mint installation token: GitHub returned HTTP {}: {detail}",
+                response.status()
+            )));
+        }
+        if !response.status().is_success() {
+            let detail = String::from_utf8_lossy(response.body());
+            return Err(GithubAppMintError::Other(format!(
+                "mint installation token: GitHub returned HTTP {}: {detail}",
+                response.status()
+            )));
+        }
+        let response: GithubAppTokenResponse = serde_json::from_slice(response.body())
+            .map_err(|error| GithubAppMintError::Other(format!("decode installation token response: {error}")))?;
+        if response.token.trim().is_empty() {
+            return Err(GithubAppMintError::Other("installation token response was empty".to_string()));
+        }
+        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+    }
+}
+
+impl RealGithubAppTokenMinter {
+    async fn jwt(&self, app_id_path: &str, private_key_path: &str) -> Result<String, String> {
+        let app_id = tokio::fs::read_to_string(expand_path(&*self.env, app_id_path))
             .await
             .map_err(|error| format!("read host-local App id: {error}"))?;
-        let private_key = tokio::fs::read(expand_path(&*self.env, &request.private_key_path))
+        let private_key = tokio::fs::read(expand_path(&*self.env, private_key_path))
             .await
             .map_err(|error| format!("read host-local private key: {error}"))?;
         let now = self.clock.now().timestamp();
@@ -85,28 +190,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
             return Err("host-local App id is empty".to_string());
         }
         let key = EncodingKey::from_rsa_pem(&private_key).map_err(|error| format!("decode host-local private key: {error}"))?;
-        let jwt =
-            jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))?;
-        let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
-        let http_request = flotilla_resources::tls::client()
-            .post(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&GithubAppTokenRequest { repositories: request.repositories.clone() })
-            .build()
-            .map_err(|error| format!("build installation token request: {error}"))?;
-        let label = ChannelLabel::http_from_url(&url);
-        let response = self.http.execute(http_request, &label).await.map_err(|error| format!("mint installation token: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("mint installation token: GitHub returned HTTP {}", response.status()));
-        }
-        let response: GithubAppTokenResponse =
-            serde_json::from_slice(response.body()).map_err(|error| format!("decode installation token response: {error}"))?;
-        if response.token.trim().is_empty() {
-            return Err("installation token response was empty".to_string());
-        }
-        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))
     }
 }
 
@@ -141,6 +225,8 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
+    github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -152,7 +238,18 @@ struct GithubAppDelivery {
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     expires_at: DateTime<Utc>,
+    refresh_failures: usize,
+    installation_repository: Option<String>,
 }
+
+#[derive(Debug)]
+pub(crate) struct CredentialRefreshError {
+    pub(crate) environment_ref: String,
+    pub(crate) message: String,
+    pub(crate) should_surface: bool,
+}
+
+const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug)]
 struct ResolvedMaterial {
@@ -217,7 +314,7 @@ impl GitCredentialPreflight {
                             &git_config_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                         material.as_bytes(),
                     )
                     .await
@@ -235,7 +332,7 @@ impl GitCredentialPreflight {
                         &git_config_path,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -253,7 +350,7 @@ impl GitCredentialPreflight {
                         host,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -319,6 +416,8 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_adoption_failures: Mutex::new(BTreeMap::new()),
+            github_app_installations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -432,6 +531,18 @@ impl CredentialStore {
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
+        self.prepare_scoped_with_github_repository_grants(environment_ref, credential_refs, credential_scopes, &BTreeSet::new(), runner)
+            .await
+    }
+
+    pub(crate) async fn prepare_scoped_with_github_repository_grants(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        github_repository_grants: &BTreeSet<String>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Vec<(String, String)>, String> {
         let mut specs = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
@@ -465,6 +576,7 @@ impl CredentialStore {
                     | CredentialConsumer::Forgejo { .. }
                     | CredentialConsumer::ClaudeOauth { .. }
                     | CredentialConsumer::Codex
+                    | CredentialConsumer::ReviewBundleStore { .. }
             )
         }) {
             Some(self.delivery_paths(&*runner).await?)
@@ -486,11 +598,11 @@ impl CredentialStore {
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
             let resolved = if spec.lifecycle == CredentialLifecycle::Refreshable {
-                self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?
+                self.resolve_for_adapter(name, spec, credential_scopes.get(name), github_repository_grants).await?
             } else if let Some(material) = cached_material {
                 ResolvedMaterial { value: material, github_app: None }
             } else {
-                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?;
+                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name), github_repository_grants).await?;
                 self.materials.lock().await.insert(cache_key.clone(), material.value.clone());
                 material
             };
@@ -521,6 +633,11 @@ impl CredentialStore {
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
                         expires_at,
+                        refresh_failures: 0,
+                        installation_repository: match &spec.consumer {
+                            CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
+                            _ => None,
+                        },
                     },
                 );
             }
@@ -545,10 +662,11 @@ impl CredentialStore {
             let mut fragments_by_environment = self.git_config_fragments.lock().await;
             let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
             composed_fragments.extend(new_git_config_fragments);
-            let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
-                Ok(gitconfig) => gitconfig,
-                Err(error) => return Err(format!("compose shared Git config: {error}")),
-            };
+            let gitconfig =
+                match compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(composed_fragments.values().cloned())) {
+                    Ok(gitconfig) => gitconfig,
+                    Err(error) => return Err(format!("compose shared Git config: {error}")),
+                };
             let delivery_paths = delivery_paths.as_ref().expect("Git credential adapters resolve delivery paths");
             if let Err(error) = runner.write_file(&delivery_paths.git_config, &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
@@ -571,6 +689,56 @@ impl CredentialStore {
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
+    }
+
+    /// Rebuild refresh registrations for an already-running environment from
+    /// its durable credential requirements. Reconciliation calls this on every
+    /// pass, so a live registration makes the operation a no-op.
+    pub(crate) async fn adopt_github_app_deliveries(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), CredentialRefreshError> {
+        let mut github_app_refs = BTreeSet::new();
+        for name in credential_refs {
+            let spec = match self.spec(name).await {
+                Ok(spec) => spec,
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+            };
+            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                github_app_refs.insert(name.clone());
+            }
+        }
+        let deliveries = self.github_app_deliveries.lock().await;
+        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
+        drop(deliveries);
+        if github_app_refs.is_empty() || already_adopted {
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
+            return Ok(());
+        }
+        let github_app_scopes = credential_scopes
+            .iter()
+            .filter(|(name, _)| github_app_refs.contains(*name))
+            .map(|(name, scopes)| (name.clone(), scopes.clone()))
+            .collect();
+        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
+            return Err(self.record_adoption_failure(environment_ref, message).await);
+        }
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
+        Ok(())
+    }
+
+    async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
+        let mut failures = self.github_app_adoption_failures.lock().await;
+        let failures = failures.entry(environment_ref.to_string()).or_default();
+        *failures += 1;
+        CredentialRefreshError {
+            environment_ref: environment_ref.to_string(),
+            message,
+            should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+        }
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -604,7 +772,7 @@ impl CredentialStore {
                 .await
                 .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
         }
-        let material = self.resolve_for_adapter(&name, &spec, None).await?;
+        let material = self.resolve_for_adapter(&name, &spec, None, &BTreeSet::new()).await?;
         let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
         let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
@@ -621,13 +789,13 @@ impl CredentialStore {
                     "docker",
                     &["--config", &config, "login", "--username", username, "--password-stdin", registry],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                     material.as_bytes(),
                 )
                 .await
                 .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
             self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Noop)
+                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
         }
@@ -649,6 +817,7 @@ impl CredentialStore {
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
         self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -659,7 +828,7 @@ impl CredentialStore {
     /// Re-mint and atomically replace GitHub App files that are approaching
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
-    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<String> {
+    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
         let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
         let due = self
             .github_app_deliveries
@@ -671,15 +840,22 @@ impl CredentialStore {
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for (key, delivery) in due {
-            let token = match self.github_app_minter.mint(&delivery.request).await {
+            let mut request = delivery.request.clone();
+            let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                 Ok(token) => token,
                 Err(error) => {
-                    errors.push(format!("credential `{}` adapter `github-app`: {error}", key.1));
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        should_surface,
+                    });
                     continue;
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                errors.push(error);
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -687,12 +863,29 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                errors.push(bounded_adapter_error(&key.1, "github-app", &error));
+                current.refresh_failures += 1;
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    message: bounded_adapter_error(&key.1, "github-app", &error),
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() >= current.expires_at,
+                });
                 continue;
             }
             current.expires_at = token.expires_at;
+            current.refresh_failures = 0;
+            current.request = request;
         }
         errors
+    }
+
+    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+            return false;
+        };
+        current.refresh_failures += 1;
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -733,7 +926,7 @@ impl CredentialStore {
             CredentialSource::IssueCommand { command, args } => {
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                 self.host_runner
-                    .run(command, &args, Path::new("/"), &ChannelLabel::Noop)
+                    .run(command, &args, Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|_| "issue command failed".to_string())?
             }
@@ -750,9 +943,13 @@ impl CredentialStore {
         name: &str,
         spec: &CredentialSpecSpec,
         repository_scope: Option<&BTreeSet<RepositoryKey>>,
+        github_repository_grants: &BTreeSet<String>,
     ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
-            (CredentialConsumer::GithubApp { installation_id }, CredentialSource::GithubApp { app_id_path, private_key_path }) => {
+            (
+                CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+                CredentialSource::GithubApp { app_id_path, private_key_path },
+            ) => {
                 if spec.lifecycle != CredentialLifecycle::Refreshable {
                     return Err(bounded_adapter_error(
                         name,
@@ -763,14 +960,24 @@ impl CredentialStore {
                 let repository_scope = repository_scope
                     .filter(|scope| !scope.is_empty())
                     .ok_or_else(|| "grant resolved to an empty repository scope".to_string())?;
-                let request = GithubAppMintRequest {
-                    installation_id: *installation_id,
+                let mut repositories = self.github_repository_names(repository_scope).await?;
+                repositories.extend(github_repository_grants.iter().cloned());
+                repositories.sort();
+                repositories.dedup();
+                let installation_id = match (installation_id, installation_repository) {
+                    (Some(id), None) => *id,
+                    (None, Some(repository)) => self.resolve_github_app_installation(repository, app_id_path, private_key_path).await?,
+                    (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
+                    (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
+                };
+                let mut request = GithubAppMintRequest {
+                    installation_id,
                     app_id_path: app_id_path.clone(),
                     private_key_path: private_key_path.clone(),
-                    repositories: self.github_repository_names(repository_scope).await?,
+                    repositories,
+                    permissions: permissions.clone(),
                 };
-                self.github_app_minter
-                    .mint(&request)
+                self.mint_github_app(&mut request, installation_repository.as_deref())
                     .await
                     .map(|token| ResolvedMaterial { value: token.value, github_app: Some((request, token.expires_at)) })
             }
@@ -781,14 +988,49 @@ impl CredentialStore {
         result.map_err(|error| bounded_adapter_error(name, spec.consumer.adapter_name(), &error))
     }
 
+    async fn resolve_github_app_installation(&self, repository: &str, app_id_path: &str, private_key_path: &str) -> Result<u64, String> {
+        let request = GithubAppInstallationRequest {
+            repository: repository.to_string(),
+            app_id_path: app_id_path.to_string(),
+            private_key_path: private_key_path.to_string(),
+        };
+        if let Some(id) = self.github_app_installations.lock().await.get(&request).copied() {
+            return Ok(id);
+        }
+        let id = self.github_app_minter.resolve_installation(&request).await?;
+        self.github_app_installations.lock().await.insert(request, id);
+        Ok(id)
+    }
+
+    async fn mint_github_app(
+        &self,
+        request: &mut GithubAppMintRequest,
+        installation_repository: Option<&str>,
+    ) -> Result<GithubAppToken, String> {
+        match self.github_app_minter.mint(request).await {
+            Ok(token) => Ok(token),
+            Err(GithubAppMintError::InstallationNotFound(_)) if installation_repository.is_some() => {
+                let repository = installation_repository.expect("guarded by is_some");
+                self.github_app_installations.lock().await.remove(&GithubAppInstallationRequest {
+                    repository: repository.to_string(),
+                    app_id_path: request.app_id_path.clone(),
+                    private_key_path: request.private_key_path.clone(),
+                });
+                request.installation_id =
+                    self.resolve_github_app_installation(repository, &request.app_id_path, &request.private_key_path).await?;
+                self.github_app_minter.mint(request).await.map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     async fn github_repository_names(&self, repository_scope: &BTreeSet<RepositoryKey>) -> Result<Vec<String>, String> {
         if repository_scope.len() > 500 {
             return Err("GitHub App repository scope exceeds the 500-repository API limit".to_string());
         }
         let repositories = self
             .backend
-            .clone()
-            .using::<Repository>(&self.namespace)
+            .including_replicas::<Repository>(&self.namespace)
             .list()
             .await
             .map_err(|error| format!("list repository identities: {error}"))?;
@@ -797,9 +1039,9 @@ impl CredentialStore {
             let repository = repositories
                 .items
                 .iter()
-                .find(|repository| repository.spec.key() == *key)
+                .find(|repository| repository.object.spec.key() == *key)
                 .ok_or_else(|| format!("repository scope references missing repository `{key}`"))?;
-            let forge = repository.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
+            let forge = repository.object.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
             let service = Url::parse(&forge.service_url).map_err(|error| format!("repository `{key}` has invalid forge URL: {error}"))?;
             if service.host_str() != Some("github.com") {
                 return Err(format!("repository `{key}` is not hosted on github.com"));
@@ -862,7 +1104,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api user --silent"],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -881,7 +1123,7 @@ impl CredentialStore {
                 write_github_app_token_file(&*runner, &token_file, material).await?;
                 let token_file = token_file.to_string_lossy().into_owned();
                 let gh_path = runner
-                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("locate gh binary: {error}"))?;
                 let gh_path = gh_path.trim();
@@ -889,7 +1131,7 @@ impl CredentialStore {
                     return Err("locate gh binary: command returned an empty path".to_string());
                 }
                 let path = runner
-                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("read executable search path: {error}"))?;
                 let gh_wrapper = credential_dir.join("gh");
@@ -913,7 +1155,7 @@ impl CredentialStore {
                             &gh_wrapper_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
@@ -947,7 +1189,7 @@ impl CredentialStore {
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
                     let helper = format!(
@@ -959,7 +1201,7 @@ impl CredentialStore {
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                     runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
@@ -969,7 +1211,7 @@ impl CredentialStore {
                         sanitize_curl_config(&url)
                     );
                     runner
-                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, curl_config.as_bytes())
+                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, curl_config.as_bytes())
                         .await
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
@@ -1020,7 +1262,7 @@ impl CredentialStore {
                 if !already_prepared {
                     let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
                     runner
-                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable config directory: {error}"))?;
                     // Preflight: a trivial `claude -p` request under the token.
@@ -1048,7 +1290,7 @@ impl CredentialStore {
                                 &config_dir,
                             ],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1068,7 +1310,7 @@ impl CredentialStore {
                     // persistent-base fallback would otherwise accumulate
                     // whatever `claude -p` writes for the daemon's lifetime,
                     // and removal guarantees the next probe starts empty.
-                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Noop).await {
+                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Default).await {
                         tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
                     }
                     probe?;
@@ -1084,7 +1326,7 @@ impl CredentialStore {
                 let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner
-                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable login cache: {error}"))?;
                     runner
@@ -1092,7 +1334,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login --with-api-key", "flotilla-codex-login", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1102,7 +1344,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login status", "flotilla-codex-status", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await
                         .map_err(|error| format!("login preflight failed: {error}"))?;
@@ -1113,6 +1355,28 @@ impl CredentialStore {
                     .await?;
                 }
                 env.insert("CODEX_HOME".to_string(), codex_home);
+            }
+            CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http, virtual_hosted_style } => {
+                let delivery_paths = delivery_paths.expect("review bundle store adapter resolves delivery paths");
+                serde_json::from_str::<flotilla_resources::ReviewBundleWriteCredential>(material)
+                    .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
+                let credential_file = delivery_paths.credential_dir(name).join("review-bundle.json");
+                if !already_prepared {
+                    runner.write_file(&credential_file, material).await.map_err(|error| format!("write credential file: {error}"))?;
+                    let path = credential_file.to_string_lossy();
+                    runner
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect credential file: {error}"))?;
+                }
+                env.insert("FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE".to_string(), credential_file.to_string_lossy().into_owned());
+                env.insert("FLOTILLA_REVIEW_STORE_ENDPOINT".to_string(), endpoint.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_BUCKET".to_string(), bucket.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_REGION".to_string(), region.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_PUBLIC_BASE_URL".to_string(), public_base_url.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_ALLOW_HTTP".to_string(), allow_http.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_VIRTUAL_HOSTED_STYLE".to_string(), virtual_hosted_style.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_PREFIX".to_string(), format!("{}/", flotilla_resources::REVIEW_BUNDLE_ROOT));
             }
             CredentialConsumer::DockerRegistry { .. } => {}
         }
@@ -1142,7 +1406,7 @@ async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, to
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect token file: {error}"))
@@ -1152,7 +1416,7 @@ async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &st
     runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect {context}: {error}"))
@@ -1175,7 +1439,7 @@ async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&s
     }
     config.push_str(&format!("url = \"{}\"\n", sanitize_curl_config(url)));
     runner
-        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, config.as_bytes())
+        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, config.as_bytes())
         .await
         .map(|_| ())
         .map_err(|error| format!("authentication preflight failed: {error}"))
@@ -1191,9 +1455,13 @@ async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
 
 /// The claude CLI writes millisecond epochs; treat implausibly-large
 /// second values as milliseconds so either unit decodes to the same instant.
+/// Non-positive values are sentinels for absent metadata, not dates.
 fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
     const MILLISECOND_THRESHOLD: i64 = 100_000_000_000;
-    if value.abs() >= MILLISECOND_THRESHOLD {
+    if value <= 0 {
+        return None;
+    }
+    if value >= MILLISECOND_THRESHOLD {
         DateTime::from_timestamp_millis(value)
     } else {
         DateTime::from_timestamp(value, 0)
@@ -1273,7 +1541,7 @@ mod tests {
     }
 
     struct FakeGithubAppTokenMinter {
-        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        tokens: StdMutex<VecDeque<Result<GithubAppToken, String>>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
     }
 
@@ -1286,7 +1554,11 @@ mod tests {
 
     #[async_trait]
     impl GithubAppTokenMinter for BlockingGithubAppTokenMinter {
-        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
+            Err("unexpected installation resolution".to_string())
+        }
+
+        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok(GithubAppToken { value: "initial-token".to_string(), expires_at: self.now + Duration::hours(1) }),
                 1 => {
@@ -1295,16 +1567,25 @@ mod tests {
                     Ok(GithubAppToken { value: "stale-refresh-token".to_string(), expires_at: self.now + Duration::hours(2) })
                 }
                 2 => Ok(GithubAppToken { value: "reprepared-token".to_string(), expires_at: self.now + Duration::hours(2) }),
-                call => Err(format!("unexpected mint call {call}")),
+                call => Err(GithubAppMintError::Other(format!("unexpected mint call {call}"))),
             }
         }
     }
 
     #[async_trait]
     impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
-        async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
+            Err("unexpected installation resolution".to_string())
+        }
+
+        async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
             self.requests.lock().expect("GitHub App requests lock").push(request.clone());
-            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
+            self.tokens
+                .lock()
+                .expect("GitHub App tokens lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("no fake token available".to_string()))
+                .map_err(GithubAppMintError::Other)
         }
     }
 
@@ -1451,7 +1732,155 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_app_mints_a_repository_scoped_token_on_every_prepare_through_replayed_http() {
+    async fn ambient_claude_expiry_probe_treats_non_positive_timestamps_as_absent() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        tokio::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":0,"refreshTokenExpiresAt":-1}}"#)
+            .await
+            .expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_preserves_live_metadata_alongside_a_sentinel() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        let refresh_expires_at_ms: i64 = 1_756_000_000_000;
+        let credentials = format!(r#"{{"claudeAiOauth":{{"expiresAt":0,"refreshTokenExpiresAt":{refresh_expires_at_ms}}}}}"#);
+        tokio::fs::write(claude_dir.join(".credentials.json"), credentials).await.expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, None);
+        assert_eq!(ambient.refresh_expires_at, DateTime::from_timestamp_millis(refresh_expires_at_ms));
+    }
+
+    #[tokio::test]
+    async fn github_app_resolves_caches_and_invalidates_installation_ids_through_replayed_http() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("create repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: None,
+                    installation_repository: Some("flotilla-org/flotilla".to_string()),
+                    permissions: None,
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/flotilla-org/flotilla/installation"
+    status: 200
+    response_body: '{"id":9876}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 201
+    response_body: '{"token":"one","expires_at":"2026-08-03T17:00:00Z"}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 404
+    response_body: '{}'
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/flotilla-org/flotilla/installation"
+    status: 200
+    response_body: '{"id":9999}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9999/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 201
+    response_body: '{"token":"two","expires_at":"2026-08-03T18:00:00Z"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_http(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            Arc::new(ReplayHttpClient::new(session.clone())),
+            state.path().to_path_buf(),
+        );
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+
+        store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
+        store.prepare_scoped("env-a", &refs, &scopes, runner).await.expect("second preparation after invalidation");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_installation_resolution_error_names_the_declared_repository() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let session = Session::replaying_from_str(
+            r#"interactions:
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/example/missing/installation"
+    status: 404
+    response_body: '{}'
+"#,
+            Masks::new(),
+        );
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let error = minter
+            .resolve_installation(&GithubAppInstallationRequest {
+                repository: "example/missing".to_string(),
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+            })
+            .await
+            .expect_err("missing installation must fail");
+        assert!(error.contains("example/missing"), "error must name the repository: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_mints_task_and_provisioning_repository_grants_on_every_prepare() {
         let state = tempfile::tempdir().expect("create state directory");
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
@@ -1471,7 +1900,7 @@ mod tests {
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: app_id_path.to_string_lossy().into_owned(),
                     private_key_path: private_key_path.to_string_lossy().into_owned(),
@@ -1490,7 +1919,7 @@ interactions:
     request_headers:
       accept: "application/vnd.github+json"
       x-github-api-version: "2022-11-28"
-    request_body: '{"repositories":["flotilla"]}'
+    request_body: '{"repositories":["flotilla","mattpocock-skills"]}'
     status: 201
     response_body: '{"token":"installation-token-one","expires_at":"2026-08-03T17:00:00Z"}'
   - channel: http
@@ -1499,7 +1928,7 @@ interactions:
     request_headers:
       accept: "application/vnd.github+json"
       x-github-api-version: "2022-11-28"
-    request_body: '{"repositories":["flotilla"]}'
+    request_body: '{"repositories":["flotilla","mattpocock-skills"]}'
     status: 201
     response_body: '{"token":"installation-token-two","expires_at":"2026-08-03T18:00:00Z"}'
 "#;
@@ -1517,9 +1946,16 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+        let grants = BTreeSet::from(["mattpocock-skills".to_string()]);
 
-        let first = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
-        let second = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("second preparation");
+        let first = store
+            .prepare_scoped_with_github_repository_grants("env-a", &refs, &scopes, &grants, runner.clone())
+            .await
+            .expect("first preparation");
+        let second = store
+            .prepare_scoped_with_github_repository_grants("env-a", &refs, &scopes, &grants, runner.clone())
+            .await
+            .expect("second preparation");
 
         let first = first.into_iter().collect::<BTreeMap<_, _>>();
         let second = second.into_iter().collect::<BTreeMap<_, _>>();
@@ -1544,30 +1980,132 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_delivery_rotates_the_file_before_expiry_without_restarting_the_environment() {
+    async fn github_app_sends_configured_permissions_and_surfaces_downscope_refusal_detail() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_headers:
+      accept: "application/vnd.github+json"
+      x-github-api-version: "2022-11-28"
+    request_body: '{"repositories":["flotilla"],"permissions":{"contents":"write"}}'
+    status: 422
+    response_body: '{"message":"The permissions requested are not granted to this installation."}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(VirtualClock::new(now)),
+        };
+        let result = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: Some(BTreeMap::from([("contents".to_string(), "write".to_string())])),
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("unsupported downscope must fail");
+        };
+
+        let error = error.to_string();
+        assert!(error.contains("HTTP 422 Unprocessable Entity"), "unexpected mint error: {error}");
+        assert!(error.contains("permissions requested are not granted"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_fixed_installation_id_preserves_404_response_detail() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 404
+    response_body: '{"message":"installation was removed"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let result = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: None,
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("removed fixed installation must fail");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("HTTP 404 Not Found"), "unexpected mint error: {error}");
+        assert!(error.contains("installation was removed"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_delivery_uses_replicated_scope_rebuilds_after_store_restart_and_rotates() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
-                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
+                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("temporary adoption outage one".to_string()),
+                Err("temporary adoption outage two".to_string()),
+                Err("persistent adoption outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Err("temporary outage one".to_string()),
+                Err("temporary outage two".to_string()),
+                Err("persistent outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_root = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
-        backend
+        repository_root
             .clone()
             .using::<Repository>("flotilla")
             .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
             .await
             .expect("create repository");
+        let repositories = repository_root.using::<Repository>("flotilla").list().await.expect("list repository source");
+        backend
+            .replica_writer::<Repository>(NodeId::new("repository-root"), "flotilla")
+            .replace(&repositories, Utc::now())
+            .await
+            .expect("replicate repository to minting root");
+        assert!(backend.using::<Repository>("flotilla").list().await.expect("list local repositories").items.is_empty());
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -1579,7 +2117,7 @@ interactions:
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            backend,
+            backend.clone(),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -1603,31 +2141,75 @@ interactions:
         assert_eq!(environment.get("PATH"), Some(&"/state/credentials/github-app:/usr/bin:/bin".to_string()));
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 1);
 
-        clock.advance(Duration::minutes(54));
-        assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "fresh material must not be re-minted");
+        drop(store);
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            assert_eq!(error.should_surface, expected_surface);
+        }
+        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
-        clock.advance(Duration::minutes(1));
+        clock.advance(Duration::minutes(115));
+        let first_failure = store.refresh_due_github_app_tokens().await;
+        assert_eq!(first_failure.len(), 1);
+        assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
+        let second_failure = store.refresh_due_github_app_tokens().await;
+        assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        let third_failure = store.refresh_due_github_app_tokens().await;
+        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "material is re-minted at the refresh margin");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
-        assert_eq!(token_writes.len(), 2);
+        assert_eq!(token_writes.len(), 3);
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
-        assert_eq!(token_writes[0].0, token_writes[1].0, "rotation replaces the file observed by the standing vessel");
-        let writes = runner.writes.lock().expect("writes lock");
-        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
-        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        let git_helper =
-            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
-        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        drop(writes);
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(command, args, _)| {
-            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
-        }));
-        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        assert!(token_writes[2].1.contains("installation-token-three"));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
+        {
+            let writes = runner.writes.lock().expect("writes lock");
+            let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+            assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+            let git_helper =
+                writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+            assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        }
+        {
+            let calls = runner.calls.lock().expect("calls lock");
+            assert!(calls.iter().any(|(command, args, _)| {
+                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+            }));
+            assert!(calls
+                .iter()
+                .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        }
+
+        let missing_store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error = missing_store
+                .adopt_github_app_deliveries("missing-github-app", &refs, &scopes, runner.clone())
+                .await
+                .expect_err("missing scoped GitHub App declaration must remain visible");
+            assert_eq!(error.should_surface, expected_surface);
+        }
     }
 
     #[tokio::test]
@@ -1653,7 +2235,7 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -1711,7 +2293,7 @@ interactions:
             PathBuf::from("/tmp/flotilla-test-state"),
         );
         let spec = CredentialSpecSpec {
-            consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+            consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
             source: CredentialSource::GithubApp {
                 app_id_path: "/not-read/github-app.id".to_string(),
                 private_key_path: "/not-read/github-app.pem".to_string(),
@@ -1721,7 +2303,7 @@ interactions:
         };
 
         for scope in [None, Some(&BTreeSet::new())] {
-            let error = store.resolve_for_adapter("github-app", &spec, scope).await.expect_err("empty scopes must fail");
+            let error = store.resolve_for_adapter("github-app", &spec, scope, &BTreeSet::new()).await.expect_err("empty scopes must fail");
             assert!(error.contains("empty repository scope"), "unexpected error: {error}");
         }
         let missing_key = RepositoryKey("missing-repository".to_string());
@@ -1736,7 +2318,7 @@ interactions:
         static_spec.lifecycle = CredentialLifecycle::Static;
         let non_empty_scope = BTreeSet::from([RepositoryKey("not-resolved".to_string())]);
         let error = store
-            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope))
+            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope), &BTreeSet::new())
             .await
             .expect_err("non-refreshable GitHub App credentials must fail");
         assert!(error.contains("must use the refreshable lifecycle"), "unexpected error: {error}");
@@ -2259,7 +2841,7 @@ interactions:
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
+            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -2422,7 +3004,7 @@ interactions:
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
+                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
@@ -2440,6 +3022,63 @@ interactions:
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn review_store_credential_is_staged_as_a_scoped_file() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("review-store".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ReviewBundleStore {
+                    endpoint: "http://rustfs.lab:9000".to_string(),
+                    bucket: "flotilla".to_string(),
+                    region: "us-east-1".to_string(),
+                    public_base_url: "https://reviews.example/flotilla".to_string(),
+                    allow_http: true,
+                    virtual_hosted_style: false,
+                },
+                source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create review store credential declaration");
+        let material = r#"{"access_key_id":"crew","secret_access_key":"secret"}"#;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REVIEW_STORE_CREDENTIAL".to_string(), material.to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            env,
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let delivered: BTreeMap<_, _> = store
+            .prepare("env-a", &BTreeSet::from(["review-store".to_string()]), runner.clone())
+            .await
+            .expect("prepare review store credential")
+            .into_iter()
+            .collect();
+
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_PREFIX"], "reviews/");
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_ENDPOINT"], "http://rustfs.lab:9000");
+        let credential_file = &delivered["FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE"];
+        assert!(runner
+            .writes
+            .lock()
+            .expect("writes lock")
+            .iter()
+            .any(|(path, contents)| path == Path::new(credential_file) && contents == material));
+        assert!(runner
+            .calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
     }
 
     async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, server_url: &str, source_env: &str) {

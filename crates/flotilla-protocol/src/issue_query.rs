@@ -1,5 +1,7 @@
 //! Issue query service types shared between core and protocol.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::provider_data::Issue;
@@ -12,6 +14,8 @@ pub const READY_ISSUE_LABEL: &str = "ready";
 pub struct IssueQuery {
     pub search: Option<String>,
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub match_fields: BTreeMap<String, Vec<String>>,
 }
 
 /// A single page of query results.
@@ -32,6 +36,7 @@ mod tests {
         let q = IssueQuery::default();
         assert!(q.search.is_none());
         assert!(q.label.is_none());
+        assert!(q.match_fields.is_empty());
     }
 
     #[test]

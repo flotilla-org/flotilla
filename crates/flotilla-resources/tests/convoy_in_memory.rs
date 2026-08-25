@@ -16,7 +16,7 @@ use tokio::time::{timeout, Duration};
 
 async fn reconcile_once(
     convoys: &flotilla_resources::TypedResolver<Convoy>,
-    templates: &flotilla_resources::TypedResolver<WorkflowTemplate>,
+    templates: &flotilla_resources::DefinitionResolver<WorkflowTemplate>,
     name: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<flotilla_resources::ConvoyStatusPatch> {
@@ -72,7 +72,7 @@ async fn convoy_persists_source_qualified_issue_snapshot_and_instruction() {
 #[tokio::test]
 async fn in_memory_controller_loop_drives_convoy_to_completion() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.using::<Convoy>("flotilla");
 
     let template = tool_only_workflow_template_object("review-and-fix");
@@ -117,7 +117,7 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
 #[tokio::test]
 async fn missing_template_transitions_convoy_to_failed() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.using::<Convoy>("flotilla");
 
     convoys.create(&convoy_meta("convoy-missing-template"), &valid_convoy_spec()).await.expect("convoy create should succeed");
@@ -134,7 +134,7 @@ async fn missing_template_transitions_convoy_to_failed() {
 #[tokio::test]
 async fn controller_loop_drives_convoy_progression_without_manual_reconcile_calls() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
 
     let template = tool_only_workflow_template_object("review-and-fix");
@@ -216,7 +216,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
 #[tokio::test]
 async fn controller_loop_advances_task_via_vessel_secondary_watch() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
 
@@ -249,6 +249,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
     let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
     workspaces
         .update_status("convoy-stage4a-implement", &workspace.metadata.resource_version, &VesselStatus {
+            wait_reason: None,
             placement_decision: None,
             phase: VesselPhase::Ready,
             message: None,
@@ -264,6 +265,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             ready_at: Some(timestamp(19)),
             requested_stance: None,
             effective_stance: None,
+            held_credentials: Default::default(),
         })
         .await
         .expect("workspace status update should succeed");
@@ -482,7 +484,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+            reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                 .with_vessels(workspaces.clone())
                 .with_presentations(presentations.clone())
                 .with_checkouts(checkouts.clone())
@@ -514,7 +516,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
                 && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
                 && matches!(checkouts.get("checkout-convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(
-                    backend.clone().using::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
+                    backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_snapshot_name).await,
                     Err(ResourceError::NotFound { .. })
                 )
                 && matches!(
@@ -580,7 +582,7 @@ async fn controller_loop_creates_one_presentation_per_active_task() {
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let workspaces = backend.clone().using::<Vessel>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
-    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
 
     let created =
         convoys.create(&convoy_meta("convoy-multi"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");

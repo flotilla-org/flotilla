@@ -28,8 +28,9 @@ use crate::{
     terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    ChangeRequest, ChangeRequestLeafSubject, Clock, InputMeta, InputValue, OwnerReference, PlacementStatus,
-    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
+    ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, EnvironmentWaitReason, InputMeta, InputValue, OwnerReference,
+    PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue,
+    TypedResolver,
 };
 
 #[async_trait]
@@ -69,7 +70,7 @@ pub enum ConvoyEvent {
 
 #[derive(Clone)]
 pub struct ConvoyReconciler {
-    templates: TypedResolver<WorkflowTemplate>,
+    templates: DefinitionResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
     federated_vessels: Option<ReplicaReadResolver<Vessel>>,
     terminal_sessions: Option<TypedResolver<TerminalSession>>,
@@ -85,17 +86,18 @@ pub struct ConvoyReconciler {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConvoyDependencies {
+pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     presentations: BTreeMap<String, ResourceObject<Presentation>>,
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
     exit_disposition: Option<String>,
+    settlement_attention: Option<crate::ConvoyAttention>,
     reclaim_eligible: bool,
 }
 
 impl ConvoyReconciler {
-    pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
+    pub fn new(templates: DefinitionResolver<WorkflowTemplate>) -> Self {
         Self {
             templates,
             vessels: None,
@@ -210,6 +212,7 @@ pub enum SettlementMode {
     NoExit,
     ClaimExit,
     WorldTerminal,
+    ObservedDigest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +229,9 @@ pub enum UnmetSettlementExpectation {
     StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
     ChangeRequestConditionFalse { record: String, value: Option<String> },
     InvalidCondition { subject: String, message: String },
+    MissingObservedRef { reference: String },
+    StaleObservedRef { reference: String, observed_at: String },
+    ObservedDigestMismatch { reference: String, claimed: String, observed: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +251,7 @@ struct LandingSettlement {
 /// function so an explanation cannot drift from the condition writer.
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
@@ -253,6 +260,7 @@ pub fn evaluate_landing_settlement(
 ) -> SettlementEvaluation {
     evaluate_landing_settlement_with_disposition(
         convoy,
+        vessels,
         checkouts,
         change_requests,
         change_request_stale_after,
@@ -264,12 +272,14 @@ pub fn evaluate_landing_settlement(
 
 fn evaluate_landing_settlement_with_disposition(
     convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> LandingSettlement {
+    let observed_digest = evaluate_observed_digest_anchor(convoy, checkouts, landing_evidence_stale_after, now);
     let expected = match expected_checkout_refs(convoy) {
         Ok(expected) => expected,
         Err(message) => {
@@ -298,6 +308,9 @@ fn evaluate_landing_settlement_with_disposition(
     };
     let entries = match exit {
         InstantiatedExit::None => {
+            if let Some(observed_digest) = observed_digest {
+                return observed_digest;
+            }
             return LandingSettlement {
                 evaluation: SettlementEvaluation { mode: SettlementMode::NoExit, satisfied: false, unmet: Vec::new() },
                 disposition: None,
@@ -373,12 +386,19 @@ fn evaluate_landing_settlement_with_disposition(
             disposition = Some(entry.disposition);
             break;
         }
-        table_unmet.extend(entry_unmet);
+        for expectation in entry_unmet {
+            if !table_unmet.contains(&expectation) {
+                table_unmet.push(expectation);
+            }
+        }
     }
 
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };
     let bound_repository = convoy.spec.change_request.as_ref().map(|bound| &bound.repository_ref);
     for name in expected {
+        if disposition.is_some() && !checkouts.contains_key(&name) && checkout_expectation_is_discharged(convoy, vessels, &name) {
+            continue;
+        }
         let Some(checkout) = checkouts.get(&name) else {
             unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
             continue;
@@ -419,17 +439,103 @@ fn evaluate_landing_settlement_with_disposition(
     }
 
     let satisfied = disposition.is_some() && unmet.is_empty();
+    if !satisfied {
+        if let Some(observed_digest) = observed_digest {
+            return observed_digest;
+        }
+    }
     LandingSettlement {
         evaluation: SettlementEvaluation { mode: SettlementMode::WorldTerminal, satisfied, unmet },
         disposition: satisfied.then_some(disposition).flatten(),
     }
 }
 
+fn evaluate_observed_digest_anchor(
+    convoy: &ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    stale_after: std::time::Duration,
+    now: DateTime<Utc>,
+) -> Option<LandingSettlement> {
+    let claims = convoy
+        .status
+        .as_ref()?
+        .crew_work
+        .values()
+        .flat_map(BTreeMap::values)
+        .filter(|work| work.phase == crate::CrewWorkPhase::Done)
+        .filter_map(|work| work.claim_evidence.as_ref())
+        .collect::<Vec<_>>();
+    if claims.is_empty() {
+        return None;
+    }
+
+    let mut unmet = Vec::new();
+    for claim in claims {
+        let observations = checkouts
+            .values()
+            .filter_map(|checkout| checkout.status.as_ref()?.integration.remote_refs.get(&claim.refs.head))
+            .collect::<Vec<_>>();
+        let Some(observation) = observations.into_iter().max_by_key(|observation| &observation.observed_at) else {
+            unmet.push(UnmetSettlementExpectation::MissingObservedRef { reference: claim.refs.head.clone() });
+            continue;
+        };
+        let fresh = DateTime::parse_from_rfc3339(&observation.observed_at)
+            .ok()
+            .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
+            .is_some_and(|age| age < stale_after);
+        if !fresh {
+            unmet.push(UnmetSettlementExpectation::StaleObservedRef {
+                reference: claim.refs.head.clone(),
+                observed_at: observation.observed_at.clone(),
+            });
+        } else if observation.digest != claim.claimed_head_digest {
+            unmet.push(UnmetSettlementExpectation::ObservedDigestMismatch {
+                reference: claim.refs.head.clone(),
+                claimed: claim.claimed_head_digest.clone(),
+                observed: observation.digest.clone(),
+            });
+        }
+    }
+    let satisfied = unmet.is_empty();
+    Some(LandingSettlement {
+        evaluation: SettlementEvaluation { mode: SettlementMode::ObservedDigest, satisfied, unmet },
+        disposition: satisfied.then(|| "observed-digest".to_string()),
+    })
+}
+
+fn checkout_expectation_is_discharged(
+    convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
+    checkout_name: &str,
+) -> bool {
+    if convoy.spec.adopted_checkout_refs.values().any(|name| name == checkout_name) {
+        return false;
+    }
+    let Some(status) = &convoy.status else { return false };
+    let mut owners = Vec::new();
+    for (work_name, work) in &status.work {
+        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
+            continue;
+        };
+        let Ok(checkout_refs) = serde_json::from_value::<BTreeMap<crate::RepositoryKey, String>>(checkout_refs.clone()) else {
+            // The caller validates every placement before reaching this helper.
+            return false;
+        };
+        if checkout_refs.values().any(|name| name == checkout_name) {
+            owners.push((work_name, work));
+        }
+    }
+    !owners.is_empty()
+        && owners.into_iter().all(|(work_name, work)| {
+            work.phase == WorkPhase::Complete && !vessels.values().any(|vessel| vessel.spec.vessel_name == *work_name)
+        })
+}
+
 impl Reconciler for ConvoyReconciler {
     type Resource = Convoy;
-    type Dependencies = ConvoyDependencies;
+    type Prepared = ConvoyPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let template = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
             None
         } else {
@@ -482,20 +588,39 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        let exit_disposition = if is_landing {
-            evaluate_landing_settlement_with_disposition(
+        let settlement = if is_landing {
+            Some(evaluate_landing_settlement_with_disposition(
                 obj,
+                &vessels,
                 &checkouts,
                 &change_requests,
                 self.change_request_stale_after,
                 self.landing_evidence_stale_after,
                 self.clock.now(),
-            )
-            .disposition
+            ))
         } else {
             None
         };
-        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+        let exit_disposition = settlement.as_ref().and_then(|settlement| settlement.disposition.clone());
+        let settlement_attention = settlement.as_ref().and_then(|settlement| {
+            settlement.evaluation.unmet.iter().find_map(|unmet| match unmet {
+                UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => Some(
+                    crate::ConvoyAttention::builder()
+                        .source("observed-digest".to_string())
+                        .reason(format!("remote ref {reference} is at {observed}, but the approved claim names {claimed}"))
+                        .raised_at(self.clock.now())
+                        .build(),
+                ),
+                _ => None,
+            })
+        });
+        let waiting_on_material_pool = vessels.values().any(|vessel| {
+            vessel
+                .status
+                .as_ref()
+                .is_some_and(|status| matches!(status.wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })))
+        });
+        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) && !waiting_on_material_pool {
             match &self.teardown_runtime {
                 Some(runtime) => {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
@@ -506,24 +631,43 @@ impl Reconciler for ConvoyReconciler {
         } else {
             false
         };
-        Ok(ConvoyDependencies { template, vessels, presentations, checkouts, exit_disposition, reclaim_eligible })
+        Ok(ConvoyPrepared { template, vessels, presentations, checkouts, exit_disposition, settlement_attention, reclaim_eligible })
     }
 
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
-        let outcome = reconcile_internal(
+        let mut outcome = reconcile_internal(
             obj,
-            deps.template.as_ref(),
-            &deps.vessels,
-            &deps.presentations,
-            &deps.checkouts,
-            LifecycleConditions { exit_disposition: deps.exit_disposition.clone(), reclaim_eligible: deps.reclaim_eligible },
+            prepared.template.as_ref(),
+            &prepared.vessels,
+            &prepared.presentations,
+            &prepared.checkouts,
+            LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
         );
+        if outcome.patch.is_none() {
+            if let Some(attention) = &prepared.settlement_attention {
+                let changed = obj
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.attention.as_ref())
+                    .is_none_or(|existing| existing.source != attention.source || existing.reason != attention.reason);
+                if changed {
+                    outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: Some(attention.clone()) });
+                }
+            } else if obj
+                .status
+                .as_ref()
+                .and_then(|status| status.attention.as_ref())
+                .is_some_and(|attention| attention.source == "observed-digest")
+            {
+                outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: None });
+            }
+        }
         // A refused reclaim must retry on its own schedule: the refusal is
         // often transient (integration evidence mid-refresh, a checkout
         // cascade in flight) and no watch event is guaranteed to arrive once
@@ -531,7 +675,7 @@ impl Reconciler for ConvoyReconciler {
         // the freshness the gate is waiting on.
         let reclaim_refused = self.teardown_runtime.is_some()
             && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal())
-            && !deps.reclaim_eligible;
+            && !prepared.reclaim_eligible;
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,

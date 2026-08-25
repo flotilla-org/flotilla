@@ -64,7 +64,7 @@ impl IssueNoun {
                     // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
                     action: CommandAction::QueryIssues {
                         repo: RepoSelector::Query("".into()),
-                        params: IssueQuery { search: Some(query.join(" ")), label: None },
+                        params: IssueQuery { search: Some(query.join(" ")), label: None, match_fields: Default::default() },
                         page: 1,
                         count: 50,
                     },
@@ -116,16 +116,12 @@ mod tests {
     #[test]
     fn issue_open() {
         let resolved = parse(&["issue", "1", "open"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::OpenIssue { id: "1".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::OpenIssue { id: "1".into() },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
@@ -147,36 +143,32 @@ mod tests {
     #[test]
     fn issue_suggest_branch_multiple() {
         let resolved = parse(&["issue", "1,5,7", "suggest-branch"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::GenerateBranchName { issue_keys: vec!["1".into(), "5".into(), "7".into()] },
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProvisioningTarget,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::GenerateBranchName { issue_keys: vec!["1".into(), "5".into(), "7".into()] },
+            RepoContext::Inferred,
+            HostResolution::ProvisioningTarget,
+        );
     }
 
     #[test]
     fn issue_search() {
         let resolved = parse(&["issue", "search", "my", "query"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssues {
-                    repo: RepoSelector::Query("".into()),
-                    params: flotilla_protocol::issue_query::IssueQuery { search: Some("my query".into()), label: None },
-                    page: 1,
-                    count: 50,
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::QueryIssues {
+                repo: RepoSelector::Query("".into()),
+                params: flotilla_protocol::issue_query::IssueQuery {
+                    search: Some("my query".into()),
+                    label: None,
+                    match_fields: Default::default(),
                 },
+                page: 1,
+                count: 50,
             },
-            repo: RepoContext::Required,
-            host: HostResolution::Local,
-        });
+            RepoContext::Required,
+            HostResolution::Local,
+        );
     }
 
     #[test]

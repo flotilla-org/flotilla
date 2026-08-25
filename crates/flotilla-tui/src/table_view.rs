@@ -513,6 +513,7 @@ fn fuzzy_matches(value: &str, pattern: &str) -> bool {
 struct VesselProjection {
     namespace: String,
     convoy: String,
+    convoy_name: String,
     origin_host: Option<HostName>,
     project_ref: Option<String>,
     repo_hint: Option<RepoKey>,
@@ -613,6 +614,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
+                convoy_name: convoy.name.clone(),
                 origin_host: convoy.origin_host.clone(),
                 project_ref: convoy.project_ref.clone(),
                 repo_hint: convoy.repo_hint.clone(),
@@ -620,8 +622,8 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel: vessel.clone(),
             });
             let title = convoy.change_request.as_ref().map_or_else(
-                || format!("Convoy · {name}"),
-                |change_request| format!("Convoy · {name} · PR #{} {}", change_request.id, change_request.status),
+                || format!("Convoy · {}", convoy.name),
+                |change_request| format!("Convoy · {} · PR #{} {}", convoy.name, change_request.id, change_request.status),
             );
             Ok(vessel_spec().project(title, rows))
         }
@@ -635,6 +637,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
                 namespace: namespace.clone(),
                 convoy: convoy.clone(),
+                convoy_name: convoy_row.name.clone(),
                 origin_host: convoy_row.origin_host.clone(),
                 project_ref: convoy_row.project_ref.clone(),
                 repo_hint: convoy_row.repo_hint.clone(),
@@ -693,17 +696,21 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let convoys = project(&convoys_address, data).unwrap_or_else(|_| pending_project_table(&convoys_address));
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
-    let independents_address = ViewAddress::Independents { scope: Some(scope) };
+    let independents_address = ViewAddress::Independents { scope: Some(scope.clone()) };
     let awareness = awareness_for_project(namespace, name, data);
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
     let mut independents = project(&independents_address, data).unwrap_or_else(|_| pending_project_table(&independents_address));
+    let checkout_count = data
+        .checkout_results
+        .iter()
+        .find(|result| result.query == &QueryId::Checkouts { scope: Some(scope.clone()) })
+        .map(|result| result.rows.len());
+    checkouts.title = checkout_count.map_or_else(|| "Checkouts".to_string(), |count| format!("Checkouts ({count})"));
     if let Some(counts) = awareness.map(|node| &node.counts) {
-        checkouts.title = format!("Checkouts ({})", counts.checkouts);
         issues.title = format!("Issues ({})", counts.issues);
         independents.title = format!("Independents ({})", counts.independents);
     } else {
-        checkouts.title = "Checkouts".to_string();
         issues.title = "Issues".to_string();
         independents.title = "Independents".to_string();
     }
@@ -718,6 +725,24 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
+    // The enclosing Project page already supplies this scope. The shared
+    // convoy projection decorates names for fleet-wide surfaces; omit that
+    // suffix here.
+    for row in &mut convoys.rows {
+        let name = &mut row.cells[0].text;
+        for suffix in [format!(" @ {}/{}", scope.namespace, scope.name), format!(" @ {}", scope.name)] {
+            if let Some(bare) = name.strip_suffix(&suffix) {
+                *name = bare.to_owned();
+                break;
+            }
+        }
+    }
+    if let Some(scope_column) = convoys.columns.iter().position(|column| column.id == "scope") {
+        convoys.columns.remove(scope_column);
+        for row in &mut convoys.rows {
+            row.cells.remove(scope_column);
+        }
+    }
     if let Some(awareness) = awareness {
         apply_family_summary(&mut convoys, awareness, AwarenessFamily::Convoys);
     }
@@ -796,7 +821,7 @@ fn find_convoy<'a>(convoys: &'a [&ConvoySummary], namespace: &str, name: &str) -
     convoys
         .iter()
         .copied()
-        .find(|convoy| convoy.namespace == namespace && convoy.name == name)
+        .find(|convoy| convoy.namespace == namespace && convoy.resource_name == name)
         .ok_or_else(|| format!("convoy not found: {namespace}/{name}"))
 }
 
@@ -873,7 +898,7 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
         label: "CONVOY",
         width: WidthHint::Flexible { minimum: 12, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.name) } else { row.name.clone() }),
+        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.display_name()) } else { row.display_name() }),
     },
     ColumnSpec {
         id: "workflow",
@@ -1070,7 +1095,7 @@ fn convoy_id(row: &ConvoySummary) -> RowId {
 }
 
 fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
-    Some(ViewAddress::Convoy { namespace: row.namespace.clone(), name: row.name.clone() })
+    Some(ViewAddress::Convoy { namespace: row.namespace.clone(), name: row.resource_name.clone() })
 }
 
 fn convoy_phase(row: &ConvoySummary) -> CellValue {
@@ -1119,7 +1144,7 @@ fn convoy_scope(row: &ConvoySummary) -> CellValue {
 fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.clone() },
-        DetailField { label: "Convoy", value: row.name.clone() },
+        DetailField { label: "Convoy", value: row.display_name() },
         DetailField { label: "Workflow", value: row.workflow_ref.clone() },
         DetailField {
             label: "Dispatcher",
@@ -1189,7 +1214,7 @@ fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
     );
     Some(TableIntent::OpenInPm(OpenInPmTarget {
         namespace: row.namespace.clone(),
-        convoy: row.name.clone(),
+        convoy: row.address(),
         vessel: vessel.map(|vessel| vessel.name.clone()),
         label,
         host: row.origin_host.clone().or_else(|| vessel.and_then(|vessel| vessel.host.clone())),
@@ -1204,7 +1229,7 @@ fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
     Some(TableIntent::DeleteConvoy {
         row_id: convoy_id(row),
         namespace: row.namespace.clone(),
-        name: row.name.clone(),
+        name: row.address(),
         host: row.origin_host.clone(),
     })
 }
@@ -1290,7 +1315,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
 fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
     let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.to_string() },
-        DetailField { label: "Convoy", value: row.convoy.to_string() },
+        DetailField { label: "Convoy", value: row.convoy_name.to_string() },
         DetailField { label: "Vessel", value: row.vessel.name.clone() },
         DetailField { label: "Depends on", value: row.vessel.depends_on.join(", ") },
         DetailField { label: "Phase", value: vessel_phase(row).text },
@@ -1342,7 +1367,7 @@ fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
         namespace: row.namespace.clone(),
         convoy: row.convoy.clone(),
         vessel: Some(row.vessel.name.clone()),
-        label: if row.vessel_count == 1 { row.convoy.clone() } else { format!("{}:{}", row.convoy, row.vessel.name) },
+        label: if row.vessel_count == 1 { row.convoy_name.clone() } else { format!("{}:{}", row.convoy_name, row.vessel.name) },
         host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
         project_ref: row.project_ref.clone(),
         repo_hint: row.repo_hint.clone(),
@@ -1421,9 +1446,11 @@ mod tests {
 
     fn convoy(vessels: Vec<VesselSummary>) -> ConvoySummary {
         ConvoySummary {
+            generation: 1,
             placement_decision: None,
             id: ConvoyId::new("dev", "tables"),
             namespace: "dev".into(),
+            resource_name: "tables".into(),
             name: "tables".into(),
             origin_host: None,
             workflow_ref: "implement-review".into(),
@@ -1456,6 +1483,17 @@ mod tests {
     }
 
     #[test]
+    fn convoy_human_surfaces_render_and_target_the_role_address() {
+        let convoy = convoy(Vec::new());
+        let table = project_convoys("convoys/dev", &[&convoy]).expect("project convoy table");
+        assert_eq!(table.rows[0].cells[0].text, "tables @ flotilla");
+        assert!(matches!(
+            delete_convoy(&convoy),
+            Some(TableIntent::DeleteConvoy { name, .. }) if name == "tables@flotilla"
+        ));
+    }
+
+    #[test]
     fn convoy_projection_exposes_honest_phase_message_and_drill_target() {
         let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         row.phase = ConvoyPhase::Failed;
@@ -1471,18 +1509,59 @@ mod tests {
     }
 
     #[test]
+    fn same_role_convoys_in_different_projects_drill_by_resource_identity() {
+        let mut first = convoy(vec![vessel("first-vessel", &[], WorkPhase::Running)]);
+        first.resource_name = "convoy-first".into();
+        first.name = "coder".into();
+        first.project_ref = Some("first-project".into());
+
+        let mut second = convoy(vec![vessel("second-vessel", &[], WorkPhase::Running)]);
+        second.resource_name = "convoy-second".into();
+        second.name = "coder".into();
+        second.project_ref = Some("second-project".into());
+
+        let first_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "first-project")) };
+        let first_table =
+            project(&first_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("first project table");
+        assert!(first_table.rows[0].cells[0].text.starts_with("coder"));
+        assert_eq!(first_table.rows[0].drill, Some("convoy/dev/convoy-first".parse().expect("first convoy address")));
+
+        let second_address = ViewAddress::Convoys { namespace: "dev".into(), scope: Some(QueryScope::new("dev", "second-project")) };
+        let second_table =
+            project(&second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() }).expect("second project table");
+        let second_address = second_table.rows[0].drill.as_ref().expect("second convoy drill address");
+        assert!(second_table.rows[0].cells[0].text.starts_with("coder"));
+        assert_eq!(second_address, &"convoy/dev/convoy-second".parse().expect("second convoy address"));
+
+        let vessel_table = project(second_address, &TableRows { convoys: vec![&first, &second], ..TableRows::default() })
+            .expect("second convoy vessel table");
+        assert_eq!(vessel_table.title, "Convoy · coder");
+        assert_eq!(vessel_table.rows[0].cells[1].text, "second-vessel");
+        assert_eq!(vessel_table.rows[0].drill, Some("vessel/dev/convoy-second/second-vessel".parse().expect("vessel address")));
+    }
+
+    #[test]
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
             policy_name: "host-direct-kiwi".into(),
-            target_host: flotilla_protocol::PlacementTargetHost { reference: "01HXYZ".into(), display_name: "kiwi".into() },
+            target_host: flotilla_protocol::PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
+                display_name: "kiwi".into(),
+            },
             refused_candidates: vec![flotilla_protocol::PlacementRefusal {
                 policy_name: "host-direct-feta".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "02HXYZ".into(), display_name: "feta".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("02HXYZ"),
+                    display_name: "feta".into(),
+                },
                 reason: "disk below admission floor".into(),
             }],
             viable_not_selected: vec![flotilla_protocol::PlacementViableCandidate {
                 policy_name: "host-direct-gouda".into(),
-                target_host: flotilla_protocol::PlacementTargetHost { reference: "03HXYZ".into(), display_name: "gouda".into() },
+                target_host: flotilla_protocol::PlacementTargetHost {
+                    reference: flotilla_protocol::CanonicalHostId::resolved("03HXYZ"),
+                    display_name: "gouda".into(),
+                },
                 reason: "priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
             }],
         };
@@ -1532,7 +1611,7 @@ mod tests {
 
         let view = project_convoys("convoys/dev", &[&row]).expect("convoy table");
 
-        assert_eq!(view.rows[0].cells[0].text, "⚠ tables");
+        assert_eq!(view.rows[0].cells[0].text, "⚠ tables @ flotilla");
     }
 
     #[test]
@@ -1583,7 +1662,7 @@ mod tests {
                     intent: TableIntent::DeleteConvoy {
                         row_id: RowId::new("dev/tables"),
                         namespace: "dev".into(),
-                        name: "tables".into(),
+                        name: "tables@flotilla".into(),
                         host: Some(HostName::new("kiwi")),
                     },
                 }
@@ -1695,7 +1774,7 @@ mod tests {
             .state(AwarenessState::Active)
             .salience(Salience::Urgent)
             .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-            .counts(AwarenessCounts::builder().total(4).convoys(1).issues(1).checkouts(1).independents(1).build())
+            .counts(AwarenessCounts::builder().total(3).convoys(1).issues(1).independents(1).build())
             .family_summaries(vec![
                 AwarenessFamilySummary::builder()
                     .family(AwarenessFamily::Convoys)
@@ -1750,6 +1829,8 @@ mod tests {
             "Issues (1)",
             "Independents (1)",
         ]);
+        assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
+        assert!(panels[0].table.columns.iter().all(|column| column.id != "scope"));
         assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
             Salience::Urgent,
             Salience::None,
@@ -1914,11 +1995,11 @@ mod tests {
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 1);
-        assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other"));
+        assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other @ flotilla"));
 
         let changed = project(&address, &TableRows { convoys: vec![&first], ..TableRows::default() }).expect("project table");
         state.reconcile(&changed);
-        assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables"));
+        assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables @ flotilla"));
     }
 
     #[test]
@@ -2004,6 +2085,6 @@ mod tests {
         let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DSK F");
 
         assert_eq!(view.rows.len(), 1);
-        assert_eq!(view.rows[0].cells[0].text, "tables");
+        assert_eq!(view.rows[0].cells[0].text, "tables @ flotilla");
     }
 }

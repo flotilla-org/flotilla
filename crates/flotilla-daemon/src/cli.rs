@@ -49,7 +49,7 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
 
     let timeout = if timeout_secs == 0 { Duration::from_secs(u64::MAX) } else { Duration::from_secs(timeout_secs) };
 
-    let repo_roots = config.load_and_migrate_repos();
+    let repo_roots = config.load_observation_roots()?;
     info!(repo_count = repo_roots.len(), "starting daemon");
 
     let discovery = DiscoveryRuntime::for_process();

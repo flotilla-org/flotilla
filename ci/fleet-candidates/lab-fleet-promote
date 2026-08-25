@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import datetime
+import hashlib
+import io
+import json
+import re
+import sys
+import tarfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+import generation_validation as validation
+
+
+class PromotionError(RuntimeError):
+    pass
+
+
+EXPECTED_JOBS = ("Linux x86_64 candidate", "Darwin arm64 candidate")
+PLATFORMS = validation.PLATFORMS
+SHA_PATTERN = validation.SHA_PATTERN
+DIGEST_PATTERN = validation.DIGEST_PATTERN
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+
+
+def read_token(path):
+    try:
+        token = Path(path).read_text().strip()
+    except OSError as error:
+        raise PromotionError(f"cannot read token file {path}: {error}") from error
+    if not token:
+        raise PromotionError(f"token file is empty: {path}")
+    return token
+
+
+def get_json(url, token):
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "Authorization": f"token {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except (urllib.error.URLError, json.JSONDecodeError) as error:
+        raise PromotionError(f"Forgejo GET failed for {url}: {error}") from error
+
+
+def get_bytes(url, token):
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/zip", "Authorization": f"token {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError as error:
+                    raise PromotionError(f"Forgejo returned an invalid Content-Length for {url}") from error
+                if declared_size > MAX_ARCHIVE_BYTES:
+                    raise PromotionError(f"Forgejo artifact exceeds the size limit: {url}")
+            content = bytearray()
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                content.extend(chunk)
+                if len(content) > MAX_ARCHIVE_BYTES:
+                    raise PromotionError(f"Forgejo artifact exceeds the size limit: {url}")
+            return bytes(content)
+    except urllib.error.URLError as error:
+        raise PromotionError(f"Forgejo artifact GET failed for {url}: {error}") from error
+
+
+def validate_run(run, run_id):
+    if run.get("id") != run_id:
+        raise PromotionError(f"Forgejo returned run {run.get('id')}, expected {run_id}")
+    if run.get("status") != "success":
+        raise PromotionError(f"run {run_id} is not successful: {run.get('status', 'unknown')}")
+    if run.get("workflow_id") != "fleet-candidates.yml":
+        raise PromotionError(f"run {run_id} did not execute fleet-candidates.yml")
+    if run.get("prettyref") != "main" or run.get("trigger_event") != "workflow_dispatch":
+        raise PromotionError(f"run {run_id} is not a manual main-branch candidate run")
+    commit_sha = run.get("commit_sha", "")
+    if not SHA_PATTERN.fullmatch(commit_sha):
+        raise PromotionError(f"run {run_id} has an invalid workflow commit")
+    try:
+        payload = json.loads(run["event_payload"])
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise PromotionError(f"run {run_id} has an invalid workflow-dispatch payload") from error
+    if payload.get("ref") != "refs/heads/main":
+        raise PromotionError(f"run {run_id} payload did not select refs/heads/main")
+    inputs = payload.get("inputs", {})
+    sources = {name: inputs.get(f"{name.replace(chr(45), chr(95))}_sha", "").lower() for name in ("flotilla", "cleat", "mattpocock-skills", "rjw-skills")}
+    for name, source_sha in sources.items():
+        if not SHA_PATTERN.fullmatch(source_sha):
+            raise PromotionError(f"run {run_id} has an invalid {name} source commit")
+    return sources
+
+
+def validate_jobs(tasks_response, run):
+    tasks = tasks_response.get("workflow_runs", [])
+    matching = [
+        task
+        for task in tasks
+        if task.get("run_number") == run["index_in_repo"]
+        and task.get("workflow_id") == "fleet-candidates.yml"
+        and task.get("head_sha") == run["commit_sha"]
+        and task.get("head_branch") == "main"
+    ]
+    for expected_name in EXPECTED_JOBS:
+        if not any(task.get("name") == expected_name and task.get("status") == "success" for task in matching):
+            raise PromotionError(f"missing successful job: {expected_name}")
+
+
+def require_mapping(value, description):
+    if not isinstance(value, dict):
+        raise PromotionError(f"{description} must be a JSON object")
+    return value
+
+
+def require_candidate_fields(document, kind, platform, sources, description):
+    require_mapping(document, description)
+    expected = {
+        "schema_version": 1,
+        "kind": kind,
+        "platform": platform,
+        "sources": sources,
+        "signed": False,
+    }
+    for field, expected_value in expected.items():
+        if document.get(field) != expected_value:
+            raise PromotionError(f"{description} has unexpected {field}")
+    try:
+        validation.require_sources(document.get("sources"))
+    except validation.ValidationError as error:
+        raise PromotionError(f"{description}: {error}") from error
+
+
+def safe_member_path(path, root):
+    prefix = f"{root}/"
+    if not path.startswith(prefix):
+        return None
+    relative = path[len(prefix) :]
+    if not relative or relative.startswith("/") or ".." in Path(relative).parts:
+        return None
+    return relative
+
+
+def inspect_inner_archive(archive_bytes, platform, sources):
+    bundle_name = f"fleet-candidate-{platform}"
+    manifest_path = f"{bundle_name}/manifest.json"
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+            members = archive.getmembers()
+            if any(not (member.isdir() or member.isfile()) for member in members):
+                raise PromotionError(f"{platform} candidate contains a non-regular archive member")
+            if sum(member.size for member in members) > MAX_ARCHIVE_BYTES:
+                raise PromotionError(f"{platform} candidate expands beyond the size limit")
+            files = {}
+            for member in members:
+                if member.isdir() and member.name.rstrip("/") == bundle_name:
+                    continue
+                relative = safe_member_path(member.name, bundle_name)
+                if relative is None:
+                    raise PromotionError(f"{platform} candidate contains an unsafe archive path: {member.name}")
+                if member.isfile():
+                    if relative in files:
+                        raise PromotionError(f"{platform} candidate contains duplicate path: {relative}")
+                    files[relative] = member
+            if "manifest.json" not in files:
+                raise PromotionError(f"{platform} candidate is missing manifest.json")
+            manifest_file = archive.extractfile(files["manifest.json"])
+            if manifest_file is None:
+                raise PromotionError(f"{platform} candidate manifest is unreadable")
+            try:
+                manifest = json.load(manifest_file)
+            except json.JSONDecodeError as error:
+                raise PromotionError(f"{platform} candidate manifest is invalid JSON") from error
+            require_candidate_fields(
+                manifest,
+                "unsigned-fleet-candidate",
+                platform,
+                sources,
+                f"{platform} candidate manifest",
+            )
+            protocol_version = manifest.get("peer_protocol_version")
+            if not isinstance(protocol_version, int) or isinstance(protocol_version, bool) or protocol_version <= 0:
+                raise PromotionError(f"{platform} candidate has an invalid peer_protocol_version")
+            declared_files = manifest.get("files")
+            if not isinstance(declared_files, list):
+                raise PromotionError(f"{platform} candidate files must be a list")
+            declared_by_path = {}
+            for entry in declared_files:
+                require_mapping(entry, f"{platform} candidate file entry")
+                relative = entry.get("path")
+                if (
+                    not isinstance(relative, str)
+                    or not relative
+                    or relative.startswith("/")
+                    or ".." in Path(relative).parts
+                    or relative in declared_by_path
+                    or not validation.allowed_payload(relative, platform)
+                ):
+                    raise PromotionError(f"{platform} candidate has an invalid file path")
+                declared_by_path[relative] = entry
+            if not validation.REQUIRED_PAYLOAD.issubset(declared_by_path):
+                raise PromotionError(f"{platform} candidate is missing a required payload")
+            actual_paths = set(files) - {"manifest.json"}
+            if set(declared_by_path) != actual_paths:
+                raise PromotionError(f"{platform} candidate files do not match its manifest")
+            total_size = 0
+            skill_bundle = None
+            for relative, entry in declared_by_path.items():
+                member = files[relative]
+                expected_size = entry.get("size_bytes")
+                expected_sha = entry.get("sha256")
+                if not isinstance(expected_size, int) or expected_size < 0:
+                    raise PromotionError(f"{platform} candidate has an invalid size for {relative}")
+                if not isinstance(expected_sha, str) or not DIGEST_PATTERN.fullmatch(expected_sha):
+                    raise PromotionError(f"{platform} candidate has an invalid digest for {relative}")
+                total_size += member.size
+                if total_size > MAX_ARCHIVE_BYTES:
+                    raise PromotionError(f"{platform} candidate expands beyond the size limit")
+                payload = archive.extractfile(member)
+                if payload is None:
+                    raise PromotionError(f"{platform} candidate file is unreadable: {relative}")
+                digest = hashlib.sha256()
+                observed_size = 0
+                captured = bytearray()
+                for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                    observed_size += len(chunk)
+                    digest.update(chunk)
+                    if relative == "share/flotilla/skills/.flotilla-sources.json":
+                        captured.extend(chunk)
+                if observed_size != expected_size or observed_size != member.size:
+                    raise PromotionError(f"{platform} candidate size mismatch: {relative}")
+                if digest.hexdigest() != expected_sha:
+                    raise PromotionError(f"{platform} candidate digest mismatch: {relative}")
+                if captured:
+                    try:
+                        skill_bundle = json.loads(captured)
+                    except json.JSONDecodeError as error:
+                        raise PromotionError(f"{platform} candidate has an invalid skill bundle") from error
+            try:
+                validation.validate_skill_bundle(skill_bundle, sources)
+            except validation.ValidationError as error:
+                raise PromotionError(f"{platform} candidate: {error}") from error
+            return protocol_version
+    except (tarfile.TarError, OSError) as error:
+        raise PromotionError(f"{platform} candidate archive is invalid: {error}") from error
+
+
+def read_candidate(artifact_bytes, platform, sources):
+    bundle_name = f"fleet-candidate-{platform}"
+    archive_name = f"{bundle_name}.tar.gz"
+    artifact_name = f"{bundle_name}.zip"
+    expected_names = {archive_name, f"{archive_name}.sha256", f"{archive_name}.json"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(artifact_bytes)) as artifact:
+            names = artifact.namelist()
+            if len(names) != len(set(names)) or set(names) != expected_names:
+                raise PromotionError(f"{artifact_name} has an unexpected file set")
+            if any(info.file_size > MAX_ARCHIVE_BYTES for info in artifact.infolist()):
+                raise PromotionError(f"{artifact_name} contains an oversized file")
+            archive_bytes = artifact.read(archive_name)
+            checksum_bytes = artifact.read(f"{archive_name}.sha256")
+            metadata_bytes = artifact.read(f"{archive_name}.json")
+    except (OSError, zipfile.BadZipFile, KeyError) as error:
+        raise PromotionError(f"cannot read Actions artifact {artifact_name}: {error}") from error
+    if len(archive_bytes) > MAX_ARCHIVE_BYTES:
+        raise PromotionError(f"{artifact_name} archive exceeds the size limit")
+    archive_sha = hashlib.sha256(archive_bytes).hexdigest()
+    expected_checksum = f"{archive_sha}  {archive_name}\n".encode()
+    if checksum_bytes != expected_checksum:
+        raise PromotionError(f"{platform} candidate checksum file does not match the archive")
+    try:
+        metadata = json.loads(metadata_bytes)
+    except json.JSONDecodeError as error:
+        raise PromotionError(f"{platform} candidate metadata is invalid JSON") from error
+    require_candidate_fields(
+        metadata,
+        "unsigned-fleet-candidate-archive",
+        platform,
+        sources,
+        f"{platform} candidate metadata",
+    )
+    expected_metadata = {
+        "artifact": archive_name,
+        "sha256": archive_sha,
+        "size_bytes": len(archive_bytes),
+    }
+    for field, expected_value in expected_metadata.items():
+        if metadata.get(field) != expected_value:
+            raise PromotionError(f"{platform} candidate metadata has unexpected {field}")
+    protocol_version = inspect_inner_archive(archive_bytes, platform, sources)
+    return {
+        "platform": platform,
+        "archive_name": archive_name,
+        "archive": archive_bytes,
+        "checksum_name": f"{archive_name}.sha256",
+        "checksum": checksum_bytes,
+        "metadata_name": f"{archive_name}.json",
+        "metadata": metadata_bytes,
+        "sha256": archive_sha,
+        "size_bytes": len(archive_bytes),
+        "peer_protocol_version": protocol_version,
+    }
+
+
+def fetch_candidates(api_root, run_id, sources, token):
+    artifacts = get_json(f"{api_root}/actions/runs/{run_id}/artifacts", token)
+    if not isinstance(artifacts, list):
+        raise PromotionError(f"run {run_id} artifacts response must be a JSON array")
+    expected_names = {f"fleet-candidate-{platform}" for platform in PLATFORMS}
+    observed_names = [artifact.get("name") for artifact in artifacts if isinstance(artifact, dict)]
+    if len(artifacts) != len(expected_names) or set(observed_names) != expected_names:
+        raise PromotionError(f"run {run_id} does not contain exactly the expected candidate artifacts")
+    artifacts_by_name = {artifact["name"]: artifact for artifact in artifacts}
+    candidates = []
+    for platform in PLATFORMS:
+        artifact = artifacts_by_name[f"fleet-candidate-{platform}"]
+        artifact_id = artifact.get("id")
+        size_in_bytes = artifact.get("size_in_bytes")
+        if not isinstance(artifact_id, int) or isinstance(artifact_id, bool) or artifact_id <= 0:
+            raise PromotionError(f"{platform} Actions artifact has an invalid id")
+        if artifact.get("run_id") != run_id:
+            raise PromotionError(f"{platform} Actions artifact is not bound to run {run_id}")
+        if artifact.get("expired") is not False:
+            raise PromotionError(f"{platform} Actions artifact is expired")
+        if (
+            not isinstance(size_in_bytes, int)
+            or isinstance(size_in_bytes, bool)
+            or size_in_bytes < 0
+            or size_in_bytes > MAX_ARCHIVE_BYTES
+        ):
+            raise PromotionError(f"{platform} Actions artifact has an invalid size")
+        artifact_url = f"{api_root}/actions/artifacts/{artifact_id}/zip"
+        candidate = read_candidate(get_bytes(artifact_url, token), platform, sources)
+        candidate["actions_artifact"] = {
+            "id": artifact_id,
+            "name": artifact["name"],
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+def generation_id(run, sources):
+    stopped = run.get("stopped", "")
+    try:
+        completed = datetime.datetime.fromisoformat(stopped.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as error:
+        raise PromotionError(f"run {run['id']} has an invalid completion time") from error
+    if completed.tzinfo is None or completed.utcoffset() != datetime.timedelta(0):
+        raise PromotionError(f"run {run['id']} completion time is not UTC")
+    stamp = completed.strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-r{run['id']}-f{sources['flotilla'][:12]}-c{sources['cleat'][:12]}"
+
+
+def package_authorization(username, token):
+    encoded = base64.b64encode(f"{username}:{token}".encode()).decode()
+    return f"Basic {encoded}"
+
+
+def put_immutable(url, content, authorization):
+    get_request = urllib.request.Request(url, headers={"Authorization": authorization})
+    try:
+        with urllib.request.urlopen(get_request, timeout=30) as response:
+            existing = response.read()
+        if existing != content:
+            raise PromotionError(f"package file already exists with different bytes: {url}")
+        return
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise PromotionError(f"package probe failed for {url}: HTTP {error.code}") from error
+    request = urllib.request.Request(
+        url,
+        data=content,
+        method="PUT",
+        headers={"Authorization": authorization, "Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            if response.status != 201:
+                raise PromotionError(f"package upload returned HTTP {response.status}: {url}")
+    except urllib.error.HTTPError as error:
+        raise PromotionError(f"package upload failed for {url}: HTTP {error.code}") from error
+
+
+def build_generation_manifest(run, sources, candidates, generation):
+    protocol_versions = {candidate["peer_protocol_version"] for candidate in candidates}
+    if len(protocol_versions) != 1:
+        raise PromotionError("candidate platforms disagree on peer_protocol_version")
+    return {
+        "schema_version": 1,
+        "kind": "internal-promoted-fleet-generation",
+        "generation": generation,
+        "sources": sources,
+        "peer_protocol_version": protocol_versions.pop(),
+        "artifact_provenance": {
+            "transport": "forgejo-v16-actions-api",
+            "api_bound_to_run": True,
+        },
+        "source_run": {
+            "repository": "lab/flotilla",
+            "api_run_id": run["id"],
+            "run_number": run["index_in_repo"],
+            "workflow": run["workflow_id"],
+            "workflow_commit": run["commit_sha"],
+            "completed_at": run["stopped"],
+        },
+        "platforms": {
+            candidate["platform"]: {
+                "artifact": candidate["archive_name"],
+                "sha256": candidate["sha256"],
+                "size_bytes": candidate["size_bytes"],
+                "signed": False,
+                "actions_artifact": candidate["actions_artifact"],
+                "state": (
+                    "installable-internal"
+                    if candidate["platform"] == "linux-x86_64-gnu2.36"
+                    else "awaiting-central-signature"
+                ),
+            }
+            for candidate in candidates
+        },
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Promote an exact Forgejo fleet-candidate run")
+    parser.add_argument("run_id", type=int)
+    parser.add_argument("--server-url", required=True)
+    parser.add_argument("--read-token-file", required=True)
+    parser.add_argument("--package-token-file", required=True)
+    parser.add_argument("--package-username", required=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.run_id <= 0:
+        raise PromotionError("run id must be a positive integer")
+    read_token_value = read_token(args.read_token_file)
+    api_root = f"{args.server_url.rstrip('/')}/api/v1/repos/lab/flotilla"
+    run_url = f"{api_root}/actions/runs/{args.run_id}"
+    run = get_json(run_url, read_token_value)
+    sources = validate_run(run, args.run_id)
+    tasks = get_json(f"{api_root}/actions/tasks?limit=50&page=1", read_token_value)
+    validate_jobs(tasks, run)
+    candidates = fetch_candidates(api_root, args.run_id, sources, read_token_value)
+    generation = generation_id(run, sources)
+    generation_manifest = build_generation_manifest(run, sources, candidates, generation)
+    generation_bytes = (json.dumps(generation_manifest, indent=2, sort_keys=True) + "\n").encode()
+    package_token_value = read_token(args.package_token_file)
+    authorization = package_authorization(args.package_username, package_token_value)
+    package_root = (
+        f"{args.server_url.rstrip('/')}/api/packages/lab/generic/flotilla-fleet/"
+        f"{urllib.parse.quote(generation, safe='')}"
+    )
+    for candidate in candidates:
+        for name_key, content_key in (
+            ("archive_name", "archive"),
+            ("checksum_name", "checksum"),
+            ("metadata_name", "metadata"),
+        ):
+            put_immutable(
+                f"{package_root}/{urllib.parse.quote(candidate[name_key], safe='')}",
+                candidate[content_key],
+                authorization,
+            )
+    put_immutable(f"{package_root}/generation.json", generation_bytes, authorization)
+    print(f"promoted {generation}")
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == "--validate-fixture":
+            validation.validate_fixture(sys.argv[2])
+        else:
+            main()
+    except PromotionError as error:
+        print(f"lab-fleet-promote: {error}", file=sys.stderr)
+        raise SystemExit(1)

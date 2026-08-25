@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::PlacementDecision;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
+use crate::{
+    environment::EnvironmentWaitReason, resource::define_resource, status_patch::StatusPatch, LandingCredentialScope, ReplicationClass,
+    RepositoryKey, Stance,
+};
 
 define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -40,6 +43,8 @@ pub struct VesselStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<EnvironmentWaitReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_policy_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_policy_version: Option<String>,
@@ -63,6 +68,10 @@ pub struct VesselStatus {
     pub requested_stance: Option<Stance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<Stance>,
+    /// Landing material actually staged in this vessel. This is deliberately
+    /// status, not desired spec: absence is the pre-approval invariant.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub held_credentials: BTreeMap<String, LandingCredentialScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +82,7 @@ pub enum VesselStatusPatch {
         placement_decision: Option<PlacementDecision>,
         started_at: DateTime<Utc>,
         message: Option<String>,
+        wait_reason: Option<EnvironmentWaitReason>,
     },
     MarkReady {
         placement_decision: Option<PlacementDecision>,
@@ -89,6 +99,9 @@ pub enum VesselStatusPatch {
         roles: BTreeSet<String>,
         message: String,
     },
+    StageLandingCredentials {
+        credentials: BTreeMap<String, LandingCredentialScope>,
+    },
     MarkTearingDown,
     MarkFailed {
         message: String,
@@ -98,7 +111,14 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
-            Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
+            Self::MarkProvisioning {
+                observed_policy_ref,
+                observed_policy_version,
+                placement_decision,
+                started_at,
+                message,
+                wait_reason,
+            } => {
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
@@ -107,6 +127,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 }
                 status.started_at.get_or_insert(*started_at);
                 status.message = message.clone();
+                status.wait_reason = wait_reason.clone();
             }
             Self::MarkReady {
                 placement_decision,
@@ -133,18 +154,25 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.effective_stance = Some(*effective_stance);
                 status.ready_at.get_or_insert(*ready_at);
                 status.message = None;
+                status.wait_reason = None;
             }
             Self::MarkInterrupted { roles, message } => {
                 status.phase = VesselPhase::Interrupted;
                 status.interrupted_roles = roles.clone();
                 status.message = Some(message.clone());
+                status.wait_reason = None;
+            }
+            Self::StageLandingCredentials { credentials } => {
+                status.held_credentials.extend(credentials.clone());
             }
             Self::MarkTearingDown => {
                 status.phase = VesselPhase::TearingDown;
+                status.wait_reason = None;
             }
             Self::MarkFailed { message } => {
                 status.phase = VesselPhase::Failed;
                 status.message = Some(message.clone());
+                status.wait_reason = None;
             }
         }
     }

@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let backend = ResourceBackend::Http(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);
-    let templates = backend.clone().using::<WorkflowTemplate>(&namespace);
+    let templates = backend.definitions::<WorkflowTemplate>(&namespace);
     let vessels = backend.clone().using::<Vessel>(&namespace);
     let presentations = backend.clone().using::<Presentation>(&namespace);
     let empty_registry = Arc::new(ProviderRegistry::new());
@@ -76,7 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &namespace,
                     {
                         let empty_registry = Arc::clone(&empty_registry);
-                        HopChainContext::new("local", HostName::local(), config_base, move |_env_ref| Ok(Arc::clone(&empty_registry)))
+                        HopChainContext::new(
+                            flotilla_protocol::CanonicalHostId::resolved("local"),
+                            HostName::local(),
+                            config_base,
+                            move |_env_ref| Ok(Arc::clone(&empty_registry)),
+                        )
                     },
                     policies,
                 ),

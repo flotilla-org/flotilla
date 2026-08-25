@@ -58,6 +58,12 @@ altogether, at which point the `follower` flag evaporates. (#1432, landed.)
    precursor shape for the Tender extraction, which remains out of scope
    until boundary-proven.
 
+The step 2 mixed-consumer audit is discharged by #1721's three-tier ruling.
+That ruling classifies the surviving provider capabilities by host,
+environment, and repository scope and retains its escalation contract: a live
+consumer that cannot delegate across the ruled boundary stops the affected
+slice and is reported rather than being moved or shimmed opportunistically.
+
 ### The store boundary
 
 **If it must survive disconnection to be useful, it is a resource; if its

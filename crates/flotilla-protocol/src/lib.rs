@@ -40,7 +40,7 @@ pub use leaf::{Leaf, LeafAddress, LeafFire, LeafKind, LeafOperator, WaitSubscrip
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerWireMessage, RoutedPeerMessage};
-pub use placement::{PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
+pub use placement::{CanonicalHostId, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate};
 pub use provisioning_target::ProvisioningTarget;
 pub use repository::{RepositoryKey, UNKNOWN_REPOSITORY_LABEL};
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
@@ -113,19 +113,19 @@ pub(crate) mod test_helpers {
 }
 
 pub use commands::{
-    AgentOverride, AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyAutoAttach,
-    ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout,
-    ExplainedCondition, ExplainedCrewDelivery, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription,
-    ExplainedUnmetExpectation, IssueSelector, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand,
-    ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType,
-    StepStatus,
+    AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
+    CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, EvidenceFreshness,
+    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector, ManifestResolution,
+    PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse,
+    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AttachableId,
     AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, Issue, IssueChangeset,
-    IssueRef, IssueSource, IssueState, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
-    WorkingTreeStatus, Workspace,
+    IssueRef, IssueSource, IssueState, ManagedTerminal, PaneExitAttention, ProviderData, RemoteAccessPoint, RemoteAccessType,
+    SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry,
@@ -184,26 +184,38 @@ pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels,
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
+
+/// Deterministic SHA-256 over the relative paths and contents beneath this
+/// crate's `src` directory.
+pub const PROTOCOL_FINGERPRINT: &str = env!("FLOTILLA_PROTOCOL_FINGERPRINT");
 
 const BUILD_ID_SEPARATOR: &str = "\u{1f}flotilla-build:";
+const PROTOCOL_FINGERPRINT_SEPARATOR: &str = "\u{1f}flotilla-protocol:";
 
-/// Add this binary's build identity to a Hello display name without changing
-/// the wire shape. Older peers continue to see an ordinary display name.
-pub fn hello_display_name(label: &str, build_id: &str) -> String {
-    format!("{label}{BUILD_ID_SEPARATOR}{build_id}")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelloBuildInfo<'a> {
+    pub build_id: &'a str,
+    pub protocol_fingerprint: &'a str,
 }
 
-/// Extract the optional build identity advertised in a Hello display name.
-pub fn hello_build_id(display_name: &str) -> Option<&str> {
-    display_name.rsplit_once(BUILD_ID_SEPARATOR).map(|(_, build_id)| build_id).filter(|build_id| !build_id.is_empty())
+/// Add this binary's diagnostic build identity and protocol fingerprint to a
+/// Hello display name without changing the wire shape.
+pub fn hello_display_name(label: &str, build_id: &str, protocol_fingerprint: &str) -> String {
+    format!("{label}{BUILD_ID_SEPARATOR}{build_id}{PROTOCOL_FINGERPRINT_SEPARATOR}{protocol_fingerprint}")
 }
 
-/// Whether two build stamps identify the same known wire generation.
+/// Extract the build metadata advertised in a Hello display name.
 ///
-/// An unknown stamp cannot prove compatibility, even when both sides report it.
-pub fn wire_generations_match(left: &str, right: &str) -> bool {
-    left != "unknown" && right != "unknown" && left == right
+/// Missing metadata cannot prove compatibility, so callers should reject a
+/// normal session while retaining any deliberately wider admission path.
+pub fn hello_build_info(display_name: &str) -> Option<HelloBuildInfo<'_>> {
+    let (_, metadata) = display_name.rsplit_once(BUILD_ID_SEPARATOR)?;
+    let (build_id, protocol_fingerprint) = metadata.split_once(PROTOCOL_FINGERPRINT_SEPARATOR)?;
+    if build_id.is_empty() || protocol_fingerprint.is_empty() {
+        return None;
+    }
+    Some(HelloBuildInfo { build_id, protocol_fingerprint })
 }
 
 /// Key for identifying an event stream in replay cursors.

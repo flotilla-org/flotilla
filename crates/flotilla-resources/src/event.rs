@@ -192,6 +192,8 @@ mod tests {
             .using::<Convoy>("flotilla")
             .create(&InputMeta::builder().name("held-work".to_string()).build(), &ConvoySpec {
                 workflow_ref: "work".to_string(),
+                role: "held-work".to_string(),
+                generation: 1,
                 dispatching_principal_ref: Default::default(),
                 inputs: Default::default(),
                 placement_policy: None,

@@ -1,5 +1,5 @@
-use flotilla_protocol::TerminalStatus;
 pub use flotilla_protocol::{AttachableId, AttachableSet, AttachableSetId};
+use flotilla_protocol::{PaneExitAttention, TerminalStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::path_context::ExecutionEnvironmentPath;
@@ -23,6 +23,15 @@ pub struct TerminalAttachable {
     pub command: String,
     pub working_directory: ExecutionEnvironmentPath,
     pub status: TerminalStatus,
+}
+
+impl TerminalAttachable {
+    pub fn exit_attention(&self) -> Option<PaneExitAttention> {
+        let TerminalStatus::Exited(exit_code) = self.status else {
+            return None;
+        };
+        Some(PaneExitAttention { exit_code })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

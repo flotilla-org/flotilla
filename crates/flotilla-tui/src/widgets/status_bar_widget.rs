@@ -323,6 +323,7 @@ mod tests {
         ConvoySummary::builder()
             .id(ConvoyId::new("flotilla", name))
             .namespace("flotilla".to_string())
+            .resource_name(name.to_string())
             .name(name.to_string())
             .workflow_ref("implement".to_string())
             .phase(ConvoyPhase::Active)

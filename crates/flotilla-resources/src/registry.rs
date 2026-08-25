@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
 use flotilla_protocol::NodeId;
@@ -17,6 +17,8 @@ use crate::{
     ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent, WatchStart,
     WorkflowTemplate, WriterIdentity,
 };
+
+pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisteredResourceKind {
@@ -73,6 +75,15 @@ pub struct DynamicResourceObject {
 pub struct DynamicResourceDelete {
     pub object: DynamicResourceObject,
     pub already_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+pub struct HomeBoundAuthorshipCollision {
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub local_root: NodeId,
+    pub replica_root: NodeId,
 }
 
 #[derive(bon::Builder)]
@@ -248,10 +259,10 @@ macro_rules! dispatch_resource_kind {
 /// another resource changes one dispatch arm rather than adding a one-off
 /// apply function or branch.
 macro_rules! dispatch_apply_resource_kind {
-    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr) => {
+    ($resource:expr, $backend:expr, $namespace:expr, $metadata:expr, $spec:expr, $writer:expr) => {
         match $resource {
             RegisteredResource::PlacementPolicy => apply_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await,
-            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, $writer).await),
         }
     };
 }
@@ -265,7 +276,10 @@ macro_rules! dispatch_manifest_apply_resource_kind {
             RegisteredResource::PlacementPolicy => {
                 apply_manifest_owned_typed::<PlacementPolicy>($backend, $namespace, $metadata, $spec).await
             }
-            resource => dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec).await),
+            resource => {
+                let writer = WriterIdentity::reconcile_loop().with_source(MANIFEST_WRITER_SOURCE);
+                dispatch_resource_kind!(resource, apply_typed($backend, $namespace, $metadata, $spec, &writer).await)
+            }
         }
     };
 }
@@ -308,6 +322,69 @@ pub async fn replica_cursor_for_resource_kind(
     origin_root: &NodeId,
 ) -> Result<Option<ReplicaCursor>, ResourceError> {
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, replica_cursor_typed(backend, namespace, origin_root).await)
+}
+
+/// Find same-name records authored both locally and by another root for every
+/// single-home resource kind.
+///
+/// The collision is diagnostic only: callers must surface it rather than
+/// choosing either record as authoritative.
+pub async fn home_bound_authorship_collisions(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
+    let local_root = backend.local_root()?;
+    let mut collisions = Vec::new();
+    for registered in REGISTERED_RESOURCE_KINDS {
+        if registered.replication_class != ReplicationClass::HomeBoundRuntime {
+            continue;
+        }
+        collisions.extend(dispatch_resource_kind!(
+            registered.resource,
+            home_bound_authorship_collisions_typed(backend, namespace, &local_root).await
+        )?);
+    }
+    collisions.sort_by(|left, right| {
+        (&left.kind, &left.namespace, &left.name, &left.replica_root).cmp(&(
+            &right.kind,
+            &right.namespace,
+            &right.name,
+            &right.replica_root,
+        ))
+    });
+    Ok(collisions)
+}
+
+async fn home_bound_authorship_collisions_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    local_root: &NodeId,
+) -> Result<Vec<HomeBoundAuthorshipCollision>, ResourceError> {
+    let sources = backend.including_replicas::<T>(namespace).list_sources().await?;
+    let local_names = sources
+        .items
+        .iter()
+        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+        .map(|item| item.object.metadata.name.as_str())
+        .collect::<HashSet<_>>();
+    Ok(sources
+        .items
+        .iter()
+        .filter_map(|item| {
+            let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
+                return None;
+            };
+            (origin_root != local_root && local_names.contains(item.object.metadata.name.as_str())).then(|| {
+                HomeBoundAuthorshipCollision::builder()
+                    .kind(T::API_PATHS.kind.to_string())
+                    .namespace(namespace.to_string())
+                    .name(item.object.metadata.name.clone())
+                    .local_root(local_root.clone())
+                    .replica_root(origin_root.clone())
+                    .build()
+            })
+        })
+        .collect())
 }
 
 async fn replica_cursor_typed<T: Resource>(
@@ -424,7 +501,66 @@ pub async fn apply_resource_document(
     let document: DynamicApplyDocument =
         serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
     let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
-    dispatch_apply_resource_kind!(lookup_resource_kind(&document.kind)?.resource, backend, &namespace, document.metadata, document.spec)
+    dispatch_apply_resource_kind!(
+        lookup_resource_kind(&document.kind)?.resource,
+        backend,
+        &namespace,
+        document.metadata,
+        document.spec,
+        &WriterIdentity::operator().with_source("resource-apply")
+    )
+}
+
+pub async fn patch_resource_annotation(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let annotations = BTreeMap::from([(key.to_string(), value.to_string())]);
+    patch_resource_annotations(backend, namespace, requested_kind, name, &annotations).await
+}
+
+pub async fn patch_resource_annotations(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+    annotations: &BTreeMap<String, String>,
+) -> Result<DynamicResourceObject, ResourceError> {
+    dispatch_resource_kind!(
+        lookup_resource_kind(requested_kind)?.resource,
+        patch_annotations_typed(backend, namespace, name, annotations).await
+    )
+}
+
+async fn patch_annotations_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    annotations: &BTreeMap<String, String>,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let updated = if T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+        let resolver = backend.definitions::<T>(namespace);
+        let existing = resolver.get(name).await?;
+        let mut meta = InputMeta::from(&existing.metadata);
+        meta.annotations.extend(annotations.clone());
+        resolver.update_metadata(&meta).await?
+    } else {
+        let resolver = backend.using::<T>(namespace);
+        let existing = resolver.get(name).await?;
+        let mut meta = InputMeta::from(&existing.metadata);
+        meta.annotations.extend(annotations.clone());
+        resolver.update(&meta, &existing.metadata.resource_version, &existing.spec).await?
+    };
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&updated)?,
+    })
 }
 
 pub async fn apply_manifest_resource_document(
@@ -630,9 +766,26 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
             }
             (object_value(&object)?, false)
         }
-        Err(ResourceError::NotFound { .. }) if T::REPLICATION_CLASS != crate::ReplicationClass::None => {
-            let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
-            (tombstone_value::<T>(&write.tombstone), !write.created)
+        Err(not_found @ ResourceError::NotFound { .. }) => {
+            if backend.delete_decode_quarantine::<T>(namespace, name).await? {
+                if T::REPLICATION_CLASS != crate::ReplicationClass::None {
+                    let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
+                    (tombstone_value::<T>(&write.tombstone), !write.created)
+                } else {
+                    let tombstone = crate::ResourceTombstone {
+                        name: name.to_string(),
+                        namespace: namespace.to_string(),
+                        resource_version: String::new(),
+                        annotations: BTreeMap::new(),
+                    };
+                    (tombstone_value::<T>(&tombstone), false)
+                }
+            } else if T::REPLICATION_CLASS != crate::ReplicationClass::None {
+                let write = retain_authoritative_name_tombstone::<T>(backend, namespace, name).await?;
+                (tombstone_value::<T>(&write.tombstone), !write.created)
+            } else {
+                return Err(not_found);
+            }
         }
         Err(error) => return Err(error),
     };
@@ -835,6 +988,7 @@ async fn apply_typed<T: Resource>(
     namespace: &str,
     metadata: DynamicApplyMetadata,
     spec: Value,
+    writer: &WriterIdentity,
 ) -> Result<DynamicResourceObject, ResourceError> {
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
@@ -844,7 +998,7 @@ async fn apply_typed<T: Resource>(
             Err(ResourceError::NotFound { .. }) => metadata.input_meta_for_create(),
             Err(error) => return Err(error),
         };
-        let object = backend.definitions::<T>(namespace).apply(&meta, &spec).await?;
+        let object = backend.definitions::<T>(namespace).apply_as(writer, &meta, &spec).await?;
         return Ok(DynamicResourceObject {
             kind: T::API_PATHS.kind.to_string(),
             plural: T::API_PATHS.plural.to_string(),
