@@ -185,6 +185,34 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
 }
 
 #[tokio::test]
+async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_writer = backend.using::<Repository>("flotilla");
+    let canonical = "https://forgejo.lab.flotilla.work/fork-issues/ghostty";
+    let repository = RepositorySpec::remote(canonical)
+        .expect("canonical repository")
+        .update_remotes("https://manchego.lab.flotilla.work/fork-issues/ghostty")
+        .expect("live alias remote");
+    let key = repository.key();
+    repository_writer.create(&InputMeta::builder().name(key.to_string()).build(), &repository).await.expect("repository should create");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
+    let project = ProjectSpec {
+        display_name: "ghostty".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        repositories: vec![ProjectRepositorySpec::builder().repo(key).roles([ProjectRepositoryRole::Code].into()).build()],
+        issue_sources: Vec::new(),
+        dispatch_policy: None,
+    };
+
+    let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project).await else {
+        panic!("repository forge should derive an issue source");
+    };
+
+    assert_eq!(bindings[0].source.service, "https://forgejo.lab.flotilla.work");
+    assert_eq!(bindings[0].source.scope, "fork-issues/ghostty");
+}
+
+#[tokio::test]
 async fn project_issue_source_resolution_reports_typed_unavailability() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let repository_writer = backend.using::<Repository>("flotilla");

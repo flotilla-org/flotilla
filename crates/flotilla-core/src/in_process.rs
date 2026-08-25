@@ -4450,7 +4450,7 @@ impl InProcessDaemon {
                 .get(&project_repository.repo.to_string())
                 .await
                 .map_err(|error| format!("repository {}: {error}", project_repository.repo))?;
-            if repository.object.spec.forge().is_some_and(|forge| {
+            if repository.object.spec.issue_source_forge().is_some_and(|forge| {
                 forge.service_url == issue.reference.source.service && forge.repository == issue.reference.source.scope
             }) {
                 matching_repositories.push(project_repository.repo.clone());

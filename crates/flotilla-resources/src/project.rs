@@ -218,8 +218,8 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
                 });
             }
         };
-        if let Some(forge) = repository.object.spec.forge() {
-            let source = IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() };
+        if let Some(forge) = repository.object.spec.issue_source_forge() {
+            let source = IssueSource { service: forge.service_url, scope: forge.repository };
             let declaration = project.issue_sources.iter().find(|binding| binding.source == source);
             if declaration.is_some_and(|binding| binding.exclude) {
                 continue;
