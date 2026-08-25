@@ -24,6 +24,7 @@ grep -Fq 'FLEET_ORCHESTRATION_SHA: ${{ forgejo.sha }}' "$workflow"
 grep -Fq 'FLEET_MATTPOCOCK_SKILLS_SHA: ${{ inputs.mattpocock_skills_sha }}' "$workflow"
 # shellcheck disable=SC2016
 grep -Fq 'FLEET_RJW_SKILLS_SHA: ${{ inputs.rjw_skills_sha }}' "$workflow"
+test "$(grep -Fc 'type: string' "$workflow")" -eq 4
 # shellcheck disable=SC2016
 test "$(grep -Fc 'git -C orchestration fetch --depth=1 origin "$FLEET_ORCHESTRATION_SHA"' "$workflow")" -eq 2
 if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_SHA'; then
@@ -31,7 +32,12 @@ if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_S
   exit 1
 fi
 grep -Fq 'retention-days: 7' "$workflow"
-grep -Fq '"schema_version": 3' "$builder"
+grep -Fq '"schema_version": 4' "$builder"
+grep -Fq '"paths": ["plugins/rjw-sdlc/skills"]' "$builder"
+grep -Fq '"name": "cleat"' "$builder"
+grep -Fq '"revision": os.environ["FLEET_CLEAT_SHA"]' "$builder"
+grep -Fq '"name": "flotilla"' "$builder"
+grep -Fq '"revision": os.environ["FLEET_FLOTILLA_SHA"]' "$builder"
 if grep -Fq '"required_skills"' "$builder"; then
   echo 'skill manifest production must carry no universal required-skill list' >&2
   exit 1

@@ -44,7 +44,7 @@ add_test_skills() {
   local mattpocock_repository="${3:-https://github.com/flotilla-org/mattpocock-skills.git}"
   local skills="$bundle/share/flotilla/skills"
   mkdir -p "$skills"
-  printf '{"schema_version":3,"sources":[{"name":"mattpocock-skills","repository":"%s","revision":"2222222222222222222222222222222222222222"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"%s"}]}\n' \
+  printf '{"schema_version":4,"sources":[{"name":"mattpocock-skills","repository":"%s","revision":"2222222222222222222222222222222222222222"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"%s","paths":["plugins/rjw-sdlc/skills"]}]}\n' \
     "$mattpocock_repository" "$rjw_revision" >"$skills/.flotilla-sources.json"
 }
 
