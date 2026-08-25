@@ -426,7 +426,9 @@ where
 
         let actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
-            TerminalPrepared::Stopped => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
             TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
             _ if matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
@@ -496,10 +498,6 @@ where
 
     fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
         obj.status.as_ref().is_some_and(|status| status.degraded.is_some())
-    }
-
-    async fn degraded_object_needs_reconcile(&self, obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
-        Ok(!matches!(self.session_owner_state(obj).await?, TerminalOwnerState::Active))
     }
 }
 
