@@ -1,4 +1,4 @@
-use std::cmp::Reverse;
+use std::{cmp::Reverse, collections::BTreeMap};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub const DEFAULT_EVENT_TTL_SECONDS: i64 = 24 * 60 * 60;
+pub const EVENT_REGARDING_LABEL: &str = "flotilla.work/event-regarding";
 
 define_resource!(Event, "events", EventSpec, (), NoStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -55,11 +56,17 @@ pub struct ObjectEvent {
     pub regarding: EventRegarding,
     pub reason: String,
     pub message: String,
+    pub related_labels: BTreeMap<String, String>,
 }
 
 impl ObjectEvent {
     pub fn for_object<T: Resource>(object: &ResourceObject<T>, reason: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { regarding: EventRegarding::object(object), reason: reason.into(), message: message.into() }
+        Self {
+            regarding: EventRegarding::object(object),
+            reason: reason.into(),
+            message: message.into(),
+            related_labels: object.metadata.labels.clone(),
+        }
     }
 }
 
@@ -80,7 +87,6 @@ impl EventRecorder {
 
     pub async fn record(&self, event: ObjectEvent, now: DateTime<Utc>) -> Result<ResourceObject<Event>, ResourceError> {
         let resolver = self.backend.using::<Event>(&event.regarding.namespace);
-        self.prune_expired(&event.regarding.namespace, now).await?;
         let name = event_name(&event);
         for _ in 0..3 {
             match resolver.get(&name).await {
@@ -102,8 +108,11 @@ impl EventRecorder {
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
+                    let mut labels = event.related_labels.clone();
+                    labels.insert(EVENT_REGARDING_LABEL.to_string(), regarding_key(&event.regarding));
                     let meta = InputMeta::builder()
                         .name(name.clone())
+                        .labels(labels)
                         .owner_references(vec![OwnerReference {
                             api_version: event.regarding.api_version.clone(),
                             kind: event.regarding.kind.clone(),
@@ -136,12 +145,33 @@ impl EventRecorder {
         let mut events = self
             .backend
             .including_replicas::<Event>(&regarding.namespace)
-            .list()
+            .list_matching_labels(&BTreeMap::from([(EVENT_REGARDING_LABEL.to_string(), regarding_key(regarding))]))
             .await?
             .items
             .into_iter()
             .map(|source| source.object)
             .filter(|event| event.spec.regarding == *regarding && !event.spec.is_expired_at(now))
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| Reverse(event.spec.last_seen));
+        Ok(events)
+    }
+
+    pub async fn recent_matching_label(
+        &self,
+        namespace: &str,
+        label: &str,
+        value: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ResourceObject<Event>>, ResourceError> {
+        let mut events = self
+            .backend
+            .including_replicas::<Event>(namespace)
+            .list_matching_labels(&BTreeMap::from([(label.to_string(), value.to_string())]))
+            .await?
+            .items
+            .into_iter()
+            .map(|source| source.object)
+            .filter(|event| !event.spec.is_expired_at(now))
             .collect::<Vec<_>>();
         events.sort_by_key(|event| Reverse(event.spec.last_seen));
         Ok(events)
@@ -159,6 +189,15 @@ impl EventRecorder {
         }
         Ok(())
     }
+}
+
+fn regarding_key(regarding: &EventRegarding) -> String {
+    let mut hash = Sha256::new();
+    for part in [regarding.api_version.as_str(), regarding.kind.as_str(), regarding.namespace.as_str(), regarding.name.as_str()] {
+        hash.update(part.as_bytes());
+        hash.update([0]);
+    }
+    format!("{:x}", hash.finalize())
 }
 
 fn event_name(event: &ObjectEvent) -> String {

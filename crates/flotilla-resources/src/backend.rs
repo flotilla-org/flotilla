@@ -226,6 +226,41 @@ impl<T: Resource> ReplicaReadResolver<T> {
         Ok(listed)
     }
 
+    pub async fn list_matching_labels(&self, required: &BTreeMap<String, String>) -> Result<ReadResourceList<T>, ResourceError> {
+        if required.is_empty() {
+            return self.list().await;
+        }
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
+        }
+        let local = self.backend.using::<T>(&self.namespace).list_matching_labels(required).await?;
+        let mut items =
+            local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
+        let mut replicas = match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
+            ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
+            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
+        };
+        replicas.retain(|item| required.iter().all(|(key, expected)| item.object.metadata.labels.get(key) == Some(expected)));
+        items.extend(replicas);
+        if self.suppress_self_origin {
+            let local_root = self.backend.local_root()?;
+            let local_names = items
+                .iter()
+                .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+                .map(|item| item.object.metadata.name.clone())
+                .collect::<HashSet<_>>();
+            items.retain(|item| {
+                !matches!(
+                    &item.provenance,
+                    ResourceProvenance::Replica { origin_root, .. }
+                        if origin_root == &local_root && local_names.contains(&item.object.metadata.name)
+                )
+            });
+        }
+        Ok(ReadResourceList { items })
+    }
+
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
         if matches!(&self.backend, ResourceBackend::Http(_)) {

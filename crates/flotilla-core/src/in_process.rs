@@ -6013,11 +6013,25 @@ impl InProcessDaemon {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.patch_project_operational_entries(&namespace, &declaration.name, false, &error).await?;
+                    self.record_project_operational_refusal(&namespace, &declaration.name, &error).await;
                     return Err(format!("operational entry refused: {error}"));
                 }
             };
         changes.extend(operational_changes);
         Ok((changes, operational_entries))
+    }
+
+    async fn record_project_operational_refusal(&self, namespace: &str, project_name: &str, error: &str) {
+        let Ok(project) = self.resource_backend.definitions::<Project>(namespace).get(project_name).await else {
+            return;
+        };
+        let reason = if error.contains("duplicate") { "DuplicateOperationalEntryRefused" } else { "ProjectOperationalEntriesRefused" };
+        if let Err(record_error) = EventRecorder::new(self.resource_backend.clone())
+            .record(ObjectEvent::for_object(&project, reason, error), self.clock.now())
+            .await
+        {
+            warn!(project = %project_name, %record_error, "failed to record operational-entry refusal event");
+        }
     }
 
     async fn materialize_project_operational_entries(
@@ -10655,15 +10669,7 @@ impl InProcessDaemon {
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
         let recent_events = match EventRecorder::new(self.resource_backend.clone())
-            .recent_for(
-                &EventRegarding {
-                    api_version: api_version(ResourceConvoy::API_PATHS),
-                    kind: ResourceConvoy::API_PATHS.kind.to_string(),
-                    namespace: namespace.clone(),
-                    name: name.to_string(),
-                },
-                Utc::now(),
-            )
+            .recent_matching_label(&namespace, CONVOY_LABEL, &convoy.metadata.name, Utc::now())
             .await
         {
             Ok(events) => events

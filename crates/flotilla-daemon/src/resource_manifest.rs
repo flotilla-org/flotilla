@@ -354,6 +354,7 @@ impl ResourceManifestReconciler {
             },
             reason: reason.to_string(),
             message,
+            related_labels: BTreeMap::new(),
         };
         if let Err(error) = self.events.record(event, chrono::Utc::now()).await {
             warn!(object = %identity, %error, "failed to record manifest refusal event");

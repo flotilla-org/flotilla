@@ -5,7 +5,7 @@ use flotilla_resources::{
     controller_patches, ConvoyEnsureStatus, ConvoyProvisioningState, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
-    EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, HostCondition,
+    EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, HostCondition,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy,
     PlacementPolicySpec, Selector, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
@@ -1612,6 +1612,32 @@ async fn standing_backing_inspection_holds_empty_evidence_after_provisioning_sta
         .expect_err("missing backing evidence after provisioning must remain conservative");
 
     assert_eq!(refusal, "no backing environment evidence is available");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("hold without backing evidence"), vec![
+        "ConvoyEnsure/quartermaster held for operator attention"
+    ]);
+    let events = backend.using::<Event>("flotilla").list().await.expect("list object events").items;
+    assert!(events.iter().any(|event| {
+        event.spec.regarding.name == convoy_ref
+            && event.spec.reason == "BackingEvidenceRefused"
+            && event.spec.message.contains("no backing environment evidence is available")
+    }));
+}
+
+#[tokio::test]
+async fn duplicate_operational_entry_refusal_records_a_project_event() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+
+    daemon
+        .record_project_operational_refusal("flotilla", "standing-project", "duplicate materialized WorkflowTemplate `quartermaster`")
+        .await;
+
+    let events = backend.using::<Event>("flotilla").list().await.expect("events").items;
+    assert!(events.iter().any(|event| {
+        event.spec.regarding.name == "standing-project"
+            && event.spec.reason == "DuplicateOperationalEntryRefused"
+            && event.spec.message == "duplicate materialized WorkflowTemplate `quartermaster`"
+    }));
 }
 
 #[tokio::test]

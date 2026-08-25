@@ -32,8 +32,6 @@ use crate::{
     EventRecorder, ObjectEvent,
 };
 
-pub type Event = ObjectEvent;
-
 #[allow(async_fn_in_trait)]
 pub trait Reconciler: Send + Sync + 'static {
     type Resource: Resource;
@@ -140,7 +138,7 @@ struct ObjectFailure {
 pub struct ReconcileOutcome<T: Resource> {
     pub patch: Option<T::StatusPatch>,
     pub actuations: Vec<Actuation>,
-    pub events: Vec<Event>,
+    pub events: Vec<ObjectEvent>,
     pub requeue_after: Option<Duration>,
 }
 
