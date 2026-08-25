@@ -2095,7 +2095,7 @@ pub struct InProcessDaemon {
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
-    driver_ensure_retries: Mutex<HashMap<(String, String), DriverEnsureRetry>>,
+    ensure_admission_retries: Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
     /// Serializes pending-brief state with its terminal-session delivery side effect.
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     /// Serializes the identity selector check with Convoy creation. The owner
@@ -2153,15 +2153,21 @@ const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
 
 #[derive(Debug, Clone)]
-struct DriverEnsureRetry {
+struct EnsureAdmissionRetry {
     config_hash: String,
-    consecutive_failures: u32,
+    consecutive_refusals: u32,
     retry_at: DateTime<Utc>,
+    dependency_hash: String,
 }
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
     let exponent = restart_count.min(5);
     ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
+}
+
+fn ensure_admission_retry_delay(refusal_count: u32) -> ChronoDuration {
+    let exponent = refusal_count.saturating_sub(1).min(2);
+    ChronoDuration::seconds(30_i64.saturating_mul(1_i64 << exponent))
 }
 
 fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
@@ -2384,7 +2390,7 @@ impl InProcessDaemon {
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
-            driver_ensure_retries: Mutex::new(HashMap::new()),
+            ensure_admission_retries: Mutex::new(HashMap::new()),
             convoy_message_locks: Mutex::new(HashMap::new()),
             convoy_admission: Mutex::new(()),
             session_id: uuid::Uuid::new_v4(),
@@ -4752,7 +4758,7 @@ impl InProcessDaemon {
     ) -> Result<Vec<String>, String> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
         let ensure_names = ensures.iter().map(|ensure| ensure.metadata.name.clone()).collect::<HashSet<_>>();
-        self.driver_ensure_retries
+        self.ensure_admission_retries
             .lock()
             .await
             .retain(|(retry_namespace, retry_name), _| retry_namespace != namespace || ensure_names.contains(retry_name));
@@ -4916,7 +4922,7 @@ impl InProcessDaemon {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
         if ensure.spec.driver_ref.is_some() {
-            self.driver_ensure_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
+            self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
             return self
                 .reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, true)
                 .await
@@ -4927,12 +4933,62 @@ impl InProcessDaemon {
             .map(|change| change.unwrap_or_else(|| format!("ConvoyEnsure/{name} is already reconciled")))
     }
 
+    /// Fingerprint the named resources consulted by standing-convoy admission.
+    /// A changed fingerprint invalidates a read-only refusal's deadline so the
+    /// next reconciliation pass can retry immediately.
+    async fn ensure_admission_dependency_hash(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
+        let mut versions = BTreeMap::new();
+        let projects = self.resource_backend.clone().including_replicas::<Project>(namespace);
+        let project = match projects.get(&ensure.spec.project_ref).await {
+            Ok(project) => {
+                versions.insert(format!("Project/{}", ensure.spec.project_ref), project.object.metadata.resource_version.clone());
+                Some(project.object)
+            }
+            Err(error) => {
+                versions.insert(format!("Project/{}", ensure.spec.project_ref), format!("absent:{error}"));
+                None
+            }
+        };
+        if let Some(project) = project {
+            let repositories = self.resource_backend.clone().including_replicas::<Repository>(namespace);
+            for repository in &project.spec.repositories {
+                let name = repository.repo.to_string();
+                let version = repositories
+                    .get(&name)
+                    .await
+                    .map(|repository| repository.object.metadata.resource_version)
+                    .unwrap_or_else(|error| format!("absent:{error}"));
+                versions.insert(format!("Repository/{name}"), version);
+            }
+        }
+        let workflows = self.resource_backend.clone().definitions::<WorkflowTemplate>(namespace);
+        for name in [
+            crate::ops_entry::materialized_workflow_name(&ensure.spec.project_ref, &ensure.spec.workflow_ref),
+            ensure.spec.workflow_ref.clone(),
+        ] {
+            let version = workflows
+                .get(&name)
+                .await
+                .map(|workflow| workflow.metadata.resource_version)
+                .unwrap_or_else(|error| format!("absent:{error}"));
+            versions.insert(format!("WorkflowTemplate/{name}"), version);
+        }
+        if let Some(name) = &ensure.spec.placement_policy {
+            let policies = self.resource_backend.clone().definitions::<PlacementPolicy>(namespace);
+            let version =
+                policies.get(name).await.map(|policy| policy.metadata.resource_version).unwrap_or_else(|error| format!("absent:{error}"));
+            versions.insert(format!("PlacementPolicy/{name}"), version);
+        }
+        let encoded = serde_json::to_vec(&versions).map_err(|error| format!("serialize ensure admission dependencies: {error}"))?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
     /// Admit a declared-driver ensure from the generation history homed here.
     ///
     /// Driver admission keeps admission retry state on the driver because the
     /// ensure definition may be homed on another root. Failed generations
-    /// remain the runtime retry budget; admission failures use the same bounded
-    /// backoff and surface a driver-local Demand when their budget is exhausted.
+    /// remain the runtime strike budget; read-only admission refusals retry
+    /// indefinitely on their own short, dependency-invalidated backoff.
     async fn reconcile_driver_convoy_ensure(
         &self,
         namespace: &str,
@@ -4951,6 +5007,12 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         generations.sort_by_key(|convoy| convoy.spec.generation);
 
+        let consecutive_failures = generations
+            .iter()
+            .rev()
+            .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
+            .count() as u32;
+
         if generations.last().is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())) {
             return Ok(None);
         }
@@ -4961,10 +5023,11 @@ impl InProcessDaemon {
             Ok(demand)
                 if demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)) =>
             {
-                if !force_now {
+                if consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES && !force_now {
                     return Ok(None);
                 }
-                (true, true)
+                demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
+                (consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES, false)
             }
             Ok(_) => {
                 demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
@@ -4976,9 +5039,10 @@ impl InProcessDaemon {
 
         let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
         let config_hash = ensure_config_hash(&ensure.spec)?;
+        let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
         {
-            let mut retries = self.driver_ensure_retries.lock().await;
-            if retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash) {
+            let mut retries = self.ensure_admission_retries.lock().await;
+            if retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash) {
                 retries.remove(&retry_key);
             }
             if !resolved_escalation && !force_now {
@@ -4992,11 +5056,6 @@ impl InProcessDaemon {
             }
         }
 
-        let consecutive_failures = generations
-            .iter()
-            .rev()
-            .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
-            .count() as u32;
         let latest = generations.last();
         if !resolved_escalation && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
@@ -5024,59 +5083,32 @@ impl InProcessDaemon {
         }
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(_) => {
-                self.driver_ensure_retries.lock().await.remove(&retry_key);
+                self.ensure_admission_retries.lock().await.remove(&retry_key);
                 self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
                 let now = self.clock.now();
-                let (admission_failures, retry_at) = {
-                    let mut retries = self.driver_ensure_retries.lock().await;
-                    let admission_failures = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_failures.saturating_add(1));
-                    let retry_at = now + ensure_retry_delay(admission_failures - 1);
-                    retries.insert(retry_key, DriverEnsureRetry { config_hash, consecutive_failures: admission_failures, retry_at });
-                    (admission_failures, retry_at)
+                let (refusals, retry_at) = {
+                    let mut retries = self.ensure_admission_retries.lock().await;
+                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
+                    let retry_at = now + ensure_admission_retry_delay(refusals);
+                    retries.insert(retry_key, EnsureAdmissionRetry {
+                        config_hash,
+                        consecutive_refusals: refusals,
+                        retry_at,
+                        dependency_hash,
+                    });
+                    (refusals, retry_at)
                 };
                 self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
-                    strikes: admission_failures,
+                    strikes: consecutive_failures,
                     retry_at,
                     failure: error.clone(),
                 })
                 .await?;
-                if admission_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
-                    let failure = format!("driver admission failed {admission_failures} consecutive times: {error}");
-                    self.raise_driver_admission_attention(namespace, ensure, &failure, now + ENSURE_ESCALATION_AFTER).await?;
-                    return Ok(Some(format!("ConvoyEnsure/{} exhausted driver admission retry budget", ensure.metadata.name)));
-                }
-                Err(format!("driver admission failed; retry at {retry_at}: {error}"))
+                Err(format!("driver admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
-        }
-    }
-
-    async fn raise_driver_admission_attention(
-        &self,
-        namespace: &str,
-        ensure: &ResourceObject<ConvoyEnsure>,
-        reason: &str,
-        escalation_deadline: DateTime<Utc>,
-    ) -> Result<(), String> {
-        let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
-        let name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
-        let target = ResourceRef::new(api_version(ConvoyEnsure::API_PATHS), ConvoyEnsure::API_PATHS.kind, namespace, &ensure.metadata.name);
-        let meta = InputMeta::builder()
-            .name(name)
-            .annotations(BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), reason.to_string())]))
-            .build();
-        let mut spec =
-            DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
-        spec.expiry = Some(DemandExpiry { deadline: escalation_deadline, disposition: DemandExpiryDisposition::Escalate });
-        match demands.create(&meta, &spec).await {
-            Ok(_) => Ok(()),
-            Err(ResourceError::Conflict { .. }) => {
-                let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
-                demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
-            }
-            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -5130,6 +5162,17 @@ impl InProcessDaemon {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut status = ensure.status.clone().unwrap_or_default();
         let config_hash = ensure_config_hash(&ensure.spec)?;
+        let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+        let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
+        let dependency_changed = {
+            let mut retries = self.ensure_admission_retries.lock().await;
+            let changed =
+                retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
+            if changed {
+                retries.remove(&retry_key);
+            }
+            changed
+        };
         if status.observed_config_hash.as_deref() != Some(&config_hash) {
             let changed = status.observed_config_hash.is_some();
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ObserveConfig {
@@ -5137,7 +5180,7 @@ impl InProcessDaemon {
                 changed,
             })
             .await?;
-            status.observed_config_hash = Some(config_hash);
+            status.observed_config_hash = Some(config_hash.clone());
             if changed {
                 self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
                 status.restart_count = 0;
@@ -5191,7 +5234,7 @@ impl InProcessDaemon {
         }
 
         if convoy.is_none() {
-            if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
+            if !force_now && !dependency_changed && status.retry_at.is_some_and(|retry_at| retry_at > now) {
                 return Ok(None);
             }
             if force_now {
@@ -5261,7 +5304,7 @@ impl InProcessDaemon {
             .await?;
             return Ok(Some(format!("ConvoyEnsure/{} backing off until {retry_at}", ensure.metadata.name)));
         }
-        if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
+        if !force_now && !dependency_changed && status.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(None);
         }
         if force_now {
@@ -5276,6 +5319,7 @@ impl InProcessDaemon {
         .await;
         match restart {
             Ok(convoy_ref) => {
+                self.ensure_admission_retries.lock().await.remove(&retry_key);
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
                     convoy_ref: convoy_ref.clone(),
                     observed_at: now,
@@ -5288,13 +5332,24 @@ impl InProcessDaemon {
                     .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
                     .await
                     .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
-                let retry_at = now + ensure_retry_delay(status.restart_count);
+                let (refusals, retry_at) = {
+                    let mut retries = self.ensure_admission_retries.lock().await;
+                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
+                    let retry_at = now + ensure_admission_retry_delay(refusals);
+                    retries.insert(retry_key, EnsureAdmissionRetry {
+                        config_hash,
+                        consecutive_refusals: refusals,
+                        retry_at,
+                        dependency_hash,
+                    });
+                    (refusals, retry_at)
+                };
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
                     failure: error.clone(),
                 })
                 .await?;
-                Err(format!("start failed; retry at {retry_at}: {error}"))
+                Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
         }
     }
@@ -5303,12 +5358,13 @@ impl InProcessDaemon {
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-        status: &flotilla_resources::ConvoyEnsureStatus,
+        _status: &flotilla_resources::ConvoyEnsureStatus,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(convoy_ref) => {
+                self.ensure_admission_retries.lock().await.remove(&(namespace.to_string(), ensure.metadata.name.clone()));
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Running {
                     convoy_ref,
                     observed_at: now,
@@ -5321,13 +5377,27 @@ impl InProcessDaemon {
                     .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
                     .await
                     .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
-                let retry_at = now + ensure_retry_delay(status.restart_count);
+                let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+                let config_hash = ensure_config_hash(&ensure.spec)?;
+                let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
+                let (refusals, retry_at) = {
+                    let mut retries = self.ensure_admission_retries.lock().await;
+                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
+                    let retry_at = now + ensure_admission_retry_delay(refusals);
+                    retries.insert(retry_key, EnsureAdmissionRetry {
+                        config_hash,
+                        consecutive_refusals: refusals,
+                        retry_at,
+                        dependency_hash,
+                    });
+                    (refusals, retry_at)
+                };
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
                     failure: error.clone(),
                 })
                 .await?;
-                Err(format!("start failed; retry at {retry_at}: {error}"))
+                Err(format!("admission refused ({refusals} consecutive refusals); retry at {retry_at}: {error}"))
             }
         }
     }

@@ -38,18 +38,19 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, ChangeRequest,
-    ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy,
-    ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
-    DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
-    EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
-    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
-    ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
+    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
+    CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime,
+    CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource,
+    ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
     CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
     MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
+use futures::StreamExt;
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -1587,33 +1588,46 @@ fn spawn_convoy_ensure_reconciler_task(
     interval: Duration,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
-    let timeout_health = runtime_health.clone();
-    spawn_timed_periodic_task(
-        interval,
-        PeriodicTaskStart::Immediate,
-        interval,
-        move || {
-            let state = Arc::clone(&state);
-            let namespace = namespace.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                let result = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await;
-                runtime_health.clear_convoy_ensure_timeout();
-                match result {
-                    Ok(changes) => {
-                        info!(changes = changes.len(), "standing convoy ensure reconciler alive");
-                    }
-                    Err(error) => {
-                        warn!(%error, "standing convoy ensure reconciliation pass failed");
+    tokio::spawn(async move {
+        let mut watches = Vec::new();
+        for kind in ["Project", "Repository", "WorkflowTemplate", "PlacementPolicy", "CredentialGrant", "CredentialSpec", "Host"] {
+            match watch_resource_kind_including_replicas(&state.daemon.resource_backend(), &namespace, kind).await {
+                Ok(watch) => watches.push(watch.stream),
+                Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
+            }
+        }
+        let mut dependency_events = futures::stream::select_all(watches);
+        let mut resync = tokio::time::interval(interval);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = resync.tick() => {}
+                event = dependency_events.next(), if !dependency_events.is_empty() => {
+                    if let Some(Err(error)) = event {
+                        warn!(%error, "standing convoy admission dependency watch failed");
                     }
                 }
             }
-        },
-        move || {
-            timeout_health.report_convoy_ensure_timeout(interval);
-            warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
-        },
-    )
+            match tokio::time::timeout(
+                interval,
+                state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state),
+            )
+            .await
+            {
+                Ok(result) => {
+                    runtime_health.clear_convoy_ensure_timeout();
+                    match result {
+                        Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
+                        Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
+                    }
+                }
+                Err(_) => {
+                    runtime_health.report_convoy_ensure_timeout(interval);
+                    warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
+                }
+            }
+        }
+    })
 }
 
 fn spawn_projection_parity_task(

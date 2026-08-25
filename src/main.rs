@@ -327,7 +327,11 @@ enum ResourceSubCommand {
     Sync(ResourceManifestResolutionArgs),
     /// Write the live spec back to its manifest
     Adopt(ResourceManifestResolutionArgs),
-    /// Reset backoff and immediately reconcile one operator target
+    /// Reset backoff and immediately reconcile one operator target.
+    ///
+    /// Interim fallback for dependencies that cannot be named by a refusal:
+    /// use `resource apply` to touch an annotation and wake reconciliation by
+    /// bumping the object's resource version.
     ReconcileNow(ResourceReconcileNowArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),

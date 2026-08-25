@@ -1347,7 +1347,7 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 }
 
 #[tokio::test]
-async fn declared_driver_admission_failures_back_off_escalate_and_clear_legacy_status() {
+async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_or_human_gate() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     let driver_id = daemon.local_host_id().expect("driver host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
@@ -1377,35 +1377,61 @@ async fn declared_driver_admission_failures_back_off_escalate_and_clear_legacy_s
     let status = ensures.get("quartermaster").await.expect("ensure").status.expect("driver-managed status");
     assert_eq!(status.convoy_ref, None);
     assert_eq!(status.running_since, None);
-    assert_eq!(status.restart_count, 1);
+    assert_eq!(status.restart_count, 0);
     assert!(status.retry_at.is_some());
 
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("backoff suppresses retry").is_empty());
     clock.advance(ChronoDuration::seconds(30));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("second admission refusal").contains("retry at"));
-    clock.advance(ChronoDuration::seconds(60));
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("third refusal escalates"), vec![
-        "ConvoyEnsure/quartermaster exhausted driver admission retry budget"
-    ]);
-    let demand = backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await.expect("admission demand");
-    assert_eq!(demand.spec.originating_work_ref.kind, "ConvoyEnsure");
-    assert!(demand.metadata.annotations[RECLAIM_REFUSAL_REASON_ANNOTATION].contains("missing-workflow"));
-    clock.advance(ChronoDuration::hours(1));
-    assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("active demand holds retries").is_empty());
+    for expected_delay in [120, 120, 120] {
+        clock.advance(ChronoDuration::seconds(expected_delay));
+        assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("admission keeps retrying").contains("retry at"));
+        let status = ensures.get("quartermaster").await.expect("ensure").status.expect("retry status");
+        assert_eq!(status.restart_count, 0);
+        assert_eq!(status.retry_at.expect("deadline") - clock.now(), ChronoDuration::seconds(120));
+    }
+    assert!(matches!(
+        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
+        Err(ResourceError::NotFound { .. })
+    ));
 
-    apply_resource_status_patch(
-        &backend.using::<ResourceDemand>("flotilla"),
-        "ensure-attention-quartermaster",
-        &DemandStatusPatch::Acknowledge { as_of: clock.now(), authority: "operator".to_string() },
-    )
-    .await
-    .expect("acknowledge admission demand");
     let ensure = ensures.get("quartermaster").await.expect("failed ensure");
     let mut recovered_spec = ensure.spec.clone();
     recovered_spec.workflow_ref = "quartermaster".to_string();
     ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &recovered_spec).await.expect("repair admission");
-    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("acknowledged demand resumes admission").len(), 1);
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("workflow dependency change resumes admission").len(), 1);
     assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("recovered convoy").items.len(), 1);
+}
+
+#[tokio::test]
+async fn resolved_default_branch_dependency_change_retries_admission_before_deadline() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let projects = backend.definitions::<Project>("flotilla");
+    let project = projects.get("standing-project").await.expect("project");
+    let mut project_spec = project.spec.clone();
+    project_spec.repositories[0].default_branch = None;
+    projects.apply(&InputMeta::from(&project.metadata), &project_spec).await.expect("require discovered default branch");
+
+    let refusal = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("unresolved default branch refuses admission");
+    assert!(refusal.contains("no resolved default branch"), "{refusal}");
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("retry status");
+    assert_eq!(status.restart_count, 0);
+    assert!(status.retry_at.is_some());
+
+    let repositories = backend.using::<Repository>("flotilla");
+    let repository = repositories.list().await.expect("repositories").items.into_iter().next().expect("repository");
+    repositories
+        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &flotilla_resources::RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("resolve default branch");
+
+    assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("dependency change bypasses deadline"), vec![
+        "started quartermaster@standing-project"
+    ]);
 }
 
 #[tokio::test]
