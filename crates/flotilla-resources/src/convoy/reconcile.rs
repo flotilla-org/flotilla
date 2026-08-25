@@ -739,7 +739,9 @@ fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> crat
         }
         ConvoyEvent::MissingInput { name } => ("WorkflowInputMissing", format!("required workflow input {name} is missing")),
     };
-    crate::ObjectEvent::for_object(obj, reason, message)
+    let mut event = crate::ObjectEvent::for_object(obj, reason, message);
+    event.related_labels.insert(CONVOY_LABEL.to_string(), obj.metadata.name.clone());
+    event
 }
 
 /// Test-support reconcile entry that carries no vessel, presentation, checkout,

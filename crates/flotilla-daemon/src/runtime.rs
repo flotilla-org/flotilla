@@ -4556,10 +4556,23 @@ mod tests {
             }
             .run(),
         );
+        let convoy_controller = tokio::spawn(
+            ControllerLoop {
+                primary: backend.using::<Convoy>(NAMESPACE),
+                secondaries: Vec::new(),
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)),
+                resync_interval: Duration::from_secs(60),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items.is_empty() {
+                let events = backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items;
+                if events.iter().any(|event| event.spec.reason == "CloneFailed")
+                    && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound")
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4586,7 +4599,12 @@ mod tests {
             .recent_events
             .iter()
             .any(|event| { event.reason == "CloneFailed" && event.message.contains("clone name mismatch") }));
+        assert!(explanation
+            .recent_events
+            .iter()
+            .any(|event| { event.reason == "WorkflowTemplateNotFound" && event.message.contains("missing-workflow") }));
         controller.abort();
+        convoy_controller.abort();
     }
 
     #[tokio::test]
