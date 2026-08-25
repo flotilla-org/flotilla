@@ -1384,13 +1384,13 @@ fn spawn_convoy_ensure_reconciler_task(
             let namespace = namespace.clone();
             let runtime_health = runtime_health.clone();
             async move {
-                match state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await {
+                let result = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await;
+                runtime_health.clear_convoy_ensure_timeout();
+                match result {
                     Ok(changes) => {
-                        runtime_health.clear_convoy_ensure_timeout();
                         info!(changes = changes.len(), "standing convoy ensure reconciler alive");
                     }
                     Err(error) => {
-                        runtime_health.clear_convoy_ensure_timeout();
                         warn!(%error, "standing convoy ensure reconciliation pass failed");
                     }
                 }
