@@ -845,6 +845,127 @@ async fn resource_list_and_get_queries_return_wire_json() {
 }
 
 #[tokio::test]
+async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let vessels = backend.clone().using::<flotilla_resources::Vessel>("flotilla");
+    let change_requests = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
+    let workflow = implement_review_workflow_spec();
+    let mut status = flotilla_resources::ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        workflow_snapshot: Some(WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels }),
+        observed_workflow_ref: Some("implement-review@1".to_string()),
+        ..Default::default()
+    };
+    status.work.insert("work".to_string(), WorkState {
+        phase: WorkPhase::Complete,
+        placement: Some(flotilla_resources::PlacementStatus {
+            fields: BTreeMap::from([(
+                "checkout_refs".to_string(),
+                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "checkout-dead".to_string())])),
+            )]),
+        }),
+        ..WorkState::builder().phase(WorkPhase::Complete).build()
+    });
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("terminal-checkout".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("implement-review".to_string())
+                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                    .url("https://github.com/owner/repo".to_string())
+                    .repo_ref(repo_ref.clone())
+                    .source_ref("feature".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("repo".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .change_request(
+                    flotilla_resources::BoundChangeRequest::builder()
+                        .id("42".to_string())
+                        .repository_ref(repo_ref.clone())
+                        .title("terminal".to_string())
+                        .build(),
+                )
+                .build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys.update_status("terminal-checkout", &convoy.metadata.resource_version, &status).await.expect("publish landing status");
+    let vessel = vessels
+        .create(
+            &InputMeta::builder()
+                .name("terminal-checkout-work".to_string())
+                .labels(BTreeMap::from([(flotilla_resources::CONVOY_LABEL.to_string(), "terminal-checkout".to_string())]))
+                .build(),
+            &flotilla_resources::VesselSpec {
+                convoy_ref: "terminal-checkout".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("create live vessel");
+    let observed_at = chrono::Utc::now();
+    let record_name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 42);
+    let record = change_requests
+        .create(
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("owner/repo".to_string())
+                .number(42)
+                .observing_authority("host-test".to_string())
+                .build(),
+        )
+        .await
+        .expect("create change request");
+    change_requests
+        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+            head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+        })
+        .await
+        .expect("publish merged change request");
+
+    let explain = || async {
+        daemon
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryExplainConvoy {
+                        namespace: Some("flotilla".to_string()),
+                        name: "terminal-checkout".to_string(),
+                    },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("explain convoy")
+    };
+    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
+    assert!(!explanation.settlement.satisfied, "a live vessel must retain its missing-checkout expectation");
+    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "missing_record" && unmet.subject == "checkout/checkout-dead"));
+
+    vessels.delete(&vessel.metadata.name).await.expect("tear down vessel");
+    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
+    assert!(explanation.settlement.satisfied, "terminal world evidence should discharge the torn-down vessel's checkout");
+    assert!(explanation.settlement.unmet.is_empty());
+}
+
+#[tokio::test]
 async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

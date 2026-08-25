@@ -246,6 +246,7 @@ struct LandingSettlement {
 /// function so an explanation cannot drift from the condition writer.
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
@@ -254,6 +255,7 @@ pub fn evaluate_landing_settlement(
 ) -> SettlementEvaluation {
     evaluate_landing_settlement_with_disposition(
         convoy,
+        vessels,
         checkouts,
         change_requests,
         change_request_stale_after,
@@ -265,6 +267,7 @@ pub fn evaluate_landing_settlement(
 
 fn evaluate_landing_settlement_with_disposition(
     convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
     change_request_stale_after: std::time::Duration,
@@ -384,6 +387,9 @@ fn evaluate_landing_settlement_with_disposition(
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };
     let bound_repository = convoy.spec.change_request.as_ref().map(|bound| &bound.repository_ref);
     for name in expected {
+        if disposition.is_some() && !checkouts.contains_key(&name) && checkout_expectation_is_discharged(convoy, vessels, &name) {
+            continue;
+        }
         let Some(checkout) = checkouts.get(&name) else {
             unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
             continue;
@@ -428,6 +434,34 @@ fn evaluate_landing_settlement_with_disposition(
         evaluation: SettlementEvaluation { mode: SettlementMode::WorldTerminal, satisfied, unmet },
         disposition: satisfied.then_some(disposition).flatten(),
     }
+}
+
+fn checkout_expectation_is_discharged(
+    convoy: &ResourceObject<Convoy>,
+    vessels: &BTreeMap<String, ResourceObject<Vessel>>,
+    checkout_name: &str,
+) -> bool {
+    if convoy.spec.adopted_checkout_refs.values().any(|name| name == checkout_name) {
+        return false;
+    }
+    let Some(status) = &convoy.status else { return false };
+    let mut owners = Vec::new();
+    for (work_name, work) in &status.work {
+        let Some(checkout_refs) = work.placement.as_ref().and_then(|placement| placement.fields.get("checkout_refs")) else {
+            continue;
+        };
+        let Ok(checkout_refs) = serde_json::from_value::<BTreeMap<crate::RepositoryKey, String>>(checkout_refs.clone()) else {
+            // The caller validates every placement before reaching this helper.
+            return false;
+        };
+        if checkout_refs.values().any(|name| name == checkout_name) {
+            owners.push((work_name, work));
+        }
+    }
+    !owners.is_empty()
+        && owners.into_iter().all(|(work_name, work)| {
+            work.phase == WorkPhase::Complete && !vessels.values().any(|vessel| vessel.spec.vessel_name == *work_name)
+        })
 }
 
 impl Reconciler for ConvoyReconciler {
@@ -490,6 +524,7 @@ impl Reconciler for ConvoyReconciler {
         let exit_disposition = if is_landing {
             evaluate_landing_settlement_with_disposition(
                 obj,
+                &vessels,
                 &checkouts,
                 &change_requests,
                 self.change_request_stale_after,
