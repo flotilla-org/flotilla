@@ -50,7 +50,7 @@ use flotilla_resources::{
     CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
     MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -1605,6 +1605,12 @@ fn spawn_convoy_ensure_reconciler_task(
                 event = dependency_events.next(), if !dependency_events.is_empty() => {
                     if let Some(Err(error)) = event {
                         warn!(%error, "standing convoy admission dependency watch failed");
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while let Some(Some(event)) = dependency_events.next().now_or_never() {
+                        if let Err(error) = event {
+                            warn!(%error, "standing convoy admission dependency watch failed");
+                        }
                     }
                 }
             }

@@ -5162,17 +5162,6 @@ impl InProcessDaemon {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut status = ensure.status.clone().unwrap_or_default();
         let config_hash = ensure_config_hash(&ensure.spec)?;
-        let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
-        let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
-        let dependency_changed = {
-            let mut retries = self.ensure_admission_retries.lock().await;
-            let changed =
-                retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
-            if changed {
-                retries.remove(&retry_key);
-            }
-            changed
-        };
         if status.observed_config_hash.as_deref() != Some(&config_hash) {
             let changed = status.observed_config_hash.is_some();
             self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ObserveConfig {
@@ -5232,6 +5221,18 @@ impl InProcessDaemon {
             }
             return Ok(None);
         }
+
+        let retry_key = (namespace.to_string(), ensure.metadata.name.clone());
+        let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
+        let dependency_changed = {
+            let mut retries = self.ensure_admission_retries.lock().await;
+            let changed =
+                retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash || retry.dependency_hash != dependency_hash);
+            if changed {
+                retries.remove(&retry_key);
+            }
+            changed
+        };
 
         if convoy.is_none() {
             if !force_now && !dependency_changed && status.retry_at.is_some_and(|retry_at| retry_at > now) {
