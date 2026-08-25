@@ -21,6 +21,16 @@ The observed checkout remote must appear in the list. Remotes are normalized
 and must be unique. Forks must not be listed as mirrors: declare them as their
 own Repository with `upstream.relation = "fork"`.
 
+Remove a mistakenly declared secondary remote without deleting the Repository:
+
+```console
+flotilla resource remove-remote <repository-key> https://forgejo.example/wrong/repository
+```
+
+The stable identity remote cannot be removed because it determines the
+Repository key. A wrong stable identity requires selecting the correct
+Repository and re-associating declarations with it.
+
 Refreshing that checkout writes the declaration to its root's Repository
 record. Observation-time identity resolution reads the replica-inclusive
 Repository view, so after resource-store replication the declaration applies

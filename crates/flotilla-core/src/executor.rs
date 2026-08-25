@@ -391,6 +391,7 @@ pub async fn build_plan(
         | CommandAction::ProjectRefresh { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
+        | CommandAction::RepositoryRemoteRemove { .. }
         | CommandAction::Refresh { .. }
         | CommandAction::QueryRepoProviders { .. }
         | CommandAction::QueryHostList {}

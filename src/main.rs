@@ -321,6 +321,8 @@ enum ResourceSubCommand {
     Get(ResourceGetArgs),
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
+    /// Remove a declared transport remote from a Repository
+    RemoveRemote(ResourceRemoveRemoteArgs),
     /// Remove standing multi-authored Host and PlacementPolicy records from non-home roots
     DedupSweep(ResourceDedupSweepArgs),
     /// Watch resources of a kind
@@ -413,6 +415,20 @@ struct ResourceDeleteArgs {
     #[arg(long, value_name = "ORIGIN_ROOT")]
     replica: Option<String>,
     /// Delete the authoritative record on this peer host (including incorrectly authored residue)
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceRemoveRemoteArgs {
+    /// Repository resource name (its stable Repository key)
+    name: String,
+    /// Remote URL to remove
+    remote: String,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the mutation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -1397,6 +1413,20 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                         name: args.name,
                         replica_origin: args.replica.map(flotilla_protocol::NodeId::new),
                     },
+                },
+                format,
+            )
+            .await
+        }
+        ResourceSubCommand::RemoveRemote(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::RepositoryRemoteRemove { namespace: args.namespace, name: args.name, remote: args.remote },
                 },
                 format,
             )

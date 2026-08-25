@@ -324,8 +324,13 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         return Err("project contains duplicate issue source declarations".to_string());
     }
     spec.repositories.sort_by(|left, right| (&left.repo, &left.subpath).cmp(&(&right.repo, &right.subpath)));
-    if spec.repositories.windows(2).any(|pair| pair[0].repo == pair[1].repo && pair[0].subpath == pair[1].subpath) {
-        return Err("project contains a duplicate repository and subpath entry".to_string());
+    if let Some(pair) = spec.repositories.windows(2).find(|pair| pair[0].repo == pair[1].repo && pair[0].subpath == pair[1].subpath) {
+        return Err(format!(
+            "project contains duplicate repository and subpath entries: aliases `{}` and `{}` both resolve to repository {}",
+            pair[0].alias.as_deref().unwrap_or("<none>"),
+            pair[1].alias.as_deref().unwrap_or("<none>"),
+            pair[0].repo
+        ));
     }
     if let Some(policy) = &spec.dispatch_policy {
         if policy.stale_after_seconds == 0 {
@@ -418,5 +423,28 @@ mod tests {
             normalize_project_spec(spec).expect_err("zero threshold must fail"),
             "dispatch policy stale_after_seconds must be at least 1"
         );
+    }
+
+    #[test]
+    fn duplicate_repository_refusal_names_aliases_and_repository_key() {
+        let key = RepositoryKey("repo-key".to_string());
+        let member = |alias: &str| ProjectRepositorySpec {
+            repo: key.clone(),
+            alias: Some(alias.to_string()),
+            roles: BTreeSet::from([ProjectRepositoryRole::Code]),
+            subpath: None,
+            default_branch: None,
+        };
+        let spec = ProjectSpec {
+            display_name: "Widgets".to_string(),
+            default_workflow_ref: "implement".to_string(),
+            issue_sources: Vec::new(),
+            repositories: vec![member("ghostty"), member("ghostty-ops")],
+            dispatch_policy: None,
+        };
+
+        let error = normalize_project_spec(spec).expect_err("duplicate repository must fail");
+        assert!(error.contains("aliases `ghostty` and `ghostty-ops`"), "{error}");
+        assert!(error.contains("repository repo-key"), "{error}");
     }
 }

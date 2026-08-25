@@ -652,6 +652,11 @@ pub enum CommandAction {
     UntrackRepo {
         repo: RepoSelector,
     },
+    RepositoryRemoteRemove {
+        namespace: String,
+        name: String,
+        remote: String,
+    },
     Refresh {
         repo: Option<RepoSelector>,
     },
@@ -815,6 +820,7 @@ impl Command {
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
+            CommandAction::RepositoryRemoteRemove { .. } => "Removing repository remote...",
             CommandAction::Refresh { .. } => "Refreshing...",
             CommandAction::QueryIssues { .. } => "query issues",
             CommandAction::QueryIssueFetchByIds { .. } => "query issue fetch by ids",
