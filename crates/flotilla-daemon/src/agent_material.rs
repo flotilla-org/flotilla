@@ -774,6 +774,45 @@ mod tests {
         .expect("write single-source manifest");
         let inspection = inspect_skill_sources(&skills).expect("single source must validate");
         assert_eq!(inspection.sources.len(), 1);
+
+        std::fs::write(
+            &manifest_path,
+            r#"{"schema_version":3,"sources":[{"name":"one","repository":"https://example.com/one.git","revision":"1111111111111111111111111111111111111111"},{"name":"two","repository":"https://example.com/two.git","revision":"2222222222222222222222222222222222222222"},{"name":"three","repository":"https://example.com/three.git","revision":"3333333333333333333333333333333333333333"}]}"#,
+        )
+        .expect("write three-source manifest");
+        let inspection = inspect_skill_sources(&skills).expect("three sources must validate");
+        assert_eq!(inspection.sources.len(), 3);
+    }
+
+    #[test]
+    fn skill_manifest_rejects_unpinned_revisions() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
+        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
+
+        for unpinned in ["main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
+            std::fs::write(&manifest_path, manifest.replace("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", unpinned))
+                .expect("write unpinned fixture manifest");
+            let error = inspect_skill_sources(&skills).expect_err("a revision that is not a full SHA must fail validation");
+            assert!(error.contains("full commit SHA"), "unexpected validation error for {unpinned}: {error}");
+        }
+    }
+
+    #[test]
+    fn skill_manifest_rejects_a_superseded_schema_version() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
+        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
+        std::fs::write(&manifest_path, manifest.replace(r#""schema_version":3"#, r#""schema_version":2"#))
+            .expect("write superseded-schema fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("schema version 2 must fail validation");
+        assert!(error.contains("schema version 3"), "unexpected validation error: {error}");
+
+        std::fs::write(&manifest_path, r#"{"schema_version":3,"sources":[]}"#).expect("write empty-source fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("empty source set must fail validation");
+        assert!(error.contains("at least one source"), "unexpected validation error: {error}");
     }
 
     #[tokio::test]
