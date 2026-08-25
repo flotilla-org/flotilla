@@ -29,7 +29,12 @@ ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        clang \
+        libc6-dev \
         libssl-dev \
+        linux-libc-dev \
+        lld \
+        make \
         pkg-config \
         xz-utils \
     && rm -rf /var/lib/apt/lists/* \
@@ -66,8 +71,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         jq \
         less \
         openssh-client \
+        procps \
         python3 \
         ripgrep \
+        strace \
         unzip \
         zsh \
     && rm -rf /var/lib/apt/lists/*
@@ -94,7 +101,16 @@ ENV SHELL=/bin/zsh
 # promise that both entry points are executable in the image.
 RUN claude --version \
     && codex --version \
-    && python3 --version
+    && python3 --version \
+    && strace --version \
+    && clang --version \
+    && ld.lld --version \
+    && make --version \
+    && pkg-config --version \
+    && printf '#include <stdio.h>\nint main(void) { puts("c toolchain ready"); }\n' \
+        | clang -fuse-ld=lld -x c - -o /tmp/c-toolchain-smoke \
+    && /tmp/c-toolchain-smoke \
+    && rm /tmp/c-toolchain-smoke
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

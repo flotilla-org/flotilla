@@ -3,7 +3,7 @@
 Contained vessels use the curated image at:
 
 ```text
-forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
+forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
 ```
 
 The explicit release tag is the deployment contract. Do not point placement
@@ -86,8 +86,8 @@ The Dockerfile is deliberately ordered from slowest-changing to
 fastest-changing:
 
 1. Ubuntu, certificates, Git, and curl;
-2. Rust stable, the repository's pinned `nightly-2026-03-12`, and Node.js;
-3. `gh` and general development utilities;
+2. C, Rust stable, the repository's pinned `nightly-2026-03-12`, and Node.js;
+3. `gh` and general development and diagnostic utilities;
 4. the cleat terminal runtime;
 5. Claude Code and Codex.
 
@@ -95,7 +95,7 @@ From the repository root, a builder with amd64 and arm64 workers can publish
 the release with:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file .flotilla/Dockerfile.crew \
@@ -119,11 +119,28 @@ Pull the published image rather than relying on the local build cache, then
 run both adapter entry points:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
 docker pull "$IMAGE"
 docker run --rm "$IMAGE" claude --version
 docker run --rm "$IMAGE" codex --version
 docker run --rm "$IMAGE" python3 --version
+docker run --rm "$IMAGE" strace --version
+docker run --rm "$IMAGE" clang --version
+docker run --rm "$IMAGE" ld.lld --version
+docker run --rm "$IMAGE" make --version
+docker run --rm "$IMAGE" pkg-config --version
+```
+
+The build-time smoke check also compiles and links a small C program with
+Clang and LLD, exercising the common C and Linux headers. To verify the
+wheelhouse cargo contract against a checkout of `ui-scratch`, mount that
+checkout as the workspace and run its debug build:
+
+```bash
+docker run --rm \
+  --volume "$UI_SCRATCH:/workspace" \
+  "$IMAGE" \
+  ./build.sh debug
 ```
 
 Cargo's installed toolchain remains on the read-only image layer, while its
