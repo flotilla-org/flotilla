@@ -1374,13 +1374,20 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
 
     let first = daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("first admission refusal");
     assert!(first.contains("retry at"), "{first}");
-    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("driver-managed status");
+    let retrying_ensure = ensures.get("quartermaster").await.expect("ensure");
+    let retry_resource_version = retrying_ensure.metadata.resource_version.clone();
+    let status = retrying_ensure.status.expect("driver-managed status");
     assert_eq!(status.convoy_ref, None);
     assert_eq!(status.running_since, None);
     assert_eq!(status.restart_count, 0);
     assert!(status.retry_at.is_some());
 
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("backoff suppresses retry").is_empty());
+    assert_eq!(
+        ensures.get("quartermaster").await.expect("unchanged ensure").metadata.resource_version,
+        retry_resource_version,
+        "a driver retry deadline must not cause a no-op legacy-status write"
+    );
     clock.advance(ChronoDuration::seconds(30));
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect_err("second admission refusal").contains("retry at"));
     for expected_delay in [120, 120, 120] {

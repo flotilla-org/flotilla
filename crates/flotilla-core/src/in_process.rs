@@ -4769,13 +4769,7 @@ impl InProcessDaemon {
             if let Some(driver_ref) = &ensure.spec.driver_ref {
                 if self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await.is_ok()
                     && ensure.status.as_ref().is_some_and(|status| {
-                        status.convoy_ref.is_some()
-                            || status.running_since.is_some()
-                            || status.retry_at.is_some()
-                            || status.last_failure.is_some()
-                            || status.hold_reason.is_some()
-                            || status.observed_config_hash.is_some()
-                            || status.restart_count > 0
+                        status.convoy_ref.is_some() || status.running_since.is_some() || status.observed_config_hash.is_some()
                     })
                 {
                     if let Err(error) =
