@@ -121,7 +121,18 @@ from pathlib import Path
 
 bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
+    "required_skills": [
+        "wayfinder",
+        "grilling",
+        "domain-modeling",
+        "to-issues",
+        "research",
+        "triage-issues",
+        "lab-hub",
+        "cleat-sessions",
+        "pr-shepherd",
+    ],
     "sources": [
         {
             "name": "mattpocock-skills",

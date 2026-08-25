@@ -3592,7 +3592,7 @@ mod tests {
         fs::create_dir_all(&skills).expect("create skill source manifest directory");
         fs::write(
             skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":1,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            r#"{"schema_version":2,"required_skills":["wayfinder","pr-shepherd"],"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
         )
         .expect("write skill source manifest");
         skills

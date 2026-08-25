@@ -58,8 +58,34 @@ pub(crate) enum AgentMaterialOutcome {
 #[async_trait]
 trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn pool_ref(&self) -> &'static str;
+    fn pool_ref(&self) -> Option<&'static str>;
     fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment>;
+    fn config_home_variable(&self) -> &'static str;
+    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool;
+    fn externally_managed_home_opts_out_of_skills(&self) -> bool;
+
+    fn skill_destination(&self, environment: &[(String, String)], config_base: &Path) -> Result<Option<PathBuf>, String> {
+        let variable = self.config_home_variable();
+        let Some(config_home) = environment.iter().find(|(name, _)| name == variable).map(|(_, value)| PathBuf::from(value)) else {
+            return if self.externally_managed_home_opts_out_of_skills() {
+                Ok(None)
+            } else {
+                Err(format!("contained {} skill staging requires seam-resolved `{variable}`", self.id()))
+            };
+        };
+        if !self.is_managed_config_home(&config_home, config_base) {
+            return if self.externally_managed_home_opts_out_of_skills() {
+                Ok(None)
+            } else {
+                Err(format!("contained {} skill target {} is outside {}", self.id(), config_home.display(), config_base.display()))
+            };
+        }
+        Ok(Some(config_home.join("skills")))
+    }
+
+    fn requires_skills_for_prepare(&self, environment: &BTreeMap<String, String>) -> bool {
+        !self.externally_managed_home_opts_out_of_skills() || !environment.contains_key(self.config_home_variable())
+    }
 
     async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String>;
 }
@@ -82,7 +108,13 @@ impl AgentMaterialRegistry {
         let skills = SkillBundle::new(env.get(FLOTILLA_SKILLS_DIR_ENV).map(PathBuf::from));
         let codex: Arc<dyn AgentMaterialAdapter> =
             Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, cfg!(any(target_os = "linux", test))));
-        Self { namespace: namespace.to_string(), pools, adapters: BTreeMap::from([(codex.id(), codex)]), skills }
+        let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
+        Self {
+            namespace: namespace.to_string(),
+            pools,
+            adapters: BTreeMap::from([(codex.id(), codex), (claude_code.id(), claude_code)]),
+            skills,
+        }
     }
 
     pub(crate) async fn prepare(
@@ -106,7 +138,11 @@ impl AgentMaterialRegistry {
                 Err(message) => return Err(AgentMaterialPrepareError::Failed(message)),
             }
         }
-        if SkillBundle::is_required_for_prepare(required_adapters, environment) {
+        if required_adapters
+            .iter()
+            .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
+            .any(|adapter| adapter.requires_skills_for_prepare(environment))
+        {
             let delivery = self.skills.prepare().await.map_err(AgentMaterialPrepareError::Failed)?;
             deliveries.push(delivery);
         }
@@ -120,7 +156,8 @@ impl AgentMaterialRegistry {
         environment: &[(String, String)],
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
-        self.skills.stage(environment_ref, required_adapters, environment, runner).await
+        let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
+        self.skills.stage(environment_ref, &adapters, environment, runner).await
     }
 
     pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
@@ -137,7 +174,7 @@ impl AgentMaterialRegistry {
 
     pub(crate) async fn recover(&self, active_environment_refs: impl IntoIterator<Item = String>) -> Result<(), String> {
         let active = active_environment_refs.into_iter().map(|name| self.holder_ref(&name)).collect::<HashSet<_>>();
-        let pool_refs = self.adapters.values().map(|adapter| adapter.pool_ref().to_string()).collect::<BTreeSet<_>>();
+        let pool_refs = self.adapters.values().filter_map(|adapter| adapter.pool_ref().map(str::to_string)).collect::<BTreeSet<_>>();
         self.pools.recover(&pool_refs, &active).await
     }
 
@@ -205,6 +242,7 @@ impl CodexMaterialAdapter {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct SkillBundleManifest {
     schema_version: u32,
+    required_skills: Vec<String>,
     sources: Vec<SkillSource>,
 }
 
@@ -223,15 +261,6 @@ struct SkillBundle {
 impl SkillBundle {
     fn new(source: Option<PathBuf>) -> Self {
         Self { source }
-    }
-
-    fn is_required(required_adapters: &BTreeSet<String>) -> bool {
-        required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) || required_adapters.contains(CODEX_ADAPTER_ID)
-    }
-
-    fn is_required_for_prepare(required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> bool {
-        required_adapters.contains(CLAUDE_CODE_ADAPTER_ID)
-            || (required_adapters.contains(CODEX_ADAPTER_ID) && !environment.contains_key("CODEX_HOME"))
     }
 
     async fn prepare(&self) -> Result<AgentMaterialDelivery, String> {
@@ -266,21 +295,26 @@ impl SkillBundle {
     async fn stage(
         &self,
         environment_ref: &str,
-        required_adapters: &BTreeSet<String>,
+        adapters: &[&Arc<dyn AgentMaterialAdapter>],
         environment: &[(String, String)],
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
-        if !Self::is_required(required_adapters) {
-            return Ok(());
-        }
-        if !required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) && !environment.iter().any(|(name, _)| name == "CODEX_HOME") {
+        if adapters.is_empty() {
             return Ok(());
         }
         let config_base = runner
             .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
             .await
             .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
-        let (adapter, destination) = skill_target(required_adapters, environment, &config_base)?;
+        let mut destinations = Vec::new();
+        for adapter in adapters {
+            if let Some(destination) = adapter.skill_destination(environment, &config_base)? {
+                destinations.push((adapter.id(), destination));
+            }
+        }
+        if destinations.is_empty() {
+            return Ok(());
+        }
         let git_config = environment
             .iter()
             .find(|(name, _)| name == "GIT_CONFIG_GLOBAL")
@@ -304,37 +338,38 @@ impl SkillBundle {
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
         let mut args = vec![
             "-c".to_string(),
-            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nshift 5\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  shift 3\n  checkout=\"$sources/$name\"\n  git -C \"$sources\" init \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" fetch --depth=1 origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --detach FETCH_HEAD >/dev/null\n  find \"$checkout\" -type f -name SKILL.md >\"$sources/skill-files\"\n  while IFS= read -r skill_file; do\n    skill_dir=${skill_file%/SKILL.md}\n    skill_name=${skill_dir##*/}\n    target=\"$staged/$skill_name\"\n    if [ -e \"$target\" ]; then\n      echo \"duplicate skill name $skill_name from $repository\" >&2\n      exit 1\n    fi\n    mkdir -p \"$target\"\n    cp -R \"$skill_dir\"/. \"$target\"/\n  done <\"$sources/skill-files\"\ndone\nfor required in wayfinder grilling domain-modeling to-issues research triage-issues lab-hub cleat-sessions pr-shepherd; do\n  test -f \"$staged/$required/SKILL.md\" || { echo \"pinned skill sources are missing required skill $required\" >&2; exit 1; }\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
+            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nrequired_count=$6\nshift 6\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nrequired_file=\"$sources/required-skills\"\n: >\"$required_file\"\nwhile [ \"$required_count\" -gt 0 ]; do\n  printf '%s\\n' \"$1\" >>\"$required_file\"\n  shift\n  required_count=$((required_count - 1))\ndone\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  shift 3\n  checkout=\"$sources/$name\"\n  git -C \"$sources\" init \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" fetch --depth=1 origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --detach FETCH_HEAD >/dev/null\n  find \"$checkout\" -type f -name SKILL.md >\"$sources/skill-files\"\n  while IFS= read -r skill_file; do\n    skill_dir=${skill_file%/SKILL.md}\n    skill_name=${skill_dir##*/}\n    target=\"$staged/$skill_name\"\n    if [ -e \"$target\" ]; then\n      echo \"duplicate skill name $skill_name from $repository\" >&2\n      exit 1\n    fi\n    mkdir -p \"$target\"\n    cp -R \"$skill_dir\"/. \"$target\"/\n  done <\"$sources/skill-files\"\ndone\nwhile IFS= read -r required; do\n  test -f \"$staged/$required/SKILL.md\" || { echo \"pinned skill sources are missing required skill $required\" >&2; exit 1; }\ndone <\"$required_file\"\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
             "flotilla-stage-skills".to_string(),
             git_config.clone(),
             token_mode.to_string(),
             github_token_file.cloned().unwrap_or_default(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
-            destination.to_string_lossy().into_owned(),
+            String::new(),
+            inspection.required_skills.len().to_string(),
         ];
+        args.extend(inspection.required_skills.iter().cloned());
         for source in &inspection.sources {
             args.extend([source.name.clone(), source.repository.clone(), source.revision.clone()]);
         }
-        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let result = match github_token {
-            Some(token) if github_token_file.is_none() => {
-                runner.run_with_input("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default, token.as_bytes()).await
-            }
-            _ => runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await,
-        };
-        result.map_err(|error| format!("stage generation-pinned skills for {environment_ref}: {error}"))?;
-        info!(
-            environment = environment_ref,
-            adapter,
-            sources = ?inspection.sources,
-            "staged generation-pinned contained agent skills"
-        );
+        for (adapter, destination) in destinations {
+            args[7] = destination.to_string_lossy().into_owned();
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let result = match github_token {
+                Some(token) if github_token_file.is_none() => {
+                    runner.run_with_input("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default, token.as_bytes()).await
+                }
+                _ => runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await,
+            };
+            result.map_err(|error| format!("stage generation-pinned skills for {environment_ref}: {error}"))?;
+            info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillBundleInspection {
+    required_skills: Vec<String>,
     sources: Vec<SkillSource>,
 }
 
@@ -349,37 +384,27 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
         (PUBLIC_SKILL_REPOSITORY, "https://github.com/rjwittams/rjw-skills.git"),
     ]);
     let actual = manifest.sources.iter().map(|source| (source.name.as_str(), source.repository.as_str())).collect::<BTreeMap<_, _>>();
-    if manifest.schema_version != 1 || actual != expected || manifest.sources.len() != expected.len() {
+    if manifest.schema_version != 2 || actual != expected || manifest.sources.len() != expected.len() {
         return Err(format!("skill source manifest {} must name exactly the supported repositories", manifest_path.display()));
     }
     if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
         return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
     }
-    Ok(SkillBundleInspection { sources: manifest.sources })
-}
-
-fn skill_target(
-    required_adapters: &BTreeSet<String>,
-    environment: &[(String, String)],
-    config_base: &Path,
-) -> Result<(&'static str, PathBuf), String> {
-    let (adapter, variable) = if required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) {
-        (CLAUDE_CODE_ADAPTER_ID, "CLAUDE_CONFIG_DIR")
-    } else {
-        (CODEX_ADAPTER_ID, "CODEX_HOME")
-    };
-    let config_dir = environment
-        .iter()
-        .find(|(name, _)| name == variable)
-        .map(|(_, value)| PathBuf::from(value))
-        .ok_or_else(|| format!("contained {adapter} skill staging requires seam-resolved `{variable}`"))?;
-    if adapter == CODEX_ADAPTER_ID && config_dir != Path::new(CONTAINER_CODEX_HOME) {
-        return Err(format!("contained Codex skill staging requires Flotilla-managed `CODEX_HOME` {CONTAINER_CODEX_HOME}"));
+    let required = manifest.required_skills.iter().collect::<BTreeSet<_>>();
+    if manifest.required_skills.is_empty()
+        || required.len() != manifest.required_skills.len()
+        || manifest.required_skills.iter().any(|name| {
+            name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+                || name.chars().any(|character| matches!(character, '\r' | '\n'))
+        })
+    {
+        return Err(format!("skill source manifest {} has invalid required skills", manifest_path.display()));
     }
-    if adapter == CLAUDE_CODE_ADAPTER_ID && !config_dir.starts_with(config_base) {
-        return Err(format!("contained {adapter} skill target {} is outside {}", config_dir.display(), config_base.display()));
-    }
-    Ok((adapter, config_dir.join("skills")))
+    Ok(SkillBundleInspection { required_skills: manifest.required_skills, sources: manifest.sources })
 }
 
 #[async_trait]
@@ -388,13 +413,25 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         CODEX_ADAPTER_ID
     }
 
-    fn pool_ref(&self) -> &'static str {
-        CODEX_POOL_REF
+    fn pool_ref(&self) -> Option<&'static str> {
+        Some(CODEX_POOL_REF)
     }
 
     fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment> {
         (!environment.contains_key("CODEX_HOME"))
             .then(|| agent_environment_fragment("CODEX_HOME", CONTAINER_CODEX_HOME, format!("agent-material/codex {CODEX_POOL_REF}")))
+    }
+
+    fn config_home_variable(&self) -> &'static str {
+        "CODEX_HOME"
+    }
+
+    fn is_managed_config_home(&self, config_home: &Path, _config_base: &Path) -> bool {
+        config_home == Path::new(CONTAINER_CODEX_HOME)
+    }
+
+    fn externally_managed_home_opts_out_of_skills(&self) -> bool {
+        true
     }
 
     async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
@@ -424,6 +461,39 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
                 ),
             }),
         }
+    }
+}
+
+struct ClaudeCodeMaterialAdapter;
+
+#[async_trait]
+impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
+    fn id(&self) -> &'static str {
+        CLAUDE_CODE_ADAPTER_ID
+    }
+
+    fn pool_ref(&self) -> Option<&'static str> {
+        None
+    }
+
+    fn fragment(&self, _environment: &BTreeMap<String, String>) -> Option<Fragment> {
+        None
+    }
+
+    fn config_home_variable(&self) -> &'static str {
+        "CLAUDE_CONFIG_DIR"
+    }
+
+    fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
+        config_home.starts_with(config_base)
+    }
+
+    fn externally_managed_home_opts_out_of_skills(&self) -> bool {
+        false
+    }
+
+    async fn prepare(&self, _holder_ref: &ResourceRef, _environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
+        Ok(AgentMaterialOutcome::NotRequired)
     }
 }
 
@@ -501,7 +571,7 @@ mod tests {
         std::fs::create_dir_all(&skills).expect("create skill bundle");
         std::fs::write(
             skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":1,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            r#"{"schema_version":2,"required_skills":["wayfinder","pr-shepherd"],"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
         )
         .expect("write skill bundle manifest");
         skills
@@ -584,6 +654,9 @@ mod tests {
         assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
         assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
+        assert!(calls[0].1.contains(&"wayfinder".to_string()));
+        assert!(calls[0].1.contains(&"pr-shepherd".to_string()));
+        assert!(!calls[0].1[1].contains("wayfinder"), "required skill policy must come from the manifest");
     }
 
     #[tokio::test]
@@ -609,11 +682,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_skills_are_staged_to_every_required_adapter_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
+        let claude_skills = "/tmp/flotilla-config/credentials/claude-max/claude/skills";
+        let codex_skills = format!("{CONTAINER_CODEX_HOME}/skills");
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/tmp/flotilla-config/credentials/claude-max/claude".to_string()),
+            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-mixed", &required, &environment, &runner).await.expect("stage pinned skills for both adapters");
+
+        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        assert_eq!(calls.len(), 2);
+        let destinations =
+            calls.iter().map(|(_, args)| args.get(7).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(destinations, BTreeSet::from([claude_skills, codex_skills.as_str()]));
+    }
+
+    #[tokio::test]
     async fn externally_managed_codex_home_skips_skill_staging() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
         let environment = vec![
+            ("CODEX_HOME".to_string(), "/image/codex".to_string()),
             ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
             ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
         ];
@@ -651,6 +749,20 @@ mod tests {
         assert!(logs.contains("staged generation-pinned contained agent skills"), "missing provisioning event: {logs}");
         assert!(logs.contains("crew-alice"), "provisioning event must identify its holder: {logs}");
         assert!(logs.contains("1111111111111111111111111111111111111111"), "provisioning event must report source pins: {logs}");
+    }
+
+    #[test]
+    fn skill_manifest_rejects_invalid_required_skills() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
+        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
+        std::fs::write(&manifest_path, manifest.replace(r#"["wayfinder","pr-shepherd"]"#, r#"["wayfinder","wayfinder"]"#))
+            .expect("write invalid fixture manifest");
+
+        let error = inspect_skill_sources(&skills).expect_err("duplicate required skill must fail validation");
+
+        assert!(error.contains("invalid required skills"), "unexpected validation error: {error}");
     }
 
     #[tokio::test]
