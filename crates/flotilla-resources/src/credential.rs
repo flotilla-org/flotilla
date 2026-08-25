@@ -29,7 +29,10 @@ pub struct CredentialSpecSpec {
 pub enum CredentialConsumer {
     Gh,
     GithubApp {
-        installation_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation_repository: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permissions: Option<BTreeMap<String, String>>,
     },
