@@ -4,6 +4,32 @@
 # version arguments belong immediately before the final layer so an adapter
 # update can reuse the much larger language-toolchain layers.
 
+# Builder stage: prepare the Ghostty install prefix cleat's ghostty-vt feature
+# needs. Zig and the ghostty source stay in this stage; only the installed
+# prefix reaches the final image (consumed via CLEAT_GHOSTTY_PREFIX).
+FROM ubuntu:24.04 AS ghostty-builder
+ARG TARGETARCH
+ARG ZIG_VERSION=0.15.2
+ARG CLEAT_REF=2694b71c593868af3b289a04ed6e468979c236bc
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "${TARGETARCH}" in \
+        amd64) zig_arch=x86_64 ;; \
+        arm64) zig_arch=aarch64 ;; \
+        *) echo "unsupported Zig architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" \
+    | tar -xJ -C /opt \
+    && ln -s "/opt/${zig_dir}/zig" /usr/local/bin/zig \
+    && test "$(zig version)" = "${ZIG_VERSION}"
+RUN git clone --filter=blob:none --no-checkout https://github.com/flotilla-org/cleat.git /src/cleat \
+    && cd /src/cleat \
+    && git fetch --depth 1 origin "${CLEAT_REF}" \
+    && git checkout --detach FETCH_HEAD \
+    && ./tools/prepare-ghostty-vt.sh
+
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -29,7 +55,28 @@ ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        clang \
+        libc6-dev \
+        libegl-dev \
+        libfontconfig-dev \
+        libfreetype-dev \
+        libgl-dev \
         libssl-dev \
+        libx11-dev \
+        libxcb1-dev \
+        libxcursor-dev \
+        libxext-dev \
+        libxfixes-dev \
+        libxi-dev \
+        libxinerama-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxrandr-dev \
+        libxrender-dev \
+        libxss-dev \
+        linux-libc-dev \
+        lld \
+        make \
         pkg-config \
         xz-utils \
     && rm -rf /var/lib/apt/lists/* \
@@ -66,8 +113,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         jq \
         less \
         openssh-client \
+        procps \
         python3 \
         ripgrep \
+        strace \
         unzip \
         zsh \
     && rm -rf /var/lib/apt/lists/*
@@ -87,14 +136,30 @@ RUN npm install --global \
         "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force
 
+COPY --from=ghostty-builder /src/cleat/.tools/ghostty-install /opt/ghostty-install
+ENV CLEAT_GHOSTTY_PREFIX=/opt/ghostty-install
+
 ENV DISABLE_AUTOUPDATER=1
 ENV SHELL=/bin/zsh
+
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
 
 # Build-time smoke check: declaring these adapters in a PlacementPolicy is a
 # promise that both entry points are executable in the image.
 RUN claude --version \
     && codex --version \
-    && python3 --version
+    && python3 --version \
+    && uv --version \
+    && strace --version \
+    && clang --version \
+    && ld.lld --version \
+    && make --version \
+    && pkg-config --version \
+    && printf '#include <stdio.h>\nint main(void) { puts("c toolchain ready"); }\n' \
+        | clang -fuse-ld=lld -x c - -o /tmp/c-toolchain-smoke \
+    && /tmp/c-toolchain-smoke \
+    && rm /tmp/c-toolchain-smoke
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
