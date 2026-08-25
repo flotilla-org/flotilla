@@ -205,7 +205,7 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 }
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
-    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None, decision_ledger_ref: None }
+    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None, decision_ledger_ref: None, claim_evidence: None }
 }
 
 fn pending_brief() -> PendingBrief {
