@@ -167,13 +167,21 @@ while dev mode is enabled.
 
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
-the read-only generation. The same generation carries both exact skill source
-revisions and the validated required-skill list in the version-2
-`share/flotilla/skills/.flotilla-sources.json` manifest. It configures
-`flotillad` to fetch those commits with the contained crew's scoped GitHub
-credential. The daemon flattens every discovered skill into each adapter's
-seam-resolved config home, verifies every manifest-required skill is present,
-and copies the source manifest alongside it as provenance.
+the read-only generation. The same generation carries the exact skill source
+revisions in the version-3 `share/flotilla/skills/.flotilla-sources.json`
+manifest, whose source set is data: any number of named sources, each pinned to
+a full commit SHA and each matching the pin the generation was promoted with.
+The one exception is the source named `mattpocock-skills`, which must point at
+`https://github.com/flotilla-org/mattpocock-skills.git`, because the daemon
+scopes its GitHub App token to that name and would otherwise fetch with it from
+whatever URL the manifest gave; per-source credentials
+(flotilla-org/flotilla#1796) replace that pairing with explicit data. It
+configures `flotillad` to fetch those commits with the contained crew's scoped
+GitHub credential. The daemon flattens every discovered skill into each
+adapter's seam-resolved config home and copies the source manifest alongside it
+as provenance. It deliberately asserts nothing about which skill *names* the
+result contains: that is a per-crew demand declaration
+(flotilla-org/flotilla#1790), not a universal list baked into a generation.
 Linux requires the exact unsigned candidate selected
 by the trusted promoter. Darwin additionally requires the completed central
 derivative, fixed Apple team `973L4GV58R`, matching source/signing metadata,

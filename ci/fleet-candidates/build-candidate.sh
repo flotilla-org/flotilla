@@ -120,19 +120,11 @@ import os
 from pathlib import Path
 
 bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
+# Supply side only: the manifest pins sources. Per-crew skill requirements are
+# demand declarations (flotilla-org/flotilla#1790), never a list baked into a
+# generation.
 manifest = {
-    "schema_version": 2,
-    "required_skills": [
-        "wayfinder",
-        "grilling",
-        "domain-modeling",
-        "to-issues",
-        "research",
-        "triage-issues",
-        "lab-hub",
-        "cleat-sessions",
-        "pr-shepherd",
-    ],
+    "schema_version": 3,
     "sources": [
         {
             "name": "mattpocock-skills",
