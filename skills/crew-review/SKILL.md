@@ -5,6 +5,10 @@ description: Conduct review rounds on a shared vessel filesystem and assemble cl
 
 # Crew review
 
+> Vessel delivery of this skill is pending the skill-sources ruling. Keeping it
+> in this repository defines and tests the protocol, but does not by itself make
+> the skill available inside provisioned vessels.
+
 Use this skill when a coder and reviewer need to record review evidence without
 depending on a pull-request surface. The reviewable unit is always the claim's
 complete `base..head` ref pair. Looking at individual patches is only a review
@@ -80,20 +84,18 @@ separate reviewer is used, transfer the directory without rewriting its files.
 
 ## Project review-prep instructions
 
-The aggregator reads `CLAUDE.md` and `AGENTS.md` from the project root. Either
-may contain a JSON code block tagged `flotilla-review-prep`:
+Projects may declare additional required evidence in
+`.flotilla/review-prep.json`:
 
-````markdown
-```flotilla-review-prep
-{"required_artifacts": ["docs/review/architecture.html", "screenshots/result.png"]}
+```json
+{"required_artifacts": ["docs/review/architecture.txt", "screenshots/result.png"]}
 ```
-````
 
 Paths are project-relative regular files. They are copied under
 `project-artifacts/` in the bundle and listed in `index.json`. This makes an
-instruction such as “involved changes require an HTML explainer” enforceable:
-the named explainer must exist or aggregation fails. Duplicate directives and
-paths outside the project are refused.
+instruction such as “involved changes require architecture notes” enforceable:
+the named evidence must exist or aggregation fails. Duplicate artifact entries
+and paths outside the project are refused.
 
 ## Assemble the bundle
 
@@ -108,6 +110,9 @@ uv run --no-project scripts/assemble_review_bundle.py \
 ```
 
 Python 3 may be used directly when `uv` is unavailable. The output contains
-`index.json`, the slice-1 machine contract, and `review.html`, a standalone page
-with the full diff summary and findings/responses record. Aggregation replaces
-an existing output directory only after all input has validated.
+`index.json`, the slice-1 machine contract, plus unrendered `diff-stat.txt`,
+`review.patch`, and the original findings, responses, and checks beneath
+`rounds/`. Any configured project artifacts sit beside those raw materials.
+Human-facing rendering is deliberately out of scope pending interactive design.
+Aggregation replaces an existing output directory only after all input has
+validated.

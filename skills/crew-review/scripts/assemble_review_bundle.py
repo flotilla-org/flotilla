@@ -4,11 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -50,43 +48,32 @@ def git(project: Path, *arguments: str) -> str:
 
 
 def prep_artifacts(project: Path) -> list[Path]:
-    block = re.compile(r"```flotilla-review-prep\s*\n(.*?)\n```", re.DOTALL)
-    directives = []
-    for name in ("CLAUDE.md", "AGENTS.md"):
-        document = project / name
-        if not document.is_file():
-            continue
-        matches = block.findall(document.read_text(encoding="utf-8"))
-        if len(matches) > 1:
-            raise BundleError(f"{name} contains more than one flotilla-review-prep block")
-        if matches:
-            try:
-                directive = json.loads(matches[0])
-            except json.JSONDecodeError as error:
-                raise BundleError(f"decode review-prep block in {name}: {error}") from error
-            if not isinstance(directive, dict) or set(directive) != {"required_artifacts"}:
-                raise BundleError(f"review-prep block in {name} must contain only required_artifacts")
-            directives.append((name, directive["required_artifacts"]))
+    config = project / ".flotilla/review-prep.json"
+    if not config.exists():
+        return []
+    directive = read_json(config)
+    if not isinstance(directive, dict) or set(directive) != {"required_artifacts"}:
+        raise BundleError(f"{config} must contain only required_artifacts")
+    values = directive["required_artifacts"]
+    if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+        raise BundleError(f"required_artifacts in {config} must be an array of non-empty paths")
 
     paths: list[Path] = []
     seen: set[Path] = set()
     root = project.resolve()
-    for source, values in directives:
-        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
-            raise BundleError(f"required_artifacts in {source} must be an array of non-empty paths")
-        for value in values:
-            relative = Path(value)
-            candidate = (root / relative).resolve()
-            try:
-                candidate.relative_to(root)
-            except ValueError as error:
-                raise BundleError(f"required artifact escapes project root: {value}") from error
-            if relative.is_absolute() or not candidate.is_file():
-                raise BundleError(f"required artifact is not a project file: {value}")
-            if candidate in seen:
-                raise BundleError(f"required artifact is declared more than once: {value}")
-            seen.add(candidate)
-            paths.append(candidate)
+    for value in values:
+        relative = Path(value)
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as error:
+            raise BundleError(f"required artifact escapes project root: {value}") from error
+        if relative.is_absolute() or not candidate.is_file():
+            raise BundleError(f"required artifact is not a project file: {value}")
+        if candidate in seen:
+            raise BundleError(f"required artifact is declared more than once: {value}")
+        seen.add(candidate)
+        paths.append(candidate)
     return paths
 
 
@@ -162,32 +149,6 @@ def load_rounds(rounds_root: Path) -> tuple[list[dict], list[dict]]:
     return rounds, checks
 
 
-def render_page(refs: dict, digest: str, stat: str, patch: str, rounds: list[dict], checks: list[dict]) -> str:
-    finding_rows = []
-    for round_record in rounds:
-        for finding in round_record["findings"]:
-            resolution = finding["resolution"]
-            response = resolution.get("fix_reference", resolution.get("rationale", ""))
-            finding_rows.append(
-                "<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                    round_record["number"], html.escape(finding["id"]), html.escape(finding["summary"]),
-                    html.escape(resolution["state"]), html.escape(response)
-                )
-            )
-    check_rows = [
-        f"<tr><td><code>{html.escape(check['name'])}</code></td><td>{html.escape(check['outcome'])}</td></tr>"
-        for check in checks
-    ]
-    return f"""<!doctype html>
-<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">
-<title>Review {html.escape(refs['base'])}..{html.escape(refs['head'])}</title>
-<style>body{{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}}code,pre{{font-family:ui-monospace,monospace}}pre{{white-space:pre-wrap;background:#f5f5f5;padding:1rem;overflow:auto}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #bbb;padding:.5rem;text-align:left;vertical-align:top}}</style></head>
-<body><h1>Claim review</h1><p><code>{html.escape(refs['base'])}..{html.escape(refs['head'])}</code> at <code>{html.escape(digest)}</code></p>
-<h2>Diff summary</h2><pre>{html.escape(stat or '(no changed files)')}</pre><details><summary>Full diff</summary><pre>{html.escape(patch or '(empty diff)')}</pre></details>
-<h2>Findings and responses</h2><table><thead><tr><th>Round</th><th>ID</th><th>Finding</th><th>Resolution</th><th>Response</th></tr></thead><tbody>{''.join(finding_rows) or '<tr><td colspan=\"5\">No findings</td></tr>'}</tbody></table>
-<h2>Checks</h2><table><thead><tr><th>Check</th><th>Outcome</th></tr></thead><tbody>{''.join(check_rows) or '<tr><td colspan=\"2\">No checks recorded</td></tr>'}</tbody></table></body></html>"""
-
-
 def assemble(rounds_root: Path, output: Path, project: Path) -> None:
     metadata = read_json(rounds_root / "review.json")
     if not isinstance(metadata, dict) or set(metadata) != {"base", "head"}:
@@ -208,8 +169,18 @@ def assemble(rounds_root: Path, output: Path, project: Path) -> None:
     output_parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output_parent))
     try:
-        artifacts = ["review.html"]
-        (staging / "review.html").write_text(render_page(metadata, digest, stat, patch, rounds, checks), encoding="utf-8")
+        artifacts = ["diff-stat.txt", "review.patch"]
+        (staging / "diff-stat.txt").write_text(stat + ("\n" if stat else ""), encoding="utf-8")
+        (staging / "review.patch").write_text(patch + ("\n" if patch else ""), encoding="utf-8")
+        for round_record in rounds:
+            round_name = f"{round_record['number']:04d}"
+            source_round = next(path for path in (rounds_root / "rounds").iterdir() if int(path.name) == round_record["number"])
+            for name in ("findings.json", "responses.json", "checks.json"):
+                destination_relative = Path("rounds") / round_name / name
+                destination = staging / destination_relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_round / name, destination)
+                artifacts.append(destination_relative.as_posix())
         for source in required:
             relative = source.relative_to(project.resolve())
             destination_relative = Path("project-artifacts") / relative
