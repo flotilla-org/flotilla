@@ -28,6 +28,9 @@ pub struct RepositoryInspection {
     pub spec: RepositorySpec,
     pub checkout: LocalCheckoutInspection,
     pub transport_url: Option<String>,
+    /// The checkout path was associated with a different Repository whose
+    /// history could not be connected to this inspection.
+    pub replaces_prior_repository: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,12 @@ pub struct OperationalEntriesInspection {
     pub repository: RepositoryInspection,
     pub commit: String,
     pub files: Vec<OperationalEntryFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryContinuity {
+    Continuous { evidence: String },
+    Unproven { evidence: String },
 }
 
 impl RepositoryInspection {
@@ -65,6 +74,10 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
+    }
+
+    async fn verify_continuity(&self, _path: &Path, _previous: &RepositorySpec) -> RepositoryContinuity {
+        RepositoryContinuity::Unproven { evidence: "repository inspector cannot compare Git history".to_string() }
     }
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
@@ -255,6 +268,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
             },
             transport_url,
+            replaces_prior_repository: false,
         })
     }
 
@@ -307,6 +321,29 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
+    }
+
+    async fn verify_continuity(&self, path: &Path, previous: &RepositorySpec) -> RepositoryContinuity {
+        let Some(previous_remote) = previous.live_remote() else {
+            return RepositoryContinuity::Unproven { evidence: "previous Repository has no transport remote".to_string() };
+        };
+        let advertised = match self.git(path, &["ls-remote", "--refs", previous_remote]).await {
+            Ok(advertised) => advertised,
+            Err(error) => return RepositoryContinuity::Unproven { evidence: format!("old remote refs unavailable: {error}") },
+        };
+        let mut refs = 0;
+        for line in advertised.lines() {
+            let Some((commit, reference)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            refs += 1;
+            if self.git(path, &["merge-base", "--is-ancestor", commit, "HEAD"]).await.is_ok() {
+                return RepositoryContinuity::Continuous {
+                    evidence: format!("old remote ref {reference} ({commit}) is reachable from HEAD"),
+                };
+            }
+        }
+        RepositoryContinuity::Unproven { evidence: format!("none of {refs} advertised old-remote refs is reachable from HEAD") }
     }
 
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
@@ -383,6 +420,7 @@ mod tests {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         };
 
         let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");
