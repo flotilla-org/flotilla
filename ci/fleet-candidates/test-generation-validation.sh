@@ -26,4 +26,9 @@ for fixture in bad-pin unexpected-payload source-set-mismatch v3-bundle-violatio
   fi
 done
 
+install_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-validator-layout.XXXXXX")"
+trap 'rm -rf "$install_root"' EXIT
+cp "$root/../../scripts/fleet-install" "$root/generation_validation.py" "$install_root/"
+PATH="$(dirname "$(command -v python3)"):$PATH" "$install_root/fleet-install" __validate_fixture "$fixtures/valid.json"
+
 echo "generation validator parity passed"

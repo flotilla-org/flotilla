@@ -204,7 +204,7 @@ def inspect_inner_archive(archive_bytes, platform, sources):
                     or relative.startswith("/")
                     or ".." in Path(relative).parts
                     or relative in declared_by_path
-                    or not validation.allowed_payload(relative)
+                    or not validation.allowed_payload(relative, platform)
                 ):
                     raise PromotionError(f"{platform} candidate has an invalid file path")
                 declared_by_path[relative] = entry

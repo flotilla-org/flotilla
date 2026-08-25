@@ -297,7 +297,7 @@ def safe_relative(member_name):
 
 
 def allowed_payload(path):
-    return validation.allowed_payload(path)
+    return validation.allowed_payload(path, INPUT_PLATFORM)
 
 
 def extract_verified_candidate(archive_bytes, stage, generation, sources, protocol):

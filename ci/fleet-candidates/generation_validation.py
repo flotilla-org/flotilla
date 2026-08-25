@@ -44,12 +44,15 @@ def require_size(value, description="size", *, allow_zero=False):
     return value
 
 
-def allowed_payload(path):
+def allowed_payload(path, platform=None):
     if path in REQUIRED_PAYLOAD:
         return True
     pure = PurePosixPath(path)
-    return ((len(pure.parts) == 2 and pure.parts[0] == "lib"
-             and (pure.suffix == ".dylib" or pure.name.endswith(".so") or ".so." in pure.name))
+    library = (len(pure.parts) == 2 and pure.parts[0] == "lib"
+               and (pure.suffix == ".dylib" or pure.name.endswith(".so") or ".so." in pure.name))
+    if platform == "darwin-aarch64" and library:
+        library = pure.suffix == ".dylib"
+    return (library
             or (len(pure.parts) >= 4 and pure.parts[:3] == ("share", "flotilla", "skills")))
 
 
@@ -166,7 +169,7 @@ def validate_release(root, outer, platform):
     for item in entries:
         rel = item.get("path") if isinstance(item, dict) else None
         pure = PurePosixPath(rel) if isinstance(rel, str) else None
-        if pure is None or pure.is_absolute() or ".." in pure.parts or not pure.parts or rel in expected or not allowed_payload(rel):
+        if pure is None or pure.is_absolute() or ".." in pure.parts or not pure.parts or rel in expected or not allowed_payload(rel, platform):
             raise ValidationError("release manifest contains an unsafe, duplicate, or unexpected path")
         require_digest(item.get("sha256"), f"digest for {rel}")
         require_size(item.get("size_bytes"), f"size for {rel}", allow_zero=True)

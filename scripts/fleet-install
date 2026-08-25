@@ -20,7 +20,15 @@ readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
 readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
-readonly GENERATION_VALIDATOR="${FLEET_GENERATION_VALIDATOR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../ci/fleet-candidates" 2>/dev/null && pwd)/generation_validation.py}"
+readonly FLEET_INSTALL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${FLEET_GENERATION_VALIDATOR:-}" ]]; then
+  GENERATION_VALIDATOR="$FLEET_GENERATION_VALIDATOR"
+elif [[ -f "$FLEET_INSTALL_SCRIPT_DIR/generation_validation.py" ]]; then
+  GENERATION_VALIDATOR="$FLEET_INSTALL_SCRIPT_DIR/generation_validation.py"
+else
+  GENERATION_VALIDATOR="$FLEET_INSTALL_SCRIPT_DIR/../ci/fleet-candidates/generation_validation.py"
+fi
+readonly GENERATION_VALIDATOR
 readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
