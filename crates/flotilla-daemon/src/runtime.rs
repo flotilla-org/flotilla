@@ -4875,9 +4875,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
-        let skills = home.join(".codex/skills/pr-shepherd");
-        fs::create_dir_all(&skills).expect("skill directory");
-        fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
+        let skill_sources = write_test_skill_sources(temp.path());
         let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
         fs::create_dir_all(&slot).expect("slot directory");
         let auth = slot.join("auth.json");
@@ -4907,7 +4905,10 @@ mod tests {
         let agent_material = Arc::new(AgentMaterialRegistry::new(
             daemon.resource_backend(),
             NAMESPACE,
-            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            Arc::new(TestEnvVars::new([
+                ("HOME", home.display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+            ])),
         ));
         let state = Arc::new(
             ControllerRuntimeState::new(
@@ -5056,9 +5057,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"material-pool-registry-wait-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
-        let skills = home.join(".codex/skills/pr-shepherd");
-        fs::create_dir_all(&skills).expect("skill directory");
-        fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
+        let skill_sources = write_test_skill_sources(temp.path());
         let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
         fs::create_dir_all(&slot).expect("slot directory");
         let auth = slot.join("auth.json");
@@ -5100,7 +5099,10 @@ mod tests {
         let agent_material = Arc::new(AgentMaterialRegistry::new(
             daemon.resource_backend(),
             NAMESPACE,
-            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            Arc::new(TestEnvVars::new([
+                ("HOME", home.display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+            ])),
         ));
         agent_material
             .prepare("slot-holder", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
