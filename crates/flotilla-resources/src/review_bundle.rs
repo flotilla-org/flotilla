@@ -117,7 +117,6 @@ impl ReviewBundleStore {
             .map_err(|source| ReviewBundleStoreError::ReadArtifact { path: index_path.display().to_string(), source })?;
         let index: ReviewBundleIndex = serde_json::from_slice(&index_bytes).map_err(ReviewBundleStoreError::DecodeIndex)?;
 
-        self.put(&prefix, REVIEW_BUNDLE_INDEX_FILE, index_bytes).await?;
         for relative in &index.artifacts {
             validate_relative_artifact(relative)?;
             let path = bundle_directory.join(relative);
@@ -126,6 +125,9 @@ impl ReviewBundleStore {
                 .map_err(|source| ReviewBundleStoreError::ReadArtifact { path: path.display().to_string(), source })?;
             self.put(&prefix, relative, contents).await?;
         }
+        // The well-known index is the publication fence: readers must never
+        // observe it before every artifact it names is durable.
+        self.put(&prefix, REVIEW_BUNDLE_INDEX_FILE, index_bytes).await?;
         Ok(format!("{}/{prefix}{REVIEW_BUNDLE_INDEX_FILE}", self.public_base_url))
     }
 

@@ -53,6 +53,8 @@ pub enum CredentialConsumer {
         public_base_url: String,
         #[serde(default)]
         allow_http: bool,
+        #[serde(default)]
+        virtual_hosted_style: bool,
     },
 }
 

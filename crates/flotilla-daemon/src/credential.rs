@@ -1228,7 +1228,7 @@ impl CredentialStore {
                 }
                 env.insert("CODEX_HOME".to_string(), codex_home);
             }
-            CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http } => {
+            CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http, virtual_hosted_style } => {
                 let delivery_paths = delivery_paths.expect("review bundle store adapter resolves delivery paths");
                 serde_json::from_str::<flotilla_resources::ReviewBundleWriteCredential>(material)
                     .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
@@ -1247,6 +1247,7 @@ impl CredentialStore {
                 env.insert("FLOTILLA_REVIEW_STORE_REGION".to_string(), region.clone());
                 env.insert("FLOTILLA_REVIEW_STORE_PUBLIC_BASE_URL".to_string(), public_base_url.clone());
                 env.insert("FLOTILLA_REVIEW_STORE_ALLOW_HTTP".to_string(), allow_http.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_VIRTUAL_HOSTED_STYLE".to_string(), virtual_hosted_style.to_string());
                 env.insert("FLOTILLA_REVIEW_STORE_PREFIX".to_string(), format!("{}/", flotilla_resources::REVIEW_BUNDLE_ROOT));
             }
             CredentialConsumer::DockerRegistry { .. } => {}
@@ -2735,6 +2736,7 @@ interactions:
                     region: "us-east-1".to_string(),
                     public_base_url: "https://reviews.example/flotilla".to_string(),
                     allow_http: true,
+                    virtual_hosted_style: false,
                 },
                 source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
                 lifecycle: CredentialLifecycle::Static,
