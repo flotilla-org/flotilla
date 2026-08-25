@@ -31,6 +31,7 @@ pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 const PRIVATE_SKILL_REPOSITORY: &str = "mattpocock-skills";
+const PRIVATE_SKILL_REPOSITORY_URL: &str = "https://github.com/flotilla-org/mattpocock-skills.git";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,10 +371,11 @@ struct SkillBundleInspection {
 }
 
 /// Validates the supply side of skill staging only: the manifest must pin an
-/// arbitrary, well-formed set of sources. There is deliberately no
-/// required-skill assertion here — what a given crew must have is a
-/// per-project/role demand declaration (#1790), validated per crew when that
-/// model lands, never a universal list.
+/// arbitrary, well-formed set of sources, and the one source that carries a
+/// privileged credential grant must point at the repository that grant is for.
+/// There is deliberately no required-skill assertion here — what a given crew
+/// must have is a per-project/role demand declaration (#1790), validated per
+/// crew when that model lands, never a universal list.
 fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String> {
     let manifest_path = source.join(SKILL_BUNDLE_MANIFEST);
     let manifest = std::fs::read_to_string(&manifest_path)
@@ -396,6 +398,19 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
         })
     {
         return Err(format!("skill source manifest {} has invalid or duplicate source entries", manifest_path.display()));
+    }
+    // The source set is data, but one name is not. `deliver` scopes the GitHub
+    // App token to PRIVATE_SKILL_REPOSITORY by name, and staging fetches every
+    // source with that token from whatever URL the manifest gives. Bind that one
+    // name to the repository its grant is actually for, so a manifest cannot aim
+    // the privileged credential somewhere else. This is a credential-scope
+    // invariant, not skill-name policy; per-source credentials (#1796) replace
+    // the pairing with explicit data.
+    if manifest.sources.iter().any(|source| source.name == PRIVATE_SKILL_REPOSITORY && source.repository != PRIVATE_SKILL_REPOSITORY_URL) {
+        return Err(format!(
+            "skill source manifest {} points the credential-granted source {PRIVATE_SKILL_REPOSITORY} at an unexpected repository",
+            manifest_path.display()
+        ));
     }
     if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
         return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
@@ -782,6 +797,33 @@ mod tests {
         .expect("write three-source manifest");
         let inspection = inspect_skill_sources(&skills).expect("three sources must validate");
         assert_eq!(inspection.sources.len(), 3);
+    }
+
+    #[test]
+    fn skill_manifest_binds_the_credential_granted_source_to_its_repository() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
+        let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
+
+        // Staging fetches every source with the App token scoped to this name, so
+        // the manifest must not be able to aim it at a different repository.
+        std::fs::write(
+            &manifest_path,
+            manifest.replace(PRIVATE_SKILL_REPOSITORY_URL, "https://github.com/flotilla-org/some-other-private-repo.git"),
+        )
+        .expect("write redirected-credential fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("redirecting the credential-granted source must fail validation");
+        assert!(error.contains("unexpected repository"), "unexpected validation error: {error}");
+
+        // Sources that carry no grant stay data: any repository is fine.
+        std::fs::write(
+            &manifest_path,
+            manifest.replace("https://github.com/rjwittams/rjw-skills.git", "https://example.com/elsewhere.git"),
+        )
+        .expect("write relocated-public-source fixture manifest");
+        let inspection = inspect_skill_sources(&skills).expect("an ungranted source may name any repository");
+        assert_eq!(inspection.sources.len(), 2);
     }
 
     #[test]

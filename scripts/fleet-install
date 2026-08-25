@@ -534,6 +534,16 @@ if (
     or len({source["name"] for source in skill_sources}) != len(skill_sources)
 ):
     raise SystemExit("skill bundle source pins do not match the fleet generation")
+# The daemon scopes its GitHub App token to this source by name and fetches with
+# it from whatever URL the manifest gives, so refuse a bundle that aims the
+# privileged credential at another repository. A credential-scope invariant, not
+# skill-name policy; per-source credentials (flotilla-org/flotilla#1796) replace
+# the pairing with explicit data.
+if any(
+    source["name"] == "mattpocock-skills" and source["repository"] != "https://github.com/flotilla-org/mattpocock-skills.git"
+    for source in skill_sources
+):
+    raise SystemExit("skill bundle points the credential-granted source at an unexpected repository")
 for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
     if not os.access(root / rel, os.X_OK):
         raise SystemExit(f"release binary is not executable: {rel}")
