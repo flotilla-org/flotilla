@@ -93,9 +93,6 @@ fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
 
 rm -rf "$output_root"
 mkdir -p "$bundle/bin" "$bundle/lib"
-install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
-install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
-install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 
 skills_bundle="$bundle/share/flotilla/skills"
 mkdir -p "$skills_bundle"
@@ -155,6 +152,10 @@ python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle
   ./tools/prepare-ghostty-vt.sh
   cargo build -p cleat --locked --features ghostty-vt --release
 )
+
+install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
+install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
+install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 
 if [[ "$platform" == darwin-aarch64 && -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
   install -m 0755 "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" "$bundle/lib/$ghostty_library"
