@@ -502,7 +502,9 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if !convoy.vessels.is_empty() {
+    if let Some(message) = &convoy.message {
+        facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(message.clone())));
+    } else if !convoy.vessels.is_empty() {
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(format!("{done}/{} vessels done", convoy.vessels.len()))));
     }
     if let [vessel] = convoy.vessels.as_slice() {
