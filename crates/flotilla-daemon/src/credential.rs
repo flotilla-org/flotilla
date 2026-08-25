@@ -495,6 +495,7 @@ impl CredentialStore {
                     | CredentialConsumer::Forgejo { .. }
                     | CredentialConsumer::ClaudeOauth { .. }
                     | CredentialConsumer::Codex
+                    | CredentialConsumer::ReviewBundleStore { .. }
             )
         }) {
             Some(self.delivery_paths(&*runner).await?)
@@ -1226,6 +1227,28 @@ impl CredentialStore {
                     .await?;
                 }
                 env.insert("CODEX_HOME".to_string(), codex_home);
+            }
+            CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http, virtual_hosted_style } => {
+                let delivery_paths = delivery_paths.expect("review bundle store adapter resolves delivery paths");
+                serde_json::from_str::<flotilla_resources::ReviewBundleWriteCredential>(material)
+                    .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
+                let credential_file = delivery_paths.credential_dir(name).join("review-bundle.json");
+                if !already_prepared {
+                    runner.write_file(&credential_file, material).await.map_err(|error| format!("write credential file: {error}"))?;
+                    let path = credential_file.to_string_lossy();
+                    runner
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect credential file: {error}"))?;
+                }
+                env.insert("FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE".to_string(), credential_file.to_string_lossy().into_owned());
+                env.insert("FLOTILLA_REVIEW_STORE_ENDPOINT".to_string(), endpoint.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_BUCKET".to_string(), bucket.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_REGION".to_string(), region.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_PUBLIC_BASE_URL".to_string(), public_base_url.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_ALLOW_HTTP".to_string(), allow_http.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_VIRTUAL_HOSTED_STYLE".to_string(), virtual_hosted_style.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_PREFIX".to_string(), format!("{}/", flotilla_resources::REVIEW_BUNDLE_ROOT));
             }
             CredentialConsumer::DockerRegistry { .. } => {}
         }
@@ -2698,6 +2721,63 @@ interactions:
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn review_store_credential_is_staged_as_a_scoped_file() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("review-store".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ReviewBundleStore {
+                    endpoint: "http://rustfs.lab:9000".to_string(),
+                    bucket: "flotilla".to_string(),
+                    region: "us-east-1".to_string(),
+                    public_base_url: "https://reviews.example/flotilla".to_string(),
+                    allow_http: true,
+                    virtual_hosted_style: false,
+                },
+                source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create review store credential declaration");
+        let material = r#"{"access_key_id":"crew","secret_access_key":"secret"}"#;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REVIEW_STORE_CREDENTIAL".to_string(), material.to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            env,
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let delivered: BTreeMap<_, _> = store
+            .prepare("env-a", &BTreeSet::from(["review-store".to_string()]), runner.clone())
+            .await
+            .expect("prepare review store credential")
+            .into_iter()
+            .collect();
+
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_PREFIX"], "reviews/");
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_ENDPOINT"], "http://rustfs.lab:9000");
+        let credential_file = &delivered["FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE"];
+        assert!(runner
+            .writes
+            .lock()
+            .expect("writes lock")
+            .iter()
+            .any(|(path, contents)| path == Path::new(credential_file) && contents == material));
+        assert!(runner
+            .calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
     }
 
     async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, server_url: &str, source_env: &str) {

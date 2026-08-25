@@ -46,6 +46,16 @@ pub enum CredentialConsumer {
         registry: String,
         username: String,
     },
+    ReviewBundleStore {
+        endpoint: String,
+        bucket: String,
+        region: String,
+        public_base_url: String,
+        #[serde(default)]
+        allow_http: bool,
+        #[serde(default)]
+        virtual_hosted_style: bool,
+    },
 }
 
 impl CredentialConsumer {
@@ -58,6 +68,7 @@ impl CredentialConsumer {
             Self::ClaudeOauth { .. } => "claude-oauth",
             Self::Codex => "codex",
             Self::DockerRegistry { .. } => "docker-registry",
+            Self::ReviewBundleStore { .. } => "review-bundle-store",
         }
     }
 

@@ -1,9 +1,11 @@
-use std::fs;
+use std::{fs, sync::Arc};
 
 use flotilla_resources::{
-    validate_settlement_claim, ClaimAdmissibilityError, CrewWorkPhase, CrewWorkState, FindingResolution, ReviewBundleIndex, ReviewCheck,
-    ReviewCheckOutcome, ReviewFinding, ReviewRefPair, ReviewRound, SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE,
+    publish_settlement_claim, validate_settlement_claim, validate_uploaded_settlement_claim, ClaimAdmissibilityError, CrewWorkPhase,
+    CrewWorkState, FindingResolution, ReviewBundleIndex, ReviewBundleLocation, ReviewBundleStore, ReviewCheck, ReviewCheckOutcome,
+    ReviewFinding, ReviewRefPair, ReviewRound, SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE,
 };
+use object_store::{memory::InMemory, ObjectStore};
 
 fn refs() -> ReviewRefPair {
     ReviewRefPair::builder().base("refs/heads/main".to_string()).head("refs/heads/topic".to_string()).build()
@@ -122,4 +124,43 @@ fn settlement_claim_carries_the_complete_evidence_reference() {
     assert_eq!(serialized["claim_evidence"]["refs"]["head"], "refs/heads/topic");
     assert_eq!(serialized["claim_evidence"]["bundle_url"], "https://objects.example/reviews/project/convoy/1/");
     assert_eq!(serialized["claim_evidence"]["claimed_head_digest"], "sha256:reviewed-head");
+}
+
+#[tokio::test]
+async fn upload_uses_convoy_scoped_keys_and_admission_reads_the_uploaded_index() {
+    let bundle = write_bundle(&index(FindingResolution::Addressed { fix_reference: "commit:abc123".to_string() }, "sha256:reviewed-head"));
+    fs::write(bundle.path().join("review.html"), "human review").expect("write artifact");
+    fs::write(bundle.path().join("diff-summary.md"), "diff summary").expect("write artifact");
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let store = ReviewBundleStore::new(Arc::clone(&objects), "https://objects.example/bucket");
+    let location =
+        ReviewBundleLocation::builder().project("flotilla".to_string()).convoy("convoy-123".to_string()).claim_sequence(2).build();
+
+    let uploaded_claim = publish_settlement_claim(refs(), "sha256:reviewed-head".to_string(), &location, bundle.path(), &store)
+        .await
+        .expect("publish claim");
+    assert_eq!(uploaded_claim.bundle_url, "https://objects.example/bucket/reviews/flotilla/convoy-123/2/index.json");
+    for key in [
+        "reviews/flotilla/convoy-123/2/index.json",
+        "reviews/flotilla/convoy-123/2/review.html",
+        "reviews/flotilla/convoy-123/2/diff-summary.md",
+    ] {
+        objects.head(&object_store::path::Path::from(key)).await.expect("uploaded object");
+    }
+
+    let admitted = validate_uploaded_settlement_claim(&uploaded_claim, &location, &store).await.expect("uploaded claim is admissible");
+    assert_eq!(admitted.head_digest, "sha256:reviewed-head");
+}
+
+#[tokio::test]
+async fn upload_refuses_artifacts_that_escape_the_bundle() {
+    let mut unsafe_index = index(FindingResolution::Addressed { fix_reference: "commit:abc123".to_string() }, "sha256:reviewed-head");
+    unsafe_index.artifacts = vec!["../secret".to_string()];
+    let bundle = write_bundle(&unsafe_index);
+    let store = ReviewBundleStore::new(Arc::new(InMemory::new()), "https://objects.example/bucket");
+    let location =
+        ReviewBundleLocation::builder().project("flotilla".to_string()).convoy("convoy-123".to_string()).claim_sequence(1).build();
+
+    let error = store.upload(&location, bundle.path()).await.expect_err("path traversal must fail");
+    assert!(error.to_string().contains("safe relative name"));
 }

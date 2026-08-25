@@ -151,8 +151,10 @@ pub use retention::{
     EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,
 };
 pub use review_bundle::{
-    validate_settlement_claim, ClaimAdmissibilityError, FindingResolution, ReviewBundleIndex, ReviewCheck, ReviewCheckOutcome,
-    ReviewFinding, ReviewRefPair, ReviewRound, SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE,
+    publish_settlement_claim, validate_settlement_claim, validate_uploaded_settlement_claim, ClaimAdmissibilityError,
+    ClaimPublicationError, FindingResolution, ReviewBundleIndex, ReviewBundleLocation, ReviewBundleStore, ReviewBundleStoreConfig,
+    ReviewBundleStoreError, ReviewBundleWriteCredential, ReviewCheck, ReviewCheckOutcome, ReviewFinding, ReviewRefPair, ReviewRound,
+    SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE, REVIEW_BUNDLE_ROOT,
 };
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
