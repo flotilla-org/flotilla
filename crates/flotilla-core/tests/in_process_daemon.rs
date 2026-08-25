@@ -966,6 +966,100 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
 }
 
 #[tokio::test]
+async fn convoy_explain_reports_observed_digest_anchor_and_mismatch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
+    let repo_ref = flotilla_resources::RepositoryKey("repo-a".to_string());
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("digest-anchor".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("reviewless".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "digest-checkout".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("create convoy");
+    let claim = flotilla_resources::SettlementClaimEvidence::builder()
+        .refs(flotilla_resources::ReviewRefPair::builder().base("refs/heads/main".to_string()).head("refs/heads/topic".to_string()).build())
+        .bundle_url("s3://reviews/digest-anchor/1/".to_string())
+        .claimed_head_digest("claimed-digest".to_string())
+        .build();
+    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    status.crew_work.insert(
+        "work".to_string(),
+        BTreeMap::from([(
+            "coder".to_string(),
+            flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).claim_evidence(claim).build(),
+        )]),
+    );
+    convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("publish claim");
+
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("digest-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "digest-anchor".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "topic".to_string(),
+                path: "/tmp/digest-checkout".to_string(),
+                repo_ref,
+                host_ref: "host-test".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let checkout_status = |digest: &str| flotilla_resources::CheckoutStatus {
+        phase: ResourceCheckoutPhase::Ready,
+        integration: flotilla_resources::CheckoutIntegrationStatus {
+            remote_refs: BTreeMap::from([(
+                "refs/heads/topic".to_string(),
+                flotilla_resources::RemoteRefObservation::builder().digest(digest.to_string()).observed_at(observed_at.clone()).build(),
+            )]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let checkout = checkouts
+        .update_status("digest-checkout", &checkout.metadata.resource_version, &checkout_status("other-digest"))
+        .await
+        .expect("publish mismatched observation");
+
+    let explain = || async {
+        daemon
+            .execute_query(
+                Command::builder()
+                    .action(CommandAction::QueryExplainConvoy {
+                        namespace: Some("flotilla".to_string()),
+                        name: "digest-anchor".to_string(),
+                    })
+                    .build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("explain convoy")
+    };
+    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
+    assert!(!explanation.settlement.satisfied);
+    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.reason == "digest_mismatch"));
+
+    checkouts
+        .update_status("digest-checkout", &checkout.metadata.resource_version, &checkout_status("claimed-digest"))
+        .await
+        .expect("publish matching observation");
+    let CommandValue::ConvoyExplanation(explanation) = explain().await else { panic!("expected convoy explanation") };
+    assert!(explanation.settlement.satisfied);
+    assert_eq!(explanation.settlement.mode, "observed_digest");
+}
+
+#[tokio::test]
 async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

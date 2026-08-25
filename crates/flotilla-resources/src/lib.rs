@@ -51,6 +51,7 @@ pub use checkout::{
     latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
     CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
+    RemoteRefObservation,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use clock::VirtualClock;

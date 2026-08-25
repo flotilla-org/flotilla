@@ -2901,6 +2901,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 &*runner,
                 path,
                 &checkout.spec,
+                convoy,
                 change_request_id.as_deref(),
                 observed_change_request.as_ref(),
             )

@@ -121,6 +121,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
                 LandedEvidence::builder().change_request_id("815".to_string()).merged_at("2026-07-21T23:15:00Z".to_string()).build(),
             ),
             change_request: None,
+            remote_refs: Default::default(),
         }),
     }
     .apply(&mut status);
@@ -137,6 +138,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
             landed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["no PR found".to_string()]).build(),
             landed_evidence: None,
             change_request: None,
+            remote_refs: Default::default(),
         }),
     }
     .apply(&mut status);

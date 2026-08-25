@@ -687,6 +687,9 @@ pub enum ConvoyStatusPatch {
         target_mismatches: Vec<TargetMismatch>,
         finished_at: DateTime<Utc>,
     },
+    SetSettlementAttention {
+        attention: Option<ConvoyAttention>,
+    },
     WorkLaunching {
         work: String,
         started_at: DateTime<Utc>,
@@ -891,8 +894,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.finished_at = None;
                 }
                 status.finished_at.get_or_insert(*finished_at);
+                status.attention = None;
                 clear_operator_pending_brief(status);
             }
+            Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Launching;
