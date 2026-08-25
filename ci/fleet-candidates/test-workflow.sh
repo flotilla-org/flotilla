@@ -31,8 +31,8 @@ if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_S
   exit 1
 fi
 grep -Fq 'retention-days: 7' "$workflow"
-grep -Fq '"schema_version": 2' "$builder"
-grep -Fq '"required_skills": [' "$builder"
+grep -Fq '"schema_version": 3' "$builder"
+! grep -Fq '"required_skills"' "$builder"
 grep -Fq 'actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 grep -Fq 'actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 test "$(grep -Fc 'actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32' "$workflow")" -eq 2

@@ -42,7 +42,7 @@ add_test_skills() {
   local bundle="$1"
   local skills="$bundle/share/flotilla/skills"
   mkdir -p "$skills"
-  printf '%s\n' '{"schema_version":2,"required_skills":["wayfinder","pr-shepherd"],"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"2222222222222222222222222222222222222222"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}' \
+  printf '%s\n' '{"schema_version":3,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"2222222222222222222222222222222222222222"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}' \
     >"$skills/.flotilla-sources.json"
 }
 

@@ -31,7 +31,6 @@ pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 const PRIVATE_SKILL_REPOSITORY: &str = "mattpocock-skills";
-const PUBLIC_SKILL_REPOSITORY: &str = "rjw-skills";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,7 +241,6 @@ impl CodexMaterialAdapter {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct SkillBundleManifest {
     schema_version: u32,
-    required_skills: Vec<String>,
     sources: Vec<SkillSource>,
 }
 
@@ -286,8 +284,9 @@ impl SkillBundle {
                 ],
                 failure_context: "generation-pinned skill source preflight failed".to_string(),
             },
-            // The App token is deliberately limited to the private fork. The
-            // other pinned source must remain publicly readable.
+            // The App token is deliberately limited to the private fork; every
+            // other source must be publicly fetchable until per-source
+            // credentials land (#1796).
             github_repository_grants: BTreeSet::from([PRIVATE_SKILL_REPOSITORY.to_string()]),
         })
     }
@@ -338,16 +337,14 @@ impl SkillBundle {
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
         let mut args = vec![
             "-c".to_string(),
-            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nrequired_count=$6\nshift 6\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nrequired_file=\"$sources/required-skills\"\n: >\"$required_file\"\nwhile [ \"$required_count\" -gt 0 ]; do\n  printf '%s\\n' \"$1\" >>\"$required_file\"\n  shift\n  required_count=$((required_count - 1))\ndone\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  shift 3\n  checkout=\"$sources/$name\"\n  git -C \"$sources\" init \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" fetch --depth=1 origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --detach FETCH_HEAD >/dev/null\n  find \"$checkout\" -type f -name SKILL.md >\"$sources/skill-files\"\n  while IFS= read -r skill_file; do\n    skill_dir=${skill_file%/SKILL.md}\n    skill_name=${skill_dir##*/}\n    target=\"$staged/$skill_name\"\n    if [ -e \"$target\" ]; then\n      echo \"duplicate skill name $skill_name from $repository\" >&2\n      exit 1\n    fi\n    mkdir -p \"$target\"\n    cp -R \"$skill_dir\"/. \"$target\"/\n  done <\"$sources/skill-files\"\ndone\nwhile IFS= read -r required; do\n  test -f \"$staged/$required/SKILL.md\" || { echo \"pinned skill sources are missing required skill $required\" >&2; exit 1; }\ndone <\"$required_file\"\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
+            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nshift 5\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  shift 3\n  checkout=\"$sources/$name\"\n  git -C \"$sources\" init \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" fetch --depth=1 origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --detach FETCH_HEAD >/dev/null\n  find \"$checkout\" -type f -name SKILL.md >\"$sources/skill-files\"\n  while IFS= read -r skill_file; do\n    skill_dir=${skill_file%/SKILL.md}\n    skill_name=${skill_dir##*/}\n    target=\"$staged/$skill_name\"\n    if [ -e \"$target\" ]; then\n      echo \"duplicate skill name $skill_name from $repository\" >&2\n      exit 1\n    fi\n    mkdir -p \"$target\"\n    cp -R \"$skill_dir\"/. \"$target\"/\n  done <\"$sources/skill-files\"\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
             "flotilla-stage-skills".to_string(),
             git_config.clone(),
             token_mode.to_string(),
             github_token_file.cloned().unwrap_or_default(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
             String::new(),
-            inspection.required_skills.len().to_string(),
         ];
-        args.extend(inspection.required_skills.iter().cloned());
         for source in &inspection.sources {
             args.extend([source.name.clone(), source.repository.clone(), source.revision.clone()]);
         }
@@ -369,42 +366,41 @@ impl SkillBundle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillBundleInspection {
-    required_skills: Vec<String>,
     sources: Vec<SkillSource>,
 }
 
+/// Validates the supply side of skill staging only: the manifest must pin an
+/// arbitrary, well-formed set of sources. There is deliberately no
+/// required-skill assertion here — what a given crew must have is a
+/// per-project/role demand declaration (#1790), validated per crew when that
+/// model lands, never a universal list.
 fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String> {
     let manifest_path = source.join(SKILL_BUNDLE_MANIFEST);
     let manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|error| format!("read skill bundle manifest {}: {error}", manifest_path.display()))?;
     let manifest = serde_json::from_str::<SkillBundleManifest>(&manifest)
         .map_err(|error| format!("decode skill bundle manifest {}: {error}", manifest_path.display()))?;
-    let expected = BTreeMap::from([
-        (PRIVATE_SKILL_REPOSITORY, "https://github.com/flotilla-org/mattpocock-skills.git"),
-        (PUBLIC_SKILL_REPOSITORY, "https://github.com/rjwittams/rjw-skills.git"),
-    ]);
-    let actual = manifest.sources.iter().map(|source| (source.name.as_str(), source.repository.as_str())).collect::<BTreeMap<_, _>>();
-    if manifest.schema_version != 2 || actual != expected || manifest.sources.len() != expected.len() {
-        return Err(format!("skill source manifest {} must name exactly the supported repositories", manifest_path.display()));
+    if manifest.schema_version != 3 || manifest.sources.is_empty() {
+        return Err(format!("skill source manifest {} must use schema version 3 and pin at least one source", manifest_path.display()));
+    }
+    let names = manifest.sources.iter().map(|source| source.name.as_str()).collect::<BTreeSet<_>>();
+    if names.len() != manifest.sources.len()
+        || manifest.sources.iter().any(|source| {
+            source.name.is_empty()
+                || source.name == "."
+                || source.name == ".."
+                || source.name.contains('/')
+                || source.name.contains('\\')
+                || source.name.chars().any(|character| matches!(character, '\r' | '\n'))
+                || source.repository.is_empty()
+        })
+    {
+        return Err(format!("skill source manifest {} has invalid or duplicate source entries", manifest_path.display()));
     }
     if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
         return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
     }
-    let required = manifest.required_skills.iter().collect::<BTreeSet<_>>();
-    if manifest.required_skills.is_empty()
-        || required.len() != manifest.required_skills.len()
-        || manifest.required_skills.iter().any(|name| {
-            name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.contains('/')
-                || name.contains('\\')
-                || name.chars().any(|character| matches!(character, '\r' | '\n'))
-        })
-    {
-        return Err(format!("skill source manifest {} has invalid required skills", manifest_path.display()));
-    }
-    Ok(SkillBundleInspection { required_skills: manifest.required_skills, sources: manifest.sources })
+    Ok(SkillBundleInspection { sources: manifest.sources })
 }
 
 #[async_trait]
@@ -571,7 +567,7 @@ mod tests {
         std::fs::create_dir_all(&skills).expect("create skill bundle");
         std::fs::write(
             skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":2,"required_skills":["wayfinder","pr-shepherd"],"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            r#"{"schema_version":3,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
         )
         .expect("write skill bundle manifest");
         skills
@@ -654,9 +650,7 @@ mod tests {
         assert!(calls[0].1.contains(&"/tmp/flotilla-config/credentials/claude-max/claude/skills".to_string()));
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
         assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
-        assert!(calls[0].1.contains(&"wayfinder".to_string()));
-        assert!(calls[0].1.contains(&"pr-shepherd".to_string()));
-        assert!(!calls[0].1[1].contains("wayfinder"), "required skill policy must come from the manifest");
+        assert!(!calls[0].1[1].contains("required"), "staging must carry no skill-name policy; demand validation is #1790's contract");
     }
 
     #[tokio::test]
@@ -752,17 +746,34 @@ mod tests {
     }
 
     #[test]
-    fn skill_manifest_rejects_invalid_required_skills() {
+    fn skill_manifest_rejects_duplicate_or_traversing_source_names() {
         let bundle = tempfile::tempdir().expect("tempdir");
         let skills = write_skill_sources(bundle.path());
         let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
         let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-        std::fs::write(&manifest_path, manifest.replace(r#"["wayfinder","pr-shepherd"]"#, r#"["wayfinder","wayfinder"]"#))
-            .expect("write invalid fixture manifest");
+        std::fs::write(&manifest_path, manifest.replace(r#""name":"rjw-skills""#, r#""name":"mattpocock-skills""#))
+            .expect("write duplicate-name fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("duplicate source name must fail validation");
+        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
 
-        let error = inspect_skill_sources(&skills).expect_err("duplicate required skill must fail validation");
+        std::fs::write(&manifest_path, manifest.replace(r#""name":"rjw-skills""#, r#""name":"../rjw-skills""#))
+            .expect("write traversing-name fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("path-traversing source name must fail validation");
+        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
+    }
 
-        assert!(error.contains("invalid required skills"), "unexpected validation error: {error}");
+    #[test]
+    fn skill_manifest_accepts_any_source_count() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
+        std::fs::write(
+            &manifest_path,
+            r#"{"schema_version":3,"sources":[{"name":"only","repository":"https://example.com/only.git","revision":"1111111111111111111111111111111111111111"}]}"#,
+        )
+        .expect("write single-source manifest");
+        let inspection = inspect_skill_sources(&skills).expect("single source must validate");
+        assert_eq!(inspection.sources.len(), 1);
     }
 
     #[tokio::test]
