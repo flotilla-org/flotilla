@@ -4703,6 +4703,35 @@ async fn remove_repo_persistence_failure_leaves_repo_tracked() {
 }
 
 #[tokio::test]
+async fn remove_repo_command_cleans_up_an_untracked_observation_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let unavailable = temp.path().join("unavailable-repo");
+    let config = test_config_store(temp.path().join("config"));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&unavailable)).expect("persist observation root");
+    let daemon = InProcessDaemon::new(vec![], Arc::clone(&config), fake_discovery(false), HostName::local()).await;
+    let mut rx = daemon.subscribe();
+
+    let command_id = daemon
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Query("unavailable-repo".into()) }).build())
+        .await
+        .expect("remove observation root command");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(DaemonEvent::CommandFinished { command_id: finished_id, result, .. }) = rx.recv().await {
+                if finished_id == command_id {
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for remove command");
+
+    assert!(matches!(result, CommandValue::RepoUntracked { ref path } if *path == unavailable));
+    assert!(config.load_observation_roots().expect("load observation roots").is_empty());
+}
+
+#[tokio::test]
 async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
 

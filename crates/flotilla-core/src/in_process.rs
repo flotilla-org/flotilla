@@ -3252,6 +3252,18 @@ impl InProcessDaemon {
         }
     }
 
+    fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
+        let roots = self.config.load_observation_roots()?;
+        match selector {
+            flotilla_protocol::RepoSelector::Path(path) if roots.iter().any(|root| root.as_path() == path) => Ok(path.clone()),
+            flotilla_protocol::RepoSelector::Path(path) => Err(format!("repo not observed: {}", path.display())),
+            flotilla_protocol::RepoSelector::Query(query) => {
+                crate::resolve::resolve_repo(query, roots.iter().map(|root| (root.as_path(), None))).map_err(|error| error.to_string())
+            }
+            flotilla_protocol::RepoSelector::Identity(identity) => Err(format!("repo not tracked: {identity}")),
+        }
+    }
+
     async fn resolve_checkout_selector(
         &self,
         selector: &flotilla_protocol::CheckoutSelector,
@@ -6905,17 +6917,18 @@ impl InProcessDaemon {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
-        if !self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path)) {
-            return Err(format!("repo not tracked: {}", path.display()));
+        let tracked = self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path));
+        // Persist first so both tracked repositories and observation roots
+        // whose initial inspection failed remain removable and retryable.
+        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
+        if !tracked {
+            self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
+            return Ok(());
         }
         let repository_key = match self.repository_keys_by_path.read().await.get(&path).cloned() {
             Some(key) => Some(key),
             None => self.inspect_repository_path(&path, None).await.ok().map(|inspection| inspection.key()),
         };
-        // Persist the observation decision before tearing down runtime state.
-        // A write failure leaves the repo fully tracked and retryable.
-        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
-
         let mut removed_identity = false;
         let removed_final_local_root;
         {
@@ -10125,10 +10138,12 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
-            let repo_path = self.resolve_repo_selector(repo).await?;
+            let repo_path = match self.resolve_repo_selector(repo).await {
+                Ok(path) => path,
+                Err(_) => self.resolve_observation_root_selector(repo)?,
+            };
             let description = command.description().to_string();
-            let repo_identity =
-                self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+            let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),

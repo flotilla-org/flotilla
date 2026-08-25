@@ -36,6 +36,17 @@ fn observation_roots_roundtrip_and_reject_configuration() {
 }
 
 #[test]
+fn unavailable_observation_roots_remain_declared() {
+    let dir = tempdir().expect("create config tempdir");
+    let unavailable = ee(dir.path().join("temporarily-unavailable"));
+    let store = ConfigStore::with_base(dir.path());
+
+    store.add_observation_root(&unavailable).expect("add unavailable observation root");
+
+    assert_eq!(store.load_observation_roots().expect("load observation roots"), vec![unavailable]);
+}
+
+#[test]
 fn concurrent_observation_root_updates_preserve_every_root() {
     let dir = tempdir().expect("create config tempdir");
     let store = Arc::new(ConfigStore::with_base(dir.path()));

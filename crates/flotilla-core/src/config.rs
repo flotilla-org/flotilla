@@ -482,7 +482,7 @@ impl ConfigStore {
         let mut paths = roots.paths;
         paths.sort();
         paths.dedup();
-        Ok(paths.into_iter().filter(|path| path.is_dir()).map(ExecutionEnvironmentPath::new).collect())
+        Ok(paths.into_iter().map(ExecutionEnvironmentPath::new).collect())
     }
 
     pub fn add_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
@@ -510,7 +510,13 @@ impl ConfigStore {
         let file = self.observation_roots_file();
         let content =
             toml::to_string_pretty(&ObservationRootsFile { paths }).map_err(|error| format!("failed to encode {file}: {error}"))?;
-        std::fs::write(file.as_path(), content).map_err(|error| format!("failed to write {file}: {error}"))
+        let temporary = file.as_path().with_extension(format!("toml.tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, content).map_err(|error| format!("failed to write temporary observation roots file: {error}"))?;
+        if let Err(error) = std::fs::rename(&temporary, file.as_path()) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("failed to replace {file}: {error}"));
+        }
+        Ok(())
     }
 
     fn open_views_file(&self) -> DaemonHostPath {
