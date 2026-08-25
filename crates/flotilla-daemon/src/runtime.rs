@@ -2932,16 +2932,22 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
-                let remove = runner
-                    .run_output(
-                        "git",
-                        &["-C", clone_path, "worktree", "remove", "--force", target_path],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                    )
-                    .await?;
-                if !remove.success && !remove.stderr.contains("is not a working tree") {
-                    return Err(remove.stderr);
+                let target_exists = runner.path_exists(Path::new(target_path)).await?;
+                if !target_exists && !runner.path_exists(Path::new(clone_path)).await? {
+                    return Ok(CheckoutRemovalOutcome::Removed);
+                }
+                if target_exists {
+                    let remove = runner
+                        .run_output(
+                            "git",
+                            &["-C", clone_path, "worktree", "remove", "--force", target_path],
+                            Path::new("/"),
+                            &ChannelLabel::Default,
+                        )
+                        .await?;
+                    if !remove.success && !remove.stderr.contains("is not a working tree") {
+                        return Err(remove.stderr);
+                    }
                 }
                 remove_checkout_path(&*runner, target_path).await?;
                 runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
@@ -5519,6 +5525,65 @@ mod tests {
 
         let branch = ProcessCommand::new("git")
             .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", "refs/heads/feature/cleanup"])
+            .status()
+            .expect("git should inspect the branch");
+        assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_treats_a_never_created_worktree_as_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = temp.path().join("clone-that-failed-auth");
+        let target = temp.path().join("workspace/never-created");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/never-created".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+
+        let outcome =
+            runtime.remove_checkout(&removal).await.expect("a worktree that provisioning never created should not wedge finalization");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_cleans_git_state_when_only_the_worktree_directory_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("workspace/removed-out-of-band");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/removed-out-of-band",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+        fs::remove_dir_all(&target).expect("remove worktree directory out of band");
+
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::Worktree {
+                clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+                branch: "feature/removed-out-of-band".to_string(),
+                target_path: target.to_str().expect("utf-8 target path").to_string(),
+            })
+            .await
+            .expect("missing worktree directory should still clean git state");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
+        let branch = ProcessCommand::new("git")
+            .args([
+                "-C",
+                clone.path().to_str().expect("utf-8 clone path"),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/feature/removed-out-of-band",
+            ])
             .status()
             .expect("git should inspect the branch");
         assert!(!branch.success(), "zero-commit convoy branch should be deleted");
