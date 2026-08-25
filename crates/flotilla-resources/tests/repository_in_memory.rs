@@ -1,18 +1,41 @@
+use std::collections::BTreeMap;
+
 use flotilla_resources::{
     normalize_project_spec, repository_display_labels, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance,
-    InMemoryBackend, InputMeta, IssueSource, IssueSourceResolution, IssueSourceUnavailable, ProjectRepositorySpec, ProjectSpec, Repository,
-    RepositoryIdentity, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceBackend, SqliteBackend,
+    InMemoryBackend, InputMeta, IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution,
+    IssueSourceUnavailable, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryGitSpec, RepositoryIdentity,
+    RepositoryKey, RepositoryProviderPreference, RepositoryRelation, RepositorySpec, RepositoryVcsSpec, ResourceBackend, SqliteBackend,
 };
 
+#[test]
+fn repository_provider_configuration_roundtrips_in_the_spec() {
+    let spec = RepositorySpec::remote("https://github.com/acme/widgets")
+        .expect("repository")
+        .with_vcs(RepositoryVcsSpec {
+            git: RepositoryGitSpec {
+                checkout_strategy: Some("wt".to_string()),
+                checkout_path: Some("{{ repo_path }}/../work/{{ branch }}".to_string()),
+            },
+        })
+        .with_change_request(RepositoryProviderPreference { backend: Some("github".to_string()) });
+
+    let value = serde_json::to_value(&spec).expect("serialize repository spec");
+    let decoded: RepositorySpec = serde_json::from_value(value).expect("deserialize repository spec");
+
+    assert_eq!(decoded, spec);
+    assert_eq!(decoded.vcs().git.checkout_strategy.as_deref(), Some("wt"));
+    assert_eq!(decoded.change_request().backend.as_deref(), Some("github"));
+}
+
 #[tokio::test]
-async fn project_issue_source_override_resolves_without_a_checkout_or_repository_record() {
+async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_source: Some(override_source.clone()),
+        issue_sources: vec![IssueSourceBindingSpec::builder().source(override_source.clone()).alias("widgets".to_string()).build()],
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: RepositoryKey("repository-not-present-on-this-host".into()),
@@ -23,28 +46,123 @@ async fn project_issue_source_override_resolves_without_a_checkout_or_repository
         }],
     };
 
-    assert_eq!(resolve_project_issue_sources(&repositories, &project).await, IssueSourceResolution::Available {
-        sources: vec![override_source]
-    });
+    assert!(matches!(
+        resolve_project_issue_sources(&repositories, &project).await,
+        IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { .. })
+    ));
+}
+
+#[tokio::test]
+async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_writer = backend.using::<Repository>("flotilla");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
+    let github = RepositorySpec::remote("https://github.com/acme/app").expect("repository");
+    repository_writer.create(&InputMeta::builder().name(github.key().to_string()).build(), &github).await.expect("create repository");
+    let github_source = IssueSource { service: "https://github.com".into(), scope: "acme/app".into() };
+    let forgejo_source = IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() };
+    let project = ProjectSpec {
+        display_name: "Zellij".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        issue_sources: vec![
+            IssueSourceBindingSpec::builder().source(github_source).exclude(true).build(),
+            IssueSourceBindingSpec::builder()
+                .source(forgejo_source.clone())
+                .alias("zellij".to_string())
+                .filter(IssueFilter { match_fields: BTreeMap::from([("component".into(), IssueFieldValue::One("terminal".into()))]) })
+                .build(),
+        ],
+        dispatch_policy: None,
+        repositories: vec![ProjectRepositorySpec::builder()
+            .repo(github.key())
+            .alias("zellij".to_string())
+            .roles([ProjectRepositoryRole::Code].into())
+            .build()],
+    };
+
+    let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project).await else {
+        panic!("bindings should resolve");
+    };
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source, forgejo_source);
+    assert_eq!(bindings[0].alias, "zellij");
+    assert_eq!(bindings[0].filter.match_fields["component"], IssueFieldValue::One("terminal".into()));
+
+    let yaml = serde_yml::to_string(&project).expect("serialize project");
+    assert_eq!(serde_yml::from_str::<ProjectSpec>(&yaml).expect("deserialize project"), project);
+}
+
+#[test]
+fn creatable_issue_binding_must_create_values_matching_its_filter() {
+    let binding = IssueSourceBindingSpec::builder()
+        .source(IssueSource { service: "https://github.com".into(), scope: "acme/app".into() })
+        .alias("app".to_string())
+        .filter(IssueFilter { match_fields: BTreeMap::from([("labels".into(), IssueFieldValue::One("terminal".into()))]) })
+        .create_with(BTreeMap::from([("labels".into(), IssueFieldValue::Many(vec!["bug".into()]))]))
+        .creatable(true)
+        .build();
+    let spec = ProjectSpec {
+        display_name: "App".into(),
+        default_workflow_ref: "implement".into(),
+        issue_sources: vec![binding],
+        repositories: vec![ProjectRepositorySpec::builder().repo(RepositoryKey("app".into())).build()],
+        dispatch_policy: None,
+    };
+
+    assert!(normalize_project_spec(spec)
+        .expect_err("mismatched creation values must fail")
+        .contains("does not satisfy filter field `labels`"));
+}
+
+#[test]
+fn issue_bindings_reject_state_as_band_semantics() {
+    let spec = ProjectSpec {
+        display_name: "App".into(),
+        default_workflow_ref: "implement".into(),
+        issue_sources: vec![IssueSourceBindingSpec::builder()
+            .source(IssueSource { service: "https://github.com".into(), scope: "acme/app".into() })
+            .filter(IssueFilter { match_fields: BTreeMap::from([("state".into(), IssueFieldValue::One("open".into()))]) })
+            .build()],
+        repositories: vec![ProjectRepositorySpec::builder().repo(RepositoryKey("app".into())).build()],
+        dispatch_policy: None,
+    };
+
+    assert_eq!(normalize_project_spec(spec).expect_err("state is not a binding field"), "issue source bindings cannot configure state");
 }
 
 #[tokio::test]
 async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let first = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("first repository");
     let second = RepositorySpec::remote("https://gitlab.com/widgets/api.git").expect("second repository");
     for spec in [&first, &second] {
-        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
+        repository_writer.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
     }
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_source: None,
+        issue_sources: vec![IssueSourceBindingSpec::builder()
+            .source(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() })
+            .filter(IssueFilter { match_fields: BTreeMap::from([("labels".into(), IssueFieldValue::One("ready".into()))]) })
+            .build()],
         dispatch_policy: None,
         repositories: vec![
-            ProjectRepositorySpec { repo: first.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
-            ProjectRepositorySpec { repo: second.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec {
+                repo: first.key(),
+                alias: Some("core".into()),
+                roles: [ProjectRepositoryRole::Code].into(),
+                subpath: None,
+                default_branch: None,
+            },
+            ProjectRepositorySpec {
+                repo: second.key(),
+                alias: Some("api".into()),
+                roles: [ProjectRepositoryRole::Code].into(),
+                subpath: None,
+                default_branch: None,
+            },
             ProjectRepositorySpec {
                 repo: first.key(),
                 alias: None,
@@ -55,24 +173,56 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
         ],
     };
 
-    assert_eq!(resolve_project_issue_sources(&repositories, &project).await, IssueSourceResolution::Available {
-        sources: vec![IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, IssueSource {
-            service: "https://gitlab.com".into(),
-            scope: "widgets/api".into()
-        },]
-    });
+    let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project).await else {
+        panic!("derived sources should resolve");
+    };
+    assert_eq!(bindings.iter().map(|binding| &binding.source).collect::<Vec<_>>(), vec![
+        &IssueSource { service: "https://gitlab.com".into(), scope: "widgets/api".into() },
+        &IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+    ]);
+    assert_eq!(bindings.iter().map(|binding| binding.alias.as_str()).collect::<Vec<_>>(), vec!["api", "core"]);
+    assert!(bindings.iter().find(|binding| binding.alias == "core").expect("filtered derived binding").creatable);
+}
+
+#[tokio::test]
+async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_writer = backend.using::<Repository>("flotilla");
+    let canonical = "https://forgejo.lab.flotilla.work/fork-issues/ghostty";
+    let repository = RepositorySpec::remote(canonical)
+        .expect("canonical repository")
+        .update_remotes("https://manchego.lab.flotilla.work/fork-issues/ghostty")
+        .expect("live alias remote");
+    let key = repository.key();
+    repository_writer.create(&InputMeta::builder().name(key.to_string()).build(), &repository).await.expect("repository should create");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
+    let project = ProjectSpec {
+        display_name: "ghostty".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        repositories: vec![ProjectRepositorySpec::builder().repo(key).roles([ProjectRepositoryRole::Code].into()).build()],
+        issue_sources: Vec::new(),
+        dispatch_policy: None,
+    };
+
+    let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project).await else {
+        panic!("repository forge should derive an issue source");
+    };
+
+    assert_eq!(bindings[0].source.service, "https://forgejo.lab.flotilla.work");
+    assert_eq!(bindings[0].source.scope, "fork-issues/ghostty");
 }
 
 #[tokio::test]
 async fn project_issue_source_resolution_reports_typed_unavailability() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
+    let repository_writer = backend.using::<Repository>("flotilla");
     let local = RepositorySpec::local("host-01", "/srv/widgets/.git").expect("local repository");
-    repositories.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    repository_writer.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_source: None,
+        issue_sources: Vec::new(),
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: local.key(),
@@ -157,6 +307,43 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
 }
 
 #[test]
+fn declared_remotes_share_the_first_remote_identity() {
+    let canonical = "https://github.com/flotilla-org/flotilla";
+    let mirror = "https://forgejo.lab/lab/flotilla.git";
+    let repository =
+        RepositorySpec::remote(mirror).expect("mirror observation").with_remotes([canonical, mirror]).expect("multi-remote declaration");
+
+    assert_eq!(repository.key(), RepositorySpec::remote(canonical).expect("canonical repository").key());
+    assert_eq!(repository.remotes(), [canonical, "https://forgejo.lab/lab/flotilla"]);
+    assert!(repository.declares_remote(mirror));
+    assert_eq!(repository.forge().expect("canonical forge").service_url, "https://github.com");
+    assert_eq!(repository.repo_fact_value(), "flotilla-org/flotilla");
+}
+
+#[test]
+fn declared_remotes_must_include_the_observed_repository_and_remain_unique() {
+    let observed = RepositorySpec::remote("https://forgejo.lab/lab/flotilla").expect("mirror observation");
+    assert!(observed.clone().with_remotes(["https://github.com/flotilla-org/flotilla"]).is_err());
+    assert!(observed.with_remotes(["https://forgejo.lab/lab/flotilla", "https://forgejo.lab/lab/flotilla.git"]).is_err());
+}
+
+#[test]
+fn remote_move_preserves_identity_and_tracks_live_forge() {
+    let original = "https://github.com/example/old-name";
+    let moved = "https://github.com/example/new-name";
+    let original_spec = RepositorySpec::remote(original).expect("original repository");
+    let key = original_spec.key();
+
+    let moved_spec = original_spec.update_remotes(moved).expect("remote move");
+
+    assert_eq!(moved_spec.key(), key);
+    assert_eq!(moved_spec.remotes(), [moved, original]);
+    assert_eq!(moved_spec.live_remote(), Some(moved));
+    assert_eq!(moved_spec.forge().expect("forge").repository, "example/new-name");
+    moved_spec.verify_key(&key).expect("birth identity remains valid");
+}
+
+#[test]
 fn repository_display_labels_use_forge_slugs_and_qualify_collisions() {
     let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
     let flotilla_widgets = RepositorySpec::remote("https://github.com/flotilla-org/widgets").expect("flotilla widgets repository");
@@ -230,7 +417,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let normalized = normalize_project_spec(ProjectSpec {
         display_name: " Example ".to_string(),
         default_workflow_ref: " single-agent-contained ".to_string(),
-        issue_source: None,
+        issue_sources: Vec::new(),
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
@@ -254,7 +441,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let duplicate = ProjectSpec {
         display_name: "Example".to_string(),
         default_workflow_ref: "single-agent-contained".to_string(),
-        issue_source: None,
+        issue_sources: Vec::new(),
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec { repo: repo_b.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
@@ -274,7 +461,7 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
         let spec = ProjectSpec {
             display_name: "Example".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_source: None,
+            issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("repo".to_string()),

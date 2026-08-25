@@ -10,7 +10,7 @@ use flotilla_core::agent_adapter::{
     append_convoy_work_context, build_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
     CrewBriefTemplateResolver,
 };
-use flotilla_protocol::PlacementDecision;
+use flotilla_protocol::{CanonicalHostId, PlacementDecision};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{
@@ -47,7 +47,7 @@ pub struct VesselReconciler {
     terminal_sessions: TypedResolver<TerminalSession>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
-    local_host_ref: Option<String>,
+    local_host_ref: Option<CanonicalHostId>,
     namespace: String,
     brief_templates: CrewBriefTemplateResolver,
 }
@@ -74,10 +74,10 @@ impl VesselReconciler {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
     }
 
-    pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: impl Into<String>) -> Self {
+    pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: CanonicalHostId) -> Self {
         self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
         self.federated_placement_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
-        self.local_host_ref = Some(local_host_ref.into());
+        self.local_host_ref = Some(local_host_ref);
         self
     }
 
@@ -118,7 +118,7 @@ impl VesselReconciler {
     }
 
     fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
-        let reconciler_host_ref = self.local_host_ref.as_deref().unwrap_or("unknown");
+        let reconciler_host_ref = self.local_host_ref.as_ref().map_or("unknown", CanonicalHostId::as_str);
         let message = format!(
             "host-local Environment {environment_ref} for placement host {placement_host_ref} was not found in the resource store for reconciler host {reconciler_host_ref}"
         );
@@ -203,12 +203,12 @@ struct ImageStamp {
 }
 
 #[derive(Debug, Clone)]
-pub struct VesselDeps {
+pub struct VesselPrepared {
     patch: PlannedPatch,
     actuations: Vec<Actuation>,
 }
 
-impl VesselDeps {
+impl VesselPrepared {
     fn none() -> Self {
         Self { patch: PlannedPatch::None, actuations: Vec::new() }
     }
@@ -260,16 +260,16 @@ impl VesselDeps {
 
 impl Reconciler for VesselReconciler {
     type Resource = Vessel;
-    type Dependencies = VesselDeps;
+    type Prepared = VesselPrepared;
 
-    async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         if obj.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Failed) {
-            return Ok(VesselDeps::none());
+            return Ok(VesselPrepared::none());
         }
 
         let convoy = match Self::dependency(&self.convoys, self.federated_convoys.as_ref(), obj, &obj.spec.convoy_ref).await {
             Ok(convoy) => convoy,
-            Err(ResourceError::NotFound { .. }) => return Ok(VesselDeps::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
+            Err(ResourceError::NotFound { .. }) => return Ok(VesselPrepared::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
             Err(err) => return Err(err),
         };
         let placement_decision = convoy.status.as_ref().and_then(|status| status.placement_decision.clone());
@@ -277,9 +277,9 @@ impl Reconciler for VesselReconciler {
             .local_host_ref
             .as_ref()
             .zip(placement_decision.as_ref())
-            .is_some_and(|(local_host_ref, decision)| decision.target_host.reference != *local_host_ref)
+            .is_some_and(|(local_host_ref, decision)| &decision.target_host.reference != local_host_ref)
         {
-            return Ok(VesselDeps::none());
+            return Ok(VesselPrepared::none());
         }
         let placement_policy = match Self::dependency(
             &self.placement_policies,
@@ -291,16 +291,16 @@ impl Reconciler for VesselReconciler {
         {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselDeps::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
+                return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
             }
             Err(err) => return Err(err),
         };
         let mut strategy = match placement_strategy(&placement_policy.spec) {
             Ok(strategy) => strategy,
-            Err(message) => return Ok(VesselDeps::failed(message)),
+            Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         if let Some(decision) = placement_decision.as_ref() {
-            strategy.canonicalize_host_ref(&decision.target_host.reference);
+            strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
         }
         let declared_agent_adapters =
             placement_policy.spec.docker_per_vessel.as_ref().map(|docker| docker.agent_adapters.clone()).unwrap_or_default();
@@ -312,15 +312,15 @@ impl Reconciler for VesselReconciler {
             .and_then(|snapshot| snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name))
         {
             Some((vessel_index, requirement)) => (vessel_index, requirement),
-            None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
+            None => return Ok(VesselPrepared::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
         let required_adapters = match required_agent_adapters(&requirement.crew) {
             Ok(adapters) => adapters,
-            Err(message) => return Ok(VesselDeps::failed(message)),
+            Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         let effective_stance = strategy.effective_stance();
         if effective_stance < requirement.stance {
-            return Ok(VesselDeps::failed(format!(
+            return Ok(VesselPrepared::failed(format!(
                 "vessel {} requires {} stance, but placement policy {} uses {} placement with effective {} stance",
                 obj.spec.vessel_name,
                 requirement.stance,
@@ -335,31 +335,34 @@ impl Reconciler for VesselReconciler {
             .clone()
             .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
         if repository_refs.is_empty() && requirement.repository_refs.is_some() {
-            return Ok(VesselDeps::failed(format!("vessel {} has an empty repository scope", obj.spec.vessel_name)));
+            return Ok(VesselPrepared::failed(format!("vessel {} has an empty repository scope", obj.spec.vessel_name)));
         }
         let git_ref = if repository_refs.is_empty() {
             None
         } else {
             match convoy.spec.r#ref.clone() {
                 Some(git_ref) => Some(git_ref),
-                None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
+                None => return Ok(VesselPrepared::failed("convoy ref is missing".to_string())),
             }
         };
         let checkout_slug = git_ref.as_deref().map(checkout_path_component);
         let convoy_checkout_slug = checkout_path_component(&convoy.metadata.name);
         if repository_refs.len() > 1 && !obj.spec.adopted_checkout_refs.is_empty() {
-            return Ok(VesselDeps::failed("adopted checkouts are not supported for multi-repository vessel workspaces".to_string()));
+            return Ok(VesselPrepared::failed("adopted checkouts are not supported for multi-repository vessel workspaces".to_string()));
         }
         let mut convoy_repositories = Vec::new();
         for repo_ref in &repository_refs {
             let Some(repository) = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref) else {
-                return Ok(VesselDeps::failed(format!(
+                return Ok(VesselPrepared::failed(format!(
                     "vessel {} references repository {repo_ref} outside its convoy",
                     obj.spec.vessel_name
                 )));
             };
             if convoy_repositories.iter().any(|existing: &&flotilla_resources::ConvoyRepositorySpec| existing.repo_ref == *repo_ref) {
-                return Ok(VesselDeps::failed(format!("vessel {} repository scope contains duplicate {repo_ref}", obj.spec.vessel_name)));
+                return Ok(VesselPrepared::failed(format!(
+                    "vessel {} repository scope contains duplicate {repo_ref}",
+                    obj.spec.vessel_name
+                )));
             }
             convoy_repositories.push(repository);
         }
@@ -375,16 +378,16 @@ impl Reconciler for VesselReconciler {
             let clone_env = match self.environments.get(&clone_env_ref).await {
                 Ok(environment) => environment,
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(VesselDeps::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())))
+                    return Ok(VesselPrepared::failed(self.missing_host_local_environment(&clone_env_ref, strategy.host_ref())))
                 }
                 Err(err) => return Err(err),
             };
             let clone_env_spec = match clone_env.spec.host_direct.as_ref() {
                 Some(spec) => spec,
-                None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
+                None => return Ok(VesselPrepared::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
             if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                return Ok(VesselDeps::provisioning(
+                return Ok(VesselPrepared::provisioning(
                     &placement_policy,
                     placement_decision.clone(),
                     format!("environment {clone_env_ref} to become ready"),
@@ -407,7 +410,7 @@ impl Reconciler for VesselReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(VesselDeps::failed(message));
+                            return Ok(VesselPrepared::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             let waiting_for = existing
@@ -415,7 +418,7 @@ impl Reconciler for VesselReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselDeps::provisioning_for_environment(
+                            return Ok(VesselPrepared::provisioning_for_environment(
                                 &placement_policy,
                                 placement_decision.clone(),
                                 &existing,
@@ -425,7 +428,7 @@ impl Reconciler for VesselReconciler {
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
-                            Err(message) => return Ok(VesselDeps::failed(message)),
+                            Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -448,7 +451,7 @@ impl Reconciler for VesselReconciler {
                                 }),
                             },
                         });
-                        return Ok(VesselDeps::provisioning(
+                        return Ok(VesselPrepared::provisioning(
                             &placement_policy,
                             placement_decision.clone(),
                             format!("environment {env_name} to become ready"),
@@ -491,14 +494,14 @@ impl Reconciler for VesselReconciler {
                     let repository_spec = match canonicalize_repo_url(&convoy_repository.url).and_then(RepositorySpec::remote) {
                         Ok(spec) => spec,
                         Err(message) => {
-                            return Ok(VesselDeps::failed(format!(
+                            return Ok(VesselPrepared::failed(format!(
                                 "convoy repository {} has invalid URL: {message}",
                                 convoy_repository.repo_ref
                             )))
                         }
                     };
                     if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
-                        return Ok(VesselDeps::failed(message));
+                        return Ok(VesselPrepared::failed(message));
                     }
                     actuations.push(Actuation::CreateRepository { key: convoy_repository.repo_ref.clone(), spec: repository_spec.clone() });
                     repository_spec
@@ -506,12 +509,12 @@ impl Reconciler for VesselReconciler {
                 Err(err) => return Err(err),
             };
             if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
-                return Ok(VesselDeps::failed(message));
+                return Ok(VesselPrepared::failed(message));
             }
             fork_stance |= repository_spec.is_fork();
             let canonical_repo = match repository_spec.identity() {
                 RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
-                RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
+                RepositoryIdentity::Local { .. } => return Ok(VesselPrepared::failed("convoy repository must have a transport remote")),
             };
             let repository_key = convoy_repository.repo_ref.clone();
             let repo_key = repository_key.to_string();
@@ -521,7 +524,7 @@ impl Reconciler for VesselReconciler {
                 match self.clones.get(&clone_name).await {
                     Ok(existing) => {
                         if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
-                            return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
+                            return Ok(VesselPrepared::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -569,13 +572,13 @@ impl Reconciler for VesselReconciler {
                     &convoy.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
                 ),
                 PlacementStrategy::DockerFreshCloneInContainer { .. } => checkout_name(
                     &obj.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_deref()).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
                 ),
             });
             let checkout_target_path = match &strategy {
@@ -602,10 +605,10 @@ impl Reconciler for VesselReconciler {
             match self.checkouts.get(&checkout_name).await {
                 Ok(existing) => {
                     if existing.spec.repo_ref() != &repository_key {
-                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} belongs to a different repository")));
+                        return Ok(VesselPrepared::failed(format!("checkout {checkout_name} belongs to a different repository")));
                     }
                     if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
-                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} is not adopted")));
+                        return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is not adopted")));
                     }
                     if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
                         let message = existing
@@ -613,7 +616,7 @@ impl Reconciler for VesselReconciler {
                             .as_ref()
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("checkout {checkout_name} failed"));
-                        return Ok(VesselDeps::failed(message));
+                        return Ok(VesselPrepared::failed(message));
                     }
                     if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
                         let Some(path) = existing
@@ -622,7 +625,7 @@ impl Reconciler for VesselReconciler {
                             .and_then(|status| status.path.clone())
                             .or_else(|| existing.spec.target_path().map(str::to_string))
                         else {
-                            return Ok(VesselDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
+                            return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
                         if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
                             contained_worktree_checkouts.push((checkout_name.clone(), match &existing.spec {
@@ -638,7 +641,7 @@ impl Reconciler for VesselReconciler {
                 }
                 Err(ResourceError::NotFound { .. }) => {
                     if adopted_checkout_ref.is_some() {
-                        return Ok(VesselDeps::failed(format!("adopted checkout {checkout_name} not found")));
+                        return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} not found")));
                     }
                     let spec = match &strategy {
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
@@ -679,7 +682,7 @@ impl Reconciler for VesselReconciler {
         }
         if !waiting_for_checkouts.is_empty() {
             let checkout_label = if waiting_for_checkouts.len() == 1 { "checkout" } else { "checkouts" };
-            return Ok(VesselDeps::provisioning(
+            return Ok(VesselPrepared::provisioning(
                 &placement_policy,
                 placement_decision.clone(),
                 format!("{checkout_label} {} to become ready", waiting_for_checkouts.join(", ")),
@@ -700,15 +703,15 @@ impl Reconciler for VesselReconciler {
                 let environment = match self.environments.get(&env_name).await {
                     Ok(environment) => environment,
                     Err(ResourceError::NotFound { .. }) => {
-                        return Ok(VesselDeps::failed(self.missing_host_local_environment(&env_name, host_ref)))
+                        return Ok(VesselPrepared::failed(self.missing_host_local_environment(&env_name, host_ref)))
                     }
                     Err(err) => return Err(err),
                 };
                 if environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
-                    return Ok(VesselDeps::failed(format!("environment {env_name} failed")));
+                    return Ok(VesselPrepared::failed(format!("environment {env_name} failed")));
                 }
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                    return Ok(VesselDeps::provisioning(
+                    return Ok(VesselPrepared::provisioning(
                         &placement_policy,
                         placement_decision.clone(),
                         format!("environment {env_name} to become ready"),
@@ -727,7 +730,7 @@ impl Reconciler for VesselReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(VesselDeps::failed(message));
+                            return Ok(VesselPrepared::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                             let waiting_for = existing
@@ -735,7 +738,7 @@ impl Reconciler for VesselReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} to become ready"));
-                            return Ok(VesselDeps::provisioning_for_environment(
+                            return Ok(VesselPrepared::provisioning_for_environment(
                                 &placement_policy,
                                 placement_decision.clone(),
                                 &existing,
@@ -745,7 +748,7 @@ impl Reconciler for VesselReconciler {
                         }
                         match image_stamp(&existing) {
                             Ok(image) => image,
-                            Err(message) => return Ok(VesselDeps::failed(message)),
+                            Err(message) => return Ok(VesselPrepared::failed(message)),
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -766,14 +769,14 @@ impl Reconciler for VesselReconciler {
                         let mut mounted_common_dirs = BTreeSet::new();
                         for (checkout_name, clone_ref) in &contained_worktree_checkouts {
                             let Some(clone_ref) = clone_ref else {
-                                return Ok(VesselDeps::failed(format!(
+                                return Ok(VesselPrepared::failed(format!(
                                     "contained worktree placement requires checkout {checkout_name} to be a managed worktree"
                                 )));
                             };
                             let clone = match self.clones.get(clone_ref).await {
                                 Ok(clone) => clone,
                                 Err(ResourceError::NotFound { .. }) => {
-                                    return Ok(VesselDeps::failed(format!(
+                                    return Ok(VesselPrepared::failed(format!(
                                         "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
                                     )))
                                 }
@@ -805,7 +808,7 @@ impl Reconciler for VesselReconciler {
                                 }),
                             },
                         });
-                        return Ok(VesselDeps::provisioning(
+                        return Ok(VesselPrepared::provisioning(
                             &placement_policy,
                             placement_decision.clone(),
                             format!("environment {env_name} to become ready"),
@@ -866,7 +869,7 @@ impl Reconciler for VesselReconciler {
                             .as_ref()
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
-                        return Ok(VesselDeps::failed(message));
+                        return Ok(VesselPrepared::failed(message));
                     }
                     if phase == Some(TerminalSessionPhase::Stopped) {
                         if matches!(process.source, CrewSource::Agent { .. }) {
@@ -885,7 +888,7 @@ impl Reconciler for VesselReconciler {
                             if !active {
                                 continue;
                             }
-                            return Ok(VesselDeps::interrupted(
+                            return Ok(VesselPrepared::interrupted(
                                 process.role.clone(),
                                 &terminal_name,
                                 work_phase == Some(WorkPhase::Interrupted),
@@ -897,10 +900,10 @@ impl Reconciler for VesselReconciler {
                             .as_ref()
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
-                        return Ok(VesselDeps::failed(message));
+                        return Ok(VesselPrepared::failed(message));
                     }
                     if phase == Some(TerminalSessionPhase::Starting) || (should_start && phase != Some(TerminalSessionPhase::Running)) {
-                        return Ok(VesselDeps::provisioning(
+                        return Ok(VesselPrepared::provisioning(
                             &placement_policy,
                             placement_decision.clone(),
                             format!("terminal session {terminal_name} to become running"),
@@ -936,12 +939,13 @@ impl Reconciler for VesselReconciler {
                                 None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
                                 None => CrewAssignment::Unassigned,
                             };
-                            let render_options = self.brief_templates.render_options_with_fork_stance(
+                            let mut render_options = self.brief_templates.render_options_with_fork_stance(
                                 brief_template.as_deref(),
                                 convoy.spec.project_ref.as_deref(),
                                 checkout_paths.values().map(PathBuf::from),
                                 fork_stance,
                             );
+                            render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
                             let mut brief = match build_crew_brief_with_options(
                                 &context,
                                 &obj.spec.vessel_name,
@@ -951,9 +955,9 @@ impl Reconciler for VesselReconciler {
                                 &render_options,
                             ) {
                                 Ok(brief) => brief,
-                                Err(message) => return Ok(VesselDeps::failed(message)),
+                                Err(message) => return Ok(VesselPrepared::failed(message)),
                             };
-                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
+                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent {
                                 selector: selector.clone(),
@@ -987,7 +991,7 @@ impl Reconciler for VesselReconciler {
                             pool: strategy.pool().to_string(),
                         },
                     });
-                    return Ok(VesselDeps::provisioning(
+                    return Ok(VesselPrepared::provisioning(
                         &placement_policy,
                         placement_decision.clone(),
                         format!("terminal session {terminal_name} to become running"),
@@ -998,7 +1002,7 @@ impl Reconciler for VesselReconciler {
             }
         }
 
-        Ok(VesselDeps {
+        Ok(VesselPrepared {
             patch: PlannedPatch::Ready {
                 placement_decision,
                 environment_ref: resolved_environment_ref,
@@ -1015,10 +1019,10 @@ impl Reconciler for VesselReconciler {
     fn reconcile(
         &self,
         obj: &ResourceObject<Self::Resource>,
-        deps: &Self::Dependencies,
+        prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
-        let patch = match &deps.patch {
+        let patch = match &prepared.patch {
             PlannedPatch::None => None,
             PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, wait_reason } => {
                 Some(VesselStatusPatch::MarkProvisioning {
@@ -1027,6 +1031,7 @@ impl Reconciler for VesselReconciler {
                     placement_decision: placement_decision.clone(),
                     started_at: now,
                     message: provisioning_stuck_message(obj, waiting_for, wait_reason.as_ref(), now),
+                    wait_reason: wait_reason.clone(),
                 })
             }
             PlannedPatch::Ready {
@@ -1061,10 +1066,10 @@ impl Reconciler for VesselReconciler {
             PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
         };
 
-        let mut outcome = ReconcileOutcome::with_actuations(patch, deps.actuations.clone());
-        if matches!(&deps.patch, PlannedPatch::Provisioning { .. }) {
+        let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
+        if matches!(&prepared.patch, PlannedPatch::Provisioning { .. }) {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
-        } else if matches!(&deps.patch, PlannedPatch::Interrupted { .. }) {
+        } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
             outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
         }
         outcome
@@ -1162,7 +1167,10 @@ fn provisioning_stuck_message(
     now: DateTime<Utc>,
 ) -> Option<String> {
     if matches!(wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })) {
-        return Some(waiting_for.to_string());
+        // Pool exhaustion is admission queueing, not a stalled provisioning
+        // attempt. Persist the typed wait reason as the holding signal without
+        // also publishing the generic stuck message.
+        return None;
     }
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
@@ -1175,7 +1183,7 @@ fn host_direct_environment_name(host_ref: &str) -> String {
 
 fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&PlacementDecision>) -> String {
     if let Some(decision) = placement_decision {
-        let target_environment = host_direct_environment_name(&decision.target_host.reference);
+        let target_environment = host_direct_environment_name(decision.target_host.reference.as_str());
         let display_environment = host_direct_environment_name(&decision.target_host.display_name);
         waiting_for = waiting_for.replace(&target_environment, &display_environment);
     }
@@ -1189,7 +1197,7 @@ mod material_pool_wait_tests {
     use super::*;
 
     #[test]
-    fn material_pool_wait_is_visible_immediately_in_vessel_status() {
+    fn material_pool_wait_is_not_reported_as_stuck() {
         let now = Utc::now();
         let vessel = ResourceObject::<Vessel> {
             metadata: ObjectMeta {
@@ -1215,7 +1223,7 @@ mod material_pool_wait_tests {
         let message = "waiting for agent login material; 2 in pool, all leased";
         let reason = EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() };
 
-        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now).as_deref(), Some(message));
+        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now), None);
     }
 }
 
@@ -1425,7 +1433,10 @@ mod tests {
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
             policy_name: "host-direct-test".to_string(),
-            target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+            target_host: PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
+                display_name: "kiwi".to_string(),
+            },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         };
@@ -1452,13 +1463,16 @@ mod tests {
             .build();
         let decision = PlacementDecision {
             policy_name: "host-direct-udder".to_string(),
-            target_host: PlacementTargetHost { reference: "1c8df992".to_string(), display_name: "udder".to_string() },
+            target_host: PlacementTargetHost {
+                reference: flotilla_protocol::CanonicalHostId::resolved("1c8df992"),
+                display_name: "udder".to_string(),
+            },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         };
         let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
 
-        strategy.canonicalize_host_ref(&decision.target_host.reference);
+        strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
 
         assert!(
             matches!(strategy, PlacementStrategy::HostDirect { ref host_ref, .. } if host_ref == "1c8df992"),
@@ -1490,7 +1504,8 @@ mod tests {
     #[test]
     fn missing_host_local_environment_warns_with_store_and_host_context() {
         let backend = ResourceBackend::InMemory(Default::default());
-        let reconciler = VesselReconciler::new(backend.clone(), "flotilla").with_federated_dependencies(&backend, "feta-host");
+        let reconciler = VesselReconciler::new(backend.clone(), "flotilla")
+            .with_federated_dependencies(&backend, flotilla_protocol::CanonicalHostId::resolved("feta-host"));
         let log_output = Arc::new(Mutex::new(Vec::new()));
         let message;
         {

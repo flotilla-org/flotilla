@@ -8,8 +8,9 @@ use crate::{
     entity,
     keys::{
         KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
-        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
-        KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
+        KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID,
+        KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL,
+        SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
 };
@@ -91,6 +92,43 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
 }
 
 #[test]
+fn long_entity_labels_publish_stable_semantic_tiers() {
+    let reference = convoy_ref("dev", "convoy-0123456789abcdef");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("grouping-live-session")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .project_ref("project/dev/platform-observability-tools")
+        .vessels(vec![vessel().convoy(&reference).name("publish-release-notes").phase(WorkPhase::Running).call()])
+        .build();
+    let independent = IndependentRow::builder()
+        .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "governor").on_host(HostName::new("feta")))
+        .name("governor")
+        .host(HostName::new("feta"))
+        .phase(SessionPhase::Running)
+        .build();
+
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[independent] }, &mint());
+    let first = catalog.reassert_patches();
+    let second = catalog.reassert_patches();
+    assert_eq!(first, second, "re-assertion must reuse the same label facts");
+
+    let cases = [
+        (entity::project("dev", "platform-observability-tools", "kiwi"), "platform-observability-tools", "po-tools", "pot"),
+        (entity::convoy("dev", "grouping-live-session", "kiwi"), "grouping-live-session", "gl-session", "gls"),
+        (entity::vessel("dev", "grouping-live-session", "publish-release-notes", "feta"), "publish-release-notes", "pr-notes", "prn"),
+        (entity::session("feta/dev/governor"), "governor", "governor", "g"),
+    ];
+    for (entity, full, medium, short) in cases {
+        let patch = find_entity(&first, &entity);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL), full);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL_MEDIUM), medium);
+        assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), short);
+    }
+}
+
+#[test]
 fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     let issue_ref = IssueRef {
         source: IssueSource { service: "https://github.com".to_owned(), scope: "flotilla-org/flotilla".to_owned() },
@@ -126,6 +164,8 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     );
     assert!(!issue_patch.set.contains_key(KEY_COUNT_ISSUES));
     assert!(!issue_patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    assert!(!issue_patch.set.contains_key(KEY_DISPLAY_LABEL_MEDIUM));
+    assert!(!issue_patch.set.contains_key(KEY_DISPLAY_LABEL_SHORT));
 }
 
 #[test]
@@ -166,6 +206,8 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
     let convoy = find_entity(&patches, &entity::convoy("dev", "landing", "fleet"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing · PR #1044");
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL_MEDIUM), "landing");
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL_SHORT), "l");
     assert_eq!(text(convoy, KEY_SUMMARY_TEXT), "landing · PR #1044");
     assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
     assert_eq!(text(convoy, KEY_CHANGE_REQUEST_NUMBER), "1044");
@@ -180,6 +222,82 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
     assert_eq!(text(project, KEY_SUMMARY_TEXT), "2 entries · 0 issues · 0 vessels · 1 checkouts");
     assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(2));
     assert_eq!(project.set[KEY_COUNT_CHECKOUTS].value, MetadataValue::Integer(1));
+}
+
+#[test]
+fn truncated_awareness_summary_reports_exact_omitted_count() {
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_owned())
+        .scope(flotilla_protocol::QueryScope::new("dev", "platform"))
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(5).convoys(5).build())
+        .entries(vec![
+            AwarenessEntry::builder()
+                .id("convoy/dev/one".to_owned())
+                .kind(AwarenessKind::Convoy)
+                .label("one".to_owned())
+                .state(AwarenessState::Active)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .build(),
+            AwarenessEntry::builder()
+                .id("convoy/dev/two".to_owned())
+                .kind(AwarenessKind::Convoy)
+                .label("two".to_owned())
+                .state(AwarenessState::Done)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .build(),
+        ])
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let project = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
+    assert!(text(project, KEY_SUMMARY_TEXT).ends_with("+3 more"));
+}
+
+#[test]
+fn same_role_remote_governors_project_as_distinct_catalog_entities() {
+    let governor = |resource_name: &str, project: &str| {
+        ConvoyRow::builder()
+            .resource(convoy_ref("flotilla", resource_name).on_host(HostName::new("udder")))
+            .name("governor")
+            .workflow_ref("standing-governor")
+            .phase(ConvoyPhase::Active)
+            .project_ref(project)
+            .build()
+    };
+    let awareness = |resource_name: &str, project: &str| {
+        AwarenessNode::builder()
+            .id(format!("project/flotilla/{project}"))
+            .kind(AwarenessKind::Project)
+            .label(project.to_owned())
+            .scope(flotilla_protocol::QueryScope::new("flotilla", project))
+            .state(AwarenessState::Active)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(1).convoys(1).build())
+            .entries(vec![AwarenessEntry::builder()
+                .id(format!("convoy/flotilla/{resource_name}"))
+                .kind(AwarenessKind::Convoy)
+                .label("governor".to_owned())
+                .state(AwarenessState::Active)
+                .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), "governor".to_owned())]))
+                .build()])
+            .build()
+    };
+    let convoys = [governor("governor-andamento-01234567", "andamento"), governor("governor-wheelhouse-89abcdef", "wheelhouse")];
+    let awareness = [awareness("governor-andamento-01234567", "andamento"), awareness("governor-wheelhouse-89abcdef", "wheelhouse")];
+
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[] }, &mint()).reassert_patches();
+    for (resource_name, project) in [("governor-andamento-01234567", "andamento"), ("governor-wheelhouse-89abcdef", "wheelhouse")] {
+        let governor = find_entity(&patches, &entity::convoy("flotilla", resource_name, "udder"));
+        assert_eq!(text(governor, SEGMENT_PROJECT), format!("flotilla/{project}@fleet"));
+        assert_eq!(text(governor, KEY_CONVOY), format!("flotilla/{resource_name}@udder"));
+        assert_eq!(text(governor, KEY_CONVOY_NAME), "governor");
+    }
 }
 
 #[test]
@@ -297,7 +415,10 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
 
     find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
-    find_entity(&patches, &entity::session("independent/dev/governor"));
+    let independent = find_entity(&patches, &entity::session("independent/dev/governor"));
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL), "governor");
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL_MEDIUM), "governor");
+    assert_eq!(text(independent, KEY_DISPLAY_LABEL_SHORT), "g");
     assert!(
         patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == "project")),
         "repository-only awareness must not mint a project entity"

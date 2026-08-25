@@ -26,14 +26,16 @@ use common::{
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
-    convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, TestLoopHarness,
+    convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, valid_workflow_template_spec, workflow_template_meta,
+    TestLoopHarness,
 };
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend, InputMeta, NoStatusPatch,
-    Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource,
-    TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
+    delete_resource_kind, ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EventRetention, InMemoryBackend,
+    InputMeta, NoStatusPatch, Project, ProjectSpec, Resource, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -42,6 +44,70 @@ use tokio::time::{timeout, Duration};
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
+}
+
+#[tokio::test]
+async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_once() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("initial store"));
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("wheelhouse-governor".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy hand-applied workflow");
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("workflow-snapshot-stray".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("legacy stray snapshot");
+    drop(backend);
+    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    connection
+        .execute("DELETE FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1'", [])
+        .expect("simulate pre-migration store");
+    connection
+        .execute(
+            r#"
+            INSERT INTO resource_decode_quarantine
+                (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+            VALUES ('flotilla.work', 'v1', 'WorkflowTemplate', 'flotilla', 'corrupt-template', '{}', 'legacy decode failure', ?1)
+            "#,
+            rusqlite::params![Utc::now().to_rfc3339()],
+        )
+        .expect("seed legacy workflow template quarantine");
+    drop(connection);
+
+    let migrated = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("migrate store"));
+    assert!(migrated.using::<WorkflowTemplate>("flotilla").list().await.expect("list templates").items.is_empty());
+    let connection = rusqlite::Connection::open(&path).expect("inspect migrated store");
+    let quarantined_templates: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM resource_decode_quarantine WHERE group_name = 'flotilla.work' AND version = 'v1' AND kind = 'WorkflowTemplate'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count quarantined templates");
+    assert_eq!(quarantined_templates, 0);
+    drop(connection);
+
+    migrated
+        .definitions::<WorkflowTemplate>("flotilla")
+        .apply(
+            &InputMeta::builder().name("single-agent-contained".to_string()).build(),
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+        )
+        .await
+        .expect("new global definition");
+    drop(migrated);
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen migrated store"));
+    assert!(reopened.definitions::<WorkflowTemplate>("flotilla").get("single-agent-contained").await.is_ok());
 }
 
 #[tokio::test]
@@ -587,6 +653,80 @@ async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
     );
 }
 
+#[tokio::test]
+async fn deleting_a_quarantined_object_clears_its_decode_diagnosis() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&convoy_meta("poisoned"), &convoy_spec("template-a"))
+            .await
+            .expect("create object to corrupt");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let changed = connection
+        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
+            Convoy::API_PATHS.kind,
+            "poisoned"
+        ])
+        .expect("corrupt stored object");
+    assert_eq!(changed, 1);
+    drop(connection);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    assert!(backend.using::<Convoy>("flotilla").list().await.expect("quarantine corrupt object").items.is_empty());
+    assert_eq!(backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len(), 1);
+
+    delete_resource_kind(&backend, "flotilla", Convoy::API_PATHS.kind, "poisoned")
+        .await
+        .expect("delete quarantined object through the operator resource API");
+
+    assert!(
+        backend.diagnostics().await.expect("read repaired diagnostics").expect("sqlite diagnostics").decode_quarantines.is_empty(),
+        "deleting a quarantined identity should resolve the active quarantine diagnosis"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_non_replicated_quarantined_object_clears_its_decode_diagnosis() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+        backend
+            .using::<WorkflowTemplate>("flotilla")
+            .create(&workflow_template_meta("poisoned"), &valid_workflow_template_spec())
+            .await
+            .expect("create object to corrupt");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
+    let changed = connection
+        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
+            WorkflowTemplate::API_PATHS.kind,
+            "poisoned"
+        ])
+        .expect("corrupt stored object");
+    assert_eq!(changed, 1);
+    drop(connection);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    assert!(backend.using::<WorkflowTemplate>("flotilla").list().await.expect("quarantine corrupt object").items.is_empty());
+
+    let deleted = delete_resource_kind(&backend, "flotilla", WorkflowTemplate::API_PATHS.kind, "poisoned")
+        .await
+        .expect("delete non-replicated quarantined object through the operator resource API");
+
+    assert!(!deleted.already_deleted, "the quarantine represented a stored identity that was actively deleted");
+    assert!(
+        backend.diagnostics().await.expect("read repaired diagnostics").expect("sqlite diagnostics").decode_quarantines.is_empty(),
+        "deleting a non-replicated quarantined identity should resolve the active quarantine diagnosis"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn delayed_sqlite_open_does_not_stall_tokio_executor() {
     let dir = tempdir().expect("tempdir");
@@ -714,12 +854,11 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         .await
         .expect("terminal child should be created");
 
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
-    let initial_dependencies =
-        convoy_reconciler.fetch_dependencies(&completed_convoy).await.expect("initial cleanup dependencies should load");
+    let initial_dependencies = convoy_reconciler.prepare(&completed_convoy).await.expect("initial cleanup dependencies should load");
     let initial_cleanup = convoy_reconciler.reconcile(&completed_convoy, &initial_dependencies, Utc::now());
     assert!(initial_cleanup
         .actuations
@@ -739,12 +878,11 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+    let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
         .with_vessels(vessels.clone())
         .with_teardown_runtime(Arc::new(AlwaysEligible));
     let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
-    let restart_dependencies =
-        convoy_reconciler.fetch_dependencies(&restarted_convoy).await.expect("restart cleanup dependencies should load");
+    let restart_dependencies = convoy_reconciler.prepare(&restarted_convoy).await.expect("restart cleanup dependencies should load");
     let restart_cleanup = convoy_reconciler.reconcile(&restarted_convoy, &restart_dependencies, Utc::now());
     assert!(
         !restart_cleanup

@@ -1,0 +1,25 @@
+{
+  "generation": "20260825T120000Z-r185-faaaaaaaaaaaa-cbbbbbbbbbbbb",
+  "manifest": {
+    "schema_version": 1,
+    "kind": "internal-promoted-fleet-generation",
+    "generation": "20260825T120000Z-r185-faaaaaaaaaaaa-cbbbbbbbbbbbb",
+    "sources": {
+      "flotilla": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "cleat": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "mattpocock-skills": "cccccccccccccccccccccccccccccccccccccccc",
+      "rjw-skills": "dddddddddddddddddddddddddddddddddddddddd"
+    },
+    "peer_protocol_version": 20,
+    "platforms": {}
+  },
+  "skill_bundle": {
+    "schema_version": 4,
+    "sources": [{
+      "name": "rjw-skills",
+      "repository": "https://github.com/rjwittams/rjw-skills.git",
+      "revision": "dddddddddddddddddddddddddddddddddddddddd",
+      "paths": ["plugins/../skills"]
+    }]
+  }
+}

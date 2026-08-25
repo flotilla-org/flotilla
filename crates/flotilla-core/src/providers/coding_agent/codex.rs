@@ -312,8 +312,36 @@ impl CodexCodingAgent {
     /// a repo matching `repo_slug`. This avoids matching by arbitrary environment
     /// label, which can cross-contaminate between repos.
     async fn fallback_via_all_environments(&self, repo_slug: &str, auth: &CodexAuth) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        let env_ids = match self.fetch_env_ids_from_all(auth).await {
+        let mut auth = auth.clone();
+        let env_ids = match self.fetch_env_ids_from_all(&auth).await {
             Ok(ids) => ids,
+            Err(e) if is_auth_error(&e) => {
+                let fresh_auth = match self.refresh_auth() {
+                    Some(a) => a,
+                    None => {
+                        if !self.auth_warned.swap(true, Ordering::Relaxed) {
+                            warn!(provider = "codex", "Codex fallback environment list failed: auth refresh failed");
+                        }
+                        return Ok(vec![]);
+                    }
+                };
+                match self.fetch_env_ids_from_all(&fresh_auth).await {
+                    Ok(ids) => {
+                        auth = fresh_auth;
+                        ids
+                    }
+                    Err(retry_error) => {
+                        if !self.auth_warned.swap(true, Ordering::Relaxed) {
+                            warn!(
+                                provider = "codex",
+                                error = %retry_error,
+                                "Codex fallback environment list unavailable after auth retry"
+                            );
+                        }
+                        return Ok(vec![]);
+                    }
+                }
+            }
             Err(e) => {
                 debug!(provider = "codex", error = %e, "fallback environment list failed");
                 return Ok(vec![]);
@@ -345,7 +373,7 @@ impl CodexCodingAgent {
 
         let mut all_sessions = Vec::new();
         for env_id in matching_ids {
-            match self.fetch_tasks(env_id, auth).await {
+            match self.fetch_tasks(env_id, &auth).await {
                 Ok(tasks) => {
                     for task in &tasks {
                         all_sessions.push(map_task_to_session(task, &self.provider_name));
@@ -529,3 +557,33 @@ impl super::CloudAgentService for CodexCodingAgent {
 }
 
 // --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{coding_agent::CloudAgentService, replay};
+
+    #[tokio::test]
+    async fn fallback_retries_environment_list_with_refreshed_auth() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let auth_path = tmp.path().join("auth.json");
+        std::fs::write(&auth_path, r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fresh-token","account_id":"acc-1"}}"#)
+            .expect("write auth file");
+
+        let fixture = crate::providers::testing::fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let session = replay::test_session(&fixture, replay::Masks::new());
+        let http = replay::test_http_client(&session);
+        let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new(auth_path), http);
+        {
+            let mut cache = agent.auth_cache.lock().expect("auth cache lock");
+            cache.auth = Some(CodexAuth { bearer_token: "expired-token".into(), account_id: None });
+            cache.loaded_at = Some(Instant::now());
+        }
+
+        let sessions = agent.list_sessions(&RepoCriteria { repo_slug: Some("owner/repo".into()) }).await.expect("list sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "task-1");
+        session.assert_complete();
+    }
+}

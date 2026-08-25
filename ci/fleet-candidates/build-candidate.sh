@@ -52,6 +52,8 @@ read_protocol_version() {
 main() {
 flotilla_sha="$(require_sha FLEET_FLOTILLA_SHA "${FLEET_FLOTILLA_SHA:-}")"
 cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
+mattpocock_skills_sha="$(require_sha FLEET_MATTPOCOCK_SKILLS_SHA "${FLEET_MATTPOCOCK_SKILLS_SHA:-}")"
+rjw_skills_sha="$(require_sha FLEET_RJW_SKILLS_SHA "${FLEET_RJW_SKILLS_SHA:-}")"
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
@@ -89,6 +91,56 @@ fi
 fetch_exact https://github.com/flotilla-org/flotilla.git "$flotilla_sha" "$flotilla_root"
 fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
 
+rm -rf "$output_root"
+mkdir -p "$bundle/bin" "$bundle/lib"
+
+skills_bundle="$bundle/share/flotilla/skills"
+mkdir -p "$skills_bundle"
+FLEET_SKILLS_BUNDLE="$skills_bundle" \
+  FLEET_FLOTILLA_SHA="$flotilla_sha" \
+  FLEET_CLEAT_SHA="$cleat_sha" \
+  FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha" \
+  FLEET_RJW_SKILLS_SHA="$rjw_skills_sha" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
+# Supply side only: the manifest pins sources. Per-crew skill requirements are
+# demand declarations (flotilla-org/flotilla#1790), never a list baked into a
+# generation.
+manifest = {
+    "schema_version": 4,
+    "sources": [
+        {
+            "name": "mattpocock-skills",
+            "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
+            "revision": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        },
+        {
+            "name": "rjw-skills",
+            "repository": "https://github.com/rjwittams/rjw-skills.git",
+            "revision": os.environ["FLEET_RJW_SKILLS_SHA"],
+            "paths": ["plugins/rjw-sdlc/skills"],
+        },
+        {
+            "name": "cleat",
+            "repository": "https://github.com/flotilla-org/cleat.git",
+            "revision": os.environ["FLEET_CLEAT_SHA"],
+        },
+        {
+            "name": "flotilla",
+            "repository": "https://github.com/flotilla-org/flotilla.git",
+            "revision": os.environ["FLEET_FLOTILLA_SHA"],
+        },
+    ],
+}
+(bundle / ".flotilla-sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+PY
+
+python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle/.flotilla-sources.json"
+
 (
   cd "$flotilla_root"
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
@@ -101,8 +153,6 @@ fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
   cargo build -p cleat --locked --features ghostty-vt --release
 )
 
-rm -rf "$output_root"
-mkdir -p "$bundle/bin" "$bundle/lib"
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
 install -m 0755 "$flotilla_root/target/release/flotillad" "$bundle/bin/flotillad"
 install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
@@ -141,8 +191,9 @@ else
   fi
 fi
 
-cp "$(dirname "$0")/install-candidate.sh" "$bundle/install.sh"
-chmod 0755 "$bundle/install.sh"
+cp "$flotilla_root/scripts/fleet-install" "$bundle/install.sh"
+cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
+chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
 
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"
@@ -155,6 +206,8 @@ export FLEET_BUNDLE="$bundle"
 export FLEET_PLATFORM="$platform"
 export FLEET_FLOTILLA_SHA="$flotilla_sha"
 export FLEET_CLEAT_SHA="$cleat_sha"
+export FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha"
+export FLEET_RJW_SKILLS_SHA="$rjw_skills_sha"
 export FLEET_PROTOCOL_VERSION="$protocol_version"
 python3 - <<'PY'
 import hashlib
@@ -182,6 +235,8 @@ manifest = {
     "sources": {
         "flotilla": os.environ["FLEET_FLOTILLA_SHA"],
         "cleat": os.environ["FLEET_CLEAT_SHA"],
+        "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
     },
     "build_profile": "release",
     "peer_protocol_version": int(os.environ["FLEET_PROTOCOL_VERSION"]),
@@ -211,6 +266,8 @@ metadata = {
     "sources": {
         "flotilla": os.environ["FLEET_FLOTILLA_SHA"],
         "cleat": os.environ["FLEET_CLEAT_SHA"],
+        "mattpocock-skills": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+        "rjw-skills": os.environ["FLEET_RJW_SKILLS_SHA"],
     },
     "artifact": archive.name,
     "sha256": os.environ["FLEET_ARCHIVE_SHA"],

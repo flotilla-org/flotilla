@@ -224,6 +224,7 @@ impl ConnectorState {
     pub fn cursors(&self) -> Vec<QueryCursor> {
         QueryId::ALWAYS_MATERIALIZED
             .iter()
+            .filter(|query| !matches!(query, QueryId::Checkouts { scope: None }))
             .cloned()
             .chain([QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() }])
             .map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query })

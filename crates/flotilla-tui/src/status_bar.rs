@@ -95,8 +95,8 @@ impl StatusSection {
 
     fn render(&self) -> String {
         match self {
-            Self::Plain(text) => text.clone(),
-            Self::Error { text, .. } => format!("{text} ×"),
+            Self::Plain(text) => text.lines().collect::<Vec<_>>().join(" · "),
+            Self::Error { text, .. } => format!("{} ×", text.lines().collect::<Vec<_>>().join(" · ")),
         }
     }
 }
@@ -267,6 +267,21 @@ fn ellipsize(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_status_is_normalized_before_single_line_width_calculation() {
+        let model = StatusBarModel::build(StatusBarInput {
+            width: 200,
+            preferred_status_width: 200,
+            keys_visible: false,
+            status: StatusSection::error(0, "Placement refused:\n- `feta`: host not ready\n- `udder`: adapter unavailable"),
+            task: None,
+            keys: vec![],
+            mode_indicators: vec![],
+        });
+
+        assert_eq!(model.status_text, "Placement refused: · - `feta`: host not ready · - `udder`: adapter unavailable ×");
+    }
 
     #[test]
     fn hides_keys_before_truncating_task_or_status() {

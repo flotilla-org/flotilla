@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
+use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
     CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
@@ -121,6 +121,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
                 LandedEvidence::builder().change_request_id("815".to_string()).merged_at("2026-07-21T23:15:00Z".to_string()).build(),
             ),
             change_request: None,
+            remote_refs: Default::default(),
         }),
     }
     .apply(&mut status);
@@ -137,6 +138,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
             landed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["no PR found".to_string()]).build(),
             landed_evidence: None,
             change_request: None,
+            remote_refs: Default::default(),
         }),
     }
     .apply(&mut status);
@@ -246,7 +248,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
     let placement_decision = PlacementDecision {
         policy_name: "docker-on-01HXYZ".to_string(),
-        target_host: PlacementTargetHost { reference: "01HXYZ".to_string(), display_name: "kiwi".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("01HXYZ"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
@@ -257,22 +259,28 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         observed_policy_version: "12".to_string(),
         started_at,
         message: None,
+        wait_reason: Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() }),
     }
     .apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Provisioning);
     assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision));
+    assert!(matches!(
+        status.wait_reason,
+        Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { ref pool_ref }) if pool_ref == "codex-login"
+    ));
 
     VesselStatusPatch::MarkProvisioning {
         placement_decision: Some(PlacementDecision {
             policy_name: "replacement-must-not-win".to_string(),
-            target_host: PlacementTargetHost { reference: "other".to_string(), display_name: "feta".to_string() },
+            target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("other"), display_name: "feta".to_string() },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         }),
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+        wait_reason: None,
         message: Some("still waiting".to_string()),
     }
     .apply(&mut status);
@@ -316,6 +324,20 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     VesselStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("clone failed"));
+}
+
+#[test]
+fn vessel_teardown_clears_a_provisioning_wait_reason() {
+    let mut status = VesselStatus {
+        phase: VesselPhase::Provisioning,
+        wait_reason: Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() }),
+        ..Default::default()
+    };
+
+    VesselStatusPatch::MarkTearingDown.apply(&mut status);
+
+    assert_eq!(status.phase, VesselPhase::TearingDown);
+    assert_eq!(status.wait_reason, None);
 }
 
 #[test]

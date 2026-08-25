@@ -11,6 +11,14 @@ pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 
+/// Store identity for a project-owned workflow template.
+///
+/// Operational entries keep using their short name. The project prefix keeps
+/// independently-authored definitions out of the same merge record.
+pub fn materialized_workflow_name(project: &str, workflow: &str) -> String {
+    format!("{project}--{workflow}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalEntryFile {
     pub path: String,
@@ -31,27 +39,38 @@ pub enum OperationalEntryDefinition {
     Ensure(EnsureEntry),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsureEntry {
+    pub driver: Option<String>,
     pub workflow: String,
-    #[serde(default)]
     pub placement: Option<String>,
-    #[serde(default)]
     pub stance: Option<Stance>,
-    #[serde(default, alias = "presents-as")]
     pub presents_as: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnsureBody {
+    workflow: String,
+    #[serde(default)]
+    placement: Option<String>,
+    #[serde(default)]
+    stance: Option<Stance>,
+    #[serde(default, alias = "presents-as")]
+    presents_as: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntryFrontmatter {
     kind: EntryKind,
-    name: String,
+    name: Option<String>,
+    role: Option<String>,
+    driver: Option<String>,
     repos: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum EntryKind {
     WorkflowTemplate,
@@ -77,7 +96,21 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
         Err(_) if !frontmatter.lines().any(|line| line.trim_start().starts_with("kind:")) => return Ok(None),
         Err(error) => return Err(format!("invalid operational entry frontmatter: {error}")),
     };
-    let name = required(frontmatter.name, "name")?;
+    let name = match frontmatter.kind {
+        EntryKind::Ensure => match (frontmatter.name, frontmatter.role) {
+            (None, Some(role)) => required(role, "role")?,
+            (Some(_), _) => return Err("ensure entries declare `role`, not `name`".to_string()),
+            (None, None) => return Err("ensure entry role cannot be empty".to_string()),
+        },
+        EntryKind::WorkflowTemplate | EntryKind::VerificationCommand => match (frontmatter.name, frontmatter.role) {
+            (Some(name), None) => required(name, "name")?,
+            (_, Some(_)) => return Err("only ensure entries declare `role`".to_string()),
+            (None, None) => return Err("operational entry name cannot be empty".to_string()),
+        },
+    };
+    if !matches!(frontmatter.kind, EntryKind::Ensure) && frontmatter.driver.is_some() {
+        return Err("only ensure entries declare `driver`".to_string());
+    }
     let repos = frontmatter
         .repos
         .map(|repos| {
@@ -97,7 +130,14 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
             OperationalEntryDefinition::VerificationCommand { command: required(body.command, "command")? }
         }
         EntryKind::Ensure => {
-            let mut body: EnsureEntry = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            let body: EnsureBody = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            let mut body = EnsureEntry {
+                driver: frontmatter.driver.map(|value| required(value, "driver")).transpose()?,
+                workflow: body.workflow,
+                placement: body.placement,
+                stance: body.stance,
+                presents_as: body.presents_as,
+            };
             body.workflow = required(body.workflow, "workflow")?;
             body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
             body.presents_as = body.presents_as.map(|value| required(value, "presents_as")).transpose()?;
@@ -144,7 +184,7 @@ mod tests {
     #[test]
     fn parses_standing_convoy_ensure_preferences() {
         let entry = parse_operational_entry(
-            "---\nkind: ensure\nname: quartermaster\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
+            "---\nkind: ensure\nrole: quartermaster\ndriver: udder\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
         )
         .expect("parse")
         .expect("entry");
@@ -152,12 +192,20 @@ mod tests {
         assert!(matches!(
             entry.definition,
             OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                driver: Some(driver),
                 workflow,
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),
                 presents_as: Some(presents_as),
-            }) if workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
+            }) if driver == "udder" && workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
         ));
+    }
+
+    #[test]
+    fn driver_is_ensure_frontmatter_not_body() {
+        let error = parse_operational_entry("---\nkind: ensure\nrole: quartermaster\n---\nworkflow: quartermaster\ndriver: udder\n")
+            .expect_err("body driver must be rejected");
+        assert!(error.contains("unknown field `driver`"));
     }
 
     #[test]
@@ -180,6 +228,7 @@ mod tests {
         assert!(matches!(
             ensure.definition,
             OperationalEntryDefinition::Ensure(super::EnsureEntry {
+                driver: None,
                 workflow,
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),
