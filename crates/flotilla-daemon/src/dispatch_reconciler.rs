@@ -9,8 +9,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchObservation, DispatchObservationSpec, DispatchPolicy,
-    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend,
+    ResourceError, ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
 use tracing::{info, warn};
 
@@ -36,20 +36,14 @@ impl DaemonDispatchIssueSource {
 impl DispatchIssueSource for DaemonDispatchIssueSource {
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
         let scope = QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-        let sources = self.daemon.resolve_issue_sources(&scope).await?;
+        let bindings = self.daemon.resolve_issue_source_bindings(&scope).await?;
         let mut issues = Vec::new();
-        for source in sources {
-            let provider = self.daemon.issue_provider_for_source(&source).await?;
+        for binding in bindings {
+            let provider = self.daemon.issue_provider_for_source(&binding.source).await?;
+            let query = ready_issue_query(&binding);
             let mut page = 1;
             loop {
-                let result = provider
-                    .query(
-                        &source,
-                        &IssueQuery { search: None, label: Some(READY_ISSUE_LABEL.to_string()), match_fields: Default::default() },
-                        page,
-                        ISSUE_PAGE_SIZE,
-                    )
-                    .await?;
+                let result = provider.query(&binding.source, &query, page, ISSUE_PAGE_SIZE).await?;
                 issues.extend(result.items);
                 if !result.has_more {
                     break;
@@ -62,6 +56,14 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
 
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
         self.daemon.fetch_issue_by_ref(reference).await
+    }
+}
+
+fn ready_issue_query(binding: &ResolvedIssueSourceBinding) -> IssueQuery {
+    IssueQuery {
+        search: None,
+        label: Some(READY_ISSUE_LABEL.to_string()),
+        match_fields: binding.filter.match_fields.iter().map(|(field, value)| (field.clone(), value.to_values())).collect(),
     }
 }
 
@@ -446,6 +448,25 @@ mod tests {
             provider_name: "fake".to_string(),
             provider_display_name: "Fake".to_string(),
         }
+    }
+
+    #[test]
+    fn ready_issue_queries_preserve_each_bindings_tracker_fields() {
+        let binding = ResolvedIssueSourceBinding {
+            source: source(),
+            alias: "widgets".to_string(),
+            filter: flotilla_resources::IssueFilter {
+                match_fields: BTreeMap::from([("component".to_string(), flotilla_resources::IssueFieldValue::One("terminal".to_string()))]),
+            },
+            create_with: BTreeMap::new(),
+            creatable: true,
+        };
+
+        assert_eq!(ready_issue_query(&binding), IssueQuery {
+            search: None,
+            label: Some(READY_ISSUE_LABEL.to_string()),
+            match_fields: BTreeMap::from([("component".to_string(), vec!["terminal".to_string()])]),
+        });
     }
 
     async fn harness(
