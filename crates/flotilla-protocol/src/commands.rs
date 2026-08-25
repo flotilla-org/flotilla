@@ -283,6 +283,8 @@ pub struct ConvoyExplanation {
     pub namespace: String,
     pub convoy: String,
     pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,

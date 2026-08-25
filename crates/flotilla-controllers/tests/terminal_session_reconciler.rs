@@ -182,6 +182,90 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
     ));
 }
 
+#[tokio::test]
+async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runtime() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-failed-convoy").await;
+    let convoy =
+        create_convoy_with_single_task(&backend, "flotilla", "failed-convoy", "work", "https://github.com/flotilla-org/flotilla", "main")
+            .await;
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let mut convoy_status = convoy.status.expect("convoy status");
+    convoy_status.phase = ConvoyPhase::Failed;
+    convoys.update_status("failed-convoy", &convoy.metadata.resource_version, &convoy_status).await.expect("fail convoy");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-failed-convoy-work-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "failed-convoy".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "env-failed-convoy".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("create terminal");
+    let mut running = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "cleat-failed-convoy".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut running);
+    let session =
+        sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &running).await.expect("mark terminal running");
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("terminal owner state");
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+
+    assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
+    assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal owner state must short-circuit the unavailable runtime");
+}
+
+#[tokio::test]
+async fn failed_environment_terminal_stops_without_probing_its_runtime() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-failed").await;
+    let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");
+    let environment = environments.get("env-failed").await.expect("environment");
+    let mut environment_status = environment.status.expect("environment status");
+    EnvironmentStatusPatch::MarkFailed { message: "container is permanently gone".to_string() }.apply(&mut environment_status);
+    environments.update_status("env-failed", &environment.metadata.resource_version, &environment_status).await.expect("fail environment");
+
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(&meta("terminal-failed-environment"), &TerminalSessionSpec {
+            env_ref: "env-failed".to_string(),
+            role: "coder".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("create terminal");
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("terminal environment state");
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+
+    assert!(matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkFailed { .. })));
+    assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteDemand { .. }]));
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 0, "terminal environment state must short-circuit the unavailable runtime");
+}
+
 #[derive(Default)]
 struct UnavailableRunningRuntime {
     probes: AtomicUsize,

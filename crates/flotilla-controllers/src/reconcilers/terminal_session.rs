@@ -161,21 +161,35 @@ impl<R> TerminalSessionReconciler<R> {
             .ok_or_else(|| ResourceError::not_found(convoy_ref))
     }
 
-    async fn session_owner_missing(&self, session: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
+    async fn session_owner_state(&self, session: &ResourceObject<TerminalSession>) -> Result<TerminalOwnerState, ResourceError> {
         let convoy_ref = match &session.spec.source {
             TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
             TerminalSessionSource::Tool { .. } => session.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
         };
         let Some(convoy_ref) = convoy_ref else {
-            return Ok(false);
+            return Ok(TerminalOwnerState::Active);
         };
         match self.convoy_for_session(session, convoy_ref).await {
-            Ok(convoy) => Ok(convoy.metadata.deletion_timestamp.is_some()
-                || convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned)),
-            Err(ResourceError::NotFound { .. }) => Ok(true),
+            Ok(convoy)
+                if convoy.metadata.deletion_timestamp.is_some()
+                    || convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned) =>
+            {
+                Ok(TerminalOwnerState::Gone)
+            }
+            Ok(convoy) => Ok(match convoy.status.as_ref().map(|status| status.phase) {
+                Some(ConvoyPhase::Failed | ConvoyPhase::Cancelled) => TerminalOwnerState::Terminal,
+                _ => TerminalOwnerState::Active,
+            }),
+            Err(ResourceError::NotFound { .. }) => Ok(TerminalOwnerState::Gone),
             Err(err) => Err(err),
         }
     }
+}
+
+enum TerminalOwnerState {
+    Active,
+    Gone,
+    Terminal,
 }
 
 pub enum TerminalPrepared {
@@ -189,6 +203,7 @@ pub enum TerminalPrepared {
     Attention(TerminalObservation),
     AttentionStale,
     OwnerMissing,
+    OwnerTerminal,
     Failed(String),
 }
 
@@ -208,8 +223,17 @@ where
             Err(ResourceError::NotFound { .. }) => return Ok(TerminalPrepared::OwnerMissing),
             Err(err) => return Err(err),
         };
-        if self.session_owner_missing(obj).await? {
-            return Ok(TerminalPrepared::OwnerMissing);
+        if environment
+            .status
+            .as_ref()
+            .is_some_and(|status| matches!(status.phase, EnvironmentPhase::Terminating | EnvironmentPhase::Failed))
+        {
+            return Ok(TerminalPrepared::OwnerTerminal);
+        }
+        match self.session_owner_state(obj).await? {
+            TerminalOwnerState::Gone => return Ok(TerminalPrepared::OwnerMissing),
+            TerminalOwnerState::Terminal => return Ok(TerminalPrepared::OwnerTerminal),
+            TerminalOwnerState::Active => {}
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
@@ -310,6 +334,12 @@ where
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let patch = match phase {
+            TerminalSessionPhase::Starting | TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::OwnerTerminal) => {
+                Some(TerminalSessionStatusPatch::MarkFailed {
+                    message: "owning environment or convoy reached a terminal phase".to_string(),
+                    stopped_at: Some(now),
+                })
+            }
             TerminalSessionPhase::Starting => match prepared {
                 TerminalPrepared::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
                     session_id: state.session_id.clone(),
@@ -330,7 +360,8 @@ where
                 | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
-                | TerminalPrepared::OwnerMissing => None,
+                | TerminalPrepared::OwnerMissing
+                | TerminalPrepared::OwnerTerminal => None,
             },
             TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped) => {
                 Some(TerminalSessionStatusPatch::MarkStopped {
@@ -395,7 +426,9 @@ where
 
         let actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
-            TerminalPrepared::Stopped => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
             TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
             _ if matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
@@ -465,10 +498,6 @@ where
 
     fn is_reconcile_degraded(&self, obj: &ResourceObject<Self::Resource>) -> bool {
         obj.status.as_ref().is_some_and(|status| status.degraded.is_some())
-    }
-
-    async fn degraded_object_needs_reconcile(&self, obj: &ResourceObject<Self::Resource>) -> Result<bool, ResourceError> {
-        self.session_owner_missing(obj).await
     }
 }
 
