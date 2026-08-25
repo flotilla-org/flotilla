@@ -13,6 +13,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         namespace: "flotilla".into(),
         convoy: "ledger".into(),
         phase: "Landing".into(),
+        message: Some("waiting for review evidence".into()),
         evidence_ttl_seconds: 30,
         change_request_stale_after_seconds: 30,
         checkouts: Vec::new(),
@@ -39,6 +40,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    assert!(output.contains("Message: waiting for review evidence"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (flagged; claim accepted)"));
 }

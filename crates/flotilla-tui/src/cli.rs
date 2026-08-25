@@ -536,6 +536,9 @@ fn explanation_provenance_label(provenance: Option<&flotilla_protocol::ResourceR
 
 pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::ConvoyExplanation) -> String {
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    if let Some(message) = explanation.message.as_deref() {
+        let _ = writeln!(output, "Message: {message}");
+    }
     let standing = explanation.settlement.mode == flotilla_protocol::commands::SETTLEMENT_MODE_STANDING;
     let verdict = if explanation.settlement.satisfied { "SATISFIED" } else { "HOLDING" };
     if standing {

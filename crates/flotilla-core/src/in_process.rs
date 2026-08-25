@@ -10580,6 +10580,7 @@ impl InProcessDaemon {
             namespace,
             convoy: name.to_string(),
             phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),
+            message: convoy.status.as_ref().and_then(|status| status.message.clone()),
             evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),
             checkouts,
