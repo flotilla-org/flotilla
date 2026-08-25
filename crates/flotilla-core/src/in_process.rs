@@ -5013,7 +5013,7 @@ impl InProcessDaemon {
 
         let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
         let demand_name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
-        let (resolved_escalation, forced_escalation) = match demands.get(&demand_name).await {
+        let resolved_escalation = match demands.get(&demand_name).await {
             Ok(demand)
                 if demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)) =>
             {
@@ -5021,13 +5021,13 @@ impl InProcessDaemon {
                     return Ok(None);
                 }
                 demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
-                (consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES, false)
+                consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES
             }
             Ok(_) => {
                 demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
-                (true, false)
+                true
             }
-            Err(ResourceError::NotFound { .. }) => (false, false),
+            Err(ResourceError::NotFound { .. }) => false,
             Err(error) => return Err(error.to_string()),
         };
 
@@ -5072,9 +5072,6 @@ impl InProcessDaemon {
             }
         }
 
-        if forced_escalation {
-            demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
-        }
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(_) => {
                 self.ensure_admission_retries.lock().await.remove(&retry_key);

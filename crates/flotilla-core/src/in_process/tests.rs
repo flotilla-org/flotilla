@@ -1291,20 +1291,15 @@ async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
         .is_empty());
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("bounded generations").items.len(), 3);
 
-    apply_resource_status_patch(&demands, "ensure-attention-quartermaster", &DemandStatusPatch::Acknowledge {
-        as_of: driver_clock.now(),
-        authority: "operator".to_string(),
-    })
-    .await
-    .expect("resolve escalation");
+    let ensure = authority_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure");
     assert_eq!(
         driver
-            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking)
+            .reconcile_driver_convoy_ensure("flotilla", &ensure, &VerifiedDeadBacking, true)
             .await
-            .expect("resolved escalation resumes admission")
-            .len(),
-        1
+            .expect("forced reconcile bypasses active driver escalation"),
+        Some("started quartermaster@standing-project".to_string())
     );
+    assert!(matches!(demands.get("ensure-attention-quartermaster").await, Err(ResourceError::NotFound { .. })));
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("resumed generations").items.len(), 4);
     assert!(
         authority_backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure").status.is_none(),
