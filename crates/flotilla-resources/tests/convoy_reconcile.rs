@@ -256,7 +256,8 @@ async fn reconcile_with_observed_change_request(
 
 async fn reconcile_with_observed_digest(
     phase: ConvoyPhase,
-    observed_digest: &str,
+    observed_digest: Option<&str>,
+    existing_attention: bool,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let now = timestamp(40);
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -279,6 +280,15 @@ async fn reconcile_with_observed_digest(
         .claimed_head_digest("claimed-digest".to_string())
         .build();
     let mut status = ConvoyStatus { phase, observed_workflow_ref: Some("reviewless".to_string()), ..Default::default() };
+    if existing_attention {
+        status.attention = Some(
+            flotilla_resources::ConvoyAttention::builder()
+                .source("observed-digest".to_string())
+                .reason("old mismatch".to_string())
+                .raised_at(now)
+                .build(),
+        );
+    }
     status.crew_work.insert(
         "work".to_string(),
         BTreeMap::from([(
@@ -308,13 +318,15 @@ async fn reconcile_with_observed_digest(
         .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
             phase: CheckoutPhase::Ready,
             integration: CheckoutIntegrationStatus {
-                remote_refs: BTreeMap::from([(
-                    "refs/heads/topic".to_string(),
-                    flotilla_resources::RemoteRefObservation::builder()
-                        .digest(observed_digest.to_string())
-                        .observed_at(now.to_rfc3339())
-                        .build(),
-                )]),
+                remote_refs: observed_digest.map_or_else(BTreeMap::new, |digest| {
+                    BTreeMap::from([(
+                        "refs/heads/topic".to_string(),
+                        flotilla_resources::RemoteRefObservation::builder()
+                            .digest(digest.to_string())
+                            .observed_at(now.to_rfc3339())
+                            .build(),
+                    )])
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -331,16 +343,17 @@ async fn reconcile_with_observed_digest(
 
 #[tokio::test]
 async fn approved_claim_settles_when_remote_ref_is_observed_at_claimed_digest() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, "claimed-digest").await;
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("claimed-digest"), false).await;
     assert_eq!(outcome.patch, Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn different_observed_digest_holds_settlement_and_raises_attention() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, "different-digest").await;
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, Some("different-digest"), false).await;
     let Some(ConvoyStatusPatch::SetSettlementAttention { attention }) = outcome.patch else {
         panic!("digest mismatch should raise convoy attention")
     };
+    let attention = attention.expect("mismatch attention");
     assert_eq!(attention.source, "observed-digest");
     assert!(attention.reason.contains("different-digest"));
     assert!(attention.reason.contains("claimed-digest"));
@@ -348,8 +361,14 @@ async fn different_observed_digest_holds_settlement_and_raises_attention() {
 
 #[tokio::test]
 async fn post_settlement_force_push_does_not_unsettle_convoy() {
-    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landed, "different-digest").await;
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landed, Some("different-digest"), false).await;
     assert!(outcome.patch.is_none(), "Landed is terminal for the settled claim even after the remote ref moves");
+}
+
+#[tokio::test]
+async fn observed_digest_attention_clears_when_mismatch_is_no_longer_observed() {
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, None, true).await;
+    assert_eq!(outcome.patch, Some(ConvoyStatusPatch::SetSettlementAttention { attention: None }));
 }
 
 #[tokio::test]

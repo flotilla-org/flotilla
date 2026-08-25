@@ -657,8 +657,15 @@ impl Reconciler for ConvoyReconciler {
                     .and_then(|status| status.attention.as_ref())
                     .is_none_or(|existing| existing.source != attention.source || existing.reason != attention.reason);
                 if changed {
-                    outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: attention.clone() });
+                    outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: Some(attention.clone()) });
                 }
+            } else if obj
+                .status
+                .as_ref()
+                .and_then(|status| status.attention.as_ref())
+                .is_some_and(|attention| attention.source == "observed-digest")
+            {
+                outcome.patch = Some(ConvoyStatusPatch::SetSettlementAttention { attention: None });
             }
         }
         // A refused reclaim must retry on its own schedule: the refusal is

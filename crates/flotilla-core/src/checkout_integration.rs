@@ -118,7 +118,8 @@ pub async fn inspect_checkout_integration(
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
 ) -> CheckoutIntegrationStatus {
-    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, None, change_request_id.is_some()).await
+    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, None, change_request_id.is_some(), false)
+        .await
 }
 
 /// Inspect a checkout for settlement after the caller has resolved the
@@ -127,10 +128,23 @@ pub async fn inspect_convoy_checkout_integration(
     runner: &dyn CommandRunner,
     checkout_path: &Path,
     spec: &CheckoutSpec,
+    convoy: &ResourceObject<Convoy>,
     change_request_id: Option<&str>,
     observed_change_request: Option<&ChangeRequestStatus>,
 ) -> CheckoutIntegrationStatus {
-    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, observed_change_request, true).await
+    let observe_remote_ref = convoy.status.as_ref().is_some_and(|status| {
+        status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some())
+    });
+    inspect_checkout_integration_with_association(
+        runner,
+        checkout_path,
+        spec,
+        change_request_id,
+        observed_change_request,
+        true,
+        observe_remote_ref,
+    )
+    .await
 }
 
 async fn inspect_checkout_integration_with_association(
@@ -140,6 +154,7 @@ async fn inspect_checkout_integration_with_association(
     change_request_id: Option<&str>,
     observed_change_request: Option<&ChangeRequestStatus>,
     convoy_association_complete: bool,
+    observe_remote_ref: bool,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
     let clean = inspect_clean(runner, checkout_path, &observed_at).await;
@@ -154,7 +169,11 @@ async fn inspect_checkout_integration_with_association(
         &observed_at,
     )
     .await;
-    let remote_refs = inspect_remote_ref(runner, checkout_path, checkout_branch_from_spec(spec), &observed_at).await;
+    let remote_refs = if observe_remote_ref {
+        inspect_remote_ref(runner, checkout_path, checkout_branch_from_spec(spec), &observed_at).await
+    } else {
+        BTreeMap::new()
+    };
     CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence, change_request, remote_refs }
 }
 

@@ -2895,7 +2895,8 @@ impl InProcessDaemon {
                 });
             let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
-                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, change_request_id.as_deref(), None).await
+                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, convoy, change_request_id.as_deref(), None)
+                    .await
             } else {
                 inspect_checkout_integration(
                     &*runner,

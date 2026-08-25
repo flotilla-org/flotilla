@@ -688,7 +688,7 @@ pub enum ConvoyStatusPatch {
         finished_at: DateTime<Utc>,
     },
     SetSettlementAttention {
-        attention: ConvoyAttention,
+        attention: Option<ConvoyAttention>,
     },
     WorkLaunching {
         work: String,
@@ -897,7 +897,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.attention = None;
                 clear_operator_pending_brief(status);
             }
-            Self::SetSettlementAttention { attention } => status.attention = Some(attention.clone()),
+            Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Launching;
