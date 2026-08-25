@@ -44,7 +44,7 @@ struct GithubAppTokenResponse {
     expires_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct GithubAppToken {
     value: String,
     expires_at: DateTime<Utc>,
@@ -1724,7 +1724,7 @@ interactions:
             http: Arc::new(ReplayHttpClient::new(session.clone())),
             clock: Arc::new(VirtualClock::new(now)),
         };
-        let error = minter
+        let result = minter
             .mint(&GithubAppMintRequest {
                 installation_id: 9876,
                 app_id_path: app_id_path.to_string_lossy().into_owned(),
@@ -1732,8 +1732,10 @@ interactions:
                 repositories: vec!["flotilla".to_string()],
                 permissions: Some(BTreeMap::from([("contents".to_string(), "write".to_string())])),
             })
-            .await
-            .expect_err("unsupported downscope must fail");
+            .await;
+        let Err(error) = result else {
+            panic!("unsupported downscope must fail");
+        };
 
         assert!(error.contains("HTTP 422 Unprocessable Entity"), "unexpected mint error: {error}");
         assert!(error.contains("permissions requested are not granted"), "GitHub response detail missing: {error}");
