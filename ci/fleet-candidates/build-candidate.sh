@@ -175,8 +175,9 @@ else
   fi
 fi
 
-cp "$(dirname "$0")/install-candidate.sh" "$bundle/install.sh"
-chmod 0755 "$bundle/install.sh"
+cp "$flotilla_root/scripts/fleet-install" "$bundle/install.sh"
+cp "$flotilla_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
+chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
 
 wire_generation="${flotilla_sha:0:12}"
 "$bundle/bin/flotilla" --version | grep -F "wire=$wire_generation"

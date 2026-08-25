@@ -17,6 +17,7 @@
     "bin/flotillad",
     "bin/cleat",
     "install.sh",
+    "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json"
   ],
   "skill_bundle": {
