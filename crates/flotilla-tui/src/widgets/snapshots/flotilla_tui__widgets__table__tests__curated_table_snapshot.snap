@@ -5,7 +5,7 @@ expression: terminal.backend()
 "┌ Convoys · dev ───────────────────────────────────────────────────────────────────────────────────────────────────────┐"
 "│convoys/dev                                                                                                           │"
 "│CONVOY                WORKFLOW       PHASE        PR               VESSELS PROJECT / REPO   MESSAGE                   │"
-"│tables @ flotilla     implement-revi initializing                      0/2 flotilla         waiting for workflow stat │"
+"│tables @ flotilla     implement-revi pending                           0/2 flotilla         waiting for workflow stat │"
 "│release @ flotilla    implement-revi active       #815 open            1/3 flotilla         review is running         │"
 "│docs @ flotilla       implement-revi landed       #812 merged          2/2 flotilla                                   │"
 "│deploy @ flotilla     implement-revi failed                            1/2 flotilla         workspace launch failed   │"

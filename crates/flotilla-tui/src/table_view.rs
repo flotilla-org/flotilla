@@ -1100,7 +1100,7 @@ fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
 
 fn convoy_phase(row: &ConvoySummary) -> CellValue {
     if row.initializing && !row.phase.is_terminal() {
-        return CellValue::toned("initializing", CellTone::Warning);
+        return CellValue::toned("pending", CellTone::Warning);
     }
     let tone = match row.phase {
         ConvoyPhase::Pending => CellTone::Muted,
@@ -1506,6 +1506,17 @@ mod tests {
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
         assert_eq!(view.rows[0].cells[6].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
+    }
+
+    #[test]
+    fn initializing_convoy_is_presented_as_pending_with_its_wait_reason() {
+        let mut row = convoy(Vec::new());
+        row.initializing = true;
+        row.message = Some("waiting for an available codex credential".into());
+        let view = project_convoys("convoys/dev", &[&row]).expect("project table");
+
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("pending", CellTone::Warning));
+        assert_eq!(view.rows[0].cells[6].text, "waiting for an available codex credential");
     }
 
     #[test]

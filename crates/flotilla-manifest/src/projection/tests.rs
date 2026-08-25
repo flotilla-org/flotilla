@@ -462,9 +462,29 @@ fn catalog_diff_unsets_removed_entity_facts() {
 
 #[test]
 fn badges_preserve_normalized_status_and_attention() {
+    assert_eq!(convoy_badge(ConvoyPhase::Pending, false), Badge { state: BadgeState::Waiting, attention: false });
+    assert_eq!(convoy_badge(ConvoyPhase::Active, false), Badge { state: BadgeState::Active, attention: false });
     assert_eq!(convoy_badge(ConvoyPhase::Failed, false), Badge { state: BadgeState::Failed, attention: true });
     assert_eq!(work_badge(WorkPhase::Ready), Badge { state: BadgeState::Waiting, attention: true });
     assert_eq!(session_badge(SessionPhase::Running), Badge { state: BadgeState::Active, attention: false });
+}
+
+#[test]
+fn convoy_summary_surfaces_status_message_ahead_of_progress() {
+    let reference = convoy_ref("dev", "waiting");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("waiting")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Pending)
+        .message("2 in pool, all leased")
+        .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Pending).call()])
+        .build();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
+    let patch = find_entity(&patches, &entity::convoy("dev", "waiting", "kiwi"));
+
+    assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
+    assert_eq!(text(patch, KEY_SUMMARY_TEXT), "2 in pool, all leased");
 }
 
 #[test]
