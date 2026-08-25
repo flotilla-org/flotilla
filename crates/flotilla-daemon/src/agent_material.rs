@@ -393,10 +393,14 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
     let required = manifest.required_skills.iter().collect::<BTreeSet<_>>();
     if manifest.required_skills.is_empty()
         || required.len() != manifest.required_skills.len()
-        || manifest
-            .required_skills
-            .iter()
-            .any(|name| name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\'))
+        || manifest.required_skills.iter().any(|name| {
+            name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.contains('/')
+                || name.contains('\\')
+                || name.chars().any(|character| matches!(character, '\r' | '\n'))
+        })
     {
         return Err(format!("skill source manifest {} has invalid required skills", manifest_path.display()));
     }
@@ -683,6 +687,7 @@ mod tests {
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
         let environment = vec![
+            ("CODEX_HOME".to_string(), "/image/codex".to_string()),
             ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
             ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
         ];

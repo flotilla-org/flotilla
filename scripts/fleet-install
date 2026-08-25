@@ -532,6 +532,8 @@ if (
         or name in {".", ".."}
         or "/" in name
         or "\\" in name
+        or "\r" in name
+        or "\n" in name
         for name in required_skills
     )
     or len(set(required_skills)) != len(required_skills)
