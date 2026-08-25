@@ -3912,38 +3912,28 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
 }
 
 #[tokio::test]
-async fn refresh_syncs_fork_stance_without_whole_project_migration_and_clears_removed_config() {
-    let (temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+async fn refresh_preserves_repository_spec_fork_stance_and_explicit_removal() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
-    ConfigStore::with_base(temp.path().join("config"))
-        .add_observation_root(&ExecutionEnvironmentPath::new(repo.clone()))
-        .expect("persist observation root");
-    let repo_config = std::fs::read_dir(temp.path().join("config/repos"))
-        .expect("repo config directory")
-        .find_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension().is_some_and(|extension| extension == "toml")).then_some(path)
-        })
-        .expect("persisted repo config");
-    let path = repo.to_string_lossy();
-    std::fs::write(
-        &repo_config,
-        format!("path = \"{path}\"\n\n[upstream]\nurl = \"https://github.com/upstream/repo\"\nrelation = \"fork\"\n"),
-    )
-    .expect("write fork config");
-
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork config");
-
     let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("materialize repository");
     let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
-    assert!(stored.spec.is_fork(), "refresh should apply fork provenance without changing repository identity");
+    let fork = stored.spec.clone().with_upstream("https://github.com/upstream/repo", RepositoryRelation::Fork).expect("fork stance");
+    repositories.update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &fork).await.expect("set fork stance");
 
-    std::fs::write(&repo_config, format!("path = \"{path}\"\n")).expect("remove fork config");
-    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh removed fork config");
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork repository");
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.is_fork(), "refresh should preserve replicated fork provenance");
+
+    repositories
+        .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &repository)
+        .await
+        .expect("remove fork stance");
+    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh repository after explicit removal");
 
     let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
-    assert!(stored.spec.upstream().is_none(), "authoritative per-repository config removal should clear previously stored fork provenance");
+    assert!(stored.spec.upstream().is_none(), "refresh should preserve explicit fork provenance removal");
 }
 
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {

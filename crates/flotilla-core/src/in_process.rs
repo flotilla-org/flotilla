@@ -2493,8 +2493,7 @@ impl InProcessDaemon {
                     return self.configure_unassociated_repository(path, spec).await;
                 }
                 let live_remote = spec.live_remote().map(str::to_string);
-                let stable_spec = spec.with_stable_identity_from(&stored.spec)?;
-                let mut updated = stable_spec;
+                let mut updated = stored.spec.clone();
                 if let Some(live_remote) = live_remote {
                     updated = updated.update_remotes(live_remote)?;
                 }
