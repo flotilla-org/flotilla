@@ -162,6 +162,7 @@ async fn reconcile_with_observed_change_request(
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_convoy_status();
     status.phase = phase;
@@ -194,6 +195,16 @@ async fn reconcile_with_observed_change_request(
         .update_status("convoy-a", &created.metadata.resource_version, source.status.as_ref().expect("status"))
         .await
         .expect("convoy status");
+
+    vessels
+        .create(&vessel_meta("convoy-a-implement", "convoy-a", "implement"), &VesselSpec {
+            convoy_ref: "convoy-a".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "test".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("live vessel create");
 
     if let Some(value) = condition {
         let meta = InputMeta {
@@ -236,7 +247,8 @@ async fn reconcile_with_observed_change_request(
     }
 
     let current = convoys.get("convoy-a").await.expect("convoy");
-    let reconciler = ConvoyReconciler::new(templates).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
+    let reconciler =
+        ConvoyReconciler::new(templates).with_vessels(vessels).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
 }
@@ -783,6 +795,7 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
         &convoy,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        &BTreeMap::new(),
         Duration::from_secs(180),
         Duration::from_secs(180),
         timestamp(40),
@@ -850,8 +863,10 @@ async fn landing_holds_on_stale_vacuous_landed_evidence() {
     assert_eq!(outcome.patch, None);
 }
 
-#[tokio::test]
-async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
+async fn reconcile_terminal_bound_change_request(
+    checkout_present: bool,
+    vessel_present: bool,
+) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -899,37 +914,39 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
         .await
         .expect("convoy status update");
 
-    let checkout = checkouts
-        .create(
-            &InputMeta {
-                name: "checkout-a".to_string(),
-                labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
-                ..Default::default()
-            },
-            &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                r#ref: "feature/bound-cr".to_string(),
-                path: "/tmp/checkout-a".to_string(),
-                repo_ref: repo_ref.clone(),
-                host_ref: "host-a".to_string(),
-                is_main: false,
-            }),
-        )
-        .await
-        .expect("checkout create");
-    checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/tmp/checkout-a".to_string()),
-            commit: None,
-            branch_provenance: Default::default(),
-            integration: CheckoutIntegrationStatus {
-                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
-                ..Default::default()
-            },
-            message: None,
-        })
-        .await
-        .expect("checkout status update");
+    if checkout_present {
+        let checkout = checkouts
+            .create(
+                &InputMeta {
+                    name: "checkout-a".to_string(),
+                    labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
+                    ..Default::default()
+                },
+                &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                    r#ref: "feature/bound-cr".to_string(),
+                    path: "/tmp/checkout-a".to_string(),
+                    repo_ref: repo_ref.clone(),
+                    host_ref: "host-a".to_string(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .expect("checkout create");
+        checkouts
+            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some("/tmp/checkout-a".to_string()),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
+                    ..Default::default()
+                },
+                message: None,
+            })
+            .await
+            .expect("checkout status update");
+    }
 
     let record_name = change_request_record_name("example.com", "repo-a", 42);
     let record = change_requests
@@ -949,15 +966,48 @@ async fn terminal_bound_change_request_settles_checkout_without_own_landed_evide
         .await
         .expect("publish terminal change request");
 
+    let vessels = backend.clone().using::<Vessel>("flotilla");
+    if vessel_present {
+        vessels
+            .create(&vessel_meta("convoy-a-implement", "convoy-a", "implement"), &VesselSpec {
+                convoy_ref: "convoy-a".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("vessel create");
+    }
+
     let current = convoys.get("convoy-a").await.expect("convoy get");
     let reconciler = ConvoyReconciler::new(templates)
+        .with_vessels(vessels)
         .with_checkouts(checkouts)
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
-    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
+    reconciler.reconcile(&current, &deps, timestamp(40))
+}
+
+#[tokio::test]
+async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
+    let outcome = reconcile_terminal_bound_change_request(true, true).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+}
+
+#[tokio::test]
+async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
+    let outcome = reconcile_terminal_bound_change_request(false, false).await;
+
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+}
+
+#[tokio::test]
+async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
+    let outcome = reconcile_terminal_bound_change_request(false, true).await;
+
+    assert_eq!(outcome.patch, None);
 }
 
 #[tokio::test]

@@ -10416,6 +10416,9 @@ impl InProcessDaemon {
         let checkout_sources =
             self.resource_backend.including_replicas::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
         let selected_checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources);
+        let vessel_sources =
+            self.resource_backend.including_replicas::<Vessel>(&namespace).list().await.map_err(|error| error.to_string())?.items;
+        let selected_vessels = flotilla_resources::select_convoy_children(&convoy, &vessel_sources);
         let expected = expected_checkout_refs(&convoy).map_err(|error| format!("derive expected checkouts: {error}"))?;
         let checkouts = expected
             .iter()
@@ -10504,6 +10507,7 @@ impl InProcessDaemon {
 
         let evaluation = evaluate_landing_settlement(
             &convoy,
+            &selected_vessels,
             &selected_checkouts,
             &change_request_objects,
             change_request_stale_after,
