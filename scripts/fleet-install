@@ -1083,6 +1083,7 @@ main() {
   if [[ "${1:-}" == __activate ]]; then
     [[ $# -eq 5 ]] || usage
     PLATFORM="$(host_platform)"
+    require_generation "$2"
     require_handoff_lock "$5"
     INSTALL_LOCK_PATH="$FLEET_ROOT/.install.lock"
     INSTALL_LOCK_OWNER="$5"

@@ -12,8 +12,8 @@ scoped GitHub credential during provisioning.
 
 The build workers receive no durable release credential or signing identity.
 Forgejo's per-run artifact token expires with the workflow. These candidates
-are therefore useful for installation and investigation, but they are not a
-completed release and cannot update a fleet pin.
+are therefore useful for investigation and rehearsal, but they are not a
+completed release and cannot update a fleet pin or be installed directly.
 
 Each artifact contains a tar archive, adjacent SHA-256 and JSON metadata, and
 the fleet installer plus its canonical generation validator inside the archive.
