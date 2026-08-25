@@ -2374,13 +2374,19 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     daemon.connect_surface(uuid::Uuid::new_v4(), flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"));
     let backend = daemon.resource_backend();
-    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
-    backend
-        .clone()
-        .using::<Repository>("flotilla")
-        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
-        .await
-        .expect("repository create");
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/planning")
+        .expect("repository spec")
+        .update_remotes("https://github-ssh-backend.example/flotilla-org/planning")
+        .expect("live alias remote");
+    let secondary_repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("secondary repository spec");
+    for spec in [&repository, &secondary_repository] {
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(spec.key().to_string()).build(), spec)
+            .await
+            .expect("repository create");
+    }
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
@@ -2399,13 +2405,22 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 .alias("planning".to_string())
                 .build()],
             dispatch_policy: None,
-            repositories: vec![ProjectRepositorySpec {
-                repo: repository.key(),
-                alias: None,
-                roles: Default::default(),
-                subpath: None,
-                default_branch: Some("main".into()),
-            }],
+            repositories: vec![
+                ProjectRepositorySpec {
+                    repo: repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                },
+                ProjectRepositorySpec {
+                    repo: secondary_repository.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: Some("main".into()),
+                },
+            ],
         })
         .await
         .expect("project create");
@@ -2453,7 +2468,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
-    assert_eq!(persisted.spec.repositories.len(), 1);
+    assert_eq!(persisted.spec.repositories.len(), 2);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
     let regards = backend.using::<Regard>("flotilla").list().await.expect("list dispatcher regards");
     assert!(

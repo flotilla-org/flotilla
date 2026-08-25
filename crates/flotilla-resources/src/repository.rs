@@ -243,7 +243,7 @@ impl RepositorySpec {
         let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
             return Some(live.clone());
         };
-        let stable = forge_from_canonical_remote(canonical_remote).ok()?;
+        let stable = forge_from_canonical_remote(canonical_remote).unwrap_or_else(|_| live.clone());
         if stable.repository == live.repository {
             Some(stable)
         } else {
