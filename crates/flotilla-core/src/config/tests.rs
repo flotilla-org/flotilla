@@ -4,6 +4,7 @@ use std::{
 };
 
 use flotilla_protocol::NodeId;
+use flotilla_resources::{RepositoryGitSpec, RepositoryProviderPreference, RepositorySpec, RepositoryVcsSpec};
 use tempfile::tempdir;
 
 use super::*;
@@ -128,6 +129,34 @@ fn load_config_parses_full_overrides() {
     let cfg = store.load_config();
     assert_eq!(cfg.vcs.git.checkout_path, "/custom/{{ branch }}");
     assert_eq!(cfg.vcs.git.checkout_strategy, "worktree");
+}
+
+#[test]
+fn repository_provider_overrides_merge_with_global_defaults() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[vcs.git]\ncheckout_path = \"/global/{{ branch }}\"\ncheckout_strategy = \"clone\"\n[change_request]\nbackend = \"github\"\n",
+    )
+    .unwrap();
+    let store = ConfigStore::with_base(dir.path());
+    let overridden = ee(dir.path().join("overridden"));
+    let fallback = ee(dir.path().join("fallback"));
+    let spec = RepositorySpec::remote("https://git.example/acme/widgets")
+        .expect("repository spec")
+        .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_strategy: Some("worktree".into()), checkout_path: None } })
+        .with_change_request(RepositoryProviderPreference { backend: Some("forgejo".into()) });
+    store.set_repository_spec(&overridden, spec);
+
+    let resolved = store.resolve_checkout_config(&overridden);
+    assert_eq!(resolved.strategy, "worktree");
+    assert_eq!(resolved.path, "/global/{{ branch }}");
+    assert_eq!(store.resolve_change_request_backend(&overridden).as_deref(), Some("forgejo"));
+
+    let fallback_checkout = store.resolve_checkout_config(&fallback);
+    assert_eq!(fallback_checkout.strategy, "clone");
+    assert_eq!(fallback_checkout.path, "/global/{{ branch }}");
+    assert_eq!(store.resolve_change_request_backend(&fallback).as_deref(), Some("github"));
 }
 
 #[test]
