@@ -394,6 +394,21 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
         UnmetSettlementExpectation::InvalidCondition { subject, message } => {
             ExplainedUnmetExpectation { reason: "invalid_condition".to_string(), subject, detail: message }
         }
+        UnmetSettlementExpectation::MissingObservedRef { reference } => ExplainedUnmetExpectation {
+            reason: "missing_observation".to_string(),
+            subject: format!("remote_ref/{reference}"),
+            detail: "the claimed ref has not been observed through Git transport".to_string(),
+        },
+        UnmetSettlementExpectation::StaleObservedRef { reference, observed_at } => ExplainedUnmetExpectation {
+            reason: "stale_evidence".to_string(),
+            subject: format!("remote_ref/{reference}"),
+            detail: format!("observed at {observed_at}"),
+        },
+        UnmetSettlementExpectation::ObservedDigestMismatch { reference, claimed, observed } => ExplainedUnmetExpectation {
+            reason: "digest_mismatch".to_string(),
+            subject: format!("remote_ref/{reference}"),
+            detail: format!("claim names {claimed}, observed {observed}"),
+        },
     }
 }
 
@@ -10525,6 +10540,7 @@ impl InProcessDaemon {
                 SettlementMode::NoExit => flotilla_protocol::commands::SETTLEMENT_MODE_STANDING,
                 SettlementMode::ClaimExit => "claim_exit",
                 SettlementMode::WorldTerminal => "world_terminal",
+                SettlementMode::ObservedDigest => "observed_digest",
             }
             .to_string(),
             satisfied: evaluation.satisfied,

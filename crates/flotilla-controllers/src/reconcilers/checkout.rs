@@ -308,6 +308,7 @@ where
                             .build(),
                         landed_evidence: None,
                         change_request: None,
+                        remote_refs: Default::default(),
                     }),
                 }),
                 CheckoutPrepared::None

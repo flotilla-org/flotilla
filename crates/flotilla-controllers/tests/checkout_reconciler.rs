@@ -72,6 +72,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
                 .build(),
             landed_evidence: None,
             change_request: None,
+            remote_refs: Default::default(),
         })
     }
 
@@ -394,6 +395,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
                 landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
                 landed_evidence: None,
                 change_request: None,
+                remote_refs: Default::default(),
             },
             message: None,
         })

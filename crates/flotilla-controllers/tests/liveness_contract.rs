@@ -76,6 +76,7 @@ impl CheckoutRuntime for HarnessRuntime {
             landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
             landed_evidence: None,
             change_request: None,
+            remote_refs: Default::default(),
         })
     }
 
@@ -349,6 +350,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                             .observed_at(observed_at)
                             .build(),
                     ),
+                    remote_refs: Default::default(),
                 },
                 message: None,
             })

@@ -16,10 +16,10 @@ use flotilla_resources::{
     CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
     ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, EnvironmentWaitReason, InMemoryBackend, InputMeta,
     InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
-    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, StatusPatch,
-    TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel,
-    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, ReviewRefPair,
+    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase,
+    WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 struct AlwaysEligible;
@@ -239,6 +239,7 @@ async fn reconcile_with_observed_change_request(
                         LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
                     }),
                     change_request: None,
+                    remote_refs: Default::default(),
                 },
                 message: None,
             })
@@ -251,6 +252,104 @@ async fn reconcile_with_observed_change_request(
         ConvoyReconciler::new(templates).with_vessels(vessels).with_checkouts(checkouts).with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
     reconciler.reconcile(&current, &deps, timestamp(40))
+}
+
+async fn reconcile_with_observed_digest(
+    phase: ConvoyPhase,
+    observed_digest: &str,
+) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
+    let now = timestamp(40);
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let checkouts = backend.clone().using::<Checkout>("flotilla");
+    let repo_ref = RepositoryKey("repo-a".to_string());
+    let convoy = convoys
+        .create(
+            &convoy_meta("digest-anchor"),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("reviewless".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(repo_ref.clone(), "checkout-a".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("convoy create");
+    let claim = SettlementClaimEvidence::builder()
+        .refs(ReviewRefPair::builder().base("refs/heads/main".to_string()).head("refs/heads/topic".to_string()).build())
+        .bundle_url("s3://reviews/digest-anchor/1/".to_string())
+        .claimed_head_digest("claimed-digest".to_string())
+        .build();
+    let mut status = ConvoyStatus { phase, observed_workflow_ref: Some("reviewless".to_string()), ..Default::default() };
+    status.crew_work.insert(
+        "work".to_string(),
+        BTreeMap::from([(
+            "coder".to_string(),
+            flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Done).claim_evidence(claim).build(),
+        )]),
+    );
+    status.work.insert("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build());
+    let convoy = convoys.update_status("digest-anchor", &convoy.metadata.resource_version, &status).await.expect("convoy status");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-a".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "digest-anchor".to_string())]))
+                .build(),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "topic".to_string(),
+                path: "/tmp/checkout-a".to_string(),
+                repo_ref,
+                host_ref: "host-a".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout create");
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            integration: CheckoutIntegrationStatus {
+                remote_refs: BTreeMap::from([(
+                    "refs/heads/topic".to_string(),
+                    flotilla_resources::RemoteRefObservation::builder()
+                        .digest(observed_digest.to_string())
+                        .observed_at(now.to_rfc3339())
+                        .build(),
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("checkout status");
+
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+        .with_checkouts(checkouts)
+        .with_clock(Arc::new(FixedClock(now)));
+    let prepared = reconciler.prepare(&convoy).await.expect("prepare convoy");
+    reconciler.reconcile(&convoy, &prepared, now)
+}
+
+#[tokio::test]
+async fn approved_claim_settles_when_remote_ref_is_observed_at_claimed_digest() {
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, "claimed-digest").await;
+    assert_eq!(outcome.patch, Some(controller_patches::settle("observed-digest".to_string(), Vec::new(), timestamp(40))));
+}
+
+#[tokio::test]
+async fn different_observed_digest_holds_settlement_and_raises_attention() {
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landing, "different-digest").await;
+    let Some(ConvoyStatusPatch::SetSettlementAttention { attention }) = outcome.patch else {
+        panic!("digest mismatch should raise convoy attention")
+    };
+    assert_eq!(attention.source, "observed-digest");
+    assert!(attention.reason.contains("different-digest"));
+    assert!(attention.reason.contains("claimed-digest"));
+}
+
+#[tokio::test]
+async fn post_settlement_force_push_does_not_unsettle_convoy() {
+    let outcome = reconcile_with_observed_digest(ConvoyPhase::Landed, "different-digest").await;
+    assert!(outcome.patch.is_none(), "Landed is terminal for the settled claim even after the remote ref moves");
 }
 
 #[tokio::test]
