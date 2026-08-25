@@ -5,10 +5,10 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, PendingBrief, PlacementStatus,
-    PresentationPhase, PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
-    TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope, PendingBrief,
+    PlacementStatus, PresentationPhase, PresentationStatus, PresentationStatusPatch, RepositoryKey, Stance, StatusPatch,
+    TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
+    VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +86,7 @@ define_patch_kinds! {
     TerminalClearReconcileDegraded => NONE,
     VesselMarkProvisioning => DUPLICATE,
     VesselMarkReady => DUPLICATE,
+    VesselStageLandingCredentials => DUPLICATE,
     VesselMarkInterrupted => NONE,
     VesselMarkTearingDown => NONE,
     VesselMarkFailed => NONE,
@@ -146,6 +147,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
+        VesselStatusPatch::StageLandingCredentials { .. } => PatchKind::VesselStageLandingCredentials,
         VesselStatusPatch::MarkTearingDown => PatchKind::VesselMarkTearingDown,
         VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
@@ -676,6 +678,24 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     requested_stance: Stance::WorkspaceWrite,
                     effective_stance: Stance::Contained,
                     ready_at: ts(30),
+                };
+                apply_and_replay(&mut status, &patch);
+                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
+                (before, after)
+            },
+        },
+        LifecycleCase {
+            name: "landing credentials staged",
+            kind: PatchKind::VesselStageLandingCredentials,
+            exercise: || {
+                let mut status =
+                    VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
+                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
+                let patch = VesselStatusPatch::StageLandingCredentials {
+                    credentials: BTreeMap::from([("landing".to_string(), LandingCredentialScope::Branch {
+                        repository: RepositoryKey("github.com-org-repo".to_string()),
+                        branch: "topic".to_string(),
+                    })]),
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };

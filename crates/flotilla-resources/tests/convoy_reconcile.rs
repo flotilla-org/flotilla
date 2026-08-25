@@ -396,6 +396,7 @@ fn vessel_object_with_image_digest(
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
             requested_stance: None,
             effective_stance: None,
+            held_credentials: Default::default(),
         }),
     }
 }

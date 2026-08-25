@@ -16,6 +16,7 @@ mod host;
 mod http;
 mod in_memory;
 mod labels;
+mod landing_gate;
 mod leaf;
 mod material_pool;
 mod placement_policy;
@@ -72,8 +73,9 @@ pub use convoy_ensure::{
 };
 pub use credential::{
     CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, LandingCredentialScope,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG,
 };
 pub use definition::DefinitionResolver;
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
@@ -96,6 +98,7 @@ pub use labels::{
     MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
     VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
+pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
     admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
     UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
@@ -114,8 +117,8 @@ pub use prepared_snapshot::{
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{
     resolve_demand, Demand, DemandAddressee, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandPoolRef, DemandResponseOption,
-    DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, Regard,
-    RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
+    DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, DemandVerdict, DemandVerdictDisposition, HumanGateContext,
+    Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue,

@@ -112,6 +112,19 @@ pub struct CredentialPlacementRequirements {
 pub struct CredentialGrantSpec {
     pub selector: CredentialGrantSelector,
     pub credentials: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[builder(default)]
+    pub landing_credentials: BTreeMap<String, LandingCredentialScope>,
+}
+
+/// Constraint retained when a human-gate approval releases a landing
+/// credential. Temporal-only is the safe fallback where a forge cannot mint
+/// a branch-constrained token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LandingCredentialScope {
+    Branch { repository: RepositoryKey, branch: String },
+    TemporalOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
