@@ -10140,7 +10140,7 @@ impl InProcessDaemon {
         if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
             let repo_path = match self.resolve_repo_selector(repo).await {
                 Ok(path) => path,
-                Err(_) => self.resolve_observation_root_selector(repo)?,
+                Err(tracked_error) => self.resolve_observation_root_selector(repo).map_err(|_| tracked_error)?,
             };
             let description = command.description().to_string();
             let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
