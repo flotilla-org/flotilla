@@ -5,7 +5,8 @@ use flotilla_protocol::PlacementDecision;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    environment::EnvironmentWaitReason, resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance,
+    environment::EnvironmentWaitReason, resource::define_resource, status_patch::StatusPatch, LandingCredentialScope, ReplicationClass,
+    RepositoryKey, Stance,
 };
 
 define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
@@ -67,6 +68,10 @@ pub struct VesselStatus {
     pub requested_stance: Option<Stance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_stance: Option<Stance>,
+    /// Landing material actually staged in this vessel. This is deliberately
+    /// status, not desired spec: absence is the pre-approval invariant.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub held_credentials: BTreeMap<String, LandingCredentialScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +98,9 @@ pub enum VesselStatusPatch {
     MarkInterrupted {
         roles: BTreeSet<String>,
         message: String,
+    },
+    StageLandingCredentials {
+        credentials: BTreeMap<String, LandingCredentialScope>,
     },
     MarkTearingDown,
     MarkFailed {
@@ -153,6 +161,9 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.interrupted_roles = roles.clone();
                 status.message = Some(message.clone());
                 status.wait_reason = None;
+            }
+            Self::StageLandingCredentials { credentials } => {
+                status.held_credentials.extend(credentials.clone());
             }
             Self::MarkTearingDown => {
                 status.phase = VesselPhase::TearingDown;

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     resource::define_resource,
     status_patch::{apply_status_patch_checked, StatusPatch},
-    ResourceError, ResourceObject, TypedResolver,
+    ResourceError, ResourceObject, SettlementClaimEvidence, TypedResolver,
 };
 
 define_resource!(Regard, "regards", RegardSpec, RegardStatus, RegardStatusPatch);
@@ -73,6 +73,8 @@ pub struct DemandSpec {
     pub response_options: Vec<DemandResponseOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<DemandExpiry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_gate: Option<HumanGateContext>,
 }
 
 impl DemandSpec {
@@ -83,11 +85,19 @@ impl DemandSpec {
             addressee: DemandAddressee::Principal { principal_ref: dispatching_principal_ref },
             response_options: Vec::new(),
             expiry: None,
+            human_gate: None,
         }
     }
 
     pub fn for_pool(originating_work_ref: ResourceRef, kind: DemandKind, pool_ref: DemandPoolRef) -> Self {
-        Self { originating_work_ref, kind, addressee: DemandAddressee::Pool { pool_ref }, response_options: Vec::new(), expiry: None }
+        Self {
+            originating_work_ref,
+            kind,
+            addressee: DemandAddressee::Pool { pool_ref },
+            response_options: Vec::new(),
+            expiry: None,
+            human_gate: None,
+        }
     }
 
     fn validate_verdict(&self, verdict: &DemandVerdict) -> Result<(), ResourceError> {
@@ -100,6 +110,11 @@ impl DemandSpec {
             Err(ResourceError::invalid(format!("demand verdict option {option:?} was not offered")))
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct HumanGateContext {
+    pub claim: SettlementClaimEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

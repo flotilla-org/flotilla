@@ -146,6 +146,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
+        VesselStatusPatch::StageLandingCredentials { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkTearingDown => PatchKind::VesselMarkTearingDown,
         VesselStatusPatch::MarkFailed { .. } => PatchKind::VesselMarkFailed,
     }
