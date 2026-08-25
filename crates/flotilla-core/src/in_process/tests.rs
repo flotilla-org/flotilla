@@ -1079,6 +1079,26 @@ async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_a
 }
 
 #[tokio::test]
+async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_immediately() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    fail_ensured_generation(&backend, &clock).await;
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record backoff");
+    let backed_off = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("backed-off ensure");
+    assert_eq!(backed_off.status.as_ref().expect("status").restart_count, 1);
+    assert!(backed_off.status.as_ref().expect("status").retry_at.is_some());
+
+    let outcome = daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking).await.expect("forced admission");
+
+    assert_eq!(outcome, "started quartermaster@standing-project");
+    let reconciled = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("reconciled ensure");
+    let status = reconciled.status.expect("status");
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(status.retry_at, None);
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 2);
+}
+
+#[tokio::test]
 async fn concurrent_ensure_admission_creates_only_one_live_generation() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     let (left, right) = tokio::join!(daemon.reconcile_convoy_ensures_once("flotilla"), daemon.reconcile_convoy_ensures_once("flotilla"));
@@ -1331,6 +1351,8 @@ async fn declared_driver_admission_failures_back_off_escalate_and_clear_legacy_s
     let status = ensures.get("quartermaster").await.expect("ensure").status.expect("driver-managed status");
     assert_eq!(status.convoy_ref, None);
     assert_eq!(status.running_since, None);
+    assert_eq!(status.restart_count, 1);
+    assert!(status.retry_at.is_some());
 
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("backoff suppresses retry").is_empty());
     clock.advance(ChronoDuration::seconds(30));

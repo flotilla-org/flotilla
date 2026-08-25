@@ -676,6 +676,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
         }

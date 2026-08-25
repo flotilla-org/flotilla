@@ -220,6 +220,7 @@ impl RemoteCommandRouter {
                         | CommandAction::CrewHandoff { .. }
                         | CommandAction::ResourceApply { .. }
                         | CommandAction::ResourceManifestResolve { .. }
+                        | CommandAction::ResourceReconcileNow { .. }
                         | CommandAction::ResourceDelete { .. }
                         | CommandAction::ResourceStatusPatch { .. }
                         | CommandAction::ResourceWatch { .. }

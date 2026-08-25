@@ -39,11 +39,13 @@ pub struct ConvoyEnsureSpec {
 pub struct ConvoyEnsureStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
-    #[serde(default)]
+    /// Consecutive failed generations in the current retry episode.
+    #[serde(default, rename = "strikes")]
     pub restart_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_since: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Wall-clock time at which automatic admission will next be attempted.
+    #[serde(default, rename = "next_attempt", skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<String>,
@@ -80,6 +82,7 @@ pub enum ConvoyEnsureStatusPatch {
     Holding { convoy_ref: String, failure: String },
     RestartLimitReached { convoy_ref: String, failure: String },
     ObserveConfig { config_hash: String, changed: bool },
+    BackoffState { strikes: u32, retry_at: DateTime<Utc>, failure: String },
     ResetBackoff,
     DriverManaged,
     DriverAdmission { condition: Option<ConvoyEnsureCondition> },
@@ -133,6 +136,12 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                     status.hold_reason = None;
                 }
             }
+            Self::BackoffState { strikes, retry_at, failure } => {
+                status.restart_count = *strikes;
+                status.retry_at = Some(*retry_at);
+                status.last_failure = Some(failure.clone());
+                status.hold_reason = None;
+            }
             Self::ResetBackoff => {
                 status.restart_count = 0;
                 status.retry_at = None;
@@ -141,11 +150,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             }
             Self::DriverManaged => {
                 status.convoy_ref = None;
-                status.restart_count = 0;
                 status.running_since = None;
-                status.retry_at = None;
-                status.last_failure = None;
-                status.hold_reason = None;
                 status.observed_config_hash = None;
             }
             Self::DriverAdmission { condition } => {
@@ -155,5 +160,27 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::ConvoyEnsureStatus;
+
+    #[test]
+    fn serialized_backoff_uses_operator_vocabulary() {
+        let value = serde_json::to_value(ConvoyEnsureStatus {
+            restart_count: 3,
+            retry_at: Some(Utc.with_ymd_and_hms(2026, 8, 25, 21, 30, 0).single().expect("timestamp")),
+            ..Default::default()
+        })
+        .expect("serialize status");
+
+        assert_eq!(value["strikes"], 3);
+        assert_eq!(value["next_attempt"], "2026-08-25T21:30:00Z");
+        assert!(value.get("restart_count").is_none());
+        assert!(value.get("retry_at").is_none());
     }
 }

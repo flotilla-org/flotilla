@@ -327,6 +327,8 @@ enum ResourceSubCommand {
     Sync(ResourceManifestResolutionArgs),
     /// Write the live spec back to its manifest
     Adopt(ResourceManifestResolutionArgs),
+    /// Reset backoff and immediately reconcile one operator target
+    ReconcileNow(ResourceReconcileNowArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
     /// Get one resource by name
@@ -376,6 +378,20 @@ struct ResourceGetArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceReconcileNowArgs {
+    /// Resource kind, or manifest-root
+    kind: String,
+    /// Resource or manifest-root name
+    name: String,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the operation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -1387,6 +1403,20 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
             print_resource_read(daemon.as_ref(), node_id, response, format).await
         }
+        ResourceSubCommand::ReconcileNow(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ResourceReconcileNow { namespace: args.namespace, kind: args.kind, name: args.name },
+                },
+                format,
+            )
+            .await
+        }
         ResourceSubCommand::Apply(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let raw = std::fs::read_to_string(&args.file)
@@ -2189,7 +2219,7 @@ mod tests {
         replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
         should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
         DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
-        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2495,6 +2525,15 @@ mod tests {
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::Get(ResourceGetArgs { kind, name, namespace, host: None })
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
+        ));
+
+        let reconcile = Cli::try_parse_from(["flotilla", "resource", "reconcile-now", "ConvoyEnsure", "quartermaster", "--host", "feta"])
+            .expect("resource reconcile-now should parse");
+        assert!(matches!(
+            reconcile.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::ReconcileNow(ResourceReconcileNowArgs { kind, name, namespace, host: Some(host) })
+            }) if kind == "ConvoyEnsure" && name == "quartermaster" && namespace == "flotilla" && host == "feta"
         ));
 
         let sync = Cli::try_parse_from(["flotilla", "resource", "sync", "projects", "cleat", "--namespace", "ops"])

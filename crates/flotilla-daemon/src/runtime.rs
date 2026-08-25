@@ -24,7 +24,7 @@ use flotilla_core::{
     },
     config::ConfigStore,
     demand_lifecycle::DemandLifecycle,
-    in_process::{InProcessDaemon, StandingConvoyBackingInspector},
+    in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
@@ -36,7 +36,7 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
+use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, ChangeRequest,
     ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy,
@@ -105,6 +105,47 @@ struct DaemonConvoyTeardownRuntime {
 struct ReclaimRefusal {
     error: String,
     attempts: u64,
+}
+
+struct RuntimeOperatorReconciler {
+    state: Arc<ControllerRuntimeState>,
+    manifests: Option<flotilla_core::config::ResourceManifestsConfig>,
+    local_root: String,
+}
+
+#[async_trait]
+impl OperatorReconciler for RuntimeOperatorReconciler {
+    async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String> {
+        let normalized = kind.to_ascii_lowercase().replace(['_', '-'], "");
+        match normalized.as_str() {
+            "convoyensure" | "convoyensures" => self.state.daemon.reconcile_convoy_ensure_now(namespace, name, &*self.state).await,
+            "manifest" | "manifestroot" | "manifestroots" => {
+                let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
+                if manifests.reconciler_root != name {
+                    return Err(format!("manifest root `{name}` is not owned here; configured root is `{}`", manifests.reconciler_root));
+                }
+                if manifests.reconciler_root != self.local_root {
+                    return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));
+                }
+                let mut reconciler =
+                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
+                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
+                let report = reconciler.reconcile_once().await?;
+                Ok(format!(
+                    "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
+                    report.created,
+                    report.updated,
+                    report.unchanged,
+                    report.errors.len()
+                ))
+            }
+            "repository" | "repositories" | "repo" => {
+                self.state.daemon.refresh(&RepoSelector::Query(name.to_string())).await?;
+                Ok(format!("Repository/{name} refreshed"))
+            }
+            _ => Err(format!("resource kind `{kind}` does not support reconcile-now; expected ConvoyEnsure, manifest-root, or Repository")),
+        }
+    }
 }
 
 impl DaemonConvoyTeardownRuntime {
@@ -518,7 +559,7 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ];
-        if let Some(manifests) = manifests {
+        if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
                     daemon.resource_backend(),
@@ -543,7 +584,7 @@ impl DaemonRuntime {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
-                    daemon,
+                    Arc::clone(&daemon),
                     config,
                     local_registry,
                     daemon_socket_path.map(DaemonHostPath::new),
@@ -554,6 +595,13 @@ impl DaemonRuntime {
                 .with_credential_store(credential_store)
                 .with_agent_material(agent_material),
             );
+            daemon
+                .set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
+                    state: Arc::clone(&state),
+                    manifests,
+                    local_root: profile.host_id.clone(),
+                }))
+                .await;
             if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
                 warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
             }

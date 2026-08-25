@@ -2125,6 +2125,7 @@ pub struct InProcessDaemon {
     fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
     resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
+    operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
     /// Last terminal state published per repository, used to emit field-scoped
     /// deltas without disturbing unrelated provider snapshot state.
@@ -2175,6 +2176,13 @@ fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
 #[async_trait]
 pub trait StandingConvoyBackingInspector: Send + Sync {
     async fn verify_backing_dead(&self, convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String>;
+}
+
+/// Runtime-owned reconciliation entry points which need collaborators that do
+/// not belong in the surface-independent core daemon.
+#[async_trait]
+pub trait OperatorReconciler: Send + Sync {
+    async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String>;
 }
 
 #[async_trait]
@@ -2393,6 +2401,7 @@ impl InProcessDaemon {
             fleet_replica_tx,
             resource_replication_failures: RwLock::new(HashMap::new()),
             repository_inspector: RwLock::new(None),
+            operator_reconciler: RwLock::new(None),
             local_placement_provider_statuses: RwLock::new(Vec::new()),
             managed_terminals_by_repo: RwLock::new(HashMap::new()),
             admission_free_space_path: std::sync::RwLock::new(admission_free_space_path),
@@ -2482,6 +2491,10 @@ impl InProcessDaemon {
 
     pub async fn set_repository_inspector(&self, inspector: Arc<dyn RepositoryInspector>) {
         *self.repository_inspector.write().await = Some(inspector);
+    }
+
+    pub async fn set_operator_reconciler(&self, reconciler: Arc<dyn OperatorReconciler>) {
+        *self.operator_reconciler.write().await = Some(reconciler);
     }
 
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
@@ -4834,7 +4847,7 @@ impl InProcessDaemon {
                     }
                     continue;
                 }
-                match self.reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector).await {
+                match self.reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, false).await {
                     Ok(Some(change)) => changes.push(change),
                     Ok(None) => {}
                     Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
@@ -4878,7 +4891,7 @@ impl InProcessDaemon {
                     }
                 }
             }
-            match self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector).await {
+            match self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector, false).await {
                 Ok(Some(change)) => changes.push(change),
                 Ok(None) => {}
                 Err(error) => errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name)),
@@ -4893,6 +4906,28 @@ impl InProcessDaemon {
         }
     }
 
+    /// Reset one ensure's retry budget and drive its admission synchronously.
+    pub async fn reconcile_convoy_ensure_now(
+        &self,
+        namespace: &str,
+        name: &str,
+        backing_inspector: &dyn StandingConvoyBackingInspector,
+    ) -> Result<String, String> {
+        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
+        let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
+        self.patch_driver_ensure_status_if_local(namespace, name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+        if ensure.spec.driver_ref.is_some() {
+            self.driver_ensure_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
+            return self
+                .reconcile_driver_convoy_ensure(namespace, &ensure, backing_inspector, true)
+                .await
+                .map(|change| change.unwrap_or_else(|| format!("ConvoyEnsure/{name} is already reconciled")));
+        }
+        self.reconcile_convoy_ensure(namespace, &ensure, backing_inspector, true)
+            .await
+            .map(|change| change.unwrap_or_else(|| format!("ConvoyEnsure/{name} is already reconciled")))
+    }
+
     /// Admit a declared-driver ensure from the generation history homed here.
     ///
     /// Driver admission keeps admission retry state on the driver because the
@@ -4904,6 +4939,7 @@ impl InProcessDaemon {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
         backing_inspector: &dyn StandingConvoyBackingInspector,
+        force_now: bool,
     ) -> Result<Option<String>, String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let mut generations = convoys
@@ -4943,7 +4979,7 @@ impl InProcessDaemon {
             if retries.get(&retry_key).is_some_and(|retry| retry.config_hash != config_hash) {
                 retries.remove(&retry_key);
             }
-            if !resolved_escalation {
+            if !resolved_escalation && !force_now {
                 if let Some(retry) = retries.get(&retry_key) {
                     if retry.retry_at > self.clock.now() {
                         return Ok(None);
@@ -4960,7 +4996,7 @@ impl InProcessDaemon {
             .take_while(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Failed))
             .count() as u32;
         let latest = generations.last();
-        if !resolved_escalation && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
+        if !resolved_escalation && !force_now && consecutive_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
             let latest = latest.expect("a positive failure count requires a generation");
             let failure = format!("ensured convoy entered a terminal failure phase; {consecutive_failures} consecutive generations failed");
             self.raise_ensure_attention(ensure, latest, &failure, Some(self.clock.now() + ENSURE_ESCALATION_AFTER)).await?;
@@ -4970,7 +5006,13 @@ impl InProcessDaemon {
             let latest = latest.expect("a positive failure count requires a generation");
             backing_inspector.verify_backing_dead(latest).await?;
             let retry_at = latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1);
-            if retry_at > self.clock.now() {
+            if !force_now && retry_at > self.clock.now() {
+                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
+                    strikes: consecutive_failures,
+                    retry_at,
+                    failure: "ensured convoy entered a terminal failure phase".to_string(),
+                })
+                .await?;
                 return Ok(None);
             }
         }
@@ -4978,6 +5020,7 @@ impl InProcessDaemon {
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(_) => {
                 self.driver_ensure_retries.lock().await.remove(&retry_key);
+                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
                 Ok(Some(format!("started {}@{}", ensure.spec.role, ensure.spec.project_ref)))
             }
             Err(error) => {
@@ -4989,6 +5032,12 @@ impl InProcessDaemon {
                     retries.insert(retry_key, DriverEnsureRetry { config_hash, consecutive_failures: admission_failures, retry_at });
                     (admission_failures, retry_at)
                 };
+                self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
+                    strikes: admission_failures,
+                    retry_at,
+                    failure: error.clone(),
+                })
+                .await?;
                 if admission_failures >= ENSURE_MAX_CONSECUTIVE_FAILURES {
                     let failure = format!("driver admission failed {admission_failures} consecutive times: {error}");
                     self.raise_driver_admission_attention(namespace, ensure, &failure, now + ENSURE_ESCALATION_AFTER).await?;
@@ -5070,6 +5119,7 @@ impl InProcessDaemon {
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
         backing_inspector: &dyn StandingConvoyBackingInspector,
+        force_now: bool,
     ) -> Result<Option<String>, String> {
         let now = self.clock.now();
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
@@ -5173,7 +5223,7 @@ impl InProcessDaemon {
         }
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
 
-        if status.retry_at.is_none() {
+        if status.retry_at.is_none() && !force_now {
             let failure = "ensured convoy entered a terminal failure phase";
             if status.restart_count.saturating_add(1) >= ENSURE_MAX_CONSECUTIVE_FAILURES {
                 let failure = format!("{failure}; {} consecutive generations failed", ENSURE_MAX_CONSECUTIVE_FAILURES);
@@ -5348,6 +5398,13 @@ impl InProcessDaemon {
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    async fn patch_driver_ensure_status_if_local(&self, namespace: &str, name: &str, patch: ConvoyEnsureStatusPatch) -> Result<(), String> {
+        if self.resource_backend.clone().using::<ConvoyEnsure>(namespace).get(name).await.is_ok() {
+            self.patch_convoy_ensure(namespace, name, patch).await?;
+        }
+        Ok(())
     }
 
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
@@ -9354,6 +9411,19 @@ impl InProcessDaemon {
                     })),
                     Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
                 };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match self.operator_reconciler.read().await.clone() {
+                Some(reconciler) => match reconciler.reconcile_now(namespace, kind, name).await {
+                    Ok(message) => CommandValue::ResourceReconciled { resource_kind: kind.clone(), name: name.clone(), message },
+                    Err(message) => CommandValue::Error { message },
+                },
+                None => CommandValue::Error { message: "operator reconciliation is unavailable before runtime startup".to_string() },
+            };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
