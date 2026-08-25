@@ -168,10 +168,12 @@ while dev mode is enabled.
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
 the read-only generation. The same generation carries both exact skill source
-revisions in `share/flotilla/skills/.flotilla-sources.json` and configures
+revisions and the validated required-skill list in the version-2
+`share/flotilla/skills/.flotilla-sources.json` manifest. It configures
 `flotillad` to fetch those commits with the contained crew's scoped GitHub
-credential. The daemon flattens every discovered skill into the seam-resolved
-Claude config home and copies the source manifest alongside it as provenance.
+credential. The daemon flattens every discovered skill into each adapter's
+seam-resolved config home, verifies every manifest-required skill is present,
+and copies the source manifest alongside it as provenance.
 Linux requires the exact unsigned candidate selected
 by the trusted promoter. Darwin additionally requires the completed central
 derivative, fixed Apple team `973L4GV58R`, matching source/signing metadata,

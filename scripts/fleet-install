@@ -519,7 +519,23 @@ expected_skill_sources = [
         "revision": outer["sources"]["rjw-skills"],
     },
 ]
-if skill_manifest != {"schema_version": 1, "sources": expected_skill_sources}:
+required_skills = skill_manifest.get("required_skills")
+if (
+    skill_manifest.get("schema_version") != 2
+    or skill_manifest.get("sources") != expected_skill_sources
+    or set(skill_manifest) != {"schema_version", "required_skills", "sources"}
+    or not isinstance(required_skills, list)
+    or not required_skills
+    or any(
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        for name in required_skills
+    )
+    or len(set(required_skills)) != len(required_skills)
+):
     raise SystemExit("skill bundle source pins do not match the fleet generation")
 for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
     if not os.access(root / rel, os.X_OK):
