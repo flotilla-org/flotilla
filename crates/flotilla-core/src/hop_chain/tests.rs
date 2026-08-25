@@ -152,7 +152,7 @@ fn docker_environment_wrap_supervises_and_reaps_the_exec_command() {
     ]);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn severing_supervised_docker_hop_reaps_lease_owner() {
     use std::{
