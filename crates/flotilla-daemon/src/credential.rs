@@ -73,15 +73,14 @@ struct GithubAppInstallationRequest {
 
 #[derive(Debug)]
 enum GithubAppMintError {
-    InstallationNotFound,
+    InstallationNotFound(String),
     Other(String),
 }
 
 impl std::fmt::Display for GithubAppMintError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InstallationNotFound => formatter.write_str("GitHub returned HTTP 404"),
-            Self::Other(message) => formatter.write_str(message),
+            Self::InstallationNotFound(message) | Self::Other(message) => formatter.write_str(message),
         }
     }
 }
@@ -118,7 +117,19 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
         let label = ChannelLabel::http_from_url(&url);
         let response = self.http.execute(http_request, &label).await.map_err(|error| format!("resolve installation: {error}"))?;
         if !response.status().is_success() {
-            return Err(format!("GitHub App is not installed on repository `{}` (HTTP {})", request.repository, response.status()));
+            let detail = String::from_utf8_lossy(response.body());
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!(
+                    "GitHub App is not installed on repository `{}` (HTTP {}): {detail}",
+                    request.repository,
+                    response.status()
+                ));
+            }
+            return Err(format!(
+                "failed to resolve GitHub App installation for repository `{}` (HTTP {}): {detail}",
+                request.repository,
+                response.status()
+            ));
         }
         serde_json::from_slice::<GithubAppInstallationResponse>(response.body())
             .map(|response| response.id)
@@ -143,7 +154,11 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
             .await
             .map_err(|error| GithubAppMintError::Other(format!("mint installation token: {error}")))?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(GithubAppMintError::InstallationNotFound);
+            let detail = String::from_utf8_lossy(response.body());
+            return Err(GithubAppMintError::InstallationNotFound(format!(
+                "mint installation token: GitHub returned HTTP {}: {detail}",
+                response.status()
+            )));
         }
         if !response.status().is_success() {
             let detail = String::from_utf8_lossy(response.body());
@@ -994,7 +1009,7 @@ impl CredentialStore {
     ) -> Result<GithubAppToken, String> {
         match self.github_app_minter.mint(request).await {
             Ok(token) => Ok(token),
-            Err(GithubAppMintError::InstallationNotFound) if installation_repository.is_some() => {
+            Err(GithubAppMintError::InstallationNotFound(_)) if installation_repository.is_some() => {
                 let repository = installation_repository.expect("guarded by is_some");
                 self.github_app_installations.lock().await.remove(&GithubAppInstallationRequest {
                     repository: repository.to_string(),
@@ -2007,6 +2022,47 @@ interactions:
         let error = error.to_string();
         assert!(error.contains("HTTP 422 Unprocessable Entity"), "unexpected mint error: {error}");
         assert!(error.contains("permissions requested are not granted"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_fixed_installation_id_preserves_404_response_detail() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 404
+    response_body: '{"message":"installation was removed"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let result = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: None,
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("removed fixed installation must fail");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("HTTP 404 Not Found"), "unexpected mint error: {error}");
+        assert!(error.contains("installation was removed"), "GitHub response detail missing: {error}");
         session.assert_complete();
     }
 
