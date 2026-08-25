@@ -28,6 +28,9 @@ pub struct RepositoryInspection {
     pub spec: RepositorySpec,
     pub checkout: LocalCheckoutInspection,
     pub transport_url: Option<String>,
+    /// The checkout path was associated with a different Repository whose
+    /// history could not be connected to this inspection.
+    pub replaces_prior_repository: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,12 @@ pub struct OperationalEntriesInspection {
     pub repository: RepositoryInspection,
     pub commit: String,
     pub files: Vec<OperationalEntryFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryContinuity {
+    Continuous { evidence: String },
+    Unproven { evidence: String },
 }
 
 impl RepositoryInspection {
@@ -65,6 +74,10 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
+    }
+
+    async fn verify_continuity(&self, _path: &Path, _previous: &RepositorySpec) -> RepositoryContinuity {
+        RepositoryContinuity::Unproven { evidence: "repository inspector cannot compare Git history".to_string() }
     }
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
@@ -255,6 +268,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
             },
             transport_url,
+            replaces_prior_repository: false,
         })
     }
 
@@ -309,6 +323,29 @@ impl RepositoryInspector for GitRepositoryInspector {
         RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
     }
 
+    async fn verify_continuity(&self, path: &Path, previous: &RepositorySpec) -> RepositoryContinuity {
+        let Some(previous_remote) = previous.live_remote() else {
+            return RepositoryContinuity::Unproven { evidence: "previous Repository has no transport remote".to_string() };
+        };
+        let advertised = match self.git(path, &["ls-remote", "--refs", previous_remote]).await {
+            Ok(advertised) => advertised,
+            Err(error) => return RepositoryContinuity::Unproven { evidence: format!("old remote refs unavailable: {error}") },
+        };
+        let mut refs = 0;
+        for line in advertised.lines() {
+            let Some((commit, reference)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            refs += 1;
+            if self.git(path, &["merge-base", "--is-ancestor", commit, "HEAD"]).await.is_ok() {
+                return RepositoryContinuity::Continuous {
+                    evidence: format!("old remote ref {reference} ({commit}) is reachable from HEAD"),
+                };
+            }
+        }
+        RepositoryContinuity::Unproven { evidence: format!("none of {refs} advertised old-remote refs is reachable from HEAD") }
+    }
+
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
         // The path template is used only when creating a worktree;
         // enumeration reads Git's existing worktree registry.
@@ -348,7 +385,7 @@ mod tests {
 
     use flotilla_resources::{RepositoryIdentity, RepositorySpec};
 
-    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
+    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -357,6 +394,34 @@ mod tests {
         std::fs::create_dir(&root).expect("repo dir");
         std::fs::create_dir(root.join(".git")).expect("git dir");
         (temp, root)
+    }
+
+    #[tokio::test]
+    async fn continuity_accepts_an_old_remote_ref_reachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Ok(String::new()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Continuous { .. }));
+    }
+
+    #[tokio::test]
+    async fn continuity_rejects_old_remote_refs_unreachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Err("unrelated histories".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Unproven { .. }));
     }
 
     #[tokio::test]
@@ -383,6 +448,7 @@ mod tests {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         };
 
         let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");

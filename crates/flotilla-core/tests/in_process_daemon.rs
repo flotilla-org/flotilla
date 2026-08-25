@@ -37,7 +37,7 @@ use flotilla_core::{
         types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus, Workspace},
         ChannelLabel, CommandRunner,
     },
-    repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector},
+    repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
@@ -91,6 +91,7 @@ struct MutableRemoteHostDetector {
 struct TestRepositoryInspector {
     repository: Arc<std::sync::RwLock<String>>,
     fixed_repository_by_path: HashMap<PathBuf, String>,
+    continuity: bool,
 }
 
 #[async_trait]
@@ -109,12 +110,27 @@ impl RepositoryInspector for TestRepositoryInspector {
                 is_main: true,
             },
             transport_url: Some(format!("https://github.com/owner/{repository}")),
+            replaces_prior_repository: false,
         })
+    }
+
+    async fn verify_continuity(&self, _path: &Path, _previous: &RepositorySpec) -> RepositoryContinuity {
+        if self.continuity {
+            RepositoryContinuity::Continuous { evidence: "test histories share a reachable ref".to_string() }
+        } else {
+            RepositoryContinuity::Unproven { evidence: "test histories are unrelated".to_string() }
+        }
     }
 }
 
 async fn install_test_repository_inspector(daemon: &InProcessDaemon, repository: Arc<std::sync::RwLock<String>>) {
-    daemon.set_repository_inspector(Arc::new(TestRepositoryInspector { repository, fixed_repository_by_path: HashMap::new() })).await;
+    daemon
+        .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            repository,
+            fixed_repository_by_path: HashMap::new(),
+            continuity: true,
+        }))
+        .await;
 }
 
 fn qpath(host: &HostName, path: impl Into<PathBuf>) -> QualifiedPath {
@@ -4596,6 +4612,61 @@ async fn associated_checkout_remote_move_updates_repository_in_place() {
     assert_eq!(repositories.list().await.expect("repositories after project add").items.len(), 1);
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts");
     assert!(observed.items.iter().all(|checkout| checkout.spec.repo_ref() == &original_key));
+}
+
+#[tokio::test]
+async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("ghostty-ops");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let remote = Arc::new(std::sync::RwLock::new("ghostty".to_string()));
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "fork-issues", repo: Arc::clone(&remote) }));
+    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    daemon
+        .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            repository: Arc::clone(&remote),
+            fixed_repository_by_path: HashMap::new(),
+            continuity: false,
+        }))
+        .await;
+    daemon.add_repo(&repo).await.expect("track original repository");
+
+    let old_key = RepositorySpec::remote("https://github.com/owner/ghostty").expect("old spec").key();
+    let unaffected_path = temp.path().join("ghostty-main");
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    observed
+        .create(
+            &InputMeta::builder()
+                .name("unaffected-old-checkout".to_string())
+                .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), old_key.to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Observed),
+            &ResourceCheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("main".to_string())
+                    .path(unaffected_path.to_string_lossy().into_owned())
+                    .repo_ref(old_key.clone())
+                    .host_ref("other-host".to_string())
+                    .is_main(true)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("create unaffected old checkout observation");
+    *remote.write().expect("remote lock") = "ghostty-ops".to_string();
+    let change = daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh replacement");
+
+    let new_key = RepositorySpec::remote("https://github.com/owner/ghostty-ops").expect("new spec").key();
+    assert!(change.is_some(), "replacement should report an identity change");
+    assert_eq!(daemon.repository_key_for_path(&repo).await, Some(new_key.clone()));
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla").list().await.expect("list repositories");
+    assert_eq!(repositories.items.len(), 2, "unrelated replacement must not be absorbed into the old Repository");
+    let old = repositories.items.iter().find(|item| item.metadata.name == old_key.to_string()).expect("old Repository remains");
+    assert_eq!(old.spec.remotes(), ["https://github.com/owner/ghostty"]);
+    repositories.items.iter().find(|item| item.metadata.name == new_key.to_string()).expect("new Repository is materialized");
+    observed.get("unaffected-old-checkout").await.expect("unaffected old checkout observation remains");
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {

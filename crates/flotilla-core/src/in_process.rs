@@ -121,7 +121,8 @@ use crate::{
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState},
     repository_inspection::{
-        GitRepositoryInspector, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
+        GitRepositoryInspector, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryContinuity, RepositoryInspection,
+        RepositoryInspector,
     },
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
@@ -2493,11 +2494,13 @@ impl InProcessDaemon {
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
-        inspection.spec = self.configure_inspected_repository(&inspection.checkout.path, inspection.spec).await?;
+        let (spec, replaces_prior_repository) = self.configure_inspected_repository(&inspection.checkout.path, inspection.spec).await?;
+        inspection.spec = spec;
+        inspection.replaces_prior_repository = replaces_prior_repository;
         Ok(inspection)
     }
 
-    async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+    async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<(RepositorySpec, bool), String> {
         if let Some(repository_key) = self.repository_keys_by_path.read().await.get(path).cloned() {
             let namespace = self.provisioning_namespace().await;
             let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
@@ -2505,9 +2508,20 @@ impl InProcessDaemon {
                 if !matches!(stored.spec.identity(), flotilla_resources::RepositoryIdentity::Remote { .. })
                     || !matches!(spec.identity(), flotilla_resources::RepositoryIdentity::Remote { .. })
                 {
-                    return self.configure_unassociated_repository(path, spec).await;
+                    return self.configure_unassociated_repository(path, spec).await.map(|spec| (spec, false));
                 }
                 let live_remote = spec.live_remote().map(str::to_string);
+                if let Some(live_remote) = live_remote.as_deref().filter(|remote| !stored.spec.declares_remote(remote)) {
+                    match self.repository_inspector().await?.verify_continuity(path, &stored.spec).await {
+                        RepositoryContinuity::Continuous { evidence } => {
+                            info!(repo = %path.display(), old_repository = %repository_key, new_remote = %live_remote, %evidence, "preserving repository identity after continuity check");
+                        }
+                        RepositoryContinuity::Unproven { evidence } => {
+                            info!(repo = %path.display(), old_repository = %repository_key, new_remote = %live_remote, %evidence, "minting repository identity because continuity is unproven");
+                            return self.configure_unassociated_repository(path, spec).await.map(|spec| (spec, true));
+                        }
+                    }
+                }
                 let mut updated = stored.spec.clone();
                 if let Some(live_remote) = live_remote {
                     updated = updated.update_remotes(live_remote)?;
@@ -2518,10 +2532,10 @@ impl InProcessDaemon {
                         .await
                         .map_err(|error| error.to_string())?;
                 }
-                return Ok(updated);
+                return Ok((updated, false));
             }
         }
-        self.configure_unassociated_repository(path, spec).await
+        self.configure_unassociated_repository(path, spec).await.map(|spec| (spec, false))
     }
 
     async fn configure_unassociated_repository(&self, _path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
@@ -2599,7 +2613,7 @@ impl InProcessDaemon {
             if let Ok(spec) = RepositorySpec::remote(repository_url) {
                 let path = std::fs::canonicalize(path)
                     .map_err(|error| format!("adopted checkout path {} cannot be resolved: {error}", path.display()))?;
-                let spec = self.configure_inspected_repository(&path, spec).await?;
+                let (spec, replaces_prior_repository) = self.configure_inspected_repository(&path, spec).await?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
                     spec,
@@ -2610,6 +2624,7 @@ impl InProcessDaemon {
                         is_main: matches!(git_ref, "main" | "master" | "trunk"),
                     },
                     transport_url: Some(repository_url.to_string()),
+                    replaces_prior_repository,
                 });
             }
         }
@@ -6515,32 +6530,43 @@ impl InProcessDaemon {
             .get(&inspection.checkout.path)
             .filter(|previous| *previous != &repository_key)
             .cloned();
-        if let Some(previous) = &previous_tracked_key {
+        if let Some(previous) = previous_tracked_key.as_ref().filter(|_| !inspection.replaces_prior_repository) {
             superseded_keys.insert(previous.clone());
         }
-        for (key, spec) in &repository_specs {
-            let aliases_current_repository = spec.remotes().iter().any(|remote| repository_spec.declares_remote(remote));
-            if key != &repository_key && (local_repository_matches_checkout(spec, &inspection.checkout) || aliases_current_repository) {
-                superseded_keys.insert(key.clone());
-                if aliases_current_repository {
-                    declared_alias_keys.insert(key.clone());
+        if !inspection.replaces_prior_repository {
+            for (key, spec) in &repository_specs {
+                let aliases_current_repository = spec.remotes().iter().any(|remote| repository_spec.declares_remote(remote));
+                if key != &repository_key && (local_repository_matches_checkout(spec, &inspection.checkout) || aliases_current_repository) {
+                    superseded_keys.insert(key.clone());
+                    if aliases_current_repository {
+                        declared_alias_keys.insert(key.clone());
+                    }
                 }
             }
-        }
-        for checkout in self
-            .observed_resource_backend
-            .clone()
-            .using::<ResourceCheckout>(&namespace)
-            .list()
+            for checkout in self
+                .observed_resource_backend
+                .clone()
+                .using::<ResourceCheckout>(&namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+            {
+                if let ResourceCheckoutSpec::Observed(observed) = checkout.spec {
+                    if Path::new(&observed.path) == inspection.checkout.path && observed.repo_ref != repository_key {
+                        superseded_keys.insert(observed.repo_ref);
+                    }
+                }
+            }
+        } else if let Some(previous) = &previous_tracked_key {
+            crate::observed_resources::delete_observed_checkout_at_path(
+                &self.observed_resource_backend,
+                &namespace,
+                previous,
+                &inspection.checkout.path,
+            )
             .await
-            .map_err(|error| error.to_string())?
-            .items
-        {
-            if let ResourceCheckoutSpec::Observed(observed) = checkout.spec {
-                if Path::new(&observed.path) == inspection.checkout.path && observed.repo_ref != repository_key {
-                    superseded_keys.insert(observed.repo_ref);
-                }
-            }
+            .map_err(|error| error.to_string())?;
         }
 
         let other_tracked_keys = self
@@ -6620,7 +6646,8 @@ impl InProcessDaemon {
         repository_spec: &RepositorySpec,
         checkout: crate::repository_inspection::LocalCheckoutInspection,
     ) -> Result<(), String> {
-        let inspection = RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None };
+        let inspection =
+            RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None, replaces_prior_repository: false };
         let inspector = self.repository_inspector().await?;
         let mut providers = ProviderData::default();
         for checkout in inspector.inspect_checkouts(&inspection).await? {

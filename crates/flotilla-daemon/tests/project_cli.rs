@@ -104,6 +104,7 @@ impl RepositoryInspector for PerPathInspector {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         })
     }
 }
@@ -126,6 +127,7 @@ impl RepositoryInspector for DeclarationInspector {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         })
     }
 
@@ -149,6 +151,7 @@ impl RepositoryInspector for MutableInspector {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         })
     }
 }
@@ -165,6 +168,7 @@ impl RepositoryInspector for FixedInspector {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         })
     }
 }
@@ -192,6 +196,7 @@ impl RepositoryInspector for WorktreeInspector {
             spec: self.spec.clone(),
             checkout: self.checkouts.read().expect("checkout inspection lock should not be poisoned")[0].clone(),
             transport_url: None,
+            replaces_prior_repository: false,
         })
     }
 
