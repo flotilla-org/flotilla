@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Barrier},
+};
 
 use flotilla_protocol::NodeId;
 use tempfile::tempdir;
@@ -30,6 +33,33 @@ fn observation_roots_roundtrip_and_reject_configuration() {
     std::fs::write(dir.path().join("observation-roots.toml"), format!("paths = [\"{}\"]\nper_path = {{}}\n", repo.display()))
         .expect("write invalid roots");
     assert!(store.load_observation_roots().expect_err("per-path config must be rejected").contains("unknown field"));
+}
+
+#[test]
+fn concurrent_observation_root_updates_preserve_every_root() {
+    let dir = tempdir().expect("create config tempdir");
+    let store = Arc::new(ConfigStore::with_base(dir.path()));
+    let paths = (0..8).map(|index| make_dir(dir.path(), &format!("repo-{index}"))).collect::<Vec<_>>();
+    let mut expected = paths.iter().cloned().map(ee).collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(paths.len()));
+
+    let threads = paths
+        .into_iter()
+        .map(|path| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.add_observation_root(&ee(path)).expect("add observation root");
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().expect("observation root update thread");
+    }
+
+    expected.sort();
+    assert_eq!(store.load_observation_roots().expect("load observation roots"), expected);
 }
 
 #[test]

@@ -2509,13 +2509,8 @@ impl InProcessDaemon {
         self.configure_unassociated_repository(path, spec).await
     }
 
-    async fn configure_unassociated_repository(&self, path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-        let resolved_spec = self.resolve_declared_repository(spec).await?;
-        let configured_spec = resolved_spec.clone();
-        if resolved_spec.remotes().len() > 1 && configured_spec.key() != resolved_spec.key() {
-            return Err(format!("repository config for {} changes the canonical remote of an existing declaration", path.display()));
-        }
-        Ok(configured_spec)
+    async fn configure_unassociated_repository(&self, _path: &Path, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        self.resolve_declared_repository(spec).await
     }
 
     pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
@@ -6910,10 +6905,16 @@ impl InProcessDaemon {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
+        if !self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path)) {
+            return Err(format!("repo not tracked: {}", path.display()));
+        }
         let repository_key = match self.repository_keys_by_path.read().await.get(&path).cloned() {
             Some(key) => Some(key),
             None => self.inspect_repository_path(&path, None).await.ok().map(|inspection| inspection.key()),
         };
+        // Persist the observation decision before tearing down runtime state.
+        // A write failure leaves the repo fully tracked and retryable.
+        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
 
         let mut removed_identity = false;
         let removed_final_local_root;
@@ -6954,9 +6955,6 @@ impl InProcessDaemon {
         }
         drop(observed_reconciliation);
 
-        // Persist to config. Tab order is Surface-owned (open-views.toml,
-        // ADR 0013) — the daemon only tracks registration.
-        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
         self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
 
         info!(repo = %path.display(), "removed repo");

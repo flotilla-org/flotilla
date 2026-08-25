@@ -434,6 +434,7 @@ pub struct ConfigStore {
     base: DaemonHostPath,
     state_dir: DaemonHostPath,
     global_config: OnceLock<Mutex<FlotillaConfig>>,
+    observation_roots: Mutex<()>,
     repository_specs: Mutex<HashMap<PathBuf, RepositorySpec>>,
 }
 
@@ -441,7 +442,13 @@ impl ConfigStore {
     /// Create a ConfigStore with explicit config and state directories.
     /// Production callers should pass paths from `PathPolicy`.
     pub fn new(base: DaemonHostPath, state_dir: DaemonHostPath) -> Self {
-        Self { base, state_dir, global_config: OnceLock::new(), repository_specs: Mutex::new(HashMap::new()) }
+        Self {
+            base,
+            state_dir,
+            global_config: OnceLock::new(),
+            observation_roots: Mutex::new(()),
+            repository_specs: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Test constructor — uses provided base path for both config and state.
@@ -479,12 +486,14 @@ impl ConfigStore {
     }
 
     pub fn add_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
+        let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
         let mut paths = self.load_observation_roots()?.into_iter().map(ExecutionEnvironmentPath::into_path_buf).collect::<Vec<_>>();
         paths.push(path.as_path().to_path_buf());
         self.save_observation_roots(paths)
     }
 
     pub fn remove_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
+        let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
         let paths = self
             .load_observation_roots()?
             .into_iter()

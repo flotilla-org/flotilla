@@ -4680,6 +4680,29 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 }
 
 #[tokio::test]
+async fn remove_repo_persistence_failure_leaves_repo_tracked() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    init_git_repo(&repo);
+
+    let config_dir = temp.path().join("config");
+    let config = test_config_store(config_dir.clone());
+    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+    daemon.add_repo(&repo).await.expect("track repo");
+
+    let roots_file = config_dir.join("observation-roots.toml");
+    std::fs::remove_file(&roots_file).expect("remove roots file");
+    std::fs::create_dir(&roots_file).expect("replace roots file with directory");
+
+    let error = daemon.remove_repo(&repo).await.expect_err("persistence failure should abort removal");
+    assert!(error.contains("failed to read"), "unexpected error: {error}");
+    assert!(daemon.tracked_repo_identity_for_path(&repo).await.is_some(), "repo should remain tracked");
+    assert_eq!(daemon.list_repos().await.expect("list repos").len(), 1);
+}
+
+#[tokio::test]
 async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
 
