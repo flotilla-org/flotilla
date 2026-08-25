@@ -8681,7 +8681,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"startup-registration-idempotent-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let profile = manual_profile(&host_id, false);
@@ -8860,7 +8860,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"startup-registration-no-origin-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
 
@@ -8905,7 +8905,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"in-memory-stage4a-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
     }
@@ -8921,7 +8921,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-stage4a-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
     }
@@ -8937,7 +8937,7 @@ mod tests {
         fs::create_dir_all(&config_base).expect("config directory");
         fs::write(config_base.join("daemon.toml"), "machine_id = \"passing-teardown-gate-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = daemon_with_backend_and_runner(
             vec![repo.clone()],
             Arc::clone(&config),
@@ -9827,7 +9827,7 @@ mod tests {
         std::fs::create_dir_all(&config_base).expect("config directory");
         std::fs::write(config_base.join("daemon.toml"), "machine_id = \"sqlite-adopted-checkout-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_base));
-        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         let host_id = daemon.local_host_id().expect("local host id").to_string();
         let profile =

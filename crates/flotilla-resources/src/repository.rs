@@ -43,6 +43,51 @@ pub struct RepositorySpec {
     allow_reviewless_workflows: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     verification_commands: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "RepositoryVcsSpec::is_empty")]
+    vcs: RepositoryVcsSpec,
+    #[serde(default, skip_serializing_if = "RepositoryProviderPreference::is_empty")]
+    change_request: RepositoryProviderPreference,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryVcsSpec {
+    #[serde(default, skip_serializing_if = "RepositoryGitSpec::is_empty")]
+    pub git: RepositoryGitSpec,
+}
+
+impl RepositoryVcsSpec {
+    fn is_empty(&self) -> bool {
+        self.git.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryGitSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
+}
+
+impl RepositoryGitSpec {
+    fn is_empty(&self) -> bool {
+        self.checkout_strategy.is_none() && self.checkout_path.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryProviderPreference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+}
+
+impl RepositoryProviderPreference {
+    fn is_empty(&self) -> bool {
+        self.backend.is_none()
+    }
 }
 
 impl RepositorySpec {
@@ -60,6 +105,8 @@ impl RepositorySpec {
             upstream: None,
             allow_reviewless_workflows: false,
             verification_commands: BTreeMap::new(),
+            vcs: RepositoryVcsSpec::default(),
+            change_request: RepositoryProviderPreference::default(),
         })
     }
 
@@ -81,6 +128,8 @@ impl RepositorySpec {
             upstream: None,
             allow_reviewless_workflows: false,
             verification_commands: BTreeMap::new(),
+            vcs: RepositoryVcsSpec::default(),
+            change_request: RepositoryProviderPreference::default(),
         })
     }
 
@@ -197,6 +246,24 @@ impl RepositorySpec {
 
     pub fn verification_commands(&self) -> &BTreeMap<String, String> {
         &self.verification_commands
+    }
+
+    pub fn vcs(&self) -> &RepositoryVcsSpec {
+        &self.vcs
+    }
+
+    pub fn change_request(&self) -> &RepositoryProviderPreference {
+        &self.change_request
+    }
+
+    pub fn with_vcs(mut self, vcs: RepositoryVcsSpec) -> Self {
+        self.vcs = vcs;
+        self
+    }
+
+    pub fn with_change_request(mut self, change_request: RepositoryProviderPreference) -> Self {
+        self.change_request = change_request;
+        self
     }
 
     pub fn with_upstream(mut self, url: impl Into<String>, relation: RepositoryRelation) -> Result<Self, String> {
@@ -409,6 +476,10 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             allow_reviewless_workflows: bool,
             #[serde(default)]
             verification_commands: BTreeMap<String, String>,
+            #[serde(default)]
+            vcs: RepositoryVcsSpec,
+            #[serde(default)]
+            change_request: RepositoryProviderPreference,
         }
 
         let stored = StoredRepositorySpec::deserialize(deserializer)?;
@@ -443,6 +514,8 @@ impl<'de> Deserialize<'de> for RepositorySpec {
         }
         normalized.allow_reviewless_workflows = stored.allow_reviewless_workflows;
         normalized.verification_commands = stored.verification_commands;
+        normalized.vcs = stored.vcs;
+        normalized.change_request = stored.change_request;
         Ok(normalized)
     }
 }

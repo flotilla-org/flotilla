@@ -200,7 +200,7 @@ Key bindings are configurable via TOML. Defaults include: `j/k` navigate, `Enter
 ## Config
 
 Stored in `~/.config/flotilla/`:
-- `repos/*.toml` — one per tracked repo (`path = "..."`, plus per-provider config: `change_request`, `issue_tracker`, `cloud_agent`, `ai_utility`, `workspace_manager`, `terminal_pool`, `vcs.git`)
+- `observation-roots.toml` — host-local paths-only list; all repo-scoped intent lives in replicated Repository/Project specs
 - `open-views.toml` — ordered TUI-owned View addresses and label overrides
 - `keybindings.toml` — user key binding overrides
 

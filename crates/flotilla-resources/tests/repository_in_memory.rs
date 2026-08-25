@@ -3,9 +3,29 @@ use std::collections::BTreeMap;
 use flotilla_resources::{
     normalize_project_spec, repository_display_labels, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance,
     InMemoryBackend, InputMeta, IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution,
-    IssueSourceUnavailable, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryIdentity, RepositoryKey,
-    RepositoryRelation, RepositorySpec, ResourceBackend, SqliteBackend,
+    IssueSourceUnavailable, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryGitSpec, RepositoryIdentity,
+    RepositoryKey, RepositoryProviderPreference, RepositoryRelation, RepositorySpec, RepositoryVcsSpec, ResourceBackend, SqliteBackend,
 };
+
+#[test]
+fn repository_provider_configuration_roundtrips_in_the_spec() {
+    let spec = RepositorySpec::remote("https://github.com/acme/widgets")
+        .expect("repository")
+        .with_vcs(RepositoryVcsSpec {
+            git: RepositoryGitSpec {
+                checkout_strategy: Some("wt".to_string()),
+                checkout_path: Some("{{ repo_path }}/../work/{{ branch }}".to_string()),
+            },
+        })
+        .with_change_request(RepositoryProviderPreference { backend: Some("github".to_string()) });
+
+    let value = serde_json::to_value(&spec).expect("serialize repository spec");
+    let decoded: RepositorySpec = serde_json::from_value(value).expect("deserialize repository spec");
+
+    assert_eq!(decoded, spec);
+    assert_eq!(decoded.vcs().git.checkout_strategy.as_deref(), Some("wt"));
+    assert_eq!(decoded.change_request().backend.as_deref(), Some("github"));
+}
 
 #[tokio::test]
 async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() {

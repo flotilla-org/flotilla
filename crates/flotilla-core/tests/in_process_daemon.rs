@@ -3915,7 +3915,9 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
 async fn refresh_syncs_fork_stance_without_whole_project_migration_and_clears_removed_config() {
     let (temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
-    ConfigStore::with_base(temp.path().join("config")).save_repo(&ExecutionEnvironmentPath::new(repo.clone()));
+    ConfigStore::with_base(temp.path().join("config"))
+        .add_observation_root(&ExecutionEnvironmentPath::new(repo.clone()))
+        .expect("persist observation root");
     let repo_config = std::fs::read_dir(temp.path().join("config/repos"))
         .expect("repo config directory")
         .find_map(|entry| {

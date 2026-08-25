@@ -849,7 +849,7 @@ async fn discover_providers_inner(
     apply_backend_pref(
         &mut registry.change_requests,
         ProviderCategory::ChangeRequest,
-        flotilla_config.change_request.preference.backend.as_deref(),
+        config.resolve_change_request_backend(repo_root).as_deref(),
         &mut unmet,
     );
     apply_backend_pref(
