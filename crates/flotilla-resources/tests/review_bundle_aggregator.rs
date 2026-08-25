@@ -114,3 +114,32 @@ fn project_review_prep_instructions_change_bundle_contents() {
     assert_eq!(read_artifacts(instructed.path()), ["review.html", "project-artifacts/review-assets/explainer.html"]);
     assert!(instructed.path().join(".flotilla/review-bundle/project-artifacts/review-assets/explainer.html").is_file());
 }
+
+#[test]
+fn project_review_prep_refuses_artifacts_outside_the_project() {
+    let outside = tempfile::NamedTempFile::new().expect("create outside artifact");
+    let declarations = [
+        outside.path().display().to_string(),
+        format!("../{}", outside.path().file_name().expect("outside artifact has a name").to_string_lossy()),
+    ];
+    for declaration in declarations {
+        let project = project_with_review(
+            Some(serde_json::json!({
+                "finding_id": "R1-F1",
+                "state": "addressed",
+                "fix_reference": "commit:HEAD"
+            })),
+            false,
+        );
+        fs::write(
+            project.path().join("CLAUDE.md"),
+            format!("```flotilla-review-prep\n{{\"required_artifacts\":[{declaration:?}]}}\n```\n"),
+        )
+        .expect("write escaping instructions");
+
+        let output = aggregator(project.path());
+        assert!(!output.status.success(), "outside artifact was accepted: {declaration}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("required artifact escapes project root"));
+        assert!(!project.path().join(".flotilla/review-bundle").exists());
+    }
+}
