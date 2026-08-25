@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,12 +28,24 @@ pub struct CredentialSpecSpec {
 #[serde(tag = "adapter", rename_all = "kebab-case")]
 pub enum CredentialConsumer {
     Gh,
-    GithubApp { installation_id: u64 },
-    Forgejo { server_url: String, username: String },
+    GithubApp {
+        installation_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permissions: Option<BTreeMap<String, String>>,
+    },
+    Forgejo {
+        server_url: String,
+        username: String,
+    },
     Claude,
-    ClaudeOauth { account_email: String },
+    ClaudeOauth {
+        account_email: String,
+    },
     Codex,
-    DockerRegistry { registry: String, username: String },
+    DockerRegistry {
+        registry: String,
+        username: String,
+    },
 }
 
 impl CredentialConsumer {
