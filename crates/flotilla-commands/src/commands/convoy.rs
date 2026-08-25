@@ -299,7 +299,16 @@ impl ConvoyNoun {
                 }
                 let issues = match (issue, issue_service, issue_scope) {
                     (None, None, None) => Vec::new(),
-                    (Some(id), None, None) => vec![IssueSelector::Id(id)],
+                    (Some(value), None, None) => {
+                        let selector = match value.split_once('#') {
+                            Some((alias, id)) if !alias.is_empty() && !id.is_empty() => {
+                                IssueSelector::Alias { alias: alias.to_string(), id: id.to_string() }
+                            }
+                            Some(_) => return Err("alias-qualified --issue must be ALIAS#ID".to_string()),
+                            None => IssueSelector::Id(value),
+                        };
+                        vec![selector]
+                    }
                     (Some(id), Some(service), Some(scope)) => {
                         vec![IssueSelector::Reference(IssueRef { source: IssueSource { service, scope }, id })]
                     }
@@ -793,6 +802,14 @@ mod tests {
             RepoContext::None,
             HostResolution::Local,
         );
+    }
+
+    #[test]
+    fn convoy_start_alias_qualified_issue_resolves_without_guessing() {
+        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--issue", "zellij#12"]).resolve().expect("resolve");
+        let Resolved::NeedsContext { command, .. } = resolved else { panic!("start needs context") };
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("start command") };
+        assert_eq!(intent.issues, vec![IssueSelector::Alias { alias: "zellij".into(), id: "12".into() }]);
     }
 
     #[test]

@@ -2638,6 +2638,13 @@ impl InProcessDaemon {
         &self,
         scope: &flotilla_protocol::QueryScope,
     ) -> Result<Vec<flotilla_protocol::IssueSource>, String> {
+        Ok(self.resolve_issue_source_bindings(scope).await?.into_iter().map(|binding| binding.source).collect())
+    }
+
+    pub async fn resolve_issue_source_bindings(
+        &self,
+        scope: &flotilla_protocol::QueryScope,
+    ) -> Result<Vec<flotilla_resources::ResolvedIssueSourceBinding>, String> {
         let project = self
             .resource_backend
             .clone()
@@ -2647,10 +2654,11 @@ impl InProcessDaemon {
             .map_err(|error| format!("project {}/{}: {error}", scope.namespace, scope.name))?;
         match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(&scope.namespace), &project.spec).await
         {
-            IssueSourceResolution::Available { sources } => Ok(sources),
+            IssueSourceResolution::Available { bindings } => Ok(bindings),
             IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
                 Err(format!("repository {repository}: {message}"))
             }
+            IssueSourceResolution::Unavailable(IssueSourceUnavailable::InvalidBindings { message }) => Err(message),
             IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
                 Err(format!("project {}/{} has no issue source", scope.namespace, scope.name))
             }
@@ -3751,7 +3759,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     normalize_project_spec(ProjectSpec {
         display_name,
         default_workflow_ref: "single-agent-contained".to_string(),
-        issue_source: None,
+        issue_sources: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
             repo: repository_key,
             alias: None,
@@ -4371,17 +4379,18 @@ impl InProcessDaemon {
     ) -> Result<ConvoyIssue, String> {
         let sources =
             match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &project.spec).await {
-                IssueSourceResolution::Available { sources } => sources,
+                IssueSourceResolution::Available { bindings } => bindings,
                 IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
                     return Err(format!("repository {repository}: {message}"));
                 }
+                IssueSourceResolution::Unavailable(IssueSourceUnavailable::InvalidBindings { message }) => return Err(message),
                 IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
                     return Err(format!("project {} has no issue source", project.metadata.name));
                 }
             };
         let issue = match selector {
             flotilla_protocol::IssueSelector::Reference(reference) => {
-                if !sources.contains(&reference.source) {
+                if !sources.iter().any(|binding| binding.source == reference.source) {
                     return Err(format!(
                         "issue source {} {} is not part of project {}",
                         reference.source.service, reference.source.scope, project.metadata.name
@@ -4389,21 +4398,23 @@ impl InProcessDaemon {
                 }
                 self.resolve_convoy_issue_snapshot(reference).await?
             }
+            flotilla_protocol::IssueSelector::Alias { alias, id } => {
+                let binding = sources
+                    .iter()
+                    .find(|binding| binding.alias == *alias)
+                    .ok_or_else(|| format!("project {} has no issue source alias `{alias}`", project.metadata.name))?;
+                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: binding.source.clone(), id: id.clone() }).await?
+            }
             flotilla_protocol::IssueSelector::Id(id) => {
-                let mut matches = Vec::new();
-                let mut failures = Vec::new();
-                for source in sources {
-                    let reference = flotilla_protocol::IssueRef { source, id: id.clone() };
-                    match self.resolve_convoy_issue_snapshot(&reference).await {
-                        Ok(issue) => matches.push(issue),
-                        Err(error) => failures.push(error),
-                    }
+                if sources.len() != 1 {
+                    return Err(format!(
+                        "issue {id} requires an alias because project {} has {} issue sources",
+                        project.metadata.name,
+                        sources.len()
+                    ));
                 }
-                match matches.len() {
-                    1 => matches.remove(0),
-                    0 => return Err(format!("issue {id} was not found for project {}: {}", project.metadata.name, failures.join("; "))),
-                    count => return Err(format!("issue {id} is ambiguous across {count} project issue sources")),
-                }
+                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef { source: sources[0].source.clone(), id: id.clone() })
+                    .await?
             }
         };
 
@@ -5926,7 +5937,7 @@ impl InProcessDaemon {
         let spec = normalize_project_spec(ProjectSpec {
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent-contained".to_string()),
-            issue_source: None,
+            issue_sources: Vec::new(),
             repositories: members,
             dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
         })?;
@@ -7209,7 +7220,7 @@ impl InProcessDaemon {
                     .display_name(project.spec.display_name)
                     .address(ViewAddress::Project { namespace: project.metadata.namespace, name: project.metadata.name })
                     .repositories(repositories)
-                    .maybe_issue_source(project.spec.issue_source)
+                    .maybe_issue_source(project.spec.issue_sources.first().map(|binding| binding.source.clone()))
                     .default_workflow_ref(project.spec.default_workflow_ref)
                     .conflicts(conflicts)
                     .build()

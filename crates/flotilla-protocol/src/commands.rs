@@ -360,6 +360,7 @@ pub struct Command {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum IssueSelector {
     Id(String),
+    Alias { alias: String, id: String },
     Reference(IssueRef),
 }
 
@@ -1600,6 +1601,10 @@ mod tests {
     fn issue_selector_json_is_stable_and_roundtrips_all_variants() {
         let cases = [
             (IssueSelector::Id("834".into()), json!({"kind": "id", "value": "834"})),
+            (
+                IssueSelector::Alias { alias: "zellij".into(), id: "12".into() },
+                json!({"kind": "alias", "value": {"alias": "zellij", "id": "12"}}),
+            ),
             (
                 IssueSelector::Reference(IssueRef {
                     source: crate::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
