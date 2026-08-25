@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 PLATFORMS = ("linux-x86_64-gnu2.36", "darwin-aarch64")
 SOURCE_NAMES = ("flotilla", "cleat", "mattpocock-skills", "rjw-skills")
 REQUIRED_PAYLOAD = {
-    "bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh",
+    "bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
 }
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")

@@ -51,6 +51,7 @@ add_test_skills() {
 generation_one="20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa"
 generation_two="20260815T220000Z-r2-f222222222222-cbbbbbbbbbbbb"
 generation_incomplete="20260815T225000Z-r9-f999999999999-cffffffffffff"
+generation_handoff_failure="20260815T224000Z-r8-f888888888888-ceeeeeeeeeeee"
 fixture_root="$test_root/packages"
 fake_bin="$test_root/fake-bin"
 mkdir -p "$test_root/home/.config/flotilla" "$fixture_root" "$fake_bin"
@@ -64,6 +65,7 @@ make_generation() {
   local corrupt_inner="${4:-no}"
   local skill_revision="${5:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
   local skill_repository="${6:-https://github.com/flotilla-org/mattpocock-skills.git}"
+  local installer_behavior="${7:-activate}"
   local directory="$fixture_root/$generation"
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
@@ -72,8 +74,13 @@ make_generation() {
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$bundle/install.sh"
-  chmod 0755 "$bundle/install.sh"
+  if [[ "$installer_behavior" == fail ]]; then
+    printf '#!/usr/bin/env bash\nprintf "incoming installer refused activation\\n" >&2\nexit 42\n' >"$bundle/install.sh"
+  else
+    cp "$installer" "$bundle/install.sh"
+  fi
+  cp "$repo_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
+  chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle" "$skill_revision" "$skill_repository"
 TEST_BUNDLE="$bundle" TEST_PLATFORM="$platform" TEST_PROTOCOL="$protocol" TEST_CORRUPT_INNER="$corrupt_inner" python3 - <<'PY'
 import hashlib
@@ -165,8 +172,9 @@ add_darwin_derivative() {
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
   chmod 0755 "$bundle/lib/libghostty-vt.dylib"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$bundle/install.sh"
-  chmod 0755 "$bundle/install.sh"
+  cp "$installer" "$bundle/install.sh"
+  cp "$repo_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
+  chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle"
   TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 - <<'PY'
 import hashlib
@@ -265,6 +273,8 @@ PY
 
 make_generation "$generation_one" 20
 make_generation "$generation_two" 21
+make_generation "$generation_handoff_failure" 21 linux-x86_64-gnu2.36 no \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb https://github.com/flotilla-org/mattpocock-skills.git fail
 source_generation_two="20260815T215500Z-r2-f222222222222-cbbbbbbbbbbbb"
 source_generation_one="20260815T205500Z-r1-f111111111111-caaaaaaaaaaaa"
 add_darwin_derivative "$generation_one" "$source_generation_one" 20
@@ -497,6 +507,9 @@ test "$(link_generation "$first_install_home/.local/opt/flotilla-fleet/current")
   || fail 'first-install retry did not select the generation'
 
 run_installer "$generation_one" >"$test_root/install-one.out"
+if grep -Fq 'handing off activation' "$test_root/install-one.out"; then
+  fail 'fresh install handed activation to the incoming installer'
+fi
 grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
   || fail 'healthy Linux install was not confirmed'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
@@ -602,6 +615,18 @@ fi
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'interrupted download switched current'
 test ! -e "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_two" || fail 'interrupted download published a release'
 
+if run_installer "$generation_handoff_failure" >"$test_root/handoff-failure.out" 2>&1; then
+  fail 'incoming installer failure was accepted'
+fi
+grep -Fq "handing off activation to generation $generation_handoff_failure installer" "$test_root/handoff-failure.out" \
+  || fail 'upgrade did not execute the incoming generation installer'
+grep -Fq 'incoming installer refused activation' "$test_root/handoff-failure.out" \
+  || fail 'incoming installer failure was not reported'
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'handoff failure switched current'
+"$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --json fleet >/dev/null \
+  || fail 'handoff failure did not leave the old generation restartable'
+
 if DAEMON_RUNNING=1 STOP_FAIL=1 run_installer "$generation_two" >"$test_root/daemon.out" 2>&1; then
   fail 'daemon stop refusal was ignored'
 fi
@@ -667,6 +692,8 @@ done
 [[ -n "$orphan_confirmation_log" ]] || fail 'detached watchdog did not retain a completed rollback audit log'
 
 DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
+grep -Fq "handing off activation to generation $generation_two installer" "$test_root/latest.out" \
+  || fail 'upgrade did not adopt the incoming generation installer'
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
   || fail 'healthy Linux upgrade was not confirmed'
 compgen -G "$test_root/home/.local/opt/flotilla-fleet/.confirmation.*.log" >/dev/null \
@@ -675,6 +702,9 @@ grep -Fq "$generation_one -> $generation_two" "$test_root/latest.out" || fail 'l
 grep -Fq 'daemon stop requested' "$test_root/latest.out" || fail 'running daemon was not stopped before switching'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'latest did not select newest promoted generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_one" || fail 'switch did not record previous generation'
+if leftover_work_dirs="$(compgen -G "$test_root/home/.local/opt/flotilla-fleet/.fleet-install.*")"; then
+  fail "successful upgrade left fleet-install work directories behind: $leftover_work_dirs"
+fi
 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
@@ -720,10 +750,10 @@ test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$g
   || fail 'signed Darwin generation was not selected'
 test -f "$darwin_home/.local/opt/flotilla-fleet/releases/$generation_two/lib/libghostty-vt.dylib" \
   || fail 'signed Darwin dynamic library was not installed'
-test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 4 \
-  || fail 'Darwin install did not strictly verify every Mach-O payload'
-test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 4 \
-  || fail 'Darwin install did not verify every Mach-O entitlement set'
+test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 8 \
+  || fail 'Darwin upgrade did not verify every Mach-O payload before and after handoff'
+test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 8 \
+  || fail 'Darwin upgrade did not verify every Mach-O entitlement set before and after handoff'
 launch_agent="$darwin_home/Library/LaunchAgents/work.flotilla.flotillad.plist"
 python3 - "$launch_agent" "$darwin_home" <<'PY' || fail 'Darwin launchd agent content is incorrect'
 import plistlib
@@ -837,9 +867,13 @@ fi
 test ! -e "$test_root/home/.local/opt/flotilla-fleet/releases/$bad_digest" || fail 'digest rejection published a release'
 
 bad_manifest="20260815T231000Z-r4-f444444444444-cdddddddddddd"
-make_generation "$bad_manifest" 21 linux-x86_64-gnu2.36 yes
+make_generation "$bad_manifest" 21 linux-x86_64-gnu2.36 yes \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb https://github.com/flotilla-org/mattpocock-skills.git fail
 if run_installer "$bad_manifest" >"$test_root/manifest.out" 2>&1; then
   fail 'inner manifest mismatch was accepted'
+fi
+if grep -Fq 'incoming installer refused activation' "$test_root/manifest.out"; then
+  fail 'generation installer ran before its payload passed verification'
 fi
 test ! -e "$test_root/home/.local/opt/flotilla-fleet/releases/$bad_manifest" || fail 'manifest rejection published a release'
 

@@ -13,12 +13,15 @@ scoped GitHub credential during provisioning.
 
 The build workers receive no durable release credential or signing identity.
 Forgejo's per-run artifact token expires with the workflow. These candidates
-are therefore useful for installation and investigation, but they are not a
-completed release and cannot update a fleet pin.
+are therefore useful for investigation and rehearsal, but they are not a
+completed release and cannot update a fleet pin or be installed directly.
 
 Each artifact contains a tar archive, adjacent SHA-256 and JSON metadata, and
-an `install.sh` inside the archive. The installer defaults to `~/.local` and
-accepts another prefix as its first argument. Cleat's current dynamic
+the fleet installer plus its canonical generation validator inside the archive.
+On a fresh install, the separately obtained bootstrap `fleet-install` verifies
+and activates the first generation itself. On an upgrade, the running installer
+fully verifies and stages the incoming generation, then delegates activation to
+that generation's `install.sh`. Cleat's current dynamic
 `libghostty-vt` dependency is included under `lib/` with a relative runtime
 search path. The Darwin Cleat binary is ad-hoc signed after that path is
 rewritten so macOS can execute it; this is not a durable release signature.

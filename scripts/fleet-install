@@ -904,6 +904,55 @@ switch_to() {
   atomic_link "releases/$generation" "$CURRENT_LINK"
 }
 
+activate_staged_generation() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local confirmation_token="$3"
+  local release="$RELEASES_DIR/$generation"
+  make_work_dir
+  [[ -d "$release" ]] || die "staged generation is missing: $generation"
+  [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
+  verify_installed_release "$release" "$release/.generation.json"
+  # Verification is the only activation step that needs this process's work
+  # directory. Release it before service mutation so interruption cannot leak
+  # staging state while the detached health watchdog completes recovery.
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  WORK_DIR=""
+  ensure_launchers_and_path
+  prepare_linux_daemon_service
+  prepare_darwin_daemon_service
+  switch_to "$generation" "$rollback_generation" "$confirmation_token"
+  restart_linux_daemon_service
+  restart_darwin_daemon_service
+  if ((DARWIN_AGENT_DISABLED)); then
+    disarm_health_confirmation "$confirmation_token"
+    printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+  else
+    await_confirmation_watchdog "$generation" "$rollback_generation"
+  fi
+}
+
+handoff_activation() {
+  local generation="$1"
+  local rollback_generation="$2"
+  local confirmation_token="$3"
+  local incoming_installer="$RELEASES_DIR/$generation/install.sh"
+  [[ -x "$incoming_installer" ]] || die "verified generation has no executable installer: $generation"
+  printf 'fleet-install: handing off activation to generation %s installer\n' "$generation"
+  # exec does not run this process's EXIT trap. Discard the bootstrap
+  # verifier's downloads before replacing it with the incoming installer.
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  WORK_DIR=""
+  exec "$incoming_installer" __activate "$generation" "$rollback_generation" "$confirmation_token" "$INSTALL_LOCK_OWNER"
+}
+
+require_handoff_lock() {
+  local expected_owner="$1"
+  local lock="$FLEET_ROOT/.install.lock"
+  [[ -L "$lock" && "$(readlink "$lock")" == "$expected_owner" ]] \
+    || die 'installer activation handoff does not own the fleet-install mutation lock'
+}
+
 install_generation() {
   local generation="$1"
   require_generation "$generation"
@@ -932,17 +981,12 @@ PY
     local installed_outer="$WORK_DIR/installed-generation.json"
     require_generation_manifest "$generation" "$installed_outer"
     verify_installed_release "$RELEASES_DIR/$generation" "$installed_outer"
-    ensure_launchers_and_path
-    prepare_linux_daemon_service
-    prepare_darwin_daemon_service
-    switch_to "$generation" "$rollback_generation" "$confirmation_token"
-    restart_linux_daemon_service
-    restart_darwin_daemon_service
-    if ((DARWIN_AGENT_DISABLED)); then
-      disarm_health_confirmation "$confirmation_token"
-      printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+    if [[ -n "$old" ]]; then
+      handoff_activation "$generation" "$rollback_generation" "$confirmation_token"
     else
-      await_confirmation_watchdog "$generation" "$rollback_generation"
+      # Fresh installs have no trusted installed generation to hand off from;
+      # the bootstrap installer completes their first activation itself.
+      activate_staged_generation "$generation" "$rollback_generation" "$confirmation_token"
     fi
     printf 'fleet-install: generation %s is installed\n' "$generation"
     return
@@ -966,17 +1010,12 @@ PY
   extract_and_verify "$archive" "$unpack" "$outer"
   mv "$unpack/release" "$RELEASES_DIR/$generation"
   chmod -R a-w "$RELEASES_DIR/$generation"
-  ensure_launchers_and_path
-  prepare_linux_daemon_service
-  prepare_darwin_daemon_service
-  switch_to "$generation" "$rollback_generation" "$confirmation_token"
-  restart_linux_daemon_service
-  restart_darwin_daemon_service
-  if ((DARWIN_AGENT_DISABLED)); then
-    disarm_health_confirmation "$confirmation_token"
-    printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
+  if [[ -n "$old" ]]; then
+    handoff_activation "$generation" "$rollback_generation" "$confirmation_token"
   else
-    await_confirmation_watchdog "$generation" "$rollback_generation"
+    # The bootstrap installer owns the fresh-install path; subsequent
+    # generations adopt their own installer through handoff_activation.
+    activate_staged_generation "$generation" "$rollback_generation" "$confirmation_token"
   fi
   printf 'fleet-install: generation %s is installed\n' "$generation"
 }
@@ -1041,6 +1080,18 @@ main() {
     confirmation_watchdog "$2" "$3" "$4"
     return
   fi
+  if [[ "${1:-}" == __activate ]]; then
+    [[ $# -eq 5 ]] || usage
+    PLATFORM="$(host_platform)"
+    require_generation "$2"
+    require_handoff_lock "$5"
+    INSTALL_LOCK_PATH="$FLEET_ROOT/.install.lock"
+    INSTALL_LOCK_OWNER="$5"
+    INSTALL_LOCK_HELD=1
+    activate_staged_generation "$2" "$3" "$4"
+    printf 'fleet-install: generation %s is installed\n' "$2"
+    return
+  fi
   [[ $# -eq 1 ]] || usage
   PLATFORM="$(host_platform)"
   case "$1" in
@@ -1050,6 +1101,9 @@ main() {
       ;;
     latest)
       local generation
+      # Allocate in the parent shell so cleanup and the activation handoff
+      # retain ownership when latest_generation runs in command substitution.
+      make_work_dir
       generation="$(latest_generation)"
       install_generation "$generation"
       ;;
