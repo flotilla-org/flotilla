@@ -21,7 +21,7 @@
     "share/flotilla/skills/.flotilla-sources.json"
   ],
   "skill_bundle": {
-    "schema_version": 3,
+    "schema_version": 4,
     "sources": [
       {
         "name": "mattpocock-skills",
@@ -31,7 +31,18 @@
       {
         "name": "rjw-skills",
         "repository": "https://github.com/rjwittams/rjw-skills.git",
-        "revision": "dddddddddddddddddddddddddddddddddddddddd"
+        "revision": "dddddddddddddddddddddddddddddddddddddddd",
+        "paths": ["plugins/rjw-sdlc/skills"]
+      },
+      {
+        "name": "cleat",
+        "repository": "https://github.com/flotilla-org/cleat.git",
+        "revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "name": "flotilla",
+        "repository": "https://github.com/flotilla-org/flotilla.git",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     ]
   }

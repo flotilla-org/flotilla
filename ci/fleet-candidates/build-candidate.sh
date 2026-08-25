@@ -112,6 +112,8 @@ install -m 0755 "$cleat_root/target/release/cleat" "$bundle/bin/cleat"
 skills_bundle="$bundle/share/flotilla/skills"
 mkdir -p "$skills_bundle"
 FLEET_SKILLS_BUNDLE="$skills_bundle" \
+  FLEET_FLOTILLA_SHA="$flotilla_sha" \
+  FLEET_CLEAT_SHA="$cleat_sha" \
   FLEET_MATTPOCOCK_SKILLS_SHA="$mattpocock_skills_sha" \
   FLEET_RJW_SKILLS_SHA="$rjw_skills_sha" \
   python3 - <<'PY'
@@ -124,7 +126,7 @@ bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
 # demand declarations (flotilla-org/flotilla#1790), never a list baked into a
 # generation.
 manifest = {
-    "schema_version": 3,
+    "schema_version": 4,
     "sources": [
         {
             "name": "mattpocock-skills",
@@ -135,6 +137,17 @@ manifest = {
             "name": "rjw-skills",
             "repository": "https://github.com/rjwittams/rjw-skills.git",
             "revision": os.environ["FLEET_RJW_SKILLS_SHA"],
+            "paths": ["plugins/rjw-sdlc/skills"],
+        },
+        {
+            "name": "cleat",
+            "repository": "https://github.com/flotilla-org/cleat.git",
+            "revision": os.environ["FLEET_CLEAT_SHA"],
+        },
+        {
+            "name": "flotilla",
+            "repository": "https://github.com/flotilla-org/flotilla.git",
+            "revision": os.environ["FLEET_FLOTILLA_SHA"],
         },
     ],
 }

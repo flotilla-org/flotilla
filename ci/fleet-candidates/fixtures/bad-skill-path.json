@@ -13,26 +13,13 @@
     "peer_protocol_version": 20,
     "platforms": {}
   },
-  "payload": [
-    "bin/flotilla",
-    "bin/flotillad",
-    "bin/cleat",
-    "install.sh",
-    "share/flotilla/skills/.flotilla-sources.json"
-  ],
   "skill_bundle": {
     "schema_version": 4,
-    "sources": [
-      {
-        "name": "mattpocock-skills",
-        "repository": "https://evil.example/skills.git",
-        "revision": "cccccccccccccccccccccccccccccccccccccccc"
-      },
-      {
-        "name": "rjw-skills",
-        "repository": "https://github.com/rjwittams/rjw-skills.git",
-        "revision": "dddddddddddddddddddddddddddddddddddddddd"
-      }
-    ]
+    "sources": [{
+      "name": "rjw-skills",
+      "repository": "https://github.com/rjwittams/rjw-skills.git",
+      "revision": "dddddddddddddddddddddddddddddddddddddddd",
+      "paths": []
+    }]
   }
 }

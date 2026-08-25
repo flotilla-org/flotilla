@@ -3,8 +3,9 @@
 `.forgejo/workflows/fleet-candidates.yml` is the first durable-credential-free
 half of the coordinated fleet release path. A human starts one workflow with
 exact 40-character Flotilla, Cleat, mattpocock-skills, and rjw-skills commits.
-The workflow fetches the public program sources from GitHub, records the two
-skill repository revisions in a provisioning manifest, builds on the real lab
+The workflow fetches the public program sources from GitHub and records the
+canonical four-source skill set in a provisioning manifest, with Cleat and
+Flotilla reusing their existing binary pins. It builds on the real lab
 Linux and Darwin runners, verifies the resulting payload, and retains unsigned
 run-scoped bundles for seven days. It does not fetch the private skill fork:
 Forgejo run tokens are repository-scoped, while each contained crew receives a
@@ -185,9 +186,13 @@ while dev mode is enabled.
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
 the read-only generation. The same generation carries the exact skill source
-revisions in the version-3 `share/flotilla/skills/.flotilla-sources.json`
+revisions in the version-4 `share/flotilla/skills/.flotilla-sources.json`
 manifest, whose source set is data: any number of named sources, each pinned to
 a full commit SHA and each matching the pin the generation was promoted with.
+Each source may declare a non-empty, unique list of repository-relative
+directories in `paths`; omitted paths default to `["skills"]`. Staging uses a
+shallow, blob-filtered sparse checkout and discovers skills only below those
+directories.
 The one exception is the source named `mattpocock-skills`, which must point at
 `https://github.com/flotilla-org/mattpocock-skills.git`, because the daemon
 scopes its GitHub App token to that name and would otherwise fetch with it from

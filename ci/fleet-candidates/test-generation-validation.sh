@@ -10,7 +10,7 @@ tools=(
 )
 for tool in "${tools[@]}"; do
   python3 "$tool" --validate-fixture "$fixtures/valid.json"
-  for fixture in bad-pin unexpected-payload source-set-mismatch v3-bundle-violation; do
+  for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v3-bundle-violation; do
     if python3 "$tool" --validate-fixture "$fixtures/$fixture.json" >/dev/null 2>&1; then
       echo "$(basename "$tool") accepted invalid fixture $fixture" >&2
       exit 1
@@ -19,7 +19,7 @@ for tool in "${tools[@]}"; do
 done
 
 FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/valid.json"
-for fixture in bad-pin unexpected-payload source-set-mismatch v3-bundle-violation; do
+for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v3-bundle-violation; do
   if FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/$fixture.json" >/dev/null 2>&1; then
     echo "fleet-install accepted invalid fixture $fixture" >&2
     exit 1
