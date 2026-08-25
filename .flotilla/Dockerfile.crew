@@ -97,11 +97,15 @@ RUN npm install --global \
 ENV DISABLE_AUTOUPDATER=1
 ENV SHELL=/bin/zsh
 
+RUN curl -LsSf https://astral.sh/uv/install.sh \
+    | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+
 # Build-time smoke check: declaring these adapters in a PlacementPolicy is a
 # promise that both entry points are executable in the image.
 RUN claude --version \
     && codex --version \
     && python3 --version \
+    && uv --version \
     && strace --version \
     && clang --version \
     && ld.lld --version \
