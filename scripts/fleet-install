@@ -20,6 +20,7 @@ readonly CURRENT_LINK="$FLEET_ROOT/current"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
 readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
+readonly GENERATION_VALIDATOR="${FLEET_GENERATION_VALIDATOR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../ci/fleet-candidates" 2>/dev/null && pwd)/generation_validation.py}"
 readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
@@ -235,101 +236,7 @@ fetch_generation_manifest() {
       result=$?
       return "$result"
     }
-  python3 - "$destination" "$generation" "$PLATFORM" "$TRUSTED_APPLE_TEAM_ID" <<'PY'
-import json
-import re
-import sys
-
-manifest = json.load(open(sys.argv[1]))
-generation = sys.argv[2]
-platform = sys.argv[3]
-trusted_team = sys.argv[4]
-identity = re.fullmatch(r"\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12})", generation)
-if identity is None:
-    raise SystemExit("invalid generation id")
-if manifest.get("schema_version") != 1 or manifest.get("kind") != "internal-promoted-fleet-generation":
-    raise SystemExit("unsupported generation manifest")
-if manifest.get("generation") != generation:
-    raise SystemExit("generation manifest identity mismatch")
-sources = manifest.get("sources")
-if (
-    not isinstance(sources, dict)
-    or set(sources) != {"flotilla", "cleat", "mattpocock-skills", "rjw-skills"}
-    or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in sources.values())
-    or sources["flotilla"][:12] != identity.group(1)
-    or sources["cleat"][:12] != identity.group(2)
-):
-    raise SystemExit("generation manifest has invalid source commits")
-version = manifest.get("peer_protocol_version")
-if not isinstance(version, int) or isinstance(version, bool) or version < 1:
-    raise SystemExit("generation manifest has invalid peer_protocol_version")
-entry = manifest.get("platforms", {}).get(platform)
-if not isinstance(entry, dict):
-    print(f"generation has no {platform} artifact", file=sys.stderr)
-    raise SystemExit(20)
-if entry.get("state") != "installable-internal":
-    print(f"generation artifact for {platform} is not installable-internal", file=sys.stderr)
-    raise SystemExit(20)
-artifact = entry.get("artifact")
-digest = entry.get("sha256")
-size = entry.get("size_bytes")
-expected_artifact = (
-    "fleet-signed-darwin-aarch64.tar.gz"
-    if platform == "darwin-aarch64"
-    else "fleet-candidate-linux-x86_64-gnu2.36.tar.gz"
-)
-if artifact != expected_artifact:
-    raise SystemExit("generation manifest has invalid artifact name")
-if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-    raise SystemExit("generation manifest has invalid artifact digest")
-if not isinstance(size, int) or isinstance(size, bool) or size < 1:
-    raise SystemExit("generation manifest has invalid artifact size")
-if platform == "linux-x86_64-gnu2.36":
-    if entry.get("signed") is not False:
-        raise SystemExit("Linux generation has an unexpected signing state")
-else:
-    if entry.get("signed") is not True:
-        raise SystemExit("Darwin generation is not centrally signed")
-    source_generation = manifest.get("source_generation")
-    source_identity = re.fullmatch(
-        r"\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12})", source_generation or ""
-    )
-    if source_identity is None:
-        raise SystemExit("Darwin generation has an invalid source generation")
-    if sources["flotilla"][:12] != source_identity.group(1) or sources["cleat"][:12] != source_identity.group(2):
-        raise SystemExit("Darwin source generation does not match the recorded source commits")
-    if entry.get("source_artifact") != "fleet-candidate-darwin-aarch64.tar.gz":
-        raise SystemExit("Darwin generation has an invalid source artifact")
-    if not re.fullmatch(r"[0-9a-f]{64}", entry.get("source_artifact_sha256", "")):
-        raise SystemExit("Darwin generation has an invalid source artifact digest")
-    central = manifest.get("central_signing")
-    if not isinstance(central, dict):
-        raise SystemExit("Darwin generation has no central-signing record")
-    expected = {
-        "derivative_package": "lab-signing/flotilla-fleet-darwin-signed",
-        "derivative_version": source_generation,
-        "attestation": "darwin-signing-attestation.json",
-        "cms": "darwin-signing-attestation.cms",
-        "certificate": "darwin-signing-certificate.pem",
-    }
-    if any(central.get(field) != value for field, value in expected.items()):
-        raise SystemExit("Darwin generation has invalid central-signing linkage")
-    for field in ("attestation_sha256", "cms_sha256", "certificate_sha256"):
-        if not re.fullmatch(r"[0-9a-f]{64}", central.get(field, "")):
-            raise SystemExit(f"Darwin generation has invalid {field}")
-    signing = central.get("signing")
-    if not isinstance(signing, dict) or signing.get("team_id") != trusted_team:
-        raise SystemExit(f"Darwin generation is not signed by trusted Apple team {trusted_team}")
-    if not isinstance(signing.get("identity"), str) or not signing["identity"]:
-        raise SystemExit("Darwin generation has invalid signing identity")
-    if signing.get("options") != ["runtime", "timestamp=none"]:
-        raise SystemExit("Darwin generation has invalid signing options")
-    for field in ("certificate_sha256", "entitlements_sha256"):
-        if not re.fullmatch(r"[0-9a-f]{64}", signing.get(field, "")):
-            raise SystemExit(f"Darwin generation has invalid signing {field}")
-    if central["certificate_sha256"] != signing["certificate_sha256"] or entry.get("signing") != signing:
-        raise SystemExit("Darwin generation has inconsistent signing metadata")
-PY
+  python3 "$GENERATION_VALIDATOR" generation "$destination" "$generation" "$PLATFORM" --installable
 }
 
 require_generation_manifest() {
@@ -445,117 +352,7 @@ PY
 verify_release() {
   local release="$1"
   local generation_manifest="$2"
-  python3 - "$release" "$generation_manifest" "$PLATFORM" <<'PY'
-import hashlib
-import json
-import os
-import re
-import sys
-from pathlib import Path, PurePosixPath
-
-root = Path(sys.argv[1])
-outer_path = Path(sys.argv[2])
-platform = sys.argv[3]
-manifest_path = root / "manifest.json"
-manifest = json.loads(manifest_path.read_text())
-outer = json.loads(outer_path.read_text())
-expected_kind = "signed-fleet-derivative" if platform == "darwin-aarch64" else "unsigned-fleet-candidate"
-if manifest.get("schema_version") != 1 or manifest.get("kind") != expected_kind or manifest.get("platform") != platform:
-    raise SystemExit("release manifest platform or schema mismatch")
-if manifest.get("peer_protocol_version") != outer.get("peer_protocol_version") or manifest.get("sources") != outer.get("sources"):
-    raise SystemExit("release and generation metadata differ")
-if platform == "darwin-aarch64":
-    entry = outer["platforms"][platform]
-    if (
-        manifest.get("signed") is not True
-        or manifest.get("source_generation") != outer.get("source_generation")
-        or manifest.get("source_artifact_sha256") != entry.get("source_artifact_sha256")
-        or manifest.get("signing") != outer.get("central_signing", {}).get("signing")
-    ):
-        raise SystemExit("signed Darwin derivative does not match its completed generation")
-elif manifest.get("signed") is not False:
-    raise SystemExit("Linux candidate has an unexpected signing state")
-entries = manifest.get("files")
-if not isinstance(entries, list) or not entries:
-    raise SystemExit("release manifest has no files")
-expected = set()
-for entry in entries:
-    rel = entry.get("path")
-    relative = PurePosixPath(rel) if isinstance(rel, str) else None
-    if relative is None or relative.is_absolute() or ".." in relative.parts or not relative.parts or rel in expected:
-        raise SystemExit("release manifest contains an unsafe or duplicate path")
-    digest = entry.get("sha256")
-    size = entry.get("size_bytes")
-    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise SystemExit(f"release manifest has an invalid digest: {rel}")
-    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
-        raise SystemExit(f"release manifest has an invalid size: {rel}")
-    path = root / rel
-    expected.add(rel)
-    if not path.is_file() or path.stat().st_size != size:
-        raise SystemExit(f"release file mismatch: {rel}")
-    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-        raise SystemExit(f"release checksum mismatch: {rel}")
-actual = {
-    str(path.relative_to(root))
-    for path in root.rglob("*")
-    if path.is_file() and path not in {manifest_path, root / ".generation.json"}
-}
-if actual != expected:
-    raise SystemExit("release files do not match the manifest")
-required = {"bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "share/flotilla/skills/.flotilla-sources.json"}
-if not required.issubset(expected):
-    raise SystemExit("release is missing a required payload")
-skill_manifest = json.loads((root / "share/flotilla/skills/.flotilla-sources.json").read_text())
-# Supply-side validation only: every pinned skill source must match the pin the
-# generation was promoted with. No skill-name policy lives here (see
-# flotilla-org/flotilla#1790 for per-crew demand declarations).
-skill_sources = skill_manifest.get("sources")
-if (
-    skill_manifest.get("schema_version") != 3
-    or set(skill_manifest) != {"schema_version", "sources"}
-    or not isinstance(skill_sources, list)
-    or not skill_sources
-    or any(
-        not isinstance(source, dict)
-        or set(source) != {"name", "repository", "revision"}
-        or not isinstance(source.get("name"), str)
-        or not source["name"]
-        or source["name"] in {".", ".."}
-        or "/" in source["name"]
-        or "\\" in source["name"]
-        or "\r" in source["name"]
-        or "\n" in source["name"]
-        or not isinstance(source.get("repository"), str)
-        or not source["repository"]
-        or source.get("revision") != outer["sources"].get(source["name"])
-        for source in skill_sources
-    )
-    or len({source["name"] for source in skill_sources}) != len(skill_sources)
-):
-    raise SystemExit("skill bundle source pins do not match the fleet generation")
-# The daemon scopes its GitHub App token to this source by name and fetches with
-# it from whatever URL the manifest gives, so refuse a bundle that aims the
-# privileged credential at another repository. A credential-scope invariant, not
-# skill-name policy; per-source credentials (flotilla-org/flotilla#1796) replace
-# the pairing with explicit data.
-if any(
-    source["name"] == "mattpocock-skills" and source["repository"] != "https://github.com/flotilla-org/mattpocock-skills.git"
-    for source in skill_sources
-):
-    raise SystemExit("skill bundle points the credential-granted source at an unexpected repository")
-for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
-    if not os.access(root / rel, os.X_OK):
-        raise SystemExit(f"release binary is not executable: {rel}")
-if platform == "darwin-aarch64":
-    allowed = (
-        required
-        | {rel for rel in expected if rel.startswith("lib/") and rel.endswith(".dylib")}
-        | {rel for rel in expected if rel.startswith("share/flotilla/skills/")}
-    )
-    if expected != allowed:
-        raise SystemExit("signed Darwin derivative contains an unexpected payload set")
-PY
+  python3 "$GENERATION_VALIDATOR" release "$release" "$generation_manifest" "$PLATFORM"
   if [[ "$PLATFORM" == darwin-aarch64 ]]; then
     verify_darwin_signatures "$release" "$generation_manifest"
   fi
@@ -1224,6 +1021,11 @@ usage() {
 }
 
 main() {
+  if [[ "${1:-}" == __validate_fixture ]]; then
+    [[ $# -eq 2 ]] || usage
+    python3 "$GENERATION_VALIDATOR" fixture "$2"
+    return
+  fi
   if [[ "${1:-}" == __confirm ]]; then
     [[ $# -eq 4 ]] || usage
     PLATFORM="$(host_platform)"

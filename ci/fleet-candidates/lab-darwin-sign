@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import gzip
+import hashlib
+import io
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path, PurePosixPath
+
+import generation_validation as validation
+
+
+class SigningError(RuntimeError):
+    pass
+
+
+GENERATION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$")
+OWNER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
+SHA_PATTERN = validation.SHA_PATTERN
+DIGEST_PATTERN = validation.DIGEST_PATTERN
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+INPUT_PACKAGE = "flotilla-fleet"
+OUTPUT_PACKAGE = "flotilla-fleet-darwin-signed"
+INPUT_OWNER = "lab"
+INPUT_PLATFORM = "darwin-aarch64"
+INPUT_ROOT = "fleet-candidate-darwin-aarch64"
+OUTPUT_ROOT = "fleet-signed-darwin-aarch64"
+OUTPUT_ARCHIVE = f"{OUTPUT_ROOT}.tar.gz"
+REQUIRED_BINARIES = ("bin/flotilla", "bin/flotillad", "bin/cleat")
+TESTING = os.environ.get("LAB_DARWIN_SIGN_TESTING") == "1"
+CODESIGN = os.environ.get("LAB_DARWIN_SIGN_CODESIGN", "/usr/bin/codesign") if TESTING else "/usr/bin/codesign"
+SECURITY = os.environ.get("LAB_DARWIN_SIGN_SECURITY", "/usr/bin/security") if TESTING else "/usr/bin/security"
+
+
+def sha256(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+def read_token_file(path):
+    try:
+        token = Path(path).read_text().strip()
+    except OSError as error:
+        raise SigningError(f"cannot read token file {path}: {error}") from error
+    if not token:
+        raise SigningError(f"token file is empty: {path}")
+    return token
+
+
+def basic_authorization(username, token):
+    encoded = base64.b64encode(f"{username}:{token}".encode()).decode()
+    return f"Basic {encoded}"
+
+
+def request_bytes(url, authorization, method="GET", content=None):
+    headers = {"Authorization": authorization}
+    if method == "GET":
+        headers["Accept"] = "application/octet-stream"
+    elif method == "PUT":
+        headers["Content-Type"] = "application/octet-stream"
+    request = urllib.request.Request(url, data=content, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            if method == "PUT":
+                return b""
+            declared = response.headers.get("Content-Length")
+            if declared is not None and int(declared) > MAX_ARCHIVE_BYTES:
+                raise SigningError(f"download exceeds the size limit: {url}")
+            result = bytearray()
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                result.extend(chunk)
+                if len(result) > MAX_ARCHIVE_BYTES:
+                    raise SigningError(f"download exceeds the size limit: {url}")
+            return bytes(result)
+    except urllib.error.HTTPError:
+        raise
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        raise SigningError(f"Forgejo {method} failed for {url}: {error}") from error
+
+
+def get_bytes(url, authorization):
+    try:
+        return request_bytes(url, authorization)
+    except urllib.error.HTTPError as error:
+        raise SigningError(f"Forgejo GET {url} returned {error.code}") from error
+
+
+def get_optional_bytes(url, authorization):
+    try:
+        return request_bytes(url, authorization)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise SigningError(f"Forgejo GET {url} returned {error.code}") from error
+
+
+def put_immutable(url, content, authorization):
+    try:
+        request_bytes(url, authorization, method="PUT", content=content)
+        return
+    except urllib.error.HTTPError as error:
+        if error.code != 409:
+            raise SigningError(f"Forgejo PUT {url} returned {error.code}") from error
+    existing = get_bytes(url, authorization)
+    if existing != content:
+        raise SigningError(f"Forgejo already contains different bytes at {url}")
+
+
+def parse_json(content, description):
+    try:
+        document = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SigningError(f"{description} is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise SigningError(f"{description} must be a JSON object")
+    return document
+
+
+def certificate_der(pem, description):
+    try:
+        text = pem.decode("ascii")
+        if text.count("-----BEGIN CERTIFICATE-----") != 1 or text.count("-----END CERTIFICATE-----") != 1:
+            raise ValueError
+        body = "".join(line for line in text.splitlines() if not line.startswith("-----"))
+        certificate = base64.b64decode(body, validate=True)
+    except (UnicodeDecodeError, ValueError, base64.binascii.Error) as error:
+        raise SigningError(f"{description} is not one PEM certificate") from error
+    if not certificate:
+        raise SigningError(f"{description} is empty")
+    return certificate
+
+
+def validate_completed_derivative(
+    output_root,
+    authorization_value,
+    generation,
+    sources,
+    protocol,
+    source_platform,
+    identity,
+    team_id,
+    entitlements_bytes,
+):
+    marker_bytes = get_optional_bytes(f"{output_root}/signed-generation.json", authorization_value)
+    if marker_bytes is None:
+        return False
+    marker = parse_json(marker_bytes, "existing signed completion marker")
+    expected_marker = {
+        "schema_version": 1,
+        "kind": "completed-signed-darwin-generation",
+        "source_generation": generation,
+        "sources": sources,
+        "peer_protocol_version": protocol,
+    }
+    for field, value in expected_marker.items():
+        if marker.get(field) != value:
+            raise SigningError(f"existing signed completion marker has unexpected {field}")
+    signing = marker.get("signing")
+    if not isinstance(signing, dict):
+        raise SigningError("existing signed completion marker has invalid signing metadata")
+    expected_signing = {
+        "identity": identity,
+        "team_id": team_id,
+        "entitlements_sha256": sha256(entitlements_bytes),
+        "options": ["runtime", "timestamp=none"],
+    }
+    if any(signing.get(field) != value for field, value in expected_signing.items()):
+        raise SigningError("existing signed completion marker has unexpected signing metadata")
+    certificate_digest = signing.get("certificate_sha256")
+    if not DIGEST_PATTERN.fullmatch(certificate_digest or ""):
+        raise SigningError("existing signed completion marker has invalid certificate digest")
+
+    artifact = marker.get("artifact")
+    attestation_record = marker.get("attestation")
+    certificate_record = marker.get("certificate")
+    if not isinstance(artifact, dict) or artifact.get("name") != OUTPUT_ARCHIVE:
+        raise SigningError("existing signed completion marker has invalid artifact metadata")
+    if not isinstance(attestation_record, dict) or attestation_record.get("name") != "attestation.json" or attestation_record.get("cms") != "attestation.cms":
+        raise SigningError("existing signed completion marker has invalid attestation metadata")
+    if not isinstance(certificate_record, dict) or certificate_record.get("name") != "signing-certificate.pem":
+        raise SigningError("existing signed completion marker has invalid certificate metadata")
+    for record, fields in (
+        (artifact, ("sha256",)),
+        (attestation_record, ("sha256", "cms_sha256")),
+        (certificate_record, ("sha256",)),
+    ):
+        if any(not DIGEST_PATTERN.fullmatch(record.get(field, "")) for field in fields):
+            raise SigningError("existing signed completion marker has an invalid digest")
+    if not isinstance(artifact.get("size_bytes"), int) or artifact["size_bytes"] < 1:
+        raise SigningError("existing signed completion marker has invalid artifact size")
+
+    archive = get_bytes(f"{output_root}/{OUTPUT_ARCHIVE}", authorization_value)
+    checksum = get_bytes(f"{output_root}/{OUTPUT_ARCHIVE}.sha256", authorization_value)
+    attestation_bytes = get_bytes(f"{output_root}/attestation.json", authorization_value)
+    signature = get_bytes(f"{output_root}/attestation.cms", authorization_value)
+    certificate_pem = get_bytes(f"{output_root}/signing-certificate.pem", authorization_value)
+    if len(archive) != artifact["size_bytes"] or sha256(archive) != artifact["sha256"]:
+        raise SigningError("existing signed archive does not match its completion marker")
+    if checksum != f"{artifact['sha256']}  {OUTPUT_ARCHIVE}\n".encode():
+        raise SigningError("existing signed archive checksum file is invalid")
+    if sha256(attestation_bytes) != attestation_record["sha256"] or sha256(signature) != attestation_record["cms_sha256"]:
+        raise SigningError("existing attestation does not match its completion marker")
+    if sha256(certificate_pem) != certificate_record["sha256"]:
+        raise SigningError("existing certificate does not match its completion marker")
+    if sha256(certificate_der(certificate_pem, "existing signing certificate")) != certificate_digest:
+        raise SigningError("existing certificate does not match the signing identity digest")
+
+    attestation = parse_json(attestation_bytes, "existing signing attestation")
+    expected_attestation = {
+        "schema_version": 1,
+        "kind": "darwin-fleet-signing-attestation",
+        "source_generation": generation,
+        "sources": sources,
+        "peer_protocol_version": protocol,
+        "signing": signing,
+    }
+    for field, value in expected_attestation.items():
+        if attestation.get(field) != value:
+            raise SigningError(f"existing signing attestation has unexpected {field}")
+    expected_input = {
+        "artifact": source_platform["artifact"],
+        "sha256": source_platform["sha256"],
+        "size_bytes": source_platform["size_bytes"],
+    }
+    attestation_input = attestation.get("input")
+    if not isinstance(attestation_input, dict) or any(
+        attestation_input.get(field) != value for field, value in expected_input.items()
+    ):
+        raise SigningError("existing signing attestation does not bind the source artifact")
+    expected_output = {
+        "artifact": OUTPUT_ARCHIVE,
+        "sha256": artifact["sha256"],
+        "size_bytes": artifact["size_bytes"],
+    }
+    attestation_output = attestation.get("output")
+    if not isinstance(attestation_output, dict) or any(
+        attestation_output.get(field) != value for field, value in expected_output.items()
+    ):
+        raise SigningError("existing signing attestation does not bind the signed archive")
+    return True
+
+
+def validate_generation(document, generation):
+    expected = {
+        "schema_version": 1,
+        "kind": "internal-promoted-fleet-generation",
+        "generation": generation,
+    }
+    for field, value in expected.items():
+        if document.get(field) != value:
+            raise SigningError(f"generation marker has unexpected {field}")
+    sources = document.get("sources")
+    try:
+        validation.require_sources(sources)
+    except validation.ValidationError as error:
+        raise SigningError(f"generation marker has invalid sources: {error}") from error
+    protocol = document.get("peer_protocol_version")
+    if not isinstance(protocol, int) or protocol < 1:
+        raise SigningError("generation marker has invalid peer_protocol_version")
+    platform = document.get("platforms", {}).get(INPUT_PLATFORM)
+    if not isinstance(platform, dict):
+        raise SigningError("generation marker has no Darwin platform")
+    expected_platform = {
+        "artifact": "fleet-candidate-darwin-aarch64.tar.gz",
+        "signed": False,
+        "state": "awaiting-central-signature",
+    }
+    for field, value in expected_platform.items():
+        if platform.get(field) != value:
+            raise SigningError(f"Darwin generation member has unexpected {field}")
+    if not DIGEST_PATTERN.fullmatch(platform.get("sha256", "")):
+        raise SigningError("Darwin generation member has invalid sha256")
+    if not isinstance(platform.get("size_bytes"), int) or platform["size_bytes"] < 1:
+        raise SigningError("Darwin generation member has invalid size_bytes")
+    return sources, protocol, platform
+
+
+def safe_relative(member_name):
+    prefix = f"{INPUT_ROOT}/"
+    if not member_name.startswith(prefix):
+        return None
+    relative = member_name[len(prefix) :]
+    path = PurePosixPath(relative)
+    if not relative or path.is_absolute() or ".." in path.parts:
+        return None
+    return str(path)
+
+
+def allowed_payload(path):
+    return validation.allowed_payload(path)
+
+
+def extract_verified_candidate(archive_bytes, stage, generation, sources, protocol):
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz")
+    except tarfile.TarError as error:
+        raise SigningError("Darwin candidate is not a valid tar.gz archive") from error
+    with archive:
+        files = {}
+        expanded_bytes = 0
+        for member in archive.getmembers():
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise SigningError(f"Darwin candidate contains non-regular member {member.name}")
+            relative = safe_relative(member.name)
+            if relative is None or relative in files:
+                raise SigningError(f"Darwin candidate contains unsafe or duplicate path {member.name}")
+            expanded_bytes += member.size
+            if expanded_bytes > MAX_ARCHIVE_BYTES:
+                raise SigningError("Darwin candidate expands beyond the size limit")
+            files[relative] = member
+        manifest_member = files.get("manifest.json")
+        if manifest_member is None:
+            raise SigningError("Darwin candidate is missing manifest.json")
+        manifest_stream = archive.extractfile(manifest_member)
+        if manifest_stream is None:
+            raise SigningError("Darwin candidate manifest is unreadable")
+        manifest = parse_json(manifest_stream.read(), "Darwin candidate manifest")
+        expected_manifest = {
+            "schema_version": 1,
+            "kind": "unsigned-fleet-candidate",
+            "platform": INPUT_PLATFORM,
+            "sources": sources,
+            "peer_protocol_version": protocol,
+            "signed": False,
+        }
+        for field, value in expected_manifest.items():
+            if manifest.get(field) != value:
+                raise SigningError(f"Darwin candidate manifest has unexpected {field}")
+        entries = manifest.get("files")
+        if not isinstance(entries, list):
+            raise SigningError("Darwin candidate manifest has invalid files")
+        declared = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not allowed_payload(entry.get("path", "")):
+                raise SigningError("Darwin candidate manifest declares an unexpected file")
+            path = entry["path"]
+            if path in declared or not DIGEST_PATTERN.fullmatch(entry.get("sha256", "")):
+                raise SigningError(f"Darwin candidate manifest has invalid entry for {path}")
+            if not isinstance(entry.get("size_bytes"), int) or entry["size_bytes"] < 0:
+                raise SigningError(f"Darwin candidate manifest has invalid size for {path}")
+            declared[path] = entry
+        if not validation.REQUIRED_PAYLOAD.issubset(declared):
+            raise SigningError("Darwin candidate is missing a required payload")
+        if set(files) != set(declared) | {"manifest.json"}:
+            raise SigningError("Darwin candidate files do not match its manifest")
+        unsigned_digests = {}
+        for path, entry in declared.items():
+            stream = archive.extractfile(files[path])
+            if stream is None:
+                raise SigningError(f"Darwin candidate payload is unreadable: {path}")
+            content = stream.read()
+            if len(content) != entry["size_bytes"] or sha256(content) != entry["sha256"]:
+                raise SigningError(f"Darwin candidate payload does not match its manifest: {path}")
+            destination = stage / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            destination.chmod(files[path].mode & 0o777)
+            unsigned_digests[path] = entry["sha256"]
+        try:
+            skill_bundle = json.loads((stage / "share/flotilla/skills/.flotilla-sources.json").read_text())
+            validation.validate_skill_bundle(skill_bundle, sources)
+        except (OSError, json.JSONDecodeError, validation.ValidationError) as error:
+            raise SigningError(f"Darwin candidate has an invalid skill bundle: {error}") from error
+    return manifest, unsigned_digests
+
+
+def run_command(arguments, description, capture=False):
+    result = subprocess.run(arguments, text=True, capture_output=capture)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() if capture else ""
+        suffix = f": {detail}" if detail else ""
+        raise SigningError(f"{description} failed{suffix}")
+    return result
+
+
+def read_certificate(identity):
+    result = run_command(
+        [SECURITY, "find-certificate", "-c", identity, "-p"], "signing certificate lookup", capture=True
+    )
+    pem = result.stdout.encode()
+    certificate = certificate_der(pem, "signing certificate lookup")
+    return pem, sha256(certificate)
+
+
+def sign_payloads(stage, identity, expected_team_id, entitlements, expected_entitlements):
+    paths = sorted(stage.glob("lib/*.dylib")) + [stage / path for path in REQUIRED_BINARIES]
+    records = []
+    for path in paths:
+        relative = str(path.relative_to(stage))
+        before = sha256(path.read_bytes())
+        run_command(
+            [
+                CODESIGN,
+                "--force",
+                "--options",
+                "runtime",
+                "--timestamp=none",
+                "--entitlements",
+                str(entitlements),
+                "--sign",
+                identity,
+                str(path),
+            ],
+            f"codesign {relative}",
+        )
+        run_command([CODESIGN, "--verify", "--strict", "--verbose=2", str(path)], f"verify signature {relative}")
+        description = run_command(
+            [CODESIGN, "-d", "--verbose=4", str(path)], f"describe signature {relative}", capture=True
+        )
+        details = description.stderr + description.stdout
+        team_match = re.search(r"^TeamIdentifier=(.+)$", details, re.MULTILINE)
+        authority_match = re.search(r"^Authority=(.+)$", details, re.MULTILINE)
+        cdhash_match = re.search(r"^CDHash=(.+)$", details, re.MULTILINE)
+        if team_match is None or team_match.group(1) != expected_team_id:
+            raise SigningError(f"signed payload has unexpected team identifier: {relative}")
+        if authority_match is None or authority_match.group(1) != identity:
+            raise SigningError(f"signed payload has unexpected authority: {relative}")
+        embedded = run_command(
+            [CODESIGN, "--display", "--entitlements", "-", "--xml", str(path)],
+            f"read embedded entitlements {relative}",
+            capture=True,
+        ).stdout
+        if embedded.strip():
+            try:
+                embedded_entitlements = plistlib.loads(embedded.encode())
+            except plistlib.InvalidFileException as error:
+                raise SigningError(f"signed payload has unreadable entitlements: {relative}") from error
+        else:
+            embedded_entitlements = {}
+        if embedded_entitlements != expected_entitlements:
+            raise SigningError(f"signed payload has unexpected entitlements: {relative}")
+        records.append(
+            {
+                "path": relative,
+                "input_sha256": before,
+                "output_sha256": sha256(path.read_bytes()),
+                "size_bytes": path.stat().st_size,
+                "cdhash": cdhash_match.group(1) if cdhash_match else None,
+                "verification": {
+                    "strict": True,
+                    "identity": True,
+                    "team_id": True,
+                    "entitlements": True,
+                },
+            }
+        )
+    return records
+
+
+def file_manifest(stage):
+    entries = []
+    for path in sorted(stage.rglob("*")):
+        if path.is_file() and path.name != "manifest.json":
+            entries.append(
+                {
+                    "path": str(path.relative_to(stage)),
+                    "sha256": sha256(path.read_bytes()),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+    return entries
+
+
+def build_archive(stage):
+    tar_output = io.BytesIO()
+    with tarfile.open(fileobj=tar_output, mode="w:") as archive:
+        for path in sorted(stage.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = str(path.relative_to(stage))
+            content = path.read_bytes()
+            member = tarfile.TarInfo(f"{OUTPUT_ROOT}/{relative}")
+            member.size = len(content)
+            member.mode = path.stat().st_mode & 0o777
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(content))
+    output = io.BytesIO()
+    with gzip.GzipFile(filename="", fileobj=output, mode="wb", mtime=0) as compressed:
+        compressed.write(tar_output.getvalue())
+    return output.getvalue()
+
+
+def cms_sign(attestation_path, signature_path, identity):
+    run_command(
+        [
+            SECURITY,
+            "cms",
+            "-S",
+            "-N",
+            identity,
+            "-u",
+            "9",
+            "-H",
+            "SHA256",
+            "-T",
+            "-i",
+            str(attestation_path),
+            "-o",
+            str(signature_path),
+        ],
+        "CMS attestation signing",
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sign one exact promoted Darwin fleet generation")
+    parser.add_argument("generation")
+    parser.add_argument("--server-url", required=True)
+    parser.add_argument("--read-token-file", required=True)
+    parser.add_argument("--package-token-file", required=True)
+    parser.add_argument("--package-username", required=True)
+    parser.add_argument("--output-owner", required=True)
+    parser.add_argument("--identity", required=True)
+    parser.add_argument("--expected-team-id", required=True)
+    parser.add_argument("--entitlements-file", required=True)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if not GENERATION_PATTERN.fullmatch(args.generation):
+        raise SigningError("generation has an invalid format")
+    if not OWNER_PATTERN.fullmatch(args.output_owner):
+        raise SigningError("output owner has an invalid format")
+    entitlements = Path(args.entitlements_file)
+    try:
+        entitlements_bytes = entitlements.read_bytes()
+    except OSError as error:
+        raise SigningError(f"cannot read entitlements file {entitlements}: {error}") from error
+    try:
+        expected_entitlements = plistlib.loads(entitlements_bytes)
+    except plistlib.InvalidFileException as error:
+        raise SigningError(f"entitlements file is not a valid plist: {entitlements}") from error
+    if not isinstance(expected_entitlements, dict):
+        raise SigningError("entitlements plist root must be a dictionary")
+    read_token = read_token_file(args.read_token_file)
+    package_token = read_token_file(args.package_token_file)
+    read_authorization = basic_authorization(args.package_username, read_token)
+    write_authorization = basic_authorization(args.package_username, package_token)
+    server = args.server_url.rstrip("/")
+    input_root = (
+        f"{server}/api/packages/{INPUT_OWNER}/generic/{INPUT_PACKAGE}/"
+        f"{urllib.parse.quote(args.generation, safe='')}"
+    )
+    generation_bytes = get_bytes(f"{input_root}/generation.json", read_authorization)
+    generation_document = parse_json(generation_bytes, "generation marker")
+    sources, protocol, platform = validate_generation(generation_document, args.generation)
+    output_root = (
+        f"{server}/api/packages/{urllib.parse.quote(args.output_owner, safe='')}/generic/{OUTPUT_PACKAGE}/"
+        f"{urllib.parse.quote(args.generation, safe='')}"
+    )
+    if validate_completed_derivative(
+        output_root,
+        read_authorization,
+        args.generation,
+        sources,
+        protocol,
+        platform,
+        args.identity,
+        args.expected_team_id,
+        entitlements_bytes,
+    ):
+        print(f"signed {args.generation}")
+        return
+    archive_bytes = get_bytes(f"{input_root}/{platform['artifact']}", read_authorization)
+    if len(archive_bytes) != platform["size_bytes"] or sha256(archive_bytes) != platform["sha256"]:
+        raise SigningError("Darwin candidate does not match the promoted generation")
+
+    certificate_pem, certificate_sha256 = read_certificate(args.identity)
+    with tempfile.TemporaryDirectory(prefix="lab-darwin-sign-") as directory:
+        stage = Path(directory) / OUTPUT_ROOT
+        stage.mkdir()
+        unsigned_manifest, unsigned_digests = extract_verified_candidate(
+            archive_bytes, stage, args.generation, sources, protocol
+        )
+        signed_payloads = sign_payloads(
+            stage, args.identity, args.expected_team_id, entitlements, expected_entitlements
+        )
+        signed_manifest = {
+            "schema_version": 1,
+            "kind": "signed-fleet-derivative",
+            "platform": INPUT_PLATFORM,
+            "sources": sources,
+            "build_profile": unsigned_manifest.get("build_profile"),
+            "peer_protocol_version": protocol,
+            "signed": True,
+            "source_generation": args.generation,
+            "source_artifact_sha256": platform["sha256"],
+            "signing": {
+                "identity": args.identity,
+                "team_id": args.expected_team_id,
+                "certificate_sha256": certificate_sha256,
+                "entitlements_sha256": sha256(entitlements_bytes),
+                "options": ["runtime", "timestamp=none"],
+            },
+            "files": file_manifest(stage),
+        }
+        manifest_bytes = (json.dumps(signed_manifest, indent=2, sort_keys=True) + "\n").encode()
+        (stage / "manifest.json").write_bytes(manifest_bytes)
+        signed_archive = build_archive(stage)
+        attestation = {
+            "schema_version": 1,
+            "kind": "darwin-fleet-signing-attestation",
+            "source_generation": args.generation,
+            "sources": sources,
+            "peer_protocol_version": protocol,
+            "input": {
+                "artifact": platform["artifact"],
+                "sha256": platform["sha256"],
+                "size_bytes": platform["size_bytes"],
+                "payload_sha256": unsigned_digests,
+            },
+            "output": {
+                "artifact": OUTPUT_ARCHIVE,
+                "sha256": sha256(signed_archive),
+                "size_bytes": len(signed_archive),
+                "manifest_sha256": sha256(manifest_bytes),
+            },
+            "signing": signed_manifest["signing"],
+            "payloads": signed_payloads,
+        }
+        attestation_bytes = (json.dumps(attestation, indent=2, sort_keys=True) + "\n").encode()
+        attestation_path = Path(directory) / "attestation.json"
+        signature_path = Path(directory) / "attestation.cms"
+        attestation_path.write_bytes(attestation_bytes)
+        cms_sign(attestation_path, signature_path, args.identity)
+        signature_bytes = signature_path.read_bytes()
+        checksum_bytes = f"{sha256(signed_archive)}  {OUTPUT_ARCHIVE}\n".encode()
+        marker = {
+            "schema_version": 1,
+            "kind": "completed-signed-darwin-generation",
+            "source_generation": args.generation,
+            "sources": sources,
+            "peer_protocol_version": protocol,
+            "artifact": {
+                "name": OUTPUT_ARCHIVE,
+                "sha256": sha256(signed_archive),
+                "size_bytes": len(signed_archive),
+            },
+            "attestation": {
+                "name": "attestation.json",
+                "sha256": sha256(attestation_bytes),
+                "cms": "attestation.cms",
+                "cms_sha256": sha256(signature_bytes),
+            },
+            "certificate": {
+                "name": "signing-certificate.pem",
+                "sha256": sha256(certificate_pem),
+            },
+            "signing": signed_manifest["signing"],
+        }
+        marker_bytes = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode()
+
+    outputs = (
+        (OUTPUT_ARCHIVE, signed_archive),
+        (f"{OUTPUT_ARCHIVE}.sha256", checksum_bytes),
+        ("attestation.json", attestation_bytes),
+        ("attestation.cms", signature_bytes),
+        ("signing-certificate.pem", certificate_pem),
+        ("signed-generation.json", marker_bytes),
+    )
+    for name, content in outputs:
+        put_immutable(f"{output_root}/{name}", content, write_authorization)
+    print(f"signed {args.generation}")
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == "--validate-fixture":
+            validation.validate_fixture(sys.argv[2])
+        else:
+            main()
+    except SigningError as error:
+        print(f"lab-darwin-sign: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -28,6 +28,23 @@ Run the local structural contract with:
 ci/fleet-candidates/test-workflow.sh
 ```
 
+## Provisioning the release validators
+
+Until non-flotillad hosts are reconciled, provision the reviewed tools and the
+shared module together (the Python programs import the module from their own
+directory):
+
+- Raclette guest 106: install `lab-fleet-promote`,
+  `lab-fleet-finalize-darwin`, and `generation_validation.py` from this
+  directory into `/usr/local/sbin`, mode 0755.
+- Comte: install `lab-darwin-sign` and `generation_validation.py` into
+  `~/.local/libexec`, mode 0755.
+
+Fleet consumers install `generation_validation.py` beside `fleet-install`, or
+set `FLEET_GENERATION_VALIDATOR` to its absolute path while provisioning.
+Neither helper contains credentials; the three host tools continue to read
+their existing token files at runtime.
+
 The later trusted half must consume these exact bytes, sign the Darwin
 derivatives, run pristine-runtime proofs, publish the complete cohort, copy it
 offsite, and only then write an immutable completed generation. It must not
