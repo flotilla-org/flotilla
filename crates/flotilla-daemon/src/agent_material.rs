@@ -682,6 +682,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_skills_are_staged_to_every_required_adapter_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string(), CODEX_ADAPTER_ID.to_string()]);
+        let claude_skills = "/tmp/flotilla-config/credentials/claude-max/claude/skills";
+        let codex_skills = format!("{CONTAINER_CODEX_HOME}/skills");
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/tmp/flotilla-config/credentials/claude-max/claude".to_string()),
+            ("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/flotilla/config/credentials/gitconfig".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
+        ];
+        let runner = RecordingRunner::default();
+
+        registry.stage_skills("crew-mixed", &required, &environment, &runner).await.expect("stage pinned skills for both adapters");
+
+        let calls = runner.0.lock().expect("recording runner lock should be healthy");
+        assert_eq!(calls.len(), 2);
+        let destinations =
+            calls.iter().map(|(_, args)| args.get(7).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
+        assert_eq!(destinations, BTreeSet::from([claude_skills, codex_skills.as_str()]));
+    }
+
+    #[tokio::test]
     async fn externally_managed_codex_home_skips_skill_staging() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path());
