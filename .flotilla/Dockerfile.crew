@@ -8,15 +8,26 @@
 # needs. Zig and the ghostty source stay in this stage; only the installed
 # prefix reaches the final image (consumed via CLEAT_GHOSTTY_PREFIX).
 FROM ubuntu:24.04 AS ghostty-builder
+ARG TARGETARCH
+ARG ZIG_VERSION=0.15.2
+ARG CLEAT_REF=2694b71c593868af3b289a04ed6e468979c236bc
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils build-essential \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+RUN case "${TARGETARCH}" in \
+        amd64) zig_arch=x86_64 ;; \
+        arm64) zig_arch=aarch64 ;; \
+        *) echo "unsupported Zig architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" \
     | tar -xJ -C /opt \
-    && ln -s /opt/zig-x86_64-linux-0.15.2/zig /usr/local/bin/zig \
-    && test "$(zig version)" = "0.15.2"
-RUN git clone --depth 1 https://github.com/flotilla-org/cleat.git /src/cleat \
+    && ln -s "/opt/${zig_dir}/zig" /usr/local/bin/zig \
+    && test "$(zig version)" = "${ZIG_VERSION}"
+RUN git clone --filter=blob:none --no-checkout https://github.com/flotilla-org/cleat.git /src/cleat \
     && cd /src/cleat \
+    && git fetch --depth 1 origin "${CLEAT_REF}" \
+    && git checkout --detach FETCH_HEAD \
     && ./tools/prepare-ghostty-vt.sh
 
 FROM ubuntu:24.04
