@@ -11,6 +11,7 @@ mod definition;
 mod dispatch_observation;
 mod environment;
 mod error;
+mod event;
 mod field_ownership;
 mod host;
 mod http;
@@ -77,6 +78,7 @@ pub use environment::{
     EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
+pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use host::{
@@ -165,6 +167,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
+        $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::MaterialPool>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);

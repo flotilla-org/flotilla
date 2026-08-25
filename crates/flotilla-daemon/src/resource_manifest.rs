@@ -11,7 +11,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ResourceBackend, ResourceError, MANAGED_BY_LABEL,
+    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, EventRecorder, EventRegarding, ObjectEvent,
+    ResourceBackend, ResourceError, MANAGED_BY_LABEL,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -64,11 +65,13 @@ pub struct ResourceManifestReconciler {
     root: PathBuf,
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
+    events: EventRecorder,
 }
 
 impl ResourceManifestReconciler {
     pub fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
+            events: EventRecorder::new(backend.clone()),
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
@@ -131,7 +134,11 @@ impl ResourceManifestReconciler {
                 }
             };
             for (index, document) in documents.into_iter().enumerate() {
+                let identity = document_identity(&document, &self.default_namespace).ok();
                 if let Err(reason) = self.reconcile_document(&relative, document, &mut report).await {
+                    if let Some(identity) = identity {
+                        self.record_refusal(&identity, "ManifestDocumentRefused", format!("{}: {reason}", relative.display())).await;
+                    }
                     let path = if index == 0 { relative.clone() } else { PathBuf::from(format!("{}#{}", relative.display(), index + 1)) };
                     report.errors.push(ManifestDocumentError { path, reason });
                 }
@@ -158,6 +165,8 @@ impl ResourceManifestReconciler {
 
         let labels = string_map(&existing, "labels")?;
         if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANIFEST_MANAGED_BY_VALUE) {
+            self.record_refusal(&identity, "ManifestAdoptionRefused", format!("{}: manifest names an unmanaged object", source.display()))
+                .await;
             if self.warned_unmanaged.insert(identity.clone()) {
                 warn!(object = %identity, source = %source.display(), "manifest names an unmanaged object; refusing adoption");
             }
@@ -170,6 +179,12 @@ impl ResourceManifestReconciler {
         let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
         let last_applied = annotations.get(LAST_APPLIED_HASH_ANNOTATION).cloned().unwrap_or_else(|| "<missing>".to_string());
         if live_hash != last_applied {
+            self.record_refusal(
+                &identity,
+                "ManifestOverwriteRefused",
+                format!("{}: manifest-managed object has live drift", source.display()),
+            )
+            .await;
             if self.warned_drift.insert((identity.clone(), live_hash.clone(), last_applied.clone())) {
                 warn!(
                     object = %identity,
@@ -194,6 +209,22 @@ impl ResourceManifestReconciler {
         self.warned_drift.retain(|(warned, _, _)| warned != &identity);
         report.updated += 1;
         Ok(())
+    }
+
+    async fn record_refusal(&self, identity: &ObjectIdentity, reason: &str, message: String) {
+        let event = ObjectEvent {
+            regarding: EventRegarding {
+                api_version: "flotilla.work/v1".to_string(),
+                kind: identity.kind.clone(),
+                namespace: identity.namespace.clone(),
+                name: identity.name.clone(),
+            },
+            reason: reason.to_string(),
+            message,
+        };
+        if let Err(error) = self.events.record(event, chrono::Utc::now()).await {
+            warn!(object = %identity, %error, "failed to record manifest refusal event");
+        }
     }
 
     async fn apply_manifest_document(&self, document: Value) -> Result<(), String> {
@@ -327,7 +358,7 @@ mod tests {
     use std::time::Duration;
 
     use flotilla_resources::{
-        InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchStart, WorkflowTemplate,
+        Event, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend, WatchStart, WorkflowTemplate,
     };
     use futures::StreamExt;
 
@@ -539,6 +570,10 @@ mod tests {
         assert_eq!(report.unmanaged, 1);
         assert_eq!(object.spec.pool, "live");
         assert!(!object.metadata.labels.contains_key(MANAGED_BY_LABEL));
+        let events = backend.using::<Event>(NAMESPACE).list().await.expect("manifest refusal events").items;
+        assert!(
+            matches!(events.as_slice(), [event] if event.spec.reason == "ManifestAdoptionRefused" && event.spec.regarding.name == "unmanaged")
+        );
     }
 
     #[tokio::test]
@@ -593,6 +628,26 @@ mod tests {
         assert_eq!(report.errors[0].path, PathBuf::from("broken.yaml"));
         assert!(report.errors[0].reason.contains("parse YAML"));
         backend.using::<PlacementPolicy>(NAMESPACE).get("valid").await.expect("valid policy");
+    }
+
+    #[tokio::test]
+    async fn semantically_refused_document_records_an_object_scoped_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join("invalid.yaml"),
+            "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: duplicate-entry\nspec: {}\n",
+        );
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+
+        let report = reconciler.reconcile_once().await.expect("manifest pass");
+        let events = backend.using::<Event>(NAMESPACE).list().await.expect("refusal events").items;
+
+        assert_eq!(report.errors.len(), 1);
+        assert!(matches!(events.as_slice(), [event]
+            if event.spec.reason == "ManifestDocumentRefused"
+                && event.spec.regarding.name == "duplicate-entry"
+                && event.spec.message.contains("invalid.yaml")));
     }
 
     #[tokio::test]

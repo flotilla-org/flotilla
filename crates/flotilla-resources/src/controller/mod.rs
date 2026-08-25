@@ -29,9 +29,10 @@ use crate::{
     terminal_session::TerminalSessionSpec,
     vessel::VesselSpec,
     watch::{WatchEvent, WatchStart},
+    EventRecorder, ObjectEvent,
 };
 
-pub type Event = String;
+pub type Event = ObjectEvent;
 
 #[allow(async_fn_in_trait)]
 pub trait Reconciler: Send + Sync + 'static {
@@ -732,6 +733,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                     for actuation in outcome.actuations {
                         Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                     }
+                    let recorder = EventRecorder::new(primary.backend.clone());
+                    for event in outcome.events {
+                        recorder.record(event, Utc::now()).await?;
+                    }
                     if let Some(patch) = outcome.patch {
                         Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
                     }
@@ -757,6 +762,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     Ok(()) => {}
                     Err(err) => {
+                        if attempted_reconcile {
+                            let recorder = EventRecorder::new(primary.backend.clone());
+                            if let Err(event_error) =
+                                recorder.record(ObjectEvent::for_object(&object, "ReconcileFailed", err.to_string()), Utc::now()).await
+                            {
+                                warn!(resource_kind = R::Resource::API_PATHS.kind, resource = %name, %event_error, "controller failed to record reconcile event");
+                            }
+                        }
                         let mut terminal = false;
                         let mut retry_after = None;
                         if attempted_reconcile {

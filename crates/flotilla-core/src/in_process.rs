@@ -25,15 +25,15 @@ use flotilla_protocol::{
     AttachBinding, Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention,
     CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
     DispatchQueueRow, EnvironmentId, EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition,
-    ExplainedCrewDelivery, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse,
-    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
-    NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoIdentity, RepoInfo,
-    RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse,
-    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus,
-    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    ExplainedCrewDelivery, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
+    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
+    QueryCursor, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
+    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -47,12 +47,12 @@ use flotilla_resources::{
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending,
     CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandKind, DemandSpec, Environment as ResourceEnvironment, EnvironmentPhase,
-    HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
-    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ReadResourceObject,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    EventRecorder, EventRegarding, HoldAct, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
     WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
@@ -4269,6 +4269,10 @@ impl InProcessDaemon {
         if !operator_forced {
             if let Err(reason) = backing_inspector.verify_backing_dead(&convoy).await {
                 let failure = format!("standing convoy teardown held: {reason}");
+                EventRecorder::new(self.resource_backend.clone())
+                    .record(ObjectEvent::for_object(&convoy, "BackingEvidenceRefused", failure.clone()), now)
+                    .await
+                    .map_err(|error| format!("record backing-evidence event: {error}"))?;
                 self.raise_ensure_attention(&convoy, &failure).await?;
                 if status.retry_at.is_some() || status.last_failure.as_deref() != Some(&failure) {
                     self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Holding {
@@ -4315,6 +4319,10 @@ impl InProcessDaemon {
                 Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
             }
             Err(error) => {
+                EventRecorder::new(self.resource_backend.clone())
+                    .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
+                    .await
+                    .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
                 let retry_at = now + ensure_retry_delay(status.restart_count);
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
@@ -4344,6 +4352,10 @@ impl InProcessDaemon {
                 Ok(Some(format!("started Convoy/{}", ensure.metadata.name)))
             }
             Err(error) => {
+                EventRecorder::new(self.resource_backend.clone())
+                    .record(ObjectEvent::for_object(ensure, "EnsureAdmissionRefused", error.clone()), now)
+                    .await
+                    .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
                 let retry_at = now + ensure_retry_delay(status.restart_count);
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
@@ -9131,6 +9143,28 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
+        let recent_events = EventRecorder::new(self.resource_backend.clone())
+            .recent_for(
+                &EventRegarding {
+                    api_version: api_version(ResourceConvoy::API_PATHS),
+                    kind: ResourceConvoy::API_PATHS.kind.to_string(),
+                    namespace: namespace.clone(),
+                    name: name.to_string(),
+                },
+                Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|event| ExplainedEvent {
+                reason: event.spec.reason,
+                message: event.spec.message,
+                count: event.spec.count,
+                first_seen: event.spec.first_seen.to_rfc3339(),
+                last_seen: event.spec.last_seen.to_rfc3339(),
+            })
+            .collect();
+
         Ok(ConvoyExplanation {
             namespace,
             convoy: name.to_string(),
@@ -9142,6 +9176,7 @@ impl InProcessDaemon {
             subscriptions,
             crew_deliveries,
             settlement,
+            recent_events,
         })
     }
 }
@@ -9301,7 +9336,25 @@ impl DaemonHandle for InProcessDaemon {
                 };
                 let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
                 let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
-                let record = resource_record(ResourceRecordType::Current, visible.value, &self.node_id);
+                let mut value = visible.value;
+                if visible.kind != "Event" {
+                    let object_name = value["metadata"]["name"].as_str().unwrap_or(name);
+                    let regarding = EventRegarding {
+                        api_version: value["apiVersion"].as_str().unwrap_or("flotilla.work/v1").to_string(),
+                        kind: visible.kind.clone(),
+                        namespace: namespace.clone(),
+                        name: object_name.to_string(),
+                    };
+                    match EventRecorder::new(self.resource_backend.clone()).recent_for(&regarding, Utc::now()).await {
+                        Ok(events) if !events.is_empty() => {
+                            value["recentEvents"] =
+                                serde_json::Value::Array(events.into_iter().filter_map(|event| serde_json::to_value(event).ok()).collect());
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
+                    }
+                }
+                let record = resource_record(ResourceRecordType::Current, value, &self.node_id);
                 Ok(CommandValue::ResourceRead(Box::new(resource_read_envelope(
                     visible.kind,
                     visible.plural,

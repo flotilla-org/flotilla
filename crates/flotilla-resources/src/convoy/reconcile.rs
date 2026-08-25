@@ -535,7 +535,11 @@ impl Reconciler for ConvoyReconciler {
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
-            events: outcome.events.into_iter().map(|event| format!("{event:?}")).collect(),
+            events: outcome
+                .events
+                .into_iter()
+                .map(|event| crate::ObjectEvent::for_object(obj, "ConvoyReconciled", format!("{event:?}")))
+                .collect(),
             requeue_after: reclaim_refused.then_some(self.landing_evidence_stale_after),
         }
     }
