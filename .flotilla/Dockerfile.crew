@@ -46,7 +46,23 @@ RUN apt-get update \
         build-essential \
         clang \
         libc6-dev \
+        libegl-dev \
+        libfontconfig-dev \
+        libfreetype-dev \
+        libgl-dev \
         libssl-dev \
+        libx11-dev \
+        libxcb1-dev \
+        libxcursor-dev \
+        libxext-dev \
+        libxfixes-dev \
+        libxi-dev \
+        libxinerama-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxrandr-dev \
+        libxrender-dev \
+        libxss-dev \
         linux-libc-dev \
         lld \
         make \
