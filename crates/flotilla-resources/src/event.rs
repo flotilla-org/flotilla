@@ -175,7 +175,15 @@ fn event_name(event: &ObjectEvent) -> String {
         hash.update([0]);
     }
     let digest = format!("{:x}", hash.finalize());
-    format!("{}-{}", event.regarding.name, &digest[..16])
+    let safe_name = event
+        .regarding
+        .name
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '-' | '.') { character } else { '-' })
+        .collect::<String>();
+    let safe_name = safe_name.trim_matches(['-', '.']);
+    let prefix = safe_name.get(..safe_name.len().min(40)).unwrap_or(safe_name);
+    format!("event-{prefix}-{}", &digest[..16])
 }
 
 #[cfg(test)]

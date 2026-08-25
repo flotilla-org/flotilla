@@ -757,7 +757,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     let recorder = EventRecorder::new(primary.backend.clone());
                     for event in outcome.events {
-                        recorder.record(event, Utc::now()).await?;
+                        if let Err(event_error) = recorder.record(event, Utc::now()).await {
+                            warn!(
+                                resource_kind = R::Resource::API_PATHS.kind,
+                                resource = %name,
+                                %event_error,
+                                "controller failed to record outcome event",
+                            );
+                        }
                     }
                     if let Some(patch) = outcome.patch {
                         Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;

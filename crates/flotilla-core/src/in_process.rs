@@ -10654,7 +10654,7 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
-        let recent_events = EventRecorder::new(self.resource_backend.clone())
+        let recent_events = match EventRecorder::new(self.resource_backend.clone())
             .recent_for(
                 &EventRegarding {
                     api_version: api_version(ResourceConvoy::API_PATHS),
@@ -10665,16 +10665,22 @@ impl InProcessDaemon {
                 Utc::now(),
             )
             .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|event| ExplainedEvent {
-                reason: event.spec.reason,
-                message: event.spec.message,
-                count: event.spec.count,
-                first_seen: event.spec.first_seen.to_rfc3339(),
-                last_seen: event.spec.last_seen.to_rfc3339(),
-            })
-            .collect();
+        {
+            Ok(events) => events
+                .into_iter()
+                .map(|event| ExplainedEvent {
+                    reason: event.spec.reason,
+                    message: event.spec.message,
+                    count: event.spec.count,
+                    first_seen: event.spec.first_seen.to_rfc3339(),
+                    last_seen: event.spec.last_seen.to_rfc3339(),
+                })
+                .collect(),
+            Err(error) => {
+                warn!(convoy = %name, %error, "failed to enrich convoy explanation with recent events");
+                Vec::new()
+            }
+        };
 
         let decision_ledgers = explained_decision_ledgers(convoy.status.as_ref());
 
@@ -10884,7 +10890,9 @@ impl DaemonHandle for InProcessDaemon {
                                 serde_json::Value::Array(events.into_iter().filter_map(|event| serde_json::to_value(event).ok()).collect());
                         }
                         Ok(_) => {}
-                        Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
+                        Err(error) => {
+                            warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to enrich resource read with recent events")
+                        }
                     }
                 }
                 let record = resource_record(ResourceRecordType::Current, value, &self.node_id);
