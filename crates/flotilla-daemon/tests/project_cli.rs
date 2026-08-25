@@ -450,7 +450,7 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
 }
 
 #[tokio::test]
-async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_across_rename() {
+async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_its_url() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let commit = Arc::new(RwLock::new("commit-one".to_string()));
     daemon
@@ -469,7 +469,8 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() }).await;
     let projects = backend.definitions::<Project>("flotilla");
     let original = projects.get("demo").await.expect("project");
-    let app_key = original.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member").repo.clone();
+    let old_app_key =
+        original.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member").repo.clone();
     let mut drifted = original.spec.clone();
     drifted.display_name = "hand edited".to_string();
     projects.apply(&InputMeta::from(&original.metadata), &drifted).await.expect("introduce drift");
@@ -494,7 +495,9 @@ async fn project_refresh_is_one_way_and_keeps_alias_repository_keys_stable_acros
     assert_eq!(refreshed.spec.display_name, "demo");
     assert_eq!(refreshed.spec.default_workflow_ref, "single-agent-trusted");
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");
-    assert_eq!(app.repo, app_key, "alias should preserve the rename-stable RepositoryKey");
+    let renamed = RepositorySpec::remote("https://github.com/example/app-renamed").expect("renamed repository");
+    assert_eq!(app.repo, renamed.key(), "the current declaration is authoritative for its alias binding");
+    assert_ne!(app.repo, old_app_key, "the superseded draft binding must not survive re-registration");
     assert!(app.roles.contains(&ProjectRepositoryRole::Knowledge));
     let app_repository = backend.using::<Repository>("flotilla").get(&app.repo.to_string()).await.expect("renamed app repository");
     assert_eq!(app_repository.spec.live_remote(), Some("https://github.com/example/app-renamed"));

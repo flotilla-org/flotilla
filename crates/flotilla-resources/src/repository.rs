@@ -191,6 +191,26 @@ impl RepositorySpec {
         Ok(self)
     }
 
+    /// Remove a declared transport remote while preserving the Repository's
+    /// stable identity. This is an operator repair operation; observations use
+    /// [`Self::update_remotes`] and remain additive.
+    pub fn remove_remote(mut self, remote: impl Into<String>) -> Result<Self, String> {
+        let remote = crate::canonicalize_repo_url(&remote.into())?;
+        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
+            return Err("a local Repository cannot declare transport remotes".to_string());
+        };
+        if &remote == canonical_remote {
+            return Err(format!("cannot remove stable identity remote `{canonical_remote}`"));
+        }
+        if !self.remotes.iter().any(|declared| declared == &remote) {
+            return Err(format!("remote `{remote}` is not declared by this Repository"));
+        }
+        self.remotes.retain(|declared| declared != &remote);
+        self.forge =
+            Some(forge_from_canonical_remote(self.remotes.first().expect("remote Repository retains its stable identity remote"))?);
+        Ok(self)
+    }
+
     pub fn with_declared_remotes(mut self, remotes: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, String> {
         let remotes = remotes.into_iter().map(|remote| crate::canonicalize_repo_url(&remote.into())).collect::<Result<Vec<_>, _>>()?;
         let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
@@ -684,5 +704,28 @@ mod fact_dialect_tests {
 
         assert_eq!(forge.repo_fact_value(), "flotilla-org/flotilla");
         assert_eq!(local.repo_fact_value(), "feta:/srv/flotilla/.git");
+    }
+
+    #[test]
+    fn operator_can_remove_a_wrong_secondary_remote() {
+        let stable = "https://github.com/flotilla-org/flotilla";
+        let wrong = "https://github.com/wrong/flotilla";
+        let spec = RepositorySpec::remote(stable)
+            .expect("repository")
+            .with_declared_remotes([wrong, stable])
+            .expect("remote declaration")
+            .remove_remote(wrong)
+            .expect("remove wrong remote");
+
+        assert_eq!(spec.remotes(), [stable]);
+        assert_eq!(spec.live_remote(), Some(stable));
+        assert_eq!(spec.forge().expect("forge").repository, "flotilla-org/flotilla");
+    }
+
+    #[test]
+    fn operator_cannot_remove_the_stable_identity_remote() {
+        let stable = "https://github.com/flotilla-org/flotilla";
+        let error = RepositorySpec::remote(stable).expect("repository").remove_remote(stable).expect_err("stable remote removal");
+        assert!(error.contains("stable identity remote"));
     }
 }

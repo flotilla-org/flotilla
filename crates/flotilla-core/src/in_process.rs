@@ -5922,7 +5922,18 @@ impl InProcessDaemon {
         let mut members = Vec::with_capacity(declaration.members.len());
         for member in declaration.members {
             let declared_spec = RepositorySpec::remote(member.url)?;
-            let key = aliases.get(&member.alias).cloned().unwrap_or_else(|| declared_spec.key());
+            let key = match aliases.get(&member.alias) {
+                Some(existing_key) => match repositories.get(&existing_key.to_string()).await {
+                    Ok(existing)
+                        if existing.spec.declares_remote(declared_spec.live_remote().expect("remote RepositorySpec has a live remote")) =>
+                    {
+                        existing_key.clone()
+                    }
+                    Ok(_) | Err(ResourceError::NotFound { .. }) => declared_spec.key(),
+                    Err(error) => return Err(error.to_string()),
+                },
+                None => declared_spec.key(),
+            };
             let mut repository = if key == declared_spec.key() {
                 ensure_repository(&repositories, &key, &declared_spec).await.map_err(|error| error.to_string())?
             } else {
@@ -9228,6 +9239,26 @@ impl InProcessDaemon {
                     value: applied.value,
                     replica_origin: None,
                 })),
+                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+            let result = match repositories.get(name).await {
+                Ok(repository) => match repository.spec.clone().remove_remote(remote) {
+                    Ok(spec) => match repositories
+                        .update(&InputMeta::from(&repository.metadata), &repository.metadata.resource_version, &spec)
+                        .await
+                    {
+                        Ok(_) => flotilla_protocol::CommandValue::Ok,
+                        Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+                    },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
             };
             self.finish_context_free_command(id, empty_identity, result);

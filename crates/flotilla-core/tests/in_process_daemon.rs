@@ -1111,6 +1111,41 @@ async fn resource_list_and_get_queries_return_local_non_replicated_resources() {
 }
 
 #[tokio::test]
+async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_record() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let stable = "https://github.com/flotilla-org/flotilla";
+    let wrong = "https://github.com/wrong/flotilla";
+    let spec = RepositorySpec::remote(stable).expect("repository").with_declared_remotes([wrong, stable]).expect("remote declaration");
+    let name = spec.key().to_string();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(name.clone()).build(), &spec)
+        .await
+        .expect("seed repository");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::RepositoryRemoteRemove {
+                    namespace: "flotilla".to_string(),
+                    name: name.clone(),
+                    remote: wrong.to_string(),
+                })
+                .build(),
+        )
+        .await
+        .expect("remove remote command");
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::Ok);
+
+    let repository = daemon.resource_backend().using::<Repository>("flotilla").get(&name).await.expect("repository remains");
+    assert_eq!(repository.spec.remotes(), [stable]);
+}
+
+#[tokio::test]
 async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =
