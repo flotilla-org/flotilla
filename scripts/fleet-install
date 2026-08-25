@@ -913,6 +913,11 @@ activate_staged_generation() {
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
   verify_installed_release "$release" "$release/.generation.json"
+  # Verification is the only activation step that needs this process's work
+  # directory. Release it before service mutation so interruption cannot leak
+  # staging state while the detached health watchdog completes recovery.
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  WORK_DIR=""
   ensure_launchers_and_path
   prepare_linux_daemon_service
   prepare_darwin_daemon_service
@@ -934,6 +939,10 @@ handoff_activation() {
   local incoming_installer="$RELEASES_DIR/$generation/install.sh"
   [[ -x "$incoming_installer" ]] || die "verified generation has no executable installer: $generation"
   printf 'fleet-install: handing off activation to generation %s installer\n' "$generation"
+  # exec does not run this process's EXIT trap. Discard the bootstrap
+  # verifier's downloads before replacing it with the incoming installer.
+  [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
+  WORK_DIR=""
   exec "$incoming_installer" __activate "$generation" "$rollback_generation" "$confirmation_token" "$INSTALL_LOCK_OWNER"
 }
 
@@ -1091,6 +1100,9 @@ main() {
       ;;
     latest)
       local generation
+      # Allocate in the parent shell so cleanup and the activation handoff
+      # retain ownership when latest_generation runs in command substitution.
+      make_work_dir
       generation="$(latest_generation)"
       install_generation "$generation"
       ;;

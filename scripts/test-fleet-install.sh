@@ -702,6 +702,9 @@ grep -Fq "$generation_one -> $generation_two" "$test_root/latest.out" || fail 'l
 grep -Fq 'daemon stop requested' "$test_root/latest.out" || fail 'running daemon was not stopped before switching'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'latest did not select newest promoted generation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_one" || fail 'switch did not record previous generation'
+if leftover_work_dirs="$(compgen -G "$test_root/home/.local/opt/flotilla-fleet/.fleet-install.*")"; then
+  fail "successful upgrade left fleet-install work directories behind: $leftover_work_dirs"
+fi
 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
