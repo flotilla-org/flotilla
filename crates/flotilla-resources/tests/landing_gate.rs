@@ -90,3 +90,16 @@ fn stale_approval_never_stages_and_refusal_preserves_the_reason() {
         reason: "review evidence is incomplete".to_string()
     });
 }
+
+#[test]
+fn acknowledged_gate_is_terminal_and_does_not_wait_forever() {
+    let spec = settlement_human_gate(
+        ResourceRef::new("flotilla.dev/v1alpha1", "Convoy", "flotilla", "convoy-a"),
+        PrincipalRef::implicit_for_namespace("flotilla"),
+        claim(),
+    );
+    let acknowledged = DemandStatus::builder().state(DemandState::Acknowledged).build();
+    assert_eq!(evaluate_landing_gate(&spec, Some(&acknowledged), "sha256:reviewed-head", &BTreeMap::new()), LandingGateDecision::Refused {
+        reason: "landing approval was dismissed".to_string()
+    });
+}

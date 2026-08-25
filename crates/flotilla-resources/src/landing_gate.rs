@@ -47,10 +47,10 @@ pub fn evaluate_landing_gate(
     };
     let Some(status) = status else { return LandingGateDecision::Pending };
     let Some(verdict) = &status.verdict else {
-        return if status.state == DemandState::Escalated {
-            LandingGateDecision::Refused { reason: "landing approval expired".to_string() }
-        } else {
-            LandingGateDecision::Pending
+        return match status.state {
+            DemandState::Escalated => LandingGateDecision::Refused { reason: "landing approval expired".to_string() },
+            DemandState::Acknowledged => LandingGateDecision::Refused { reason: "landing approval was dismissed".to_string() },
+            DemandState::Raised | DemandState::Satisfied => LandingGateDecision::Pending,
         };
     };
     let DemandVerdictDisposition::Selected { option } = &verdict.disposition else {
