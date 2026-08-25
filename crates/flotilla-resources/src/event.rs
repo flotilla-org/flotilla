@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -141,7 +143,7 @@ impl EventRecorder {
             .map(|source| source.object)
             .filter(|event| event.spec.regarding == *regarding && !event.spec.is_expired_at(now))
             .collect::<Vec<_>>();
-        events.sort_by(|left, right| right.spec.last_seen.cmp(&left.spec.last_seen));
+        events.sort_by_key(|event| Reverse(event.spec.last_seen));
         Ok(events)
     }
 
