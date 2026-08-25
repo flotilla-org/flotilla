@@ -385,7 +385,7 @@ mod tests {
 
     use flotilla_resources::{RepositoryIdentity, RepositorySpec};
 
-    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
+    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -394,6 +394,34 @@ mod tests {
         std::fs::create_dir(&root).expect("repo dir");
         std::fs::create_dir(root.join(".git")).expect("git dir");
         (temp, root)
+    }
+
+    #[tokio::test]
+    async fn continuity_accepts_an_old_remote_ref_reachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Ok(String::new()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Continuous { .. }));
+    }
+
+    #[tokio::test]
+    async fn continuity_rejects_old_remote_refs_unreachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Err("unrelated histories".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Unproven { .. }));
     }
 
     #[tokio::test]

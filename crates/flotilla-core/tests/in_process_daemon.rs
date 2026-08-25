@@ -4619,6 +4619,27 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
     daemon.add_repo(&repo).await.expect("track original repository");
 
     let old_key = RepositorySpec::remote("https://github.com/owner/ghostty").expect("old spec").key();
+    let unaffected_path = temp.path().join("ghostty-main");
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    observed
+        .create(
+            &InputMeta::builder()
+                .name("unaffected-old-checkout".to_string())
+                .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), old_key.to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Observed),
+            &ResourceCheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("main".to_string())
+                    .path(unaffected_path.to_string_lossy().into_owned())
+                    .repo_ref(old_key.clone())
+                    .host_ref("other-host".to_string())
+                    .is_main(true)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("create unaffected old checkout observation");
     *remote.write().expect("remote lock") = "ghostty-ops".to_string();
     let change = daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh replacement");
 
@@ -4630,6 +4651,7 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
     let old = repositories.items.iter().find(|item| item.metadata.name == old_key.to_string()).expect("old Repository remains");
     assert_eq!(old.spec.remotes(), ["https://github.com/owner/ghostty"]);
     repositories.items.iter().find(|item| item.metadata.name == new_key.to_string()).expect("new Repository is materialized");
+    observed.get("unaffected-old-checkout").await.expect("unaffected old checkout observation remains");
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {

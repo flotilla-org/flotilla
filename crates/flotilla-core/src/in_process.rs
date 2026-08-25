@@ -6559,9 +6559,14 @@ impl InProcessDaemon {
                 }
             }
         } else if let Some(previous) = &previous_tracked_key {
-            crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, previous)
-                .await
-                .map_err(|error| error.to_string())?;
+            crate::observed_resources::delete_observed_checkout_at_path(
+                &self.observed_resource_backend,
+                &namespace,
+                previous,
+                &inspection.checkout.path,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
 
         let other_tracked_keys = self
