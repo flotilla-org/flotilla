@@ -105,3 +105,4 @@ cmp "$bundle/bin/cleat" "$prefix/bin/cleat"
 cmp "$bundle/lib/libghostty-vt.dylib" "$prefix/lib/libghostty-vt.dylib"
 
 echo 'fleet candidate workflow contract passed'
+"$repo_root/ci/fleet-candidates/test-generation-validation.sh"
