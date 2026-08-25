@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 
 PLATFORMS = ("linux-x86_64-gnu2.36", "darwin-aarch64")
@@ -84,6 +86,45 @@ def validate_skill_bundle(document, sources):
                 raise ValidationError(f"skill source {name} has invalid path: {path}")
         names.add(name)
     return entries
+
+
+def validate_skill_source_paths(document):
+    entries = document.get("sources") if isinstance(document, dict) else None
+    pins = {source.get("name"): source.get("revision") for source in entries or [] if isinstance(source, dict)}
+    if set(pins) != set(SOURCE_NAMES):
+        raise ValidationError("invalid source set")
+    entries = validate_skill_bundle(document, pins)
+    with tempfile.TemporaryDirectory(prefix="fleet-skill-sources-") as temporary:
+        for source in entries:
+            name = source["name"]
+            revision = source["revision"]
+            paths = source.get("paths", ["skills"])
+            checkout = Path(temporary) / name
+            checkout.mkdir()
+            commands = (
+                (("git", "-C", str(checkout), "init", "--quiet"), None),
+                (("git", "-C", str(checkout), "remote", "add", "origin", source["repository"]), None),
+                (("git", "-C", str(checkout), "sparse-checkout", "set", "--no-cone", "--stdin"),
+                 "".join(f"/{path}/\n" for path in paths)),
+                (("git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", "--filter=blob:none", "--no-tags", "origin", revision), None),
+                (("git", "-C", str(checkout), "checkout", "--quiet", "--detach", "FETCH_HEAD"), None),
+            )
+            for command, stdin in commands:
+                try:
+                    subprocess.run(command, input=stdin, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError as error:
+                    detail = error.stderr.strip().splitlines()[-1] if error.stderr.strip() else "git command failed"
+                    raise ValidationError(f"skill source {name} at pinned revision {revision} could not be fetched: {detail}") from error
+            resolved = subprocess.run(("git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"), text=True,
+                                      check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+            if resolved != revision:
+                raise ValidationError(f"skill source {name} fetch did not resolve pinned revision {revision}")
+            for declared_path in paths:
+                path = checkout / declared_path
+                if not path.is_dir():
+                    raise ValidationError(f"skill source {name} declared path {declared_path} is missing at pinned revision {revision}")
+                if not any(path.rglob("SKILL.md")):
+                    raise ValidationError(f"skill source {name} declared path {declared_path} has no SKILL.md at pinned revision {revision}")
 
 
 def validate_generation(document, generation, platform=None, trusted_team="973L4GV58R", require_installable=False):
@@ -220,10 +261,14 @@ def main():
     release.add_argument("platform")
     fixture = sub.add_parser("fixture")
     fixture.add_argument("path")
+    skill_sources = sub.add_parser("skill-sources")
+    skill_sources.add_argument("manifest")
     args = parser.parse_args()
     try:
         if args.command == "fixture":
             validate_fixture(args.path)
+        elif args.command == "skill-sources":
+            validate_skill_source_paths(json.loads(Path(args.manifest).read_text()))
         else:
             outer = json.loads(Path(args.manifest).read_text())
         if args.command == "generation":

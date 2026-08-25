@@ -58,6 +58,48 @@ if require_sha TEST_SHA main >/dev/null 2>&1; then
   exit 1
 fi
 
+skill_test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-skill-paths.XXXXXX")"
+trap 'rm -rf "$skill_test_root"' EXIT
+skill_repo="$skill_test_root/source"
+git init --quiet "$skill_repo"
+git -C "$skill_repo" config user.name test
+git -C "$skill_repo" config user.email test@example.invalid
+mkdir -p "$skill_repo/skills/example"
+printf '# Example\n' >"$skill_repo/skills/example/SKILL.md"
+git -C "$skill_repo" add .
+git -C "$skill_repo" commit --quiet -m fixture
+skill_pin="$(git -C "$skill_repo" rev-parse HEAD)"
+skill_manifest="$skill_test_root/sources.json"
+python3 - "$skill_manifest" "$skill_repo" "$skill_pin" <<'PY'
+import json
+import sys
+
+manifest, repository, revision = sys.argv[1:]
+sources = []
+for name in ("mattpocock-skills", "rjw-skills", "cleat", "flotilla"):
+    source = {"name": name, "repository": repository, "revision": revision}
+    if name == "mattpocock-skills":
+        source["repository"] = "https://github.com/flotilla-org/mattpocock-skills.git"
+    if name == "rjw-skills":
+        source["paths"] = ["missing/skills"]
+    sources.append(source)
+with open(manifest, "w") as output:
+    json.dump({"schema_version": 4, "sources": sources}, output)
+PY
+git_config="$skill_test_root/gitconfig"
+git config --file "$git_config" "url.file://$skill_repo.insteadOf" https://github.com/flotilla-org/mattpocock-skills.git
+if GIT_CONFIG_GLOBAL="$git_config" python3 "$repo_root/ci/fleet-candidates/generation_validation.py" \
+    skill-sources "$skill_manifest" >"$skill_test_root/stdout" 2>"$skill_test_root/stderr"; then
+  echo 'accepted a declared skill path absent at its pinned revision' >&2
+  exit 1
+fi
+expected="skill source rjw-skills declared path missing/skills is missing at pinned revision $skill_pin"
+grep -Fq "$expected" "$skill_test_root/stderr"
+if grep -Fq 'remote: Enumerating objects' "$skill_test_root/stderr"; then
+  echo 'skill path validation leaked git fetch chatter' >&2
+  exit 1
+fi
+
 fake_flotilla="$(mktemp "${TMPDIR:-/tmp}/fake-flotilla.XXXXXX")"
 printf '#!/bin/sh\nprintf "flotilla 0.1.0 (wire=test, proto=20)\\n"\n' >"$fake_flotilla"
 chmod 0755 "$fake_flotilla"

@@ -91,18 +91,6 @@ fi
 fetch_exact https://github.com/flotilla-org/flotilla.git "$flotilla_sha" "$flotilla_root"
 fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
 
-(
-  cd "$flotilla_root"
-  export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
-  cargo build --locked --release --bin flotilla --bin flotillad
-)
-
-(
-  cd "$cleat_root"
-  ./tools/prepare-ghostty-vt.sh
-  cargo build -p cleat --locked --features ghostty-vt --release
-)
-
 rm -rf "$output_root"
 mkdir -p "$bundle/bin" "$bundle/lib"
 install -m 0755 "$flotilla_root/target/release/flotilla" "$bundle/bin/flotilla"
@@ -153,6 +141,20 @@ manifest = {
 }
 (bundle / ".flotilla-sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
+
+python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle/.flotilla-sources.json"
+
+(
+  cd "$flotilla_root"
+  export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
+  cargo build --locked --release --bin flotilla --bin flotillad
+)
+
+(
+  cd "$cleat_root"
+  ./tools/prepare-ghostty-vt.sh
+  cargo build -p cleat --locked --features ghostty-vt --release
+)
 
 if [[ "$platform" == darwin-aarch64 && -f "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" ]]; then
   install -m 0755 "$cleat_root/.tools/ghostty-install/lib/$ghostty_library" "$bundle/lib/$ghostty_library"
