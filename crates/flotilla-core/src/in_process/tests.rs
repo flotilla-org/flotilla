@@ -1099,6 +1099,32 @@ async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_imme
 }
 
 #[tokio::test]
+async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    for delay in [30, 60] {
+        fail_ensured_generation(&backend, &clock).await;
+        daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record failure");
+        clock.advance(ChronoDuration::seconds(delay));
+        daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("restart");
+    }
+    fail_ensured_generation(&backend, &clock).await;
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("exhaust restart budget");
+
+    let outcome = daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking).await.expect("forced restart");
+
+    assert_eq!(outcome, "started quartermaster@standing-project");
+    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status");
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(status.retry_at, None);
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 4);
+    assert!(matches!(
+        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
+        Err(ResourceError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn concurrent_ensure_admission_creates_only_one_live_generation() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     let (left, right) = tokio::join!(daemon.reconcile_convoy_ensures_once("flotilla"), daemon.reconcile_convoy_ensures_once("flotilla"));

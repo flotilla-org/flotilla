@@ -122,7 +122,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
             "manifest" | "manifestroot" | "manifestroots" => {
                 let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
                 if manifests.reconciler_root != name {
-                    return Err(format!("manifest root `{name}` is not owned here; configured root is `{}`", manifests.reconciler_root));
+                    return Err(format!("manifest root `{name}` does not match configured root `{}`", manifests.reconciler_root));
                 }
                 if manifests.reconciler_root != self.local_root {
                     return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));

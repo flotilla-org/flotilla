@@ -4915,7 +4915,6 @@ impl InProcessDaemon {
     ) -> Result<String, String> {
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
-        self.patch_driver_ensure_status_if_local(namespace, name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
         if ensure.spec.driver_ref.is_some() {
             self.driver_ensure_retries.lock().await.remove(&(namespace.to_string(), name.to_string()));
             return self
@@ -4958,17 +4957,20 @@ impl InProcessDaemon {
 
         let demands = self.resource_backend.clone().using::<ResourceDemand>(namespace);
         let demand_name = format!("{ENSURE_HOLD_ATTENTION_PREFIX}{}", ensure.metadata.name);
-        let resolved_escalation = match demands.get(&demand_name).await {
+        let (resolved_escalation, forced_escalation) = match demands.get(&demand_name).await {
             Ok(demand)
                 if demand.status.as_ref().is_none_or(|status| matches!(status.state, DemandState::Raised | DemandState::Escalated)) =>
             {
-                return Ok(None);
+                if !force_now {
+                    return Ok(None);
+                }
+                (true, true)
             }
             Ok(_) => {
                 demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
-                true
+                (true, false)
             }
-            Err(ResourceError::NotFound { .. }) => false,
+            Err(ResourceError::NotFound { .. }) => (false, false),
             Err(error) => return Err(error.to_string()),
         };
 
@@ -5017,6 +5019,9 @@ impl InProcessDaemon {
             }
         }
 
+        if forced_escalation {
+            demands.delete(&demand_name).await.map_err(|error| error.to_string())?;
+        }
         match self.start_ensured_convoy(namespace, ensure).await {
             Ok(_) => {
                 self.driver_ensure_retries.lock().await.remove(&retry_key);
@@ -5189,17 +5194,30 @@ impl InProcessDaemon {
             if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
                 return Ok(None);
             }
+            if force_now {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+                status.restart_count = 0;
+                status.retry_at = None;
+                status.last_failure = None;
+                status.hold_reason = None;
+            }
             return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
         }
 
         let convoy = convoy.expect("terminal branch requires an existing convoy");
         if status.hold_reason == Some(ConvoyEnsureHoldReason::RestartLimit) {
-            if self.ensure_attention_is_active(namespace, &ensure.metadata.name).await? {
+            if !force_now && self.ensure_attention_is_active(namespace, &ensure.metadata.name).await? {
                 return Ok(None);
             }
             self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
-            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
-            return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
+            if !force_now {
+                self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
+                return Ok(Some(format!("ConvoyEnsure/{} restart hold cleared", ensure.metadata.name)));
+            }
+            status.restart_count = 0;
+            status.retry_at = None;
+            status.last_failure = None;
+            status.hold_reason = None;
         }
         let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
         if !operator_forced {
@@ -5245,6 +5263,9 @@ impl InProcessDaemon {
         }
         if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(None);
+        }
+        if force_now {
+            self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
         }
 
         let restart = async {
