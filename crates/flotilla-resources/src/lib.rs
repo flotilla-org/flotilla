@@ -29,6 +29,7 @@ mod replica;
 mod repository;
 mod resource;
 mod retention;
+mod review_bundle;
 mod sqlite;
 mod status_patch;
 mod terminal_session;
@@ -144,6 +145,10 @@ pub use resource::{
 };
 pub use retention::{
     EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,
+};
+pub use review_bundle::{
+    validate_settlement_claim, ClaimAdmissibilityError, FindingResolution, ReviewBundleIndex, ReviewCheck, ReviewCheckOutcome,
+    ReviewFinding, ReviewRefPair, ReviewRound, SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE,
 };
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};

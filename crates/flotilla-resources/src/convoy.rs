@@ -623,6 +623,10 @@ pub struct CrewWorkState {
     /// for rejecting the claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
+    /// Review evidence for this settlement claim. Kept optional while claim
+    /// producers migrate onto the evidence-backed protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_evidence: Option<crate::SettlementClaimEvidence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
