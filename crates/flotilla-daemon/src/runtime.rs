@@ -2817,6 +2817,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
+                if !runner.path_exists(Path::new(target_path)).await? {
+                    return Ok(CheckoutRemovalOutcome::Removed);
+                }
                 let remove = runner
                     .run_output(
                         "git",
@@ -4983,6 +4986,24 @@ mod tests {
             .status()
             .expect("git should inspect the branch");
         assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_treats_a_never_created_worktree_as_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = temp.path().join("clone-that-failed-auth");
+        let target = temp.path().join("workspace/never-created");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/never-created".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+
+        let outcome =
+            runtime.remove_checkout(&removal).await.expect("a worktree that provisioning never created should not wedge finalization");
+
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
     }
 
     #[tokio::test]
