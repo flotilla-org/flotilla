@@ -5186,7 +5186,7 @@ impl InProcessDaemon {
         }
 
         if convoy.is_none() {
-            if status.retry_at.is_some_and(|retry_at| retry_at > now) {
+            if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
                 return Ok(None);
             }
             return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
@@ -5243,7 +5243,7 @@ impl InProcessDaemon {
             .await?;
             return Ok(Some(format!("ConvoyEnsure/{} backing off until {retry_at}", ensure.metadata.name)));
         }
-        if status.retry_at.is_some_and(|retry_at| retry_at > now) {
+        if !force_now && status.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(None);
         }
 
