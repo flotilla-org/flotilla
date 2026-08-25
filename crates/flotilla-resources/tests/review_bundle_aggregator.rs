@@ -143,3 +143,24 @@ fn project_review_prep_refuses_artifacts_outside_the_project() {
         assert!(!project.path().join(".flotilla/review-bundle").exists());
     }
 }
+
+#[test]
+fn refuses_option_shaped_refs_before_invoking_git() {
+    let project = project_with_review(
+        Some(serde_json::json!({
+            "finding_id": "R1-F1",
+            "state": "addressed",
+            "fix_reference": "commit:HEAD"
+        })),
+        false,
+    );
+    write_json(
+        &project.path().join(".flotilla/review/review.json"),
+        serde_json::json!({"base": "base", "head": "--output=/tmp/not-a-ref"}),
+    );
+
+    let output = aggregator(project.path());
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("base and head must not begin with '-'"));
+    assert!(!project.path().join(".flotilla/review-bundle").exists());
+}

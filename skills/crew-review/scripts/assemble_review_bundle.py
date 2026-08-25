@@ -195,6 +195,8 @@ def assemble(rounds_root: Path, output: Path, project: Path) -> None:
     if any(not isinstance(metadata[key], str) or not metadata[key] for key in ("base", "head")):
         raise BundleError("review.json base and head must be non-empty strings")
     base, head = metadata["base"], metadata["head"]
+    if base.startswith("-") or head.startswith("-"):
+        raise BundleError("review.json base and head must not begin with '-'")
     digest = git(project, "rev-parse", "--verify", f"{head}^{{commit}}")
     git(project, "rev-parse", "--verify", f"{base}^{{commit}}")
     rounds, checks = load_rounds(rounds_root)
