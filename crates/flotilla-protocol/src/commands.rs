@@ -209,6 +209,15 @@ pub struct ExplainedCheckout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedEvent {
+    pub reason: String,
+    pub message: String,
+    pub count: u64,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedChangeRequest {
     pub name: String,
     pub bound: bool,
@@ -293,6 +302,8 @@ pub struct ConvoyExplanation {
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
     pub decision_ledgers: Vec<ExplainedDecisionLedger>,
     pub settlement: ExplainedSettlement,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_events: Vec<ExplainedEvent>,
 }
 
 /// Filters for reading a daemon's host-local structured log.

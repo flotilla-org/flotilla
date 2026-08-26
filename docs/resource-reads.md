@@ -45,6 +45,21 @@ served it. A replicated record has `source: "replica"`, `originRoot`, and
 in `records` and a cursor immediately after that slice. An empty list still
 returns an envelope and cursor with an empty `records` array.
 
+### Recent event shapes
+
+`resource get` adds a camel-case `recentEvents` field to the returned raw
+resource object. Its entries are complete Event resource objects, including
+metadata, `spec.regarding`, occurrence counts, timestamps, expiry, and replica
+provenance. This keeps the generic read useful to clients that understand the
+resource wire format.
+
+`convoy <name> explain` intentionally uses a different, diagnostic shape. Its
+snake-case `recent_events` array contains the compact fields `reason`,
+`message`, `count`, `first_seen`, and `last_seen`; it includes events attached
+to the convoy and its convoy-labelled child resources. Use `flotilla events`
+to list complete Event resources fleet-wide, or add `--local-only` to exclude
+replicas.
+
 ## Watching and resuming
 
 JSON watch output is JSON Lines: each line is one complete resource-read

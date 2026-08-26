@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_resources::{
     clone_key,
     controller::{ReconcileOutcome, Reconciler},
-    Clone, ClonePhase, CloneStatusPatch, Repository, RepositoryIdentity, ResourceError, ResourceObject, TypedResolver,
+    Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, RepositoryIdentity, ResourceError, ResourceObject, TypedResolver,
 };
 
 const CLONE_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -95,6 +95,9 @@ where
         };
 
         let mut outcome = ReconcileOutcome::new(patch);
+        if let ClonePrepared::Failed(message) = prepared {
+            outcome.events.push(ObjectEvent::for_object(obj, "CloneFailed", message.clone()));
+        }
         if matches!(prepared, ClonePrepared::Retrying(_)) {
             outcome.requeue_after = Some(CLONE_RETRY_AFTER);
         }

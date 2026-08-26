@@ -478,6 +478,7 @@ impl DaemonRuntime {
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
+            spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
@@ -1456,6 +1457,19 @@ fn spawn_demand_expiry_task(backend: ResourceBackend, namespace: String, interva
         async move {
             if let Err(error) = lifecycle.expire_due(&namespace).await {
                 warn!(%error, %namespace, "failed to expire demands");
+            }
+        }
+    })
+}
+
+fn spawn_event_expiry_task(backend: ResourceBackend, namespace: String, interval: Duration) -> JoinHandle<()> {
+    let recorder = flotilla_resources::EventRecorder::new(backend);
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+        let recorder = recorder.clone();
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = recorder.prune_expired(&namespace, Utc::now()).await {
+                warn!(%error, %namespace, "failed to prune expired events");
             }
         }
     })
@@ -4491,6 +4505,112 @@ mod tests {
         let default_branch = runtime.clone_and_inspect(repo_url, target_path).await.expect("redrive should replace the interrupted clone");
 
         assert_eq!(default_branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn clone_controller_failure_is_visible_in_convoy_explain() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"clone-failure-explain-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let backend = daemon.resource_backend();
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+        let repository_key = repository_spec.key();
+        flotilla_resources::ensure_repository(&backend.using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
+            .await
+            .expect("repository");
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(
+                &InputMeta::builder()
+                    .name("clone-failure-convoy".to_string())
+                    .labels(BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "clone-failure-convoy".to_string())]))
+                    .build(),
+                &ConvoySpec::builder().workflow_ref("missing-workflow".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        backend
+            .using::<Clone>(NAMESPACE)
+            .create(
+                &InputMeta::builder()
+                    .name("incorrect-clone-name".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "clone-failure-convoy".to_string())]))
+                    .build(),
+                &CloneSpec {
+                    repo_ref: repository_key,
+                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+                    env_ref: "host-direct-test".to_string(),
+                    path: temp.path().join("clone").display().to_string(),
+                },
+            )
+            .await
+            .expect("clone intent");
+
+        let controller = tokio::spawn(
+            ControllerLoop {
+                primary: backend.using::<Clone>(NAMESPACE),
+                secondaries: Vec::new(),
+                reconciler: CloneReconciler::new(
+                    Arc::new(CloneControllerRuntime { runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) }),
+                    backend.using::<Repository>(NAMESPACE),
+                ),
+                resync_interval: Duration::from_secs(60),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+        let convoy_controller = tokio::spawn(
+            ControllerLoop {
+                primary: backend.using::<Convoy>(NAMESPACE),
+                secondaries: Vec::new(),
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE)),
+                resync_interval: Duration::from_secs(60),
+                backend: backend.clone(),
+            }
+            .run(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = backend.using::<flotilla_resources::Event>(NAMESPACE).list().await.expect("events").items;
+                if events.iter().any(|event| event.spec.reason == "CloneFailed")
+                    && events.iter().any(|event| event.spec.reason == "WorkflowTemplateNotFound")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clone failure should reach explain");
+        let result = daemon
+            .execute_query(
+                Command::builder()
+                    .action(CommandAction::QueryExplainConvoy {
+                        namespace: Some(NAMESPACE.to_string()),
+                        name: "clone-failure-convoy".to_string(),
+                    })
+                    .build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("explain convoy");
+        let CommandValue::ConvoyExplanation(explanation) = result else {
+            panic!("explain should return a convoy explanation, got {result:?}");
+        };
+        assert!(explanation
+            .recent_events
+            .iter()
+            .any(|event| { event.reason == "CloneFailed" && event.message.contains("clone name mismatch") }));
+        assert!(explanation
+            .recent_events
+            .iter()
+            .any(|event| { event.reason == "WorkflowTemplateNotFound" && event.message.contains("missing-workflow") }));
+        controller.abort();
+        convoy_controller.abort();
     }
 
     #[tokio::test]

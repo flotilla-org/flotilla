@@ -115,10 +115,10 @@ pub(crate) mod test_helpers {
 pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
     CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, EvidenceFreshness,
-    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedLeafFiring,
-    ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand,
-    PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, StepStatus,
+    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector, ManifestResolution,
+    PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse,
+    ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

@@ -100,6 +100,30 @@ impl HttpBackend {
         self.list_read_view_typed::<T>(namespace, "includeReplicas").await
     }
 
+    pub(crate) async fn list_including_replicas_typed_matching_labels<T: Resource>(
+        &self,
+        namespace: &str,
+        required: &BTreeMap<String, String>,
+    ) -> Result<ReadResourceList<T>, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
+        let label_selector = required.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(",");
+        let response = self
+            .http
+            .get(url)
+            .query(&[("includeReplicas", "true"), ("labelSelector", label_selector.as_str())])
+            .send()
+            .await
+            .map_err(|err| ResourceError::other(format!("LIST resources including replicas: {err}")))?;
+        let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
+        let items = list
+            .items
+            .into_iter()
+            .map(ResourceObject::from_k8s_object)
+            .map(|object| object.and_then(read_resource_object))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReadResourceList { items })
+    }
+
     pub(crate) async fn get_including_replicas_typed<T: Resource>(
         &self,
         namespace: &str,

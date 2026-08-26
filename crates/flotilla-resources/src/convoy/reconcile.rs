@@ -679,7 +679,7 @@ impl Reconciler for ConvoyReconciler {
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
-            events: outcome.events.into_iter().map(|event| format!("{event:?}")).collect(),
+            events: outcome.events.into_iter().map(|event| convoy_object_event(obj, event)).collect(),
             requeue_after: reclaim_refused.then_some(self.landing_evidence_stale_after),
         }
     }
@@ -721,6 +721,27 @@ impl Reconciler for ConvoyReconciler {
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/convoy-teardown")
     }
+}
+
+fn convoy_object_event(obj: &ResourceObject<Convoy>, event: ConvoyEvent) -> crate::ObjectEvent {
+    let (reason, message) = match event {
+        ConvoyEvent::PhaseChanged { from, to } => ("ConvoyPhaseChanged", format!("convoy phase changed from {from:?} to {to:?}")),
+        ConvoyEvent::WorkPhaseChanged { work, from, to } => {
+            ("ConvoyWorkPhaseChanged", format!("work {work} changed phase from {from:?} to {to:?}"))
+        }
+        ConvoyEvent::TemplateNotFound { name } => ("WorkflowTemplateNotFound", format!("workflow template {name} was not found")),
+        ConvoyEvent::TemplateInvalid { name, errors } => {
+            let details = errors.into_iter().map(|error| error.to_string()).collect::<Vec<_>>().join("; ");
+            ("WorkflowTemplateInvalid", format!("workflow template {name} is invalid: {details}"))
+        }
+        ConvoyEvent::WorkflowRefChanged { from, to } => {
+            ("ConvoyWorkflowRefChanged", format!("workflow reference changed from {from} to {to}"))
+        }
+        ConvoyEvent::MissingInput { name } => ("WorkflowInputMissing", format!("required workflow input {name} is missing")),
+    };
+    let mut event = crate::ObjectEvent::for_object(obj, reason, message);
+    event.related_labels.insert(CONVOY_LABEL.to_string(), obj.metadata.name.clone());
+    event
 }
 
 /// Test-support reconcile entry that carries no vessel, presentation, checkout,

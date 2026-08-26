@@ -7,7 +7,7 @@ use common::{
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Checkout, CheckoutSpec, Convoy, ConvoyIssue, ConvoyPhase,
-    ConvoyReconciler, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy,
+    ConvoyReconciler, Event, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, PlacementPolicy,
     PlacementPolicySpec, PreparedSnapshotGarbageCollector, Presentation, PresentationSpec, RepositoryKey, RepositorySpec, ResourceBackend,
     ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, PLACEMENT_SNAPSHOT_ANNOTATION,
     PLACEMENT_SNAPSHOT_KIND, PREPARED_SNAPSHOT_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_KIND,
@@ -122,13 +122,37 @@ async fn missing_template_transitions_convoy_to_failed() {
 
     convoys.create(&convoy_meta("convoy-missing-template"), &valid_convoy_spec()).await.expect("convoy create should succeed");
 
-    let patch = reconcile_once(&convoys, &templates, "convoy-missing-template", timestamp(10)).await.expect("fail-init patch");
-    assert!(matches!(patch, flotilla_resources::ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. }));
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: Vec::new(),
+            reconciler: ConvoyReconciler::new(templates.clone()),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let events = backend.using::<Event>("flotilla").list().await.expect("list events").items;
+            if events
+                .iter()
+                .any(|event| event.spec.regarding.name == "convoy-missing-template" && event.spec.reason == "WorkflowTemplateNotFound")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("template refusal should become an object event");
 
     let convoy = convoys.get("convoy-missing-template").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status");
     assert_eq!(status.phase, ConvoyPhase::Failed);
     assert!(status.message.as_deref().is_some_and(|message| message.contains("not found")));
+    loop_task.abort();
 }
 
 #[tokio::test]

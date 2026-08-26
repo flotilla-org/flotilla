@@ -12,8 +12,8 @@ use std::{
 };
 
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, patch_resource_annotations, resource_document_spec_hash, ResourceBackend,
-    ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
+    apply_manifest_resource_document, get_resource_kind, patch_resource_annotations, resource_document_spec_hash, EventRecorder,
+    EventRegarding, ObjectEvent, ResourceBackend, ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -80,11 +80,13 @@ pub struct ResourceManifestReconciler {
     fixed_revision: Option<String>,
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
+    events: EventRecorder,
 }
 
 impl ResourceManifestReconciler {
     pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
+            events: EventRecorder::new(backend.clone()),
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
@@ -172,7 +174,11 @@ impl ResourceManifestReconciler {
                 }
             };
             for (index, document) in documents.into_iter().enumerate() {
+                let identity = document_identity(&document, &self.default_namespace).ok();
                 if let Err(reason) = self.reconcile_document(&relative, &revision, document, &mut report).await {
+                    if let Some(identity) = identity {
+                        self.record_refusal_event(&identity, "ManifestDocumentRefused", format!("{}: {reason}", relative.display())).await;
+                    }
                     let path = if index == 0 { relative.clone() } else { PathBuf::from(format!("{}#{}", relative.display(), index + 1)) };
                     report.errors.push(ManifestDocumentError { path, reason });
                 }
@@ -278,6 +284,12 @@ impl ResourceManifestReconciler {
 
         let labels = string_map(&existing, "labels")?;
         if labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANIFEST_MANAGED_BY_VALUE) {
+            self.record_refusal_event(
+                &identity,
+                "ManifestAdoptionRefused",
+                format!("{}: manifest names an unmanaged object", path.display()),
+            )
+            .await;
             if self.warned_unmanaged.insert(identity.clone()) {
                 warn!(object = %identity, source = %self.source, path = %path.display(), "manifest names an unmanaged object; refusing adoption");
             }
@@ -288,6 +300,12 @@ impl ResourceManifestReconciler {
         self.warned_unmanaged.remove(&identity);
 
         if live_hash != last_applied && resolution != Some("sync") {
+            self.record_refusal_event(
+                &identity,
+                "ManifestOverwriteRefused",
+                format!("{}: manifest-managed object has live drift", path.display()),
+            )
+            .await;
             if self.warned_drift.insert((identity.clone(), live_hash.clone(), last_applied.clone())) {
                 warn!(
                     object = %identity,
@@ -324,6 +342,23 @@ impl ResourceManifestReconciler {
     fn clear_warnings(&mut self, identity: &ObjectIdentity) {
         self.warned_unmanaged.remove(identity);
         self.warned_drift.retain(|(warned, _, _)| warned != identity);
+    }
+
+    async fn record_refusal_event(&self, identity: &ObjectIdentity, reason: &str, message: String) {
+        let event = ObjectEvent {
+            regarding: EventRegarding {
+                api_version: "flotilla.work/v1".to_string(),
+                kind: identity.kind.clone(),
+                namespace: identity.namespace.clone(),
+                name: identity.name.clone(),
+            },
+            reason: reason.to_string(),
+            message,
+            related_labels: BTreeMap::new(),
+        };
+        if let Err(error) = self.events.record(event, chrono::Utc::now()).await {
+            warn!(object = %identity, %error, "failed to record manifest refusal event");
+        }
     }
 
     async fn record_refusal(
