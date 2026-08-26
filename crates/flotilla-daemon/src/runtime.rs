@@ -1614,6 +1614,9 @@ fn spawn_convoy_ensure_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut watches = Vec::new();
+        // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
+        // renewed clone demand and ensure readmission can unblock work even
+        // though their payloads are not part of the admission hash.
         for kind in [
             "Clone",
             "Convoy",
