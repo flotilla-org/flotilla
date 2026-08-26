@@ -141,7 +141,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 ))
             }
             "repository" | "repositories" | "repo" => {
-                self.state.daemon.refresh(&RepoSelector::Query(name.to_string())).await?;
+                self.state.daemon.refresh_strict(&RepoSelector::Query(name.to_string())).await?;
                 Ok(format!("Repository/{name} refreshed"))
             }
             _ => Err(format!("resource kind `{kind}` does not support reconcile-now; expected ConvoyEnsure, manifest-root, or Repository")),

@@ -2144,6 +2144,13 @@ pub struct InProcessDaemon {
 /// is called. Matches `RuntimeOptions::namespace`'s default so tests that construct
 /// the daemon directly hit the same namespace the runtime uses.
 pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RepositoryRefreshFailurePolicy {
+    BestEffort,
+    Strict,
+}
+
 const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
@@ -6876,6 +6883,23 @@ impl InProcessDaemon {
     }
 
     pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
+        self.refresh_repository(repo, RepositoryRefreshFailurePolicy::BestEffort).await
+    }
+
+    /// Refresh a tracked repository and surface inspection failures to the caller.
+    ///
+    /// Operator-triggered reconciliation uses this path so a successful response
+    /// means the requested refresh actually ran. Periodic background refreshes use
+    /// [`Self::refresh`] and retain their best-effort behavior.
+    pub async fn refresh_strict(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
+        self.refresh_repository(repo, RepositoryRefreshFailurePolicy::Strict).await
+    }
+
+    async fn refresh_repository(
+        &self,
+        repo: &flotilla_protocol::RepoSelector,
+        failure_policy: RepositoryRefreshFailurePolicy,
+    ) -> Result<Option<RepositoryIdentityChange>, String> {
         let repo = self.resolve_repo_selector(repo).await?;
         let identity = self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
         let identity_change = match self.inspect_repository_path(&repo, None).await {
@@ -6902,6 +6926,9 @@ impl InProcessDaemon {
                 identity_change
             }
             Err(error) => {
+                if failure_policy == RepositoryRefreshFailurePolicy::Strict {
+                    return Err(format!("inspect repository {} during refresh: {error}", repo.display()));
+                }
                 warn!(repo = %repo.display(), %error, "repository identity is unavailable during refresh");
                 None
             }

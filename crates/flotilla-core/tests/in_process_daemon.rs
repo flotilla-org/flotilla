@@ -92,11 +92,15 @@ struct TestRepositoryInspector {
     repository: Arc<std::sync::RwLock<String>>,
     fixed_repository_by_path: HashMap<PathBuf, String>,
     continuity: bool,
+    inspection_failure: Option<String>,
 }
 
 #[async_trait]
 impl RepositoryInspector for TestRepositoryInspector {
     async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        if let Some(error) = &self.inspection_failure {
+            return Err(error.clone());
+        }
         let repository = match self.fixed_repository_by_path.get(path) {
             Some(repository) => repository.clone(),
             None => self.repository.read().map_err(|_| "test repository identity lock poisoned".to_string())?.clone(),
@@ -129,6 +133,7 @@ async fn install_test_repository_inspector(daemon: &InProcessDaemon, repository:
             repository,
             fixed_repository_by_path: HashMap::new(),
             continuity: true,
+            inspection_failure: None,
         }))
         .await;
 }
@@ -4096,6 +4101,23 @@ async fn refresh_preserves_repository_spec_fork_stance_and_explicit_removal() {
     assert!(stored.spec.upstream().is_none(), "refresh should preserve explicit fork provenance removal");
 }
 
+#[tokio::test]
+async fn strict_refresh_surfaces_repository_inspection_failures() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+    daemon
+        .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            repository: Arc::new(std::sync::RwLock::new("repo".to_string())),
+            fixed_repository_by_path: HashMap::new(),
+            continuity: true,
+            inspection_failure: Some("repository metadata unavailable".to_string()),
+        }))
+        .await;
+
+    assert_eq!(daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("best-effort refresh"), None);
+    let error = daemon.refresh_strict(&RepoSelector::Path(repo.clone())).await.expect_err("strict refresh must fail");
+    assert_eq!(error, format!("inspect repository {} during refresh: repository metadata unavailable", repo.display()));
+}
+
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo_a = temp.path().join("repo-a");
@@ -4664,6 +4686,7 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
             repository: Arc::clone(&remote),
             fixed_repository_by_path: HashMap::new(),
             continuity: false,
+            inspection_failure: None,
         }))
         .await;
     daemon.add_repo(&repo).await.expect("track original repository");
