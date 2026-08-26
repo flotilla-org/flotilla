@@ -80,6 +80,7 @@ const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 const BUILTIN_MANAGED_BY_VALUE: &str = "builtin";
 const RECLAIM_REFUSAL_ATTENTION_AFTER: u64 = 3;
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
 
 fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<Option<ComposedFile>, String> {
@@ -155,11 +156,21 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                     .map_err(|error| error.to_string())?;
                 Ok(format!("Clone/{name} retry requested"))
             }
+            "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
             _ => Err(format!(
-                "resource kind `{kind}` does not support reconcile-now; expected Clone, ConvoyEnsure, manifest-root, or Repository"
+                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, manifest-root, or Repository"
             )),
         }
     }
+}
+
+async fn wake_controller_resource<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<String, String> {
+    let resources = backend.clone().using::<T>(namespace);
+    let object = resources.get(name).await.map_err(|error| error.to_string())?;
+    let mut meta = InputMeta::from(&object.metadata);
+    meta.annotations.insert(RECONCILE_NOW_ANNOTATION.to_string(), Utc::now().to_rfc3339());
+    resources.update(&meta, &object.metadata.resource_version, &object.spec).await.map_err(|error| error.to_string())?;
+    Ok(format!("{}/{} woken", T::API_PATHS.kind, name))
 }
 
 impl DaemonConvoyTeardownRuntime {
@@ -1603,7 +1614,18 @@ fn spawn_convoy_ensure_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut watches = Vec::new();
-        for kind in ["Project", "Repository", "WorkflowTemplate", "PlacementPolicy", "CredentialGrant", "CredentialSpec", "Host"] {
+        for kind in [
+            "Clone",
+            "Convoy",
+            "ConvoyEnsure",
+            "Project",
+            "Repository",
+            "WorkflowTemplate",
+            "PlacementPolicy",
+            "CredentialGrant",
+            "CredentialSpec",
+            "Host",
+        ] {
             match watch_resource_kind_including_replicas(&state.daemon.resource_backend(), &namespace, kind).await {
                 Ok(watch) => watches.push(watch.stream),
                 Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
@@ -3715,11 +3737,12 @@ mod tests {
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec,
         ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
-        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
-        ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-        TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec, VesselStatus, VirtualClock,
-        WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+        CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, InMemoryBackend, LifecycleAuthority, MaterialPoolSpec,
+        MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey,
+        RepositorySpec, Resource, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession,
+        TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec,
+        VesselStatus, VirtualClock, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
+        CONVOY_LABEL,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -3743,6 +3766,59 @@ mod tests {
             DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"),
             state_root.into(),
         )
+    }
+
+    #[tokio::test]
+    async fn convoy_and_workflow_template_changes_emit_ensure_dependency_wakes() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        for kind in ["Convoy", "WorkflowTemplate"] {
+            let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
+            match kind {
+                "Convoy" => {
+                    backend
+                        .using::<Convoy>(NAMESPACE)
+                        .create(&empty_meta("standing"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+                        .await
+                        .expect("create convoy");
+                }
+                "WorkflowTemplate" => {
+                    let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+                    let created = templates
+                        .create(&empty_meta("workflow"), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+                        .await
+                        .expect("create workflow template");
+                    watch.next().await.expect("watch should remain open").expect("template create event");
+                    let mut updated_meta = InputMeta::from(&created.metadata);
+                    updated_meta.annotations.insert("example.com/revision".to_string(), "2".to_string());
+                    templates
+                        .update(&updated_meta, &created.metadata.resource_version, &created.spec)
+                        .await
+                        .expect("update workflow template");
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .expect("dependency change should wake promptly")
+                .expect("watch should remain open")
+                .expect("dependency event");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_now_wakes_convoy_controller_resource() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("teardown"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+            .await
+            .expect("create convoy");
+
+        assert_eq!(
+            wake_controller_resource::<Convoy>(&backend, NAMESPACE, "teardown").await.expect("wake convoy"),
+            "Convoy/teardown woken"
+        );
+        assert_ne!(convoys.get("teardown").await.expect("updated convoy").metadata.resource_version, convoy.metadata.resource_version);
     }
 
     fn write_test_skill_sources(root: &Path) -> PathBuf {
