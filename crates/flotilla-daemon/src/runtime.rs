@@ -39,7 +39,7 @@ use flotilla_core::{
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
-    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
+    watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason,
@@ -1614,11 +1614,14 @@ fn spawn_convoy_ensure_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut watches = Vec::new();
+        match watch_resource_kind(&state.daemon.resource_backend(), &namespace, "Clone").await {
+            Ok(watch) => watches.push(watch.stream),
+            Err(error) => warn!(kind = "Clone", %error, "could not watch standing convoy admission trigger"),
+        }
         // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
         // renewed clone demand and ensure readmission can unblock work even
         // though their payloads are not part of the admission hash.
         for kind in [
-            "Clone",
             "Convoy",
             "ConvoyEnsure",
             "Project",
@@ -3775,7 +3778,13 @@ mod tests {
     async fn standing_ensure_dependency_changes_emit_wakes() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         for kind in ["Clone", "Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
-            let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
+            let mut watch = if kind == "Clone" {
+                watch_resource_kind(&backend, NAMESPACE, kind).await
+            } else {
+                watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await
+            }
+            .expect("dependency watch")
+            .stream;
             match kind {
                 "Clone" => {
                     let clones = backend.clone().using::<Clone>(NAMESPACE);
