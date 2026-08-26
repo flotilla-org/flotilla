@@ -1421,15 +1421,25 @@ async fn resolved_default_branch_dependency_change_retries_admission_before_dead
     assert_eq!(status.restart_count, 0);
     assert!(status.retry_at.is_some());
 
-    let repositories = backend.using::<Repository>("flotilla");
-    let repository = repositories.list().await.expect("repositories").items.into_iter().next().expect("repository");
-    repositories
-        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &flotilla_resources::RepositoryStatus {
-            default_branch: Some("main".to_string()),
-            ..Default::default()
-        })
+    let repository =
+        backend.using::<Repository>("flotilla").list().await.expect("repositories").items.into_iter().next().expect("repository");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source_repositories = source.using::<Repository>("flotilla");
+    let source_repository =
+        source_repositories.create(&test_meta(&repository.metadata.name), &repository.spec).await.expect("replica repository source");
+    source_repositories
+        .update_status(
+            &source_repository.metadata.name,
+            &source_repository.metadata.resource_version,
+            &flotilla_resources::RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+        )
         .await
-        .expect("resolve default branch");
+        .expect("resolve default branch on another root");
+    backend
+        .replica_writer::<Repository>(NodeId::new("readiness-root"), "flotilla")
+        .replace(&source_repositories.list().await.expect("repository source snapshot"), Utc::now())
+        .await
+        .expect("replicate resolved default branch");
 
     assert_eq!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("dependency change bypasses deadline"), vec![
         "started quartermaster@standing-project"

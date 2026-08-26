@@ -4945,14 +4945,21 @@ impl InProcessDaemon {
         };
         if let Some(project) = project {
             let repositories = self.resource_backend.clone().including_replicas::<Repository>(namespace);
+            let repository_sources = repositories.list_replica_sources().await.map_err(|error| error.to_string())?;
             for repository in &project.spec.repositories {
                 let name = repository.repo.to_string();
-                let version = repositories
-                    .get(&name)
-                    .await
-                    .map(|repository| repository.object.metadata.resource_version)
-                    .unwrap_or_else(|error| format!("absent:{error}"));
-                versions.insert(format!("Repository/{name}"), version);
+                let mut found = false;
+                for source in repository_sources.items.iter().filter(|source| source.object.metadata.name == name) {
+                    let provenance = match &source.provenance {
+                        ResourceProvenance::Local => "local".to_string(),
+                        ResourceProvenance::Replica { origin_root, .. } => format!("replica:{origin_root}"),
+                    };
+                    versions.insert(format!("Repository/{name}/{provenance}"), source.object.metadata.resource_version.clone());
+                    found = true;
+                }
+                if !found {
+                    versions.insert(format!("Repository/{name}"), "absent".to_string());
+                }
             }
         }
         let workflows = self.resource_backend.clone().definitions::<WorkflowTemplate>(namespace);

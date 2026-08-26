@@ -1614,22 +1614,20 @@ fn spawn_convoy_ensure_reconciler_task(
                     }
                 }
             }
-            match tokio::time::timeout(
+            let result = run_bounded_operation(
                 interval,
                 state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state),
-            )
-            .await
-            {
-                Ok(result) => {
-                    runtime_health.clear_convoy_ensure_timeout();
-                    match result {
-                        Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
-                        Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
-                    }
-                }
-                Err(_) => {
+                || {
                     runtime_health.report_convoy_ensure_timeout(interval);
                     warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
+                },
+            )
+            .await;
+            if let Some(result) = result {
+                runtime_health.clear_convoy_ensure_timeout();
+                match result {
+                    Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
+                    Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
                 }
             }
         }
@@ -1731,32 +1729,22 @@ where
     })
 }
 
-fn spawn_timed_periodic_task<Operation, OperationFuture, OnTimeout>(
-    interval: Duration,
-    start: PeriodicTaskStart,
+async fn run_bounded_operation<Output, OperationFuture, OnTimeout>(
     timeout: Duration,
-    mut operation: Operation,
-    mut on_timeout: OnTimeout,
-) -> JoinHandle<()>
+    operation: OperationFuture,
+    on_timeout: OnTimeout,
+) -> Option<Output>
 where
-    Operation: FnMut() -> OperationFuture + Send + 'static,
-    OperationFuture: Future<Output = ()> + Send + 'static,
-    OnTimeout: FnMut() + Send + 'static,
+    OperationFuture: Future<Output = Output>,
+    OnTimeout: FnOnce(),
 {
-    tokio::spawn(async move {
-        let start = match start {
-            PeriodicTaskStart::Immediate => tokio::time::Instant::now(),
-            PeriodicTaskStart::AfterInterval => tokio::time::Instant::now() + interval,
-        };
-        let mut ticker = tokio::time::interval_at(start, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if tokio::time::timeout(timeout, operation()).await.is_err() {
-                on_timeout();
-            }
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(output) => Some(output),
+        Err(_) => {
+            on_timeout();
+            None
         }
-    })
+    }
 }
 
 async fn apply_host_heartbeat_with_credentials(
@@ -7593,38 +7581,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_periodic_task_continues_after_a_blocked_pass() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let second_pass = Arc::new(Notify::new());
-        let task = spawn_timed_periodic_task(
-            Duration::from_millis(10),
-            PeriodicTaskStart::Immediate,
-            Duration::from_millis(20),
-            {
-                let attempts = Arc::clone(&attempts);
-                let second_pass = Arc::clone(&second_pass);
-                move || {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                    let second_pass = Arc::clone(&second_pass);
-                    async move {
-                        if attempt == 0 {
-                            std::future::pending().await
-                        } else {
-                            second_pass.notify_one();
-                        }
-                    }
-                }
-            },
-            || {},
-        );
+    async fn bounded_operation_releases_the_loop_after_a_blocked_pass() {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let first = run_bounded_operation(Duration::from_millis(20), std::future::pending::<()>(), {
+            let timed_out = Arc::clone(&timed_out);
+            move || timed_out.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(first.is_none());
+        assert!(timed_out.load(Ordering::SeqCst));
 
-        tokio::time::timeout(Duration::from_secs(1), second_pass.notified())
-            .await
-            .expect("a blocked pass must time out so a subsequent pass can run");
-        assert!(attempts.load(Ordering::SeqCst) >= 2);
-
-        task.abort();
-        let _ = task.await;
+        let second = run_bounded_operation(Duration::from_millis(20), async { 42 }, || panic!("completed pass must not time out")).await;
+        assert_eq!(second, Some(42), "a subsequent pass must run after the blocked pass times out");
     }
 
     #[tokio::test]
