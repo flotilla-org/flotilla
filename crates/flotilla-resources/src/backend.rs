@@ -208,8 +208,12 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if !self.suppress_self_origin {
             return self.list_sources().await;
         }
+        let listed = self.list_sources().await?;
+        self.suppress_shadowed_self_origin_sources(listed)
+    }
+
+    fn suppress_shadowed_self_origin_sources(&self, mut listed: ReadResourceList<T>) -> Result<ReadResourceList<T>, ResourceError> {
         let local_root = self.backend.local_root()?;
-        let mut listed = self.list_sources().await?;
         let local_names = listed
             .items
             .iter()
@@ -287,6 +291,20 @@ impl<T: Resource> ReplicaReadResolver<T> {
             })
         });
         Ok(ReadResourceList { items })
+    }
+
+    /// Lists every local and replicated source object without collapsing
+    /// same-name replicas behind the local object.
+    ///
+    /// Consumers that combine host-local status need the individual sources;
+    /// ordinary resource reads should continue to use [`Self::list`].
+    pub async fn list_replica_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
+        let listed = self.list_sources().await?;
+        if self.suppress_self_origin {
+            self.suppress_shadowed_self_origin_sources(listed)
+        } else {
+            Ok(listed)
+        }
     }
 
     pub async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {

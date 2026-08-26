@@ -388,6 +388,10 @@ pub async fn assert_local_authority_shadows_self_origin_replica_with_backend(bac
     assert!(matches!(visible.items[0].provenance, ResourceProvenance::Local));
     assert_eq!(visible.items[0].object.status.as_ref().and_then(|status| status.disk_free_bytes), Some(100 * 1024 * 1024 * 1024));
 
+    let sources = backend.including_replicas::<Host>("flotilla").list_replica_sources().await.expect("list source-preserving host view");
+    assert_eq!(sources.items.len(), 1, "source-preserving reads must also suppress a stale self-origin replica");
+    assert!(matches!(sources.items[0].provenance, ResourceProvenance::Local));
+
     let mut visible_watch = backend.including_replicas::<Host>("flotilla").watch().await.expect("watch converged host view");
     let stale = stale_hosts.get("local-host").await.expect("read stale self-origin host");
     backend

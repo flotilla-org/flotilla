@@ -7,7 +7,7 @@ use flotilla_resources::{
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
     EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, HostCondition,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy,
-    PlacementPolicySpec, Selector, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    PlacementPolicySpec, RepositoryStatus, Selector, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
     VirtualClock, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, AUTHORITY_LABEL, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL,
@@ -1464,7 +1464,7 @@ async fn changing_ensure_config_starts_a_fresh_retry_episode() {
 }
 
 #[tokio::test]
-async fn standing_ensure_admission_reads_project_and_repositories_from_root_replicas() {
+async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driver_root() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"root-b\"\n").expect("daemon config");
     let target = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1485,11 +1485,24 @@ async fn standing_ensure_admission_reads_project_and_repositories_from_root_repl
     let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     let repository_spec = RepositorySpec::remote("https://github.com/acme/cross-root").expect("repository spec");
     let repository_key = repository_spec.key();
-    source
+    let source_repository = source
         .using::<Repository>("flotilla")
         .create(&test_meta(&repository_key.to_string()), &repository_spec)
         .await
         .expect("source repository");
+    source
+        .using::<Repository>("flotilla")
+        .update_status(&source_repository.metadata.name, &source_repository.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("source default branch observation");
+    target
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("driver repository without a local status observation");
     source
         .definitions::<Project>("flotilla")
         .create(
@@ -1502,7 +1515,7 @@ async fn standing_ensure_admission_reads_project_and_repositories_from_root_repl
                     alias: None,
                     roles: BTreeSet::from([ProjectRepositoryRole::Code]),
                     subpath: None,
-                    default_branch: Some("main".to_string()),
+                    default_branch: None,
                 }])
                 .build(),
         )
@@ -1542,7 +1555,7 @@ async fn standing_ensure_admission_reads_project_and_repositories_from_root_repl
                 workflow_ref: "cross-root-workflow".to_string(),
                 placement_policy: None,
                 stance: Some(Stance::Trusted),
-                repositories: vec![repository_key],
+                repositories: vec![repository_key.clone()],
                 presents_as: None,
             },
         )
@@ -1579,6 +1592,32 @@ async fn standing_ensure_admission_reads_project_and_repositories_from_root_repl
         .next()
         .expect("admitted convoy on root B");
     assert_eq!(convoy.spec.project_ref.as_deref(), Some("cross-root-project"));
+
+    let conflicting_source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let conflicting_repository = conflicting_source
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("conflicting source repository");
+    conflicting_source
+        .using::<Repository>("flotilla")
+        .update_status(&conflicting_repository.metadata.name, &conflicting_repository.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("trunk".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("conflicting default branch observation");
+    target
+        .replica_writer::<Repository>(NodeId::new("root-c"), "flotilla")
+        .replace(&conflicting_source.using::<Repository>("flotilla").list().await.expect("conflicting repositories"), Utc::now())
+        .await
+        .expect("replicate conflicting repository status");
+
+    let error = daemon
+        .snapshot_project_repositories("flotilla", "cross-root-project", None)
+        .await
+        .expect_err("different non-driver observations must fail admission closed");
+    assert!(error.contains("conflicting observed default branches"), "unexpected readiness error: {error}");
 }
 
 #[tokio::test]
