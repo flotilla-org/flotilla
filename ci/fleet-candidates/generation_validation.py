@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -109,12 +110,28 @@ def validate_skill_source_paths(document):
                 (("git", "-C", str(checkout), "fetch", "--quiet", "--depth=1", "--filter=blob:none", "--no-tags", "origin", revision), None),
                 (("git", "-C", str(checkout), "checkout", "--quiet", "--detach", "FETCH_HEAD"), None),
             )
+            skipped = False
             for command, stdin in commands:
                 try:
                     subprocess.run(command, input=stdin, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 except subprocess.CalledProcessError as error:
                     detail = error.stderr.strip().splitlines()[-1] if error.stderr.strip() else "git command failed"
+                    # Ruled 2026-08-26: the candidates job is credential-free, so
+                    # sources requiring authentication cannot be verified here.
+                    # Skip them LOUDLY by name; credentialed verification belongs
+                    # to the rehearsal gate (#1804/#1805). Vessel staging remains
+                    # the enforcement point for these sources.
+                    if "could not read Username" in detail or "Authentication failed" in detail or "terminal prompts disabled" in detail:
+                        print(
+                            f"generation validation: SKIPPED unverifiable skill source {name} at {revision}: "
+                            f"requires authentication and this job is credential-free ({detail})",
+                            file=sys.stderr,
+                        )
+                        skipped = True
+                        break
                     raise ValidationError(f"skill source {name} at pinned revision {revision} could not be fetched: {detail}") from error
+            if skipped:
+                continue
             resolved = subprocess.run(("git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"), text=True,
                                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
             if resolved != revision:
