@@ -5733,6 +5733,7 @@ impl InProcessDaemon {
             .map(|project| project.object)
             .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
         let repositories = self.resource_backend.including_replicas::<Repository>(namespace);
+        let repository_sources = repositories.list_replica_sources().await.map_err(|error| error.to_string())?;
         let mut unresolved = Vec::new();
         let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
@@ -5756,7 +5757,22 @@ impl InProcessDaemon {
                             continue;
                         }
                     };
-                    let default_ref = entry.default_branch.clone().or_else(|| repository.status.as_ref()?.default_branch.clone());
+                    let observed_default_refs = repository_sources
+                        .items
+                        .iter()
+                        .filter(|source| source.object.metadata.name == entry.repo.to_string())
+                        .filter_map(|source| source.object.status.as_ref()?.default_branch.clone())
+                        .collect::<BTreeSet<_>>();
+                    let default_ref = if let Some(default_branch) = &entry.default_branch {
+                        Some(default_branch.clone())
+                    } else if observed_default_refs.len() == 1 {
+                        observed_default_refs.into_iter().next()
+                    } else {
+                        if observed_default_refs.len() > 1 {
+                            unresolved.push(format!("repository {} has conflicting observed default branches", entry.repo));
+                        }
+                        None
+                    };
                     let snapshot = snapshots
                         .entry(entry.repo.clone())
                         .or_insert_with(|| (url, repository.spec.clone(), default_ref.clone(), BTreeSet::new()));
