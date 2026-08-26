@@ -280,6 +280,7 @@ pub async fn create_ready_clone(
             default_branch: Some("main".to_string()),
             message: None,
             failed_at: None,
+            failure_policy: None,
         })
         .await
         .expect("clone status update should succeed");

@@ -22,6 +22,11 @@ pub enum ClonePhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloneFailurePolicy {
+    Terminal,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloneStatus {
     pub phase: ClonePhase,
@@ -31,6 +36,9 @@ pub struct CloneStatus {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_at: Option<DateTime<Utc>>,
+    /// Absent on legacy failures, which remain eligible for renewed-demand retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_policy: Option<CloneFailurePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,22 +56,26 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
                 status.phase = ClonePhase::Cloning;
                 status.message = None;
                 status.failed_at = None;
+                status.failure_policy = None;
             }
             Self::MarkRetrying { message } => {
                 status.phase = ClonePhase::Cloning;
                 status.message = Some(message.clone());
                 status.failed_at = None;
+                status.failure_policy = None;
             }
             Self::MarkReady { default_branch } => {
                 status.phase = ClonePhase::Ready;
                 status.default_branch = default_branch.clone();
                 status.message = None;
                 status.failed_at = None;
+                status.failure_policy = None;
             }
             Self::MarkFailed { message, failed_at } => {
                 status.phase = ClonePhase::Failed;
                 status.message = Some(message.clone());
                 status.failed_at = Some(*failed_at);
+                status.failure_policy = Some(CloneFailurePolicy::Terminal);
             }
         }
     }
