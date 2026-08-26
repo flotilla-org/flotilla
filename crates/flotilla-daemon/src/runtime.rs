@@ -3735,9 +3735,9 @@ mod tests {
             TransitionDriver, TransitionSequence, WorldBuilder,
         },
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec,
-        ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
-        CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, InMemoryBackend, LifecycleAuthority, MaterialPoolSpec,
+        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyRepositorySpec,
+        ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements,
+        CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, InMemoryBackend, LifecycleAuthority, MaterialPoolSpec,
         MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey,
         RepositorySpec, Resource, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalSession,
         TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement, VesselSpec,
@@ -3769,11 +3769,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convoy_and_workflow_template_changes_emit_ensure_dependency_wakes() {
+    async fn standing_ensure_dependency_changes_emit_wakes() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        for kind in ["Convoy", "WorkflowTemplate"] {
+        for kind in ["Clone", "Convoy", "ConvoyEnsure", "WorkflowTemplate"] {
             let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
             match kind {
+                "Clone" => {
+                    let clones = backend.clone().using::<Clone>(NAMESPACE);
+                    clones
+                        .create(&empty_meta("renewed-demand"), &CloneSpec {
+                            repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".to_string()),
+                            url: "https://github.com/flotilla-org/flotilla".to_string(),
+                            env_ref: "host-direct".to_string(),
+                            path: "/workspace".to_string(),
+                        })
+                        .await
+                        .expect("create renewed clone demand");
+                    watch.next().await.expect("watch should remain open").expect("clone create event");
+                    flotilla_resources::apply_status_patch(&clones, "renewed-demand", &flotilla_resources::CloneStatusPatch::MarkCloning)
+                        .await
+                        .expect("renew clone demand");
+                }
                 "Convoy" => {
                     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
                     convoys
@@ -3782,6 +3798,21 @@ mod tests {
                         .expect("create convoy");
                     watch.next().await.expect("watch should remain open").expect("convoy create event");
                     convoys.delete("standing").await.expect("delete convoy");
+                }
+                "ConvoyEnsure" => {
+                    backend
+                        .using::<ConvoyEnsure>(NAMESPACE)
+                        .create(
+                            &empty_meta("readmitted"),
+                            &ConvoyEnsureSpec::builder()
+                                .project_ref("project".to_string())
+                                .role("governor".to_string())
+                                .workflow_ref("workflow".to_string())
+                                .repositories(vec![RepositoryKey("github.com/flotilla-org/flotilla".to_string())])
+                                .build(),
+                        )
+                        .await
+                        .expect("create readmitted ensure");
                 }
                 "WorkflowTemplate" => {
                     let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
