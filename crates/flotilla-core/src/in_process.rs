@@ -5071,7 +5071,10 @@ impl InProcessDaemon {
             self.raise_ensure_attention(ensure, latest, &failure, Some(self.clock.now() + ENSURE_ESCALATION_AFTER)).await?;
             return Ok(Some(format!("ConvoyEnsure/{} exhausted restart budget", ensure.metadata.name)));
         }
-        if !resolved_escalation && consecutive_failures > 0 {
+        // `reconcile-now` is the operator's explicit acknowledgement that any
+        // missing backing records were deliberately wiped. Automatic passes
+        // still require positive death evidence before admitting a successor.
+        if !resolved_escalation && !force_now && consecutive_failures > 0 {
             let latest = latest.expect("a positive failure count requires a generation");
             backing_inspector.verify_backing_dead(latest).await?;
             let retry_at = latest.metadata.creation_timestamp + ensure_retry_delay(consecutive_failures - 1);
@@ -5269,7 +5272,9 @@ impl InProcessDaemon {
             status.hold_reason = None;
         }
         let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
-        if !operator_forced {
+        // A forced pass is the recovery boundary for recordless teardown: the
+        // operator has acknowledged that raw deletion destroyed the evidence.
+        if !operator_forced && !force_now {
             if let Err(reason) = backing_inspector.verify_backing_dead(&convoy).await {
                 let failure = format!("standing convoy teardown held: {reason}");
                 EventRecorder::new(self.resource_backend.clone())
