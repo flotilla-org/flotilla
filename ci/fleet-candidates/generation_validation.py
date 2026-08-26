@@ -111,9 +111,17 @@ def validate_skill_source_paths(document):
                 (("git", "-C", str(checkout), "checkout", "--quiet", "--detach", "FETCH_HEAD"), None),
             )
             skipped = False
+            # Non-interactive git everywhere: without this, an unauthenticated
+            # fetch of a private source FAILS FAST on Linux but HANGS on macOS
+            # (osxkeychain helper / terminal prompt), which stalled the Darwin
+            # candidate lane for 70 minutes on 2026-08-26. The skip path below
+            # only works if the failure is allowed to surface.
+            git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/usr/bin/false", GCM_INTERACTIVE="never")
             for command, stdin in commands:
+                if command[0] == "git":
+                    command = command[:1] + ("-c", "credential.helper=") + command[1:]
                 try:
-                    subprocess.run(command, input=stdin, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    subprocess.run(command, input=stdin, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env)
                 except subprocess.CalledProcessError as error:
                     detail = error.stderr.strip().splitlines()[-1] if error.stderr.strip() else "git command failed"
                     # Ruled 2026-08-26: the candidates job is credential-free, so
