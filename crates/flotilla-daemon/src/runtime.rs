@@ -40,15 +40,15 @@ use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, No
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
     watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
-    CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime,
-    CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource,
-    ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
-    MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
+    ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason,
+    ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
+    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy,
+    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
+    HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -144,7 +144,20 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 self.state.daemon.refresh_strict(&RepoSelector::Query(name.to_string())).await?;
                 Ok(format!("Repository/{name} refreshed"))
             }
-            _ => Err(format!("resource kind `{kind}` does not support reconcile-now; expected ConvoyEnsure, manifest-root, or Repository")),
+            "clone" | "clones" => {
+                let clones = self.state.daemon.resource_backend().using::<Clone>(namespace);
+                let clone = clones.get(name).await.map_err(|error| error.to_string())?;
+                if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready) {
+                    return Ok(format!("Clone/{name} is already ready"));
+                }
+                flotilla_resources::apply_status_patch(&clones, name, &flotilla_resources::CloneStatusPatch::MarkCloning)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(format!("Clone/{name} retry requested"))
+            }
+            _ => Err(format!(
+                "resource kind `{kind}` does not support reconcile-now; expected Clone, ConvoyEnsure, manifest-root, or Repository"
+            )),
         }
     }
 }

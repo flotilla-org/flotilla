@@ -125,7 +125,7 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
 }
 
 #[tokio::test]
-async fn clone_failure_from_the_current_checkout_attempt_is_reported_as_a_historical_dependency() {
+async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_attempt() {
     let backend = ResourceBackend::InMemory(Default::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     clones
@@ -161,11 +161,13 @@ async fn clone_failure_from_the_current_checkout_attempt_is_reported_as_a_histor
     let deps = reconciler.prepare(&checkout).await.expect("dependencies should load");
     let outcome = reconciler.reconcile(&checkout, &deps, failed_at);
 
+    assert!(outcome.patch.is_none());
     assert!(matches!(
-        outcome.patch,
-        Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message })
-            if message == format!("clone clone-a is Failed since {}: authentication failed", failed_at.to_rfc3339())
+        outcome.actuations.as_slice(),
+        [flotilla_resources::controller::Actuation::RetryClone { name, failed_at: observed_failed_at }]
+            if name == "clone-a" && *observed_failed_at == failed_at
     ));
+    assert!(outcome.requeue_after.is_some());
 }
 
 async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_path: &str) {

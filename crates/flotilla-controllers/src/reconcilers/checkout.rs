@@ -229,19 +229,7 @@ where
                 };
                 if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
                     let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    if failed_at <= obj.metadata.creation_timestamp {
-                        return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
-                    }
-                    let detail = clone
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.message.as_deref())
-                        .map_or(String::new(), |message| format!(": {message}"));
-                    return Ok(CheckoutPrepared::Failed(format!(
-                        "clone {} is Failed since {}{detail}",
-                        clone.metadata.name,
-                        failed_at.to_rfc3339()
-                    )));
+                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
                 }
                 if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
                     return Ok(CheckoutPrepared::Waiting);

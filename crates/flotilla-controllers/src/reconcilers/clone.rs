@@ -7,7 +7,7 @@ use flotilla_resources::{
     Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, RepositoryIdentity, ResourceError, ResourceObject, TypedResolver,
 };
 
-const CLONE_RETRY_AFTER: Duration = Duration::from_secs(1);
+const CLONE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait CloneRuntime: Send + Sync {
@@ -71,8 +71,7 @@ where
         };
         Ok(match result {
             Ok(default_branch) => ClonePrepared::Ready { default_branch },
-            Err(err) if phase == ClonePhase::Pending => ClonePrepared::Retrying(err),
-            Err(err) => ClonePrepared::Failed(err),
+            Err(err) => ClonePrepared::Retrying(err),
         })
     }
 

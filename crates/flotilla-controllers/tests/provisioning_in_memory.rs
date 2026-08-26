@@ -500,7 +500,7 @@ async fn clone_controller_marks_clone_ready() {
 }
 
 #[tokio::test]
-async fn new_checkout_demand_redrives_a_previously_failed_clone() {
+async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
@@ -518,8 +518,8 @@ async fn new_checkout_demand_redrives_a_previously_failed_clone() {
         .await
         .expect("clone create should succeed");
     apply_status_patch(&clones, &clone_name, &CloneStatusPatch::MarkFailed {
-        message: "destination path already exists and is not an empty directory".to_string(),
-        failed_at: Utc::now() - chrono::Duration::minutes(5),
+        message: "authentication failed: repository access denied".to_string(),
+        failed_at: Utc::now() - chrono::Duration::hours(15),
     })
     .await
     .expect("clone failure should apply");
