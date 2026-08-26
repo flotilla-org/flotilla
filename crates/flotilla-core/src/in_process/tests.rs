@@ -977,6 +977,15 @@ impl StandingConvoyBackingInspector for VerifiedDeadBacking {
     }
 }
 
+struct RecordlessBacking;
+
+#[async_trait]
+impl StandingConvoyBackingInspector for RecordlessBacking {
+    async fn verify_backing_dead(&self, _convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+        Err("no backing environment evidence is available".to_string())
+    }
+}
+
 async fn fail_ensured_generation(backend: &ResourceBackend, clock: &VirtualClock) -> String {
     let convoy_ref = backend
         .using::<ConvoyEnsure>("flotilla")
@@ -1099,6 +1108,55 @@ async fn reconcile_now_resets_backoff_and_admits_the_next_ensure_generation_imme
 }
 
 #[tokio::test]
+async fn reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ensure() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let failed_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("live generation");
+    let failed = convoys.get(&failed_ref).await.expect("generation");
+    convoys
+        .update_status(&failed_ref, &failed.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            provisioning: Some(ConvoyProvisioningState::Started { started_at: clock.now() }),
+            message: Some("clone failed before the work environment was provisioned".to_string()),
+            finished_at: Some(clock.now()),
+            ..Default::default()
+        })
+        .await
+        .expect("record clone-failed generation");
+
+    assert_eq!(
+        daemon
+            .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &RecordlessBacking)
+            .await
+            .expect("automatic reconcile holds when bypass deletion removed the backing records"),
+        vec!["ConvoyEnsure/quartermaster held for operator attention"]
+    );
+
+    let outcome = daemon
+        .reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking)
+        .await
+        .expect("reconcile-now acknowledges the record wipe");
+
+    assert_eq!(outcome, "started quartermaster@standing-project");
+    let generations = convoys.list().await.expect("standing generations").items;
+    assert_eq!(generations.len(), 2);
+    assert!(generations.iter().any(|convoy| convoy.metadata.name == failed_ref && convoy.spec.generation == 1));
+    assert!(generations.iter().any(|convoy| convoy.spec.generation == 2));
+    assert!(matches!(
+        backend.using::<ResourceDemand>("flotilla").get("ensure-attention-quartermaster").await,
+        Err(ResourceError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
@@ -1183,6 +1241,30 @@ async fn set_ensure_driver(backend: &ResourceBackend, driver_ref: &str) {
     let mut spec = ensure.spec;
     spec.driver_ref = Some(driver_ref.to_string());
     ensures.update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &spec).await.expect("set ensure driver");
+}
+
+#[tokio::test]
+async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_the_ensure() {
+    let (driver, backend, clock, _temp) = standing_ensure_fixture_for("udder", true).await;
+    let driver_id = driver.local_host_id().expect("driver host identity").to_string();
+    set_ensure_driver(&backend, &driver_id).await;
+    let ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("driver ensure");
+    driver.reconcile_driver_convoy_ensure("flotilla", &ensure, &RecordlessBacking, false).await.expect("initial driver admission");
+    fail_latest_ensured_generation(&backend, &clock).await;
+
+    let refusal = driver
+        .reconcile_driver_convoy_ensure("flotilla", &ensure, &RecordlessBacking, false)
+        .await
+        .expect_err("automatic driver reconcile must hold on missing backing evidence");
+    assert!(refusal.contains("no backing environment evidence is available"), "unexpected refusal: {refusal}");
+
+    let outcome = driver
+        .reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking)
+        .await
+        .expect("operator acknowledges the driver generation record wipe");
+
+    assert_eq!(outcome, "started quartermaster@standing-project");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("standing generations").items.len(), 2);
 }
 
 #[tokio::test]
