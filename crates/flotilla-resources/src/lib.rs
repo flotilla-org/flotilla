@@ -57,7 +57,7 @@ pub use checkout::{
 #[cfg(any(test, feature = "test-support"))]
 pub use clock::VirtualClock;
 pub use clock::{Clock, SystemClock};
-pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
+pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     bound_change_request_record_name, change_request_address, controller_patches, convoy_sanctions_checkout_reclaim,
     evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit,

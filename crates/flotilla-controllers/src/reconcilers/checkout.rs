@@ -8,9 +8,9 @@ use flotilla_core::checkout_integration::{
 use flotilla_resources::{
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition, LifecycleAuthority,
-    ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock, TypedResolver,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition,
+    LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
+    TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
 };
 use tracing::warn;
 
@@ -228,20 +228,16 @@ where
                     Err(err) => return Err(err),
                 };
                 if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
-                    if failed_at <= obj.metadata.creation_timestamp {
-                        return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
+                    if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
+                        let message = clone
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.message.clone())
+                            .unwrap_or_else(|| format!("clone {} failed validation", clone.metadata.name));
+                        return Ok(CheckoutPrepared::Failed(message));
                     }
-                    let detail = clone
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.message.as_deref())
-                        .map_or(String::new(), |message| format!(": {message}"));
-                    return Ok(CheckoutPrepared::Failed(format!(
-                        "clone {} is Failed since {}{detail}",
-                        clone.metadata.name,
-                        failed_at.to_rfc3339()
-                    )));
+                    let failed_at = clone.status.as_ref().and_then(|status| status.failed_at).unwrap_or(clone.metadata.creation_timestamp);
+                    return Ok(CheckoutPrepared::RetryClone { clone_name: clone.metadata.name, failed_at });
                 }
                 if clone.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
                     return Ok(CheckoutPrepared::Waiting);

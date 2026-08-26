@@ -33,9 +33,9 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_resources::{
-    apply_status_patch, canonicalize_repo_url, clone_key,
+    canonicalize_repo_url, clone_key,
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatusPatch,
+    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus,
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation,
     PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, Stance, StatusPatch,
@@ -500,7 +500,7 @@ async fn clone_controller_marks_clone_ready() {
 }
 
 #[tokio::test]
-async fn new_checkout_demand_redrives_a_previously_failed_clone() {
+async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_spec.key(), &repository_spec)
@@ -508,7 +508,7 @@ async fn new_checkout_demand_redrives_a_previously_failed_clone() {
         .expect("repository create should succeed");
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
     let clones = backend.clone().using::<Clone>(NAMESPACE);
-    clones
+    let failed_clone = clones
         .create(&controller_meta().name(&clone_name).call(), &CloneSpec {
             repo_ref: repository_spec.key(),
             url: "git@github.com:flotilla-org/flotilla.git".to_string(),
@@ -517,12 +517,16 @@ async fn new_checkout_demand_redrives_a_previously_failed_clone() {
         })
         .await
         .expect("clone create should succeed");
-    apply_status_patch(&clones, &clone_name, &CloneStatusPatch::MarkFailed {
-        message: "destination path already exists and is not an empty directory".to_string(),
-        failed_at: Utc::now() - chrono::Duration::minutes(5),
-    })
-    .await
-    .expect("clone failure should apply");
+    clones
+        .update_status(&clone_name, &failed_clone.metadata.resource_version, &CloneStatus {
+            phase: ClonePhase::Failed,
+            default_branch: None,
+            message: Some("authentication failed: repository access denied".to_string()),
+            failed_at: Some(Utc::now() - chrono::Duration::hours(15)),
+            failure_policy: None,
+        })
+        .await
+        .expect("legacy clone failure should apply");
 
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     checkouts

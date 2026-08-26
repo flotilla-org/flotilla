@@ -106,6 +106,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
             default_branch: Some("main".to_string()),
             message: None,
             failed_at: None,
+            failure_policy: None,
         })
         .await
         .expect("clone status");

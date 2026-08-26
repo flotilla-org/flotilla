@@ -111,7 +111,7 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
 }
 
 #[tokio::test]
-async fn clone_failure_retries_once_before_marking_failed() {
+async fn clone_failures_remain_retryable() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/private").expect("repository spec");
     let repository_key = repository_spec.key();
@@ -152,9 +152,9 @@ async fn clone_failure_retries_once_before_marking_failed() {
 
     assert!(matches!(
         repeated_outcome.patch,
-        Some(flotilla_resources::CloneStatusPatch::MarkFailed { message, .. }) if message == "authentication failed"
+        Some(flotilla_resources::CloneStatusPatch::MarkRetrying { message }) if message == "authentication failed"
     ));
-    assert!(repeated_outcome.requeue_after.is_none());
+    assert!(repeated_outcome.requeue_after.is_some());
 }
 
 #[tokio::test]
