@@ -232,6 +232,7 @@ impl PatchSink for UnixSocketSink {
         let write = write_http_like_frame(stream.as_mut().expect("wheelhouse stream is connected"), payload.as_bytes()).await;
         if let Err(initial_error) = write {
             warn!(%initial_error, socket = %self.path.display(), "wheelhouse stream ended; reconnecting and retrying patch");
+            *stream = None;
             let mut replacement = self.connect().await?;
             write_http_like_frame(&mut replacement, payload.as_bytes())
                 .await
@@ -471,5 +472,25 @@ done
         assert_eq!(second_body, second.to_pipe_payload().as_bytes(), "wheelhouse and zellij bodies must match");
         assert_eq!(serde_json::from_slice::<WireMessage>(&first_body).expect("parse first frame"), WireMessage::MetadataPatch(first));
         assert_eq!(serde_json::from_slice::<WireMessage>(&second_body).expect("parse second frame"), WireMessage::MetadataPatch(second));
+    }
+
+    #[tokio::test]
+    async fn unix_socket_sink_reconnects_and_retries_after_peer_closes_stream() {
+        let dir = flotilla_test_support::TestSocketDir::new();
+        let socket_path = dir.socket_path("manifest-reconnect.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let sink = UnixSocketSink::new(&socket_path);
+
+        let (stale, peer) = UnixStream::pair().expect("create stale connection");
+        *sink.stream.lock().await = Some(stale);
+        drop(peer);
+
+        let mut retried = stamp_patch();
+        retried.source_id = "retried-source".to_owned();
+        let (sent, accepted) = tokio::join!(sink.send(&retried), listener.accept());
+        sent.expect("retry patch through replacement connection");
+        let (stream, _) = accepted.expect("accept replacement connection");
+        let body = read_http_like_frame(&mut BufReader::new(stream)).await;
+        assert_eq!(body, retried.to_pipe_payload().as_bytes());
     }
 }
