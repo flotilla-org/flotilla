@@ -72,6 +72,7 @@ use crate::{
 /// wedge can hide in.
 const LIVENESS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
 const MANIFEST_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const CONVOY_ENSURE_CONDITION_TYPE: &str = "Controller/standing_convoy_ensure";
 const ENVIRONMENT_ADOPTION_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
@@ -291,6 +292,21 @@ impl RuntimeHealth {
                 failures.remove(CONDITION_TYPE);
             }
         }
+    }
+
+    fn report_convoy_ensure_timeout(&self, timeout: Duration) {
+        let condition = HostCondition::builder()
+            .condition_type(CONVOY_ENSURE_CONDITION_TYPE)
+            .value(ConditionValue::False)
+            .reason("ReconciliationPassTimedOut")
+            .message(format!("standing convoy ensure reconciliation exceeded its {timeout:?} pass timeout"))
+            .observed_at(Utc::now())
+            .build();
+        self.failures.lock().expect("runtime health lock poisoned").insert(CONVOY_ENSURE_CONDITION_TYPE.to_string(), condition);
+    }
+
+    fn clear_convoy_ensure_timeout(&self) {
+        self.failures.lock().expect("runtime health lock poisoned").remove(CONVOY_ENSURE_CONDITION_TYPE);
     }
 
     async fn conditions(&self) -> Vec<HostCondition> {
@@ -545,6 +561,7 @@ impl DaemonRuntime {
                 Arc::clone(&state),
                 options.namespace.clone(),
                 options.controller_resync_interval,
+                runtime_health.clone(),
             ));
             tasks.push(spawn_provisioned_environment_reconciliation_task(
                 Arc::clone(&state),
@@ -1516,16 +1533,39 @@ fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: Strin
     })
 }
 
-fn spawn_convoy_ensure_reconciler_task(state: Arc<ControllerRuntimeState>, namespace: String, interval: Duration) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let state = Arc::clone(&state);
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await {
-                warn!(%error, "standing convoy ensure reconciliation pass failed");
+fn spawn_convoy_ensure_reconciler_task(
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+    interval: Duration,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    let timeout_health = runtime_health.clone();
+    spawn_timed_periodic_task(
+        interval,
+        PeriodicTaskStart::Immediate,
+        interval,
+        move || {
+            let state = Arc::clone(&state);
+            let namespace = namespace.clone();
+            let runtime_health = runtime_health.clone();
+            async move {
+                let result = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await;
+                runtime_health.clear_convoy_ensure_timeout();
+                match result {
+                    Ok(changes) => {
+                        info!(changes = changes.len(), "standing convoy ensure reconciler alive");
+                    }
+                    Err(error) => {
+                        warn!(%error, "standing convoy ensure reconciliation pass failed");
+                    }
+                }
             }
-        }
-    })
+        },
+        move || {
+            timeout_health.report_convoy_ensure_timeout(interval);
+            warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
+        },
+    )
 }
 
 fn spawn_projection_parity_task(
@@ -1619,6 +1659,34 @@ where
         loop {
             ticker.tick().await;
             operation().await;
+        }
+    })
+}
+
+fn spawn_timed_periodic_task<Operation, OperationFuture, OnTimeout>(
+    interval: Duration,
+    start: PeriodicTaskStart,
+    timeout: Duration,
+    mut operation: Operation,
+    mut on_timeout: OnTimeout,
+) -> JoinHandle<()>
+where
+    Operation: FnMut() -> OperationFuture + Send + 'static,
+    OperationFuture: Future<Output = ()> + Send + 'static,
+    OnTimeout: FnMut() + Send + 'static,
+{
+    tokio::spawn(async move {
+        let start = match start {
+            PeriodicTaskStart::Immediate => tokio::time::Instant::now(),
+            PeriodicTaskStart::AfterInterval => tokio::time::Instant::now() + interval,
+        };
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if tokio::time::timeout(timeout, operation()).await.is_err() {
+                on_timeout();
+            }
         }
     })
 }
@@ -7454,6 +7522,55 @@ mod tests {
         assert_eq!(conditions[0].condition_type, format!("Controller/{}", Checkout::API_PATHS.kind));
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
         assert!(conditions[0].message.contains("root-owned debris"));
+    }
+
+    #[tokio::test]
+    async fn timed_periodic_task_continues_after_a_blocked_pass() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let second_pass = Arc::new(Notify::new());
+        let task = spawn_timed_periodic_task(
+            Duration::from_millis(10),
+            PeriodicTaskStart::Immediate,
+            Duration::from_millis(20),
+            {
+                let attempts = Arc::clone(&attempts);
+                let second_pass = Arc::clone(&second_pass);
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let second_pass = Arc::clone(&second_pass);
+                    async move {
+                        if attempt == 0 {
+                            std::future::pending().await
+                        } else {
+                            second_pass.notify_one();
+                        }
+                    }
+                }
+            },
+            || {},
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), second_pass.notified())
+            .await
+            .expect("a blocked pass must time out so a subsequent pass can run");
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn convoy_ensure_timeout_degrades_runtime_health_until_recovery() {
+        let runtime_health = RuntimeHealth::default();
+        runtime_health.report_convoy_ensure_timeout(Duration::from_secs(60));
+
+        let conditions = runtime_health.conditions().await;
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].condition_type, CONVOY_ENSURE_CONDITION_TYPE);
+        assert_eq!(conditions[0].reason, "ReconciliationPassTimedOut");
+
+        runtime_health.clear_convoy_ensure_timeout();
+        assert!(runtime_health.conditions().await.is_empty(), "a completed pass should restore fleet health");
     }
 
     async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
