@@ -3775,11 +3775,13 @@ mod tests {
             let mut watch = watch_resource_kind_including_replicas(&backend, NAMESPACE, kind).await.expect("dependency watch").stream;
             match kind {
                 "Convoy" => {
-                    backend
-                        .using::<Convoy>(NAMESPACE)
+                    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+                    convoys
                         .create(&empty_meta("standing"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
                         .await
                         .expect("create convoy");
+                    watch.next().await.expect("watch should remain open").expect("convoy create event");
+                    convoys.delete("standing").await.expect("delete convoy");
                 }
                 "WorkflowTemplate" => {
                     let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
