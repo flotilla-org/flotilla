@@ -7,7 +7,7 @@ use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use async_trait::async_trait;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncWrite, AsyncWriteExt},
     net::UnixStream,
     process::{Child, ChildStdin, Command},
     sync::Mutex,
@@ -20,6 +20,17 @@ const BLOCKED_WRITE_WARNING_AFTER: Duration = Duration::from_secs(5);
 const RESPAWN_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESPAWN_STABLE_AFTER: Duration = Duration::from_secs(5);
+const PATCH_CONTENT_TYPE: &str = "application/json";
+
+fn patch_payload(patch: &MetadataPatch) -> String {
+    patch.to_pipe_payload()
+}
+
+async fn write_http_like_frame(writer: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> std::io::Result<()> {
+    writer.write_all(format!("Content-Length: {}\r\nContent-Type: {PATCH_CONTENT_TYPE}\r\n\r\n", payload.len()).as_bytes()).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await
+}
 
 #[async_trait]
 pub trait PatchSink: Send + Sync {
@@ -163,7 +174,7 @@ impl ZellijPipeSink {
 #[async_trait]
 impl PatchSink for ZellijPipeSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
-        let mut payload = patch.to_pipe_payload();
+        let mut payload = patch_payload(patch);
         payload.push('\n');
 
         let mut state = self.state.lock().await;
@@ -191,28 +202,44 @@ impl PatchSink for ZellijPipeSink {
     }
 }
 
-/// Sends patches as newline-delimited wire messages over a unix socket —
-/// the wheelhouse transport. The listener side is Leg 3 of the manifest
-/// extraction convoy; the framing here is flotilla's proposal until that
-/// contract lands.
+/// Streams patches over one wheelhouse unix-socket connection. Frames use
+/// HTTP-like `Content-Length` headers so the JSON body is byte-for-byte the
+/// same metadata-patch payload delivered to andamento through zellij.
 pub struct UnixSocketSink {
     path: PathBuf,
+    stream: Mutex<Option<UnixStream>>,
 }
 
 impl UnixSocketSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        UnixSocketSink { path: path.into() }
+        UnixSocketSink { path: path.into(), stream: Mutex::new(None) }
+    }
+
+    async fn connect(&self) -> Result<UnixStream, String> {
+        UnixStream::connect(&self.path).await.map_err(|error| format!("connect {}: {error}", self.path.display()))
     }
 }
 
 #[async_trait]
 impl PatchSink for UnixSocketSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
-        let mut stream = UnixStream::connect(&self.path).await.map_err(|error| format!("connect {}: {error}", self.path.display()))?;
-        let mut payload = patch.to_pipe_payload();
-        payload.push('\n');
-        stream.write_all(payload.as_bytes()).await.map_err(|error| format!("write {}: {error}", self.path.display()))?;
-        stream.flush().await.map_err(|error| format!("flush {}: {error}", self.path.display()))
+        let payload = patch_payload(patch);
+        let mut stream = self.stream.lock().await;
+        if stream.is_none() {
+            *stream = Some(self.connect().await?);
+        }
+
+        let write = write_http_like_frame(stream.as_mut().expect("wheelhouse stream is connected"), payload.as_bytes()).await;
+        if let Err(initial_error) = write {
+            warn!(%initial_error, socket = %self.path.display(), "wheelhouse stream ended; reconnecting and retrying patch");
+            *stream = None;
+            let mut replacement = self.connect().await?;
+            write_http_like_frame(&mut replacement, payload.as_bytes())
+                .await
+                .map_err(|error| format!("write {} after reconnect: {error} (initial error: {initial_error})", self.path.display()))?;
+            *stream = Some(replacement);
+        }
+        Ok(())
     }
 }
 
@@ -221,7 +248,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
     use tokio::{
-        io::{AsyncBufReadExt, BufReader},
+        io::{AsyncBufReadExt, AsyncReadExt, BufReader},
         net::UnixListener,
     };
 
@@ -406,21 +433,64 @@ done
         assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
     }
 
+    async fn read_http_like_frame(reader: &mut BufReader<UnixStream>) -> Vec<u8> {
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read frame header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = Some(value.trim().parse::<usize>().expect("content length"));
+            }
+        }
+        let mut body = vec![0; content_length.expect("content-length header")];
+        reader.read_exact(&mut body).await.expect("read frame body");
+        body
+    }
+
     #[tokio::test]
-    async fn unix_socket_sink_writes_one_wire_message_per_line() {
+    async fn unix_socket_sink_streams_http_like_frames_with_zellij_payloads() {
         let dir = flotilla_test_support::TestSocketDir::new();
         let socket_path = dir.socket_path("manifest.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind test socket");
 
-        let patch = stamp_patch();
+        let first = stamp_patch();
+        let mut second = stamp_patch();
+        second.source_id = "second-source".to_owned();
         let sink = UnixSocketSink::new(&socket_path);
-        let (sent, accepted) = tokio::join!(sink.send(&patch), listener.accept());
-        sent.expect("send over unix socket");
+        let (sent, accepted) = tokio::join!(sink.send(&first), listener.accept());
+        sent.expect("send first patch over unix socket");
         let (stream, _) = accepted.expect("accept");
+        sink.send(&second).await.expect("send second patch over existing connection");
 
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).await.expect("read line");
-        let message: WireMessage = serde_json::from_str(line.trim_end()).expect("parse wire message");
-        assert_eq!(message, WireMessage::MetadataPatch(patch));
+        let mut reader = BufReader::new(stream);
+        let first_body = read_http_like_frame(&mut reader).await;
+        let second_body = read_http_like_frame(&mut reader).await;
+        assert_eq!(first_body, first.to_pipe_payload().as_bytes(), "wheelhouse and zellij bodies must match");
+        assert_eq!(second_body, second.to_pipe_payload().as_bytes(), "wheelhouse and zellij bodies must match");
+        assert_eq!(serde_json::from_slice::<WireMessage>(&first_body).expect("parse first frame"), WireMessage::MetadataPatch(first));
+        assert_eq!(serde_json::from_slice::<WireMessage>(&second_body).expect("parse second frame"), WireMessage::MetadataPatch(second));
+    }
+
+    #[tokio::test]
+    async fn unix_socket_sink_reconnects_and_retries_after_peer_closes_stream() {
+        let dir = flotilla_test_support::TestSocketDir::new();
+        let socket_path = dir.socket_path("manifest-reconnect.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let sink = UnixSocketSink::new(&socket_path);
+
+        let (stale, peer) = UnixStream::pair().expect("create stale connection");
+        *sink.stream.lock().await = Some(stale);
+        drop(peer);
+
+        let mut retried = stamp_patch();
+        retried.source_id = "retried-source".to_owned();
+        let (sent, accepted) = tokio::join!(sink.send(&retried), listener.accept());
+        sent.expect("retry patch through replacement connection");
+        let (stream, _) = accepted.expect("accept replacement connection");
+        let body = read_http_like_frame(&mut BufReader::new(stream)).await;
+        assert_eq!(body, retried.to_pipe_payload().as_bytes());
     }
 }
