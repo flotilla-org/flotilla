@@ -736,6 +736,11 @@ pub enum CommandAction {
         name: String,
         resolution: ManifestResolution,
     },
+    ResourceReconcileNow {
+        namespace: String,
+        kind: String,
+        name: String,
+    },
     ResourceStatusPatch {
         namespace: String,
         kind: String,
@@ -855,6 +860,7 @@ impl Command {
                 ManifestResolution::Sync => "sync manifest resource",
                 ManifestResolution::Adopt => "adopt manifest resource",
             },
+            CommandAction::ResourceReconcileNow { .. } => "reconcile resource now",
             CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
@@ -903,6 +909,11 @@ impl AttachBinding {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
+    ResourceReconciled {
+        resource_kind: String,
+        name: String,
+        message: String,
+    },
     ConvoyBriefDelivered {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         displaced: Option<String>,

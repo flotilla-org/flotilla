@@ -24,7 +24,7 @@ use flotilla_core::{
     },
     config::ConfigStore,
     demand_lifecycle::DemandLifecycle,
-    in_process::{InProcessDaemon, StandingConvoyBackingInspector},
+    in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
@@ -36,20 +36,21 @@ use flotilla_core::{
         ChannelLabel, CommandRunner,
     },
 };
-use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, Rows, TerminalStatus};
+use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, ChangeRequest,
-    ChangeRequestStatus, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy,
-    ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
-    DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
-    EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
-    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
-    ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
+    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
+    CheckoutIntegrationStatus, Clone, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime,
+    CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason, ForgeIdentity, Host, HostCondition,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource,
+    ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
     CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
     MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
+use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -105,6 +106,47 @@ struct DaemonConvoyTeardownRuntime {
 struct ReclaimRefusal {
     error: String,
     attempts: u64,
+}
+
+struct RuntimeOperatorReconciler {
+    state: Arc<ControllerRuntimeState>,
+    manifests: Option<flotilla_core::config::ResourceManifestsConfig>,
+    local_root: String,
+}
+
+#[async_trait]
+impl OperatorReconciler for RuntimeOperatorReconciler {
+    async fn reconcile_now(&self, namespace: &str, kind: &str, name: &str) -> Result<String, String> {
+        let normalized = kind.to_ascii_lowercase().replace(['_', '-'], "");
+        match normalized.as_str() {
+            "convoyensure" | "convoyensures" => self.state.daemon.reconcile_convoy_ensure_now(namespace, name, &*self.state).await,
+            "manifest" | "manifestroot" | "manifestroots" => {
+                let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
+                if manifests.reconciler_root != name {
+                    return Err(format!("manifest root `{name}` does not match configured root `{}`", manifests.reconciler_root));
+                }
+                if manifests.reconciler_root != self.local_root {
+                    return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));
+                }
+                let mut reconciler =
+                    ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
+                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
+                let report = reconciler.reconcile_once().await?;
+                Ok(format!(
+                    "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
+                    report.created,
+                    report.updated,
+                    report.unchanged,
+                    report.errors.len()
+                ))
+            }
+            "repository" | "repositories" | "repo" => {
+                self.state.daemon.refresh_strict(&RepoSelector::Query(name.to_string())).await?;
+                Ok(format!("Repository/{name} refreshed"))
+            }
+            _ => Err(format!("resource kind `{kind}` does not support reconcile-now; expected ConvoyEnsure, manifest-root, or Repository")),
+        }
+    }
 }
 
 impl DaemonConvoyTeardownRuntime {
@@ -518,7 +560,7 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ];
-        if let Some(manifests) = manifests {
+        if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
                     daemon.resource_backend(),
@@ -543,7 +585,7 @@ impl DaemonRuntime {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
-                    daemon,
+                    Arc::clone(&daemon),
                     config,
                     local_registry,
                     daemon_socket_path.map(DaemonHostPath::new),
@@ -554,6 +596,13 @@ impl DaemonRuntime {
                 .with_credential_store(credential_store)
                 .with_agent_material(agent_material),
             );
+            daemon
+                .set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
+                    state: Arc::clone(&state),
+                    manifests,
+                    local_root: profile.host_id.clone(),
+                }))
+                .await;
             if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
                 warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
             }
@@ -1539,33 +1588,50 @@ fn spawn_convoy_ensure_reconciler_task(
     interval: Duration,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
-    let timeout_health = runtime_health.clone();
-    spawn_timed_periodic_task(
-        interval,
-        PeriodicTaskStart::Immediate,
-        interval,
-        move || {
-            let state = Arc::clone(&state);
-            let namespace = namespace.clone();
-            let runtime_health = runtime_health.clone();
-            async move {
-                let result = state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state).await;
-                runtime_health.clear_convoy_ensure_timeout();
-                match result {
-                    Ok(changes) => {
-                        info!(changes = changes.len(), "standing convoy ensure reconciler alive");
+    tokio::spawn(async move {
+        let mut watches = Vec::new();
+        for kind in ["Project", "Repository", "WorkflowTemplate", "PlacementPolicy", "CredentialGrant", "CredentialSpec", "Host"] {
+            match watch_resource_kind_including_replicas(&state.daemon.resource_backend(), &namespace, kind).await {
+                Ok(watch) => watches.push(watch.stream),
+                Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
+            }
+        }
+        let mut dependency_events = futures::stream::select_all(watches);
+        let mut resync = tokio::time::interval(interval);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = resync.tick() => {}
+                event = dependency_events.next(), if !dependency_events.is_empty() => {
+                    if let Some(Err(error)) = event {
+                        warn!(%error, "standing convoy admission dependency watch failed");
                     }
-                    Err(error) => {
-                        warn!(%error, "standing convoy ensure reconciliation pass failed");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while let Some(Some(event)) = dependency_events.next().now_or_never() {
+                        if let Err(error) = event {
+                            warn!(%error, "standing convoy admission dependency watch failed");
+                        }
                     }
                 }
             }
-        },
-        move || {
-            timeout_health.report_convoy_ensure_timeout(interval);
-            warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
-        },
-    )
+            let result = run_bounded_operation(
+                interval,
+                state.daemon.reconcile_convoy_ensures_once_with_backing_inspector(&namespace, &*state),
+                || {
+                    runtime_health.report_convoy_ensure_timeout(interval);
+                    warn!(timeout_secs = interval.as_secs(), "standing convoy ensure reconciliation pass timed out");
+                },
+            )
+            .await;
+            if let Some(result) = result {
+                runtime_health.clear_convoy_ensure_timeout();
+                match result {
+                    Ok(changes) => info!(changes = changes.len(), "standing convoy ensure reconciler alive"),
+                    Err(error) => warn!(%error, "standing convoy ensure reconciliation pass failed"),
+                }
+            }
+        }
+    })
 }
 
 fn spawn_projection_parity_task(
@@ -1663,32 +1729,22 @@ where
     })
 }
 
-fn spawn_timed_periodic_task<Operation, OperationFuture, OnTimeout>(
-    interval: Duration,
-    start: PeriodicTaskStart,
+async fn run_bounded_operation<Output, OperationFuture, OnTimeout>(
     timeout: Duration,
-    mut operation: Operation,
-    mut on_timeout: OnTimeout,
-) -> JoinHandle<()>
+    operation: OperationFuture,
+    on_timeout: OnTimeout,
+) -> Option<Output>
 where
-    Operation: FnMut() -> OperationFuture + Send + 'static,
-    OperationFuture: Future<Output = ()> + Send + 'static,
-    OnTimeout: FnMut() + Send + 'static,
+    OperationFuture: Future<Output = Output>,
+    OnTimeout: FnOnce(),
 {
-    tokio::spawn(async move {
-        let start = match start {
-            PeriodicTaskStart::Immediate => tokio::time::Instant::now(),
-            PeriodicTaskStart::AfterInterval => tokio::time::Instant::now() + interval,
-        };
-        let mut ticker = tokio::time::interval_at(start, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if tokio::time::timeout(timeout, operation()).await.is_err() {
-                on_timeout();
-            }
+    match tokio::time::timeout(timeout, operation).await {
+        Ok(output) => Some(output),
+        Err(_) => {
+            on_timeout();
+            None
         }
-    })
+    }
 }
 
 async fn apply_host_heartbeat_with_credentials(
@@ -7525,38 +7581,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_periodic_task_continues_after_a_blocked_pass() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let second_pass = Arc::new(Notify::new());
-        let task = spawn_timed_periodic_task(
-            Duration::from_millis(10),
-            PeriodicTaskStart::Immediate,
-            Duration::from_millis(20),
-            {
-                let attempts = Arc::clone(&attempts);
-                let second_pass = Arc::clone(&second_pass);
-                move || {
-                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                    let second_pass = Arc::clone(&second_pass);
-                    async move {
-                        if attempt == 0 {
-                            std::future::pending().await
-                        } else {
-                            second_pass.notify_one();
-                        }
-                    }
-                }
-            },
-            || {},
-        );
+    async fn bounded_operation_releases_the_loop_after_a_blocked_pass() {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let first = run_bounded_operation(Duration::from_millis(20), std::future::pending::<()>(), {
+            let timed_out = Arc::clone(&timed_out);
+            move || timed_out.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(first.is_none());
+        assert!(timed_out.load(Ordering::SeqCst));
 
-        tokio::time::timeout(Duration::from_secs(1), second_pass.notified())
-            .await
-            .expect("a blocked pass must time out so a subsequent pass can run");
-        assert!(attempts.load(Ordering::SeqCst) >= 2);
-
-        task.abort();
-        let _ = task.await;
+        let second = run_bounded_operation(Duration::from_millis(20), async { 42 }, || panic!("completed pass must not time out")).await;
+        assert_eq!(second, Some(42), "a subsequent pass must run after the blocked pass times out");
     }
 
     #[tokio::test]

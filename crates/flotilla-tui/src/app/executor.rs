@@ -128,6 +128,7 @@ pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, a
 pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
         CommandValue::Ok
+        | CommandValue::ResourceReconciled { .. }
         | CommandValue::ConvoyBriefDelivered { .. }
         | CommandValue::ConvoyBriefQueued { .. }
         | CommandValue::ConvoyBriefWithdrawn { .. } => {}
