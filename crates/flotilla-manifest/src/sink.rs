@@ -3,10 +3,9 @@
 //! Per the manifest architecture, producers swap only their send function —
 //! the same projection drives zellij (CLI pipe) and wheelhouse (unix socket).
 
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use async_trait::async_trait;
-use rustls::{crypto::ring, ClientConfig, RootCertStore};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, ChildStdin, Command},
@@ -17,6 +16,7 @@ use tracing::warn;
 use crate::{keys::APPLY_METADATA_PATCH_PIPE, wire::MetadataPatch};
 
 const BLOCKED_WRITE_WARNING_AFTER: Duration = Duration::from_secs(5);
+const HTTP_RETRY_DELAY: Duration = Duration::from_millis(500);
 const RESPAWN_INITIAL_DELAY: Duration = Duration::from_millis(500);
 const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
 const RESPAWN_STABLE_AFTER: Duration = Duration::from_secs(5);
@@ -200,15 +200,7 @@ pub struct UnixSocketSink {
 
 impl UnixSocketSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        // Workspace feature unification enables Rustls in reqwest even for this
-        // HTTP-only client. Supply its provider explicitly without global state.
-        let tls = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("supported TLS versions")
-            .with_root_certificates(RootCertStore::empty())
-            .with_no_client_auth();
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
+        let client = flotilla_resources::tls::client_builder()
             .unix_socket(path.into())
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))
@@ -248,7 +240,7 @@ impl PatchSink for UnixSocketSink {
                 return Err(error);
             }
             warn!(%error, "retrying Wheelhouse metadata patch");
-            tokio::time::sleep(RESPAWN_INITIAL_DELAY).await;
+            tokio::time::sleep(HTTP_RETRY_DELAY).await;
         }
         unreachable!("two attempts return a result")
     }

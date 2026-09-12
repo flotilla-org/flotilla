@@ -6,10 +6,10 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-reqwest = { workspace = true }
-rustls = { workspace = true }
 bon = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"] }
