@@ -3,12 +3,12 @@
 //! Per the manifest architecture, producers swap only their send function —
 //! the same projection drives zellij (CLI pipe) and wheelhouse (unix socket).
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use rustls::{crypto::ring, ClientConfig, RootCertStore};
 use tokio::{
     io::AsyncWriteExt,
-    net::UnixStream,
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
@@ -191,28 +191,66 @@ impl PatchSink for ZellijPipeSink {
     }
 }
 
-/// Sends patches as newline-delimited wire messages over a unix socket —
-/// the wheelhouse transport. The listener side is Leg 3 of the manifest
-/// extraction convoy; the framing here is flotilla's proposal until that
-/// contract lands.
+/// Wheelhouse's HTTP/UDS metadata endpoint. The payload is shared with Zellij.
+/// Contract: wheelhouse/docs/protocol/pm-connect.md (wheelhouse #22).
 pub struct UnixSocketSink {
-    path: PathBuf,
+    client: Result<reqwest::Client, String>,
+    serial: Mutex<()>,
 }
 
 impl UnixSocketSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        UnixSocketSink { path: path.into() }
+        // Workspace feature unification enables Rustls in reqwest even for this
+        // HTTP-only client. Supply its provider explicitly without global state.
+        let tls = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("supported TLS versions")
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .unix_socket(path.into())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(6))
+            .build()
+            .map_err(|error| format!("build Wheelhouse HTTP client: {error}"));
+        Self { client, serial: Mutex::new(()) }
     }
 }
 
 #[async_trait]
 impl PatchSink for UnixSocketSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
-        let mut stream = UnixStream::connect(&self.path).await.map_err(|error| format!("connect {}: {error}", self.path.display()))?;
-        let mut payload = patch.to_pipe_payload();
-        payload.push('\n');
-        stream.write_all(payload.as_bytes()).await.map_err(|error| format!("write {}: {error}", self.path.display()))?;
-        stream.flush().await.map_err(|error| format!("flush {}: {error}", self.path.display()))
+        let _serial = self.serial.lock().await;
+        let client = self.client.as_ref().map_err(Clone::clone)?;
+        let payload = patch.to_pipe_payload();
+        for attempt in 0..2 {
+            let response = client
+                .post("http://localhost/v1/metadata/patch")
+                .header("content-type", "application/json")
+                .body(payload.clone())
+                .send()
+                .await;
+            let error = match response {
+                Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => return Ok(()),
+                Ok(response) => {
+                    let status = response.status();
+                    let error = format!("Wheelhouse metadata POST returned {status}");
+                    if !status.is_server_error() {
+                        return Err(error);
+                    }
+                    error
+                }
+                Err(error) => format!("Wheelhouse metadata POST: {error}"),
+            };
+            if attempt == 1 {
+                return Err(error);
+            }
+            warn!(%error, "retrying Wheelhouse metadata patch");
+            tokio::time::sleep(RESPAWN_INITIAL_DELAY).await;
+        }
+        unreachable!("two attempts return a result")
     }
 }
 
@@ -220,15 +258,12 @@ impl PatchSink for UnixSocketSink {
 mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
-    use tokio::{
-        io::{AsyncBufReadExt, BufReader},
-        net::UnixListener,
-    };
+    use tokio::net::UnixListener;
 
     use super::*;
     use crate::{
         keys::SOURCE_ATTACH,
-        wire::{MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget, WireMessage},
+        wire::{MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
     };
 
     fn stamp_patch() -> MetadataPatch {
@@ -406,21 +441,70 @@ done
         assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
     }
 
-    #[tokio::test]
-    async fn unix_socket_sink_writes_one_wire_message_per_line() {
+    async fn http_sink_case(statuses: Vec<axum::http::StatusCode>, disconnect: bool) -> (Result<(), String>, Vec<Vec<u8>>) {
+        use std::{collections::VecDeque, sync::Arc};
+
+        use axum::{body::Bytes, extract::State, routing::post, Router};
+        type Calls = Arc<Mutex<(VecDeque<axum::http::StatusCode>, Vec<Vec<u8>>)>>;
+        async fn receive(State(calls): State<Calls>, body: Bytes) -> axum::http::StatusCode {
+            let mut calls = calls.lock().await;
+            calls.1.push(body.to_vec());
+            calls.0.pop_front().expect("expected request count")
+        }
         let dir = flotilla_test_support::TestSocketDir::new();
-        let socket_path = dir.socket_path("manifest.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+        let path = dir.socket_path("manifest.sock");
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let calls: Calls = Arc::new(Mutex::new((statuses.into(), Vec::new())));
+        let app = Router::new().route("/v1/metadata/patch", post(receive)).with_state(Arc::clone(&calls));
+        let server = tokio::spawn(async move {
+            if disconnect {
+                use tokio::io::AsyncReadExt;
+                let (mut stream, _) = listener.accept().await.expect("first connection");
+                let mut bytes = [0; 4096];
+                let received = stream.read(&mut bytes).await.expect("read before lost acknowledgement");
+                assert!(received > 0);
+                drop(stream);
+            }
+            axum::serve(listener, app).await.expect("HTTP server");
+        });
+        let result = UnixSocketSink::new(&path).send(&stamp_patch()).await;
+        server.abort();
+        let bodies = calls.lock().await.1.clone();
+        (result, bodies)
+    }
 
-        let patch = stamp_patch();
-        let sink = UnixSocketSink::new(&socket_path);
-        let (sent, accepted) = tokio::join!(sink.send(&patch), listener.accept());
-        sent.expect("send over unix socket");
-        let (stream, _) = accepted.expect("accept");
+    #[tokio::test]
+    async fn unix_socket_sink_uses_http_and_preserves_shared_payload() {
+        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::NO_CONTENT], false).await;
+        result.expect("acknowledged patch");
+        assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
+    }
 
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).await.expect("read line");
-        let message: WireMessage = serde_json::from_str(line.trim_end()).expect("parse wire message");
-        assert_eq!(message, WireMessage::MetadataPatch(patch));
+    #[tokio::test]
+    async fn unix_socket_sink_retries_transient_response_with_identical_patch() {
+        let (result, bodies) =
+            http_sink_case(vec![axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::http::StatusCode::NO_CONTENT], false).await;
+        result.expect("retry succeeds");
+        assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes(); 2]);
+    }
+
+    #[tokio::test]
+    async fn unix_socket_sink_does_not_retry_invalid_patch() {
+        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::UNPROCESSABLE_ENTITY], false).await;
+        assert!(result.expect_err("rejected patch").contains("422"));
+        assert_eq!(bodies.len(), 1);
+    }
+    #[tokio::test]
+    async fn unix_socket_sink_reconnects_after_lost_acknowledgement() {
+        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::NO_CONTENT], true).await;
+        result.expect("reconnected patch acknowledged");
+        assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running native Wheelhouse HTTP endpoint"]
+    async fn unix_socket_sink_live_wheelhouse() {
+        let path = std::env::var("WHEELHOUSE_TEST_SOCKET").expect("explicit integration socket");
+        UnixSocketSink::new(path).send(&stamp_patch()).await.expect("native UI acknowledged patch");
     }
 }

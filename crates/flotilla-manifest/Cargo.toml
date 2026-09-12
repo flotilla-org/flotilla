@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
 bon = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true }
@@ -14,6 +16,7 @@ tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"
 tracing = { workspace = true }
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 flotilla-test-support = { path = "../flotilla-test-support" }
 tokio = { version = "1", features = ["macros", "rt", "fs"] }
 tempfile = "3"

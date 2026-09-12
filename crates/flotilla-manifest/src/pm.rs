@@ -23,11 +23,10 @@ pub enum PmInstance {
         /// The pane this process runs in, when the PM exposes it.
         pane: Option<PaneTarget>,
     },
-    /// Wheelhouse listens on a unix socket. The `WHEELHOUSE_SOCKET` /
-    /// `WHEELHOUSE_PANE_ID` environment spellings are flotilla's proposal
-    /// until Leg 3 of the manifest extraction defines the wheelhouse side;
-    /// they live only here, so blessing or renaming them is a one-line
-    /// change.
+    /// Wheelhouse accepts HTTP metadata patches at `WHEELHOUSE_SOCKET`.
+    /// The contract is owned by wheelhouse/docs/protocol/pm-connect.md (#22).
+    /// `WHEELHOUSE_PANE_ID` remains provisional until native pane identity is
+    /// generalized; the current Wheelhouse host does not export it.
     Wheelhouse {
         socket: PathBuf,
         /// The pane this process runs in, when wheelhouse exposes it.
