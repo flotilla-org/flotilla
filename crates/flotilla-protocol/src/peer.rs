@@ -44,9 +44,9 @@ pub enum RoutedPeerMessage {
         target_node_id: NodeId,
         remaining_hops: u8,
         command: Box<crate::Command>,
-        /// Principal attributed by the originating client surface.
+        /// Caller attributed by the originating socket connection.
         #[serde(default)]
-        principal_ref: Option<crate::PrincipalRef>,
+        caller: Option<Box<crate::CommandCaller>>,
         /// Session ID of the originating client, for cursor ownership on the target.
         #[serde(default)]
         session_id: Option<uuid::Uuid>,
@@ -228,7 +228,11 @@ mod tests {
                     .node_id(NodeId::new("feta"))
                     .build(),
             ),
-            principal_ref: Some(crate::PrincipalRef { namespace: "flotilla".into(), name: "governor agent".into() }),
+            caller: Some(Box::new(crate::CommandCaller {
+                principal_ref: crate::PrincipalRef { namespace: "flotilla".into(), name: "governor agent".into() },
+                process: None,
+                crew: None,
+            })),
             session_id: None,
         };
         let json_value = serde_json::to_value(&msg).expect("serialize");
@@ -237,12 +241,12 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, principal_ref, .. } => {
+            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, caller, .. } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(requester_node_id, NodeId::new("workstation"));
                 assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 7);
-                assert_eq!(principal_ref.expect("principal").name, "governor agent");
+                assert_eq!(caller.expect("caller").principal_ref.name, "governor agent");
             }
             other => panic!("expected CommandRequest, got {:?}", other),
         }

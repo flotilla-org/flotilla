@@ -25,6 +25,49 @@ use tracing::info;
 
 use crate::peer::{PeerManager, PeerSender};
 
+fn command_action_name(command: &Command) -> &'static str {
+    match &command.action {
+        CommandAction::ConvoyDelete { .. } => "convoy_delete",
+        CommandAction::ConvoyAbandon { .. } => "convoy_abandon",
+        CommandAction::ConvoyResume { .. } => "convoy_resume",
+        CommandAction::CrewComplete { .. } => "crew_complete",
+        CommandAction::CrewFail { .. } => "crew_fail",
+        CommandAction::CrewHandoff { .. } => "crew_handoff",
+        CommandAction::ResourceApply { .. } => "resource_apply",
+        CommandAction::ResourceDelete { .. } => "resource_delete",
+        CommandAction::ResourceStatusPatch { .. } => "resource_status_patch",
+        _ => command.description(),
+    }
+}
+
+fn command_subject(action: &CommandAction) -> String {
+    match action {
+        CommandAction::ConvoyDelete { namespace, name, .. }
+        | CommandAction::ConvoyAbandon { namespace, name, .. }
+        | CommandAction::ConvoyResume { namespace, name, .. } => {
+            format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
+        }
+        CommandAction::CrewComplete { context, .. }
+        | CommandAction::CrewFail { context, .. }
+        | CommandAction::CrewHandoff { context, .. } => format!(
+            "crew:{}/{}/{}/{}",
+            context.namespace.as_deref().unwrap_or("default"),
+            context.convoy.as_deref().unwrap_or("unknown"),
+            context.vessel_ref.as_deref().unwrap_or("unknown"),
+            context.role.as_deref().unwrap_or("unknown")
+        ),
+        CommandAction::ResourceApply { namespace, document } => {
+            let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("resource");
+            let name = document.pointer("/metadata/name").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+            format!("{}:{}/{}", kind.to_lowercase(), namespace, name)
+        }
+        CommandAction::ResourceDelete { namespace, kind, name, .. } | CommandAction::ResourceStatusPatch { namespace, kind, name, .. } => {
+            format!("{kind}:{namespace}/{name}")
+        }
+        _ => "unspecified".to_string(),
+    }
+}
+
 #[derive(Debug, bon::Builder)]
 pub(super) struct PendingRemoteCommand {
     pub(super) command_id: u64,
@@ -65,7 +108,7 @@ pub(super) struct ForwardedCommand {
 }
 
 struct ForwardedCommandOrigin {
-    principal_ref: Option<flotilla_protocol::PrincipalRef>,
+    caller: Option<flotilla_protocol::CommandCaller>,
     session_id: Option<uuid::Uuid>,
 }
 
@@ -158,14 +201,25 @@ impl RemoteCommandRouter {
 
     #[cfg(test)]
     pub(super) async fn dispatch_execute(&self, command: Command) -> Result<u64, String> {
-        self.dispatch_execute_for_principal(command, None).await
+        self.dispatch_execute_for_caller(command, None).await
     }
 
     pub(super) async fn dispatch_execute_for_principal(
         &self,
-        mut command: Command,
+        command: Command,
         dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
     ) -> Result<u64, String> {
+        let caller =
+            dispatching_principal_ref.map(|principal_ref| flotilla_protocol::CommandCaller { principal_ref, process: None, crew: None });
+        self.dispatch_execute_for_caller(command, caller).await
+    }
+
+    pub(super) async fn dispatch_execute_for_caller(
+        &self,
+        mut command: Command,
+        caller: Option<flotilla_protocol::CommandCaller>,
+    ) -> Result<u64, String> {
+        let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         if let Some(completion) = &mut crew_completion {
             completion.principal_ref = dispatching_principal_ref.clone();
@@ -208,7 +262,10 @@ impl RemoteCommandRouter {
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
         let desc = command.description();
-        info!(%target_node_id, %local, %desc, "dispatch_execute");
+        let action = command_action_name(&command);
+        let subject = command_subject(&command.action);
+        let caller_label = caller.as_ref().map(ToString::to_string).unwrap_or_else(|| "unattributed".to_string());
+        info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
             if command.action.is_query()
                 || matches!(
@@ -261,7 +318,7 @@ impl RemoteCommandRouter {
                     target_node_id: target_node_id.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                     command: Box::new(command),
-                    principal_ref: dispatching_principal_ref,
+                    caller: caller.map(Box::new),
                     session_id: None,
                 };
                 let send_result = match &existing_convoy_target {
@@ -290,7 +347,7 @@ impl RemoteCommandRouter {
                 self.daemon.execute_with_remote_executor(command, remote_executor).await
             }
         } else {
-            self.daemon.execute_for_principal(command, dispatching_principal_ref).await
+            self.daemon.execute_for_caller(command, caller).await
         }
     }
 
@@ -341,7 +398,7 @@ impl RemoteCommandRouter {
             target_node_id: target_node_id.clone(),
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             command: Box::new(command),
-            principal_ref: None,
+            caller: None,
             session_id: Some(session_id),
         };
         if let Err(err) = self.send_routed_to(&target_node_id, routed).await {
@@ -422,7 +479,7 @@ impl RemoteCommandRouter {
         requester_node_id: NodeId,
         reply_via: NodeId,
         command: Command,
-        principal_ref: Option<flotilla_protocol::PrincipalRef>,
+        caller: Option<Box<flotilla_protocol::CommandCaller>>,
         session_id: Option<uuid::Uuid>,
     ) {
         let ready = Arc::new(Notify::new());
@@ -432,7 +489,7 @@ impl RemoteCommandRouter {
             .insert(request_id, ForwardedCommand { state: ForwardedCommandState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
         tokio::spawn(async move {
-            let origin = ForwardedCommandOrigin { principal_ref, session_id };
+            let origin = ForwardedCommandOrigin { caller: caller.map(|caller| *caller), session_id };
             router.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
         });
     }
@@ -737,7 +794,7 @@ impl RemoteCommandRouter {
         }
 
         let mut event_rx = self.daemon.subscribe();
-        let command_id = match self.daemon.execute_for_principal(command, origin.principal_ref).await {
+        let command_id = match self.daemon.execute_for_caller(command, origin.caller).await {
             Ok(command_id) => command_id,
             Err(message) => {
                 self.forwarded_commands.lock().await.remove(&request_id);
@@ -848,7 +905,7 @@ impl RemoteCommandRouter {
         command: Command,
         ready: Arc<Notify>,
     ) {
-        let origin = ForwardedCommandOrigin { principal_ref: None, session_id: None };
+        let origin = ForwardedCommandOrigin { caller: None, session_id: None };
         self.execute_forwarded_command(request_id, requester_node_id, reply_via, command, origin, ready).await;
     }
 

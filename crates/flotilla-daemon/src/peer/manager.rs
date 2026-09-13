@@ -27,7 +27,7 @@ pub enum HandleResult {
         requester_node_id: NodeId,
         reply_via: NodeId,
         command: Command,
-        principal_ref: Option<flotilla_protocol::PrincipalRef>,
+        caller: Option<Box<flotilla_protocol::CommandCaller>>,
         session_id: Option<uuid::Uuid>,
     },
     /// A routed command cancel request targeted this daemon.
@@ -610,7 +610,7 @@ impl PeerManager {
                 target_node_id,
                 remaining_hops,
                 command,
-                principal_ref,
+                caller,
                 session_id,
             } => {
                 if remaining_hops == 0 {
@@ -622,7 +622,7 @@ impl PeerManager {
                         requester_node_id,
                         reply_via: connection_peer,
                         command: *command,
-                        principal_ref,
+                        caller,
                         session_id,
                     };
                 }
@@ -645,7 +645,7 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command,
-                    principal_ref,
+                    caller,
                     session_id,
                 };
                 self.queue_send_to(&target_node_id, PeerWireMessage::Routed(forwarded));

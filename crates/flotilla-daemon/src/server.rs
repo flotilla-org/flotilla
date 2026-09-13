@@ -1,3 +1,4 @@
+mod caller;
 mod client_connection;
 pub mod environment_sockets;
 mod peer_connection;
@@ -495,6 +496,7 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
+                            let peer_credential = caller::socket_peer_credential(&stream);
                             let daemon = Arc::clone(&daemon);
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
@@ -507,7 +509,11 @@ impl DaemonServer {
 
                             let shutdown_request_tx = shutdown_request_tx.clone();
                             connection_tasks.spawn(async move {
-                                handle_client(
+                                let namespace = daemon.provisioning_namespace().await;
+                                let caller = tokio::task::spawn_blocking(move || caller::caller_from_peer(peer_credential, &namespace))
+                                    .await
+                                    .ok();
+                                handle_client_with_caller(
                                     stream,
                                     daemon,
                                     shutdown_request_tx,
@@ -520,6 +526,7 @@ impl DaemonServer {
                                     peer_connected_tx,
                                     agent_state_store,
                                     None,
+                                    caller,
                                 )
                                 .await;
                             });
@@ -625,7 +632,41 @@ fn spawn_peer_networking_runtime(
 /// `environment_id` the connection is dropped.  `None` means the main socket
 /// (forward-compatible with HTTP transport).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_client(
+    stream: tokio::net::UnixStream,
+    daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    shutdown_rx: watch::Receiver<bool>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+) {
+    handle_client_with_caller(
+        stream,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        inbound_peer_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_with_caller(
     mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
@@ -638,6 +679,7 @@ async fn handle_client(
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
+    caller: Option<flotilla_protocol::CommandCaller>,
 ) {
     let mut first_byte = [0_u8; 1];
     match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte)).await {
@@ -662,7 +704,7 @@ async fn handle_client(
             return;
         }
     }
-    handle_client_session(
+    handle_client_session_with_caller(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_request_tx,
@@ -675,12 +717,48 @@ async fn handle_client(
         peer_connected_tx,
         agent_state_store,
         environment_context,
+        caller,
     )
     .await;
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
 async fn handle_client_session(
+    session: MessageSession,
+    daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    shutdown_rx: watch::Receiver<bool>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+) {
+    handle_client_session_with_caller(
+        session,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        inbound_peer_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_session_with_caller(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
@@ -693,6 +771,7 @@ async fn handle_client_session(
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
+    caller: Option<flotilla_protocol::CommandCaller>,
 ) {
     let session = Arc::new(session);
     let first_msg = tokio::select! {
@@ -767,6 +846,16 @@ async fn handle_client_session(
                     Some(surface) => surface,
                     None => flotilla_protocol::SurfaceDeclaration::focal_for_namespace(daemon.provisioning_namespace().await),
                 };
+                let caller = caller
+                    .map(|mut caller| {
+                        caller.principal_ref = surface.principal_ref.clone();
+                        caller
+                    })
+                    .unwrap_or_else(|| flotilla_protocol::CommandCaller {
+                        principal_ref: surface.principal_ref.clone(),
+                        process: None,
+                        crew: None,
+                    });
                 ClientConnection::new(
                     daemon,
                     shutdown_request_tx,
@@ -775,6 +864,7 @@ async fn handle_client_session(
                     client_count,
                     client_notify,
                     agent_state_store,
+                    caller,
                 )
                 .run_stateful(Arc::clone(&session), session_id, surface)
                 .await;

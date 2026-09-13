@@ -110,6 +110,7 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     }
 }
 
@@ -327,6 +328,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     }
 }
 
@@ -427,5 +429,6 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     }
 }

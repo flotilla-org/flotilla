@@ -8202,6 +8202,38 @@ impl InProcessDaemon {
         Ok(archives)
     }
 
+    async fn record_lifecycle_mutation(
+        &self,
+        namespace: &str,
+        name: &str,
+        action: &str,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+    ) -> Result<(), String> {
+        let Some(caller) = caller else { return Ok(()) };
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::RecordLifecycleMutation {
+            mutation: flotilla_resources::LifecycleMutation { action: action.to_string(), caller: caller.clone(), at: self.clock.now() },
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    async fn record_lifecycle_mutation_best_effort(
+        &self,
+        namespace: &str,
+        name: &str,
+        action: &str,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+        missing_expected: bool,
+    ) {
+        if let Err(error) = self.record_lifecycle_mutation(namespace, name, action, caller).await {
+            if !missing_expected || !error.contains("not found") {
+                warn!(%error, %namespace, convoy = %name, %action, "failed to persist lifecycle mutation attribution");
+            }
+        }
+    }
+
     async fn apply_crew_work_patch(
         &self,
         requested: &CrewCommandContext,
@@ -9407,7 +9439,12 @@ impl InProcessDaemon {
     }
 
     pub async fn execute_for_principal(&self, command: Command, principal_ref: Option<PrincipalRef>) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, principal_ref).await
+        let caller = principal_ref.map(|principal_ref| flotilla_protocol::CommandCaller { principal_ref, process: None, crew: None });
+        self.execute_for_caller(command, caller).await
+    }
+
+    pub async fn execute_for_caller(&self, command: Command, caller: Option<flotilla_protocol::CommandCaller>) -> Result<u64, String> {
+        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, caller).await
     }
 
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
@@ -9486,8 +9523,9 @@ impl InProcessDaemon {
         command: Command,
         remote_executor: Arc<dyn RemoteStepExecutor>,
         allow_remote_host: bool,
-        dispatching_principal_ref: Option<PrincipalRef>,
+        caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, String> {
+        let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
         debug!(
             %command_node_id, local_node = %self.node_id, %allow_remote_host,
@@ -9766,9 +9804,15 @@ impl InProcessDaemon {
                 Ok(record_name) => {
                     match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
                         Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .await;
                             flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
                         }
-                        Ok(ConvoyResumeOutcome::Queued { displaced }) => flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced },
+                        Ok(ConvoyResumeOutcome::Queued { displaced }) => {
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .await;
+                            flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
+                        }
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }
                 }
@@ -9796,6 +9840,7 @@ impl InProcessDaemon {
             &command.action
         {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let routing = self.resolve_crew_routing_context(context).await.ok();
             let result = match self
                 .crew_complete_as_principal_internal(
                     context,
@@ -9807,7 +9852,14 @@ impl InProcessDaemon {
                 )
                 .await
             {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Ok(()) => {
+                    if let Some(resolved) = routing {
+                        let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
+                        self.record_lifecycle_mutation_best_effort(namespace, &resolved.convoy, "crew_complete", caller.as_ref(), false)
+                            .await;
+                    }
+                    flotilla_protocol::CommandValue::Ok
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -9832,7 +9884,12 @@ impl InProcessDaemon {
             };
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => match self.reap_convoy_internal(&namespace, &record_name, *force).await {
-                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Ok(()) => {
+                        // Finalizers retain an explainable convoy after delete; a fully
+                        // removed convoy has no remaining status to annotate.
+                        self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_delete", caller.as_ref(), true).await;
+                        flotilla_protocol::CommandValue::Ok
+                    }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
@@ -9850,7 +9907,11 @@ impl InProcessDaemon {
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
                     match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
-                        Ok(archives) => flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives },
+                        Ok(archives) => {
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_abandon", caller.as_ref(), false)
+                                .await;
+                            flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives }
+                        }
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }
                 }
@@ -11014,6 +11075,17 @@ impl InProcessDaemon {
         };
 
         let decision_ledgers = explained_decision_ledgers(convoy.status.as_ref());
+        let lifecycle_mutations = convoy
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| &status.lifecycle_mutations)
+            .map(|mutation| flotilla_protocol::ExplainedLifecycleMutation {
+                action: mutation.action.clone(),
+                caller: mutation.caller.clone(),
+                at: mutation.at.to_rfc3339(),
+            })
+            .collect();
 
         Ok(ConvoyExplanation {
             namespace,
@@ -11030,6 +11102,7 @@ impl InProcessDaemon {
             decision_ledgers,
             settlement,
             recent_events,
+            lifecycle_mutations,
         })
     }
 }

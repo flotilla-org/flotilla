@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
+use flotilla_protocol::{CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -439,6 +439,16 @@ pub struct ConvoyStatus {
     pub turn_deliveries: BTreeMap<String, TurnDeliveryStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<ConvoyAttention>,
+    /// Mutating lifecycle requests retained for operator explanation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_mutations: Vec<LifecycleMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleMutation {
+    pub action: String,
+    pub caller: CommandCaller,
+    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -661,6 +671,9 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    RecordLifecycleMutation {
+        mutation: LifecycleMutation,
+    },
     SetPlacementDecision {
         placement_decision: PlacementDecision,
     },
@@ -811,10 +824,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // current status, so accepting it here would resurrect the convoy and
         // erase its terminal history. Once stamped, the historical record is
         // immutable, including under duplicate abandon requests.
-        if status.phase == ConvoyPhase::Abandoned {
+        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. }) {
             return;
         }
         match self {
+            Self::RecordLifecycleMutation { mutation } => {
+                const RETAINED_MUTATIONS: usize = 32;
+                status.lifecycle_mutations.push(mutation.clone());
+                if status.lifecycle_mutations.len() > RETAINED_MUTATIONS {
+                    status.lifecycle_mutations.remove(0);
+                }
+            }
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }
