@@ -10959,6 +10959,40 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         crew_deliveries.sort_by(|left, right| left.session.cmp(&right.session));
 
+        let mut material_leases = self
+            .resource_backend
+            .clone()
+            .using::<ResourceEnvironment>(&namespace)
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter_map(|environment| {
+                let spec = environment.spec.docker.as_ref()?;
+                (spec.required_agent_adapters.contains("codex") && !spec.env.contains_key("CODEX_HOME")).then(|| {
+                    let status = environment.status.as_ref();
+                    let (state, reason) = match status.and_then(|status| status.wait_reason.as_ref()) {
+                        Some(flotilla_resources::EnvironmentWaitReason::MaterialLeaseReleased { .. }) => {
+                            ("released", status.and_then(|status| status.message.clone()))
+                        }
+                        Some(flotilla_resources::EnvironmentWaitReason::MaterialPoolExhausted { .. }) => {
+                            ("waiting", status.and_then(|status| status.message.clone()))
+                        }
+                        None if status.is_some_and(|status| status.ready) => ("held", None),
+                        _ => ("pending", status.and_then(|status| status.message.clone())),
+                    };
+                    flotilla_protocol::ExplainedMaterialLease {
+                        environment: environment.metadata.name,
+                        pool_ref: "codex-login".to_string(),
+                        state: state.to_string(),
+                        reason,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        material_leases.sort_by(|left, right| left.environment.cmp(&right.environment));
+
         let recent_events = match EventRecorder::new(self.resource_backend.clone())
             .recent_matching_label(&namespace, CONVOY_LABEL, &convoy.metadata.name, Utc::now())
             .await
@@ -10992,6 +11026,7 @@ impl InProcessDaemon {
             change_requests,
             subscriptions,
             crew_deliveries,
+            material_leases,
             decision_ledgers,
             settlement,
             recent_events,

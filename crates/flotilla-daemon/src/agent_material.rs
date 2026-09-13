@@ -93,6 +93,7 @@ trait AgentMaterialAdapter: Send + Sync {
 pub(crate) struct AgentMaterialRegistry {
     namespace: String,
     pools: Arc<MaterialPoolManager>,
+    homes_dir: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
     skills: SkillBundle,
 }
@@ -105,13 +106,19 @@ impl AgentMaterialRegistry {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
             .join(".config/flotilla/credentials/codex-pool");
+        let homes_dir = env
+            .get("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
+            .join(".local/share/flotilla/agent-homes");
         let skills = SkillBundle::new(env.get(FLOTILLA_SKILLS_DIR_ENV).map(PathBuf::from));
         let codex: Arc<dyn AgentMaterialAdapter> =
-            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, cfg!(any(target_os = "linux", test))));
+            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, homes_dir.clone(), cfg!(any(target_os = "linux", test))));
         let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
         Self {
             namespace: namespace.to_string(),
             pools,
+            homes_dir,
             adapters: BTreeMap::from([(codex.id(), codex), (claude_code.id(), claude_code)]),
             skills,
         }
@@ -169,6 +176,12 @@ impl AgentMaterialRegistry {
     }
 
     pub(crate) async fn release(&self, environment_ref: &str) -> Result<(), String> {
+        let auth = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join("auth.json");
+        match fs::remove_file(&auth).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove released Codex login {}: {error}", auth.display())),
+        }
         self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
@@ -192,12 +205,13 @@ pub(crate) enum AgentMaterialPrepareError {
 struct CodexMaterialAdapter {
     pools: Arc<MaterialPoolManager>,
     pool_dir: PathBuf,
+    homes_dir: PathBuf,
     supported: bool,
 }
 
 impl CodexMaterialAdapter {
-    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, supported: bool) -> Self {
-        Self { pools, pool_dir, supported }
+    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, homes_dir: PathBuf, supported: bool) -> Self {
+        Self { pools, pool_dir, homes_dir, supported }
     }
 
     async fn usable_units(&self) -> Result<BTreeMap<String, MaterialPoolUnitSpec>, String> {
@@ -473,15 +487,27 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         let spec = MaterialPoolSpec { units: self.usable_units().await? };
         self.pools.reconcile_pool(CODEX_POOL_REF, &spec).await?;
         match self.pools.acquire(CODEX_POOL_REF, holder_ref).await? {
-            MaterialLeaseOutcome::Leased { unit, .. } => Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
-                mount: ProvisionedMount::new(PathBuf::from(&unit.directory), CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
-                preflight: AgentMaterialPreflight {
-                    command: "codex".to_string(),
-                    args: vec!["login".to_string(), "status".to_string()],
-                    failure_context: "Codex login preflight failed".to_string(),
-                },
-                github_repository_grants: BTreeSet::new(),
-            })),
+            MaterialLeaseOutcome::Leased { unit, .. } => {
+                let home = self.homes_dir.join(&holder_ref.name).join(CODEX_ADAPTER_ID);
+                fs::create_dir_all(&home).await.map_err(|error| format!("create persistent Codex home {}: {error}", home.display()))?;
+                let source = PathBuf::from(&unit.directory).join("auth.json");
+                let destination = home.join("auth.json");
+                fs::copy(&source, &destination)
+                    .await
+                    .map_err(|error| format!("install leased Codex login {} into {}: {error}", source.display(), destination.display()))?;
+                fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                    .await
+                    .map_err(|error| format!("protect leased Codex login {}: {error}", destination.display()))?;
+                Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
+                    mount: ProvisionedMount::new(home, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
+                    preflight: AgentMaterialPreflight {
+                        command: "codex".to_string(),
+                        args: vec!["login".to_string(), "status".to_string()],
+                        failure_context: "Codex login preflight failed".to_string(),
+                    },
+                    github_repository_grants: BTreeSet::new(),
+                }))
+            }
             MaterialLeaseOutcome::Waiting { unit_count } => Ok(AgentMaterialOutcome::Waiting {
                 pool_ref: CODEX_POOL_REF.to_string(),
                 message: format!(
@@ -628,7 +654,18 @@ mod tests {
             registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await.expect("prepare");
 
         assert_eq!(deliveries.len(), 2);
-        assert_eq!(deliveries[0].mount, ProvisionedMount::new(&slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+        assert_eq!(
+            deliveries[0].mount,
+            ProvisionedMount::new(
+                temp.path().join(".local/share/flotilla/agent-homes/env-a/codex"),
+                CONTAINER_CODEX_HOME,
+                ProvisionedMountMode::Rw,
+            )
+        );
+        assert_eq!(
+            std::fs::read(deliveries[0].mount.host_path.join("auth.json")).expect("copied auth"),
+            std::fs::read(slot.join("auth.json")).expect("slot auth")
+        );
         assert_eq!(
             deliveries[1].mount,
             ProvisionedMount::new(
@@ -923,7 +960,8 @@ mod tests {
         let slot_zero = write_named_slot(&pool_dir, "slot-0", 0);
         let slot_zero_padded = write_named_slot(&pool_dir, "slot-00", 0);
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        let adapter = CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, true);
+        let adapter =
+            CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, temp.path().join("homes"), true);
         let log_output = Arc::new(Mutex::new(Vec::new()));
 
         let units = {
@@ -961,9 +999,36 @@ mod tests {
             Err(AgentMaterialPrepareError::Waiting { pool_ref, .. }) if pool_ref == CODEX_POOL_REF
         ));
 
-        let second = write_slot(&pool, 1);
+        write_slot(&pool, 1);
         let delivery = registry.prepare("env-b", &required, &BTreeMap::new()).await.expect("lease new unit");
-        assert_eq!(delivery[0].mount, ProvisionedMount::new(second, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw));
+        assert_eq!(delivery[0].mount.host_path.as_path(), temp.path().join(".local/share/flotilla/agent-homes/env-b/codex"));
+    }
+
+    #[tokio::test]
+    async fn codex_release_preserves_session_home_and_reacquire_installs_login_again() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
+        write_slot(&pool, 0);
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+
+        let delivery = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("initial lease");
+        let codex_home = delivery[0].mount.host_path.as_path();
+        std::fs::create_dir_all(codex_home.join("sessions/2026/09/13")).expect("real rollout tree");
+        std::fs::write(codex_home.join("sessions/2026/09/13/rollout.jsonl"), "{\"type\":\"session_meta\"}\n").expect("rollout");
+        std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5\"\n").expect("config");
+
+        registry.release("env-a").await.expect("release login");
+        assert!(!codex_home.join("auth.json").exists(), "released home must not retain pooled login material");
+        let resumed = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("reacquire login");
+
+        assert_eq!(resumed[0].mount.host_path.as_path(), codex_home);
+        assert!(codex_home.join("auth.json").exists());
+        assert_eq!(std::fs::read_to_string(codex_home.join("config.toml")).expect("preserved config"), "model = \"gpt-5\"\n");
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("sessions/2026/09/13/rollout.jsonl")).expect("preserved rollout"),
+            "{\"type\":\"session_meta\"}\n"
+        );
     }
 
     #[tokio::test]

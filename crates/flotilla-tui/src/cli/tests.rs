@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use flotilla_protocol::{
-    CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement, HostName, HostSnapshot,
-    HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
+    CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedMaterialLease, ExplainedSettlement,
+    HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human};
@@ -21,6 +21,12 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
+        material_leases: vec![ExplainedMaterialLease {
+            environment: "ledger-work".into(),
+            pool_ref: "codex-login".into(),
+            state: "waiting".into(),
+            reason: Some("all login units are leased".into()),
+        }],
         decision_ledgers: vec![
             ExplainedDecisionLedger {
                 vessel: "work".into(),
@@ -55,6 +61,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 
     let output = format_convoy_explanation_human(&explanation);
     assert!(output.contains("Message: waiting for review evidence"));
+    assert!(output.contains("ledger-work pool=codex-login state=waiting reason=all login units are leased"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
     assert!(output.contains(

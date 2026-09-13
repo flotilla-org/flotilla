@@ -662,6 +662,21 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             );
         }
     }
+    output.push_str("\nAgent material leases:\n");
+    if explanation.material_leases.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        for lease in &explanation.material_leases {
+            let _ = writeln!(
+                output,
+                "  - {} pool={} state={}{}",
+                lease.environment,
+                lease.pool_ref,
+                lease.state,
+                lease.reason.as_ref().map(|reason| format!(" reason={reason}")).unwrap_or_default()
+            );
+        }
+    }
     output
 }
 
