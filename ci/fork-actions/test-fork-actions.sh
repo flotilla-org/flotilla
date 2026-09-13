@@ -13,6 +13,7 @@ fake_curl="$bundle_root/tests/fake-forgejo-curl"
 bash -n "$publisher"
 bash -n "$metadata_writer"
 bash -n "$bundle_root/runtime/cleat/prepare-ghostty-vt.sh"
+bash -n "$bundle_root/runtime/cleat/verify-zig-version.sh"
 bash -n "$bundle_root/runtime/cleat/macos-zig-sdk-shim/xcrun"
 bash -n "$fake_curl"
 
@@ -191,6 +192,12 @@ grep -Fxq false "$identical_race_state/draft"
 workflow_count=$(find "$bundle_root/workflows" -type f -name '*.yml' | wc -l | tr -d '[:space:]')
 if [[ "$workflow_count" != 7 ]]; then
   echo "expected seven inert workflow templates, found $workflow_count" >&2
+  exit 1
+fi
+
+test "$(grep -RFl 'bash ci/fork-actions/runtime/cleat/verify-zig-version.sh' "$bundle_root/workflows/cleat" | wc -l | tr -d '[:space:]')" = 2
+if grep -RFq 'test "$(zig version)" =' "$bundle_root/workflows/cleat"; then
+  echo 'Cleat workflows must derive the Zig version from its toolchain pin' >&2
   exit 1
 fi
 

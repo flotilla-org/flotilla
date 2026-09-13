@@ -72,6 +72,7 @@ pub enum CrewAttention {
     Working,
     NeedsInput,
     Stalled,
+    DeliveryUnconfirmed,
     Idle,
     Unobservable,
 }
@@ -82,6 +83,7 @@ impl std::fmt::Display for CrewAttention {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
             Self::Stalled => "stalled",
+            Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
         })
@@ -319,6 +321,10 @@ pub struct FleetListResponse {
 #[builder(on(String, into))]
 pub struct FleetListRow {
     pub convoy: String,
+    /// Opaque record key used for internal joins. Human surfaces render
+    /// `convoy`, which is the role address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_ref: Option<String>,
     pub vessel: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,

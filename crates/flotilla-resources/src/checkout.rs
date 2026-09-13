@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryCheckoutKind, RepositoryKey};
@@ -143,6 +145,18 @@ pub struct CheckoutIntegrationStatus {
     pub landed_evidence: Option<LandedEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_request: Option<ChangeRequestObservation>,
+    /// Remote refs observed directly through Git transport. These facts are
+    /// forge-independent and can therefore anchor settlement without a
+    /// change-request surface.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remote_refs: BTreeMap<String, RemoteRefObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct RemoteRefObservation {
+    pub digest: String,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -276,6 +290,7 @@ mod tests {
             landed: condition(landed),
             landed_evidence,
             change_request: None,
+            remote_refs: BTreeMap::new(),
         }
     }
 

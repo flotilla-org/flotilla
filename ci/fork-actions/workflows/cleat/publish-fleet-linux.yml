@@ -26,7 +26,6 @@ jobs:
         run: |
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
-          test "$(zig version)" = 0.15.2
 
       - name: Check out exact source revision
         uses: https://data.forgejo.org/actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -40,6 +39,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
           git clean -ffdx -e target/ -e .tools/
+          bash ci/fork-actions/runtime/cleat/verify-zig-version.sh
 
       - name: Prepare Ghostty VT
         run: ci/fork-actions/runtime/cleat/prepare-ghostty-vt.sh

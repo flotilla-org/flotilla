@@ -1,0 +1,38 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: events.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: events
+    singular: event
+    kind: Event
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [regarding, reason, message, count, first_seen, last_seen, expires_at]
+              properties:
+                regarding:
+                  type: object
+                  required: [apiVersion, kind, namespace, name]
+                  properties:
+                    apiVersion: { type: string }
+                    kind: { type: string }
+                    namespace: { type: string }
+                    name: { type: string }
+                reason: { type: string }
+                message: { type: string }
+                count: { type: integer, minimum: 1 }
+                first_seen: { type: string, format: date-time }
+                last_seen: { type: string, format: date-time }
+                expires_at: { type: string, format: date-time }

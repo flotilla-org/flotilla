@@ -45,6 +45,21 @@ served it. A replicated record has `source: "replica"`, `originRoot`, and
 in `records` and a cursor immediately after that slice. An empty list still
 returns an envelope and cursor with an empty `records` array.
 
+### Recent event shapes
+
+`resource get` adds a camel-case `recentEvents` field to the returned raw
+resource object. Its entries are complete Event resource objects, including
+metadata, `spec.regarding`, occurrence counts, timestamps, expiry, and replica
+provenance. This keeps the generic read useful to clients that understand the
+resource wire format.
+
+`convoy <name> explain` intentionally uses a different, diagnostic shape. Its
+snake-case `recent_events` array contains the compact fields `reason`,
+`message`, `count`, `first_seen`, and `last_seen`; it includes events attached
+to the convoy and its convoy-labelled child resources. Use `flotilla events`
+to list complete Event resources fleet-wide, or add `--local-only` to exclude
+replicas.
+
 ## Watching and resuming
 
 JSON watch output is JSON Lines: each line is one complete resource-read
@@ -87,3 +102,38 @@ last successfully processed cursor and resume after an error.
 `--host <name>` routes all three reads to that peer. The same wire-generation
 handshake used by every CLI connection rejects an incompatible daemon before
 the read starts.
+
+## One-time single-home duplicate sweep
+
+[ADR 0033](adr/0033-homing-in-practice-creation-cascade-mutation-routing-enforcement.md)
+enforces single-home authorship for new records, but fleets upgrading from the
+transitional multi-author behavior may still contain Host and PlacementPolicy
+records authored on several roots. With every fleet host upgraded, online, and
+connected, run:
+
+```bash
+flotilla resource dedup-sweep
+flotilla resource dedup-sweep --json
+```
+
+Run the sweep as the migration step immediately after deploying the ADR 0033
+behavior, before relying on placement decisions. Until the standing duplicates
+are removed, ordinary replica lookup may select an older authored copy and the
+collision condition will remain active.
+
+The command inventories each root's local authored rows, keeps the copy on the
+host named by the Host or ordinary placement policy, and keeps a placement
+snapshot with the authored convoy that references it. It uses the raw
+resource-delete path for every non-home copy. It refuses before deleting a
+record if the copies disagree about their home, a placement snapshot has no
+unique authored convoy home, or the home has no authored copy. The report names
+each deletion. A successful second run reports zero duplicates and zero
+deletions.
+
+The automated sweep covers Host records and host-scoped PlacementPolicies:
+`host_direct` and `docker_per_vessel`. Placement snapshots are convoy-owned, so
+their embedded strategy host does not determine their home. A duplicated policy
+with neither strategy, or a snapshot without one authored convoy home, has no
+natural home the tool can prove. The sweep refuses the complete plan before
+deleting anything; resolve that policy explicitly with `resource delete --host`
+on the non-home roots, then rerun the sweep.

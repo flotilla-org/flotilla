@@ -37,7 +37,7 @@ impl Factory for DockerEnvironmentFactory {
             return Ok(Arc::new(DockerEnvironmentProvider::new(runner)));
         }
         // Fallback: try running docker directly
-        match runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Noop).await {
+        match runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Default).await {
             Ok(_) => Ok(Arc::new(DockerEnvironmentProvider::new(runner))),
             Err(_) => Err(vec![UnmetRequirement::MissingBinary("docker".into())]),
         }

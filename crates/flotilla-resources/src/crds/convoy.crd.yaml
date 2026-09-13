@@ -270,8 +270,20 @@ spec:
                         type: string
                         enum: [Pending, Ready, Launching, Running, Complete, Failed, Cancelled]
                       completion_authority:
-                        type: string
-                        enum: [CrewRollup, HumanOverride]
+                        oneOf:
+                          - type: string
+                            enum: [CrewRollup, HumanOverride, Unattributed]
+                          - type: object
+                            required: [Principal]
+                            properties:
+                              Principal:
+                                type: object
+                                required: [namespace, name]
+                                properties:
+                                  namespace:
+                                    type: string
+                                  name:
+                                    type: string
                       ready_at:
                         type: string
                         format: date-time

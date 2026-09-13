@@ -1,9 +1,13 @@
 mod common;
 
-use common::contract::{
-    assert_create_get_list_roundtrip, assert_delete_emits_event, assert_metadata_roundtrip, assert_namespace_isolation,
-    assert_stale_resource_version_conflicts, assert_watch_from_version_replays, assert_watch_now_semantics, WorkflowTemplateFixture,
+use common::{
+    contract::{
+        assert_metadata_roundtrip, assert_namespace_isolation, assert_stale_resource_version_conflicts, in_memory_backend,
+        WorkflowTemplateFixture,
+    },
+    updated_workflow_template_spec, valid_workflow_template_spec, workflow_template_meta,
 };
+use flotilla_resources::WorkflowTemplate;
 use rstest::rstest;
 
 // Keep the rstest shape even with a single fixture so this suite can grow into
@@ -12,7 +16,15 @@ use rstest::rstest;
 #[case(WorkflowTemplateFixture)]
 #[tokio::test]
 async fn create_get_list_roundtrip_for_workflow_templates(#[case] _fixture: WorkflowTemplateFixture) {
-    assert_create_get_list_roundtrip::<WorkflowTemplateFixture>().await;
+    let backend = in_memory_backend();
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let created = templates.apply(&workflow_template_meta("alpha"), &valid_workflow_template_spec()).await.expect("apply should succeed");
+
+    let fetched = templates.get("alpha").await.expect("get should succeed");
+    assert_eq!(fetched.metadata.resource_version, created.metadata.resource_version);
+    let listed = templates.list().await.expect("list should succeed");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].metadata.resource_version, created.metadata.resource_version);
 }
 
 #[rstest]
@@ -25,22 +37,30 @@ async fn update_requires_current_resource_version_for_workflow_templates(#[case]
 #[rstest]
 #[case(WorkflowTemplateFixture)]
 #[tokio::test]
-async fn delete_emits_deleted_event_for_workflow_templates(#[case] _fixture: WorkflowTemplateFixture) {
-    assert_delete_emits_event::<WorkflowTemplateFixture>().await;
+async fn delete_removes_workflow_template_definition(#[case] _fixture: WorkflowTemplateFixture) {
+    let backend = in_memory_backend();
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    templates.apply(&workflow_template_meta("alpha"), &valid_workflow_template_spec()).await.expect("apply should succeed");
+
+    templates.delete("alpha").await.expect("delete should succeed");
+    assert!(templates.list().await.expect("list should succeed").is_empty());
 }
 
 #[rstest]
 #[case(WorkflowTemplateFixture)]
 #[tokio::test]
-async fn watch_from_version_replays_update_then_delete_for_workflow_templates(#[case] _fixture: WorkflowTemplateFixture) {
-    assert_watch_from_version_replays::<WorkflowTemplateFixture>().await;
-}
+async fn apply_updates_workflow_template_definition(#[case] _fixture: WorkflowTemplateFixture) {
+    let backend = in_memory_backend();
+    let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+    let created =
+        templates.apply(&workflow_template_meta("alpha"), &valid_workflow_template_spec()).await.expect("initial apply should succeed");
+    let updated =
+        templates.apply(&workflow_template_meta("alpha"), &updated_workflow_template_spec()).await.expect("updated apply should succeed");
 
-#[rstest]
-#[case(WorkflowTemplateFixture)]
-#[tokio::test]
-async fn watch_now_only_sees_future_events_for_workflow_templates(#[case] _fixture: WorkflowTemplateFixture) {
-    assert_watch_now_semantics::<WorkflowTemplateFixture>().await;
+    assert_ne!(updated.metadata.resource_version, created.metadata.resource_version);
+    let fetched = templates.get("alpha").await.expect("get should succeed");
+    assert_eq!(fetched.metadata.resource_version, updated.metadata.resource_version);
+    assert_eq!(fetched.spec.vessels, updated.spec.vessels);
 }
 
 #[rstest]

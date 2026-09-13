@@ -797,6 +797,7 @@ pub struct EnsuredTerminalSession {
     pub command: String,
     pub cwd: ExecutionEnvironmentPath,
     pub env_vars: super::super::terminal::TerminalEnvVars,
+    pub initial_size: Option<super::super::terminal::TerminalSize>,
 }
 
 impl Default for FakeTerminalPool {
@@ -850,7 +851,19 @@ impl TerminalPool for FakeTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &super::super::terminal::TerminalEnvVars,
+        tags: &[super::super::terminal::TerminalSessionTag],
+    ) -> Result<(), String> {
+        self.ensure_session_with_size(session_name, command, cwd, env_vars, tags, None).await
+    }
+
+    async fn ensure_session_with_size(
+        &self,
+        session_name: &str,
+        command: &str,
+        cwd: &ExecutionEnvironmentPath,
+        env_vars: &super::super::terminal::TerminalEnvVars,
         _tags: &[super::super::terminal::TerminalSessionTag],
+        initial_size: Option<super::super::terminal::TerminalSize>,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
@@ -861,6 +874,7 @@ impl TerminalPool for FakeTerminalPool {
             command: command.to_string(),
             cwd: cwd.clone(),
             env_vars: env_vars.clone(),
+            initial_size,
         });
         sessions.push(super::super::terminal::TerminalSession {
             session_name: session_name.to_string(),
@@ -899,6 +913,7 @@ impl TerminalPool for FakeTerminalPool {
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         let flag = match mode {
             flotilla_protocol::commands::AttachMode::Default => "",
+            flotilla_protocol::commands::AttachMode::PreferTake => " --take",
             flotilla_protocol::commands::AttachMode::Strict => " --strict",
             flotilla_protocol::commands::AttachMode::Take => " --take",
         };
@@ -915,8 +930,8 @@ impl TerminalPool for FakeTerminalPool {
         Ok(self.captured_screens.lock().await.get(session_name).cloned())
     }
 
-    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
-        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), submit));
+    async fn deliver(&self, session_name: &str, text: &str) -> Result<(), String> {
+        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), true));
         Ok(())
     }
 }
@@ -943,30 +958,26 @@ impl FakeChangeRequest {
 
 #[async_trait::async_trait]
 impl ChangeRequestTracker for FakeChangeRequest {
-    async fn list_change_requests(&self, _repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
+    async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         let store = self.change_requests.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
     }
 
-    async fn get_change_request(&self, _repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
+    async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         let store = self.change_requests.lock().await;
         store.iter().find(|(cr_id, _)| cr_id == id).cloned().ok_or_else(|| format!("change request {id} not found"))
     }
 
-    async fn get_change_request_for_admission(
-        &self,
-        repo_root: &Path,
-        id: &str,
-    ) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
-        let (id, change_request) = self.get_change_request(repo_root, id).await?;
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
+        let (id, change_request) = self.get_change_request(id).await?;
         Ok(super::super::change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
     }
 
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
+    async fn open_in_browser(&self, _id: &str) -> Result<(), String> {
         Ok(())
     }
 
-    async fn close_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+    async fn close_change_request(&self, id: &str) -> Result<(), String> {
         let mut store = self.change_requests.lock().await;
         if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {
             cr.status = ChangeRequestStatus::Closed;
@@ -976,7 +987,7 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
-    async fn merge_change_request(&self, _repo_root: &Path, id: &str) -> Result<(), String> {
+    async fn merge_change_request(&self, id: &str) -> Result<(), String> {
         let mut store = self.change_requests.lock().await;
         if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {
             cr.status = ChangeRequestStatus::Merged;
@@ -986,7 +997,7 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
-    async fn list_merged_branch_names(&self, _repo_root: &Path, limit: usize) -> Result<Vec<String>, String> {
+    async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String> {
         let store = self.merged_branches.lock().await;
         Ok(store.iter().take(limit).cloned().collect())
     }
@@ -1385,7 +1396,10 @@ mod tests {
         let second = provider.query(&source, &IssueQuery::default(), 2, 1).await.expect("second page");
         assert_eq!(second.items[0].reference.id, "opaque-A");
         assert!(!second.has_more);
-        let search = provider.query(&source, &IssueQuery { search: Some("newer".into()), label: None }, 1, 10).await.expect("search");
+        let search = provider
+            .query(&source, &IssueQuery { search: Some("newer".into()), label: None, match_fields: Default::default() }, 1, 10)
+            .await
+            .expect("search");
         assert_eq!(search.items[0].reference.id, "opaque-B");
 
         let changes = provider.list_changed_since(&source, &cutoff, 10).await.expect("cutoff changes");

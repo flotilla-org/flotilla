@@ -345,12 +345,19 @@ pub enum TerminalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneExitAttention {
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedTerminal {
     pub set_id: AttachableSetId,
     pub role: String,
     pub command: String,
     pub working_directory: PathBuf,
     pub status: TerminalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<PaneExitAttention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

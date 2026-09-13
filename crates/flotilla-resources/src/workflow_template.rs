@@ -8,9 +8,16 @@ use flotilla_protocol::LeafOperator;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
 
-define_resource!(WorkflowTemplate, "workflowtemplates", WorkflowTemplateSpec, (), NoStatusPatch);
+define_resource!(
+    WorkflowTemplate,
+    "workflowtemplates",
+    WorkflowTemplateSpec,
+    (),
+    NoStatusPatch,
+    replication = ReplicationClass::Definitions
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkflowTemplateSpec {
@@ -295,10 +302,10 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
-/// Interim default while contained crews lack credential seeding
-/// (flotilla-org/flotilla#1140): the single-agent coding workflow with a
-/// trusted stance. Retire in favour of `single-agent-contained` once the
-/// contained smoke passes with credentials.
+/// Single-agent coding workflow with explicit trusted host access.
+///
+/// This remains available for operators to select explicitly; ordinary
+/// project dispatch defaults to `single-agent-contained`.
 pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
@@ -377,18 +384,39 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
 }
 
 fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, TurnDeliveryRule> {
-    IndexMap::from([(
-        "actionable-review".to_string(),
-        TurnDeliveryRule::builder()
-            .on("$cr.review.actionable-at-head == true".parse().expect("valid stock review leaf"))
-            .to(TurnDeliveryTarget::builder().vessel(vessel.to_string()).role(role.to_string()).build())
-            .brief("Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim.".to_string())
-            .hold(HoldAct::ChangeRequestComment {
-                body: "Flotilla paused automatic turn delivery after repeated actionable-review episodes; human attention is required."
-                    .to_string(),
-            })
-            .build(),
-    )])
+    let target = || TurnDeliveryTarget::builder().vessel(vessel.to_string()).role(role.to_string()).build();
+    IndexMap::from([
+        (
+            "actionable-review".to_string(),
+            TurnDeliveryRule::builder()
+                .on("$cr.review.actionable-at-head == true".parse().expect("valid stock review leaf"))
+                .to(target())
+                .brief(
+                    "Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim."
+                        .to_string(),
+                )
+                .hold(HoldAct::ChangeRequestComment {
+                    body: "Flotilla paused automatic turn delivery after repeated actionable-review episodes; human attention is required."
+                        .to_string(),
+                })
+                .build(),
+        ),
+        (
+            "conflicting".to_string(),
+            TurnDeliveryRule::builder()
+                .on("$cr.mergeable == conflicting".parse().expect("valid stock mergeability leaf"))
+                .to(target())
+                .brief(
+                    "Rebase onto the current base branch and resolve conflicts additively, keeping both sides' intent. Regenerate generated files rather than hand-merging them. Re-run the repository's pinned CI gates, push the same branch, process any review, and file a fresh settlement claim; the previous claim is superseded."
+                        .to_string(),
+                )
+                .hold(HoldAct::ChangeRequestComment {
+                    body: "Flotilla paused automatic turn delivery after repeated conflicting episodes; human attention is required."
+                        .to_string(),
+                })
+                .build(),
+        ),
+    ])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
