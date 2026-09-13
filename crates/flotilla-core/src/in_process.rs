@@ -10886,7 +10886,7 @@ impl InProcessDaemon {
             })
             .collect::<Vec<_>>();
 
-        let mut evaluation = evaluate_landing_settlement(
+        let evaluation = evaluate_landing_settlement(
             &convoy,
             &selected_vessels,
             &selected_checkouts,
@@ -10895,18 +10895,6 @@ impl InProcessDaemon {
             LANDING_EVIDENCE_TTL,
             now,
         );
-        if convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.attention.as_ref())
-            .is_some_and(|attention| attention.reason == "crew completed without a decision ledger")
-        {
-            evaluation.satisfied = false;
-            evaluation.unmet.push(flotilla_resources::UnmetSettlementExpectation::InvalidCondition {
-                subject: convoy.metadata.name.clone(),
-                message: "crew completed without a decision ledger".to_string(),
-            });
-        }
         let mut unmet = evaluation.unmet.into_iter().map(explain_unmet_expectation).collect::<Vec<_>>();
         unmet.extend(observation_errors.iter().map(|(record, error)| ExplainedUnmetExpectation {
             reason: "observation_error".to_string(),
@@ -11009,7 +10997,7 @@ impl InProcessDaemon {
 }
 
 fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {
-    let mut ledgers = status
+    status
         .into_iter()
         .flat_map(|status| &status.crew_work)
         .flat_map(|(vessel, crew)| {
@@ -11025,26 +11013,7 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
                 },
             )
         })
-        .collect::<Vec<_>>();
-    if let Some(attention) = status.and_then(|status| status.attention.as_ref()) {
-        if let Some(target) = attention.source.strip_prefix("crew-completion/") {
-            if let Some((vessel, role)) = target.rsplit_once('/') {
-                ledgers.push(ExplainedDecisionLedger {
-                    vessel: vessel.to_string(),
-                    role: role.to_string(),
-                    claimed_at: Some(attention.raised_at.to_rfc3339()),
-                    comment_url: None,
-                    missing: true,
-                    override_principal: None,
-                    completed_while_crew_active: status
-                        .and_then(|status| status.crew_work.get(vessel))
-                        .and_then(|crew| crew.get(role))
-                        .is_some_and(|claim| claim.completed_while_crew_active),
-                });
-            }
-        }
-    }
-    ledgers
+        .collect()
 }
 
 #[async_trait]

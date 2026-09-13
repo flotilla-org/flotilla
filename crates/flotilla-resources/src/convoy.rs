@@ -749,14 +749,6 @@ pub enum ConvoyStatusPatch {
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
     },
-    HoldCrewCompletion {
-        vessel: String,
-        role: String,
-        attempted_at: DateTime<Utc>,
-        message: Option<String>,
-        disposition: Option<String>,
-        completed_while_crew_active: bool,
-    },
     MarkCrewFailed {
         vessel: String,
         role: String,
@@ -1047,20 +1039,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.completed_while_crew_active |= *completed_while_crew_active;
                 }
-                if status.attention.as_ref().is_some_and(|attention| attention.source == format!("crew-completion/{vessel}/{role}")) {
-                    status.attention = None;
-                }
                 enter_landing_if_completion_claims_settled(status);
-            }
-            Self::HoldCrewCompletion { vessel, role, attempted_at, message, disposition, completed_while_crew_active } => {
-                let reason = "crew completed without a decision ledger".to_string();
-                status.attention =
-                    Some(ConvoyAttention { source: format!("crew-completion/{vessel}/{role}"), reason, raised_at: *attempted_at });
-                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                    state.message = message.clone();
-                    state.disposition = disposition.clone();
-                    state.completed_while_crew_active |= *completed_while_crew_active;
-                }
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -1155,9 +1134,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         }
                     }
                     state.completed_while_crew_active |= *completed_while_crew_active;
-                }
-                if status.attention.as_ref().is_some_and(|attention| attention.source == format!("crew-completion/{vessel}/{role}")) {
-                    status.attention = None;
                 }
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
@@ -1360,17 +1336,6 @@ pub mod external_patches {
             completed_while_crew_active,
             forced_by,
         }
-    }
-
-    pub fn hold_crew_completion(
-        vessel: String,
-        role: String,
-        attempted_at: DateTime<Utc>,
-        message: Option<String>,
-        disposition: Option<String>,
-        completed_while_crew_active: bool,
-    ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::HoldCrewCompletion { vessel, role, attempted_at, message, disposition, completed_while_crew_active }
     }
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
