@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 pub const UNIT_NAME: &str = "flotillad.service";
+#[cfg(any(test, target_os = "linux"))]
 const MANAGED_MARKER: &str = "# managed by fleet-install";
 
 #[cfg(target_os = "linux")]
@@ -19,14 +20,15 @@ fn default_user_unit() -> Result<PathBuf, String> {
 fn systemd_path(path: &Path) -> Result<String, String> {
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set; cannot validate the flotillad systemd unit".to_string())?;
     let home = PathBuf::from(home);
-    let rendered = if path == home {
-        "%h".to_string()
-    } else if let Ok(relative) = path.strip_prefix(&home) {
-        format!("%h/{}", relative.display())
+    if path == home {
+        return Ok("%h".to_string());
+    }
+    let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    if let Ok(relative) = path.strip_prefix(&home) {
+        Ok(format!("%h/{}", escape(&relative.display().to_string())))
     } else {
-        path.display().to_string()
-    };
-    Ok(rendered.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replacen("%%h", "%h", 1))
+        Ok(escape(&path.display().to_string()))
+    }
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -135,5 +137,13 @@ mod tests {
         assert!(unit_has_daemon_identity(&unit, &socket, &config, &state).expect("valid unit"));
         assert!(!unit_has_daemon_identity(&unit.replace(MANAGED_MARKER, "# local unit"), &socket, &config, &state).expect("local unit"));
         assert!(!unit_has_daemon_identity(&unit, &socket, &config, &state.join("other")).expect("different identity"));
+    }
+
+    #[test]
+    fn literal_systemd_specifier_outside_home_is_escaped() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME should be set for tests"));
+        let outside_home = home.parent().expect("HOME should have a parent").join("literal-%h/socket");
+
+        assert!(systemd_path(&outside_home).expect("render path").contains("%%h"));
     }
 }
