@@ -359,6 +359,13 @@ cat >"$fake_bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+if [[ "$*" == '--user is-enabled flotillad.service' ]]; then
+  if [[ "${SYSTEMD_UNIT_DISABLED:-false}" == true ]]; then
+    printf 'disabled\n'
+    exit 1
+  fi
+  printf 'enabled\n'
+fi
 SH
 chmod 0755 "$fake_bin/systemctl"
 
@@ -542,6 +549,14 @@ grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd 
 grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
 grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not started'
 grep -Eq '^enable-linger .+$' "$test_root/loginctl.log" || fail 'systemd lingering was not enabled'
+
+: >"$test_root/systemctl.log"
+SYSTEMD_UNIT_DISABLED=true run_installer "$generation_one" >"$test_root/linux-dev-mode-install.out"
+grep -Fq 'preserving flotillad dev mode' "$test_root/linux-dev-mode-install.out" \
+  || fail 'Linux install did not report preserved dev mode'
+if grep -Eq -- '^--user (enable|restart) flotillad\.service$' "$test_root/systemctl.log"; then
+  fail 'Linux install enabled or restarted the fleet unit while dev mode was active'
+fi
 
 status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
