@@ -559,10 +559,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="$daemon_path"
+ExecStart="$daemon_path" --timeout 0
 Environment="PATH=$fleet_bin_path:$cargo_bin_path:/usr/local/bin:/usr/bin:/bin"
 Environment="FLOTILLA_SKILLS_DIR=$skills_path"
-Restart=on-failure
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=default.target
@@ -634,6 +635,8 @@ content = {
     "Label": label,
     "ProgramArguments": [
         daemon,
+        "--timeout",
+        "0",
         "--config-dir",
         config_dir,
         "--state-dir",
@@ -645,7 +648,7 @@ content = {
     "StandardErrorPath": stderr_path,
     "StandardOutPath": stdout_path,
     "RunAtLoad": True,
-    "KeepAlive": {"SuccessfulExit": False},
+    "KeepAlive": True,
 }
 with open(destination, "wb") as output:
     plistlib.dump(content, output, sort_keys=False)
