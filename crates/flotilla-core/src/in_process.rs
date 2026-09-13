@@ -8219,6 +8219,21 @@ impl InProcessDaemon {
         .map_err(|error| error.to_string())
     }
 
+    async fn record_lifecycle_mutation_best_effort(
+        &self,
+        namespace: &str,
+        name: &str,
+        action: &str,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+        missing_expected: bool,
+    ) {
+        if let Err(error) = self.record_lifecycle_mutation(namespace, name, action, caller).await {
+            if !missing_expected || !error.contains("not found") {
+                warn!(%error, %namespace, convoy = %name, %action, "failed to persist lifecycle mutation attribution");
+            }
+        }
+    }
+
     async fn apply_crew_work_patch(
         &self,
         requested: &CrewCommandContext,
@@ -9789,11 +9804,13 @@ impl InProcessDaemon {
                 Ok(record_name) => {
                     match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
                         Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
-                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_resume", caller.as_ref()).await;
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .await;
                             flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
                         }
                         Ok(ConvoyResumeOutcome::Queued { displaced }) => {
-                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_resume", caller.as_ref()).await;
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
+                                .await;
                             flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
                         }
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
@@ -9838,7 +9855,8 @@ impl InProcessDaemon {
                 Ok(()) => {
                     if let Some(resolved) = routing {
                         let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
-                        let _ = self.record_lifecycle_mutation(namespace, &resolved.convoy, "crew_complete", caller.as_ref()).await;
+                        self.record_lifecycle_mutation_best_effort(namespace, &resolved.convoy, "crew_complete", caller.as_ref(), false)
+                            .await;
                     }
                     flotilla_protocol::CommandValue::Ok
                 }
@@ -9869,7 +9887,7 @@ impl InProcessDaemon {
                     Ok(()) => {
                         // Finalizers retain an explainable convoy after delete; a fully
                         // removed convoy has no remaining status to annotate.
-                        let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_delete", caller.as_ref()).await;
+                        self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_delete", caller.as_ref(), true).await;
                         flotilla_protocol::CommandValue::Ok
                     }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
@@ -9890,7 +9908,8 @@ impl InProcessDaemon {
                 Ok(record_name) => {
                     match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
                         Ok(archives) => {
-                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_abandon", caller.as_ref()).await;
+                            self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_abandon", caller.as_ref(), false)
+                                .await;
                             flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives }
                         }
                         Err(message) => flotilla_protocol::CommandValue::Error { message },

@@ -496,7 +496,7 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
-                            let caller = caller::socket_caller(&stream, &daemon.provisioning_namespace().await);
+                            let peer_credential = caller::socket_peer_credential(&stream);
                             let daemon = Arc::clone(&daemon);
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
@@ -509,6 +509,10 @@ impl DaemonServer {
 
                             let shutdown_request_tx = shutdown_request_tx.clone();
                             connection_tasks.spawn(async move {
+                                let namespace = daemon.provisioning_namespace().await;
+                                let caller = tokio::task::spawn_blocking(move || caller::caller_from_peer(peer_credential, &namespace))
+                                    .await
+                                    .ok();
                                 handle_client_with_caller(
                                     stream,
                                     daemon,
@@ -522,7 +526,7 @@ impl DaemonServer {
                                     peer_connected_tx,
                                     agent_state_store,
                                     None,
-                                    Some(caller),
+                                    caller,
                                 )
                                 .await;
                             });

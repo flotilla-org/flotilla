@@ -2,11 +2,19 @@ use std::{collections::HashMap, fs, path::Path};
 
 use flotilla_protocol::{CallerCrew, CallerProcess, CommandCaller, PrincipalRef};
 
-pub(super) fn socket_caller(stream: &tokio::net::UnixStream, namespace: &str) -> CommandCaller {
+pub(super) struct PeerCredential {
+    pid: Option<u32>,
+    uid: u32,
+}
+
+pub(super) fn socket_peer_credential(stream: &tokio::net::UnixStream) -> Option<PeerCredential> {
+    let credentials = stream.peer_cred().ok()?;
+    Some(PeerCredential { pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()), uid: credentials.uid() })
+}
+
+pub(super) fn caller_from_peer(peer: Option<PeerCredential>, namespace: &str) -> CommandCaller {
     let principal_ref = PrincipalRef::implicit_for_namespace(namespace);
-    let process = stream.peer_cred().ok().and_then(|credentials| {
-        credentials.pid().and_then(|pid| u32::try_from(pid).ok()).map(|pid| process_identity(pid, credentials.uid()))
-    });
+    let process = peer.and_then(|credentials| credentials.pid.map(|pid| process_identity(pid, credentials.uid)));
     let crew = process.as_ref().and_then(|process| read_environ(process.pid)).and_then(|environment| crew_identity(&environment));
     CommandCaller { principal_ref, process, crew }
 }
@@ -78,7 +86,7 @@ mod tests {
         let (stream, _) = accepted.expect("accept unix peer");
         connected.expect("connect unix peer");
 
-        let caller = socket_caller(&stream, "flotilla");
+        let caller = caller_from_peer(socket_peer_credential(&stream), "flotilla");
         let process = caller.process.expect("peer process identity");
         assert_eq!(process.pid, std::process::id());
         assert_eq!(process.uid, unsafe { libc::geteuid() });
