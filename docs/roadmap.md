@@ -61,6 +61,11 @@ until boundary-proven, *then* promote to separate repos (as cleat/porthole are).
 
 ## Cross-cutting
 
+Phase 4's [provisional Tender design](architecture/tender.md) records the
+publication and connection model, source-level extraction assessment, and
+remaining decisions. It refines the earlier per-host sketch to per-user
+instances, including dedicated service accounts; these remain working choices.
+
 - **Tests ride along with the refactors.** Verbose, ad-hoc tests for old
   shapes get deleted wholesale as those shapes move; new shapes get **contract
   tests** per the CLAUDE.md testing philosophy. The only standalone test work
