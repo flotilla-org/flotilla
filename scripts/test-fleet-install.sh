@@ -590,7 +590,7 @@ printf '# managed by fleet-install\nstale unit\n' >"$unit"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0 --config-dir="%h/.config/flotilla" --state-dir="%h/.local/state/flotilla" --socket="%h/.config/flotilla/run/flotilla.sock"' "$unit" \
   || fail 'exact-generation reinstall did not refresh the systemd user unit'
 test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not reload the systemd user manager exactly once'
