@@ -6,8 +6,33 @@ workflow="$repo_root/.forgejo/workflows/fleet-candidates.yml"
 builder="$repo_root/ci/fleet-candidates/build-candidate.sh"
 setup="$repo_root/ci/fleet-candidates/setup-linux-toolchain.sh"
 installer="$repo_root/ci/fleet-candidates/install-candidate.sh"
+toolchain="$repo_root/ci/fleet-candidates/cleat-toolchain.sh"
 
-bash -n "$builder" "$setup" "$installer"
+bash -n "$builder" "$setup" "$installer" "$toolchain"
+if grep -Fq 'test "$(zig version)" = "0.16.0"' "$builder"; then
+  echo 'candidate builder must derive the Zig version from the Cleat toolchain pin' >&2
+  exit 1
+fi
+grep -Fq 'read_cleat_toolchain_value "$cleat_root/tools/ghostty-toolchain.toml" zig version' "$builder"
+
+# shellcheck disable=SC1090
+source "$toolchain"
+test "$(read_cleat_toolchain_value /dev/stdin zig version <<'EOF'
+[zig]
+version = "0.16.0"
+
+[zig_sha256]
+x86_64-linux = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+EOF
+)" = 0.16.0
+test "$(read_cleat_toolchain_value /dev/stdin zig_sha256 x86_64-linux <<'EOF'
+[zig]
+version = "0.16.0"
+
+[zig_sha256]
+x86_64-linux = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+EOF
+)" = 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 
 grep -Fq 'workflow_dispatch:' "$workflow"
 if grep -Eq '^[[:space:]]+(push|pull_request):' "$workflow"; then
