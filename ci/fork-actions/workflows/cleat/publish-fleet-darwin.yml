@@ -26,7 +26,6 @@ jobs:
         run: |
           test "$(uname -s)" = Darwin
           test "$(uname -m)" = arm64
-          test "$(zig version)" = 0.15.2
           : "${FLEET_CODESIGN_IDENTITY:?runner environment must provide FLEET_CODESIGN_IDENTITY}"
           : "${FLEET_MACOS_SDK:?runner environment must provide FLEET_MACOS_SDK}"
           test -d "$FLEET_MACOS_SDK"
@@ -48,6 +47,7 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$FLEET_COMMIT_SHA"
           git clean -ffdx -e target/ -e .tools/
+          bash ci/fork-actions/runtime/cleat/verify-zig-version.sh
 
       - name: Prepare Ghostty VT
         run: |
