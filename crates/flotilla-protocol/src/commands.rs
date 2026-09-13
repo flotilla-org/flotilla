@@ -226,6 +226,15 @@ pub struct ExplainedCrewDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedMaterialLease {
+    pub environment: String,
+    pub pool_ref: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedUnmetExpectation {
     pub reason: String,
     pub subject: String,
@@ -253,6 +262,8 @@ pub struct ConvoyExplanation {
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_leases: Vec<ExplainedMaterialLease>,
     pub settlement: ExplainedSettlement,
 }
 

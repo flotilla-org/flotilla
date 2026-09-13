@@ -180,7 +180,7 @@ where
             return Ok(TerminalDeps::None);
         }
 
-        if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
+        if !environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready) {
             return Ok(TerminalDeps::Waiting);
         }
 

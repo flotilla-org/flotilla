@@ -534,6 +534,11 @@ impl DaemonRuntime {
                 options.namespace.clone(),
                 options.controller_resync_interval,
             ));
+            tasks.push(spawn_agent_material_lease_reconciliation_task(
+                Arc::clone(&state),
+                options.namespace.clone(),
+                options.controller_resync_interval,
+            ));
             tasks.extend(spawn_controller_loops(
                 state,
                 &options.namespace,
@@ -1336,6 +1341,91 @@ fn spawn_provisioned_environment_reconciliation_task(
             }
         }
     })
+}
+
+fn spawn_agent_material_lease_reconciliation_task(
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+    interval: Duration,
+) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let state = Arc::clone(&state);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = reconcile_agent_material_leases(&state, &namespace).await {
+                warn!(%error, "failed to reconcile parked agent material leases");
+            }
+        }
+    })
+}
+
+async fn reconcile_agent_material_leases(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
+    let Some(registry) = state.agent_material.as_deref() else {
+        return Ok(());
+    };
+    let backend = state.daemon.resource_backend();
+    let convoys = backend.using::<Convoy>(namespace);
+    let environments = backend.using::<Environment>(namespace);
+    for environment in environments.list().await.map_err(|error| error.to_string())?.items {
+        let Some(spec) = environment.spec.docker.as_ref() else {
+            continue;
+        };
+        if !spec.required_agent_adapters.contains("codex")
+            || environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready)
+        {
+            continue;
+        }
+        let Some(convoy_ref) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) else {
+            continue;
+        };
+        let convoy = match convoys.get(convoy_ref).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let phase = convoy.status.as_ref().map(|status| status.phase);
+        let mut status = environment.status.clone().expect("ready environment has status");
+        let changed;
+        if phase == Some(flotilla_resources::ConvoyPhase::Landing) {
+            if !matches!(status.wait_reason, Some(EnvironmentWaitReason::MaterialLeaseReleased { .. })) {
+                registry.release(&environment.metadata.name).await?;
+                status.ready = false;
+                status.message = Some("codex login lease released while convoy is Landing".to_string());
+                status.wait_reason = Some(EnvironmentWaitReason::MaterialLeaseReleased { pool_ref: "codex-login".to_string() });
+                changed = true;
+            } else {
+                changed = false;
+            }
+        } else if matches!(phase, Some(flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Interrupted))
+            && !status.ready
+        {
+            match registry.prepare(&environment.metadata.name, &spec.required_agent_adapters, &spec.env).await {
+                Ok(_) => {
+                    status.ready = true;
+                    status.message = None;
+                    status.wait_reason = None;
+                    changed = true;
+                }
+                Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
+                    changed = status.message.as_ref() != Some(&message)
+                        || status.wait_reason != Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: pool_ref.clone() });
+                    status.message = Some(message);
+                    status.wait_reason = Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref });
+                }
+                Err(AgentMaterialPrepareError::Failed(error)) => return Err(error),
+            }
+        } else {
+            continue;
+        }
+        if !changed {
+            continue;
+        }
+        environments
+            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &status)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
@@ -3328,7 +3418,7 @@ mod tests {
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
         CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-        CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPoolSpec, MaterialPoolUnitSpec,
+        CredentialSpecSpec, CrewSource, CrewSpec, LifecycleAuthority, MaterialPool, MaterialPoolSpec, MaterialPoolUnitSpec,
         ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus, RepositoryKey, RepositorySpec, Resource,
         Selector, SqliteBackend, TerminalAttentionState, TerminalSession, TerminalSessionPhase, VesselRequirement, VesselSpec,
         VesselStatus, VirtualClock, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
@@ -4452,7 +4542,11 @@ mod tests {
 
         assert_eq!(error.to_string(), "stop after capturing create options");
         let opts = provider.create_opts.lock().await.take().expect("captured create options");
-        assert!(opts.provisioned_mounts.contains(&ProvisionedMount::new(slot, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw,)));
+        assert!(opts.provisioned_mounts.contains(&ProvisionedMount::new(
+            home.join(".local/share/flotilla/agent-homes/contained-work/codex"),
+            CONTAINER_CODEX_HOME,
+            ProvisionedMountMode::Rw,
+        )));
         assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
 
         let mut preconfigured = spec;
@@ -4467,6 +4561,123 @@ mod tests {
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
             "a placement-provided CODEX_HOME must not be overwritten with a leased slot"
         );
+    }
+
+    #[tokio::test]
+    async fn landing_releases_codex_lease_and_active_turn_waits_then_reacquires() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"lease-lifecycle-test\"\n").expect("daemon config");
+        let home = temp.path().join("home");
+        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
+        fs::create_dir_all(&slot).expect("slot directory");
+        fs::write(slot.join("auth.json"), "{\"tokens\":\"test\"}").expect("slot auth");
+        fs::set_permissions(slot.join("auth.json"), fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("dinghy"),
+        )
+        .await;
+        let material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+        ));
+        let state = ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        )
+        .with_agent_material(Arc::clone(&material));
+        let required = BTreeSet::from(["codex".to_string()]);
+        material.prepare("work", &required, &BTreeMap::new()).await.expect("initial lease");
+
+        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("lease-convoy"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+            .await
+            .expect("convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                ..Default::default()
+            })
+            .await
+            .expect("landing");
+        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
+        let environment = environments
+            .create(
+                &empty_meta_with_labels("work", BTreeMap::from([(CONVOY_LABEL.to_string(), "lease-convoy".to_string())])),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        host_ref: "host-test".to_string(),
+                        image: "test".to_string(),
+                        declared_agent_adapters: required.clone(),
+                        required_agent_adapters: required.clone(),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::new(),
+                    }),
+                },
+            )
+            .await
+            .expect("environment");
+        environments
+            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+                phase: EnvironmentPhase::Ready,
+                ready: true,
+                ..Default::default()
+            })
+            .await
+            .expect("ready");
+
+        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("release in Landing");
+        assert!(daemon
+            .resource_backend()
+            .using::<MaterialPool>(NAMESPACE)
+            .get("codex-login")
+            .await
+            .expect("pool")
+            .status
+            .expect("status")
+            .leases
+            .is_empty());
+        assert!(matches!(
+            environments.get("work").await.expect("released environment").status.expect("status").wait_reason,
+            Some(EnvironmentWaitReason::MaterialLeaseReleased { .. })
+        ));
+
+        material.prepare("blocker", &required, &BTreeMap::new()).await.expect("occupy only unit");
+        let convoy = convoys.get("lease-convoy").await.expect("convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                ..convoy.status.expect("status")
+            })
+            .await
+            .expect("deliver turn");
+        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("wait for exhausted pool");
+        assert!(matches!(
+            environments.get("work").await.expect("waiting environment").status.expect("status").wait_reason,
+            Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })
+        ));
+
+        material.release("blocker").await.expect("free unit");
+        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("reacquire");
+        let status = environments.get("work").await.expect("resumed environment").status.expect("status");
+        assert!(status.ready);
+        assert!(status.wait_reason.is_none());
     }
 
     #[tokio::test]

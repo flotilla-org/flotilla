@@ -84,12 +84,16 @@ pub enum EnvironmentWaitReason {
     /// Capacity contention surfaced immediately by Vessel planning rather than
     /// waiting for the generic provisioning-stuck threshold.
     MaterialPoolExhausted { pool_ref: String },
+    /// A parked environment intentionally released scarce agent login material.
+    MaterialLeaseReleased { pool_ref: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
     MarkWaiting { message: String, reason: EnvironmentWaitReason },
+    MarkMaterialReleased { message: String, pool_ref: String },
+    MarkMaterialReady,
     MarkFailed { message: String },
     MarkTerminating,
 }
@@ -111,6 +115,16 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.ready = false;
                 status.message = Some(message.clone());
                 status.wait_reason = Some(reason.clone());
+            }
+            Self::MarkMaterialReleased { message, pool_ref } => {
+                status.ready = false;
+                status.message = Some(message.clone());
+                status.wait_reason = Some(EnvironmentWaitReason::MaterialLeaseReleased { pool_ref: pool_ref.clone() });
+            }
+            Self::MarkMaterialReady => {
+                status.ready = true;
+                status.message = None;
+                status.wait_reason = None;
             }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;
