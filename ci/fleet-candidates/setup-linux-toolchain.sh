@@ -19,6 +19,7 @@ if [[ ${#cleat_sha} -ne 40 || "$cleat_sha" == *[!0-9a-fA-F]* ]]; then
   printf 'FLEET_CLEAT_SHA must be an exact 40-character hexadecimal commit: %s\n' "$cleat_sha" >&2
   return 1
 fi
+cleat_sha="$(printf '%s' "$cleat_sha" | tr 'A-F' 'a-f')"
 cleat_toolchain="$toolchain_root/cleat-$cleat_sha-ghostty-toolchain.toml"
 if [[ ! -f "$cleat_toolchain" ]]; then
   cleat_toolchain_download="$cleat_toolchain.download"
