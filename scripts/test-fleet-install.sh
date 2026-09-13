@@ -530,13 +530,14 @@ for name in flotilla flotillad cleat; do
 done
 unit="$test_root/home/.config/systemd/user/flotillad.service"
 test -f "$unit" || fail 'systemd user unit was not installed'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
-  || fail 'systemd user unit does not use the stable flotillad path'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
+  || fail 'systemd user unit does not run the stable flotillad path without an idle timeout'
 grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
   || fail 'systemd user unit does not expose the fleet binary PATH'
 grep -Fxq 'Environment="FLOTILLA_SKILLS_DIR=%h/.local/opt/flotilla-fleet/current/share/flotilla/skills"' "$unit" \
   || fail 'systemd user unit does not select the generation-pinned skills'
-grep -Fxq 'Restart=on-failure' "$unit" || fail 'systemd user unit does not restart after failures'
+grep -Fxq 'Restart=always' "$unit" || fail 'systemd user unit does not always restart'
+grep -Fxq 'RestartSec=5' "$unit" || fail 'systemd user unit does not delay restarts'
 grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd user manager was not reloaded'
 grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
 grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not started'
@@ -589,7 +590,7 @@ printf '# managed by fleet-install\nstale unit\n' >"$unit"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad"' "$unit" \
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
   || fail 'exact-generation reinstall did not refresh the systemd user unit'
 test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not reload the systemd user manager exactly once'
@@ -719,7 +720,7 @@ HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_b
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" "$generation_one" >"$test_root/custom-paths.out"
-grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\"" "$unit" \
+grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\" --timeout 0" "$unit" \
   || fail 'systemd user unit ignored the configured fleet root'
 grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet binary directory'
@@ -765,6 +766,8 @@ home = sys.argv[2]
 assert agent["Label"] == "work.flotilla.flotillad"
 assert agent["ProgramArguments"] == [
     f"{home}/.local/opt/flotilla-fleet/current/bin/flotillad",
+    "--timeout",
+    "0",
     "--config-dir",
     f"{home}/.config/flotilla",
     "--state-dir",
@@ -779,7 +782,7 @@ assert "/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
 assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/flotillad.stderr.log"
 assert agent["StandardOutPath"] == f"{home}/Library/Logs/flotilla/flotillad.stdout.log"
 assert agent["RunAtLoad"] is True
-assert agent["KeepAlive"] == {"SuccessfulExit": False}
+assert agent["KeepAlive"] is True
 PY
 test -d "$darwin_home/Library/Logs/flotilla" \
   || fail 'Darwin install did not create the launchd log directory'
