@@ -43,7 +43,7 @@ provider rather than failing detection.
 ### Checkout config merge
 
 Checkout config follows a two-tier merge: per-repo overrides in
-`~/.config/flotilla/repos/{slug}.toml` take precedence over global defaults in
+Repository-spec provider preferences take precedence over global defaults in
 `~/.config/flotilla/config.toml`. Fields are `Option<T>` so "not set" is
 distinguishable from "set to default."
 

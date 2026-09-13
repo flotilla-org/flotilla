@@ -172,13 +172,18 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// Whether the principal currently occupies the terminal's controller
+    /// seat. Cleat's attachment state is authoritative for this observation.
+    #[serde(default)]
+    pub occupancy: TerminalOccupancy,
     /// A crew completion accepted by this host but not yet acknowledged by
     /// the convoy authority. The local terminal session owns this durable
     /// intent so a daemon restart or mesh partition cannot lose the final act.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_pending: Option<CrewCompletionPending>,
     /// Set when the controller exhausts its budget for one repeated reconcile
-    /// error. The session remains parked until an explicit restart clears it.
+    /// error. The controller may either park or continue retrying with backoff,
+    /// according to its error policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<TerminalSessionDegradedCondition>,
 }
@@ -188,6 +193,8 @@ pub struct CrewCompletionPending {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ledger_ref: Option<String>,
     pub attempted_at: DateTime<Utc>,
     pub authority: String,
     pub last_error: String,
@@ -197,6 +204,8 @@ pub struct CrewCompletionPending {
 pub struct TerminalSessionDegradedCondition {
     pub reason: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub consecutive_failures: u32,
     pub observed_at: DateTime<Utc>,
 }
@@ -215,6 +224,15 @@ pub enum TerminalAttentionState {
 pub enum TerminalAttentionSource {
     Hook,
     Screen,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOccupancy {
+    Occupied,
+    Vacant,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +306,11 @@ pub enum TerminalSessionStatusPatch {
     MarkMessageDelivered {
         message_id: String,
     },
+    MarkDeliveryUnconfirmed {
+        message_id: String,
+        message: String,
+        observed_at: DateTime<Utc>,
+    },
     MarkStopped {
         stopped_at: DateTime<Utc>,
         inner_command_status: Option<InnerCommandStatus>,
@@ -303,8 +326,13 @@ pub enum TerminalSessionStatusPatch {
         consecutive_failures: u32,
         observed_at: DateTime<Utc>,
     },
+    ClearReconcileDegraded,
     ObserveAttention {
         attention: TerminalAttention,
+    },
+    Observe {
+        attention: Option<TerminalAttention>,
+        occupancy: TerminalOccupancy,
     },
     MarkCompletionPending {
         pending: CrewCompletionPending,
@@ -329,14 +357,30 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
+                status.degraded = None;
             }
-            Self::MarkMessageDelivered { message_id } => status.delivered_message_id = Some(message_id.clone()),
+            Self::MarkMessageDelivered { message_id } => {
+                status.delivered_message_id = Some(message_id.clone());
+                status.message = None;
+                status.degraded = None;
+            }
+            Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
+                status.message = Some(message.clone());
+                status.degraded = Some(TerminalSessionDegradedCondition {
+                    reason: "DeliveryUnconfirmed".to_string(),
+                    message: message.clone(),
+                    message_id: Some(message_id.clone()),
+                    consecutive_failures: 1,
+                    observed_at: *observed_at,
+                });
+            }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
                 status.stopped_at.get_or_insert(*stopped_at);
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
                 status.message = message.clone();
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     attention.as_of = *stopped_at;
@@ -348,6 +392,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.stopped_at.get_or_insert(*stopped_at);
                 }
                 status.message = Some(message.clone());
+                status.degraded = None;
                 if let Some(attention) = &mut status.attention {
                     attention.state = TerminalAttentionState::Unobservable;
                     if let Some(stopped_at) = stopped_at {
@@ -356,11 +401,11 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 }
             }
             Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
-                status.phase = TerminalSessionPhase::Failed;
-                status.message = Some(format!("reconcile stopped after {consecutive_failures} consecutive failures: {message}"));
+                status.message = Some(format!("reconcile backing off after {consecutive_failures} consecutive failures: {message}"));
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "ReconcileErrorBudgetExhausted".to_string(),
+                    reason: "ReconcileBackoff".to_string(),
                     message: message.clone(),
+                    message_id: None,
                     consecutive_failures: *consecutive_failures,
                     observed_at: *observed_at,
                 });
@@ -369,11 +414,28 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     attention.as_of = *observed_at;
                 }
             }
+            Self::ClearReconcileDegraded => {
+                status.message = None;
+                status.degraded = None;
+            }
             Self::ObserveAttention { attention } => {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                 if replace {
                     status.attention = Some(attention.clone());
                 }
+                status.message = None;
+                status.degraded = None;
+            }
+            Self::Observe { attention, occupancy } => {
+                status.occupancy = *occupancy;
+                if let Some(attention) = attention {
+                    let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
+                    if replace {
+                        status.attention = Some(attention.clone());
+                    }
+                }
+                status.message = None;
+                status.degraded = None;
             }
             Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
             Self::ClearCompletionPending => status.completion_pending = None,
@@ -457,10 +519,31 @@ mod tests {
     }
 
     #[test]
+    fn delivery_unconfirmed_preserves_the_specific_failure_diagnostic() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).single().expect("valid timestamp");
+        let message = "agent TUI did not become ready before the message delivery deadline; no text was sent";
+        let mut status = TerminalSessionStatus::default();
+
+        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+            message_id: "handoff-1".to_string(),
+            message: message.to_string(),
+            observed_at,
+        }
+        .apply(&mut status);
+
+        assert_eq!(status.message.as_deref(), Some(message));
+        let condition = status.degraded.expect("delivery condition");
+        assert_eq!(condition.reason, "DeliveryUnconfirmed");
+        assert_eq!(condition.message, message);
+        assert_eq!(condition.message_id.as_deref(), Some("handoff-1"));
+    }
+
+    #[test]
     fn pending_completion_survives_terminal_restart_until_acknowledged() {
         let pending = CrewCompletionPending {
             message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
             disposition: None,
+            decision_ledger_ref: None,
             attempted_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).single().expect("valid timestamp"),
             authority: "kiwi".into(),
             last_error: "authority unreachable for convoy-a".into(),

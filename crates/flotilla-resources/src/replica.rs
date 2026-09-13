@@ -15,6 +15,9 @@ pub(crate) const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at
 pub enum ReplicationClass {
     None,
     Definitions,
+    /// Durable facts materialized independently at each root and read as the
+    /// natural-key union of local and replica sources.
+    ConvergentFacts,
     HomeBoundRuntime,
     /// Demand-scoped observed state. Retain only the latest watch handoff
     /// event so lagging peers relist current state instead of replaying history.

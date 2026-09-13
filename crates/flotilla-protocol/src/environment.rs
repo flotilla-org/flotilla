@@ -75,7 +75,7 @@ impl EnvironmentId {
             }
 
             let mut bytes = Vec::with_capacity(encoded.len() / 2);
-            for chunk in encoded.as_bytes().chunks_exact(2) {
+            for chunk in encoded.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(chunk).map_err(|err| format!("invalid environment id encoding: {err}"))?;
                 let byte = u8::from_str_radix(pair, 16)
                     .map_err(|err| format!("invalid environment id encoding: failed to decode '{pair}': {err}"))?;

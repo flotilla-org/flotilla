@@ -21,6 +21,7 @@ use flotilla_protocol::{
     DaemonEvent, DemandBackedMetadata, IssueChangeset, IssueRef, IssueRow, IssueSource, IssueState, QueryId, QueryScope,
     ResultSetCondition, ResultSetState,
 };
+use flotilla_resources::ResolvedIssueSourceBinding;
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
@@ -35,14 +36,14 @@ const MAX_RATE_LIMIT_JITTER: Duration = Duration::from_secs(5);
 
 #[async_trait]
 pub(crate) trait IssueMaterializationResolver: Send + Sync {
-    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String>;
+    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String>;
     async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String>;
 }
 
 #[async_trait]
 impl IssueMaterializationResolver for InProcessDaemon {
-    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
-        self.resolve_issue_sources(scope).await
+    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String> {
+        self.resolve_issue_source_bindings(scope).await
     }
 
     async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
@@ -153,6 +154,7 @@ impl Drop for IssueMaterializer {
 
 struct IssueSourceWindow {
     source: IssueSource,
+    query_params: IssueQuery,
     provider: Arc<dyn IssueProvider>,
     next_page: u32,
     has_more: bool,
@@ -252,8 +254,8 @@ async fn load_window(
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) -> MaterializedWindow {
     let QueryId::Issues { scope, search, label } = query else { unreachable!("issue materializer only accepts issue queries") };
-    let params = IssueQuery { search: search.clone(), label: label.clone() };
-    let sources = match resolver.resolve_issue_sources(scope).await {
+    let base_params = IssueQuery { search: search.clone(), label: label.clone(), match_fields: Default::default() };
+    let bindings = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
             let conditions = vec![unavailable(None, "query scope has no issue source")];
@@ -267,8 +269,10 @@ async fn load_window(
         }
     };
 
-    let loaded = stream::iter(sources.into_iter().map(|source| {
-        let params = params.clone();
+    let loaded = stream::iter(bindings.into_iter().map(|binding| {
+        let source = binding.source;
+        let mut params = base_params.clone();
+        params.match_fields = binding.filter.match_fields.into_iter().map(|(field, value)| (field, value.to_values())).collect();
         async move {
             let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
             // Capture before the request. Re-reading changes is safe; skipping an
@@ -282,6 +286,7 @@ async fn load_window(
             Ok::<_, ResultSetCondition>((
                 IssueSourceWindow {
                     source,
+                    query_params: params,
                     provider,
                     next_page: 2,
                     has_more: page.has_more,
@@ -333,7 +338,7 @@ async fn fetch_more(
         .iter()
         .enumerate()
         .filter(|(_, source)| source.has_more)
-        .map(|(index, source)| (index, Arc::clone(&source.provider), source.source.clone(), issue_params(query), source.next_page))
+        .map(|(index, source)| (index, Arc::clone(&source.provider), source.source.clone(), source.query_params.clone(), source.next_page))
         .collect::<Vec<_>>();
     let mut futures = Vec::<BoxFuture<'static, (usize, Result<IssueResultPage, String>)>>::with_capacity(requests.len());
     for request in requests {
@@ -388,7 +393,11 @@ async fn refresh_window(
     if window.suspended_until.is_some_and(|deadline| deadline > tokio::time::Instant::now()) {
         return;
     }
-    if matches!(query, QueryId::Issues { search: Some(_), .. }) {
+    if matches!(query, QueryId::Issues { search: Some(_), .. })
+        || window.sources.iter().any(|source| !source.query_params.match_fields.is_empty())
+    {
+        // Provider-specific fields are not all present in normalized Issues,
+        // so changed-since results cannot be safely filtered client-side.
         *window = load_window(query, generation, resolver, state, event_tx).await;
         return;
     }
@@ -554,11 +563,6 @@ async fn query_page(
     (index, provider, source, params, page): (usize, Arc<dyn IssueProvider>, IssueSource, IssueQuery, u32),
 ) -> (usize, Result<IssueResultPage, String>) {
     (index, provider.query(&source, &params, page, PAGE_SIZE).await)
-}
-
-fn issue_params(query: &QueryId) -> IssueQuery {
-    let QueryId::Issues { search, label, .. } = query else { unreachable!("issue params require an issue query") };
-    IssueQuery { search: search.clone(), label: label.clone() }
 }
 
 fn issue_matches_query(issue: &flotilla_protocol::Issue, query: &QueryId) -> bool {
@@ -749,8 +753,8 @@ mod tests {
 
     #[async_trait]
     impl IssueMaterializationResolver for ScopeResolver {
-        async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
-            Ok(vec![IssueSource { service: "https://issues.example".into(), scope: scope.name.clone() }])
+        async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String> {
+            Ok(vec![resolved_binding(IssueSource { service: "https://issues.example".into(), scope: scope.name.clone() })])
         }
 
         async fn issue_provider_for(&self, _source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
@@ -810,13 +814,23 @@ mod tests {
 
     #[async_trait]
     impl IssueMaterializationResolver for FixedResolver {
-        async fn resolve_issue_sources(&self, _scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
-            Ok(self.sources.clone())
+        async fn resolve_issue_sources(&self, _scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String> {
+            Ok(self.sources.iter().cloned().map(resolved_binding).collect())
         }
 
         async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
             assert!(self.sources.contains(source));
             Ok(Arc::clone(&self.provider))
+        }
+    }
+
+    fn resolved_binding(source: IssueSource) -> ResolvedIssueSourceBinding {
+        ResolvedIssueSourceBinding {
+            alias: source.scope.clone(),
+            source,
+            filter: Default::default(),
+            create_with: Default::default(),
+            creatable: false,
         }
     }
 

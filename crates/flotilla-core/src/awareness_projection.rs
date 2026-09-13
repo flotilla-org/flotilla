@@ -6,15 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::Utc;
-use flotilla_manifest::keys::{KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY_NAME};
+use flotilla_manifest::keys::{KEY_CHANGE_REQUEST_NUMBER, KEY_CONVOY_NAME};
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
-    AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow,
-    QueryScope, ResourceRef, ResultSetState, Salience, WorkPhase, AWARENESS_REL_FOR_CONVOY, UNKNOWN_REPOSITORY_LABEL,
+    AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
+    ResultSetState, Salience, WorkPhase, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{api_version, Project, Resource};
 
-use crate::salience::{evaluate_entry, SalienceFacts};
+use crate::salience::{evaluate_entry, evaluate_pane_exits, SalienceFacts};
 
 const REPO_FACT_ANNOTATION: &str = "vcs.repo";
 
@@ -26,7 +26,9 @@ pub struct AwarenessInput {
     pub projects: Vec<QueryScope>,
     pub convoys: Vec<ConvoyRow>,
     pub issues: Vec<ScopedIssueRow>,
-    pub checkouts: Vec<CheckoutRow>,
+    /// Observed checkout identities used only to join checkout-targeted
+    /// salience onto real Project nodes. They are never emitted as entries.
+    pub checkout_refs_by_project: HashMap<QueryScope, Vec<ResourceRef>>,
     pub independents: Vec<IndependentRow>,
     pub salience: SalienceFacts,
     pub state: ResultSetState,
@@ -45,6 +47,7 @@ struct Group {
     scope: Option<QueryScope>,
     kind: AwarenessKind,
     refs: Vec<ResourceRef>,
+    salience_targets: Vec<ResourceRef>,
     entries: Vec<AwarenessEntry>,
     counts: AwarenessCounts,
     state: AwarenessState,
@@ -59,6 +62,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             let key = group_key_for_scope(project);
             let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
             group.refs.push(project_resource_ref(&project.namespace, &project.name));
+            group.salience_targets.extend(input.checkout_refs_by_project.get(project).into_iter().flatten().cloned());
         }
     }
 
@@ -75,7 +79,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .collect::<Vec<_>>();
         group.add_entry(enrich_salience(
             AwarenessEntry::builder()
-                .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name))
+                .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name))
                 .kind(AwarenessKind::Convoy)
                 .label(convoy_label(convoy))
                 .state(convoy_state(convoy.phase, convoy.initializing))
@@ -95,7 +99,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             ancestors.extend(project_ancestors.clone());
             group.add_entry(enrich_salience(
                 AwarenessEntry::builder()
-                    .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.name, vessel.name))
+                    .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.resource.name, vessel.name))
                     .kind(AwarenessKind::Vessel)
                     .label(vessel.name.clone())
                     .state(work_state(vessel.phase))
@@ -133,37 +137,6 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .phase(AwarenessPhase::Issue(row.issue.state))
                 .as_of(row.issue.as_of)
                 .issue_refs(vec![row.reference.clone()])
-                .build(),
-            &input.salience,
-            &project_ancestors,
-        ));
-    }
-
-    for checkout in &input.checkouts {
-        let key = input
-            .scope
-            .as_ref()
-            .map(group_key_for_scope)
-            .unwrap_or_else(|| GroupKey::new(format!("repo/{}", checkout.repo), checkout.repo_label.clone()));
-        let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        let project_ancestors =
-            input.scope.as_ref().map(|scope| project_resource_ref(&scope.namespace, &scope.name)).into_iter().collect::<Vec<_>>();
-        group.add_entry(enrich_salience(
-            AwarenessEntry::builder()
-                .id(format!("checkout/{}/{}", checkout.host, checkout.path))
-                .kind(AwarenessKind::Checkout)
-                .label(format!("{} · {}", checkout.branch, checkout.path))
-                .state(AwarenessState::Active)
-                .as_of(as_of)
-                .refs(vec![checkout.resource.clone()])
-                .links(
-                    checkout
-                        .for_convoy
-                        .iter()
-                        .map(|convoy| AwarenessLink { rel: AWARENESS_REL_FOR_CONVOY.to_owned(), target: convoy.clone() })
-                        .collect(),
-                )
-                .annotations(checkout_annotations(checkout))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -214,9 +187,23 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         .into_iter()
         .map(|mut group| {
             group.entries.sort_by(|left, right| entry_rank(left).cmp(&entry_rank(right)).then_with(|| left.label.cmp(&right.label)));
-            let salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
-            let node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
-            let family_summaries = awareness_family_summaries(&group.entries);
+            let mut salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
+            let mut node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
+            // Checkouts remain observation-only. Their pane-exit attention is
+            // owned and rendered by the real Project's Checkouts family.
+            let node_evaluation = evaluate_pane_exits(&group.salience_targets, &input.salience, node_as_of);
+            salience = salience.max(node_evaluation.salience);
+            node_as_of = node_as_of.max(node_evaluation.as_of);
+            let mut family_summaries = awareness_family_summaries(&group.entries);
+            if node_evaluation.salience != Salience::None {
+                family_summaries.push(
+                    AwarenessFamilySummary::builder()
+                        .family(AwarenessFamily::Checkouts)
+                        .salience(node_evaluation.salience)
+                        .as_of(node_evaluation.as_of)
+                        .build(),
+                );
+            }
             let repo_facts =
                 group.entries.iter().filter_map(|entry| entry.annotations.get(REPO_FACT_ANNOTATION).cloned()).collect::<BTreeSet<_>>();
             let annotations = if repo_facts.len() == 1 {
@@ -260,15 +247,8 @@ fn convoy_annotations(convoy: &ConvoyRow) -> HashMap<String, String> {
     annotations
 }
 
-fn checkout_annotations(checkout: &CheckoutRow) -> HashMap<String, String> {
-    let mut annotations = repo_fact_annotations(checkout.repo_fact.as_ref());
-    annotations.insert(KEY_CHECKOUT_BRANCH.to_owned(), checkout.branch.clone());
-    annotations.insert(KEY_CHECKOUT_PATH.to_owned(), checkout.path.clone());
-    annotations
-}
-
 fn awareness_family_summaries(entries: &[AwarenessEntry]) -> Vec<AwarenessFamilySummary> {
-    [AwarenessFamily::Convoys, AwarenessFamily::Issues, AwarenessFamily::Checkouts, AwarenessFamily::Independents]
+    [AwarenessFamily::Convoys, AwarenessFamily::Issues, AwarenessFamily::Independents]
         .into_iter()
         .filter_map(|family| {
             let mut matching = entries.iter().filter(|entry| family_contains(family, entry.kind));
@@ -328,6 +308,7 @@ impl Group {
             scope: key.scope,
             kind,
             refs: Vec::new(),
+            salience_targets: Vec::new(),
             entries: Vec::new(),
             counts: AwarenessCounts::default(),
             state: AwarenessState::Idle,
@@ -380,7 +361,9 @@ fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> Grou
                 )
             })
         }
-        AwarenessGrouping::Convoy => GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name), convoy.name.clone()),
+        AwarenessGrouping::Convoy => {
+            GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name), convoy.name.clone())
+        }
     }
 }
 
@@ -444,12 +427,17 @@ fn state_rank(state: AwarenessState) -> u8 {
     }
 }
 
-fn group_rank(group: &Group) -> (std::cmp::Reverse<u8>, std::cmp::Reverse<usize>, String) {
-    (std::cmp::Reverse(state_rank(group.state)), std::cmp::Reverse(group.counts.total), group.label.clone())
+fn group_rank(group: &Group) -> (bool, std::cmp::Reverse<u8>, std::cmp::Reverse<usize>, String) {
+    (
+        group.entries.iter().all(entry_is_terminal),
+        std::cmp::Reverse(state_rank(group.state)),
+        std::cmp::Reverse(group.counts.total),
+        group.label.clone(),
+    )
 }
 
-fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
-    (std::cmp::Reverse(state_rank(entry.state)).0, match entry.kind {
+fn entry_rank(entry: &AwarenessEntry) -> (bool, std::cmp::Reverse<u8>, u8) {
+    (entry_is_terminal(entry), std::cmp::Reverse(state_rank(entry.state)), match entry.kind {
         AwarenessKind::Issue => 0,
         AwarenessKind::Convoy => 1,
         AwarenessKind::Vessel => 2,
@@ -457,6 +445,22 @@ fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
         AwarenessKind::Checkout => 4,
         AwarenessKind::Fleet | AwarenessKind::Project => 5,
     })
+}
+
+fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
+    match entry.phase {
+        Some(AwarenessPhase::Convoy(phase)) => {
+            matches!(phase, ConvoyPhase::Landed | ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned)
+        }
+        Some(AwarenessPhase::Work(phase)) => {
+            matches!(phase, WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned)
+        }
+        Some(AwarenessPhase::Session(phase)) => {
+            matches!(phase, flotilla_protocol::SessionPhase::Stopped | flotilla_protocol::SessionPhase::Failed)
+        }
+        Some(AwarenessPhase::Issue(phase)) => phase == flotilla_protocol::IssueState::Closed,
+        None => matches!(entry.state, AwarenessState::Done | AwarenessState::Failed | AwarenessState::Cancelled),
+    }
 }
 
 #[cfg(test)]
@@ -469,7 +473,7 @@ mod tests {
     use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
 
     use super::*;
-    use crate::salience::{AttentionFact, DemandFact, RegardFact};
+    use crate::salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact};
 
     fn convoy(project_ref: Option<&str>, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()
@@ -501,23 +505,13 @@ mod tests {
     }
 
     #[test]
-    fn project_grouping_joins_convoys_issues_checkouts_and_independents() {
+    fn project_grouping_joins_convoys_issues_and_independents() {
         let scope = QueryScope::new("flotilla", "platform");
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(scope.clone()),
             grouping: AwarenessGrouping::Project,
             convoys: vec![convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active)],
             issues: vec![ScopedIssueRow { scope: Some(scope.clone()), row: issue("862", "awareness band") }],
-            checkouts: vec![CheckoutRow::builder()
-                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
-                .repo(RepositoryKey("repo-a".into()))
-                .repo_label("github.com/flotilla-org/flotilla")
-                .repo_fact(flotilla_protocol::RepoKey("flotilla-org/flotilla".into()))
-                .path("/work/flotilla")
-                .branch("feat/awareness-band")
-                .host(HostName::new("local"))
-                .authority(flotilla_protocol::LifecycleAuthority::Observed)
-                .build()],
             independents: vec![IndependentRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "scratch"))
                 .name("scratch")
@@ -533,21 +527,15 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].label, "platform");
         assert_eq!(nodes[0].counts.issues, 1);
-        assert_eq!(nodes[0].counts.checkouts, 1);
+        assert_eq!(nodes[0].counts.checkouts, 0);
         assert_eq!(nodes[0].counts.independents, 1);
         assert!(nodes[0].entries.iter().any(|entry| entry.kind == AwarenessKind::Convoy && entry.label == "ship-it"));
-        for kind in [AwarenessKind::Checkout, AwarenessKind::Independent] {
-            let entry = nodes[0].entries.iter().find(|entry| entry.kind == kind).expect("awareness entry");
-            assert_eq!(
-                entry.annotations.get(REPO_FACT_ANNOTATION).map(String::as_str),
-                Some("flotilla-org/flotilla"),
-                "repo grouping uses canonical fact value, not display label",
-            );
-        }
+        let entry = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Independent).expect("independent entry");
+        assert_eq!(entry.annotations.get(REPO_FACT_ANNOTATION).map(String::as_str), Some("flotilla-org/flotilla"));
     }
 
     #[test]
-    fn composed_labels_retain_granular_convoy_and_checkout_annotations() {
+    fn composed_labels_retain_granular_convoy_annotations() {
         let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
         convoy.change_request = Some(ConvoyChangeRequest {
             id: "1044".into(),
@@ -557,16 +545,6 @@ mod tests {
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
             convoys: vec![convoy],
-            checkouts: vec![CheckoutRow::builder()
-                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
-                .repo(RepositoryKey("repo-a".into()))
-                .repo_label("github.com/flotilla-org/flotilla")
-                .path("/work/flotilla")
-                .branch("main")
-                .host(HostName::new("local"))
-                .authority(flotilla_protocol::LifecycleAuthority::Observed)
-                .for_convoy("ship-it")
-                .build()],
             ..AwarenessInput::default()
         });
 
@@ -574,32 +552,6 @@ mod tests {
         assert_eq!(convoy.label, "ship-it · PR #1044");
         assert_eq!(convoy.annotations.get("flotilla.convoy.name").map(String::as_str), Some("ship-it"));
         assert_eq!(convoy.annotations.get("change_request.number").map(String::as_str), Some("1044"));
-
-        let checkout = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Checkout).expect("checkout entry");
-        assert_eq!(checkout.label, "main · /work/flotilla");
-        assert_eq!(checkout.annotations.get("checkout.branch").map(String::as_str), Some("main"));
-        assert_eq!(checkout.annotations.get("checkout.path").map(String::as_str), Some("/work/flotilla"));
-        assert_eq!(checkout.links, vec![flotilla_protocol::AwarenessLink { rel: "for-convoy".to_owned(), target: "ship-it".to_owned() }]);
-    }
-
-    #[test]
-    fn repository_group_carries_canonical_fact_separately_from_display_label() {
-        let (nodes, _) = project_awareness(AwarenessInput {
-            checkouts: vec![CheckoutRow::builder()
-                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
-                .repo(RepositoryKey("repo-a".into()))
-                .repo_label("github.com/flotilla-org/flotilla")
-                .repo_fact(flotilla_protocol::RepoKey("flotilla-org/flotilla".into()))
-                .path("/work/flotilla")
-                .branch("main")
-                .host(HostName::new("local"))
-                .authority(flotilla_protocol::LifecycleAuthority::Observed)
-                .build()],
-            ..AwarenessInput::default()
-        });
-
-        assert_eq!(nodes[0].label, "github.com/flotilla-org/flotilla");
-        assert_eq!(nodes[0].annotations.get(REPO_FACT_ANNOTATION).map(String::as_str), Some("flotilla-org/flotilla"),);
     }
 
     #[test]
@@ -672,6 +624,34 @@ mod tests {
     }
 
     #[test]
+    fn same_role_convoys_use_resource_identity_in_awareness_ids() {
+        let mut andamento = convoy(Some("flotilla/andamento"), "governor", ConvoyPhase::Active);
+        andamento.resource.name = "governor-andamento-01234567".to_owned();
+        let mut wheelhouse = convoy(Some("flotilla/wheelhouse"), "governor", ConvoyPhase::Active);
+        wheelhouse.resource.name = "governor-wheelhouse-89abcdef".to_owned();
+
+        let (nodes, _) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Project,
+            convoys: vec![andamento, wheelhouse],
+            ..AwarenessInput::default()
+        });
+
+        let ids = nodes
+            .iter()
+            .flat_map(|node| &node.entries)
+            .filter(|entry| entry.kind == AwarenessKind::Convoy)
+            .map(|entry| (entry.id.as_str(), entry.label.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                ("convoy/flotilla/governor-andamento-01234567", "governor"),
+                ("convoy/flotilla/governor-wheelhouse-89abcdef", "governor"),
+            ])
+        );
+    }
+
+    #[test]
     fn awareness_state_distinguishes_projection_truncation_from_source_pagination() {
         let source_state = ResultSetState {
             demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
@@ -718,6 +698,24 @@ mod tests {
     }
 
     #[test]
+    fn entry_limit_keeps_live_convoy_ahead_of_terminal_convoys() {
+        let terminal = [ConvoyPhase::Landed, ConvoyPhase::Abandoned, ConvoyPhase::Failed]
+            .into_iter()
+            .enumerate()
+            .map(|(index, phase)| convoy(Some("flotilla/platform"), &format!("terminal-{index}"), phase));
+        let (nodes, state) = project_awareness(AwarenessInput {
+            scope: Some(QueryScope::new("flotilla", "platform")),
+            limit: AwarenessLimit { groups: 1, entries: 2 },
+            convoys: terminal.chain([convoy(Some("flotilla/platform"), "live", ConvoyPhase::Active)]).collect(),
+            ..AwarenessInput::default()
+        });
+
+        assert!(state.truncated);
+        assert_eq!(nodes[0].entries.len(), 2);
+        assert!(nodes[0].entries.iter().any(|entry| entry.label == "live"));
+    }
+
+    #[test]
     fn salience_is_joined_onto_entries_and_aggregated_to_their_node() {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("timestamp");
         let demand_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("timestamp");
@@ -737,15 +735,6 @@ mod tests {
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
             convoys: vec![convoy.clone()],
-            checkouts: vec![CheckoutRow::builder()
-                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "platform"))
-                .repo(RepositoryKey("repo-a".into()))
-                .repo_label("platform")
-                .path("/work/platform")
-                .branch("main")
-                .host(HostName::new("local"))
-                .authority(flotilla_protocol::LifecycleAuthority::Observed)
-                .build()],
             salience: SalienceFacts {
                 demands: vec![DemandFact {
                     target: vessel.clone(),
@@ -760,6 +749,7 @@ mod tests {
                     work_unsettled: true,
                     as_of: attention_at,
                 }],
+                pane_exits: Vec::new(),
             },
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),
@@ -778,8 +768,59 @@ mod tests {
         let convoys = node.family_summary(AwarenessFamily::Convoys).expect("convoy family summary");
         assert_eq!(convoys.salience, Salience::Urgent);
         assert_eq!(convoys.as_of, attention_at);
+        assert!(node.family_summary(AwarenessFamily::Checkouts).is_none());
+    }
+
+    #[test]
+    fn checkout_pane_exit_is_presented_by_its_project_family_without_project_regard_leakage() {
+        let base = Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).single().expect("timestamp");
+        let exit_at = Utc.with_ymd_and_hms(2026, 8, 24, 12, 1, 0).single().expect("timestamp");
+        let scope = QueryScope::new("flotilla", "platform");
+        let checkout = ResourceRef::new("flotilla.work/v1", "Checkout", "local", "platform");
+        let (nodes, _) = project_awareness(AwarenessInput {
+            projects: vec![scope.clone()],
+            checkout_refs_by_project: HashMap::from([(scope, vec![checkout.clone()])]),
+            salience: SalienceFacts {
+                regards: vec![RegardFact {
+                    principal: PrincipalRef::implicit_for_namespace("flotilla"),
+                    target: project_resource_ref("flotilla", "platform"),
+                    as_of: base,
+                }],
+                pane_exits: vec![PaneExitFact { target: checkout, as_of: exit_at }],
+                ..SalienceFacts::default()
+            },
+            state: ResultSetState {
+                demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),
+                ..ResultSetState::default()
+            },
+            ..AwarenessInput::default()
+        });
+
+        let node = nodes.first().expect("project node");
         let checkouts = node.family_summary(AwarenessFamily::Checkouts).expect("checkout family summary");
-        assert_eq!(checkouts.salience, Salience::Info);
-        assert_eq!(checkouts.as_of, base);
+        assert_eq!(node.salience, Salience::Attention);
+        assert_eq!(checkouts.salience, Salience::Attention);
+        assert_eq!(checkouts.as_of, exit_at);
+        assert!(node.entries.iter().all(|entry| entry.kind != AwarenessKind::Checkout));
+
+        let (regard_only_nodes, _) = project_awareness(AwarenessInput {
+            projects: vec![QueryScope::new("flotilla", "platform")],
+            salience: SalienceFacts {
+                regards: vec![RegardFact {
+                    principal: PrincipalRef::implicit_for_namespace("flotilla"),
+                    target: project_resource_ref("flotilla", "platform"),
+                    as_of: base,
+                }],
+                ..SalienceFacts::default()
+            },
+            state: ResultSetState {
+                demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),
+                ..ResultSetState::default()
+            },
+            ..AwarenessInput::default()
+        });
+        let regard_only = regard_only_nodes.first().expect("project node");
+        assert_eq!(regard_only.salience, Salience::None);
+        assert!(regard_only.family_summary(AwarenessFamily::Checkouts).is_none());
     }
 }

@@ -372,8 +372,17 @@ impl AggregatorProjectionState {
         };
         let independents_set = self.independents_result_set(scope).await;
         let independents = independents_set.rows.as_independents().map_or_else(Vec::new, ToOwned::to_owned);
-        let checkouts_set = self.checkouts.write().await.result_set(scope);
-        let checkouts = checkouts_set.rows.as_checkouts().map_or_else(Vec::new, ToOwned::to_owned);
+        let checkout_sets = {
+            let mut checkouts = self.checkouts.write().await;
+            projects.iter().map(|project| (project.clone(), checkouts.result_set(&Some(project.clone())))).collect::<Vec<_>>()
+        };
+        let checkout_refs_by_project = checkout_sets
+            .iter()
+            .map(|(project, set)| {
+                let refs = set.rows.as_checkouts().into_iter().flatten().map(|checkout| checkout.resource.clone()).collect::<Vec<_>>();
+                (project.clone(), refs)
+            })
+            .collect();
         let issue_sets = self.issue_sets_for_awareness(scope).await;
         let issues = issue_sets
             .iter()
@@ -386,11 +395,15 @@ impl AggregatorProjectionState {
             let projection = self.salience.read().await;
             (projection.facts.clone(), projection.revision)
         };
-        let base_seq =
-            [self.seq().await, independents_set.seq, checkouts_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
-                .into_iter()
-                .max()
-                .unwrap_or(0);
+        let base_seq = [
+            self.seq().await,
+            independents_set.seq,
+            checkout_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0),
+            issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
         let seq = base_seq.saturating_add(project_catalog_revision).saturating_add(salience_revision);
         let (rows, state) = project_awareness(AwarenessInput {
             scope: scope.clone(),
@@ -399,7 +412,7 @@ impl AggregatorProjectionState {
             projects,
             convoys,
             issues,
-            checkouts,
+            checkout_refs_by_project,
             independents,
             salience,
             state,
@@ -586,6 +599,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn awareness_omits_observed_checkouts_while_scoped_checkout_queries_remain_available() {
+        let state = AggregatorProjectionState::new();
+        let project = scope("roadmap");
+        state
+            .replace_store_catalog(
+                HashMap::from([(RepositoryKey("repo-a".into()), "github.com/flotilla-org/flotilla".to_string())]),
+                HashMap::from([(project.clone(), vec![RepositoryKey("repo-a".into())])]),
+            )
+            .await;
+        let checkout = CheckoutRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "observed"))
+            .repo(RepositoryKey("repo-a".into()))
+            .repo_label("github.com/flotilla-org/flotilla")
+            .path("/work/flotilla")
+            .branch("main")
+            .host(HostName::new("local"))
+            .authority(flotilla_protocol::LifecycleAuthority::Observed)
+            .build();
+        state.replace_local_checkout_rows(vec![checkout.clone()]).await;
+
+        let awareness = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        let rows = awareness.rows.as_awareness().expect("awareness rows");
+        assert_eq!(rows.len(), 1, "only the catalogued project is present");
+        assert_eq!(rows[0].scope.as_ref(), Some(&project));
+        assert!(rows[0].entries.iter().all(|entry| entry.kind != AwarenessKind::Checkout));
+        assert_eq!(rows[0].counts.checkouts, 0);
+
+        let scoped = state.result_set_for(&QueryId::Checkouts { scope: Some(project) }).await.expect("scoped checkout result set");
+        assert_eq!(scoped.rows.as_checkouts().expect("checkout rows"), &[checkout]);
+    }
+
+    #[tokio::test]
     async fn fleet_awareness_emits_every_catalogued_project_including_empty_projects() {
         let state = AggregatorProjectionState::new();
         let active = scope("active");
@@ -610,6 +655,31 @@ mod tests {
         assert_eq!(empty_node.state, flotilla_protocol::AwarenessState::Idle);
         assert_eq!(empty_node.counts, flotilla_protocol::AwarenessCounts::default());
         assert!(empty_node.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn awareness_result_set_keeps_live_convoy_when_terminal_history_exceeds_entry_limit() {
+        let state = AggregatorProjectionState::new();
+        let mut rows = (0..4)
+            .map(|index| {
+                let mut row = convoy_row("flotilla", &format!("terminal-{index}"), "roadmap");
+                row.phase = ConvoyPhase::Landed;
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.push(convoy_row("flotilla", "live", "roadmap"));
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows = rows.into_iter().map(|row| (row.resource.clone(), row)).collect();
+            convoys.seq = 1;
+        }
+
+        let result =
+            state.awareness_result_set(&Some(scope("roadmap")), AwarenessGrouping::Project, AwarenessLimit { groups: 1, entries: 2 }).await;
+        let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };
+
+        assert!(result.state.truncated);
+        assert!(rows[0].entries.iter().any(|entry| entry.label == "live"));
     }
 
     #[tokio::test]

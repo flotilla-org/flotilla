@@ -379,7 +379,14 @@ impl InteractiveWidget for Screen {
 
         // 1. Tab bar
         if !ctx.views.is_scoped() {
-            self.tabs.render(ctx.views, ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
+            self.tabs.render(
+                ctx.views,
+                super::tabs::TabData { model: ctx.model, namespaces: ctx.namespaces },
+                ctx.ui,
+                ctx.theme,
+                frame,
+                chunks[0],
+            );
         }
 
         // 2. Tab-local navigation header

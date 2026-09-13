@@ -201,6 +201,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.stale_after()
     }
 
+    pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
+        self.inner.change_requests.observation_error(subject).await
+    }
+
     pub async fn rows(&self) -> Vec<LeafSubscriptionRow> {
         self.inner.rows.lock().await.values().cloned().collect()
     }
@@ -388,17 +392,18 @@ impl LeafSubscriptionTable {
         if status.turn_deliveries.get(source).is_some_and(|delivery| delivery.episodes.iter().any(|episode| episode.head_sha == head_sha)) {
             return Ok(());
         }
-        let claim_at = status
+        let claim = status
             .crew_work
             .get(&rule.to.vessel)
             .and_then(|crew| crew.get(&rule.to.role))
-            .and_then(|work| work.finished_at)
             .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
+        let claim_at =
+            claim.finished_at.ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
         if evidence_at <= claim_at || cr.head_sha.observed_at <= claim_at {
             return Ok(());
         }
 
-        let brief = compose_turn_brief(&convoy, source, rule, leaf, cr, claim_at);
+        let brief = compose_turn_brief(&convoy, source, rule, leaf, cr, claim_at, claim.decision_ledger_ref.as_deref());
         let request = TurnDeliveryRequest::builder()
             .namespace(namespace.clone())
             .convoy(convoy_name.to_string())
@@ -458,6 +463,7 @@ fn compose_turn_brief(
     leaf: &Leaf,
     cr: &flotilla_resources::ChangeRequestStatus,
     claim_at: DateTime<Utc>,
+    decision_ledger_ref: Option<&str>,
 ) -> String {
     let repositories = convoy
         .spec
@@ -467,13 +473,14 @@ fn compose_turn_brief(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
+        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Decision ledger: {}\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
         rule.brief.trim(),
         cr.head_sha.value.as_deref().unwrap_or("unknown"),
         cr.review.actionable_at_head.value,
         cr.checks.value,
         cr.mergeable.value,
         claim_at.to_rfc3339(),
+        decision_ledger_ref.unwrap_or("MISSING (flagged, claim remains accepted)"),
         convoy.metadata.namespace,
         convoy.metadata.name,
         rule.to.vessel,
@@ -583,7 +590,7 @@ impl ReconcilerWake {
                             namespace: namespace.to_string(),
                             leaves: entry.leaves,
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
-                            freshness_demand: None,
+                            freshness_demand: Some(Utc::now()),
                             created_at: Utc::now(),
                             episode_key: EpisodeKeyFields::default(),
                         });
@@ -658,7 +665,7 @@ impl ReconcilerWake {
             row.id = id;
             self.subscriptions.inner.rows.lock().await.insert(id, row.clone());
             for subject in row.leaves.iter().filter_map(|leaf| ChangeRequestRef::from_address(namespace, &leaf.address)) {
-                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, None).await {
+                if let Err(error) = self.subscriptions.inner.change_requests.demand(id, subject, row.freshness_demand).await {
                     self.subscriptions.inner.rows.lock().await.remove(&id);
                     self.subscriptions.forget_firings(id).await;
                     self.subscriptions.inner.change_requests.release(id).await;
@@ -680,10 +687,15 @@ impl ReconcilerWake {
 }
 
 fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) -> bool {
+    let same_freshness = left.freshness_demand == right.freshness_demand
+        || (matches!(left.watcher, LeafWatcher::ReconcilerWake { .. })
+            && matches!(right.watcher, LeafWatcher::ReconcilerWake { .. })
+            && left.freshness_demand.is_some()
+            && right.freshness_demand.is_some());
     left.namespace == right.namespace
         && left.leaves == right.leaves
         && left.watcher == right.watcher
-        && left.freshness_demand == right.freshness_demand
+        && same_freshness
         && left.episode_key == right.episode_key
 }
 
@@ -781,6 +793,24 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
+        let row = |freshness_demand| LeafSubscriptionRow {
+            id: uuid::Uuid::nil(),
+            namespace: "flotilla".to_string(),
+            leaves: vec!["cr/github.com/flotilla-org/flotilla/1699 .state == merged".parse().expect("leaf")],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "landing".to_string() },
+            freshness_demand: Some(freshness_demand),
+            created_at: freshness_demand,
+            episode_key: EpisodeKeyFields::default(),
+        };
+
+        assert!(same_standing_row(
+            &row("2026-08-23T14:00:00Z".parse().expect("first instant")),
+            &row("2026-08-23T14:01:00Z".parse().expect("second instant")),
+        ));
+    }
 
     struct UnavailableChangeRequests;
 
@@ -1055,7 +1085,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(16);
         let source = Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) });
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
-            state: Duration::from_millis(20),
+            state: Duration::from_secs(3600),
             checks_pending: Duration::from_millis(20),
             freshness_demanded: Duration::from_millis(20),
             stale_after: Duration::from_secs(60),
@@ -1096,7 +1126,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1114,7 +1144,24 @@ mod tests {
         })
         .await
         .expect("boot must rederive a ReconcilerWake row");
+        assert!(
+            table.rows().await.iter().any(|row| row.freshness_demand.is_some()),
+            "Landing settlement must demand fresh targeted observations"
+        );
         assert_eq!(convoys.get("wake").await.expect("open convoy").status.expect("status").phase, ConvoyPhase::Landing);
+        let change_requests = backend.using::<ChangeRequest>("flotilla");
+        let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1364);
+        let change_request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(record) = change_requests.get(&record_name).await {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("home authority must publish the demanded change request record");
+        assert_eq!(change_request.spec.observing_authority, "authority");
 
         source.merged.store(true, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1214,7 +1261,14 @@ mod tests {
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
                 crew_work: BTreeMap::from([(
                     "work".to_string(),
-                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(base).build())]),
+                    BTreeMap::from([(
+                        "coder".to_string(),
+                        CrewWorkState::builder()
+                            .phase(CrewWorkPhase::Done)
+                            .finished_at(base)
+                            .decision_ledger_ref("https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1".to_string())
+                            .build(),
+                    )]),
                 )]),
                 ..Default::default()
             })
@@ -1314,6 +1368,7 @@ mod tests {
         assert!(first_brief.contains("Head SHA: `aaa`"));
         assert!(first_brief.contains("feature/wake"));
         assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
+        assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
     }
 
     #[tokio::test]
@@ -1369,7 +1424,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1437,7 +1492,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")),
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")),
                 resync_interval: Duration::from_secs(3600),
                 backend,
             }
@@ -1510,7 +1565,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
                     .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),
                 backend: backend.clone(),
@@ -1672,7 +1727,7 @@ mod tests {
             ControllerLoop {
                 primary: convoys.clone(),
                 secondaries: vec![table.reconciler_wake_watch()],
-                reconciler: ConvoyReconciler::new(authority.clone().using::<WorkflowTemplate>("flotilla"))
+                reconciler: ConvoyReconciler::new(authority.definitions::<WorkflowTemplate>("flotilla"))
                     .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"))
                     .with_change_requests(authority.including_replicas::<ChangeRequest>("flotilla"), cadence.stale_after),
                 resync_interval: Duration::from_secs(3600),

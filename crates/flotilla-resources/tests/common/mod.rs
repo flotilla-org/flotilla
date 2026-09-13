@@ -95,6 +95,7 @@ pub fn convoy_spec(workflow_ref: &str) -> RealConvoySpec {
 
 pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus {
     RealConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase,
         workflow_snapshot: None,
@@ -202,6 +203,8 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
 
 pub fn valid_convoy_spec() -> RealConvoySpec {
     RealConvoySpec {
+        role: String::new(),
+        generation: 1,
         workflow_ref: "review-and-fix".to_string(),
         dispatching_principal_ref: Default::default(),
         inputs: [
@@ -309,6 +312,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     ]);
 
     RealConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: flotilla_resources::ConvoyPhase::Pending,
         workflow_snapshot: Some(snapshot),
@@ -408,6 +412,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let crew_work = BTreeMap::from([("implement".to_string(), BTreeMap::new()), ("review".to_string(), BTreeMap::new())]);
 
     RealConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: flotilla_resources::ConvoyPhase::Pending,
         workflow_snapshot: Some(snapshot),

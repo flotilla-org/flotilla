@@ -111,9 +111,28 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
     let convoys = cursors.iter().find(|cursor| cursor.query == QueryId::Convoys { scope: None }).expect("convoys cursor");
     assert_eq!(convoys.since, None, "never-seen queries subscribe from scratch");
     assert!(
+        !cursors.iter().any(|cursor| cursor.query == QueryId::Checkouts { scope: None }),
+        "pm connector does not subscribe to the fleet checkout catalog",
+    );
+    assert!(
         cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, .. })),
         "pm connector subscribes to awareness transport"
     );
+}
+
+#[test]
+fn awareness_subscription_uses_the_unbounded_default() {
+    let state = ConnectorState::default();
+    let awareness = state
+        .cursors()
+        .into_iter()
+        .find_map(|cursor| match cursor.query {
+            QueryId::Awareness { limit, .. } => Some(limit),
+            _ => None,
+        })
+        .expect("awareness cursor");
+
+    assert_eq!(awareness, AwarenessLimit::default());
 }
 
 #[test]

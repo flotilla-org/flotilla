@@ -40,6 +40,8 @@
 //! | `entity.kind` | Canonical presentation entity kind. |
 //! | `entity.id` | Canonical id in that kind's single permitted dialect. |
 //! | `display.label` | Concise human label, never identity. |
+//! | `display.label.medium` | Optional medium-width, display-only companion to `display.label`. |
+//! | `display.label.short` | Optional shortest, acronym-like display companion to `display.label`. |
 //! | `status.state` | Normalized `idle`, `waiting`, `active`, `done`, or `failed` badge state. |
 //! | `status.attention` | Boolean human-attention demand. |
 //! | `status.connectivity` | Connectivity annotation (`connected` or `disconnected`); reserved until emitted. |
@@ -55,6 +57,11 @@
 //! | `action.primary.vehicle` | Execution vehicle for the action. |
 //! | `action.primary.target` | Stable focus/deduplication target. |
 //! | `action.primary.recipe` | Command address used to materialize an entry, when known. |
+//!
+//! Display-label companions are stable producer-derived facts, not identities.
+//! Missing tiers are legal and consumers fall back toward `display.label`.
+//! Flotilla does not guarantee that abbreviated labels are unique in any
+//! scope; consumers must not change tiers based on sibling collisions.
 //!
 //! Hierarchy facts are equally single-dialect. The presentation manager
 //! derives paths from them using its active grouping template:
