@@ -359,6 +359,13 @@ cat >"$fake_bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+if [[ "$*" == '--user is-enabled flotillad.service' ]]; then
+  if [[ "${SYSTEMD_UNIT_DISABLED:-false}" == true ]]; then
+    printf 'disabled\n'
+    exit 1
+  fi
+  printf 'enabled\n'
+fi
 SH
 chmod 0755 "$fake_bin/systemctl"
 
@@ -530,8 +537,8 @@ for name in flotilla flotillad cleat; do
 done
 unit="$test_root/home/.config/systemd/user/flotillad.service"
 test -f "$unit" || fail 'systemd user unit was not installed'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
-  || fail 'systemd user unit does not run the stable flotillad path without an idle timeout'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0 --config-dir="%h/.config/flotilla" --state-dir="%h/.local/state/flotilla" --socket="%h/.config/flotilla/run/flotilla.sock"' "$unit" \
+  || fail 'systemd user unit does not run the declared daemon identity without an idle timeout'
 grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
   || fail 'systemd user unit does not expose the fleet binary PATH'
 grep -Fxq 'Environment="FLOTILLA_SKILLS_DIR=%h/.local/opt/flotilla-fleet/current/share/flotilla/skills"' "$unit" \
@@ -542,6 +549,14 @@ grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd 
 grep -Fxq -- '--user enable flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not enabled'
 grep -Fxq -- '--user restart flotillad.service' "$test_root/systemctl.log" || fail 'systemd user unit was not started'
 grep -Eq '^enable-linger .+$' "$test_root/loginctl.log" || fail 'systemd lingering was not enabled'
+
+: >"$test_root/systemctl.log"
+SYSTEMD_UNIT_DISABLED=true run_installer "$generation_one" >"$test_root/linux-dev-mode-install.out"
+grep -Fq 'preserving flotillad dev mode' "$test_root/linux-dev-mode-install.out" \
+  || fail 'Linux install did not report preserved dev mode'
+if grep -Eq -- '^--user (enable|restart) flotillad\.service$' "$test_root/systemctl.log"; then
+  fail 'Linux install enabled or restarted the fleet unit while dev mode was active'
+fi
 
 status="$(run_installer status 2>"$test_root/status.err")"
 grep -Fq "current: $generation_one (peer protocol 20)" <<<"$status" || fail 'status omitted current manifest protocol'
@@ -590,7 +605,7 @@ printf '# managed by fleet-install\nstale unit\n' >"$unit"
 run_installer "$generation_one" >/dev/null
 after_manifest="$(file_sha256 "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json")"
 [[ "$before_manifest" == "$after_manifest" ]] || fail 'exact-generation reinstall mutated the release'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0 --config-dir="%h/.config/flotilla" --state-dir="%h/.local/state/flotilla" --socket="%h/.config/flotilla/run/flotilla.sock"' "$unit" \
   || fail 'exact-generation reinstall did not refresh the systemd user unit'
 test "$(grep -Fxc -- '--user daemon-reload' "$test_root/systemctl.log")" = 1 \
   || fail 'unit refresh did not reload the systemd user manager exactly once'
@@ -720,7 +735,7 @@ HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_b
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" "$generation_one" >"$test_root/custom-paths.out"
-grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\" --timeout 0" "$unit" \
+grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\" --timeout 0 --config-dir=\"%h/.config/flotilla\" --state-dir=\"%h/.local/state/flotilla\" --socket=\"%h/.config/flotilla/run/flotilla.sock\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet root'
 grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet binary directory'

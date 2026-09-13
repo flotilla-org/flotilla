@@ -21,6 +21,7 @@ use tracing::{debug, error, warn};
 pub mod launchd;
 pub mod reconnect;
 pub mod resource;
+pub mod systemd;
 pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
@@ -470,7 +471,8 @@ async fn connect_or_spawn_with_optional_surface(
     state_dir: &Path,
     surface: Option<SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    connect_or_spawn_with_optional_surface_using(socket_path, config_dir, state_dir, surface, &launchd_startup_owner, &spawn_daemon).await
+    connect_or_spawn_with_optional_surface_using(socket_path, config_dir, state_dir, surface, &supervisor_startup_owner, &spawn_daemon)
+        .await
 }
 
 type DaemonSpawner = dyn Fn(&Path, &Path, &Path) -> Result<(), String> + Send + Sync;
@@ -479,16 +481,28 @@ type DaemonSupervisor = dyn Fn(&Path, &Path, &Path) -> Result<DaemonStartupOwner
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonStartupOwner {
     Client,
+    #[cfg(any(test, target_os = "macos"))]
     LaunchdAgent,
+    #[cfg(any(test, target_os = "linux"))]
+    SystemdUnit,
 }
 
-fn launchd_startup_owner(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<DaemonStartupOwner, String> {
-    if launchd::agent_manages_daemon(socket_path, config_dir, state_dir)? {
-        launchd::kickstart_agent()?;
-        Ok(DaemonStartupOwner::LaunchdAgent)
-    } else {
-        Ok(DaemonStartupOwner::Client)
+fn supervisor_startup_owner(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<DaemonStartupOwner, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if launchd::agent_manages_daemon(socket_path, config_dir, state_dir)? {
+            launchd::kickstart_agent()?;
+            return Ok(DaemonStartupOwner::LaunchdAgent);
+        }
     }
+    #[cfg(target_os = "linux")]
+    {
+        if systemd::unit_manages_daemon(socket_path, config_dir, state_dir)? {
+            systemd::start_unit()?;
+            return Ok(DaemonStartupOwner::SystemdUnit);
+        }
+    }
+    Ok(DaemonStartupOwner::Client)
 }
 
 async fn connect_or_spawn_with_optional_surface_using(
@@ -514,8 +528,12 @@ async fn connect_or_spawn_with_optional_surface_using(
         return Ok(daemon);
     }
 
-    if supervisor(socket_path, config_dir, state_dir)? == DaemonStartupOwner::LaunchdAgent {
-        return wait_for_daemon(socket_path, surface.as_ref(), "launchd agent").await;
+    match supervisor(socket_path, config_dir, state_dir)? {
+        #[cfg(any(test, target_os = "macos"))]
+        DaemonStartupOwner::LaunchdAgent => return wait_for_daemon(socket_path, surface.as_ref(), "launchd agent").await,
+        #[cfg(any(test, target_os = "linux"))]
+        DaemonStartupOwner::SystemdUnit => return wait_for_daemon(socket_path, surface.as_ref(), "systemd unit").await,
+        DaemonStartupOwner::Client => {}
     }
 
     // Config identity constrains daemon creation, not client connectivity. A
@@ -1118,6 +1136,27 @@ mod spawn_lock_tests {
         let Err(error) = result else { panic!("an absent fake launchd daemon should time out") };
 
         assert!(error.contains("launchd agent"), "unexpected error: {error}");
+        assert_eq!(direct_spawns.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn systemd_owned_startup_never_calls_the_direct_spawner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        let state_dir = dir.path().join("state");
+        let socket_path = config_dir.join("run/flotilla.sock");
+        let direct_spawns = Arc::new(AtomicUsize::new(0));
+        let counted_spawns = Arc::clone(&direct_spawns);
+        let supervisor = |_: &Path, _: &Path, _: &Path| Ok(DaemonStartupOwner::SystemdUnit);
+        let spawner = move |_: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+
+        let result = connect_or_spawn_with_optional_surface_using(&socket_path, &config_dir, &state_dir, None, &supervisor, &spawner).await;
+        let Err(error) = result else { panic!("an absent fake systemd daemon should time out") };
+
+        assert!(error.contains("systemd unit"), "unexpected error: {error}");
         assert_eq!(direct_spawns.load(Ordering::Relaxed), 0);
     }
 

@@ -37,7 +37,7 @@ READ_ONLY=0
 INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
-DARWIN_AGENT_DISABLED=0
+DAEMON_SERVICE_DISABLED=0
 CONFIRMATION_PID=""
 CONFIRMATION_LOG=""
 CONFIRMATION_DONE=""
@@ -543,11 +543,14 @@ PY
 write_systemd_user_unit() {
   [[ "$PLATFORM" == linux-* ]] || return 0
   local unit="$SYSTEMD_USER_DIR/flotillad.service"
-  local temporary daemon_path fleet_bin_path cargo_bin_path skills_path
+  local temporary daemon_path fleet_bin_path cargo_bin_path skills_path config_path state_path socket_path
   daemon_path="$(systemd_path "$FLEET_ROOT/current/bin/flotillad")"
   fleet_bin_path="$(systemd_path "$FLEET_BIN_DIR")"
   cargo_bin_path="$(systemd_path "$HOME/.cargo/bin")"
   skills_path="$(systemd_path "$FLEET_ROOT/current/share/flotilla/skills")"
+  config_path="$(systemd_path "$DAEMON_CONFIG_DIR")"
+  state_path="$(systemd_path "$DAEMON_STATE_DIR")"
+  socket_path="$(systemd_path "$DAEMON_SOCKET")"
   mkdir -p "$SYSTEMD_USER_DIR"
   temporary="$(mktemp "$SYSTEMD_USER_DIR/.flotillad.service.fleet-install.XXXXXX")"
   cat >"$temporary" <<UNIT
@@ -559,7 +562,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="$daemon_path" --timeout 0
+ExecStart="$daemon_path" --timeout 0 --config-dir="$config_path" --state-dir="$state_path" --socket="$socket_path"
 Environment="PATH=$fleet_bin_path:$cargo_bin_path:/usr/local/bin:/usr/bin:/bin"
 Environment="FLOTILLA_SKILLS_DIR=$skills_path"
 Restart=always
@@ -594,6 +597,10 @@ prepare_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
   command -v loginctl >/dev/null || die 'cannot install flotillad.service: loginctl is not available'
   command -v systemctl >/dev/null || die 'cannot install flotillad.service: systemctl is not available'
+  if [[ -f "$SYSTEMD_USER_DIR/flotillad.service" ]] \
+    && [[ "$(systemctl --user is-enabled flotillad.service 2>/dev/null || true)" == disabled ]]; then
+    DAEMON_SERVICE_DISABLED=1
+  fi
   write_systemd_user_unit
   # Re-enabling linger can be denied by polkit outside a login session even
   # when linger is already on; only attempt the transition that is needed.
@@ -605,11 +612,17 @@ prepare_linux_daemon_service() {
       || die "cannot enable linger for $user; run: sudo loginctl enable-linger $user"
   fi
   systemctl --user daemon-reload
-  systemctl --user enable flotillad.service
+  if ((!DAEMON_SERVICE_DISABLED)); then
+    systemctl --user enable flotillad.service
+  fi
 }
 
 restart_linux_daemon_service() {
   [[ "$PLATFORM" == linux-* ]] || return 0
+  if ((DAEMON_SERVICE_DISABLED)); then
+    printf 'fleet-install: preserving flotillad dev mode; systemd user unit remains disabled\n'
+    return 0
+  fi
   command -v systemctl >/dev/null || die 'cannot restart flotillad.service: systemctl is not available'
   systemctl --user restart flotillad.service
 }
@@ -665,7 +678,7 @@ prepare_darwin_daemon_service() {
   disabled_services="$(launchctl print-disabled "$domain")" \
     || die "cannot determine whether $LAUNCH_AGENT_LABEL is disabled"
   if grep -Fq "\"$LAUNCH_AGENT_LABEL\" => true" <<<"$disabled_services"; then
-    DARWIN_AGENT_DISABLED=1
+    DAEMON_SERVICE_DISABLED=1
   fi
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
@@ -676,7 +689,7 @@ prepare_darwin_daemon_service() {
 
 restart_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
-  if ((DARWIN_AGENT_DISABLED)); then
+  if ((DAEMON_SERVICE_DISABLED)); then
     printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
     return 0
   fi
@@ -891,14 +904,14 @@ switch_to() {
   old="$(current_generation)"
   if [[ "$old" == "$generation" ]]; then
     arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
-    if ((!DARWIN_AGENT_DISABLED)); then
+    if ((!DAEMON_SERVICE_DISABLED)); then
       start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
     fi
     return 0
   fi
   daemon_preflight "$generation"
   arm_health_confirmation "$generation" "$rollback_generation" "$confirmation_token"
-  if ((!DARWIN_AGENT_DISABLED)); then
+  if ((!DAEMON_SERVICE_DISABLED)); then
     start_confirmation_watchdog "$generation" "$rollback_generation" "$confirmation_token"
   fi
   if [[ -n "$old" ]]; then
@@ -927,7 +940,7 @@ activate_staged_generation() {
   switch_to "$generation" "$rollback_generation" "$confirmation_token"
   restart_linux_daemon_service
   restart_darwin_daemon_service
-  if ((DARWIN_AGENT_DISABLED)); then
+  if ((DAEMON_SERVICE_DISABLED)); then
     disarm_health_confirmation "$confirmation_token"
     printf 'fleet-install: health confirmation skipped while flotillad dev mode is active\n'
   else
