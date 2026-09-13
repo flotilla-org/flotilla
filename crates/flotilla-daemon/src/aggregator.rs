@@ -2327,6 +2327,8 @@ mod tests {
             message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
             disposition: None,
             decision_ledger_ref: None,
+            force: false,
+            principal_ref: None,
             attempted_at: Utc::now(),
             authority: "kiwi".into(),
             last_error: "authority unreachable for convoy-a".into(),

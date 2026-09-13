@@ -11,7 +11,7 @@ use crate::{
         CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
         HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
-    AttachableSetId, IssueRef, RepoIdentity,
+    AttachableSetId, IssueRef, PrincipalRef, RepoIdentity,
 };
 
 fn is_false(value: &bool) -> bool {
@@ -268,6 +268,11 @@ pub struct ExplainedDecisionLedger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_url: Option<String>,
     pub missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_principal: Option<PrincipalRef>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub completed_while_crew_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -605,6 +610,8 @@ pub enum CommandAction {
         disposition: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decision_ledger_ref: Option<String>,
+        #[serde(default)]
+        force: bool,
     },
     CrewFail {
         context: CrewCommandContext,
@@ -1212,6 +1219,7 @@ mod tests {
                     message: Some("ready for review".into()),
                     disposition: Some("changes-pushed".into()),
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2".into()),
+                    force: false,
                 })
                 .build(),
             Command::builder()

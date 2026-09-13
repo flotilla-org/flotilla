@@ -11,6 +11,27 @@ use flotilla_resources::{
     VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
+#[test]
+fn force_does_not_relabel_a_ledger_backed_claim_as_overridden() {
+    let mut status = settled_convoy_status();
+    status.crew_work.get_mut("implement").expect("crew vessel").get_mut("coder").expect("crew role").decision_ledger_ref =
+        Some("https://example.test/pull/1#decision-ledger".to_string());
+
+    ConvoyStatusPatch::MarkCrewCompleted {
+        vessel: "implement".to_string(),
+        role: "coder".to_string(),
+        finished_at: ts(30),
+        message: Some("duplicate completion".to_string()),
+        disposition: None,
+        decision_ledger_ref: None,
+        completed_while_crew_active: false,
+        forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() }),
+    }
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].completion_override, None);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleClass {
     Duplicate,
@@ -209,7 +230,17 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 }
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
-    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None, decision_ledger_ref: None, claim_evidence: None }
+    CrewWorkState {
+        phase,
+        started_at,
+        finished_at,
+        message: None,
+        disposition: None,
+        decision_ledger_ref: None,
+        completion_override: None,
+        completed_while_crew_active: false,
+        claim_evidence: None,
+    }
 }
 
 fn pending_brief() -> PendingBrief {
@@ -547,6 +578,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     message: Some("still complete".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
@@ -846,6 +879,8 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     completion_message: Some("first turn complete".to_string()),
                     disposition: Some("satisfied".to_string()),
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
@@ -1026,6 +1061,8 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                     message: Some("addressed".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &resettle);
                 (before, crew_timestamps(&status))

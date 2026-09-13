@@ -24,7 +24,7 @@ use crate::providers::{
 };
 
 #[test]
-fn completed_claims_without_a_decision_ledger_are_flagged_not_hidden() {
+fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
     let claimed_at = chrono::Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).single().expect("timestamp");
     let status = ConvoyStatus {
         crew_work: BTreeMap::from([(

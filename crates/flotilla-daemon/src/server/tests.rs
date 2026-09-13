@@ -1525,6 +1525,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
                     disposition: None,
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1300#issuecomment-1".into()),
+                    force: false,
                 })
                 .build(),
         )
@@ -1548,6 +1549,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1301".into()),
                     disposition: None,
                     decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1301#issuecomment-2".into()),
+                    force: false,
                 })
                 .build(),
         )
@@ -1611,6 +1613,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                     message: Some("https://github.com/flotilla-org/flotilla/pull/1302".into()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    force: false,
                 })
                 .build(),
         )

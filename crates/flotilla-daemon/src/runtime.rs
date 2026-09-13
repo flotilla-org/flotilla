@@ -9923,6 +9923,34 @@ mod tests {
         assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
 
         let mut rx = daemon.subscribe();
+        let refused_complete_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: crew_context.clone(),
+                        message: Some("delegate attempted completion".to_string()),
+                        disposition: None,
+                        decision_ledger_ref: None,
+                        force: false,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch refused completion");
+        assert_eq!(wait_for_command_result(&mut rx, refused_complete_id).await, CommandValue::Error {
+            message: "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
+                .to_string(),
+        });
+        let after_refusal =
+            convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
+        assert_eq!(after_refusal, initial_status, "refused completion must not mutate convoy status");
+        assert_eq!(
+            terminals.get(&coder.metadata.name).await.expect("coder session after refusal").status.expect("coder session status").phase,
+            TerminalSessionPhase::Running,
+            "refused completion must leave the crew session alive"
+        );
+
+        let mut rx = daemon.subscribe();
         let coder_complete_id = daemon
             .execute(
                 Command::builder()
@@ -9930,13 +9958,19 @@ mod tests {
                         context: crew_context.clone(),
                         message: Some("implementation ready".to_string()),
                         disposition: None,
-                        decision_ledger_ref: None,
+                        decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-coder".to_string()),
+                        force: false,
                     })
                     .build(),
             )
             .await
             .expect("coder complete");
         assert_eq!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::Ok);
+        assert!(
+            convoys.get(&crew_record).await.expect("crew convoy").status.expect("convoy status").crew_work["implement"]["coder"]
+                .completed_while_crew_active,
+            "completion while the agent process is running must remain visible on convoy status"
+        );
 
         let mut rx = daemon.subscribe();
         let handoff_id = daemon
@@ -10159,7 +10193,8 @@ mod tests {
                         context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
                         message: Some("review findings addressed".to_string()),
                         disposition: None,
-                        decision_ledger_ref: None,
+                        decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-recomplete".to_string()),
+                        force: false,
                     })
                     .build(),
             )
@@ -10212,7 +10247,8 @@ mod tests {
                         context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
                         message: Some("changes accepted".to_string()),
                         disposition: None,
-                        decision_ledger_ref: None,
+                        decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-reviewer".to_string()),
+                        force: false,
                     })
                     .build(),
             )

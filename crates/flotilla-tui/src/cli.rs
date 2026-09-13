@@ -564,12 +564,17 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     } else {
         for ledger in &explanation.decision_ledgers {
             if ledger.missing {
+                let detail = ledger.override_principal.as_ref().map_or_else(
+                    || "crew completed without a decision ledger".to_string(),
+                    |principal| format!("completed by {}/{} with --force", principal.namespace, principal.name),
+                );
                 let _ = writeln!(
                     output,
-                    "  - {}/{} claimed_at={} MISSING (flagged; claim accepted)",
+                    "  - {}/{} claimed_at={} MISSING ({detail}){}",
                     ledger.vessel,
                     ledger.role,
-                    ledger.claimed_at.as_deref().unwrap_or("-")
+                    ledger.claimed_at.as_deref().unwrap_or("-"),
+                    if ledger.completed_while_crew_active { " — completed while crew active" } else { "" }
                 );
             } else {
                 let _ = writeln!(
