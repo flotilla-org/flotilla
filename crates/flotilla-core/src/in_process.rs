@@ -5628,6 +5628,19 @@ impl InProcessDaemon {
         self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
     }
 
+    async fn reap_convoy_internal_attributed(
+        &self,
+        namespace: &str,
+        name: &str,
+        force: bool,
+        caller: Option<&flotilla_protocol::CommandCaller>,
+    ) -> Result<(), String> {
+        self.verify_convoy_teardown_gate(namespace, name, force).await?;
+        self.record_lifecycle_mutation(namespace, name, "convoy_delete", caller).await?;
+        self.cascade_convoy_children(namespace, name).await?;
+        self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
+    }
+
     async fn check_local_free_space_floor(&self) -> Result<(), String> {
         let config = Arc::clone(&self.config);
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
@@ -9787,20 +9800,16 @@ impl InProcessDaemon {
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
-                    let attribution = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_resume", caller.as_ref()).await;
-                    match attribution {
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                        Ok(()) => {
-                            match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
-                                Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
-                                    flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
-                                }
-                                Ok(ConvoyResumeOutcome::Queued { displaced }) => {
-                                    flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
-                                }
-                                Err(message) => flotilla_protocol::CommandValue::Error { message },
-                            }
+                    match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
+                        Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
+                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_resume", caller.as_ref()).await;
+                            flotilla_protocol::CommandValue::ConvoyBriefDelivered { displaced }
                         }
+                        Ok(ConvoyResumeOutcome::Queued { displaced }) => {
+                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_resume", caller.as_ref()).await;
+                            flotilla_protocol::CommandValue::ConvoyBriefQueued { displaced }
+                        }
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }
                 }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
@@ -9827,10 +9836,7 @@ impl InProcessDaemon {
             &command.action
         {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            if let Ok(resolved) = self.resolve_crew_routing_context(context).await {
-                let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
-                let _ = self.record_lifecycle_mutation(namespace, &resolved.convoy, "crew_complete", caller.as_ref()).await;
-            }
+            let routing = self.resolve_crew_routing_context(context).await.ok();
             let result = match self
                 .crew_complete_as_principal_internal(
                     context,
@@ -9842,7 +9848,13 @@ impl InProcessDaemon {
                 )
                 .await
             {
-                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Ok(()) => {
+                    if let Some(resolved) = routing {
+                        let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
+                        let _ = self.record_lifecycle_mutation(namespace, &resolved.convoy, "crew_complete", caller.as_ref()).await;
+                    }
+                    flotilla_protocol::CommandValue::Ok
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -9866,16 +9878,10 @@ impl InProcessDaemon {
                 None => self.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => {
-                    let result = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_delete", caller.as_ref()).await;
-                    match result {
-                        Ok(()) => match self.reap_convoy_internal(&namespace, &record_name, *force).await {
-                            Ok(()) => flotilla_protocol::CommandValue::Ok,
-                            Err(message) => flotilla_protocol::CommandValue::Error { message },
-                        },
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
-                }
+                Ok(record_name) => match self.reap_convoy_internal_attributed(&namespace, &record_name, *force, caller.as_ref()).await {
+                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
@@ -9890,12 +9896,10 @@ impl InProcessDaemon {
             };
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
-                    match self.record_lifecycle_mutation(&namespace, &record_name, "convoy_abandon", caller.as_ref()).await {
-                        Ok(()) => {
-                            match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
-                                Ok(archives) => flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives },
-                                Err(message) => flotilla_protocol::CommandValue::Error { message },
-                            }
+                    match self.abandon_convoy_internal(&namespace, &record_name, reason, dispatching_principal_ref.as_ref()).await {
+                        Ok(archives) => {
+                            let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_abandon", caller.as_ref()).await;
+                            flotilla_protocol::CommandValue::ConvoyAbandoned { name: name.clone(), archives }
                         }
                         Err(message) => flotilla_protocol::CommandValue::Error { message },
                     }

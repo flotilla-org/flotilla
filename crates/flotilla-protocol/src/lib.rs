@@ -129,7 +129,7 @@ pub struct CallerCrew {
 impl fmt::Display for CommandCaller {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(crew) = &self.crew {
-            return write!(f, "crew:{}/{}/{}/{}", crew.namespace, crew.convoy, crew.vessel, crew.role);
+            return write!(f, "crew:{}/{}/{}/{}#{}", crew.namespace, crew.convoy, crew.vessel, crew.role, crew.crew_id);
         }
         if let Some(process) = &self.process {
             return write!(f, "{} (uid={}, pid={})", self.principal_ref.name, process.uid, process.pid);

@@ -824,11 +824,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // current status, so accepting it here would resurrect the convoy and
         // erase its terminal history. Once stamped, the historical record is
         // immutable, including under duplicate abandon requests.
-        if status.phase == ConvoyPhase::Abandoned {
+        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. }) {
             return;
         }
         match self {
-            Self::RecordLifecycleMutation { mutation } => status.lifecycle_mutations.push(mutation.clone()),
+            Self::RecordLifecycleMutation { mutation } => {
+                const RETAINED_MUTATIONS: usize = 32;
+                status.lifecycle_mutations.push(mutation.clone());
+                if status.lifecycle_mutations.len() > RETAINED_MUTATIONS {
+                    status.lifecycle_mutations.remove(0);
+                }
+            }
             Self::SetPlacementDecision { placement_decision } => {
                 status.placement_decision.get_or_insert_with(|| placement_decision.clone());
             }

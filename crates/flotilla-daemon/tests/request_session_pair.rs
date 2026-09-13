@@ -464,6 +464,27 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
         .await
         .expect("seed status");
     let mut events = leader.subscribe();
+    let rejected_id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyResume {
+                    namespace: Some("flotilla".into()),
+                    name: role.into(),
+                    prompt: String::new(),
+                    vessel: None,
+                    role: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("dispatch rejected resume");
+    assert!(matches!(await_command_result(&mut events, rejected_id).await, CommandValue::Error { .. }));
+    assert!(
+        convoys.get(&created.metadata.name).await.expect("convoy").status.expect("status").lifecycle_mutations.is_empty(),
+        "a rejected mutation must not enter the audit trail"
+    );
+
     let command_id = topology
         .client
         .execute(
