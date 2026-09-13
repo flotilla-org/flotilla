@@ -5461,7 +5461,10 @@ mod tests {
         let material = Arc::new(AgentMaterialRegistry::new(
             daemon.resource_backend(),
             NAMESPACE,
-            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
+            Arc::new(TestEnvVars::new([
+                ("HOME", home.display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+            ])),
         ));
         let state = ControllerRuntimeState::new(
             Arc::clone(&daemon),
