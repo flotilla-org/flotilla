@@ -320,6 +320,15 @@ pub struct ConvoyExplanation {
     pub settlement: ExplainedSettlement,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<ExplainedEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedLifecycleMutation {
+    pub action: String,
+    pub caller: crate::CommandCaller,
+    pub at: String,
 }
 
 /// Filters for reading a daemon's host-local structured log.

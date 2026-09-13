@@ -92,6 +92,52 @@ impl Default for PrincipalRef {
     }
 }
 
+/// Auditable identity of a client that asked the daemon to mutate state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCaller {
+    pub principal_ref: PrincipalRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<CallerProcess>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<CallerCrew>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CallerProcess {
+    pub pid: u32,
+    pub uid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CallerCrew {
+    pub namespace: String,
+    pub convoy: String,
+    pub vessel: String,
+    pub role: String,
+    pub crew_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session: Option<String>,
+}
+
+impl fmt::Display for CommandCaller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(crew) = &self.crew {
+            return write!(f, "crew:{}/{}/{}/{}", crew.namespace, crew.convoy, crew.vessel, crew.role);
+        }
+        if let Some(process) = &self.process {
+            return write!(f, "{} (uid={}, pid={})", self.principal_ref.name, process.uid, process.pid);
+        }
+        write!(f, "{}/{}", self.principal_ref.namespace, self.principal_ref.name)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use serde::{de::DeserializeOwned, Serialize};
@@ -116,9 +162,10 @@ pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
     CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, EvidenceFreshness,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedMaterialLease, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, IssueSelector,
-    ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor,
-    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StepStatus,
+    ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedMaterialLease, ExplainedSettlement, ExplainedSubscription,
+    ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector,
+    ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
+    ResourceRecordType, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

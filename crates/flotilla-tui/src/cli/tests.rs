@@ -11,6 +11,7 @@ use super::{event_stream_seq, format_command_result, format_convoy_explanation_h
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
         recent_events: Vec::new(),
+        lifecycle_mutations: Vec::new(),
         namespace: "flotilla".into(),
         convoy: "ledger".into(),
         phase: "Landing".into(),

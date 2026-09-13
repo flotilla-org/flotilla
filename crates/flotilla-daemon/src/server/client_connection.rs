@@ -7,7 +7,7 @@ use std::{
 };
 
 use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{DaemonEvent, Message, QueryId, SurfaceDeclaration};
+use flotilla_protocol::{CommandCaller, DaemonEvent, Message, QueryId, SurfaceDeclaration};
 use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
@@ -36,9 +36,11 @@ pub(super) struct ClientConnection {
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<Notify>,
     agent_state_store: SharedAgentStateStore,
+    caller: CommandCaller,
 }
 
 impl ClientConnection {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
         shutdown_request_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -47,8 +49,9 @@ impl ClientConnection {
         client_count: Arc<AtomicUsize>,
         client_notify: Arc<Notify>,
         agent_state_store: SharedAgentStateStore,
+        caller: CommandCaller,
     ) -> Self {
-        Self { daemon, shutdown_request_tx, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store }
+        Self { daemon, shutdown_request_tx, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store, caller }
     }
 
     /// Run a stateful client session that began with a Hello handshake.
@@ -101,8 +104,14 @@ impl ClientConnection {
             }
         });
 
-        let request_dispatcher =
-            RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store, session_id, subscriptions);
+        let request_dispatcher = RequestDispatcher::new_with_caller(
+            &self.daemon,
+            &self.remote_command_router,
+            &self.agent_state_store,
+            session_id,
+            subscriptions,
+            self.caller.clone(),
+        );
         (event_task, request_dispatcher, self.shutdown_rx.clone())
     }
 

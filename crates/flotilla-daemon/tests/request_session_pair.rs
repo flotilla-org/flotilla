@@ -17,13 +17,15 @@ use flotilla_core::{
 };
 use flotilla_daemon::server::test_support::{
     apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
-    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestTopology,
+    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
+    spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestTopology,
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     test_support::TestIssue,
-    Command, CommandAction, CommandValue, ConvoyStartIntent, DaemonEvent, HostName, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo,
-    PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
+    CallerCrew, CallerProcess, Command, CommandAction, CommandCaller, CommandValue, ConvoyStartIntent, DaemonEvent, HostName, Issue,
+    IssueChangeset, IssueRef, IssueSource, NodeInfo, PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter,
+    SurfaceDeclaration,
 };
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
@@ -423,6 +425,68 @@ async fn implicit_human_abandon_remains_a_human_override() {
 async fn cross_namespace_implicit_human_abandon_remains_a_human_override() {
     assert_abandon_attribution(PrincipalRef::implicit_for_namespace("people"), WorkCompletionAuthority::HumanOverride, "human override")
         .await;
+}
+
+#[tokio::test]
+async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let principal_ref = PrincipalRef { namespace: "flotilla".into(), name: "alice".into() };
+    let caller = CommandCaller {
+        principal_ref: principal_ref.clone(),
+        process: Some(CallerProcess::builder().pid(4242).uid(1000).executable("/usr/bin/flotilla".to_string()).build()),
+        crew: Some(
+            CallerCrew::builder()
+                .namespace("flotilla".to_string())
+                .convoy("research".to_string())
+                .vessel("research-work".to_string())
+                .role("coder".to_string())
+                .crew_id("crew-123".to_string())
+                .build(),
+        ),
+    };
+    let topology = spawn_in_memory_request_topology_stateful_with_caller(
+        Arc::clone(&leader),
+        follower,
+        SurfaceDeclaration { principal_ref, character: SurfaceCharacter::Focal },
+        caller.clone(),
+    )
+    .await
+    .expect("spawn caller-attributed topology");
+    let convoys = leader.resource_backend().using::<Convoy>("flotilla");
+    let role = "attributed-status";
+    let created = convoys.create(&convoy_meta("attributed-status-g1", role), &convoy_spec("empty", role)).await.expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            ..Default::default()
+        })
+        .await
+        .expect("seed status");
+    let mut events = leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyAbandon { namespace: Some("flotilla".into()), name: role.into(), reason: "done".into() })
+                .build(),
+        )
+        .await
+        .expect("dispatch abandon");
+    let _ = await_command_result(&mut events, command_id).await;
+
+    let status = convoys.get(&created.metadata.name).await.expect("convoy").status.expect("status");
+    assert_eq!(status.lifecycle_mutations[0].caller, caller);
+    let value = topology
+        .client
+        .execute_query(
+            Command::builder().action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: role.into() }).build(),
+            uuid::Uuid::nil(),
+        )
+        .await
+        .expect("explain convoy");
+    let CommandValue::ConvoyExplanation(explanation) = value else { panic!("expected convoy explanation") };
+    assert_eq!(explanation.lifecycle_mutations[0].caller.crew.as_ref().expect("crew caller").crew_id, "crew-123");
 }
 
 // ---------------------------------------------------------------------------

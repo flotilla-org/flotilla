@@ -536,6 +536,9 @@ fn explanation_provenance_label(provenance: Option<&flotilla_protocol::ResourceR
 
 pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::ConvoyExplanation) -> String {
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    for mutation in &explanation.lifecycle_mutations {
+        let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
+    }
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
     }
