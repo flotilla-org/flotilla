@@ -720,7 +720,7 @@ HOME="$test_root/home" XDG_CONFIG_HOME="$test_root/home/.config" PATH="$custom_b
   FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
   FLEET_INSTALL_API_URL=https://test.invalid/api/v1 FLEET_INSTALL_PACKAGE_URL=https://test.invalid/api/packages \
   "$installer" "$generation_one" >"$test_root/custom-paths.out"
-grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\" --timeout 0" "$unit" \
+grep -Fxq "ExecStart=\"$custom_root/current/bin/flotillad\" --timeout 0 --config-dir=\"%h/.config/flotilla\" --state-dir=\"%h/.local/state/flotilla\" --socket=\"%h/.config/flotilla/run/flotilla.sock\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet root'
 grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\"" "$unit" \
   || fail 'systemd user unit ignored the configured fleet binary directory'
