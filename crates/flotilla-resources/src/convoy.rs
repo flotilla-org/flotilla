@@ -1146,6 +1146,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                     state.completed_while_crew_active |= *completed_while_crew_active;
                 }
+                if status.attention.as_ref().is_some_and(|attention| attention.source == format!("crew-completion/{vessel}/{role}")) {
+                    status.attention = None;
+                }
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;

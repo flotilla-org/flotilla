@@ -5,11 +5,37 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, LandingCredentialScope, PendingBrief,
-    PlacementStatus, PresentationPhase, PresentationStatus, PresentationStatusPatch, RepositoryKey, Stance, StatusPatch,
-    TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
-    VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    ConvoyAttention, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus,
+    LandingCredentialScope, PendingBrief, PlacementStatus, PresentationPhase, PresentationStatus, PresentationStatusPatch, RepositoryKey,
+    Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    TurnDeliveryRung, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
+
+#[test]
+fn pending_brief_delivery_clears_a_resolved_crew_completion_hold() {
+    let mut status = settled_convoy_status();
+    status.attention = Some(ConvoyAttention {
+        source: "crew-completion/implement/coder".to_string(),
+        reason: "crew completed without a decision ledger".to_string(),
+        raised_at: ts(20),
+    });
+    ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
+
+    ConvoyStatusPatch::DeliverPendingBrief {
+        vessel: "implement".to_string(),
+        role: "coder".to_string(),
+        delivered_at: ts(30),
+        content: "address review".to_string(),
+        completion_message: Some("first turn complete".to_string()),
+        disposition: Some("satisfied".to_string()),
+        decision_ledger_ref: Some("https://example.test/pull/1#decision-ledger".to_string()),
+        completed_while_crew_active: false,
+        forced_by: None,
+    }
+    .apply(&mut status);
+
+    assert_eq!(status.attention, None);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleClass {

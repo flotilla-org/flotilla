@@ -1923,7 +1923,9 @@ impl Aggregator {
                 && target.name == resource.name
                 && demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
         });
-        let needs_attention = reclaim_refusal.is_some() || vessels.iter().any(|vessel| vessel.needs_attention);
+        let needs_attention = reclaim_refusal.is_some()
+            || status.is_some_and(|status| status.attention.is_some())
+            || vessels.iter().any(|vessel| vessel.needs_attention);
         ConvoyRow::builder()
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
@@ -2311,6 +2313,24 @@ mod tests {
         assert_eq!(delta.query(), query);
         let QueryChanges::Convoys { changed, .. } = &delta.changes else { panic!("expected convoy changes") };
         assert!(changed.iter().any(|convoy| convoy.name == "convoy-a" && convoy.needs_attention));
+    }
+
+    #[tokio::test]
+    async fn convoy_status_attention_is_visible_in_the_convoy_projection() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        convoy.status.as_mut().expect("convoy status").attention = Some(flotilla_resources::ConvoyAttention {
+            source: "crew-completion/implement/coder".to_string(),
+            reason: "crew completed without a decision ledger".to_string(),
+            raised_at: Utc::now(),
+        });
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let result_set = state.result_set().await;
+        assert!(result_set.rows.as_convoys().expect("convoy rows")[0].needs_attention);
     }
 
     #[tokio::test]

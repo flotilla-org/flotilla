@@ -7886,6 +7886,10 @@ impl InProcessDaemon {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
+        // This records the principal declared by the connected surface. Stronger
+        // authentication and operator/agent separation belongs to the caller-
+        // identity contract; until then the durable attribution is the audit
+        // boundary rather than an authorization boundary.
         let forced_by = if force { Some(principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?) } else { None };
         if decision_ledger_ref.is_none() && forced_by.is_none() {
             apply_resource_status_patch(
