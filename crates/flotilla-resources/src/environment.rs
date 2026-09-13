@@ -93,6 +93,7 @@ pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
     MarkWaiting { message: String, reason: EnvironmentWaitReason },
     MarkMaterialReleased { message: String, pool_ref: String },
+    MarkMaterialWaiting { message: String, pool_ref: String },
     MarkMaterialReady,
     MarkFailed { message: String },
     MarkTerminating,
@@ -120,6 +121,11 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.ready = false;
                 status.message = Some(message.clone());
                 status.wait_reason = Some(EnvironmentWaitReason::MaterialLeaseReleased { pool_ref: pool_ref.clone() });
+            }
+            Self::MarkMaterialWaiting { message, pool_ref } => {
+                status.ready = false;
+                status.message = Some(message.clone());
+                status.wait_reason = Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: pool_ref.clone() });
             }
             Self::MarkMaterialReady => {
                 status.ready = true;

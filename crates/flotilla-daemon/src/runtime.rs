@@ -1626,6 +1626,7 @@ async fn reconcile_agent_material_leases(state: &ControllerRuntimeState, namespa
             continue;
         };
         if !spec.required_agent_adapters.contains("codex")
+            || spec.env.contains_key("CODEX_HOME")
             || environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready)
         {
             continue;
@@ -1639,44 +1640,39 @@ async fn reconcile_agent_material_leases(state: &ControllerRuntimeState, namespa
             Err(error) => return Err(error.to_string()),
         };
         let phase = convoy.status.as_ref().map(|status| status.phase);
-        let mut status = environment.status.clone().expect("ready environment has status");
-        let changed;
+        let status = environment.status.as_ref().expect("ready environment has status");
+        let patch;
         if phase == Some(flotilla_resources::ConvoyPhase::Landing) {
             if !matches!(status.wait_reason, Some(EnvironmentWaitReason::MaterialLeaseReleased { .. })) {
                 registry.release(&environment.metadata.name).await?;
-                status.ready = false;
-                status.message = Some("codex login lease released while convoy is Landing".to_string());
-                status.wait_reason = Some(EnvironmentWaitReason::MaterialLeaseReleased { pool_ref: "codex-login".to_string() });
-                changed = true;
+                patch = EnvironmentStatusPatch::MarkMaterialReleased {
+                    message: "codex login lease released while convoy is Landing".to_string(),
+                    pool_ref: "codex-login".to_string(),
+                };
             } else {
-                changed = false;
+                continue;
             }
         } else if matches!(phase, Some(flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Interrupted))
             && !status.ready
         {
             match registry.prepare(&environment.metadata.name, &spec.required_agent_adapters, &spec.env).await {
                 Ok(_) => {
-                    status.ready = true;
-                    status.message = None;
-                    status.wait_reason = None;
-                    changed = true;
+                    patch = EnvironmentStatusPatch::MarkMaterialReady;
                 }
                 Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
-                    changed = status.message.as_ref() != Some(&message)
-                        || status.wait_reason != Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: pool_ref.clone() });
-                    status.message = Some(message);
-                    status.wait_reason = Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref });
+                    if status.message.as_ref() == Some(&message)
+                        && status.wait_reason == Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: pool_ref.clone() })
+                    {
+                        continue;
+                    }
+                    patch = EnvironmentStatusPatch::MarkMaterialWaiting { message, pool_ref };
                 }
                 Err(AgentMaterialPrepareError::Failed(error)) => return Err(error),
             }
         } else {
             continue;
         }
-        if !changed {
-            continue;
-        }
-        environments
-            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &status)
+        flotilla_resources::apply_status_patch(&environments, &environment.metadata.name, &patch)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -5555,6 +5551,46 @@ mod tests {
         let status = environments.get("work").await.expect("resumed environment").status.expect("status");
         assert!(status.ready);
         assert!(status.wait_reason.is_none());
+
+        let external_convoy = convoys
+            .create(&empty_meta("external-home"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+            .await
+            .expect("external-home convoy");
+        convoys
+            .update_status(&external_convoy.metadata.name, &external_convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                ..Default::default()
+            })
+            .await
+            .expect("external-home landing");
+        let external_environment = environments
+            .create(
+                &empty_meta_with_labels("external-home", BTreeMap::from([(CONVOY_LABEL.to_string(), "external-home".to_string())])),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        host_ref: "host-test".to_string(),
+                        image: "test".to_string(),
+                        declared_agent_adapters: required.clone(),
+                        required_agent_adapters: required,
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]),
+                    }),
+                },
+            )
+            .await
+            .expect("external-home environment");
+        environments
+            .update_status(
+                &external_environment.metadata.name,
+                &external_environment.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
+            )
+            .await
+            .expect("external-home ready");
+        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("ignore external home");
+        assert!(environments.get("external-home").await.expect("external home").status.expect("status").ready);
     }
 
     #[tokio::test]
