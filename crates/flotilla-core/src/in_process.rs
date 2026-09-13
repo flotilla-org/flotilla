@@ -7905,6 +7905,9 @@ impl InProcessDaemon {
                     .to_string(),
             );
         }
+        if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
+            return Ok(());
+        }
         if let Some(pending) = convoy
             .status
             .as_ref()

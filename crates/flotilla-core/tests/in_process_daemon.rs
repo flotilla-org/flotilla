@@ -6068,4 +6068,22 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
     assert_eq!(forced.phase, ConvoyPhase::Landing);
     assert_eq!(forced.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     assert_eq!(forced.crew_work["work"]["coder"].completion_override.as_ref().map(|override_| &override_.principal), Some(&operator));
+
+    daemon
+        .crew_complete_with_disposition_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("missing-ledger".to_string()),
+                vessel_ref: Some("missing-ledger-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            Some("stray duplicate".to_string()),
+            Some("must not replace the admitted claim".to_string()),
+            None,
+        )
+        .await
+        .expect("already-admitted completion is idempotent");
+    let after_duplicate = convoys.get("missing-ledger").await.expect("read convoy after duplicate").status.expect("status after duplicate");
+    assert_eq!(after_duplicate, forced);
 }
