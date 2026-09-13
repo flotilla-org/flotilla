@@ -28,6 +28,8 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#comment-2".into()),
                 missing: false,
+                override_principal: None,
+                completed_while_crew_active: false,
             },
             ExplainedDecisionLedger {
                 vessel: "review".into(),
@@ -35,6 +37,8 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
                 comment_url: None,
                 missing: true,
+                override_principal: None,
+                completed_while_crew_active: false,
             },
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
@@ -43,7 +47,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let output = format_convoy_explanation_human(&explanation);
     assert!(output.contains("Message: waiting for review evidence"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
-    assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (flagged; claim accepted)"));
+    assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
 }
 
 #[test]

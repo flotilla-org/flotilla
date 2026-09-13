@@ -988,7 +988,7 @@ mod tests {
         assert!(content.contains("**If asking were free:**"));
         assert!(content.contains("No decisions beyond the brief."));
         assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
-        assert!(content.contains("A claim without this pointer is accepted but flagged"));
+        assert!(content.contains("A claim without this pointer is held for governor attention"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
-        assert!(brief.contains("A missing ledger is a finding, not grounds to reject or wedge the claim"));
+        assert!(brief.contains("A missing ledger holds the claim for governor attention"));
         assert!(brief.contains("park the verified commit"));
         assert!(brief.contains("redispatched under the owning project"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));

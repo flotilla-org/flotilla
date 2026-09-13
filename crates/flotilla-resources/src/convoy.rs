@@ -441,6 +441,12 @@ pub struct ConvoyStatus {
     pub attention: Option<ConvoyAttention>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewCompletionOverride {
+    pub principal: PrincipalRef,
+    pub forced_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum ConvoyProvisioningState {
@@ -619,10 +625,17 @@ pub struct CrewWorkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
     /// Durable pointer to the PR comment containing the claim's decision ledger.
-    /// Absence on a completed claim is an advisory fence flag, never grounds
-    /// for rejecting the claim.
+    /// A claim without this pointer is held unless an operator overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
+    /// Operator authority that admitted this claim without a decision ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_override: Option<CrewCompletionOverride>,
+    /// The completion arrived while the agent process was alive and its
+    /// attention had not reached idle.
+    #[builder(default)]
+    #[serde(default)]
+    pub completed_while_crew_active: bool,
     /// Review evidence for this settlement claim. Kept optional while claim
     /// producers migrate onto the evidence-backed protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -733,6 +746,14 @@ pub enum ConvoyStatusPatch {
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        completed_while_crew_active: bool,
+        forced_by: Option<PrincipalRef>,
+    },
+    HoldCrewCompletion {
+        vessel: String,
+        role: String,
+        attempted_at: DateTime<Utc>,
+        completed_while_crew_active: bool,
     },
     MarkCrewFailed {
         vessel: String,
@@ -765,6 +786,8 @@ pub enum ConvoyStatusPatch {
         completion_message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        completed_while_crew_active: bool,
+        forced_by: Option<PrincipalRef>,
     },
     RecordTurnDelivery {
         source: String,
@@ -984,7 +1007,16 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_operator_pending_brief(status);
             }
-            Self::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref } => {
+            Self::MarkCrewCompleted {
+                vessel,
+                role,
+                finished_at,
+                message,
+                disposition,
+                decision_ledger_ref,
+                completed_while_crew_active,
+                forced_by,
+            } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Done
@@ -1002,7 +1034,26 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
                 }
+                if let Some(principal) = forced_by {
+                    if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                        state.completion_override = Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *finished_at });
+                    }
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.completed_while_crew_active |= *completed_while_crew_active;
+                }
+                if status.attention.as_ref().is_some_and(|attention| attention.source == format!("crew-completion/{vessel}/{role}")) {
+                    status.attention = None;
+                }
                 enter_landing_if_completion_claims_settled(status);
+            }
+            Self::HoldCrewCompletion { vessel, role, attempted_at, completed_while_crew_active } => {
+                let reason = "crew completed without a decision ledger".to_string();
+                status.attention =
+                    Some(ConvoyAttention { source: format!("crew-completion/{vessel}/{role}"), reason, raised_at: *attempted_at });
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.completed_while_crew_active |= *completed_while_crew_active;
+                }
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -1064,7 +1115,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ClearPendingBrief => {
                 clear_operator_pending_brief(status);
             }
-            Self::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref } => {
+            Self::DeliverPendingBrief {
+                vessel,
+                role,
+                delivered_at,
+                content,
+                completion_message,
+                disposition,
+                decision_ledger_ref,
+                completed_while_crew_active,
+                forced_by,
+            } => {
                 let matches_pending =
                     status.pending_brief().is_some_and(|brief| brief.vessel == *vessel && brief.role == *role && brief.content == *content);
                 if !matches_pending {
@@ -1080,6 +1141,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     if decision_ledger_ref.is_some() {
                         state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
+                    if let Some(principal) = forced_by {
+                        state.completion_override = Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at });
+                    }
+                    state.completed_while_crew_active |= *completed_while_crew_active;
                 }
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
@@ -1258,7 +1323,39 @@ pub mod external_patches {
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message, disposition, decision_ledger_ref }
+        mark_crew_completed_with_context(vessel, role, finished_at, message, disposition, decision_ledger_ref, false, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_crew_completed_with_context(
+        vessel: String,
+        role: String,
+        finished_at: DateTime<Utc>,
+        message: Option<String>,
+        disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
+        completed_while_crew_active: bool,
+        forced_by: Option<PrincipalRef>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkCrewCompleted {
+            vessel,
+            role,
+            finished_at,
+            message,
+            disposition,
+            decision_ledger_ref,
+            completed_while_crew_active,
+            forced_by,
+        }
+    }
+
+    pub fn hold_crew_completion(
+        vessel: String,
+        role: String,
+        attempted_at: DateTime<Utc>,
+        completed_while_crew_active: bool,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::HoldCrewCompletion { vessel, role, attempted_at, completed_while_crew_active }
     }
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
@@ -1287,6 +1384,7 @@ pub mod external_patches {
         ConvoyStatusPatch::ClearPendingBrief
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn deliver_pending_brief(
         vessel: String,
         role: String,
@@ -1295,8 +1393,20 @@ pub mod external_patches {
         completion_message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        completed_while_crew_active: bool,
+        forced_by: Option<PrincipalRef>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::DeliverPendingBrief { vessel, role, delivered_at, content, completion_message, disposition, decision_ledger_ref }
+        ConvoyStatusPatch::DeliverPendingBrief {
+            vessel,
+            role,
+            delivered_at,
+            content,
+            completion_message,
+            disposition,
+            decision_ledger_ref,
+            completed_while_crew_active,
+            forced_by,
+        }
     }
 
     pub fn record_turn_delivery(

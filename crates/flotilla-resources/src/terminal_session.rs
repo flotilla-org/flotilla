@@ -195,6 +195,10 @@ pub struct CrewCompletionPending {
     pub disposition: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_ref: Option<flotilla_protocol::PrincipalRef>,
     pub attempted_at: DateTime<Utc>,
     pub authority: String,
     pub last_error: String,
@@ -544,6 +548,8 @@ mod tests {
             message: Some("https://github.com/flotilla-org/flotilla/pull/1300".into()),
             disposition: None,
             decision_ledger_ref: None,
+            force: false,
+            principal_ref: None,
             attempted_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).single().expect("valid timestamp"),
             authority: "kiwi".into(),
             last_error: "authority unreachable for convoy-a".into(),

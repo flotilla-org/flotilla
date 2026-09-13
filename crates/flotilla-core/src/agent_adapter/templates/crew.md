@@ -21,7 +21,7 @@ At settlement-claim time, post a PR comment headed `## Decision ledger` that rep
 - **Alternative:** the alternative you considered
 - **If asking were free:** what you would have asked
 
-If there were no such decisions, post the heading followed by `No decisions beyond the brief.`. Pass the durable comment URL with `flotilla crew complete --decision-ledger-ref '<comment URL>' ...`. A claim without this pointer is accepted but flagged. Do not create a ledger file in the repository.
+If there were no such decisions, post the heading followed by `No decisions beyond the brief.`. Pass the durable comment URL with `flotilla crew complete --decision-ledger-ref '<comment URL>' ...`. A claim without this pointer is held for governor attention; only an operator may override it with `--force`. Do not create a ledger file in the repository.
 
 ## Assignment
 

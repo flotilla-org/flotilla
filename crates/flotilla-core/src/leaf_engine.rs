@@ -480,7 +480,7 @@ fn compose_turn_brief(
         cr.checks.value,
         cr.mergeable.value,
         claim_at.to_rfc3339(),
-        decision_ledger_ref.unwrap_or("MISSING (flagged, claim remains accepted)"),
+        decision_ledger_ref.unwrap_or("MISSING (crew completed without a decision ledger)"),
         convoy.metadata.namespace,
         convoy.metadata.name,
         rule.to.vessel,

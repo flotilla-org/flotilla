@@ -65,6 +65,7 @@ define_patch_kinds! {
     ConvoyMarkWorkCancelled => DUPLICATE,
     ConvoyMarkConvoyAbandoned => DUPLICATE,
     ConvoyMarkCrewCompleted => DUPLICATE_RESETTLEMENT,
+    ConvoyHoldCrewCompletion => NONE,
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyHandoffCrewWork => CONTINUATION,
     ConvoyResumeCrewWork => CONTINUATION,
@@ -115,6 +116,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
+        ConvoyStatusPatch::HoldCrewCompletion { .. } => PatchKind::ConvoyHoldCrewCompletion,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
@@ -209,7 +211,17 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 }
 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
-    CrewWorkState { phase, started_at, finished_at, message: None, disposition: None, decision_ledger_ref: None, claim_evidence: None }
+    CrewWorkState {
+        phase,
+        started_at,
+        finished_at,
+        message: None,
+        disposition: None,
+        decision_ledger_ref: None,
+        completion_override: None,
+        completed_while_crew_active: false,
+        claim_evidence: None,
+    }
 }
 
 fn pending_brief() -> PendingBrief {
@@ -547,6 +559,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     message: Some("still complete".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
@@ -846,6 +860,8 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     completion_message: Some("first turn complete".to_string()),
                     disposition: Some("satisfied".to_string()),
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
@@ -1026,6 +1042,8 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                     message: Some("addressed".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    completed_while_crew_active: false,
+                    forced_by: None,
                 };
                 apply_and_replay(&mut status, &resettle);
                 (before, crew_timestamps(&status))

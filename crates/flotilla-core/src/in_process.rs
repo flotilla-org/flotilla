@@ -7856,6 +7856,18 @@ impl InProcessDaemon {
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
     ) -> Result<(), String> {
+        self.crew_complete_as_principal_internal(requested, message, disposition, decision_ledger_ref, false, None).await
+    }
+
+    pub async fn crew_complete_as_principal_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: Option<String>,
+        disposition: Option<String>,
+        decision_ledger_ref: Option<String>,
+        force: bool,
+        principal: Option<PrincipalRef>,
+    ) -> Result<(), String> {
         if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
         {
             return Err("decision ledger reference must use an HTTP(S) URL".to_string());
@@ -7866,9 +7878,30 @@ impl InProcessDaemon {
         let message_lock = self.convoy_message_lock(namespace, convoy_name).await;
         let _message_guard = message_lock.lock().await;
         let context = self.resolve_crew_context_from_routing(&routing).await?;
+        let completed_while_crew_active = context.caller_session.as_ref().is_some_and(|session| {
+            let Some(status) = session.status.as_ref() else { return false };
+            status.phase == ResourceTerminalSessionPhase::Running
+                && status.attention.as_ref().is_none_or(|attention| attention.state != TerminalAttentionState::Idle)
+        });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
+        let forced_by = if force { Some(principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?) } else { None };
+        if decision_ledger_ref.is_none() && forced_by.is_none() {
+            apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &convoy_external_patches::hold_crew_completion(
+                    context.vessel,
+                    context.caller_role,
+                    chrono::Utc::now(),
+                    completed_while_crew_active,
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+            return Ok(());
+        }
         if let Some(pending) = convoy
             .status
             .as_ref()
@@ -7892,6 +7925,8 @@ impl InProcessDaemon {
                     message,
                     disposition,
                     decision_ledger_ref,
+                    completed_while_crew_active,
+                    forced_by,
                 ),
             )
             .await
@@ -7902,13 +7937,15 @@ impl InProcessDaemon {
         apply_resource_status_patch(
             &convoys,
             convoy_name,
-            &convoy_external_patches::mark_crew_completed(
+            &convoy_external_patches::mark_crew_completed_with_context(
                 context.vessel,
                 context.caller_role,
                 chrono::Utc::now(),
                 message,
                 disposition,
                 decision_ledger_ref,
+                completed_while_crew_active,
+                forced_by,
             ),
         )
         .await
@@ -9749,10 +9786,19 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } =
+            &command.action
+        {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self
-                .crew_complete_with_disposition_internal(context, message.clone(), disposition.clone(), decision_ledger_ref.clone())
+                .crew_complete_as_principal_internal(
+                    context,
+                    message.clone(),
+                    disposition.clone(),
+                    decision_ledger_ref.clone(),
+                    *force,
+                    dispatching_principal_ref.clone(),
+                )
                 .await
             {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
@@ -10837,7 +10883,7 @@ impl InProcessDaemon {
             })
             .collect::<Vec<_>>();
 
-        let evaluation = evaluate_landing_settlement(
+        let mut evaluation = evaluate_landing_settlement(
             &convoy,
             &selected_vessels,
             &selected_checkouts,
@@ -10846,6 +10892,18 @@ impl InProcessDaemon {
             LANDING_EVIDENCE_TTL,
             now,
         );
+        if convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.attention.as_ref())
+            .is_some_and(|attention| attention.reason == "crew completed without a decision ledger")
+        {
+            evaluation.satisfied = false;
+            evaluation.unmet.push(flotilla_resources::UnmetSettlementExpectation::InvalidCondition {
+                subject: convoy.metadata.name.clone(),
+                message: "crew completed without a decision ledger".to_string(),
+            });
+        }
         let mut unmet = evaluation.unmet.into_iter().map(explain_unmet_expectation).collect::<Vec<_>>();
         unmet.extend(observation_errors.iter().map(|(record, error)| ExplainedUnmetExpectation {
             reason: "observation_error".to_string(),
@@ -10948,7 +11006,7 @@ impl InProcessDaemon {
 }
 
 fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {
-    status
+    let mut ledgers = status
         .into_iter()
         .flat_map(|status| &status.crew_work)
         .flat_map(|(vessel, crew)| {
@@ -10959,10 +11017,31 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
                     claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
                     comment_url: claim.decision_ledger_ref.clone(),
                     missing: claim.decision_ledger_ref.is_none(),
+                    override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
+                    completed_while_crew_active: claim.completed_while_crew_active,
                 },
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(attention) = status.and_then(|status| status.attention.as_ref()) {
+        if let Some(target) = attention.source.strip_prefix("crew-completion/") {
+            if let Some((vessel, role)) = target.rsplit_once('/') {
+                ledgers.push(ExplainedDecisionLedger {
+                    vessel: vessel.to_string(),
+                    role: role.to_string(),
+                    claimed_at: Some(attention.raised_at.to_rfc3339()),
+                    comment_url: None,
+                    missing: true,
+                    override_principal: None,
+                    completed_while_crew_active: status
+                        .and_then(|status| status.crew_work.get(vessel))
+                        .and_then(|crew| crew.get(role))
+                        .is_some_and(|claim| claim.completed_while_crew_active),
+                });
+            }
+        }
+    }
+    ledgers
 }
 
 #[async_trait]

@@ -48,6 +48,8 @@ pub(super) struct PendingCrewCompletionRoute {
     message: Option<String>,
     disposition: Option<String>,
     decision_ledger_ref: Option<String>,
+    force: bool,
+    principal_ref: Option<flotilla_protocol::PrincipalRef>,
     authority: Option<HostName>,
 }
 
@@ -165,6 +167,9 @@ impl RemoteCommandRouter {
         dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
     ) -> Result<u64, String> {
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
+        if let Some(completion) = &mut crew_completion {
+            completion.principal_ref = dispatching_principal_ref.clone();
+        }
         let existing_convoy_target = self.daemon.resolve_existing_convoy_target(&command.action).await?;
         if let (Some(completion), Some(target)) = (&mut crew_completion, &existing_convoy_target) {
             completion.authority = Some(target.home.clone());
@@ -973,8 +978,8 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 impl RemoteCommandRouter {
     async fn resolve_crew_command_routing(&self, action: &mut CommandAction) -> Result<Option<PendingCrewCompletionRoute>, String> {
         let (context, completion) = match action {
-            CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref } => {
-                (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone())))
+            CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } => {
+                (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone(), *force)))
             }
             CommandAction::CrewFail { context, .. }
             | CommandAction::CrewHandoff { context, .. }
@@ -983,7 +988,7 @@ impl RemoteCommandRouter {
         };
         let routing = self.daemon.resolve_crew_routing_context(context).await?;
         *context = routing.command_context.clone();
-        let Some((message, disposition, decision_ledger_ref)) = completion else { return Ok(None) };
+        let Some((message, disposition, decision_ledger_ref, force)) = completion else { return Ok(None) };
         let Some(session_name) = routing.session_name else { return Ok(None) };
         Ok(Some(PendingCrewCompletionRoute {
             namespace: context.namespace.clone().expect("resolved crew context has namespace"),
@@ -993,6 +998,8 @@ impl RemoteCommandRouter {
             message,
             disposition,
             decision_ledger_ref,
+            force,
+            principal_ref: None,
             authority: None,
         }))
     }
@@ -1006,6 +1013,8 @@ impl RemoteCommandRouter {
             message: completion.message.clone(),
             disposition: completion.disposition.clone(),
             decision_ledger_ref: completion.decision_ledger_ref.clone(),
+            force: completion.force,
+            principal_ref: completion.principal_ref.clone(),
             attempted_at: chrono::Utc::now(),
             authority: authority.to_string(),
             last_error: last_error.to_string(),
@@ -1055,9 +1064,10 @@ impl RemoteCommandRouter {
                         message: state.completion.message.clone(),
                         disposition: state.completion.disposition.clone(),
                         decision_ledger_ref: state.completion.decision_ledger_ref.clone(),
+                        force: state.completion.force,
                     },
                 };
-                if router.dispatch_execute_for_principal(command, None).await.is_ok() {
+                if router.dispatch_execute_for_principal(command, state.completion.principal_ref.clone()).await.is_ok() {
                     let mut retrying = router.retrying_crew_completions.lock().expect("crew completion retry lock");
                     if retrying.get(&session_name).is_some_and(|current| current.generation == state.generation) {
                         retrying.remove(&session_name);
@@ -1087,6 +1097,8 @@ impl RemoteCommandRouter {
                 message: pending.message,
                 disposition: pending.disposition,
                 decision_ledger_ref: pending.decision_ledger_ref,
+                force: pending.force,
+                principal_ref: pending.principal_ref,
                 authority: Some(HostName::new(pending.authority)),
             });
         }
