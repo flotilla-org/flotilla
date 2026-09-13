@@ -7891,7 +7891,15 @@ impl InProcessDaemon {
         // identity contract; until then the durable attribution is the audit
         // boundary rather than an authorization boundary.
         let forced_by = if force { Some(principal.ok_or_else(|| "`--force` requires an operator principal".to_string())?) } else { None };
-        if decision_ledger_ref.is_none() && forced_by.is_none() {
+        let existing_claim_is_admitted = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .and_then(|crew| crew.get(&context.caller_role))
+            .is_some_and(|claim| {
+                claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
+            });
+        if decision_ledger_ref.is_none() && forced_by.is_none() && !existing_claim_is_admitted {
             apply_resource_status_patch(
                 &convoys,
                 convoy_name,

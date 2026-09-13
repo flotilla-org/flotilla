@@ -6078,4 +6078,23 @@ async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
     assert_eq!(forced.phase, ConvoyPhase::Landing);
     assert_eq!(forced.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     assert_eq!(forced.crew_work["work"]["coder"].completion_override.as_ref().map(|override_| &override_.principal), Some(&operator));
+
+    daemon
+        .crew_complete_with_disposition_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("missing-ledger".to_string()),
+                vessel_ref: Some("missing-ledger-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            Some("duplicate completion".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("ignore ledger-less duplicate of admitted claim");
+    let duplicate = convoys.get("missing-ledger").await.expect("read duplicate claim").status.expect("duplicate status");
+    assert_eq!(duplicate.phase, ConvoyPhase::Landing);
+    assert_eq!(duplicate.attention, None);
 }
