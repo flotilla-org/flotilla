@@ -5628,19 +5628,6 @@ impl InProcessDaemon {
         self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
     }
 
-    async fn reap_convoy_internal_attributed(
-        &self,
-        namespace: &str,
-        name: &str,
-        force: bool,
-        caller: Option<&flotilla_protocol::CommandCaller>,
-    ) -> Result<(), String> {
-        self.verify_convoy_teardown_gate(namespace, name, force).await?;
-        self.record_lifecycle_mutation(namespace, name, "convoy_delete", caller).await?;
-        self.cascade_convoy_children(namespace, name).await?;
-        self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())
-    }
-
     async fn check_local_free_space_floor(&self) -> Result<(), String> {
         let config = Arc::clone(&self.config);
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
@@ -9878,8 +9865,13 @@ impl InProcessDaemon {
                 None => self.provisioning_namespace().await,
             };
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
-                Ok(record_name) => match self.reap_convoy_internal_attributed(&namespace, &record_name, *force, caller.as_ref()).await {
-                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Ok(record_name) => match self.reap_convoy_internal(&namespace, &record_name, *force).await {
+                    Ok(()) => {
+                        // Finalizers retain an explainable convoy after delete; a fully
+                        // removed convoy has no remaining status to annotate.
+                        let _ = self.record_lifecycle_mutation(&namespace, &record_name, "convoy_delete", caller.as_ref()).await;
+                        flotilla_protocol::CommandValue::Ok
+                    }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },

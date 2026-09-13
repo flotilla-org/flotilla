@@ -25,11 +25,19 @@ use tracing::info;
 
 use crate::peer::{PeerManager, PeerSender};
 
-fn command_action_name(action: &CommandAction) -> String {
-    serde_json::to_value(action)
-        .ok()
-        .and_then(|value| value.get("action").and_then(serde_json::Value::as_str).map(ToString::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
+fn command_action_name(command: &Command) -> &'static str {
+    match &command.action {
+        CommandAction::ConvoyDelete { .. } => "convoy_delete",
+        CommandAction::ConvoyAbandon { .. } => "convoy_abandon",
+        CommandAction::ConvoyResume { .. } => "convoy_resume",
+        CommandAction::CrewComplete { .. } => "crew_complete",
+        CommandAction::CrewFail { .. } => "crew_fail",
+        CommandAction::CrewHandoff { .. } => "crew_handoff",
+        CommandAction::ResourceApply { .. } => "resource_apply",
+        CommandAction::ResourceDelete { .. } => "resource_delete",
+        CommandAction::ResourceStatusPatch { .. } => "resource_status_patch",
+        _ => command.description(),
+    }
 }
 
 fn command_subject(action: &CommandAction) -> String {
@@ -254,7 +262,7 @@ impl RemoteCommandRouter {
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
         let desc = command.description();
-        let action = command_action_name(&command.action);
+        let action = command_action_name(&command);
         let subject = command_subject(&command.action);
         let caller_label = caller.as_ref().map(ToString::to_string).unwrap_or_else(|| "unattributed".to_string());
         info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, "dispatch_execute");

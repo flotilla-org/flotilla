@@ -47,11 +47,15 @@ fn crew_identity(environment: &HashMap<String, String>) -> Option<CallerCrew> {
 }
 
 fn container_from_cgroup(contents: &str) -> Option<String> {
-    contents
-        .lines()
-        .flat_map(|line| line.rsplit('/').next())
-        .find(|component| component.len() >= 12 && component.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .map(ToString::to_string)
+    contents.lines().flat_map(|line| line.rsplit('/').next()).find_map(|component| {
+        let without_scope = component.strip_suffix(".scope").unwrap_or(component);
+        let candidate = without_scope
+            .strip_prefix("docker-")
+            .or_else(|| without_scope.strip_prefix("cri-containerd-"))
+            .or_else(|| without_scope.strip_prefix("libpod-"))
+            .unwrap_or(without_scope);
+        (candidate.len() == 64 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| candidate.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -60,7 +64,8 @@ mod tests {
 
     #[test]
     fn extracts_container_id_from_cgroup() {
-        assert_eq!(container_from_cgroup("0::/docker/0123456789abcdef\n"), Some("0123456789abcdef".to_string()));
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(container_from_cgroup(&format!("0::/system.slice/docker-{id}.scope\n")), Some(id.to_string()));
     }
 
     #[tokio::test]
