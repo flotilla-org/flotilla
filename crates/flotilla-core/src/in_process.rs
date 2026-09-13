@@ -7900,21 +7900,10 @@ impl InProcessDaemon {
                 claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
             });
         if decision_ledger_ref.is_none() && forced_by.is_none() && !existing_claim_is_admitted {
-            apply_resource_status_patch(
-                &convoys,
-                convoy_name,
-                &convoy_external_patches::hold_crew_completion(
-                    context.vessel,
-                    context.caller_role,
-                    chrono::Utc::now(),
-                    message,
-                    disposition,
-                    completed_while_crew_active,
-                ),
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-            return Ok(());
+            return Err(
+                "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
+                    .to_string(),
+            );
         }
         if let Some(pending) = convoy
             .status

@@ -5977,7 +5977,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
 }
 
 #[tokio::test]
-async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
+async fn crew_completion_without_a_decision_ledger_is_refused() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -6015,7 +6015,8 @@ async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
         .await
         .expect("create vessel");
 
-    daemon
+    let before = convoys.get("missing-ledger").await.expect("read convoy before refusal").status.expect("convoy status before refusal");
+    let error = daemon
         .crew_complete_with_disposition_internal(
             &flotilla_protocol::CrewCommandContext {
                 crew_id: None,
@@ -6029,26 +6030,14 @@ async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
             None,
         )
         .await
-        .expect("record held completion");
+        .expect_err("refuse completion without a ledger");
+    assert_eq!(
+        error,
+        "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
+    );
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
-    assert_eq!(status.phase, ConvoyPhase::Active);
-    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("done"));
-    assert_eq!(status.attention.expect("governor attention").reason, "crew completed without a decision ledger");
-    let explanation = daemon
-        .execute_query(
-            Command::builder()
-                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "missing-ledger".to_string() })
-                .build(),
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .expect("explain held convoy");
-    let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
-    assert!(!explanation.settlement.satisfied);
-    assert!(explanation.settlement.unmet.iter().any(|unmet| unmet.detail == "crew completed without a decision ledger"));
-    assert!(explanation.decision_ledgers.iter().any(|ledger| ledger.role == "coder" && ledger.missing));
+    assert_eq!(status, before);
 
     let operator = flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() };
     let mut events = daemon.subscribe();
@@ -6079,23 +6068,4 @@ async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
     assert_eq!(forced.phase, ConvoyPhase::Landing);
     assert_eq!(forced.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     assert_eq!(forced.crew_work["work"]["coder"].completion_override.as_ref().map(|override_| &override_.principal), Some(&operator));
-
-    daemon
-        .crew_complete_with_disposition_internal(
-            &flotilla_protocol::CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("missing-ledger".to_string()),
-                vessel_ref: Some("missing-ledger-vessel".to_string()),
-                role: Some("coder".to_string()),
-            },
-            Some("duplicate completion".to_string()),
-            None,
-            None,
-        )
-        .await
-        .expect("ignore ledger-less duplicate of admitted claim");
-    let duplicate = convoys.get("missing-ledger").await.expect("read duplicate claim").status.expect("duplicate status");
-    assert_eq!(duplicate.phase, ConvoyPhase::Landing);
-    assert_eq!(duplicate.attention, None);
 }

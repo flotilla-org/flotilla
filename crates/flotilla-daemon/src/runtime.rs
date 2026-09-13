@@ -9923,6 +9923,34 @@ mod tests {
         assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
 
         let mut rx = daemon.subscribe();
+        let refused_complete_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewComplete {
+                        context: crew_context.clone(),
+                        message: Some("delegate attempted completion".to_string()),
+                        disposition: None,
+                        decision_ledger_ref: None,
+                        force: false,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch refused completion");
+        assert_eq!(wait_for_command_result(&mut rx, refused_complete_id).await, CommandValue::Error {
+            message: "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
+                .to_string(),
+        });
+        let after_refusal =
+            convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
+        assert_eq!(after_refusal, initial_status, "refused completion must not mutate convoy status");
+        assert_eq!(
+            terminals.get(&coder.metadata.name).await.expect("coder session after refusal").status.expect("coder session status").phase,
+            TerminalSessionPhase::Running,
+            "refused completion must leave the crew session alive"
+        );
+
+        let mut rx = daemon.subscribe();
         let coder_complete_id = daemon
             .execute(
                 Command::builder()

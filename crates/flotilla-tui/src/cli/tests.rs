@@ -58,7 +58,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
     assert!(output.contains(
-        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (forced by flotilla/operator) — completed while crew active"
+        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
     ));
 }
 

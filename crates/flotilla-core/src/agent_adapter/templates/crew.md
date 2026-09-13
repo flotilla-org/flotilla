@@ -7,6 +7,7 @@ You are `{{ role }}` in convoy `{{ convoy }}`, aboard vessel `{{ vessel }}` (`{{
 {% block crew %}{% for member in members %}- `{{ member.role }}`: {{ member.state }}
 {% endfor %}{% endblock %}
 {% block operating_instructions %}Run `flotilla crew list` for current crew state.
+Only this top-level crew session may run `flotilla crew` or `flotilla convoy` verbs. Background delegates and sub-agents must never run those verbs. After all delegated work has returned, this top-level session posts the decision ledger and only then completes the crew work.
 Clone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.
 {% if has_credential_scope %}Before enacting repository changes, compare the destination with `Minted credential repository scope` in `## Work context`. If the enactment repository is outside that scope, park the verified commit and report the mismatch with `flotilla crew fail --message '...'` so the work can be redispatched under the owning project; do not discover the mismatch by attempting a push.
 {% endif %}{% for member in handoff_members %}Hand off to {{ member.role }} with `flotilla crew {{ member.role }} handoff --message '...'`.
@@ -21,7 +22,7 @@ At settlement-claim time, post a PR comment headed `## Decision ledger` that rep
 - **Alternative:** the alternative you considered
 - **If asking were free:** what you would have asked
 
-If there were no such decisions, post the heading followed by `No decisions beyond the brief.`. Pass the durable comment URL with `flotilla crew complete --decision-ledger-ref '<comment URL>' ...`. A claim without this pointer is held for governor attention; only an operator may override it with `--force`. Do not create a ledger file in the repository.
+If there were no such decisions, post the heading followed by `No decisions beyond the brief.`. Pass the durable comment URL with `flotilla crew complete --decision-ledger-ref '<comment URL>' ...`. A completion without this pointer is refused; only an operator may override it with `--force`. Do not create a ledger file in the repository.
 
 ## Assignment
 
