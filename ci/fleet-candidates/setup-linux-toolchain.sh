@@ -14,12 +14,7 @@ rustup_version="1.28.2"
 rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$toolchain_root"
 
-cleat_sha="${FLEET_CLEAT_SHA:-}"
-if [[ ${#cleat_sha} -ne 40 || "$cleat_sha" == *[!0-9a-fA-F]* ]]; then
-  printf 'FLEET_CLEAT_SHA must be an exact 40-character hexadecimal commit: %s\n' "$cleat_sha" >&2
-  return 1
-fi
-cleat_sha="$(printf '%s' "$cleat_sha" | tr 'A-F' 'a-f')"
+cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
 cleat_toolchain="$toolchain_root/cleat-$cleat_sha-ghostty-toolchain.toml"
 if [[ ! -f "$cleat_toolchain" ]]; then
   cleat_toolchain_download="$cleat_toolchain.download"

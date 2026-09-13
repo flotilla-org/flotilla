@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+require_sha() {
+  local name="$1"
+  local value="$2"
+  if [[ ${#value} -ne 40 || "$value" == *[!0-9a-fA-F]* ]]; then
+    printf '%s must be an exact 40-character hexadecimal commit: %s\n' "$name" "$value" >&2
+    return 1
+  fi
+  printf '%s' "$value" | tr 'A-F' 'a-f'
+}
+
 read_cleat_toolchain_value() {
   local toolchain_file="$1"
   local section="$2"
