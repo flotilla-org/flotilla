@@ -5970,7 +5970,6 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     assert!(status.pending_brief().is_none());
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("done"));
     assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
@@ -6035,6 +6034,7 @@ async fn crew_completion_without_a_decision_ledger_holds_the_convoy() {
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("done"));
     assert_eq!(status.attention.expect("governor attention").reason, "crew completed without a decision ledger");
     let explanation = daemon
         .execute_query(
