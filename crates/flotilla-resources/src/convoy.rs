@@ -625,7 +625,7 @@ pub struct CrewWorkState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
     /// Durable pointer to the PR comment containing the claim's decision ledger.
-    /// A claim without this pointer is held unless an operator overrides it.
+    /// A claim without this pointer is refused unless an operator uses `--force`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
     /// Operator authority that admitted this claim without a decision ledger.
