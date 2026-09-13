@@ -70,7 +70,7 @@ provide:
 - Bash, Git, curl, jq, coreutils, a C/C++ toolchain, and Node.js for the
   fully-qualified checkout Action;
 - Rust stable with `rustup`, including permission to add `wasm32-wasip1`;
-- Zig 0.15.2 for Cleat;
+- Zig 0.16.0 for Cleat;
 - enough writable space for Cargo, Ghostty, Zellij, and `target/` caches.
 
 Start the runner as a supervised service and confirm the fork's runner page
@@ -88,7 +88,7 @@ runner:
 ```
 
 The dedicated service account must provide Bash, Git, curl, jq, Node.js, Rust
-stable, Zig 0.15.2, Xcode command-line tools, and `codesign`. Its service
+stable, Zig 0.16.0, Xcode command-line tools, and `codesign`. Its service
 environment must set:
 
 - `FLEET_CODESIGN_IDENTITY` to the standard CLI signing identity;

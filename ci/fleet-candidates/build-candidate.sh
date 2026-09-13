@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-require_sha() {
-  local name="$1"
-  local value="$2"
-  if [[ ${#value} -ne 40 || "$value" == *[!0-9a-fA-F]* ]]; then
-    printf '%s must be an exact 40-character hexadecimal commit: %s\n' "$name" "$value" >&2
-    return 1
-  fi
-  printf '%s' "$value" | tr 'A-F' 'a-f'
-}
+source "$(dirname "${BASH_SOURCE[0]}")/cleat-toolchain.sh"
 
 fetch_exact() {
   local repository="$1"
@@ -71,7 +63,6 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 test "$(cargo --version)" = "cargo 1.97.1 (c980f4866 2026-06-30)"
-test "$(zig version)" = "0.15.2"
 if [[ "$platform" == darwin-aarch64 ]]; then
   xcodebuild -version | grep -Fx 'Xcode 26.6'
   security find-identity -v -p codesigning | grep -Eq '^[[:space:]]*0 valid identities found[[:space:]]*$'
@@ -90,6 +81,8 @@ fi
 
 fetch_exact https://github.com/flotilla-org/flotilla.git "$flotilla_sha" "$flotilla_root"
 fetch_exact https://github.com/flotilla-org/cleat.git "$cleat_sha" "$cleat_root"
+zig_version="$(read_cleat_toolchain_value "$cleat_root/tools/ghostty-toolchain.toml" zig version)"
+test "$(zig version)" = "$zig_version"
 
 rm -rf "$output_root"
 mkdir -p "$bundle/bin" "$bundle/lib"

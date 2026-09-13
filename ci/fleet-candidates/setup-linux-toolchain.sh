@@ -4,17 +4,28 @@
 # remain in effect for the build step.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/cleat-toolchain.sh"
+
 toolchain_root="$PWD/.fleet-cache/toolchains"
 export CARGO_HOME="$PWD/.fleet-cache/cargo"
 export RUSTUP_HOME="$toolchain_root/rustup"
 rust_toolchain="1.97.1"
 rustup_version="1.28.2"
 rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
-zig_version="0.15.2"
-zig_sha256="02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
-zig_root="$toolchain_root/zig-$zig_version"
-
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$toolchain_root"
+
+cleat_sha="$(require_sha FLEET_CLEAT_SHA "${FLEET_CLEAT_SHA:-}")"
+cleat_toolchain="$toolchain_root/cleat-$cleat_sha-ghostty-toolchain.toml"
+if [[ ! -f "$cleat_toolchain" ]]; then
+  cleat_toolchain_download="$cleat_toolchain.download"
+  curl --proto '=https' --tlsv1.2 --fail --show-error --silent \
+    "https://raw.githubusercontent.com/flotilla-org/cleat/$cleat_sha/tools/ghostty-toolchain.toml" \
+    -o "$cleat_toolchain_download"
+  mv "$cleat_toolchain_download" "$cleat_toolchain"
+fi
+zig_version="$(read_cleat_toolchain_value "$cleat_toolchain" zig version)"
+zig_sha256="$(read_cleat_toolchain_value "$cleat_toolchain" zig_sha256 x86_64-linux)"
+zig_root="$toolchain_root/zig-$zig_version"
 
 if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
   rustup_installer="$toolchain_root/rustup-init"
