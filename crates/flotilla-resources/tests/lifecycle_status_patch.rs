@@ -37,6 +37,27 @@ fn pending_brief_delivery_clears_a_resolved_crew_completion_hold() {
     assert_eq!(status.attention, None);
 }
 
+#[test]
+fn force_does_not_relabel_a_ledger_backed_claim_as_overridden() {
+    let mut status = settled_convoy_status();
+    status.crew_work.get_mut("implement").expect("crew vessel").get_mut("coder").expect("crew role").decision_ledger_ref =
+        Some("https://example.test/pull/1#decision-ledger".to_string());
+
+    ConvoyStatusPatch::MarkCrewCompleted {
+        vessel: "implement".to_string(),
+        role: "coder".to_string(),
+        finished_at: ts(30),
+        message: Some("duplicate completion".to_string()),
+        disposition: None,
+        decision_ledger_ref: None,
+        completed_while_crew_active: false,
+        forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() }),
+    }
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].completion_override, None);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleClass {
     Duplicate,

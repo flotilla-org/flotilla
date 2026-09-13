@@ -1036,7 +1036,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 if let Some(principal) = forced_by {
                     if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                        state.completion_override = Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *finished_at });
+                        if state.decision_ledger_ref.is_none() {
+                            state.completion_override =
+                                Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *finished_at });
+                        }
                     }
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
@@ -1142,7 +1145,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
                     if let Some(principal) = forced_by {
-                        state.completion_override = Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at });
+                        if state.decision_ledger_ref.is_none() {
+                            state.completion_override =
+                                Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at });
+                        }
                     }
                     state.completed_while_crew_active |= *completed_while_crew_active;
                 }

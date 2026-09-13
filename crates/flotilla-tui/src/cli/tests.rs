@@ -40,6 +40,15 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 override_principal: None,
                 completed_while_crew_active: false,
             },
+            ExplainedDecisionLedger {
+                vessel: "research".into(),
+                role: "researcher".into(),
+                claimed_at: Some("2026-08-21T12:02:00Z".into()),
+                comment_url: None,
+                missing: true,
+                override_principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+                completed_while_crew_active: true,
+            },
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
     };
@@ -48,6 +57,9 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     assert!(output.contains("Message: waiting for review evidence"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
+    assert!(output.contains(
+        "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (forced by flotilla/operator) — completed while crew active"
+    ));
 }
 
 #[test]
