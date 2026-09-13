@@ -530,8 +530,8 @@ for name in flotilla flotillad cleat; do
 done
 unit="$test_root/home/.config/systemd/user/flotillad.service"
 test -f "$unit" || fail 'systemd user unit was not installed'
-grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0' "$unit" \
-  || fail 'systemd user unit does not run the stable flotillad path without an idle timeout'
+grep -Fxq 'ExecStart="%h/.local/opt/flotilla-fleet/current/bin/flotillad" --timeout 0 --config-dir="%h/.config/flotilla" --state-dir="%h/.local/state/flotilla" --socket="%h/.config/flotilla/run/flotilla.sock"' "$unit" \
+  || fail 'systemd user unit does not run the declared daemon identity without an idle timeout'
 grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"' "$unit" \
   || fail 'systemd user unit does not expose the fleet binary PATH'
 grep -Fxq 'Environment="FLOTILLA_SKILLS_DIR=%h/.local/opt/flotilla-fleet/current/share/flotilla/skills"' "$unit" \

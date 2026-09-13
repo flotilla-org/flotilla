@@ -1045,30 +1045,59 @@ async fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
 async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()> {
     match command {
         DevModeSubCommand::Enable => {
-            // Disable first. Even if graceful shutdown fails, launchd cannot
+            // Disable first. Even if graceful shutdown fails, the supervisor cannot
             // resurrect the fleet daemon while we finish unloading the job.
-            flotilla_tui::socket::launchd::set_agent_enabled(false).map_err(|error| color_eyre::eyre::eyre!(error))?;
+            set_fleet_daemon_enabled(false)?;
             let socket_path = cli.socket_path();
             let shutdown_error =
                 if socket_path.exists() { flotilla_tui::socket::shutdown_existing(&socket_path).await.err() } else { None };
-            flotilla_tui::socket::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            stop_fleet_daemon_service()?;
             if socket_path.exists() {
                 wait_for_socket_removal(&socket_path).await?;
             }
             if let Some(error) = shutdown_error {
-                tracing::debug!(%error, "fleet daemon did not accept graceful shutdown before launchd bootout");
+                tracing::debug!(%error, "fleet daemon did not accept graceful shutdown before supervisor stop");
             }
-            println!("Daemon dev mode enabled; the fleet launchd agent is disabled and stopped.");
+            println!("Daemon dev mode enabled; the fleet daemon service is disabled and stopped.");
             Ok(())
         }
         DevModeSubCommand::Disable => {
-            flotilla_tui::socket::launchd::set_agent_enabled(true).map_err(|error| color_eyre::eyre::eyre!(error))?;
-            flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
-            flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
-            println!("Daemon dev mode disabled; the fleet launchd agent is enabled and started.");
+            set_fleet_daemon_enabled(true)?;
+            start_fleet_daemon_service()?;
+            println!("Daemon dev mode disabled; the fleet daemon service is enabled and started.");
             Ok(())
         }
     }
+}
+
+fn set_fleet_daemon_enabled(enabled: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return flotilla_tui::socket::launchd::set_agent_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    #[cfg(target_os = "linux")]
+    return flotilla_tui::socket::systemd::set_unit_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
+}
+
+fn stop_fleet_daemon_service() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return flotilla_tui::socket::launchd::bootout_agent().map_err(|error| color_eyre::eyre::eyre!(error));
+    #[cfg(target_os = "linux")]
+    return flotilla_tui::socket::systemd::stop_unit().map_err(|error| color_eyre::eyre::eyre!(error));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
+}
+
+fn start_fleet_daemon_service() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
+        return flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error));
+    }
+    #[cfg(target_os = "linux")]
+    return flotilla_tui::socket::systemd::start_unit().map_err(|error| color_eyre::eyre::eyre!(error));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
 }
 
 fn resolve_flotillad_binary() -> Result<PathBuf> {
