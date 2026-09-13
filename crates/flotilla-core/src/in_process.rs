@@ -7907,6 +7907,8 @@ impl InProcessDaemon {
                     context.vessel,
                     context.caller_role,
                     chrono::Utc::now(),
+                    message,
+                    disposition,
                     completed_while_crew_active,
                 ),
             )
