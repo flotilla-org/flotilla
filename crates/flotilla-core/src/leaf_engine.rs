@@ -1215,8 +1215,15 @@ mod tests {
         assert_eq!(diagnostics[0].1[0].value, "Landed");
     }
 
-    #[tokio::test]
-    async fn turn_delivery_enforces_head_identity_records_rungs_and_escalates() {
+    async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+        source: &str,
+        condition: &str,
+        field_path: &str,
+        literal: &str,
+        actionable_review: bool,
+        mergeability: flotilla_resources::ObservedMergeability,
+        brief: &str,
+    ) {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(4);
         let refresher = ChangeRequestRefresher::new(
@@ -1229,9 +1236,9 @@ mod tests {
         let actuator = Arc::new(RecordingTurnDelivery::default());
         table.set_turn_delivery_actuator(actuator.clone()).await;
         let rule = TurnDeliveryRule::builder()
-            .on("$cr.review.actionable-at-head == true".parse().expect("wake leaf"))
+            .on(condition.parse().expect("wake leaf"))
             .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
-            .brief("Address the actionable review and push the fix.".to_string())
+            .brief(brief.to_string())
             .hold(HoldAct::ChangeRequestComment { body: "Automatic delivery paused.".to_string() })
             .build();
         let repo_ref = RepositoryKey("repo".to_string());
@@ -1255,7 +1262,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     exit: Some(ExitDeclaration::standard_table()),
-                    turn_delivery: indexmap::IndexMap::from([("review".to_string(), rule.clone())]),
+                    turn_delivery: indexmap::IndexMap::from([(source.to_string(), rule.clone())]),
                     vessels: Vec::new(),
                 }),
                 work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Complete).build())]),
@@ -1294,16 +1301,16 @@ mod tests {
                 scope: "flotilla-org/flotilla".to_string(),
                 number: 1392,
             },
-            field_path: ".review.actionable-at-head".to_string(),
+            field_path: field_path.to_string(),
             operator: LeafOperator::Equal,
-            literal: "true".to_string(),
+            literal: literal.to_string(),
         };
         let subscription_id = uuid::Uuid::new_v4();
         table.inner.rows.lock().await.insert(subscription_id, LeafSubscriptionRow {
             id: subscription_id,
             namespace: "flotilla".to_string(),
             leaves: vec![leaf.clone()],
-            watcher: LeafWatcher::TurnDelivery { convoy: "wake-turn".to_string(), source: "review".to_string(), rule: rule.clone() },
+            watcher: LeafWatcher::TurnDelivery { convoy: "wake-turn".to_string(), source: source.to_string(), rule: rule.clone() },
             freshness_demand: Some(base),
             created_at: base,
             episode_key: EpisodeKeyFields::default(),
@@ -1315,13 +1322,13 @@ mod tests {
             head_sha: flotilla_resources::Observation::known("stale".to_string(), base),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, base),
             review: flotilla_resources::ChangeRequestReviewObservation {
-                actionable_at_head: flotilla_resources::Observation::known(true, base),
+                actionable_at_head: flotilla_resources::Observation::known(actionable_review, base),
             },
-            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, base),
+            mergeable: flotilla_resources::Observation::known(mergeability, base),
         };
         let updated = records.update_status(&record.metadata.name, &record_version, &stale_status).await.expect("observe stale head");
         record_version = updated.metadata.resource_version;
-        table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("ignore stale firing");
+        table.deliver_turn(subscription_id, "wake-turn", source, &rule, &leaf).await.expect("ignore stale firing");
         assert_eq!(table.inner.rows.lock().await[&subscription_id].episode_key.head_sha, None);
         assert!(convoys.get("wake-turn").await.expect("convoy").status.expect("status").turn_deliveries.is_empty());
 
@@ -1343,20 +1350,20 @@ mod tests {
                 head_sha: flotilla_resources::Observation::known(head.to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, observed_at),
                 review: flotilla_resources::ChangeRequestReviewObservation {
-                    actionable_at_head: flotilla_resources::Observation::known(true, observed_at),
+                    actionable_at_head: flotilla_resources::Observation::known(actionable_review, observed_at),
                 },
-                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+                mergeable: flotilla_resources::Observation::known(mergeability, observed_at),
             };
             let updated = records.update_status(&record.metadata.name, &record_version, &cr_status).await.expect("observe head");
             record_version = updated.metadata.resource_version;
-            table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("process firing");
+            table.deliver_turn(subscription_id, "wake-turn", source, &rule, &leaf).await.expect("process firing");
             if index == 0 {
-                table.deliver_turn(subscription_id, "wake-turn", "review", &rule, &leaf).await.expect("same head is a no-op");
+                table.deliver_turn(subscription_id, "wake-turn", source, &rule, &leaf).await.expect("same head is a no-op");
             }
         }
 
         let status = convoys.get("wake-turn").await.expect("convoy").status.expect("status");
-        let episodes = &status.turn_deliveries["review"].episodes;
+        let episodes = &status.turn_deliveries[source].episodes;
         assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
         assert!(matches!(episodes[0].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, .. }));
         assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::FreshAgent, .. }));
@@ -1369,6 +1376,34 @@ mod tests {
         assert!(first_brief.contains("feature/wake"));
         assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
         assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
+    }
+
+    #[tokio::test]
+    async fn actionable_review_turn_delivery_enforces_head_identity_records_rungs_and_escalates() {
+        assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+            "review",
+            "$cr.review.actionable-at-head == true",
+            ".review.actionable-at-head",
+            "true",
+            true,
+            flotilla_resources::ObservedMergeability::Mergeable,
+            "Address the actionable review and push the fix.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conflicting_mergeability_delivers_once_per_episode_and_escalates_to_hold() {
+        assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(
+            "conflicting",
+            "$cr.mergeable == conflicting",
+            ".mergeable",
+            "conflicting",
+            false,
+            flotilla_resources::ObservedMergeability::Conflicting,
+            "Rebase onto the current base branch, resolve additively, run pinned CI, push the same branch, process review, and file a fresh settlement claim; the previous claim is superseded.",
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -163,6 +163,36 @@ fn stock_workflows_transcribe_the_standard_exit_table() {
 }
 
 #[test]
+fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() {
+    for (name, spec, role) in [
+        ("single-agent-contained", single_agent_contained_workflow_spec(), "coder"),
+        ("single-agent-shepherd", single_agent_shepherd_workflow_spec(), "shepherd"),
+        ("single-agent-trusted", single_agent_trusted_workflow_spec(), "coder"),
+        ("implement-review", implement_review_workflow_spec(), "coder"),
+    ] {
+        validate(&spec).unwrap_or_else(|errors| panic!("stock workflow {name} must validate: {errors:?}"));
+        assert_eq!(spec.turn_delivery.keys().map(String::as_str).collect::<Vec<_>>(), ["actionable-review", "conflicting"]);
+        for rule in spec.turn_delivery.values() {
+            assert_eq!(rule.to.vessel, "work", "wrong vessel in {name}");
+            assert_eq!(rule.to.role, role, "wrong role in {name}");
+        }
+        assert_eq!(spec.turn_delivery["conflicting"].on.to_string(), "$cr.mergeable == conflicting");
+    }
+}
+
+#[test]
+fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
+    let workflow = single_agent_contained_workflow_spec();
+    let snapshot =
+        flotilla_resources::WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels };
+
+    let rendered = serde_json::to_value(snapshot).expect("render workflow snapshot");
+    let rules = rendered["turn_delivery"].as_object().expect("turn-delivery object");
+    assert!(rules.contains_key("actionable-review"));
+    assert_eq!(rules["conflicting"]["on"], "$cr.mergeable == conflicting");
+}
+
+#[test]
 fn exit_schema_rejects_branching_and_sequencing_constructs() {
     for exit in ["exit:\n  sequence:\n    - $cr.state == merged", "exit:\n  merged:\n    then: $cr.state == closed"] {
         let yaml =
