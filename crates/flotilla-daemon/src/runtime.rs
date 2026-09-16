@@ -2725,9 +2725,12 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             }
         }
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
-        let cleanup_errors =
+        self.cleanup(environment_ref).await
+    }
+
+    async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
+        let mut cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
-        let mut cleanup_errors = cleanup_errors;
         if let Some(registry) = self.state.agent_material.as_deref() {
             if let Err(error) = registry.remove_environment_home(environment_ref).await {
                 cleanup_errors.push(error);
