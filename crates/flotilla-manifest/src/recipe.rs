@@ -49,20 +49,25 @@ impl FlotillaRecipes {
 
 impl RecipeMint for FlotillaRecipes {
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
-        Some(Recipe::Command(format!("{} attach --host {} {}", self.flotilla_bin, shell_quote(host.as_str()), shell_quote(attach_ref))))
+        Some(Recipe::Command(format!(
+            "{} attach --host {} {}",
+            shell_quote(&self.flotilla_bin),
+            shell_quote(host.as_str()),
+            shell_quote(attach_ref)
+        )))
     }
 
     fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
         Some(Recipe::Command(format!(
             "{} attach --transient --host {} {}",
-            self.flotilla_bin,
+            shell_quote(&self.flotilla_bin),
             shell_quote(host.as_str()),
             shell_quote(path)
         )))
     }
 
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe> {
-        Some(Recipe::Command(format!("{} view {}", self.flotilla_bin, flotilla_protocol::arg::shell_quote(&target.to_string()))))
+        Some(Recipe::Command(format!("{} view {}", shell_quote(&self.flotilla_bin), shell_quote(&target.to_string()))))
     }
 }
 
@@ -75,7 +80,7 @@ mod tests {
         let mint = FlotillaRecipes::new("flotilla");
         assert_eq!(
             mint.attach("implement", &HostName::new("feta")),
-            Some(Recipe::Command("flotilla attach --host 'feta' 'implement'".to_owned()))
+            Some(Recipe::Command("'flotilla' attach --host 'feta' 'implement'".to_owned()))
         );
         assert_eq!(
             mint.scoped_view(&flotilla_protocol::ViewAddress::Vessel {
@@ -83,11 +88,28 @@ mod tests {
                 convoy: "manifest-extraction".to_owned(),
                 vessel: "implement".to_owned(),
             }),
-            Some(Recipe::Command("flotilla view 'vessel/dev/manifest-extraction/implement'".to_owned()))
+            Some(Recipe::Command("'flotilla' view 'vessel/dev/manifest-extraction/implement'".to_owned()))
         );
         assert_eq!(
             mint.checkout_terminal("/work/flotilla's checkout", &HostName::new("kiwi")),
-            Some(Recipe::Command("flotilla attach --transient --host 'kiwi' '/work/flotilla'\\''s checkout'".to_owned()))
+            Some(Recipe::Command("'flotilla' attach --transient --host 'kiwi' '/work/flotilla'\\''s checkout'".to_owned()))
         );
+    }
+
+    #[test]
+    fn flotilla_mint_quotes_executable_for_every_recipe() {
+        let mint = FlotillaRecipes::new("/opt/Flotilla builds/$current;version's/flotilla");
+        let executable = "'/opt/Flotilla builds/$current;version'\\''s/flotilla'";
+
+        let recipes = [
+            mint.attach("session", &HostName::new("local")).expect("attach recipe"),
+            mint.checkout_terminal("/work/repo", &HostName::new("local")).expect("checkout recipe"),
+            mint.scoped_view(&flotilla_protocol::ViewAddress::Project { namespace: "dev".to_owned(), name: "flotilla".to_owned() })
+                .expect("view recipe"),
+        ];
+
+        for recipe in recipes {
+            assert!(recipe.command().starts_with(executable), "recipe did not preserve executable as one shell argument: {recipe:?}");
+        }
     }
 }
