@@ -2727,6 +2727,12 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let _ = self.state.daemon.remove_provisioned_environment(&EnvironmentId::new(environment_ref));
         let cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
+        let mut cleanup_errors = cleanup_errors;
+        if let Some(registry) = self.state.agent_material.as_deref() {
+            if let Err(error) = registry.remove_environment_home(environment_ref).await {
+                cleanup_errors.push(error);
+            }
+        }
         if !cleanup_errors.is_empty() {
             return Err(cleanup_errors.join("; "));
         }
@@ -5783,7 +5789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_teardown_after_restart_does_not_parse_corrupt_mount_metadata() {
+    async fn docker_teardown_after_restart_removes_persistent_agent_home() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -5808,15 +5814,27 @@ mod tests {
             ),
             Arc::new(ListingEnvironmentProvider { handle }),
         );
-        let state = Arc::new(ControllerRuntimeState::new(
-            daemon,
-            config,
-            Arc::new(local_registry),
-            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
-            "host-test".to_string(),
-            None,
-            "host-direct-host-test".to_string(),
+        let home = temp.path().join("home");
+        let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
+        fs::create_dir_all(environment_home.join("codex/sessions")).expect("persistent agent home");
+        fs::write(environment_home.join("codex/sessions/rollout.jsonl"), "session state").expect("persistent session state");
+        let agent_material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
         ));
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                daemon,
+                config,
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_agent_material(agent_material),
+        );
 
         DockerControllerRuntime { state }
             .destroy("contained-restarted", "test-interior")
@@ -5824,6 +5842,7 @@ mod tests {
             .expect("restart teardown should rediscover and destroy the container");
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
+        assert!(!environment_home.exists(), "durable environment teardown must remove its persistent agent home");
     }
 
     #[tokio::test]

@@ -185,6 +185,15 @@ impl AgentMaterialRegistry {
         self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
+    pub(crate) async fn remove_environment_home(&self, environment_ref: &str) -> Result<(), String> {
+        let home = self.homes_dir.join(environment_ref);
+        match fs::remove_dir_all(&home).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove persistent agent home {}: {error}", home.display())),
+        }
+    }
+
     pub(crate) async fn recover(&self, active_environment_refs: impl IntoIterator<Item = String>) -> Result<(), String> {
         let active = active_environment_refs.into_iter().map(|name| self.holder_ref(&name)).collect::<HashSet<_>>();
         let pool_refs = self.adapters.values().filter_map(|adapter| adapter.pool_ref().map(str::to_string)).collect::<BTreeSet<_>>();
@@ -1029,6 +1038,21 @@ mod tests {
             std::fs::read_to_string(codex_home.join("sessions/2026/09/13/rollout.jsonl")).expect("preserved rollout"),
             "{\"type\":\"session_meta\"}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn environment_home_removal_deletes_persistent_agent_state_and_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let environment_home = temp.path().join(".local/share/flotilla/agent-homes/env-a");
+        let session = environment_home.join("codex/sessions/2026/09/16/rollout.jsonl");
+        std::fs::create_dir_all(session.parent().expect("session has parent")).expect("session directory");
+        std::fs::write(&session, "{\"type\":\"session_meta\"}\n").expect("session state");
+
+        registry.remove_environment_home("env-a").await.expect("remove environment home");
+        assert!(!environment_home.exists(), "environment deletion must remove persistent agent state");
+
+        registry.remove_environment_home("env-a").await.expect("repeat environment home removal");
     }
 
     #[tokio::test]
