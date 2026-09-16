@@ -12,6 +12,9 @@ use flotilla_resources::{
 pub trait DockerEnvironmentRuntime: Send + Sync {
     async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError>;
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
+    async fn cleanup(&self, _environment_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,8 @@ where
         }
         if let Some(container_id) = obj.status.as_ref().and_then(|status| status.docker_container_id.as_deref()) {
             self.docker.destroy(&obj.metadata.name, container_id).await.map_err(ResourceError::other)?;
+        } else {
+            self.docker.cleanup(&obj.metadata.name).await.map_err(ResourceError::other)?;
         }
         Ok(())
     }

@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler};
@@ -20,6 +24,31 @@ impl DockerEnvironmentRuntime for WaitingDockerRuntime {
     }
 
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn cleanup(&self, _environment_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingDockerRuntime {
+    cleaned: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl DockerEnvironmentRuntime for RecordingDockerRuntime {
+    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError> {
+        unreachable!("finalizer test does not provision")
+    }
+
+    async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
+        unreachable!("failed environment has no container")
+    }
+
+    async fn cleanup(&self, environment_ref: &str) -> Result<(), String> {
+        self.cleaned.lock().expect("cleanup log lock should be healthy").push(environment_ref.to_string());
         Ok(())
     }
 }
@@ -80,6 +109,41 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
 
     assert_eq!(status.phase, EnvironmentPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("environment teardown failed: failed to parse provisioned mount metadata: corrupt label"));
+}
+
+#[tokio::test]
+async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let environments = backend.clone().using::<Environment>("flotilla");
+    let environment = environments
+        .create(&InputMeta::builder().name("env-failed".to_string()).build(), &EnvironmentSpec {
+            host_direct: None,
+            docker: Some(DockerEnvironmentSpec {
+                host_ref: "host-a".to_string(),
+                image: "crew-image".to_string(),
+                declared_agent_adapters: BTreeSet::new(),
+                required_agent_adapters: BTreeSet::new(),
+                pull_policy: Default::default(),
+                mounts: Vec::new(),
+                env: Default::default(),
+            }),
+        })
+        .await
+        .expect("create environment");
+    let environment = environments
+        .update_status("env-failed", &environment.metadata.resource_version, &EnvironmentStatus {
+            phase: EnvironmentPhase::Failed,
+            message: Some("provisioning failed".to_string()),
+            ..EnvironmentStatus::default()
+        })
+        .await
+        .expect("mark environment failed");
+    let runtime = Arc::new(RecordingDockerRuntime::default());
+    let reconciler = EnvironmentReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    reconciler.run_finalizer(&environment).await.expect("failed environment cleanup");
+
+    assert_eq!(*runtime.cleaned.lock().expect("cleanup log lock should be healthy"), ["env-failed"]);
 }
 
 struct ForeignEnvironmentRuntime;
