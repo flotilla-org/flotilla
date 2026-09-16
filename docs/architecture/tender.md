@@ -53,7 +53,12 @@ A **publication** associates an assigned endpoint identity, a service protocol
 label, display metadata, an allowed audience, and a publisher. A publisher
 holds a registration or is represented by local configuration. Protocol labels
 are claims by the publisher, not proof that the endpoint implements them.
-Clients still perform their application handshake.
+Clients still perform their application handshake. Jackstay also says
+"publication" for a running frame stream with a local endpoint; a Jackstay
+publication registered with Tender is one Tender publication whose protocol
+label names the Jackstay setup channel, so the two uses nest rather than
+collide. Frame transport itself is never carried by Tender (see the local IPC
+paragraph below).
 
 A **grant** authorises bounded publication, including identity scope and maximum
 audience. Short-lived and reusable revocable grants should both fit the model.
