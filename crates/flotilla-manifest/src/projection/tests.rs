@@ -87,7 +87,7 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         "the one-vessel convoy and vessel point at the same live target"
     );
     assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), vessel_entity.action_target());
-    assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_RECIPE), "flotilla attach --host 'feta' 'terminal-cutover-coder'");
+    assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-cutover-coder'");
     assert!(patches.iter().all(|patch| text(patch, KEY_SOURCE) == "flotilla"), "every entity carries producer provenance");
 }
 
@@ -333,7 +333,7 @@ fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_
 
     let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
     let standing = find_entity(&patches, &entity::checkout("standing"));
-    assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "flotilla attach --transient --host 'kiwi' '/work/standing'");
+    assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --transient --host 'kiwi' '/work/standing'");
     assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), entity::checkout("standing").action_target());
 
     let convoy_owned = find_entity(&patches, &entity::checkout("convoy-owned"));
@@ -357,7 +357,7 @@ fn empty_project_is_an_idle_zero_count_latent_that_opens_its_scoped_view() {
 
     assert_eq!(text(project, KEY_STATUS_STATE), "idle");
     assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(0));
-    assert_eq!(text(project, KEY_PRIMARY_ACTION_RECIPE), "flotilla view 'project/dev/empty'");
+    assert_eq!(text(project, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' view 'project/dev/empty'");
 }
 
 #[test]
