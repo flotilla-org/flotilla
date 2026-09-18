@@ -371,7 +371,7 @@ impl CredentialStore {
         Self::new_with_http(backend, namespace, env, host_bag, host_runner, Arc::new(ReqwestHttpClient::new()), state_dir)
     }
 
-    fn new_with_http(
+    pub(crate) fn new_with_http(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,

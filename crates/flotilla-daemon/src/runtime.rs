@@ -3884,6 +3884,7 @@ mod tests {
                 EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
             },
             environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+            replay::{Masks, ReplayHttpClient, Session},
             terminal::{TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionTag},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
@@ -4034,6 +4035,17 @@ mod tests {
             r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
         )
         .expect("write skill source manifest");
+        skills
+    }
+
+    fn write_test_credentialed_skill_sources(root: &Path) -> PathBuf {
+        let skills = root.join("generation/credentialed-skills");
+        fs::create_dir_all(&skills).expect("create credentialed skill source manifest directory");
+        fs::write(
+            skills.join(".flotilla-sources.json"),
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
+        )
+        .expect("write credentialed skill source manifest");
         skills
     }
 
@@ -4646,7 +4658,8 @@ mod tests {
                     staged.store(true, Ordering::SeqCst);
                 }
                 Ok("ok".to_string())
-            } else if cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
+            } else if cmd == "mkdir" || cmd == "chmod" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
+            {
                 Ok(String::new())
             } else {
                 self.0.run(cmd, args, cwd, label).await
@@ -5325,6 +5338,10 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
         let backend = daemon.resource_backend();
+        let app_id_path = temp.path().join("github-app.id");
+        let private_key_path = temp.path().join("github-app.pem");
+        fs::write(&app_id_path, "12345\n").expect("write App id");
+        fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).expect("write App private key");
         for (name, consumer, source) in [
             ("claude-max", CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() }, "TEST_CLAUDE_TOKEN"),
             ("github-crew-pr", CredentialConsumer::Gh, "TEST_GITHUB_TOKEN"),
@@ -5341,6 +5358,24 @@ mod tests {
                 .await
                 .expect("credential declaration");
         }
+        backend
+            .clone()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&empty_meta("github-skills-fork"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("skill credential declaration");
 
         let staged = Arc::new(AtomicBool::new(false));
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
@@ -5366,12 +5401,24 @@ mod tests {
             ("TEST_CLAUDE_TOKEN", "claude-secret".to_string()),
             ("TEST_GITHUB_TOKEN", "github-secret".to_string()),
         ]));
-        let credential_store = Arc::new(CredentialStore::new(
+        let mint_session = Session::replaying_from_str(
+            r#"interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["mattpocock-skills"],"permissions":{"contents":"read"}}'
+    status: 201
+    response_body: '{"token":"skill-token","expires_at":"2026-08-03T17:00:00Z"}'
+"#,
+            Masks::new(),
+        );
+        let credential_store = Arc::new(CredentialStore::new_with_http(
             backend.clone(),
             NAMESPACE,
             host_env.clone(),
             EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude")),
             Arc::clone(&runner),
+            Arc::new(ReplayHttpClient::new(mint_session.clone())),
             config.state_dir().as_path().to_path_buf(),
         ));
         let agent_material = Arc::new(AgentMaterialRegistry::new(
@@ -5379,7 +5426,7 @@ mod tests {
             NAMESPACE,
             Arc::new(TestEnvVars::new([
                 ("HOME", temp.path().join("home").display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
             ])),
         ));
         let state = Arc::new(
@@ -5414,6 +5461,7 @@ mod tests {
 
         assert!(staged.load(Ordering::SeqCst), "provisioning must stage pinned skills before interior discovery");
         assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
+        mint_session.assert_complete();
     }
 
     #[tokio::test]
