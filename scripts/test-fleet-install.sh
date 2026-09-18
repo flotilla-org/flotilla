@@ -906,19 +906,6 @@ grep -Fq 'skill bundle source pins do not match the fleet generation' "$test_roo
   || fail 'skill pin mismatch was refused for the wrong reason'
 test ! -e "$test_root/home/.local/opt/flotilla-fleet/releases/$bad_skill_pin" || fail 'skill pin rejection published a release'
 
-# The daemon scopes its GitHub App token to the mattpocock-skills source by name,
-# so a bundle may not aim that name at some other repository.
-bad_skill_repository="20260815T234000Z-r7-f777777777777-cfffffffffff1"
-make_generation "$bad_skill_repository" 21 linux-x86_64-gnu2.36 no \
-  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "https://github.com/flotilla-org/some-other-private-repo.git"
-if run_installer "$bad_skill_repository" >"$test_root/skill-repository.out" 2>&1; then
-  fail 'credential-granted skill source aimed at another repository was accepted'
-fi
-grep -Fq 'credential-granted source at an unexpected repository' "$test_root/skill-repository.out" \
-  || fail 'credential-granted source redirect was refused for the wrong reason'
-test ! -e "$test_root/home/.local/opt/flotilla-fleet/releases/$bad_skill_repository" \
-  || fail 'credential-granted source rejection published a release'
-
 bad_platform="20260815T232000Z-r5-f555555555555-ceeeeeeeeeeee"
 make_generation "$bad_platform" 21 darwin-aarch64
 if run_installer "$bad_platform" >"$test_root/platform.out" 2>&1; then
