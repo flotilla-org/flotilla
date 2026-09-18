@@ -62,11 +62,11 @@ def allowed_payload(path, platform=None):
 def validate_skill_bundle(document, sources):
     entries = document.get("sources") if isinstance(document, dict) else None
     if (not isinstance(document, dict) or set(document) != {"schema_version", "sources"}
-            or document.get("schema_version") != 4 or not isinstance(entries, list) or not entries):
-        raise ValidationError("invalid v4 skill bundle")
+            or document.get("schema_version") != 5 or not isinstance(entries, list) or not entries):
+        raise ValidationError("invalid v5 skill bundle")
     names = set()
     for source in entries:
-        if not isinstance(source, dict) or not {"name", "repository", "revision"}.issubset(source) or set(source) - {"name", "repository", "revision", "paths"}:
+        if not isinstance(source, dict) or not {"name", "repository", "revision"}.issubset(source) or set(source) - {"name", "repository", "revision", "paths", "credential"}:
             raise ValidationError("invalid skill source")
         name = source.get("name")
         repository = source.get("repository")
@@ -74,8 +74,9 @@ def validate_skill_bundle(document, sources):
                 or name in names or not isinstance(repository, str) or not repository
                 or source.get("revision") != sources.get(name)):
             raise ValidationError("skill bundle source pins do not match the fleet generation")
-        if name == "mattpocock-skills" and repository != "https://github.com/flotilla-org/mattpocock-skills.git":
-            raise ValidationError("skill bundle points the credential-granted source at an unexpected repository")
+        credential = source.get("credential")
+        if credential is not None and (not isinstance(credential, str) or not credential or any(c in credential for c in "/\\\r\n")):
+            raise ValidationError(f"skill source {name} has invalid credential")
         paths = source.get("paths", ["skills"])
         if (not isinstance(paths, list) or not paths or not all(isinstance(path, str) for path in paths)
                 or len(paths) != len(set(paths))):

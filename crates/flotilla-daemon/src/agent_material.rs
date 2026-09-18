@@ -30,8 +30,6 @@ const CODEX_POOL_REF: &str = "codex-login";
 pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
-const PRIVATE_SKILL_REPOSITORY: &str = "mattpocock-skills";
-const PRIVATE_SKILL_REPOSITORY_URL: &str = "https://github.com/flotilla-org/mattpocock-skills.git";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +43,13 @@ pub(crate) struct AgentMaterialPreflight {
 pub(crate) struct AgentMaterialDelivery {
     pub(crate) mount: ProvisionedMount,
     pub(crate) preflight: AgentMaterialPreflight,
-    pub(crate) github_repository_grants: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillSourceCredentialRequest {
+    pub(crate) source: String,
+    pub(crate) repository: String,
+    pub(crate) credential: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +165,15 @@ impl AgentMaterialRegistry {
         environment_ref: &str,
         required_adapters: &BTreeSet<String>,
         environment: &[(String, String)],
+        source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-        self.skills.stage(environment_ref, &adapters, environment, runner).await
+        self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner).await
+    }
+
+    pub(crate) async fn skill_source_credentials(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
+        self.skills.credential_requests().await
     }
 
     pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
@@ -264,6 +273,7 @@ struct SkillSource {
     name: String,
     repository: String,
     revision: String,
+    credential: Option<String>,
     #[serde(default = "default_skill_source_paths")]
     paths: Vec<String>,
 }
@@ -305,11 +315,28 @@ impl SkillBundle {
                 ],
                 failure_context: "generation-pinned skill source preflight failed".to_string(),
             },
-            // The App token is deliberately limited to the private fork; every
-            // other source must be publicly fetchable until per-source
-            // credentials land (#1796).
-            github_repository_grants: BTreeSet::from([PRIVATE_SKILL_REPOSITORY.to_string()]),
         })
+    }
+
+    async fn credential_requests(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
+        let source = self
+            .source
+            .clone()
+            .ok_or_else(|| format!("contained agent requires generation-pinned skill sources declared by {FLOTILLA_SKILLS_DIR_ENV}"))?;
+        let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
+            .await
+            .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
+        Ok(inspection
+            .sources
+            .into_iter()
+            .filter_map(|source| {
+                source.credential.map(|credential| SkillSourceCredentialRequest {
+                    source: source.name,
+                    repository: source.repository,
+                    credential,
+                })
+            })
+            .collect())
     }
 
     async fn stage(
@@ -317,6 +344,7 @@ impl SkillBundle {
         environment_ref: &str,
         adapters: &[&Arc<dyn AgentMaterialAdapter>],
         environment: &[(String, String)],
+        source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         if adapters.is_empty() {
@@ -335,20 +363,6 @@ impl SkillBundle {
         if destinations.is_empty() {
             return Ok(());
         }
-        let git_config = environment
-            .iter()
-            .find(|(name, _)| name == "GIT_CONFIG_GLOBAL")
-            .map(|(_, value)| value)
-            .ok_or_else(|| "contained agent skill staging requires a prepared Git credential configuration".to_string())?;
-        let github_token_file = environment.iter().find(|(name, _)| name == "GITHUB_TOKEN_FILE").map(|(_, value)| value);
-        let github_token = environment.iter().find(|(name, _)| name == "GH_TOKEN").map(|(_, value)| value);
-        let token_mode = if github_token_file.is_some() {
-            "token-file"
-        } else if github_token.is_some() {
-            "stdin-token"
-        } else {
-            return Err("contained agent skill staging requires a prepared GitHub credential".to_string());
-        };
         let source = self
             .source
             .clone()
@@ -358,27 +372,30 @@ impl SkillBundle {
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
         let mut args = vec![
             "-c".to_string(),
-            "set -eu\ngit_config=$1\ntoken_mode=$2\ntoken_file=$3\nmanifest=$4\ndestination=$5\nshift 5\nexport GIT_CONFIG_GLOBAL=\"$git_config\" GIT_TERMINAL_PROMPT=0\nif [ \"$token_mode\" = token-file ]; then\n  export GITHUB_TOKEN_FILE=\"$token_file\"\nelse\n  GH_TOKEN=$(cat)\n  export GH_TOKEN\nfi\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntrap 'rm -rf \"$staged\" \"$sources\"' EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  path_count=$4\n  shift 4\n  checkout=\"$sources/$name\"\n  paths_file=\"$sources/$name.paths\"\n  sparse_file=\"$sources/$name.sparse\"\n  : >\"$paths_file\"\n  : >\"$sparse_file\"\n  while [ \"$path_count\" -gt 0 ]; do\n    printf '%s\\n' \"$1\" >>\"$paths_file\"\n    printf '/%s/\\n' \"$1\" >>\"$sparse_file\"\n    shift\n    path_count=$((path_count - 1))\n  done\n  git -C \"$sources\" init --quiet \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" sparse-checkout set --no-cone --stdin <\"$sparse_file\" >/dev/null\n  git -C \"$checkout\" fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --quiet --detach FETCH_HEAD >/dev/null\n  while IFS= read -r path; do\n    if [ ! -d \"$checkout/$path\" ]; then\n      echo \"skill source $name declared path $path is missing at pinned revision $revision\" >&2\n      exit 1\n    fi\n    find \"$checkout/$path\" -type f -name SKILL.md >\"$sources/skill-files\"\n    if [ ! -s \"$sources/skill-files\" ]; then\n      echo \"skill source $name declared path $path has no SKILL.md at pinned revision $revision\" >&2\n      exit 1\n    fi\n    while IFS= read -r skill_file; do\n      skill_dir=${skill_file%/SKILL.md}\n      skill_name=${skill_dir##*/}\n      target=\"$staged/$skill_name\"\n      if [ -e \"$target\" ]; then\n        echo \"duplicate skill name $skill_name from $repository\" >&2\n        exit 1\n      fi\n      mkdir -p \"$target\"\n      cp -R \"$skill_dir\"/. \"$target\"/\n    done <\"$sources/skill-files\"\n  done <\"$paths_file\"\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\ntrap - EXIT HUP INT TERM".to_string(),
+            "set -eu\nmanifest=$1\ndestination=$2\ncleanup_tokens=$3\nshift 3\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntoken_files=\nsucceeded=false\ncleanup() { rm -rf \"$staged\" \"$sources\"; if [ \"$cleanup_tokens\" = true ] || [ \"$succeeded\" != true ]; then for token_file in $token_files; do rm -f \"$token_file\"; done; fi; }\ntrap cleanup EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  token_file=$4\n  credential=$5\n  path_count=$6\n  shift 6\n  checkout=\"$sources/$name\"\n  paths_file=\"$sources/$name.paths\"\n  sparse_file=\"$sources/$name.sparse\"\n  : >\"$paths_file\"\n  : >\"$sparse_file\"\n  while [ \"$path_count\" -gt 0 ]; do\n    printf '%s\\n' \"$1\" >>\"$paths_file\"\n    printf '/%s/\\n' \"$1\" >>\"$sparse_file\"\n    shift\n    path_count=$((path_count - 1))\n  done\n  git -C \"$sources\" init --quiet \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" sparse-checkout set --no-cone --stdin <\"$sparse_file\" >/dev/null\n  if [ -n \"$token_file\" ]; then\n    token_files=\"$token_files $token_file\"\n    export GITHUB_TOKEN_FILE=\"$token_file\"\n    helper='!f() { [ \"$1\" = get ] || exit 0; printf \"username=x-access-token\\npassword=\"; cat \"$GITHUB_TOKEN_FILE\"; printf \"\\n\"; }; f'\n    git -C \"$checkout\" -c credential.helper= -c credential.helper=\"$helper\" fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name credential $credential fetch failed\" >&2; exit 1; }\n    unset GITHUB_TOKEN_FILE\n  else\n    git -C \"$checkout\" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name anonymous fetch failed\" >&2; exit 1; }\n  fi\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --quiet --detach FETCH_HEAD >/dev/null\n  while IFS= read -r path; do\n    if [ ! -d \"$checkout/$path\" ]; then\n      echo \"skill source $name declared path $path is missing at pinned revision $revision\" >&2\n      exit 1\n    fi\n    find \"$checkout/$path\" -type f -name SKILL.md >\"$sources/skill-files\"\n    if [ ! -s \"$sources/skill-files\" ]; then\n      echo \"skill source $name declared path $path has no SKILL.md at pinned revision $revision\" >&2\n      exit 1\n    fi\n    while IFS= read -r skill_file; do\n      skill_dir=${skill_file%/SKILL.md}\n      skill_name=${skill_dir##*/}\n      target=\"$staged/$skill_name\"\n      if [ -e \"$target\" ]; then\n        echo \"duplicate skill name $skill_name from $repository\" >&2\n        exit 1\n      fi\n      mkdir -p \"$target\"\n      cp -R \"$skill_dir\"/. \"$target\"/\n    done <\"$sources/skill-files\"\n  done <\"$paths_file\"\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\nsucceeded=true\ncleanup\ntrap - EXIT HUP INT TERM".to_string(),
             "flotilla-stage-skills".to_string(),
-            git_config.clone(),
-            token_mode.to_string(),
-            github_token_file.cloned().unwrap_or_default(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
+            String::new(),
             String::new(),
         ];
         for source in &inspection.sources {
-            args.extend([source.name.clone(), source.repository.clone(), source.revision.clone(), source.paths.len().to_string()]);
+            let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
+            args.extend([
+                source.name.clone(),
+                source.repository.clone(),
+                source.revision.clone(),
+                token_file,
+                source.credential.clone().unwrap_or_default(),
+                source.paths.len().to_string(),
+            ]);
             args.extend(source.paths.clone());
         }
-        for (adapter, destination) in destinations {
-            args[7] = destination.to_string_lossy().into_owned();
+        let destination_count = destinations.len();
+        for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
+            args[4] = destination.to_string_lossy().into_owned();
+            args[5] = (index + 1 == destination_count).to_string();
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let result = match github_token {
-                Some(token) if github_token_file.is_none() => {
-                    runner.run_with_input("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default, token.as_bytes()).await
-                }
-                _ => runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await,
-            };
+            let result = runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await;
             result.map_err(|error| format!("stage generation-pinned skills for {environment_ref}: {error}"))?;
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
         }
@@ -392,8 +409,8 @@ struct SkillBundleInspection {
 }
 
 /// Validates the supply side of skill staging only: the manifest must pin an
-/// arbitrary, well-formed set of sources, and the one source that carries a
-/// privileged credential grant must point at the repository that grant is for.
+/// arbitrary, well-formed set of sources and may attach a named credential to
+/// each source.
 /// There is deliberately no required-skill assertion here — what a given crew
 /// must have is a per-project/role demand declaration (#1790), validated per
 /// crew when that model lands, never a universal list.
@@ -403,8 +420,8 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
         .map_err(|error| format!("read skill bundle manifest {}: {error}", manifest_path.display()))?;
     let manifest = serde_json::from_str::<SkillBundleManifest>(&manifest)
         .map_err(|error| format!("decode skill bundle manifest {}: {error}", manifest_path.display()))?;
-    if manifest.schema_version != 4 || manifest.sources.is_empty() {
-        return Err(format!("skill source manifest {} must use schema version 4 and pin at least one source", manifest_path.display()));
+    if manifest.schema_version != 5 || manifest.sources.is_empty() {
+        return Err(format!("skill source manifest {} must use schema version 5 and pin at least one source", manifest_path.display()));
     }
     let names = manifest.sources.iter().map(|source| source.name.as_str()).collect::<BTreeSet<_>>();
     if names.len() != manifest.sources.len()
@@ -416,6 +433,12 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
                 || source.name.contains('\\')
                 || source.name.chars().any(|character| matches!(character, '\r' | '\n'))
                 || source.repository.is_empty()
+                || source.credential.as_ref().is_some_and(|credential| {
+                    credential.is_empty()
+                        || credential.contains('/')
+                        || credential.contains('\\')
+                        || credential.chars().any(|character| matches!(character, '\r' | '\n'))
+                })
                 || source.paths.is_empty()
                 || source.paths.iter().collect::<BTreeSet<_>>().len() != source.paths.len()
                 || source.paths.iter().any(|path| {
@@ -429,19 +452,6 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
         })
     {
         return Err(format!("skill source manifest {} has invalid or duplicate source entries", manifest_path.display()));
-    }
-    // The source set is data, but one name is not. `deliver` scopes the GitHub
-    // App token to PRIVATE_SKILL_REPOSITORY by name, and staging fetches every
-    // source with that token from whatever URL the manifest gives. Bind that one
-    // name to the repository its grant is actually for, so a manifest cannot aim
-    // the privileged credential somewhere else. This is a credential-scope
-    // invariant, not skill-name policy; per-source credentials (#1796) replace
-    // the pairing with explicit data.
-    if manifest.sources.iter().any(|source| source.name == PRIVATE_SKILL_REPOSITORY && source.repository != PRIVATE_SKILL_REPOSITORY_URL) {
-        return Err(format!(
-            "skill source manifest {} points the credential-granted source {PRIVATE_SKILL_REPOSITORY} at an unexpected repository",
-            manifest_path.display()
-        ));
     }
     if manifest.sources.iter().any(|source| source.revision.len() != 40 || !source.revision.bytes().all(|byte| byte.is_ascii_hexdigit())) {
         return Err(format!("skill source manifest {} must pin every source to a full commit SHA", manifest_path.display()));
@@ -505,7 +515,6 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
                         args: vec!["login".to_string(), "status".to_string()],
                         failure_context: "Codex login preflight failed".to_string(),
                     },
-                    github_repository_grants: BTreeSet::new(),
                 }))
             }
             MaterialLeaseOutcome::Waiting { unit_count } => Ok(AgentMaterialOutcome::Waiting {
@@ -625,7 +634,7 @@ mod tests {
         std::fs::create_dir_all(&skills).expect("create skill bundle");
         std::fs::write(
             skills.join(SKILL_BUNDLE_MANIFEST),
-            r#"{"schema_version":4,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
         )
         .expect("write skill bundle manifest");
         skills
@@ -710,7 +719,16 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-alice", &required, &environment, &runner).await.expect("stage pinned skills");
+        registry
+            .stage_skills(
+                "crew-alice",
+                &required,
+                &environment,
+                &BTreeMap::from([("mattpocock-skills".to_string(), PathBuf::from("/tmp/skills-token"))]),
+                &runner,
+            )
+            .await
+            .expect("stage pinned skills");
 
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
@@ -720,7 +738,10 @@ mod tests {
         assert!(calls[0].1.contains(&"https://github.com/flotilla-org/mattpocock-skills.git".to_string()));
         assert!(calls[0].1.contains(&"1111111111111111111111111111111111111111".to_string()));
         assert!(calls[0].1.contains(&"plugins/rjw-sdlc/skills".to_string()));
+        assert!(calls[0].1.contains(&"/tmp/skills-token".to_string()));
         assert!(calls[0].1[1].contains("fetch --quiet --depth=1 --filter=blob:none --no-tags"));
+        assert!(calls[0].1[1].contains("credential.helper="), "public fetches must clear the project credential helper");
+        assert!(calls[0].1[1].contains("anonymous fetch failed"));
         assert!(calls[0].1[1].contains("init --quiet"));
         assert!(!calls[0].1[1].contains("2>&1"), "git failures must retain their stderr diagnostics");
         assert!(calls[0].1[1].contains("sparse-checkout set --no-cone --stdin"));
@@ -741,7 +762,7 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-codex", &required, &environment, &runner).await.expect("stage pinned skills");
+        registry.stage_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
 
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
@@ -766,12 +787,15 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-mixed", &required, &environment, &runner).await.expect("stage pinned skills for both adapters");
+        registry
+            .stage_skills("crew-mixed", &required, &environment, &BTreeMap::new(), &runner)
+            .await
+            .expect("stage pinned skills for both adapters");
 
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 2);
         let destinations =
-            calls.iter().map(|(_, args)| args.get(7).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
+            calls.iter().map(|(_, args)| args.get(4).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
         assert_eq!(destinations, BTreeSet::from([claude_skills, codex_skills.as_str()]));
     }
 
@@ -787,7 +811,7 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-codex", &required, &environment, &runner).await.expect("skip external Codex home");
+        registry.stage_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("skip external Codex home");
 
         assert!(runner.0.lock().expect("recording runner lock should be healthy").is_empty());
     }
@@ -836,6 +860,11 @@ mod tests {
             .expect("write traversing-name fixture manifest");
         let error = inspect_skill_sources(&skills).expect_err("path-traversing source name must fail validation");
         assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
+
+        std::fs::write(&manifest_path, manifest.replace("github-skills-fork", "../credential"))
+            .expect("write traversing credential fixture manifest");
+        let error = inspect_skill_sources(&skills).expect_err("path-traversing credential must fail validation");
+        assert!(error.contains("invalid or duplicate source entries"), "unexpected validation error: {error}");
     }
 
     #[test]
@@ -880,7 +909,7 @@ mod tests {
         let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
         std::fs::write(
             &manifest_path,
-            r#"{"schema_version":4,"sources":[{"name":"only","repository":"https://example.com/only.git","revision":"1111111111111111111111111111111111111111"}]}"#,
+            r#"{"schema_version":5,"sources":[{"name":"only","repository":"https://example.com/only.git","revision":"1111111111111111111111111111111111111111"}]}"#,
         )
         .expect("write single-source manifest");
         let inspection = inspect_skill_sources(&skills).expect("single source must validate");
@@ -888,7 +917,7 @@ mod tests {
 
         std::fs::write(
             &manifest_path,
-            r#"{"schema_version":4,"sources":[{"name":"one","repository":"https://example.com/one.git","revision":"1111111111111111111111111111111111111111"},{"name":"two","repository":"https://example.com/two.git","revision":"2222222222222222222222222222222222222222"},{"name":"three","repository":"https://example.com/three.git","revision":"3333333333333333333333333333333333333333"}]}"#,
+            r#"{"schema_version":5,"sources":[{"name":"one","repository":"https://example.com/one.git","revision":"1111111111111111111111111111111111111111"},{"name":"two","repository":"https://example.com/two.git","revision":"2222222222222222222222222222222222222222"},{"name":"three","repository":"https://example.com/three.git","revision":"3333333333333333333333333333333333333333"}]}"#,
         )
         .expect("write three-source manifest");
         let inspection = inspect_skill_sources(&skills).expect("three sources must validate");
@@ -896,29 +925,18 @@ mod tests {
     }
 
     #[test]
-    fn skill_manifest_binds_the_credential_granted_source_to_its_repository() {
+    fn skill_manifest_allows_credentials_on_arbitrary_sources() {
         let bundle = tempfile::tempdir().expect("tempdir");
         let skills = write_skill_sources(bundle.path());
         let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
         let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
 
-        // Staging fetches every source with the App token scoped to this name, so
-        // the manifest must not be able to aim it at a different repository.
         std::fs::write(
             &manifest_path,
-            manifest.replace(PRIVATE_SKILL_REPOSITORY_URL, "https://github.com/flotilla-org/some-other-private-repo.git"),
+            manifest.replace("https://github.com/flotilla-org/mattpocock-skills.git", "https://github.com/another-owner/private.git"),
         )
-        .expect("write redirected-credential fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("redirecting the credential-granted source must fail validation");
-        assert!(error.contains("unexpected repository"), "unexpected validation error: {error}");
-
-        // Sources that carry no grant stay data: any repository is fine.
-        std::fs::write(
-            &manifest_path,
-            manifest.replace("https://github.com/rjwittams/rjw-skills.git", "https://example.com/elsewhere.git"),
-        )
-        .expect("write relocated-public-source fixture manifest");
-        let inspection = inspect_skill_sources(&skills).expect("an ungranted source may name any repository");
+        .expect("write relocated credentialed source fixture manifest");
+        let inspection = inspect_skill_sources(&skills).expect("credentialed source repository remains manifest data");
         assert_eq!(inspection.sources.len(), 2);
     }
 
@@ -943,12 +961,12 @@ mod tests {
         let skills = write_skill_sources(bundle.path());
         let manifest_path = skills.join(SKILL_BUNDLE_MANIFEST);
         let manifest = std::fs::read_to_string(&manifest_path).expect("read fixture manifest");
-        std::fs::write(&manifest_path, manifest.replace(r#""schema_version":4"#, r#""schema_version":3"#))
+        std::fs::write(&manifest_path, manifest.replace(r#""schema_version":5"#, r#""schema_version":4"#))
             .expect("write superseded-schema fixture manifest");
-        let error = inspect_skill_sources(&skills).expect_err("schema version 3 must fail validation");
-        assert!(error.contains("schema version 4"), "unexpected validation error: {error}");
+        let error = inspect_skill_sources(&skills).expect_err("schema version 4 must fail validation");
+        assert!(error.contains("schema version 5"), "unexpected validation error: {error}");
 
-        std::fs::write(&manifest_path, r#"{"schema_version":4,"sources":[]}"#).expect("write empty-source fixture manifest");
+        std::fs::write(&manifest_path, r#"{"schema_version":5,"sources":[]}"#).expect("write empty-source fixture manifest");
         let error = inspect_skill_sources(&skills).expect_err("empty source set must fail validation");
         assert!(error.contains("at least one source"), "unexpected validation error: {error}");
     }

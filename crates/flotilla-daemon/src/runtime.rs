@@ -2567,18 +2567,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         let delivered_credential_environment = if let Some(store) = &self.state.credential_store {
-            let github_repository_grants =
-                material_deliveries.iter().flat_map(|delivery| delivery.github_repository_grants.iter().cloned()).collect::<BTreeSet<_>>();
-            match store
-                .prepare_scoped_with_github_repository_grants(
-                    name,
-                    &credential_refs,
-                    &credential_scopes,
-                    &github_repository_grants,
-                    handle.runner(),
-                )
-                .await
-            {
+            match store.prepare_scoped(name, &credential_refs, &credential_scopes, handle.runner()).await {
                 Ok(environment) => environment,
                 Err(error) => {
                     return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
@@ -2637,7 +2626,77 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         if let Some(agent_material) = &self.state.agent_material {
             let mut environment = resolved_agent_environment.as_ref().map(|composed| composed.environment.clone()).unwrap_or_default();
             environment.extend(delivered_credential_environment.iter().cloned());
-            if let Err(error) = agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &*handle.runner()).await {
+            let mut source_token_files = BTreeMap::new();
+            if !spec.required_agent_adapters.is_empty() {
+                let requests = match agent_material.skill_source_credentials().await {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        return Err(discard_failed_environment(
+                            &handle,
+                            self.state.credential_store.as_deref(),
+                            self.state.agent_material.as_deref(),
+                            name,
+                            error,
+                        )
+                        .await
+                        .into())
+                    }
+                };
+                let mut prepared_by_credential: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+                for request in requests {
+                    let token_file = if let Some((repository, token_file)) = prepared_by_credential.get(&request.credential) {
+                        if repository != &request.repository {
+                            let error = format!(
+                                "skill source {} credential {} mint failed: one credential cannot be narrowed to multiple source repositories",
+                                request.source, request.credential
+                            );
+                            return Err(discard_failed_environment(
+                                &handle,
+                                self.state.credential_store.as_deref(),
+                                self.state.agent_material.as_deref(),
+                                name,
+                                error,
+                            )
+                            .await
+                            .into());
+                        }
+                        token_file.clone()
+                    } else {
+                        let Some(store) = &self.state.credential_store else {
+                            let error = format!(
+                                "skill source {} credential {} mint failed: host-local credential store unavailable",
+                                request.source, request.credential
+                            );
+                            return Err(discard_failed_environment(&handle, None, self.state.agent_material.as_deref(), name, error)
+                                .await
+                                .into());
+                        };
+                        match store.prepare_skill_source(&request.credential, &request.repository, &*handle.runner()).await {
+                            Ok(token_file) => {
+                                prepared_by_credential.insert(request.credential.clone(), (request.repository.clone(), token_file.clone()));
+                                token_file
+                            }
+                            Err(error) => {
+                                let error =
+                                    format!("skill source {} credential {} mint failed: {error}", request.source, request.credential);
+                                return Err(discard_failed_environment(
+                                    &handle,
+                                    self.state.credential_store.as_deref(),
+                                    self.state.agent_material.as_deref(),
+                                    name,
+                                    error,
+                                )
+                                .await
+                                .into());
+                            }
+                        }
+                    };
+                    source_token_files.insert(request.source, token_file);
+                }
+            }
+            if let Err(error) =
+                agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &source_token_files, &*handle.runner()).await
+            {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -3957,7 +4016,7 @@ mod tests {
         fs::create_dir_all(&skills).expect("create skill source manifest directory");
         fs::write(
             skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":4,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
         )
         .expect("write skill source manifest");
         skills
@@ -4567,7 +4626,12 @@ mod tests {
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            if cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
+            if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
+                if let Some(staged) = &self.1 {
+                    staged.store(true, Ordering::SeqCst);
+                }
+                Ok("ok".to_string())
+            } else if cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
                 Ok(String::new())
             } else {
                 self.0.run(cmd, args, cwd, label).await
