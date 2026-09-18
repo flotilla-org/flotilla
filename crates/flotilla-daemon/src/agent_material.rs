@@ -755,8 +755,6 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        assert!(!registry.will_stage_skills(&required, &environment, &runner).await.expect("resolve external Codex skill staging"));
-
         registry
             .stage_skills(
                 "crew-alice",
@@ -848,6 +846,8 @@ mod tests {
             ("GITHUB_TOKEN_FILE".to_string(), "/run/flotilla/config/credentials/github-app/token".to_string()),
         ];
         let runner = RecordingRunner::default();
+
+        assert!(!registry.will_stage_skills(&required, &environment, &runner).await.expect("resolve external Codex skill staging"));
 
         registry
             .stage_skills(
