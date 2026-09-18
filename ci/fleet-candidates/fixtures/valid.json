@@ -22,12 +22,13 @@
     "share/flotilla/skills/.flotilla-sources.json"
   ],
   "skill_bundle": {
-    "schema_version": 4,
+    "schema_version": 5,
     "sources": [
       {
         "name": "mattpocock-skills",
         "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
-        "revision": "cccccccccccccccccccccccccccccccccccccccc"
+        "revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "credential": "github-skills-fork"
       },
       {
         "name": "rjw-skills",
