@@ -2627,7 +2627,22 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             let mut environment = resolved_agent_environment.as_ref().map(|composed| composed.environment.clone()).unwrap_or_default();
             environment.extend(delivered_credential_environment.iter().cloned());
             let mut source_token_files = BTreeMap::new();
-            if !spec.required_agent_adapters.is_empty() {
+            let will_stage_skills =
+                match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
+                    Ok(will_stage) => will_stage,
+                    Err(error) => {
+                        return Err(discard_failed_environment(
+                            &handle,
+                            self.state.credential_store.as_deref(),
+                            self.state.agent_material.as_deref(),
+                            name,
+                            error,
+                        )
+                        .await
+                        .into())
+                    }
+                };
+            if will_stage_skills {
                 let requests = match agent_material.skill_source_credentials().await {
                     Ok(requests) => requests,
                     Err(error) => {

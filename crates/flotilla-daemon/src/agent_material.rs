@@ -176,6 +176,28 @@ impl AgentMaterialRegistry {
         self.skills.credential_requests().await
     }
 
+    pub(crate) async fn will_stage_skills(
+        &self,
+        required_adapters: &BTreeSet<String>,
+        environment: &[(String, String)],
+        runner: &dyn CommandRunner,
+    ) -> Result<bool, String> {
+        let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
+        if adapters.is_empty() {
+            return Ok(false);
+        }
+        let config_base = runner
+            .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
+            .await
+            .map_err(|error| format!("resolve contained agent skill base: {error}"))?;
+        for adapter in adapters {
+            if adapter.skill_destination(environment, &config_base)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
         required_adapters
             .iter()
@@ -348,7 +370,7 @@ impl SkillBundle {
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         if adapters.is_empty() {
-            return Ok(());
+            return remove_source_token_files(source_token_files, runner).await;
         }
         let config_base = runner
             .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
@@ -361,7 +383,7 @@ impl SkillBundle {
             }
         }
         if destinations.is_empty() {
-            return Ok(());
+            return remove_source_token_files(source_token_files, runner).await;
         }
         let source = self
             .source
@@ -401,6 +423,20 @@ impl SkillBundle {
         }
         Ok(())
     }
+}
+
+async fn remove_source_token_files(source_token_files: &BTreeMap<String, PathBuf>, runner: &dyn CommandRunner) -> Result<(), String> {
+    if source_token_files.is_empty() {
+        return Ok(());
+    }
+    let paths = source_token_files.values().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>();
+    let mut args = vec!["-f", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    runner
+        .run("rm", &args, Path::new("/"), &ChannelLabel::Default)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("discard unused skill-source credential files: {error}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,6 +755,8 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
+        assert!(!registry.will_stage_skills(&required, &environment, &runner).await.expect("resolve external Codex skill staging"));
+
         registry
             .stage_skills(
                 "crew-alice",
@@ -811,9 +849,22 @@ mod tests {
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("skip external Codex home");
+        registry
+            .stage_skills(
+                "crew-codex",
+                &required,
+                &environment,
+                &BTreeMap::from([("mattpocock-skills".to_string(), PathBuf::from("/tmp/unused-skill-token"))]),
+                &runner,
+            )
+            .await
+            .expect("skip external Codex home");
 
-        assert!(runner.0.lock().expect("recording runner lock should be healthy").is_empty());
+        assert_eq!(runner.0.lock().expect("recording runner lock should be healthy").as_slice(), &[("rm".to_string(), vec![
+            "-f".to_string(),
+            "--".to_string(),
+            "/tmp/unused-skill-token".to_string()
+        ])]);
     }
 
     #[test]
