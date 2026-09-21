@@ -276,9 +276,12 @@ enum PmSubCommand {
         /// Publish to a wheelhouse unix socket instead of zellij pipes
         #[arg(long)]
         wheelhouse_socket: Option<PathBuf>,
-        /// Binary name minted into materialise recipes the PM executes
-        #[arg(long, default_value = "flotilla")]
-        flotilla_bin: String,
+        /// Executable path or name the PM runs (default: this connector executable)
+        ///
+        /// The recipe executes on the PM host; use this override when that host
+        /// needs a different path or wrapper.
+        #[arg(long)]
+        flotilla_bin: Option<String>,
     },
 }
 
@@ -1142,6 +1145,7 @@ async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
 async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
     match command {
         PmSubCommand::Connect { zellij_bin, plugin_url, wheelhouse_socket, flotilla_bin } => {
+            let flotilla_bin = resolve_pm_flotilla_bin(flotilla_bin, std::env::current_exe)?;
             let options = flotilla_tui::pm_connect::PmConnectOptions::builder()
                 .maybe_zellij_bin(zellij_bin)
                 .maybe_plugin_url(plugin_url)
@@ -1162,6 +1166,18 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
             .map_err(|e| color_eyre::eyre::eyre!(e))
         }
     }
+}
+
+fn resolve_pm_flotilla_bin(override_bin: Option<String>, current_exe: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<String> {
+    if let Some(override_bin) = override_bin {
+        return Ok(override_bin);
+    }
+
+    let current_exe = current_exe().map_err(|error| color_eyre::eyre::eyre!("resolve running Flotilla executable: {error}"))?;
+    current_exe
+        .into_os_string()
+        .into_string()
+        .map_err(|path| color_eyre::eyre::eyre!("running Flotilla executable path is not valid UTF-8: {}", PathBuf::from(path).display()))
 }
 
 async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
@@ -2249,10 +2265,11 @@ mod tests {
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
-        replace_host_ids, run_replica_snapshot, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
-        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths, CommandValue, DaemonSubCommand,
-        DevModeSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
-        ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target, select_startup_repo_roots,
+        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths,
+        CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
+        ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand,
+        ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2268,6 +2285,36 @@ mod tests {
         let surface = cli_surface_from(None, Some("fleet"));
 
         assert_eq!(surface.principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("fleet"));
+    }
+
+    #[test]
+    fn pm_connector_defaults_to_running_executable_and_override_wins() {
+        let discovered =
+            resolve_pm_flotilla_bin(None, || Ok(PathBuf::from("/different/from/path/flotilla"))).expect("discover running executable");
+        assert_eq!(discovered, "/different/from/path/flotilla");
+
+        let overridden = resolve_pm_flotilla_bin(Some("remote-flotilla".to_owned()), || {
+            panic!("explicit override must not inspect the connector executable")
+        })
+        .expect("use explicit override");
+        assert_eq!(overridden, "remote-flotilla");
+    }
+
+    #[test]
+    fn pm_connector_reports_executable_discovery_failure() {
+        let error = resolve_pm_flotilla_bin(None, || Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing executable")))
+            .expect_err("discovery failure should be reported");
+        assert!(error.to_string().contains("resolve running Flotilla executable: missing executable"));
+    }
+
+    #[test]
+    fn pm_connector_cli_leaves_flotilla_bin_unset_without_override() {
+        let cli = Cli::try_parse_from(["flotilla", "pm", "connect", "--wheelhouse-socket", "/tmp/wheelhouse.sock"])
+            .expect("parse connector command");
+        let Some(SubCommand::Pm { command: PmSubCommand::Connect { flotilla_bin, .. } }) = cli.command else {
+            panic!("expected pm connect command")
+        };
+        assert_eq!(flotilla_bin, None);
     }
 
     #[test]

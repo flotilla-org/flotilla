@@ -68,8 +68,8 @@ pub struct PmConnectOptions {
     pub zellij_bin: Option<String>,
     pub plugin_url: Option<String>,
     pub wheelhouse_socket: Option<PathBuf>,
-    /// Binary name minted into materialise recipes — what the PM runs on
-    /// activation, resolved in the PM's own environment.
+    /// Executable path or name minted into materialise recipes — what the PM
+    /// runs on activation, resolved in the PM's own environment.
     pub flotilla_bin: String,
 }
 
