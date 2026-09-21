@@ -56,7 +56,7 @@ if grep -F 'git -C orchestration fetch' "$workflow" | grep -Fq 'FLEET_FLOTILLA_S
   exit 1
 fi
 grep -Fq 'retention-days: 7' "$workflow"
-grep -Fq '"schema_version": 4' "$builder"
+grep -Fq '"schema_version": 5' "$builder"
 grep -Fq '"paths": ["plugins/rjw-sdlc/skills"]' "$builder"
 grep -Fq '"name": "cleat"' "$builder"
 grep -Fq '"revision": os.environ["FLEET_CLEAT_SHA"]' "$builder"
@@ -109,7 +109,7 @@ for name in ("mattpocock-skills", "rjw-skills", "cleat", "flotilla"):
         source["paths"] = ["missing/skills"]
     sources.append(source)
 with open(manifest, "w") as output:
-    json.dump({"schema_version": 4, "sources": sources}, output)
+    json.dump({"schema_version": 5, "sources": sources}, output)
 PY
 git_config="$skill_test_root/gitconfig"
 git config --file "$git_config" "url.file://$skill_repo.insteadOf" https://github.com/flotilla-org/mattpocock-skills.git

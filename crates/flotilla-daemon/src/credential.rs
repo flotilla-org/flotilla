@@ -371,7 +371,7 @@ impl CredentialStore {
         Self::new_with_http(backend, namespace, env, host_bag, host_runner, Arc::new(ReqwestHttpClient::new()), state_dir)
     }
 
-    fn new_with_http(
+    pub(crate) fn new_with_http(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,
@@ -531,16 +531,14 @@ impl CredentialStore {
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
-        self.prepare_scoped_with_github_repository_grants(environment_ref, credential_refs, credential_scopes, &BTreeSet::new(), runner)
-            .await
+        self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, runner).await
     }
 
-    pub(crate) async fn prepare_scoped_with_github_repository_grants(
+    async fn prepare_scoped_inner(
         &self,
         environment_ref: &str,
         credential_refs: &BTreeSet<String>,
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
-        github_repository_grants: &BTreeSet<String>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
         let mut specs = Vec::new();
@@ -598,11 +596,11 @@ impl CredentialStore {
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
             let resolved = if spec.lifecycle == CredentialLifecycle::Refreshable {
-                self.resolve_for_adapter(name, spec, credential_scopes.get(name), github_repository_grants).await?
+                self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?
             } else if let Some(material) = cached_material {
                 ResolvedMaterial { value: material, github_app: None }
             } else {
-                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name), github_repository_grants).await?;
+                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?;
                 self.materials.lock().await.insert(cache_key.clone(), material.value.clone());
                 material
             };
@@ -772,7 +770,7 @@ impl CredentialStore {
                 .await
                 .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
         }
-        let material = self.resolve_for_adapter(&name, &spec, None, &BTreeSet::new()).await?;
+        let material = self.resolve_for_adapter(&name, &spec, None).await?;
         let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
         let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
@@ -810,6 +808,66 @@ impl CredentialStore {
         }
         self.registry_configs.lock().await.insert(environment_ref.to_string(), config_dir.clone());
         Ok(Some(config_dir))
+    }
+
+    pub(crate) async fn prepare_skill_source(
+        &self,
+        credential_name: &str,
+        repository: &str,
+        runner: &dyn CommandRunner,
+    ) -> Result<PathBuf, String> {
+        let spec = self.spec(credential_name).await?;
+        let (
+            CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+            CredentialSource::GithubApp { app_id_path, private_key_path },
+        ) = (&spec.consumer, &spec.source)
+        else {
+            return Err(bounded_adapter_error(
+                credential_name,
+                spec.consumer.adapter_name(),
+                "skill-source credentials must use the github-app adapter and source",
+            ));
+        };
+        if spec.lifecycle != CredentialLifecycle::Refreshable {
+            return Err(bounded_adapter_error(
+                credential_name,
+                spec.consumer.adapter_name(),
+                "GitHub App credentials must use the refreshable lifecycle",
+            ));
+        }
+        let parsed = Url::parse(repository)
+            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &format!("invalid repository URL: {error}")))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must be an HTTPS github.com URL"));
+        }
+        let components =
+            parsed.path().trim_matches('/').strip_suffix(".git").unwrap_or(parsed.path().trim_matches('/')).split('/').collect::<Vec<_>>();
+        if components.len() != 2 || components.iter().any(|component| component.is_empty()) {
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must identify one owner/repository"));
+        }
+        let installation_id = match (installation_id, installation_repository) {
+            (Some(id), None) => *id,
+            (None, Some(installation_repository)) => {
+                self.resolve_github_app_installation(installation_repository, app_id_path, private_key_path).await?
+            }
+            (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
+            (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
+        };
+        let mut request = GithubAppMintRequest {
+            installation_id,
+            app_id_path: app_id_path.clone(),
+            private_key_path: private_key_path.clone(),
+            repositories: vec![components[1].to_string()],
+            permissions: permissions.clone(),
+        };
+        let token = self
+            .mint_github_app(&mut request, installation_repository.as_deref())
+            .await
+            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
+        let paths = self.delivery_paths(runner).await?;
+        let token_file = paths.base.join("skill-sources").join(safe_component(credential_name)).join("token");
+        write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
+        Ok(token_file)
     }
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
@@ -943,7 +1001,6 @@ impl CredentialStore {
         name: &str,
         spec: &CredentialSpecSpec,
         repository_scope: Option<&BTreeSet<RepositoryKey>>,
-        github_repository_grants: &BTreeSet<String>,
     ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
             (
@@ -961,7 +1018,6 @@ impl CredentialStore {
                     .filter(|scope| !scope.is_empty())
                     .ok_or_else(|| "grant resolved to an empty repository scope".to_string())?;
                 let mut repositories = self.github_repository_names(repository_scope).await?;
-                repositories.extend(github_repository_grants.iter().cloned());
                 repositories.sort();
                 repositories.dedup();
                 let installation_id = match (installation_id, installation_repository) {
@@ -1880,7 +1936,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_mints_task_and_provisioning_repository_grants_on_every_prepare() {
+    async fn github_app_mints_only_project_repositories_on_every_prepare() {
         let state = tempfile::tempdir().expect("create state directory");
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
@@ -1919,7 +1975,7 @@ interactions:
     request_headers:
       accept: "application/vnd.github+json"
       x-github-api-version: "2022-11-28"
-    request_body: '{"repositories":["flotilla","mattpocock-skills"]}'
+    request_body: '{"repositories":["flotilla"]}'
     status: 201
     response_body: '{"token":"installation-token-one","expires_at":"2026-08-03T17:00:00Z"}'
   - channel: http
@@ -1928,7 +1984,7 @@ interactions:
     request_headers:
       accept: "application/vnd.github+json"
       x-github-api-version: "2022-11-28"
-    request_body: '{"repositories":["flotilla","mattpocock-skills"]}'
+    request_body: '{"repositories":["flotilla"]}'
     status: 201
     response_body: '{"token":"installation-token-two","expires_at":"2026-08-03T18:00:00Z"}'
 "#;
@@ -1946,16 +2002,8 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-        let grants = BTreeSet::from(["mattpocock-skills".to_string()]);
-
-        let first = store
-            .prepare_scoped_with_github_repository_grants("env-a", &refs, &scopes, &grants, runner.clone())
-            .await
-            .expect("first preparation");
-        let second = store
-            .prepare_scoped_with_github_repository_grants("env-a", &refs, &scopes, &grants, runner.clone())
-            .await
-            .expect("second preparation");
+        let first = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
+        let second = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("second preparation");
 
         let first = first.into_iter().collect::<BTreeMap<_, _>>();
         let second = second.into_iter().collect::<BTreeMap<_, _>>();
@@ -1976,6 +2024,64 @@ interactions:
                 .count(),
             2,
         );
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn skill_source_credential_is_one_shot_and_narrowed_to_its_repository() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create skill credential declaration");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["mattpocock-skills"],"permissions":{"contents":"read"}}'
+    status: 201
+    response_body: '{"token":"skill-token","expires_at":"2026-08-03T17:00:00Z"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_http(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            Arc::new(ReplayHttpClient::new(session.clone())),
+            state.path().to_path_buf(),
+        );
+
+        let token_file = store
+            .prepare_skill_source("github-skills-fork", "https://github.com/flotilla-org/mattpocock-skills.git", &*runner)
+            .await
+            .expect("mint narrowed skill-source credential");
+
+        assert!(token_file.ends_with("skill-sources/github-skills-fork/token"));
+        assert!(runner.writes.lock().expect("writes lock").iter().any(|(path, contents)| path == &token_file && contents == "skill-token"));
+        assert!(store.github_app_deliveries.lock().await.is_empty(), "one-shot skill tokens must not enter refresh registrations");
         session.assert_complete();
     }
 
@@ -2303,7 +2409,7 @@ interactions:
         };
 
         for scope in [None, Some(&BTreeSet::new())] {
-            let error = store.resolve_for_adapter("github-app", &spec, scope, &BTreeSet::new()).await.expect_err("empty scopes must fail");
+            let error = store.resolve_for_adapter("github-app", &spec, scope).await.expect_err("empty scopes must fail");
             assert!(error.contains("empty repository scope"), "unexpected error: {error}");
         }
         let missing_key = RepositoryKey("missing-repository".to_string());
@@ -2318,7 +2424,7 @@ interactions:
         static_spec.lifecycle = CredentialLifecycle::Static;
         let non_empty_scope = BTreeSet::from([RepositoryKey("not-resolved".to_string())]);
         let error = store
-            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope), &BTreeSet::new())
+            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope))
             .await
             .expect_err("non-refreshable GitHub App credentials must fail");
         assert!(error.contains("must use the refreshable lifecycle"), "unexpected error: {error}");

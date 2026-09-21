@@ -14,7 +14,7 @@
     "platforms": {}
   },
   "skill_bundle": {
-    "schema_version": 4,
+    "schema_version": 5,
     "sources": [{
       "name": "rjw-skills",
       "repository": "https://github.com/rjwittams/rjw-skills.git",

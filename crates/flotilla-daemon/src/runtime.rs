@@ -2567,18 +2567,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
 
         let container_id = handle.container_name().map(ToString::to_string).unwrap_or_else(|| format!("flotilla-env-{}", env_id));
         let delivered_credential_environment = if let Some(store) = &self.state.credential_store {
-            let github_repository_grants =
-                material_deliveries.iter().flat_map(|delivery| delivery.github_repository_grants.iter().cloned()).collect::<BTreeSet<_>>();
-            match store
-                .prepare_scoped_with_github_repository_grants(
-                    name,
-                    &credential_refs,
-                    &credential_scopes,
-                    &github_repository_grants,
-                    handle.runner(),
-                )
-                .await
-            {
+            match store.prepare_scoped(name, &credential_refs, &credential_scopes, handle.runner()).await {
                 Ok(environment) => environment,
                 Err(error) => {
                     return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
@@ -2637,7 +2626,92 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         if let Some(agent_material) = &self.state.agent_material {
             let mut environment = resolved_agent_environment.as_ref().map(|composed| composed.environment.clone()).unwrap_or_default();
             environment.extend(delivered_credential_environment.iter().cloned());
-            if let Err(error) = agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &*handle.runner()).await {
+            let mut source_token_files = BTreeMap::new();
+            let will_stage_skills =
+                match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
+                    Ok(will_stage) => will_stage,
+                    Err(error) => {
+                        return Err(discard_failed_environment(
+                            &handle,
+                            self.state.credential_store.as_deref(),
+                            self.state.agent_material.as_deref(),
+                            name,
+                            error,
+                        )
+                        .await
+                        .into())
+                    }
+                };
+            if will_stage_skills {
+                let requests = match agent_material.skill_source_credentials().await {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        return Err(discard_failed_environment(
+                            &handle,
+                            self.state.credential_store.as_deref(),
+                            self.state.agent_material.as_deref(),
+                            name,
+                            error,
+                        )
+                        .await
+                        .into())
+                    }
+                };
+                let mut prepared_by_credential: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+                for request in requests {
+                    let token_file = if let Some((repository, token_file)) = prepared_by_credential.get(&request.credential) {
+                        if repository != &request.repository {
+                            let error = format!(
+                                "skill source {} credential {} mint failed: one credential cannot be narrowed to multiple source repositories",
+                                request.source, request.credential
+                            );
+                            return Err(discard_failed_environment(
+                                &handle,
+                                self.state.credential_store.as_deref(),
+                                self.state.agent_material.as_deref(),
+                                name,
+                                error,
+                            )
+                            .await
+                            .into());
+                        }
+                        token_file.clone()
+                    } else {
+                        let Some(store) = &self.state.credential_store else {
+                            let error = format!(
+                                "skill source {} credential {} mint failed: host-local credential store unavailable",
+                                request.source, request.credential
+                            );
+                            return Err(discard_failed_environment(&handle, None, self.state.agent_material.as_deref(), name, error)
+                                .await
+                                .into());
+                        };
+                        match store.prepare_skill_source(&request.credential, &request.repository, &*handle.runner()).await {
+                            Ok(token_file) => {
+                                prepared_by_credential.insert(request.credential.clone(), (request.repository.clone(), token_file.clone()));
+                                token_file
+                            }
+                            Err(error) => {
+                                let error =
+                                    format!("skill source {} credential {} mint failed: {error}", request.source, request.credential);
+                                return Err(discard_failed_environment(
+                                    &handle,
+                                    self.state.credential_store.as_deref(),
+                                    self.state.agent_material.as_deref(),
+                                    name,
+                                    error,
+                                )
+                                .await
+                                .into());
+                            }
+                        }
+                    };
+                    source_token_files.insert(request.source, token_file);
+                }
+            }
+            if let Err(error) =
+                agent_material.stage_skills(name, &spec.required_agent_adapters, &environment, &source_token_files, &*handle.runner()).await
+            {
                 return Err(discard_failed_environment(
                     &handle,
                     self.state.credential_store.as_deref(),
@@ -3819,6 +3893,7 @@ mod tests {
                 EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
             },
             environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+            replay::{Masks, ReplayHttpClient, Session},
             terminal::{TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionTag},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
         },
@@ -3966,9 +4041,20 @@ mod tests {
         fs::create_dir_all(&skills).expect("create skill source manifest directory");
         fs::write(
             skills.join(".flotilla-sources.json"),
-            r#"{"schema_version":4,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111"},{"name":"rjw-skills","repository":"https://github.com/rjwittams/rjw-skills.git","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","paths":["plugins/rjw-sdlc/skills"]}]}"#,
         )
         .expect("write skill source manifest");
+        skills
+    }
+
+    fn write_test_credentialed_skill_sources(root: &Path) -> PathBuf {
+        let skills = root.join("generation/credentialed-skills");
+        fs::create_dir_all(&skills).expect("create credentialed skill source manifest directory");
+        fs::write(
+            skills.join(".flotilla-sources.json"),
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/flotilla-org/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
+        )
+        .expect("write credentialed skill source manifest");
         skills
     }
 
@@ -4576,7 +4662,13 @@ mod tests {
     #[async_trait]
     impl CommandRunner for CredentialInteriorRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            if cmd == "mkdir" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight"))) {
+            if cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-stage-skills")) {
+                if let Some(staged) = &self.1 {
+                    staged.store(true, Ordering::SeqCst);
+                }
+                Ok("ok".to_string())
+            } else if cmd == "mkdir" || cmd == "chmod" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
+            {
                 Ok(String::new())
             } else {
                 self.0.run(cmd, args, cwd, label).await
@@ -5255,6 +5347,10 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
         let backend = daemon.resource_backend();
+        let app_id_path = temp.path().join("github-app.id");
+        let private_key_path = temp.path().join("github-app.pem");
+        fs::write(&app_id_path, "12345\n").expect("write App id");
+        fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).expect("write App private key");
         for (name, consumer, source) in [
             ("claude-max", CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() }, "TEST_CLAUDE_TOKEN"),
             ("github-crew-pr", CredentialConsumer::Gh, "TEST_GITHUB_TOKEN"),
@@ -5271,6 +5367,24 @@ mod tests {
                 .await
                 .expect("credential declaration");
         }
+        backend
+            .clone()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&empty_meta("github-skills-fork"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("skill credential declaration");
 
         let staged = Arc::new(AtomicBool::new(false));
         let runner: Arc<dyn CommandRunner> = Arc::new(CredentialInteriorRunner(
@@ -5296,12 +5410,24 @@ mod tests {
             ("TEST_CLAUDE_TOKEN", "claude-secret".to_string()),
             ("TEST_GITHUB_TOKEN", "github-secret".to_string()),
         ]));
-        let credential_store = Arc::new(CredentialStore::new(
+        let mint_session = Session::replaying_from_str(
+            r#"interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["mattpocock-skills"],"permissions":{"contents":"read"}}'
+    status: 201
+    response_body: '{"token":"skill-token","expires_at":"2026-08-03T17:00:00Z"}'
+"#,
+            Masks::new(),
+        );
+        let credential_store = Arc::new(CredentialStore::new_with_http(
             backend.clone(),
             NAMESPACE,
             host_env.clone(),
             EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude")),
             Arc::clone(&runner),
+            Arc::new(ReplayHttpClient::new(mint_session.clone())),
             config.state_dir().as_path().to_path_buf(),
         ));
         let agent_material = Arc::new(AgentMaterialRegistry::new(
@@ -5309,7 +5435,7 @@ mod tests {
             NAMESPACE,
             Arc::new(TestEnvVars::new([
                 ("HOME", temp.path().join("home").display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
             ])),
         ));
         let state = Arc::new(
@@ -5344,6 +5470,7 @@ mod tests {
 
         assert!(staged.load(Ordering::SeqCst), "provisioning must stage pinned skills before interior discovery");
         assert!(!destroyed.load(Ordering::SeqCst), "successful skill staging must keep the fresh vessel");
+        mint_session.assert_complete();
     }
 
     #[tokio::test]

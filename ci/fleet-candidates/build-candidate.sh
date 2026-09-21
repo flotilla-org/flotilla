@@ -104,12 +104,13 @@ bundle = Path(os.environ["FLEET_SKILLS_BUNDLE"])
 # demand declarations (flotilla-org/flotilla#1790), never a list baked into a
 # generation.
 manifest = {
-    "schema_version": 4,
+    "schema_version": 5,
     "sources": [
         {
             "name": "mattpocock-skills",
             "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
             "revision": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
+            "credential": "github-skills-fork",
         },
         {
             "name": "rjw-skills",
