@@ -663,14 +663,21 @@ mod tests {
 
     struct PromisorRunner {
         config_base: PathBuf,
+        skills_source: PathBuf,
         path: String,
     }
 
     #[async_trait]
     impl CommandRunner for PromisorRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            let container_manifest = format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}");
+            let source_manifest = self.skills_source.join(SKILL_BUNDLE_MANIFEST).to_string_lossy().into_owned();
+            let args = args
+                .iter()
+                .map(|arg| if *arg == container_manifest { source_manifest.clone() } else { (*arg).to_string() })
+                .collect::<Vec<_>>();
             let output = Command::new(cmd)
-                .args(args)
+                .args(&args)
                 .current_dir(cwd)
                 .env("PATH", &self.path)
                 .output()
@@ -748,7 +755,11 @@ esac
         .expect("write fake Git");
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("make fake Git executable");
         let system_path = std::env::var("PATH").expect("test process PATH");
-        PromisorRunner { config_base: root.join("config"), path: format!("{}:{system_path}", bin.display()) }
+        PromisorRunner {
+            config_base: root.join("config"),
+            skills_source: root.join("generation/skills"),
+            path: format!("{}:{system_path}", bin.display()),
+        }
     }
 
     fn write_named_slot(root: &Path, name: &str, number: u64) -> PathBuf {
