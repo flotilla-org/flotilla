@@ -250,6 +250,9 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
                 (KEY_CONVOY_NAME, MetadataValue::text(semantic_label)),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
             ];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
             facts.extend(label_tier_facts(semantic_label));
             Some((entity, facts))
         }
@@ -306,7 +309,15 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let semantic_label = entry.annotations.get(KEY_CONVOY_NAME).map(String::as_str).unwrap_or(name);
             let mut facts =
                 vec![(KEY_CONVOY, MetadataValue::text(entity.id.clone())), (KEY_CONVOY_NAME, MetadataValue::text(semantic_label))];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
             facts.extend(label_tier_facts(semantic_label));
+            if row.is_none() {
+                if let Some(AwarenessPhase::Convoy(phase)) = entry.phase {
+                    facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
+                }
+            }
             if let Some(number) = entry.annotations.get(KEY_CHANGE_REQUEST_NUMBER) {
                 facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(number.clone())));
             }
@@ -330,6 +341,9 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
                 (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
                 (KEY_VESSEL_NAME, MetadataValue::text(label.clone())),
             ];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
             facts.extend(label_tier_facts(&label));
             (entity, facts)
         }
@@ -540,6 +554,7 @@ fn project_vessel(
     facts.extend([
         (KEY_CONVOY, MetadataValue::text(convoy_entity.id)),
         (KEY_CONVOY_NAME, MetadataValue::text(convoy.name.clone())),
+        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
         (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
         (KEY_VESSEL_NAME, MetadataValue::text(vessel.name.clone())),
         (KEY_DISPLAY_LABEL, MetadataValue::text(vessel.name.clone())),

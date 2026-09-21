@@ -508,3 +508,38 @@ fn crew_roles_remain_a_flat_fact() {
     let patch = find_entity(&patches, &entity::vessel("dev", "cutover", "coder", "feta"));
     assert_eq!(patch.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned()]));
 }
+
+#[test]
+fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
+    for phase in [ConvoyPhase::Active, ConvoyPhase::Landed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
+        let reference = convoy_ref("dev", "governor-old");
+        let convoy = ConvoyRow::builder()
+            .resource(reference.clone())
+            .name("governor".to_owned())
+            .workflow_ref("standing-governor")
+            .phase(phase)
+            .build();
+        let entry = AwarenessEntry::builder()
+            .id("convoy/dev/governor-old".to_owned())
+            .kind(AwarenessKind::Convoy)
+            .label("governor".to_owned())
+            .state(AwarenessState::Idle)
+            .phase(AwarenessPhase::Convoy(phase))
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .build();
+        let vessel = AwarenessEntry::builder()
+            .id("vessel/dev/governor-old/govern".to_owned())
+            .kind(AwarenessKind::Vessel)
+            .label("govern".to_owned())
+            .state(AwarenessState::Idle)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .build();
+        let rows = [convoy];
+        for subject in [&entry, &vessel] {
+            let (_, facts) = awareness_entry_entity(subject, &rows).expect("published entity facts");
+            assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
+        }
+        let (_, facts) = awareness_entry_entity(&entry, &[]).expect("published entity facts");
+        assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
+    }
+}
