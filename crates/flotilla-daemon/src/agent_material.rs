@@ -403,7 +403,7 @@ impl SkillBundle {
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
         let mut args = vec![
             "-c".to_string(),
-            "set -eu\nmanifest=$1\ndestination=$2\ncleanup_tokens=$3\nshift 3\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntoken_files=\nsucceeded=false\ncleanup() { rm -rf \"$staged\" \"$sources\"; if [ \"$cleanup_tokens\" = true ] || [ \"$succeeded\" != true ]; then for token_file in $token_files; do rm -f \"$token_file\"; done; fi; }\ntrap cleanup EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  token_file=$4\n  credential=$5\n  path_count=$6\n  shift 6\n  checkout=\"$sources/$name\"\n  paths_file=\"$sources/$name.paths\"\n  sparse_file=\"$sources/$name.sparse\"\n  : >\"$paths_file\"\n  : >\"$sparse_file\"\n  while [ \"$path_count\" -gt 0 ]; do\n    printf '%s\\n' \"$1\" >>\"$paths_file\"\n    printf '/%s/\\n' \"$1\" >>\"$sparse_file\"\n    shift\n    path_count=$((path_count - 1))\n  done\n  git -C \"$sources\" init --quiet \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" sparse-checkout set --no-cone --stdin <\"$sparse_file\" >/dev/null\n  if [ -n \"$token_file\" ]; then\n    token_files=\"$token_files $token_file\"\n    export GITHUB_TOKEN_FILE=\"$token_file\"\n    helper='!f() { [ \"$1\" = get ] || exit 0; printf \"username=x-access-token\\npassword=\"; cat \"$GITHUB_TOKEN_FILE\"; printf \"\\n\"; }; f'\n    git -C \"$checkout\" -c credential.helper= -c credential.helper=\"$helper\" fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name credential $credential fetch failed\" >&2; exit 1; }\n    unset GITHUB_TOKEN_FILE\n  else\n    git -C \"$checkout\" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name anonymous fetch failed\" >&2; exit 1; }\n  fi\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --quiet --detach FETCH_HEAD >/dev/null\n  while IFS= read -r path; do\n    if [ ! -d \"$checkout/$path\" ]; then\n      echo \"skill source $name declared path $path is missing at pinned revision $revision\" >&2\n      exit 1\n    fi\n    find \"$checkout/$path\" -type f -name SKILL.md >\"$sources/skill-files\"\n    if [ ! -s \"$sources/skill-files\" ]; then\n      echo \"skill source $name declared path $path has no SKILL.md at pinned revision $revision\" >&2\n      exit 1\n    fi\n    while IFS= read -r skill_file; do\n      skill_dir=${skill_file%/SKILL.md}\n      skill_name=${skill_dir##*/}\n      target=\"$staged/$skill_name\"\n      if [ -e \"$target\" ]; then\n        echo \"duplicate skill name $skill_name from $repository\" >&2\n        exit 1\n      fi\n      mkdir -p \"$target\"\n      cp -R \"$skill_dir\"/. \"$target\"/\n    done <\"$sources/skill-files\"\n  done <\"$paths_file\"\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\nsucceeded=true\ncleanup\ntrap - EXIT HUP INT TERM".to_string(),
+            "set -eu\nmanifest=$1\ndestination=$2\ncleanup_tokens=$3\nshift 3\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntoken_files=\nsucceeded=false\ncleanup() { rm -rf \"$staged\" \"$sources\"; if [ \"$cleanup_tokens\" = true ] || [ \"$succeeded\" != true ]; then for token_file in $token_files; do rm -f \"$token_file\"; done; fi; }\ntrap cleanup EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  token_file=$4\n  credential=$5\n  path_count=$6\n  shift 6\n  checkout=\"$sources/$name\"\n  paths_file=\"$sources/$name.paths\"\n  sparse_file=\"$sources/$name.sparse\"\n  : >\"$paths_file\"\n  : >\"$sparse_file\"\n  while [ \"$path_count\" -gt 0 ]; do\n    printf '%s\\n' \"$1\" >>\"$paths_file\"\n    printf '/%s/\\n' \"$1\" >>\"$sparse_file\"\n    shift\n    path_count=$((path_count - 1))\n  done\n  git -C \"$sources\" init --quiet \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" sparse-checkout set --no-cone --stdin <\"$sparse_file\" >/dev/null\n  if [ -n \"$token_file\" ]; then\n    token_files=\"$token_files $token_file\"\n    export GITHUB_TOKEN_FILE=\"$token_file\"\n    helper='!f() { [ \"$1\" = get ] || exit 0; printf \"username=x-access-token\\npassword=\"; cat \"$GITHUB_TOKEN_FILE\"; printf \"\\n\"; }; f'\n    git -C \"$checkout\" config credential.helper \"$helper\"\n    git -C \"$checkout\" fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name credential $credential fetch failed\" >&2; exit 1; }\n  else\n    git -C \"$checkout\" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name anonymous fetch failed\" >&2; exit 1; }\n  fi\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\"\n  git -C \"$checkout\" checkout --quiet --detach FETCH_HEAD >/dev/null\n  while IFS= read -r path; do\n    if [ ! -d \"$checkout/$path\" ]; then\n      echo \"skill source $name declared path $path is missing at pinned revision $revision\" >&2\n      exit 1\n    fi\n    find \"$checkout/$path\" -type f -name SKILL.md >\"$sources/skill-files\"\n    if [ ! -s \"$sources/skill-files\" ]; then\n      echo \"skill source $name declared path $path has no SKILL.md at pinned revision $revision\" >&2\n      exit 1\n    fi\n    while IFS= read -r skill_file; do\n      skill_dir=${skill_file%/SKILL.md}\n      skill_name=${skill_dir##*/}\n      target=\"$staged/$skill_name\"\n      if [ -e \"$target\" ]; then\n        echo \"duplicate skill name $skill_name from $repository\" >&2\n        exit 1\n      fi\n      mkdir -p \"$target\"\n      cp -R \"$skill_dir\"/. \"$target\"/\n    done <\"$sources/skill-files\"\n  done <\"$paths_file\"\n  if [ -n \"$token_file\" ]; then\n    unset GITHUB_TOKEN_FILE\n  fi\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\nsucceeded=true\ncleanup\ntrap - EXIT HUP INT TERM".to_string(),
             "flotilla-stage-skills".to_string(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
             String::new(),
@@ -607,9 +607,9 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, path::Path, sync::Mutex};
+    use std::{io, path::Path, process::Command, sync::Mutex};
 
-    use flotilla_core::providers::discovery::test_support::TestEnvVars;
+    use flotilla_core::providers::{discovery::test_support::TestEnvVars, CommandOutput};
     use flotilla_protocol::NodeId;
     use flotilla_resources::InMemoryBackend;
 
@@ -659,6 +659,96 @@ mod tests {
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             true
         }
+    }
+
+    struct PromisorRunner {
+        config_base: PathBuf,
+        path: String,
+    }
+
+    #[async_trait]
+    impl CommandRunner for PromisorRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            let output = Command::new(cmd)
+                .args(args)
+                .current_dir(cwd)
+                .env("PATH", &self.path)
+                .output()
+                .map_err(|error| format!("run {cmd}: {error}"))?;
+            if output.status.success() {
+                String::from_utf8(output.stdout).map_err(|error| format!("decode {cmd} stdout: {error}"))
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).into_owned())
+            }
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            match self.run(cmd, args, cwd, label).await {
+                Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
+                Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
+            }
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
+        }
+
+        async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
+            Ok(self.config_base.clone())
+        }
+    }
+
+    fn promisor_runner(root: &Path) -> PromisorRunner {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("create fake Git bin");
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            r#"#!/bin/sh
+set -eu
+test "$1" = -C
+checkout=$2
+shift 2
+case "$1" in
+  init)
+    name=$3
+    mkdir -p "$checkout/$name/.git"
+    ;;
+  remote|sparse-checkout)
+    ;;
+  config)
+    test "$2" = credential.helper
+    printf '%s' "$3" >"$checkout/.git/credential-helper"
+    ;;
+  -c|fetch)
+    while [ "$1" = -c ]; do shift 2; done
+    test "$1" = fetch
+    eval "revision=\${$#}"
+    printf '%s' "$revision" >"$checkout/.git/FETCH_HEAD"
+    ;;
+  rev-parse)
+    cat "$checkout/.git/FETCH_HEAD"
+    ;;
+  checkout)
+    if [ ! -s "$checkout/.git/credential-helper" ] || [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+      echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
+      echo "fatal: could not fetch promised blob from promisor remote" >&2
+      exit 1
+    fi
+    mkdir -p "$checkout/skills/private-source"
+    printf '%s\n' '# Private source' >"$checkout/skills/private-source/SKILL.md"
+    ;;
+  *)
+    echo "unexpected fake git command: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+        )
+        .expect("write fake Git");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).expect("make fake Git executable");
+        let system_path = std::env::var("PATH").expect("test process PATH");
+        PromisorRunner { config_base: root.join("config"), path: format!("{}:{system_path}", bin.display()) }
     }
 
     fn write_named_slot(root: &Path, name: &str, number: u64) -> PathBuf {
@@ -793,6 +883,36 @@ mod tests {
         assert!(calls[0].1[1].contains("skill source $name declared path $path is missing at pinned revision $revision"));
         assert!(calls[0].1[1].contains("skill source $name declared path $path has no SKILL.md at pinned revision $revision"));
         assert!(!calls[0].1[1].contains("required"), "staging must carry no skill-name policy; demand validation is #1790's contract");
+    }
+
+    #[tokio::test]
+    async fn credentialed_partial_clone_keeps_credentials_for_lazy_checkout_fetch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation skill source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("write private source manifest");
+        let runner = promisor_runner(temp.path());
+        let destination = runner.config_base.join("claude/skills");
+        let token_file = temp.path().join("private-skills.token");
+        std::fs::write(&token_file, "secret-token").expect("write source token");
+
+        registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
+                &runner,
+            )
+            .await
+            .expect("stage private partial-clone source through lazy checkout fetch");
+
+        assert!(destination.join("private-source/SKILL.md").is_file());
+        assert!(!token_file.exists(), "one-shot source token must be cleaned after materialization");
     }
 
     #[tokio::test]
