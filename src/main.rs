@@ -1973,9 +1973,17 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
 
 async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: bool) -> Result<()> {
     reset_sigpipe();
+    let format = topology_output_format(format, dot).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let daemon = connect_daemon(cli).await?;
-    let format = if dot { flotilla_tui::cli::TopologyOutputFormat::Dot } else { format.into() };
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+fn topology_output_format(format: OutputFormat, dot: bool) -> Result<flotilla_tui::cli::TopologyOutputFormat, String> {
+    match (format, dot) {
+        (OutputFormat::Json, true) => Err("--dot cannot be used with --json".to_string()),
+        (_, true) => Ok(flotilla_tui::cli::TopologyOutputFormat::Dot),
+        (format, false) => Ok(format.into()),
+    }
 }
 
 fn parse_log_duration(value: &str) -> Result<Duration, String> {
@@ -2535,7 +2543,15 @@ mod tests {
     #[test]
     fn cli_rejects_topology_dot_with_json() {
         assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());
-        assert!(Cli::try_parse_from(["flotilla", "--json", "topology", "--dot"]).is_err());
+
+        let cli = Cli::try_parse_from(["flotilla", "--json", "topology", "--dot"]).expect("clap accepts this global flag order");
+        let Some(SubCommand::Topology { dot }) = cli.command else {
+            panic!("expected topology command");
+        };
+        assert_eq!(
+            topology_output_format(OutputFormat::from_json_flag(cli.json), dot),
+            Err("--dot cannot be used with --json".to_string())
+        );
     }
 
     #[test]
