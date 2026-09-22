@@ -297,6 +297,7 @@ enum GitCredentialPreflight {
     Gh,
     GithubApp { token_file: String },
     Forgejo { host: String, token_file: String, username: String },
+    GitHttpToken { host: String },
 }
 
 impl GitCredentialPreflight {
@@ -347,6 +348,22 @@ impl GitCredentialPreflight {
                         &git_config_path,
                         token_file,
                         username,
+                        host,
+                    ],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("Git credential preflight failed: {error}")),
+            Self::GitHttpToken { host } => runner
+                .run(
+                    "sh",
+                    &[
+                        "-c",
+                        "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=%s\\n\\n' \"$2\" | git credential fill >/dev/null",
+                        "flotilla-git-http-token-preflight",
+                        &git_config_path,
                         host,
                     ],
                     Path::new("/"),
@@ -554,7 +571,27 @@ impl CredentialStore {
         // loudly instead (registry credentials multiplex per image in
         // prepare_registry_pull and are exempt).
         let mut seen_adapters = BTreeSet::new();
+        let mut seen_git_http_hosts = BTreeSet::new();
         for (name, spec) in &specs {
+            let git_http_host = match &spec.consumer {
+                CredentialConsumer::GitHttpToken { host, .. } => Some(canonical_git_http_host(host)),
+                CredentialConsumer::Forgejo { server_url, .. } => Some(forgejo_git_host(server_url)),
+                CredentialConsumer::Gh | CredentialConsumer::GithubApp { .. } => Some(Ok("github.com".to_string())),
+                _ => None,
+            };
+            if let Some(host) = git_http_host {
+                let host = host.map_err(|error| bounded_adapter_error(name, spec.consumer.adapter_name(), &error))?;
+                if !seen_git_http_hosts.insert(host) {
+                    return Err(bounded_adapter_error(
+                        name,
+                        spec.consumer.adapter_name(),
+                        "multiple granted credentials target the same Git HTTPS host",
+                    ));
+                }
+                if matches!(spec.consumer, CredentialConsumer::GitHttpToken { .. }) {
+                    continue;
+                }
+            }
             if !seen_adapters.insert(spec.consumer.delivery_slot()) {
                 return Err(bounded_adapter_error(
                     name,
@@ -572,6 +609,7 @@ impl CredentialStore {
                 CredentialConsumer::Gh
                     | CredentialConsumer::GithubApp { .. }
                     | CredentialConsumer::Forgejo { .. }
+                    | CredentialConsumer::GitHttpToken { .. }
                     | CredentialConsumer::ClaudeOauth { .. }
                     | CredentialConsumer::Codex
                     | CredentialConsumer::ReviewBundleStore { .. }
@@ -1287,6 +1325,42 @@ impl CredentialStore {
                     }),
                 });
             }
+            CredentialConsumer::GitHttpToken { host, username } => {
+                let delivery_paths = delivery_paths.expect("git-http-token adapter resolves delivery paths");
+                let host = canonical_git_http_host(host)?;
+                let credential_url = format!("https://{host}");
+                if username.is_empty() || username.contains(['\n', '\r']) {
+                    return Err("Git HTTPS username must be non-empty and single-line".to_string());
+                }
+                let credential_dir = delivery_paths.credential_dir(name);
+                let path = credential_dir.join("token").to_string_lossy().into_owned();
+                let helper_path = credential_dir.join("git-credential-http-token").to_string_lossy().into_owned();
+                if !already_prepared {
+                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
+                    runner
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect token file: {error}"))?;
+                    let helper = format!(
+                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nrequest_host=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) request_host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$request_host\" = {} ] || exit 0\nprintf 'username=%s\\n' {}\nprintf 'password='\ncat {}\nprintf '\\n'\n",
+                        shell_single_quote(&host),
+                        shell_single_quote(username),
+                        shell_single_quote(&path),
+                    );
+                    runner
+                        .write_file(Path::new(&helper_path), &helper)
+                        .await
+                        .map_err(|error| format!("write Git credential helper: {error}"))?;
+                    runner
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
+                }
+                git_credential = Some(GitCredentialContribution {
+                    fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
+                    preflight: (!already_prepared).then_some(GitCredentialPreflight::GitHttpToken { host }),
+                });
+            }
             CredentialConsumer::Claude => {
                 if !runner.exists("claude", &["--version"]).await {
                     return Err("consumer binary is unavailable".to_string());
@@ -1438,6 +1512,35 @@ impl CredentialStore {
         }
         Ok(AdapterDelivery { env, git_credential })
     }
+}
+
+fn canonical_git_http_host(host: &str) -> Result<String, String> {
+    let parsed_url = Url::parse(&format!("https://{host}")).map_err(|error| format!("invalid Git HTTPS host: {error}"))?;
+    if parsed_url.username() != ""
+        || parsed_url.password().is_some()
+        || parsed_url.path() != "/"
+        || parsed_url.query().is_some()
+        || parsed_url.fragment().is_some()
+    {
+        return Err("Git HTTPS host must contain only a hostname and optional port".to_string());
+    }
+    let canonical_host = parsed_url.host_str().ok_or_else(|| "Git HTTPS host has no hostname".to_string())?;
+    Ok(match parsed_url.port() {
+        Some(port) => format!("{canonical_host}:{port}"),
+        None => canonical_host.to_string(),
+    })
+}
+
+fn forgejo_git_host(server_url: &str) -> Result<String, String> {
+    let parsed_url = Url::parse(server_url.trim_end_matches('/')).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
+    if parsed_url.scheme() != "https" {
+        return Err("Forgejo server URL must use HTTPS".to_string());
+    }
+    let host = parsed_url.host_str().ok_or_else(|| "Forgejo server URL has no host".to_string())?;
+    Ok(match parsed_url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
@@ -2961,7 +3064,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn gh_and_forgejo_helpers_compose_in_one_environment() {
+    async fn github_and_git_http_token_helpers_compose_without_cross_talk() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
@@ -2974,7 +3077,7 @@ interactions:
             })
             .await
             .expect("create GitHub credential declaration");
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_GITHUB_TOKEN".to_string(), "github-test-token".to_string()),
             ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string()),
@@ -2988,7 +3091,7 @@ interactions:
         let delivered: BTreeMap<String, String> = store
             .prepare("env-a", &BTreeSet::from(["github".to_string(), "lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect("prepare GitHub and Forgejo credentials")
+            .expect("prepare GitHub and Git HTTP credentials")
             .into_iter()
             .collect();
 
@@ -3006,10 +3109,10 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
         ));
         assert!(gitconfig.contains("# fragment: credential/gh github"));
-        assert!(gitconfig.contains("# fragment: credential/forgejo lab-forgejo"));
+        assert!(gitconfig.contains("# fragment: credential/git-http-token lab-forgejo"));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| {
             cmd == "sh"
@@ -3038,7 +3141,7 @@ interactions:
             })
             .await
             .expect("create GitHub credential declaration");
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_GITHUB_TOKEN".to_string(), "github-test-token".to_string()),
             ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string()),
@@ -3050,7 +3153,7 @@ interactions:
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
 
         store.prepare("env-a", &BTreeSet::from(["github".to_string()]), runner.clone()).await.expect("prepare GitHub credential");
-        store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+        store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Git HTTP credential");
 
         let writes = runner.writes.lock().expect("writes lock");
         let gitconfig = writes
@@ -3061,21 +3164,18 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
         ));
     }
 
     #[tokio::test]
-    async fn forgejo_material_is_delivered_as_a_protected_file_and_preflighted() {
+    async fn git_http_token_is_delivered_as_a_protected_file_and_persisted_helper() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo {
-                    server_url: "https://forgejo.lab".to_string(),
-                    username: "flotilla-crew".to_string(),
-                },
+                consumer: CredentialConsumer::GitHttpToken { host: "forgejo.lab".to_string(), username: "crew-reader".to_string() },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -3088,29 +3188,28 @@ interactions:
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
 
-        let delivered =
-            store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+        let delivered = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect("prepare Git HTTP credential");
 
         assert_eq!(delivered, vec![
-            ("FORGEJO_API_URL".to_string(), "https://forgejo.lab/api/v1".to_string()),
-            ("FORGEJO_SERVER_URL".to_string(), "https://forgejo.lab".to_string()),
-            ("FORGEJO_TOKEN_FILE".to_string(), "/tmp/flotilla-test-state/credentials/lab-forgejo/token".to_string()),
-            ("FORGEJO_USERNAME".to_string(), "flotilla-crew".to_string()),
             ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ]);
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes[0], (PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), secret.to_string()));
-        assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"));
+        assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"));
         assert!(writes[1].1.contains("[ \"$protocol\" = https ]"));
-        assert!(writes[1].1.contains("[ \"$host\" = forgejo.lab ]"));
-        assert!(writes[1].1.contains("$FORGEJO_USERNAME"));
+        assert!(writes[1].1.contains("[ \"$request_host\" = 'forgejo.lab' ]"));
+        assert!(writes[1].1.contains("printf 'username=%s\\n' 'crew-reader'"));
+        assert!(writes[1].1.contains("cat '/tmp/flotilla-test-state/credentials/lab-forgejo/token'"));
         assert!(!writes[1].1.contains(secret));
         assert_eq!(
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
+                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
@@ -3118,13 +3217,13 @@ interactions:
             .iter()
             .any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/tmp/flotilla-test-state/credentials/lab-forgejo/token"]));
         assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"]
+            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"]
         }));
         assert!(calls.iter().any(|(cmd, args, input)| {
-            cmd == "curl"
-                && args == &["--config", "-"]
-                && String::from_utf8_lossy(input).contains("https://forgejo.lab/api/v1/user")
-                && String::from_utf8_lossy(input).contains(secret)
+            cmd == "sh"
+                && args.iter().any(|arg| arg.contains("GIT_CONFIG_NOSYSTEM=1"))
+                && args.iter().any(|arg| arg == "forgejo.lab")
+                && input.is_empty()
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
@@ -3187,12 +3286,12 @@ interactions:
             .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
     }
 
-    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, server_url: &str, source_env: &str) {
+    async fn create_git_http_token_spec(backend: &ResourceBackend, name: &str, host: &str, source_env: &str) {
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { server_url: server_url.to_string(), username: "flotilla-crew".to_string() },
+                consumer: CredentialConsumer::GitHttpToken { host: host.to_string(), username: "crew-reader".to_string() },
                 source: CredentialSource::Env { name: source_env.to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -3202,9 +3301,9 @@ interactions:
     }
 
     #[tokio::test]
-    async fn forgejo_server_url_must_be_https() {
+    async fn git_http_token_host_rejects_a_url() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -3213,16 +3312,22 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect_err("plain-HTTP Forgejo server URL must be rejected");
+            .expect_err("a host containing a URL must be rejected");
 
-        assert!(error.contains("must use HTTPS"), "unexpected error: {error}");
+        assert!(error.contains("must contain only a hostname"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
     }
 
+    #[test]
+    fn git_http_token_host_is_canonicalized_before_delivery() {
+        assert_eq!(canonical_git_http_host("FORGEJO.LAB/"), Ok("forgejo.lab".to_string()));
+        assert_eq!(canonical_git_http_host("forgejo.lab:3000/"), Ok("forgejo.lab:3000".to_string()));
+    }
+
     #[tokio::test]
-    async fn forgejo_server_url_must_parse() {
+    async fn git_http_token_host_must_parse() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "not a url", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "not a host", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -3231,16 +3336,16 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect_err("an unparsable Forgejo server URL must be rejected");
+            .expect_err("an unparsable Git HTTPS host must be rejected");
 
-        assert!(error.contains("invalid Forgejo server URL"), "unexpected error: {error}");
+        assert!(error.contains("invalid Git HTTPS host"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
     }
 
     #[tokio::test]
-    async fn forgejo_helper_and_git_config_agree_on_an_explicit_port() {
+    async fn git_http_token_helper_and_config_agree_on_an_explicit_port() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -3249,32 +3354,64 @@ interactions:
         let delivered: BTreeMap<String, String> = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect("prepare Forgejo credential with an explicit port")
+            .expect("prepare Git HTTP credential with an explicit port")
             .into_iter()
             .collect();
 
-        assert_eq!(delivered.get("FORGEJO_SERVER_URL"), Some(&"https://forgejo.lab:3000".to_string()));
         assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/tmp/flotilla-test-state/credentials/gitconfig".to_string()));
         let writes = runner.writes.lock().expect("writes lock");
         assert!(
-            writes[1].1.contains("[ \"$host\" = forgejo.lab:3000 ]"),
+            writes[1].1.contains("[ \"$request_host\" = 'forgejo.lab:3000' ]"),
             "helper must compare against the host:port form git passes when a port is present"
         );
         assert!(writes[2].1.contains("[credential \"https://forgejo.lab:3000\"]"));
     }
 
     #[tokio::test]
-    async fn a_second_credential_on_the_same_adapter_fails_loudly() {
+    async fn git_http_token_credentials_for_multiple_hosts_coexist() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-a", "https://forgejo.lab", "TEST_TOKEN_A").await;
-        create_forgejo_spec(&backend, "lab-b", "https://other.lab", "TEST_TOKEN_B").await;
+        create_git_http_token_spec(&backend, "lab-a", "forgejo.lab", "TEST_TOKEN_A").await;
+        create_git_http_token_spec(&backend, "lab-b", "other.lab", "TEST_TOKEN_B").await;
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
         let store = CredentialStore::new(
             backend,
             "flotilla",
-            Arc::new(TestEnv::default()),
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_TOKEN_A".to_string(), "token-a".to_string()),
+                ("TEST_TOKEN_B".to_string(), "token-b".to_string()),
+            ]))),
             bag,
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let delivered = store
+            .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
+            .await
+            .expect("host-specific helpers coexist");
+
+        assert!(delivered.iter().any(|(key, _)| key == "GIT_CONFIG_GLOBAL"));
+        let writes = runner.writes.lock().expect("writes lock");
+        let gitconfig = &writes.last().expect("composed Git config").1;
+        assert!(gitconfig.contains("[credential \"https://forgejo.lab\"]"));
+        assert!(gitconfig.contains("[credential \"https://other.lab\"]"));
+    }
+
+    #[tokio::test]
+    async fn git_http_token_credentials_for_the_same_canonical_host_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "lab-a", "FORGEJO.LAB", "TEST_TOKEN_A").await;
+        create_git_http_token_spec(&backend, "lab-b", "forgejo.lab/", "TEST_TOKEN_B").await;
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_TOKEN_A".to_string(), "token-a".to_string()),
+                ("TEST_TOKEN_B".to_string(), "token-b".to_string()),
+            ]))),
+            EnvironmentBag::new(),
             runner.clone(),
             PathBuf::from("/tmp/flotilla-test-state"),
         );
@@ -3282,10 +3419,87 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
             .await
-            .expect_err("two credentials on one adapter would silently clobber each other's delivery");
+            .expect_err("duplicate canonical hosts must be rejected");
 
-        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
-        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written when preparation is rejected");
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgejo_and_git_http_token_credentials_for_the_same_host_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "git-only", "forgejo.lab", "TEST_GIT_TOKEN").await;
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo {
+                    server_url: "https://FORGEJO.LAB/".to_string(),
+                    username: "crew-reader".to_string(),
+                },
+                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create Forgejo credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_GIT_TOKEN".to_string(), "git-token".to_string()),
+                ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-token".to_string()),
+            ]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["forgejo-api".to_string(), "git-only".to_string()]), runner.clone())
+            .await
+            .expect_err("cross-adapter duplicate hosts must be rejected");
+
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_and_git_http_token_credentials_for_github_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "git-only", "GITHUB.COM/", "TEST_GIT_TOKEN").await;
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create GitHub credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_GIT_TOKEN".to_string(), "git-token".to_string()),
+                ("TEST_GITHUB_TOKEN".to_string(), "github-token".to_string()),
+            ]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["git-only".to_string(), "github".to_string()]), runner.clone())
+            .await
+            .expect_err("GitHub cross-adapter duplicate hosts must be rejected");
+
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
     }
 
     #[tokio::test]

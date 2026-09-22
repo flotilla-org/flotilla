@@ -40,6 +40,10 @@ pub enum CredentialConsumer {
         server_url: String,
         username: String,
     },
+    GitHttpToken {
+        host: String,
+        username: String,
+    },
     Claude,
     ClaudeOauth {
         account_email: String,
@@ -67,6 +71,7 @@ impl CredentialConsumer {
             Self::Gh => "gh",
             Self::GithubApp { .. } => "github-app",
             Self::Forgejo { .. } => "forgejo",
+            Self::GitHttpToken { .. } => "git-http-token",
             Self::Claude => "claude",
             Self::ClaudeOauth { .. } => "claude-oauth",
             Self::Codex => "codex",
@@ -186,6 +191,17 @@ mod tests {
         assert_eq!(encoded, r#"{"adapter":"claude-oauth","account_email":"ops@example.com"}"#);
         assert_eq!(consumer.adapter_name(), "claude-oauth");
         assert_eq!(consumer.delivery_slot(), CredentialConsumer::Claude.delivery_slot());
+    }
+
+    #[test]
+    fn git_http_token_declares_a_forge_agnostic_host_and_username() {
+        let consumer =
+            CredentialConsumer::GitHttpToken { host: "forgejo.lab.flotilla.work".to_string(), username: "crew-reader".to_string() };
+
+        let encoded = serde_json::to_string(&consumer).expect("serialize consumer");
+
+        assert_eq!(encoded, r#"{"adapter":"git-http-token","host":"forgejo.lab.flotilla.work","username":"crew-reader"}"#);
+        assert_eq!(consumer.adapter_name(), "git-http-token");
     }
 
     #[test]

@@ -27,7 +27,7 @@ the consumers it appears to solve.
   provisions vessels with them. Secrets do not travel the resource log,
   replicas, snapshots, or any future archive.
 - **`CredentialSpec` declarations replicate** (definitions class): name,
-  consumer adapter (`claude`, `codex`, `gh`, `forgejo`,
+  consumer adapter (`claude`, `codex`, `gh`, `forgejo`, `git-http-token`,
   `docker-registry`, …), source, lifecycle
   (`static | refreshable | issued`), and placement requirements. The ten
   requirements in the research are the field checklist (vendor-schema
