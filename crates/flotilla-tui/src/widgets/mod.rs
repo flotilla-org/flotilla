@@ -28,21 +28,6 @@ use crate::{
     theme::Theme,
 };
 
-/// Human-readable label and protocol key for each provider category.
-///
-/// Shared by widgets that render provider status tables (event log, work-item table).
-pub(crate) const PROVIDER_CATEGORIES: [(&str, &str); 9] = [
-    ("VCS", "vcs"),
-    ("Checkout mgr", "checkout_manager"),
-    ("Change request", "change_request"),
-    ("Issue tracker", "issue_tracker"),
-    ("Cloud agents", "cloud_agent"),
-    ("AI utility", "ai_utility"),
-    ("Workspace mgr", "workspace_manager"),
-    ("Terminal pool", "terminal_pool"),
-    ("Environment", "environment_provider"),
-];
-
 /// App-level effects that widgets can request. Processed by the event
 /// loop after widget dispatch — widgets declare intent, the app executes.
 #[derive(Debug, Clone)]

@@ -2,6 +2,7 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use flotilla_core::providers::discovery::ProviderCategory;
 use flotilla_protocol::{
     CredentialAttentionSeverity, FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth,
 };
@@ -13,7 +14,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext, PROVIDER_CATEGORIES};
+use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{PeerStatus, ProviderStatus, TuiHostState, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode},
@@ -265,7 +266,8 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
 
     for repo_identity in &model.repo_order {
         let rm = &model.repos[repo_identity];
-        for &(_, key) in &PROVIDER_CATEGORIES {
+        for category in ProviderCategory::ALL {
+            let key = category.slug();
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
@@ -282,7 +284,9 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
 
     let mut rows: Vec<Row> = Vec::new();
 
-    for &(category, key) in &PROVIDER_CATEGORIES {
+    for category in ProviderCategory::ALL {
+        let key = category.slug();
+        let category = category.display_name();
         let entries = by_category.get(key);
         if let Some(providers) = entries {
             for (i, provider) in providers.iter().enumerate() {
