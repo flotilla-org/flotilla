@@ -20,10 +20,10 @@ use flotilla_resources::{
         TransitionDriver, TransitionSequence, WorldBuilder,
     },
     Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
-    LifecycleAuthority, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
-    CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    LifecycleAuthority, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselSpec, VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 mod common;
@@ -132,6 +132,81 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
         [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { name: demand_name }]
             if name == "terminal-orphan" && demand_name == "terminal-attention-terminal-orphan"
     ));
+}
+
+fn vessel_owner(name: &str) -> OwnerReference {
+    OwnerReference {
+        api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
+        kind: Vessel::API_PATHS.kind.to_string(),
+        name: name.to_string(),
+        controller: true,
+    }
+}
+
+fn vessel_spec() -> VesselSpec {
+    VesselSpec {
+        convoy_ref: "convoy-governor".to_string(),
+        vessel_name: "work".to_string(),
+        placement_policy_ref: "policy-a".to_string(),
+        adopted_checkout_refs: BTreeMap::new(),
+    }
+}
+
+async fn vessel_owned_session(backend: &ResourceBackend, session_name: &str, vessel_name: &str) -> ResourceObject<TerminalSession> {
+    backend
+        .clone()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name(session_name.to_string())
+                .owner_references(vec![vessel_owner(vessel_name)])
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "governor".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("create vessel-owned terminal session")
+}
+
+#[tokio::test]
+async fn managed_terminal_session_is_reclaimed_when_its_vessel_owner_is_gone() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let session = vessel_owned_session(&backend, "terminal-orphan", "deleted-vessel").await;
+    let reconciler = TerminalSessionReconciler::new(Arc::new(RecordingTerminalRuntime::default()), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("missing vessel should be lifecycle state");
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+
+    assert!(matches!(
+        outcome.actuations.as_slice(),
+        [Actuation::DeleteTerminalSession { name }, Actuation::DeleteDemand { .. }] if name == "terminal-orphan"
+    ));
+}
+
+#[tokio::test]
+async fn managed_terminal_session_is_preserved_while_its_vessel_owner_exists() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    backend
+        .clone()
+        .using::<Vessel>("flotilla")
+        .create(&meta("convoy-governor-work"), &vessel_spec())
+        .await
+        .expect("create live governor vessel");
+    let session = vessel_owned_session(&backend, "terminal-convoy-governor-work-governor", "convoy-governor-work").await;
+    let reconciler = TerminalSessionReconciler::new(Arc::new(FailingTerminalRuntime), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("live vessel should be readable");
+    let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
+
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteTerminalSession { .. })));
 }
 
 #[tokio::test]
@@ -427,6 +502,7 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
                 .name("terminal-demo-work-coder".to_string())
                 .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string())]))
                 .annotations(BTreeMap::from([(ACTUATOR_HOST_REF_ANNOTATION.to_string(), "udder".to_string())]))
+                .owner_references(vec![vessel_owner("missing-foreign-vessel")])
                 .build(),
             &TerminalSessionSpec {
                 env_ref: "env-a".to_string(),
