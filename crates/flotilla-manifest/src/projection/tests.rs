@@ -116,8 +116,8 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
 
     let cases = [
         (entity::project("dev", "platform-observability-tools", "kiwi"), "platform-observability-tools", "po-tools", "pot"),
-        (entity::convoy("dev", "grouping-live-session", "kiwi"), "grouping-live-session", "gl-session", "gls"),
-        (entity::vessel("dev", "grouping-live-session", "publish-release-notes", "feta"), "publish-release-notes", "pr-notes", "prn"),
+        (entity::convoy("dev", &reference.name, "kiwi"), "grouping-live-session", "gl-session", "gls"),
+        (entity::vessel("dev", &reference.name, "publish-release-notes", "feta"), "publish-release-notes", "pr-notes", "prn"),
         (entity::session("feta/dev/governor"), "governor", "governor", "g"),
     ];
     for (entity, full, medium, short) in cases {
@@ -507,4 +507,120 @@ fn crew_roles_remain_a_flat_fact() {
     let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
     let patch = find_entity(&patches, &entity::vessel("dev", "cutover", "coder", "feta"));
     assert_eq!(patch.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned()]));
+}
+
+#[test]
+fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
+    for phase in [ConvoyPhase::Active, ConvoyPhase::Landed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned, ConvoyPhase::Failed] {
+        let reference = convoy_ref("dev", "governor-old");
+        let convoy = ConvoyRow::builder()
+            .resource(reference.clone())
+            .name("governor".to_owned())
+            .workflow_ref("standing-governor")
+            .phase(phase)
+            .build();
+        let entry = AwarenessEntry::builder()
+            .id("convoy/dev/governor-old".to_owned())
+            .kind(AwarenessKind::Convoy)
+            .label("governor".to_owned())
+            .state(AwarenessState::Idle)
+            .phase(AwarenessPhase::Convoy(phase))
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .build();
+        let vessel = AwarenessEntry::builder()
+            .id("vessel/dev/governor-old/govern".to_owned())
+            .kind(AwarenessKind::Vessel)
+            .label("govern".to_owned())
+            .state(AwarenessState::Idle)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .build();
+        let rows = [convoy];
+        for subject in [&entry, &vessel] {
+            let (_, facts) = awareness_entry_entity(subject, &rows).expect("published entity facts");
+            assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
+        }
+        let (_, facts) = awareness_entry_entity(&entry, &[]).expect("published entity facts");
+        assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
+    }
+}
+
+#[test]
+fn only_older_terminal_role_generations_are_superseded() {
+    let rows = [
+        ("old", "p", "governor", 1, ConvoyPhase::Failed),
+        ("latest", "p", "governor", 2, ConvoyPhase::Failed),
+        ("live-old", "p", "governor", 1, ConvoyPhase::Active),
+        ("other-project", "q", "governor", 1, ConvoyPhase::Failed),
+        ("other-role", "p", "worker", 1, ConvoyPhase::Failed),
+    ]
+    .into_iter()
+    .map(|(name, project, role, generation, phase)| {
+        ConvoyRow::builder()
+            .resource(convoy_ref("dev", name))
+            .name(role)
+            .project_ref(project)
+            .address_role(role)
+            .generation(generation)
+            .phase(phase)
+            .workflow_ref("standing")
+            .build()
+    })
+    .collect::<Vec<_>>();
+    let mut catalog = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[] }, &mint());
+    // A detached vessel in Attention must receive the same visibility fact.
+    catalog.assert_entity(
+        entity::vessel("dev", "old", "govern", "kiwi"),
+        vec![(KEY_CONVOY, MetadataValue::text(entity::convoy("dev", "old", "kiwi").id))],
+        None,
+    );
+    mark_superseded_convoys(&mut catalog, &rows);
+    for row in &rows {
+        let patches = catalog.reassert_patches();
+        let facts = find_entity(&patches, &entity::convoy("dev", &row.resource.name, "kiwi"));
+        assert_eq!(facts.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.resource.name == "old"));
+    }
+    let patches = catalog.reassert_patches();
+    assert_eq!(
+        find_entity(&patches, &entity::vessel("dev", "old", "govern", "kiwi")).set["flotilla.convoy.superseded"].value,
+        MetadataValue::Bool(true)
+    );
+}
+
+#[test]
+fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
+    let rows = [("convoy-old", 1, ConvoyPhase::Failed), ("convoy-new", 2, ConvoyPhase::Active)]
+        .into_iter()
+        .map(|(name, generation, phase)| {
+            let reference = convoy_ref("dev", name);
+            ConvoyRow::builder()
+                .resource(reference.clone())
+                .name("governor")
+                .project_ref("project/dev/p")
+                .address_role("governor")
+                .generation(generation)
+                .phase(phase)
+                .workflow_ref("standing")
+                .vessels(vec![vessel()
+                    .convoy(&reference)
+                    .name("govern")
+                    .phase(WorkPhase::Running)
+                    .materialize(&format!("terminal-{name}"))
+                    .call()])
+                .build()
+        })
+        .collect::<Vec<_>>();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[] }, &mint()).reassert_patches();
+    for row in &rows {
+        let convoy = entity::convoy("dev", &row.resource.name, "kiwi");
+        let vessel = entity::vessel("dev", &row.resource.name, "govern", "feta");
+        let convoy_patch = find_entity(&patches, &convoy);
+        let vessel_patch = find_entity(&patches, &vessel);
+        assert_eq!(text(convoy_patch, KEY_DISPLAY_LABEL), "governor");
+        assert_eq!(text(vessel_patch, KEY_CONVOY), convoy.id);
+        assert_eq!(text(convoy_patch, KEY_PRIMARY_ACTION_TARGET), vessel.action_target());
+        assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), vessel.action_target());
+        for patch in [convoy_patch, vessel_patch] {
+            assert_eq!(patch.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.generation == 1));
+        }
+    }
 }
