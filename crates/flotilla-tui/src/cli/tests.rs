@@ -150,6 +150,15 @@ fn topology_dot_renders_hosts_and_route_semantics_deterministically() {
                 last_attempt: None,
                 last_error: None,
             },
+            TopologyRoute {
+                target: NodeInfo::new(NodeId::new("remote-e"), "test host"),
+                next_hop: NodeInfo::new(NodeId::new("remote-b"), "build host"),
+                direct: false,
+                connected: true,
+                fallbacks: vec![],
+                last_attempt: None,
+                last_error: None,
+            },
         ],
     };
 
@@ -163,8 +172,10 @@ fn topology_dot_renders_hosts_and_route_semantics_deterministically() {
             "  \"remote-b\" [label=\"build host\"];\n",
             "  \"remote-c\" [label=\"cloud runner\"];\n",
             "  \"remote-d\" [label=\"backup\"];\n",
+            "  \"remote-e\" [label=\"test host\"];\n",
             "  \"local-node\" -> \"remote-b\" [label=\"direct\"];\n",
             "  \"remote-b\" -> \"remote-c\" [label=\"route, disconnected\", color=red, style=dashed];\n",
+            "  \"remote-b\" -> \"remote-e\" [label=\"route\"];\n",
             "  \"remote-d\" -> \"remote-c\" [label=\"fallback\", style=dotted];\n",
             "}\n",
         )

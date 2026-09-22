@@ -462,9 +462,8 @@ impl From<&TopologyResponse> for TopologyGraph {
             insert_graph_node(&mut nodes, &route.target);
             insert_graph_node(&mut nodes, &route.next_hop);
 
-            let direct = route.direct || route.next_hop.node_id == route.target.node_id;
             edges.insert(TopologyGraphEdge {
-                from: if direct { response.local_node.node_id.clone() } else { route.next_hop.node_id.clone() },
+                from: if route.direct { response.local_node.node_id.clone() } else { route.next_hop.node_id.clone() },
                 to: route.target.node_id.clone(),
                 kind: if route.direct { TopologyGraphEdgeKind::Direct } else { TopologyGraphEdgeKind::Routed },
                 connected: Some(route.connected),

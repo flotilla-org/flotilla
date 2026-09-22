@@ -2535,6 +2535,7 @@ mod tests {
     #[test]
     fn cli_rejects_topology_dot_with_json() {
         assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["flotilla", "--json", "topology", "--dot"]).is_err());
     }
 
     #[test]
