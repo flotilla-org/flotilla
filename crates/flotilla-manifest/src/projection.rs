@@ -349,10 +349,8 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
             }
             facts.extend(label_tier_facts(semantic_label));
-            if row.is_none() {
-                if let Some(AwarenessPhase::Convoy(phase)) = entry.phase {
-                    facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
-                }
+            if let (None, Some(AwarenessPhase::Convoy(phase))) = (row, &entry.phase) {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
             }
             if let Some(number) = entry.annotations.get(KEY_CHANGE_REQUEST_NUMBER) {
                 facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(number.clone())));
@@ -525,7 +523,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let Some(repo) = &repo {
         assert_repo_entity(catalog, repo, &project_facts(&project));
     }
-    let convoy_entity = entity::convoy(namespace, &convoy.name, &origin);
+    let convoy_entity = entity::convoy(namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = convoy_badge(convoy.phase, convoy.initializing);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
@@ -559,7 +557,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     }
     if let [vessel] = convoy.vessels.as_slice() {
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
-            let target = entity::vessel(namespace, &convoy.name, &vessel.name, vessel.host.as_str());
+            let target = entity::vessel(namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
             facts.extend(action_facts(&target, &recipe, "workspace"));
         }
     }
@@ -577,9 +575,9 @@ fn project_vessel(
     repo: Option<&str>,
     mint: &dyn RecipeMint,
 ) {
-    let entity = entity::vessel(&convoy.resource.namespace, &convoy.name, &vessel.name, vessel.host.as_str());
+    let entity = entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
     let origin = entity::resource_origin(&convoy.resource);
-    let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.name, &origin);
+    let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = work_badge(vessel.phase);
     let mut facts = project_facts(project);
