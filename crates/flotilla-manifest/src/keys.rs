@@ -48,6 +48,8 @@ pub const KEY_ATTACH_REF: &str = "flotilla.attach.ref";
 // Catalog keys (`flotilla pm connect`, Entity targets, TTL'd).
 
 pub const KEY_PROJECT_NAME: &str = "flotilla.project.name";
+/// Terminal attempt with a newer generation of the same project and role.
+pub const KEY_CONVOY_SUPERSEDED: &str = "flotilla.convoy.superseded";
 pub const KEY_CONVOY_PHASE: &str = "flotilla.convoy.phase";
 pub const KEY_CONVOY_WORKFLOW: &str = "flotilla.convoy.workflow";
 pub const KEY_CONVOY_MESSAGE: &str = "flotilla.convoy.message";

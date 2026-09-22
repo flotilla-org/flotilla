@@ -543,3 +543,48 @@ fn awareness_retains_exact_convoy_phase_for_visibility_controls() {
         assert!(facts.contains(&(KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str()))));
     }
 }
+
+#[test]
+fn only_older_terminal_role_generations_are_superseded() {
+    let rows = [
+        ("old", "p", "governor", 1, ConvoyPhase::Failed),
+        ("latest", "p", "governor", 2, ConvoyPhase::Failed),
+        ("live-old", "p", "governor", 1, ConvoyPhase::Active),
+        ("other-project", "q", "governor", 1, ConvoyPhase::Failed),
+        ("other-role", "p", "worker", 1, ConvoyPhase::Failed),
+    ]
+    .into_iter()
+    .map(|(name, project, role, generation, phase)| {
+        ConvoyRow::builder()
+            .resource(convoy_ref("dev", name))
+            .name(name)
+            .project_ref(project)
+            .address_role(role)
+            .generation(generation)
+            .phase(phase)
+            .workflow_ref("standing")
+            .build()
+    })
+    .collect::<Vec<_>>();
+    let mut catalog = Catalog::default();
+    for row in &rows {
+        project_convoy(&mut catalog, row, &mint());
+    }
+    // A detached vessel in Attention must receive the same visibility fact.
+    catalog.assert_entity(
+        entity::vessel("dev", "old", "govern", "kiwi"),
+        vec![(KEY_CONVOY, MetadataValue::text(entity::convoy("dev", "old", "kiwi").id))],
+        None,
+    );
+    mark_superseded_convoys(&mut catalog, &rows);
+    for row in &rows {
+        let patches = catalog.reassert_patches();
+        let facts = find_entity(&patches, &entity::convoy("dev", &row.name, "kiwi"));
+        assert_eq!(facts.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.name == "old"));
+    }
+    let patches = catalog.reassert_patches();
+    assert_eq!(
+        find_entity(&patches, &entity::vessel("dev", "old", "govern", "kiwi")).set["flotilla.convoy.superseded"].value,
+        MetadataValue::Bool(true)
+    );
+}

@@ -18,8 +18,8 @@ use crate::{
     entity::{self, EntityRef},
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
-        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
-        KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
+        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS,
+        KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
         KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY,
         KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME,
         KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST,
@@ -168,6 +168,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         for node in nodes {
             project_awareness_node(&mut catalog, node, input.convoys, mint);
         }
+        mark_superseded_convoys(&mut catalog, input.convoys);
         return catalog;
     }
     for convoy in input.convoys {
@@ -176,7 +177,42 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     for independent in input.independents {
         project_independent(&mut catalog, independent, mint);
     }
+    mark_superseded_convoys(&mut catalog, input.convoys);
     catalog
+}
+
+// Lifecycle identity comes from role addressing, never from display labels.
+// Keep nonterminal attempts visible even if a newer generation also exists.
+fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
+    let mut latest = BTreeMap::new();
+    for row in convoys {
+        if let (Some(project), Some(role)) = (&row.project_ref, &row.address_role) {
+            let key = (&row.resource.namespace, project, role);
+            latest.entry(key).and_modify(|generation: &mut u64| *generation = (*generation).max(row.generation)).or_insert(row.generation);
+        }
+    }
+    let superseded = convoys
+        .iter()
+        .filter(|row| {
+            row.phase.is_terminal()
+                && match (&row.project_ref, &row.address_role) {
+                    (Some(project), Some(role)) => {
+                        latest.get(&(&row.resource.namespace, project, role)).is_some_and(|generation| *generation > row.generation)
+                    }
+                    _ => false,
+                }
+        })
+        .map(|row| entity::convoy(&row.resource.namespace, &row.resource.name, &entity::resource_origin(&row.resource)).id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for facts in catalog.facts.values_mut() {
+        let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
+            continue;
+        };
+        facts.insert(
+            KEY_CONVOY_SUPERSEDED.to_owned(),
+            MetadataValueUpdate::new(MetadataValue::Bool(superseded.contains(convoy)), Some(CATALOG_TTL_MS)),
+        );
+    }
 }
 
 fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
