@@ -1411,6 +1411,40 @@ impl TerminalPool for MockTerminalPool {
     }
 }
 
+struct FailingEnsureTerminalPool;
+
+#[async_trait]
+impl TerminalPool for FailingEnsureTerminalPool {
+    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
+        Ok(vec![])
+    }
+
+    async fn ensure_session(
+        &self,
+        _session_name: &str,
+        _cmd: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        _tags: &[crate::providers::terminal::TerminalSessionTag],
+    ) -> Result<(), String> {
+        Err("failed to start terminal".to_string())
+    }
+
+    fn attach_args(
+        &self,
+        session_name: &str,
+        _cmd: &str,
+        _cwd: &ExecutionEnvironmentPath,
+        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+    ) -> Result<Vec<Arg>, String> {
+        Ok(vec![Arg::Literal(format!("attach:{session_name}"))])
+    }
+
+    async fn kill_session(&self, _session_name: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn remove_checkout_succeeds_with_terminal_pool() {
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
@@ -3297,6 +3331,24 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     // Args should contain structured Arg from attach_args(), not Literal-wrapped strings
     let flat = flotilla_protocol::arg::flatten(&result[0].args, 0);
     assert!(flat.starts_with("attach:"), "expected attach: prefix, got: {flat}");
+}
+
+#[tokio::test]
+async fn prepare_terminal_commands_skips_terminal_when_ensure_running_fails() {
+    let mock_pool: Arc<dyn TerminalPool> = Arc::new(FailingEnsureTerminalPool);
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
+
+    let service = super::terminals::TerminalPreparationService::new(&tm, None);
+    let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }];
+
+    let result = service
+        .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
+        .await
+        .expect("prepare requested terminal commands");
+
+    assert!(result.is_empty());
 }
 
 #[tokio::test]
