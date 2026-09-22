@@ -1,12 +1,16 @@
-use std::{collections::HashMap, fmt::Write as _, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Write as _,
+    path::Path,
+};
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
-    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo,
-    PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
+    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeId,
+    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -399,6 +403,136 @@ fn format_topology_human(response: &TopologyResponse) -> String {
     }
     out.push_str(&table.to_string());
     out.push('\n');
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyOutputFormat {
+    Human,
+    Json,
+    Dot,
+}
+
+impl From<OutputFormat> for TopologyOutputFormat {
+    fn from(format: OutputFormat) -> Self {
+        match format {
+            OutputFormat::Human => Self::Human,
+            OutputFormat::Json => Self::Json,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopologyGraphNode {
+    label: String,
+    local: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TopologyGraphEdgeKind {
+    Direct,
+    Routed,
+    Fallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TopologyGraphEdge {
+    from: NodeId,
+    to: NodeId,
+    kind: TopologyGraphEdgeKind,
+    connected: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopologyGraph {
+    nodes: BTreeMap<NodeId, TopologyGraphNode>,
+    edges: BTreeSet<TopologyGraphEdge>,
+}
+
+impl From<&TopologyResponse> for TopologyGraph {
+    fn from(response: &TopologyResponse) -> Self {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(response.local_node.node_id.clone(), TopologyGraphNode {
+            label: response.local_node.display_name.clone(),
+            local: true,
+        });
+
+        let mut edges = BTreeSet::new();
+        for route in &response.routes {
+            insert_graph_node(&mut nodes, &route.target);
+            insert_graph_node(&mut nodes, &route.next_hop);
+
+            edges.insert(TopologyGraphEdge {
+                from: if route.direct { response.local_node.node_id.clone() } else { route.next_hop.node_id.clone() },
+                to: route.target.node_id.clone(),
+                kind: if route.direct { TopologyGraphEdgeKind::Direct } else { TopologyGraphEdgeKind::Routed },
+                connected: Some(route.connected),
+            });
+
+            for fallback in &route.fallbacks {
+                insert_graph_node(&mut nodes, fallback);
+                edges.insert(TopologyGraphEdge {
+                    from: if fallback.node_id == route.target.node_id {
+                        response.local_node.node_id.clone()
+                    } else {
+                        fallback.node_id.clone()
+                    },
+                    to: route.target.node_id.clone(),
+                    kind: TopologyGraphEdgeKind::Fallback,
+                    connected: None,
+                });
+            }
+        }
+
+        Self { nodes, edges }
+    }
+}
+
+fn insert_graph_node(nodes: &mut BTreeMap<NodeId, TopologyGraphNode>, node: &NodeInfo) {
+    nodes.entry(node.node_id.clone()).or_insert_with(|| TopologyGraphNode { label: node.display_name.clone(), local: false });
+}
+
+fn dot_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn format_topology_dot(response: &TopologyResponse) -> String {
+    let graph = TopologyGraph::from(response);
+    let mut out = String::from("digraph topology {\n  graph [rankdir=LR];\n  node [shape=ellipse];\n");
+
+    for (node_id, node) in graph.nodes {
+        let local_attribute = if node.local { ", shape=doublecircle" } else { "" };
+        writeln!(out, "  {} [label={}{}];", dot_quote(node_id.as_str()), dot_quote(&node.label), local_attribute)
+            .expect("writing to a string cannot fail");
+    }
+
+    for edge in graph.edges {
+        let attributes = match (edge.kind, edge.connected) {
+            (TopologyGraphEdgeKind::Direct, Some(true)) => "label=\"direct\"",
+            (TopologyGraphEdgeKind::Direct, Some(false)) => "label=\"direct, disconnected\", color=red, style=dashed",
+            (TopologyGraphEdgeKind::Routed, Some(true)) => "label=\"route\"",
+            (TopologyGraphEdgeKind::Routed, Some(false)) => "label=\"route, disconnected\", color=red, style=dashed",
+            (TopologyGraphEdgeKind::Fallback, _) => "label=\"fallback\", style=dotted",
+            (_, None) => unreachable!("only fallback edges omit connection state"),
+        };
+        writeln!(out, "  {} -> {} [{attributes}];", dot_quote(edge.from.as_str()), dot_quote(edge.to.as_str()))
+            .expect("writing to a string cannot fail");
+    }
+
+    out.push_str("}\n");
     out
 }
 
@@ -939,11 +1073,12 @@ pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), 
     Ok(())
 }
 
-pub async fn run_topology(daemon: &dyn DaemonHandle, format: OutputFormat) -> Result<(), String> {
+pub async fn run_topology(daemon: &dyn DaemonHandle, format: TopologyOutputFormat) -> Result<(), String> {
     let topology = daemon.get_topology().await?;
     let output = match format {
-        OutputFormat::Human => format_topology_human(&topology),
-        OutputFormat::Json => flotilla_protocol::output::json_pretty(&topology),
+        TopologyOutputFormat::Human => format_topology_human(&topology),
+        TopologyOutputFormat::Json => flotilla_protocol::output::json_pretty(&topology),
+        TopologyOutputFormat::Dot => format_topology_dot(&topology),
     };
     print!("{output}");
     Ok(())

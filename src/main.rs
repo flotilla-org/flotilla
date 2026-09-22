@@ -115,7 +115,11 @@ enum SubCommand {
         timeout: Option<u64>,
     },
     /// Show the daemon's current multi-host routing view
-    Topology,
+    Topology {
+        /// Output the topology as a Graphviz DOT graph
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
+    },
     /// Read structured daemon logs from this host or a peer
     Logs {
         /// Peer host name; omit to read this host
@@ -656,7 +660,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Wait { leaves, namespace, fresher_than, timeout }) => {
             run_wait(&cli, leaves, namespace, fresher_than, timeout, format).await
         }
-        Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
+        Some(SubCommand::Topology { dot }) => run_topology_command(&cli, format, dot).await,
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
@@ -1967,10 +1971,19 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
     }
 }
 
-async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
+async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: bool) -> Result<()> {
     reset_sigpipe();
+    let format = topology_output_format(format, dot).map_err(|e| color_eyre::eyre::eyre!(e))?;
     let daemon = connect_daemon(cli).await?;
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+fn topology_output_format(format: OutputFormat, dot: bool) -> Result<flotilla_tui::cli::TopologyOutputFormat, String> {
+    match (format, dot) {
+        (OutputFormat::Json, true) => Err("--dot cannot be used with --json".to_string()),
+        (_, true) => Ok(flotilla_tui::cli::TopologyOutputFormat::Dot),
+        (format, false) => Ok(format.into()),
+    }
 }
 
 fn parse_log_duration(value: &str) -> Result<Duration, String> {
@@ -2258,18 +2271,19 @@ mod tests {
 
     use clap::Parser;
     use flotilla_protocol::{
-        qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry,
-        ProjectListRepository, ProjectListResponse, ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepositoryKey, ViewAddress,
+        output::OutputFormat, qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState,
+        ProjectListEntry, ProjectListRepository, ProjectListResponse, ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels,
+        RepositoryKey, ViewAddress,
     };
 
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
         replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, Cli, CliPaths,
-        CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
-        ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand,
-        ResourceWatchArgs, SubCommand,
+        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format,
+        Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs,
+        ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs,
+        ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -2509,15 +2523,36 @@ mod tests {
     #[test]
     fn cli_parses_topology_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "topology"]).expect("topology cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(!cli.json);
     }
 
     #[test]
     fn cli_parses_topology_with_global_json() {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_topology_dot() {
+        let cli = Cli::try_parse_from(["flotilla", "topology", "--dot"]).expect("topology dot should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: true })));
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn cli_rejects_topology_dot_with_json() {
+        assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());
+
+        let cli = Cli::try_parse_from(["flotilla", "--json", "topology", "--dot"]).expect("clap accepts this global flag order");
+        let Some(SubCommand::Topology { dot }) = cli.command else {
+            panic!("expected topology command");
+        };
+        assert_eq!(
+            topology_output_format(OutputFormat::from_json_flag(cli.json), dot),
+            Err("--dot cannot be used with --json".to_string())
+        );
     }
 
     #[test]
@@ -3103,7 +3138,7 @@ mod tests {
     #[test]
     fn cli_global_json_before_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "--json", "topology"]).expect("json before subcommand should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(cli.json);
     }
 
