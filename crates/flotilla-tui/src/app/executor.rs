@@ -214,3 +214,107 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use flotilla_protocol::{commands::AttachMode, IssueRef, IssueSource, RepoSelector, ViewAddress};
+
+    use super::*;
+    use crate::{
+        app::{
+            test_support::{stub_app_with_daemon, ExecuteCalls, QueryCalls, StubDaemon},
+            ui_state::ProjectIssueStartContext,
+        },
+        table_view::RowId,
+    };
+
+    fn dispatch_channels() -> (mpsc::UnboundedSender<Event>, mpsc::UnboundedReceiver<Event>) {
+        mpsc::unbounded_channel()
+    }
+
+    #[tokio::test]
+    async fn dispatch_executes_regular_commands_and_forwards_the_command_id() {
+        let execute_calls: ExecuteCalls = Arc::new(Mutex::new(Vec::new()));
+        let daemon = Arc::new(StubDaemon::builder().execute_result(Ok(42)).execute_calls(execute_calls.clone()).build());
+        let mut app = stub_app_with_daemon(daemon, vec![]);
+        let command = app.command(CommandAction::Refresh { repo: None });
+        let (event_tx, mut event_rx) = dispatch_channels();
+
+        dispatch(command.clone(), &mut app, None, event_tx);
+
+        let event = event_rx.recv().await.expect("dispatch completion event");
+        assert!(matches!(event, Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None }));
+        assert_eq!(*execute_calls.lock().expect("execute calls lock"), vec![command]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_attach_queries_without_executing_a_command() {
+        let execute_calls: ExecuteCalls = Arc::new(Mutex::new(Vec::new()));
+        let query_calls: QueryCalls = Arc::new(Mutex::new(Vec::new()));
+        let daemon = Arc::new(
+            StubDaemon::builder()
+                .query_result(Ok(CommandValue::Ok))
+                .execute_calls(execute_calls.clone())
+                .query_calls(query_calls.clone())
+                .build(),
+        );
+        let mut app = stub_app_with_daemon(daemon, vec![]);
+        let command = app.command(CommandAction::Attach { reference: "session".into(), host: None, mode: AttachMode::default() });
+        let session_id = app.session_id;
+        let (event_tx, mut event_rx) = dispatch_channels();
+
+        dispatch(command.clone(), &mut app, None, event_tx);
+
+        let event = event_rx.recv().await.expect("attach dispatch completion event");
+        assert!(matches!(event, Event::AttachDispatchCompleted(Ok(CommandValue::Ok))));
+        assert!(execute_calls.lock().expect("execute calls lock").is_empty());
+        assert_eq!(*query_calls.lock().expect("query calls lock"), vec![(command, session_id)]);
+    }
+
+    #[tokio::test]
+    async fn successful_dispatch_acknowledges_pending_action() {
+        let daemon = Arc::new(StubDaemon::builder().execute_result(Ok(73)).build());
+        let mut app = stub_app_with_daemon(daemon, vec![]);
+        let pending_ctx = PendingActionContext::project_issue_start(
+            ProjectIssueStartContext {
+                address: ViewAddress::Project { namespace: "default".into(), name: "project".into() },
+                row_id: RowId::new("issue-9"),
+                issue: IssueRef { source: IssueSource { service: "github".into(), scope: "org/repo".into() }, id: "9".into() },
+                batch_id: 1,
+            },
+            "Start convoy".into(),
+        );
+        let command = app.command(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Path("/repo".into()), ids: vec!["9".into()] });
+        let (event_tx, mut event_rx) = dispatch_channels();
+
+        dispatch(command, &mut app, Some(pending_ctx), event_tx);
+        assert_eq!(app.pending_dispatch_acks, 1);
+
+        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event") else {
+            panic!("expected command dispatch completion");
+        };
+        handle_dispatch_completion(result, pending_ctx, &mut app);
+
+        assert_eq!(app.pending_dispatch_acks, 0);
+        assert!(app.acknowledged_dispatches.contains(&73));
+        assert!(app.command_project_issue_starts.contains_key(&73));
+    }
+
+    #[tokio::test]
+    async fn failed_dispatch_sets_status_message() {
+        let daemon = Arc::new(StubDaemon::builder().execute_result(Err("dispatch failed".into())).build());
+        let mut app = stub_app_with_daemon(daemon, vec![]);
+        let command = app.command(CommandAction::Refresh { repo: None });
+        let (event_tx, mut event_rx) = dispatch_channels();
+
+        dispatch(command, &mut app, None, event_tx);
+        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event") else {
+            panic!("expected command dispatch completion");
+        };
+        handle_dispatch_completion(result, pending_ctx, &mut app);
+
+        assert_eq!(app.model.status_message.as_deref(), Some("dispatch failed"));
+    }
+}
