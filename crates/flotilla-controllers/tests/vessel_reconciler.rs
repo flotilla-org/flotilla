@@ -2038,6 +2038,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
     let convoys = backend.clone().using::<Convoy>(NAMESPACE);
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
+    let environments = backend.clone().using::<Environment>(NAMESPACE);
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-finalizer", "implement", REPO_URL, GIT_REF).await;
 
     let mut status = convoy.status.expect("convoy status");
@@ -2062,6 +2063,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .update(&vessel_meta, &vessel.metadata.resource_version, &vessel.spec)
         .await
         .expect("vessel finalizer and convoy label should be recorded");
+    create_labeled_environment(&backend, NAMESPACE, "env-convoy-finalizer-implement", "convoy-finalizer-implement").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
     let convoy_reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
@@ -2099,6 +2101,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
 
     assert!(matches!(vessels.get("convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(terminals.get("terminal-convoy-finalizer-implement-coder").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(environments.get("env-convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]

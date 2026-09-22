@@ -9,7 +9,7 @@ use flotilla_resources::{
     Convoy, ConvoyPhase, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta, LifecycleAuthority,
     OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
     TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
     CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
     VESSEL_REF_LABEL,
 };
@@ -96,6 +96,7 @@ pub struct TerminalSessionReconciler<R> {
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
+    vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
 }
@@ -107,6 +108,7 @@ impl<R> TerminalSessionReconciler<R> {
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
             environments: backend.clone().using::<Environment>(namespace),
+            vessels: backend.clone().using::<Vessel>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
         }
@@ -162,6 +164,16 @@ impl<R> TerminalSessionReconciler<R> {
     }
 
     async fn session_owner_state(&self, session: &ResourceObject<TerminalSession>) -> Result<TerminalOwnerState, ResourceError> {
+        if let Some(owner) = session.metadata.owner_references.iter().find(|owner| owner.controller && owner.kind == Vessel::API_PATHS.kind)
+        {
+            match self.vessels.get(&owner.name).await {
+                Ok(vessel) if vessel.metadata.deletion_timestamp.is_some() => return Ok(TerminalOwnerState::Gone),
+                Ok(_) => {}
+                Err(ResourceError::NotFound { .. }) => return Ok(TerminalOwnerState::Gone),
+                Err(err) => return Err(err),
+            }
+        }
+
         let convoy_ref = match &session.spec.source {
             TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
             TerminalSessionSource::Tool { .. } => session.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
