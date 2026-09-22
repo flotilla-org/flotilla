@@ -4,7 +4,7 @@
 //! one canonical entity and carries only flat facts. Presentation managers
 //! derive paths from those facts using their selected grouping template.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{
     result_set::{
@@ -203,7 +203,7 @@ fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
                 }
         })
         .map(|row| entity::convoy(&row.resource.namespace, &row.resource.name, &entity::resource_origin(&row.resource)).id)
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     for facts in catalog.facts.values_mut() {
         let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
             continue;
