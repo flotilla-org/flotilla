@@ -243,8 +243,10 @@ fn provider_table_header(theme: &Theme) -> Row<'static> {
 }
 
 fn provider_table_widths() -> [Constraint; 3] {
-    [Constraint::Length(16), Constraint::Length(24), Constraint::Length(6)]
+    [Constraint::Length(PROVIDER_ROLE_WIDTH), Constraint::Length(24), Constraint::Length(6)]
 }
+
+const PROVIDER_ROLE_WIDTH: u16 = 20;
 
 /// Return the worse of two provider statuses (Error > Ok > None).
 fn worse_status(a: Option<ProviderStatus>, b: Option<ProviderStatus>) -> Option<ProviderStatus> {
@@ -519,6 +521,16 @@ mod tests {
     fn disabled_host_provider_is_not_rendered_as_healthy() {
         let provider = flotilla_protocol::HostProviderStatus::disabled("issue_tracker", "Issue Provider", "credentials unavailable");
         assert_eq!(format_host_provider_status(&provider), "Issue Provider (disabled: credentials unavailable)");
+    }
+
+    #[test]
+    fn provider_role_column_fits_all_category_display_names() {
+        let longest_category = ProviderCategory::ALL
+            .iter()
+            .map(|category| category.display_name().chars().count())
+            .max()
+            .expect("provider categories should not be empty");
+        assert!(longest_category <= usize::from(PROVIDER_ROLE_WIDTH));
     }
 
     // ── select_next ───────────────────────────────────────────────────
