@@ -177,20 +177,18 @@ fn provider_descriptor_labeled_simple() {
 
 #[test]
 fn provider_category_slug_round_trip() {
-    let categories = [
-        (ProviderCategory::Vcs, "vcs"),
-        (ProviderCategory::CheckoutManager, "checkout_manager"),
-        (ProviderCategory::ChangeRequest, "change_request"),
-        (ProviderCategory::IssueProvider, "issue_tracker"),
-        (ProviderCategory::CloudAgent, "cloud_agent"),
-        (ProviderCategory::AiUtility, "ai_utility"),
-        (ProviderCategory::WorkspaceManager, "workspace_manager"),
-        (ProviderCategory::TerminalPool, "terminal_pool"),
-        (ProviderCategory::EnvironmentProvider, "environment_provider"),
+    let expected = [
+        "vcs",
+        "checkout_manager",
+        "change_request",
+        "issue_tracker",
+        "cloud_agent",
+        "ai_utility",
+        "workspace_manager",
+        "terminal_pool",
+        "environment_provider",
     ];
-    for (cat, expected_slug) in categories {
-        assert_eq!(cat.slug(), expected_slug);
-    }
+    assert_eq!(ProviderCategory::ALL.map(|category| category.slug()), expected);
 }
 
 #[test]

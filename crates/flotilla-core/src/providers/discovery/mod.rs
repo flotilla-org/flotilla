@@ -269,6 +269,18 @@ pub enum ProviderCategory {
 }
 
 impl ProviderCategory {
+    pub const ALL: [Self; 9] = [
+        Self::Vcs,
+        Self::CheckoutManager,
+        Self::ChangeRequest,
+        Self::IssueProvider,
+        Self::CloudAgent,
+        Self::AiUtility,
+        Self::WorkspaceManager,
+        Self::TerminalPool,
+        Self::EnvironmentProvider,
+    ];
+
     pub fn slug(&self) -> &'static str {
         match self {
             Self::Vcs => "vcs",
