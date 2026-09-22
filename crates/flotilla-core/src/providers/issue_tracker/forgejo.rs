@@ -179,6 +179,9 @@ impl super::IssueProvider for ForgejoIssueProvider {
         if let Some(search) = &params.search {
             query.push(("q", search.clone()));
         }
+        for (field, values) in &params.match_fields {
+            query.push((field, values.join(",")));
+        }
         let (value, has_more) = self.get_json(&format!("repos/{}/issues", source.scope), &query).await?;
         let fetched_at = Utc::now();
         let raw_items = value.as_array().ok_or("Forgejo issue list response was not an array")?;
@@ -348,7 +351,12 @@ mod tests {
         let provider = provider(http.clone());
 
         provider
-            .query(&source(), &IssueQuery { search: Some("anchor".into()), label: Some("ready".into()) }, 2, 75)
+            .query(
+                &source(),
+                &IssueQuery { search: Some("anchor".into()), label: Some("ready".into()), match_fields: Default::default() },
+                2,
+                75,
+            )
             .await
             .expect("query should succeed");
 

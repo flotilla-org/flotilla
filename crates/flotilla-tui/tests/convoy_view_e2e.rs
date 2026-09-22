@@ -17,7 +17,7 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,
-    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -30,7 +30,11 @@ fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
 fn convoy_meta(name: &str) -> InputMeta {
     InputMeta {
         name: name.to_string(),
-        labels: BTreeMap::new(),
+        labels: BTreeMap::from([
+            (PROJECT_LABEL.to_string(), "flotilla".to_string()),
+            (ROLE_LABEL.to_string(), name.to_string()),
+            (GENERATION_LABEL.to_string(), "1".to_string()),
+        ]),
         annotations: BTreeMap::new(),
         owner_references: vec![],
         finalizers: vec![],
@@ -38,15 +42,17 @@ fn convoy_meta(name: &str) -> InputMeta {
     }
 }
 
-fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
+fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
     ConvoySpec {
+        role: role.to_string(),
+        generation: 1,
         workflow_ref: workflow_ref.to_string(),
         dispatching_principal_ref: Default::default(),
         inputs: BTreeMap::new(),
         placement_policy: None,
         repositories: Vec::new(),
         r#ref: None,
-        project_ref: None,
+        project_ref: Some("flotilla".to_string()),
         adopted_checkout_refs: BTreeMap::new(),
         issues: Vec::new(),
         change_request: None,
@@ -94,7 +100,7 @@ async fn tui_shows_convoys_from_daemon() {
 
     // Create a Convoy resource — the Aggregator should broadcast a panel snapshot.
     let convoys = backend.using::<Convoy>("flotilla");
-    convoys.create(&convoy_meta("my-convoy"), &convoy_spec("my-workflow")).await.expect("create convoy");
+    convoys.create(&convoy_meta("my-convoy"), &convoy_spec("my-workflow", "my-convoy")).await.expect("create convoy");
 
     // Poll until App.convoys("flotilla") is non-empty or we time out.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -170,7 +176,7 @@ async fn generated_table_action_completes_work() {
 
     // Create a convoy and bootstrap its status so it has work ready for completion.
     let convoys = backend.using::<Convoy>("flotilla");
-    convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix")).await.expect("create convoy");
+    convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix", "fix-bug-123")).await.expect("create convoy");
 
     let mut work = BTreeMap::new();
     work.insert("implement".to_string(), WorkState {

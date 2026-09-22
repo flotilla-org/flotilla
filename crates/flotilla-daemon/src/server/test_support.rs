@@ -4,12 +4,12 @@ use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
-    HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
+    CommandCaller, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
 };
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, Stance, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use super::{build_remote_command_router, handle_client_session, spawn_peer_networking_runtime};
+use super::{build_remote_command_router, spawn_peer_networking_runtime};
 use crate::{
     peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
     server::PeerConnectionEvent,
@@ -73,7 +73,7 @@ pub async fn spawn_in_memory_request_topology_stateful(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_optional_surface(leader, follower, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None).await
 }
 
 /// Stateful in-memory topology whose client declares an explicit attention
@@ -83,13 +83,23 @@ pub async fn spawn_in_memory_request_topology_stateful_with_surface(
     follower: Arc<InProcessDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_optional_surface(leader, follower, Some(surface)).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None).await
 }
 
-async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
+pub async fn spawn_in_memory_request_topology_stateful_with_caller(
+    leader: Arc<InProcessDaemon>,
+    follower: Arc<InProcessDaemon>,
+    surface: SurfaceDeclaration,
+    caller: CommandCaller,
+) -> Result<InMemoryRequestTopology, String> {
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller)).await
+}
+
+async fn spawn_in_memory_request_topology_stateful_with_options(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
     surface: Option<SurfaceDeclaration>,
+    caller: Option<CommandCaller>,
 ) -> Result<InMemoryRequestTopology, String> {
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
@@ -154,7 +164,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
     let client_count_for_task = Arc::clone(&client_count);
     let client_notify_for_task = Arc::clone(&client_notify);
     let client_session_handle = tokio::spawn(async move {
-        handle_client_session(
+        super::handle_client_session_with_caller(
             server_session,
             leader_for_client,
             shutdown_request_tx,
@@ -167,6 +177,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
             peer_connected_tx,
             flotilla_core::agents::shared_in_memory_agent_state_store(),
             None,
+            caller,
         )
         .await;
     });

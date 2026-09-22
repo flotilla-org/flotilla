@@ -24,6 +24,9 @@ spec:
                 project_ref:
                   type: string
                   minLength: 1
+                driver_ref:
+                  type: string
+                  minLength: 1
                 workflow_ref:
                   type: string
                   minLength: 1
@@ -57,3 +60,26 @@ spec:
                   format: date-time
                 last_failure:
                   type: string
+                hold_reason:
+                  type: string
+                  enum: [backing_unverified, restart_limit]
+                observed_config_hash:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, value, reason, message, observed_at]
+                    properties:
+                      type:
+                        type: string
+                      value:
+                        type: string
+                        enum: ["true", "false", "unknown"]
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observed_at:
+                        type: string
+                        format: date-time

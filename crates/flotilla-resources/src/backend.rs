@@ -92,6 +92,13 @@ impl ResourceBackend {
         }
     }
 
+    pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        match self {
+            Self::Sqlite(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
+            Self::InMemory(_) | Self::Http(_) => Ok(false),
+        }
+    }
+
     async fn record_field_ownership_violation(&self, violation: FieldOwnershipViolation) -> Result<(), ResourceError> {
         match self {
             Self::InMemory(backend) => {
@@ -201,8 +208,12 @@ impl<T: Resource> ReplicaReadResolver<T> {
         if !self.suppress_self_origin {
             return self.list_sources().await;
         }
+        let listed = self.list_sources().await?;
+        self.suppress_shadowed_self_origin_sources(listed)
+    }
+
+    fn suppress_shadowed_self_origin_sources(&self, mut listed: ReadResourceList<T>) -> Result<ReadResourceList<T>, ResourceError> {
         let local_root = self.backend.local_root()?;
-        let mut listed = self.list_sources().await?;
         let local_names = listed
             .items
             .iter()
@@ -217,6 +228,41 @@ impl<T: Resource> ReplicaReadResolver<T> {
             )
         });
         Ok(listed)
+    }
+
+    pub async fn list_matching_labels(&self, required: &BTreeMap<String, String>) -> Result<ReadResourceList<T>, ResourceError> {
+        if required.is_empty() {
+            return self.list().await;
+        }
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.list_including_replicas_typed_matching_labels::<T>(&self.namespace, required).await;
+        }
+        let local = self.backend.using::<T>(&self.namespace).list_matching_labels(required).await?;
+        let mut items =
+            local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
+        let mut replicas = match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
+            ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
+            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
+        };
+        replicas.retain(|item| required.iter().all(|(key, expected)| item.object.metadata.labels.get(key) == Some(expected)));
+        items.extend(replicas);
+        if self.suppress_self_origin {
+            let local_root = self.backend.local_root()?;
+            let local_names = items
+                .iter()
+                .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+                .map(|item| item.object.metadata.name.clone())
+                .collect::<HashSet<_>>();
+            items.retain(|item| {
+                !matches!(
+                    &item.provenance,
+                    ResourceProvenance::Replica { origin_root, .. }
+                        if origin_root == &local_root && local_names.contains(&item.object.metadata.name)
+                )
+            });
+        }
+        Ok(ReadResourceList { items })
     }
 
     pub(crate) async fn list_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
@@ -245,6 +291,20 @@ impl<T: Resource> ReplicaReadResolver<T> {
             })
         });
         Ok(ReadResourceList { items })
+    }
+
+    /// Lists every local and replicated source object without collapsing
+    /// same-name replicas behind the local object.
+    ///
+    /// Consumers that combine host-local status need the individual sources;
+    /// ordinary resource reads should continue to use [`Self::list`].
+    pub async fn list_replica_sources(&self) -> Result<ReadResourceList<T>, ResourceError> {
+        let listed = self.list_sources().await?;
+        if self.suppress_self_origin {
+            self.suppress_shadowed_self_origin_sources(listed)
+        } else {
+            Ok(listed)
+        }
     }
 
     pub async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {

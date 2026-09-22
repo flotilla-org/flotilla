@@ -6,7 +6,7 @@ use ratatui::{layout::Rect, style::Style, Frame};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{ui_state::DragState, OpenView, OpenViews, TabId, TuiModel, UiState, ViewTarget},
+    app::{ui_state::DragState, NamespaceMap, OpenView, OpenViews, TabId, TuiModel, UiState, ViewTarget},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     theme::{BarKind, Theme},
     widgets::AppAction,
@@ -25,6 +25,11 @@ pub enum TabBarAction {
     /// No recognized tab was hit. The caller should continue with
     /// normal mouse handling.
     None,
+}
+
+pub struct TabData<'a> {
+    pub model: &'a TuiModel,
+    pub namespaces: &'a NamespaceMap,
 }
 
 /// Trailing close affordance shown on the active (closable) tab.
@@ -67,7 +72,14 @@ fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, leve
 /// The default (pre-override) label for an open View's tab at a
 /// qualification `level`: 0 is the short form; each higher level widens the
 /// label with more qualifying parameters (saturating per kind).
-fn default_address_label(address: &ViewAddress, model: &TuiModel, level: usize) -> String {
+fn convoy_role<'a>(namespaces: &'a NamespaceMap, namespace: &str, resource_name: &'a str) -> &'a str {
+    namespaces
+        .get(namespace)
+        .and_then(|model| model.convoys.values().find(|convoy| convoy.resource_name == resource_name))
+        .map_or(resource_name, |convoy| convoy.name.as_str())
+}
+
+fn default_address_label(address: &ViewAddress, model: &TuiModel, namespaces: &NamespaceMap, level: usize) -> String {
     match address {
         ViewAddress::Overview => " ⚓ flotilla ".to_string(),
         ViewAddress::Convoys { namespace, .. } if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
@@ -77,14 +89,17 @@ fn default_address_label(address: &ViewAddress, model: &TuiModel, level: usize) 
             _ => format!("⛵ {}/{} independents", scope.namespace, scope.name),
         },
         ViewAddress::Independents { scope: None } => " ⛵ independents ".to_string(),
-        ViewAddress::Convoy { namespace, name } => match level {
-            0 => format!("🚢 {name}"),
-            _ => format!("🚢 {namespace}/{name}"),
-        },
-        ViewAddress::Vessel { namespace, convoy, vessel } => match level {
-            0 => vessel.clone(),
-            1 => format!("{convoy}/{vessel}"),
-            _ => format!("{namespace}/{convoy}/{vessel}"),
+        ViewAddress::Convoy { namespace, name } => {
+            let role = convoy_role(namespaces, namespace, name);
+            match level {
+                0 => format!("🚢 {role}"),
+                _ => format!("🚢 {namespace}/{role}"),
+            }
+        }
+        ViewAddress::Vessel { namespace, convoy, vessel } => match (level, convoy_role(namespaces, namespace, convoy)) {
+            (0, _) => vessel.clone(),
+            (1, role) => format!("{role}/{vessel}"),
+            (_, role) => format!("{namespace}/{role}/{vessel}"),
         },
         ViewAddress::Project { namespace, name } => match level {
             0 => format!("⛰ {name}"),
@@ -103,9 +118,9 @@ fn default_address_label(address: &ViewAddress, model: &TuiModel, level: usize) 
     }
 }
 
-fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
+fn default_label(view: &OpenView, model: &TuiModel, namespaces: &NamespaceMap, level: usize) -> String {
     match &view.target {
-        ViewTarget::View(address) => default_address_label(address, model, level),
+        ViewTarget::View(address) => default_address_label(address, model, namespaces, level),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
     }
 }
@@ -120,19 +135,19 @@ fn max_label_level(view: &OpenView) -> usize {
 
 /// The visible label for an open View's tab: the user override when set,
 /// otherwise the kind default (short form).
-pub fn tab_label(view: &OpenView, model: &TuiModel) -> String {
-    tab_label_at_level(view, model, 0)
+pub fn tab_label(view: &OpenView, model: &TuiModel, namespaces: &NamespaceMap) -> String {
+    tab_label_at_level(view, model, namespaces, 0)
 }
 
-fn tab_label_at_level(view: &OpenView, model: &TuiModel, level: usize) -> String {
-    tab_label_parts_at_level(view, model, level).join(" › ")
+fn tab_label_at_level(view: &OpenView, model: &TuiModel, namespaces: &NamespaceMap, level: usize) -> String {
+    tab_label_parts_at_level(view, model, namespaces, level).join(" › ")
 }
 
-fn tab_label_parts_at_level(view: &OpenView, model: &TuiModel, level: usize) -> Vec<String> {
+fn tab_label_parts_at_level(view: &OpenView, model: &TuiModel, namespaces: &NamespaceMap, level: usize) -> Vec<String> {
     if !view.has_history() {
         return vec![match &view.label_override {
             Some(label) => label.clone(),
-            None => default_label(view, model, level),
+            None => default_label(view, model, namespaces, level),
         }];
     }
 
@@ -148,7 +163,7 @@ fn tab_label_parts_at_level(view: &OpenView, model: &TuiModel, level: usize) -> 
                 }
             }
             let address_level = if index == last { level } else { 0 };
-            default_address_label(address, model, address_level).trim().to_string()
+            default_address_label(address, model, namespaces, address_level).trim().to_string()
         })
         .collect::<Vec<_>>()
 }
@@ -163,9 +178,9 @@ struct TabLabel {
 /// qualifying parameters only where two tabs would otherwise read the same
 /// (vessel labels widen to convoy/vessel, then namespace/convoy/vessel).
 /// User overrides never widen.
-fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<TabLabel> {
+fn tab_labels(views: &OpenViews, model: &TuiModel, namespaces: &NamespaceMap) -> Vec<TabLabel> {
     let mut levels = vec![0usize; views.len()];
-    let mut labels: Vec<String> = views.iter().map(|view| tab_label(view, model)).collect();
+    let mut labels: Vec<String> = views.iter().map(|view| tab_label(view, model, namespaces)).collect();
     // Each pass widens every still-colliding label by one level; two passes
     // reach the deepest qualification any kind has.
     for _ in 0..2 {
@@ -182,7 +197,7 @@ fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<TabLabel> {
         }
         for (i, view) in views.iter().enumerate() {
             if view.label_override.is_none() {
-                labels[i] = tab_label_at_level(view, model, levels[i]);
+                labels[i] = tab_label_at_level(view, model, namespaces, levels[i]);
             }
         }
     }
@@ -190,7 +205,7 @@ fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<TabLabel> {
         .iter()
         .enumerate()
         .map(|(index, view)| {
-            let parts = tab_label_parts_at_level(view, model, levels[index]);
+            let parts = tab_label_parts_at_level(view, model, namespaces, levels[index]);
             TabLabel { text: parts.join(" › "), lineage: (parts.len() > 1).then_some(parts) }
         })
         .collect()
@@ -263,13 +278,13 @@ impl Tabs {
 
     /// Render the tab bar into `area`, populating click targets for later
     /// hit-testing.
-    pub fn render(&mut self, views: &OpenViews, model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, views: &OpenViews, data: TabData<'_>, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
         self.drag_active = self.drag.active;
 
         let mut items = Vec::new();
         let mut tab_ids = Vec::new();
         let active_idx = views.active_index();
-        let labels = tab_labels(views, model);
+        let labels = tab_labels(views, data.model, data.namespaces);
 
         for (i, view) in views.iter().enumerate() {
             let is_active = i == active_idx;
@@ -440,7 +455,10 @@ mod tests {
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use super::*;
-    use crate::app::test_support::stub_app_with_repos;
+    use crate::{
+        app::{test_support::stub_app_with_repos, NamespaceModel},
+        convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary},
+    };
 
     // ── Click hit-testing ──
 
@@ -484,7 +502,18 @@ mod tests {
             let mut tabs = Tabs::new();
             let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
 
-            terminal.draw(|frame| tabs.render(&app.views, &app.model, &mut app.ui, &theme, frame, frame.area())).expect("render tabs");
+            terminal
+                .draw(|frame| {
+                    tabs.render(
+                        &app.views,
+                        TabData { model: &app.model, namespaces: &app.namespaces },
+                        &mut app.ui,
+                        &theme,
+                        frame,
+                        frame.area(),
+                    )
+                })
+                .expect("render tabs");
 
             let active_area = *tabs.tab_areas().get(&TabId::View(active_idx)).expect("active tab area");
             let close_x = (active_area.x..active_area.right())
@@ -542,9 +571,34 @@ mod tests {
     fn label_override_wins_over_kind_default() {
         let app = stub_app_with_repos(1);
         let view = app.views.get(1).expect("convoys tab").clone();
-        assert_eq!(tab_label(&view, &app.model), " 🚢 convoys ");
+        assert_eq!(tab_label(&view, &app.model, &app.namespaces), " 🚢 convoys ");
         let renamed = OpenView { label_override: Some("mine".to_string()), ..view };
-        assert_eq!(tab_label(&renamed, &app.model), "mine");
+        assert_eq!(tab_label(&renamed, &app.model, &app.namespaces), "mine");
+    }
+
+    #[test]
+    fn resource_keyed_drill_addresses_keep_role_based_tab_labels() {
+        let mut app = stub_app_with_repos(0);
+        let convoy = ConvoySummary::builder()
+            .id(ConvoyId::new("dev", "convoy-123"))
+            .namespace("dev".to_string())
+            .resource_name("convoy-123".to_string())
+            .name("coder".to_string())
+            .workflow_ref("implement".to_string())
+            .phase(ConvoyPhase::Active)
+            .project_ref("first-project".to_string())
+            .vessels(Vec::new())
+            .initializing(false)
+            .build();
+        let mut namespace = NamespaceModel::default();
+        namespace.convoys.insert(convoy.id.clone(), convoy);
+        app.namespaces.insert("dev".to_string(), namespace);
+
+        let convoy_views = OpenViews::scoped("convoy/dev/convoy-123".parse().expect("convoy address"));
+        assert_eq!(tab_label(convoy_views.active(), &app.model, &app.namespaces), "🚢 coder");
+
+        let vessel_views = OpenViews::scoped("vessel/dev/convoy-123/implement".parse().expect("vessel address"));
+        assert_eq!(tab_label_at_level(vessel_views.active(), &app.model, &app.namespaces, 1), "coder/implement");
     }
 
     #[test]
@@ -553,10 +607,10 @@ mod tests {
         let mut views = OpenViews::scoped("project/flotilla/cleat".parse().expect("valid project"));
 
         assert!(views.drill("convoys/flotilla?project=flotilla%2Fcleat".parse().expect("valid scoped convoys")));
-        assert_eq!(tab_label(views.active(), &app.model), "⛰ cleat › 🚢 convoys");
+        assert_eq!(tab_label(views.active(), &app.model, &app.namespaces), "⛰ cleat › 🚢 convoys");
 
         assert!(views.back());
-        assert_eq!(tab_label(views.active(), &app.model), "⛰ cleat");
+        assert_eq!(tab_label(views.active(), &app.model, &app.namespaces), "⛰ cleat");
     }
 
     #[test]
@@ -569,7 +623,18 @@ mod tests {
         let theme = Theme::classic();
         let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("terminal");
 
-        terminal.draw(|frame| tabs.render(&app.views, &app.model, &mut app.ui, &theme, frame, frame.area())).expect("render tabs");
+        terminal
+            .draw(|frame| {
+                tabs.render(
+                    &app.views,
+                    TabData { model: &app.model, namespaces: &app.namespaces },
+                    &mut app.ui,
+                    &theme,
+                    frame,
+                    frame.area(),
+                )
+            })
+            .expect("render tabs");
 
         let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(rendered.contains("…"));
@@ -587,7 +652,7 @@ mod tests {
         views.open_or_focus("vessel/flotilla/bravo/leg-1".parse().expect("valid"));
         views.open_or_focus("vessel/flotilla/bravo/solo".parse().expect("valid"));
 
-        let labels = tab_labels(&views, &app.model);
+        let labels = tab_labels(&views, &app.model, &app.namespaces);
         assert_eq!(labels[1].text, "alpha/leg-1", "colliding label widens");
         assert_eq!(labels[2].text, "bravo/leg-1", "colliding label widens");
         assert_eq!(labels[3].text, "solo", "unique label stays short");
@@ -602,7 +667,7 @@ mod tests {
         views.open_or_focus("vessel/ns-one/alpha/leg-1".parse().expect("valid"));
         views.open_or_focus("vessel/ns-two/alpha/leg-1".parse().expect("valid"));
 
-        let labels = tab_labels(&views, &app.model);
+        let labels = tab_labels(&views, &app.model, &app.namespaces);
         assert_eq!(labels[1].text, "ns-one/alpha/leg-1");
         assert_eq!(labels[2].text, "ns-two/alpha/leg-1");
     }

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
 use flotilla_resources::{
@@ -163,6 +166,22 @@ pub async fn delete_observed_checkouts(
         checkouts.delete(&checkout.metadata.name).await?;
     }
 
+    Ok(())
+}
+
+pub async fn delete_observed_checkout_at_path(
+    backend: &ResourceBackend,
+    namespace: &str,
+    repository_key: &RepositoryKey,
+    path: &Path,
+) -> Result<(), ResourceError> {
+    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: String::new() };
+    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+    for checkout in checkouts.list_matching_labels(&scope.selector()).await?.items {
+        if matches!(&checkout.spec, ResourceCheckoutSpec::Observed(observed) if Path::new(&observed.path) == path) {
+            checkouts.delete(&checkout.metadata.name).await?;
+        }
+    }
     Ok(())
 }
 

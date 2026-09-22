@@ -12,16 +12,16 @@ use std::{
 use async_trait::async_trait;
 use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_controllers::reconcilers::{
-    checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
+    checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     apply_status_patch,
     controller::{Actuation, ControllerLoop, Reconciler},
-    repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone, CloneSpec,
-    CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec, InMemoryBackend, InputMeta,
-    IntegrationCondition, LifecycleAuthority, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, StatusPatch, VirtualClock,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone, ClonePhase,
+    CloneSpec, CloneStatus, CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec,
+    InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority, RepositoryKey, ResourceBackend, ResourceError, ResourceObject,
+    StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
 };
 use tokio::time::timeout;
 
@@ -72,6 +72,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
                 .build(),
             landed_evidence: None,
             change_request: None,
+            remote_refs: Default::default(),
         })
     }
 
@@ -124,10 +125,10 @@ async fn finalizer_error_maps_to_failed_checkout_status() {
 }
 
 #[tokio::test]
-async fn clone_failure_from_the_current_checkout_attempt_is_reported_as_a_historical_dependency() {
+async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_attempt() {
     let backend = ResourceBackend::InMemory(Default::default());
     let clones = backend.clone().using::<Clone>(NAMESPACE);
-    clones
+    let clone = clones
         .create(&meta("clone-a"), &CloneSpec {
             repo_ref: RepositoryKey(repo_key(REPO_URL)),
             url: REPO_URL.to_string(),
@@ -152,19 +153,75 @@ async fn clone_failure_from_the_current_checkout_attempt_is_reported_as_a_histor
         .await
         .expect("checkout should create");
     let failed_at = checkout.metadata.creation_timestamp + chrono::Duration::seconds(1);
-    apply_status_patch(&clones, "clone-a", &CloneStatusPatch::MarkFailed { message: "authentication failed".to_string(), failed_at })
+    clones
+        .update_status("clone-a", &clone.metadata.resource_version, &CloneStatus {
+            phase: ClonePhase::Failed,
+            default_branch: None,
+            message: Some("authentication failed".to_string()),
+            failed_at: Some(failed_at),
+            failure_policy: None,
+        })
         .await
-        .expect("clone failure should apply");
+        .expect("legacy clone failure should apply");
     let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
 
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("dependencies should load");
+    let deps = reconciler.prepare(&checkout).await.expect("dependencies should load");
     let outcome = reconciler.reconcile(&checkout, &deps, failed_at);
 
+    assert!(outcome.patch.is_none());
     assert!(matches!(
-        outcome.patch,
-        Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message })
-            if message == format!("clone clone-a is Failed since {}: authentication failed", failed_at.to_rfc3339())
+        outcome.actuations.as_slice(),
+        [flotilla_resources::controller::Actuation::RetryClone { name, failed_at: observed_failed_at }]
+            if name == "clone-a" && *observed_failed_at == failed_at
     ));
+    assert!(outcome.requeue_after.is_some());
+}
+
+#[tokio::test]
+async fn structural_clone_failure_is_terminal_for_its_checkout() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let clones = backend.clone().using::<Clone>(NAMESPACE);
+    clones
+        .create(&meta("clone-a"), &CloneSpec {
+            repo_ref: RepositoryKey(repo_key(REPO_URL)),
+            url: REPO_URL.to_string(),
+            env_ref: "host-direct-a".to_string(),
+            path: "/clones/repo".to_string(),
+        })
+        .await
+        .expect("clone should create");
+    apply_status_patch(&clones, "clone-a", &CloneStatusPatch::MarkFailed {
+        message: "clone name mismatch".to_string(),
+        failed_at: chrono::Utc::now(),
+    })
+    .await
+    .expect("structural clone failure should apply");
+    let checkout = backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &meta("checkout-a"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "fix/clone-failed-latch".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/repo.fix-clone-failed-latch".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout should create");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+
+    let prepared = reconciler.prepare(&checkout).await.expect("dependencies should load");
+    let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
+
+    assert!(
+        matches!(outcome.patch, Some(flotilla_resources::CheckoutStatusPatch::MarkFailed { message }) if message == "clone name mismatch")
+    );
+    assert!(outcome.actuations.is_empty());
+    assert!(outcome.requeue_after.is_none());
 }
 
 async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_path: &str) {
@@ -348,7 +405,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
     let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("fetch dependencies should succeed");
+    let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies should succeed");
 
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
 
@@ -394,6 +451,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
                 landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
                 landed_evidence: None,
                 change_request: None,
+                remote_refs: Default::default(),
             },
             message: None,
         })
@@ -403,17 +461,27 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
     let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
 
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("fetch dependencies should succeed");
+    let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies should succeed");
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
 
-    assert!(matches!(deps, CheckoutDeps::None));
+    assert!(matches!(deps, CheckoutPrepared::None));
     assert!(outcome.patch.is_none(), "fresh integration status should not be patched");
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0);
 }
 
 #[tokio::test]
-async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evidence() {
-    for phase in [ConvoyPhase::Landing, ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
+async fn checkout_authority_keeps_delete_evidence_fresh_for_replicated_convoy() {
+    for (phase, refreshes_delete_evidence) in [
+        (ConvoyPhase::Pending, true),
+        (ConvoyPhase::Active, true),
+        (ConvoyPhase::Interrupted, true),
+        (ConvoyPhase::Anchored, true),
+        (ConvoyPhase::Landing, true),
+        (ConvoyPhase::Landed, true),
+        (ConvoyPhase::Failed, true),
+        (ConvoyPhase::Cancelled, true),
+        (ConvoyPhase::Abandoned, false),
+    ] {
         let authority_root = NodeId::new("convoy-authority");
         let checkout_root = NodeId::new("checkout-authority");
         let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
@@ -432,7 +500,7 @@ async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evide
         convoys
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
             .await
-            .expect("mark convoy in evidence-consuming phase");
+            .expect("mark convoy in delete-gated phase");
         checkout_host
             .replica_writer::<Convoy>(authority_root, NAMESPACE)
             .replace(&convoys.list().await.expect("list authority convoys"), now)
@@ -480,10 +548,18 @@ async fn checkout_authority_observes_when_replicated_convoy_needs_terminal_evide
         let reconciler = CheckoutReconciler::with_clock(runtime.clone(), checkout_host.clone(), NAMESPACE, clock)
             .with_federated_convoys(&checkout_host, NAMESPACE);
 
-        let deps = reconciler.fetch_dependencies(&checkout).await.expect("resolve replicated evidence-consuming convoy");
+        let deps = reconciler.prepare(&checkout).await.expect("resolve replicated delete-gated convoy");
 
-        assert!(matches!(deps, CheckoutDeps::Integration { .. }), "{phase:?} must shorten the observation TTL to 30 seconds");
-        assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 1, "only the checkout authority should probe its checkout");
+        assert_eq!(
+            matches!(deps, CheckoutPrepared::Integration { .. }),
+            refreshes_delete_evidence,
+            "{phase:?} must use the cadence required by its delete gate"
+        );
+        assert_eq!(
+            *runtime.inspections.lock().expect("inspections lock"),
+            usize::from(refreshes_delete_evidence),
+            "only evidence-gated convoys should provoke an authority-side probe"
+        );
     }
 }
 
@@ -538,10 +614,10 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
     let reconciler =
         CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE).with_federated_convoys(&checkout_host, NAMESPACE);
 
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("resolve replicated Landed convoy");
+    let deps = reconciler.prepare(&checkout).await.expect("resolve replicated Landed convoy");
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
 
-    assert!(matches!(deps, CheckoutDeps::OwnerTerminal));
+    assert!(matches!(deps, CheckoutPrepared::OwnerTerminal));
     assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteCheckout { name }] if name == "remote-checkout"));
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "Landed is durable settlement evidence");
 }
@@ -609,8 +685,8 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
     let reconciler = CheckoutReconciler::with_clock(runtime.clone(), backend, NAMESPACE, Arc::new(VirtualClock::new(now)));
     let checkout = checkouts.get("checkout-a").await.expect("get checkout");
-    let deps = reconciler.fetch_dependencies(&checkout).await.expect("fetch dependencies");
+    let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies");
 
-    assert!(matches!(deps, CheckoutDeps::None));
+    assert!(matches!(deps, CheckoutPrepared::None));
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "forge failures should be rate-limited by the TTL");
 }

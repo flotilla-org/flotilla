@@ -78,7 +78,7 @@ impl CommandRunner for RecordingRunner {
 async fn run_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok(""));
     let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     env_runner.run("git", &["status"], Path::new("/workspace"), &label).await.ok();
 
@@ -94,7 +94,7 @@ async fn run_wraps_with_docker_exec() {
 async fn run_output_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok("output"));
     let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     env_runner.run_output("git", &["status"], Path::new("/workspace"), &label).await.ok();
 
@@ -917,7 +917,7 @@ async fn environment_runner_transforms_commands_for_container() {
     // Simulate the exact check a discovery factory might perform: "cleat --version"
     let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
     let env_runner = DockerEnvironmentRunner::new("my-container".to_string(), inner.clone());
-    let label = ChannelLabel::Noop;
+    let label = ChannelLabel::Default;
 
     // This is the kind of command a binary-check probe would issue
     env_runner.run("cleat", &["--version"], Path::new("/"), &label).await.ok();
@@ -1019,27 +1019,28 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     assert_eq!(outer_args[1], Arg::Quoted("feta".into()), "ssh target should be feta");
     assert_eq!(outer_args.len(), 3, "ssh args should have exactly 3 elements (ssh, target, nested)");
 
-    // Middle: docker exec -it container-abc cleat attach <sess-id>
-    // (DockerEnvironmentHopResolver extends the inner args directly, no extra NestedCommand)
+    // Middle: a client-side supervisor wrapping docker exec and the terminal attach.
     let docker_nested = match &outer_args[2] {
         Arg::NestedCommand(args) => args,
         other => panic!("expected NestedCommand for docker layer, got {other:?}"),
     };
-    assert_eq!(docker_nested[0], Arg::Literal("docker".into()), "middle command should be docker");
-    assert_eq!(docker_nested[1], Arg::Literal("exec".into()), "docker subcommand should be exec");
-    assert_eq!(docker_nested[2], Arg::Literal("-it".into()), "docker exec should have -it flag");
-    assert_eq!(docker_nested[3], Arg::Quoted("container-abc".into()), "docker exec target should be container-abc");
+    assert_eq!(docker_nested[0], Arg::Literal("sh".into()), "middle command should be the supervisor shell");
+    assert_eq!(docker_nested[1], Arg::Literal("-c".into()));
+    let Arg::Quoted(wrapper) = &docker_nested[2] else { panic!("expected quoted supervisor") };
+    assert!(wrapper.contains("trap cleanup EXIT HUP INT TERM"));
+    assert!(wrapper.contains("kill -KILL \"$pid\""));
+    assert_eq!(docker_nested[4], Arg::Quoted("container-abc".into()), "docker exec target should be container-abc");
 
     // Innermost args are flattened directly into the docker exec invocation
-    assert_eq!(docker_nested[4], Arg::Literal("cleat".into()), "innermost command should be cleat");
-    assert_eq!(docker_nested[5], Arg::Literal("attach".into()), "cleat subcommand should be attach");
-    assert_eq!(docker_nested[6], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
-    assert_eq!(docker_nested.len(), 7, "docker nested should have exactly 7 args");
+    assert_eq!(docker_nested[7], Arg::Literal("cleat".into()), "innermost command should be cleat");
+    assert_eq!(docker_nested[8], Arg::Literal("attach".into()), "cleat subcommand should be attach");
+    assert_eq!(docker_nested[9], Arg::Literal(att_id.to_string()), "cleat should attach to correct session");
+    assert_eq!(docker_nested.len(), 10, "docker nested should have exactly 10 args");
 
     // Verify flatten produces the expected structure
     let flat = flatten(outer_args, 0);
     assert!(flat.starts_with("ssh "), "flattened output should start with ssh: {flat}");
-    assert!(flat.contains("docker exec -it"), "should contain docker exec: {flat}");
+    assert!(flat.contains("docker exec"), "should contain supervised docker exec: {flat}");
     assert!(flat.contains("container-abc"), "should contain the quoted container target: {flat}");
     assert!(flat.contains("cleat attach"), "should contain cleat attach: {flat}");
     assert!(flat.contains(att_id.as_str()), "should contain session id: {flat}");

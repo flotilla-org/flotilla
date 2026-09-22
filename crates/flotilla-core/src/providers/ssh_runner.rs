@@ -81,7 +81,7 @@ impl SshCommandRunner {
 
     async fn writable_base(&self, purpose: &str) -> Result<PathBuf, String> {
         let base = self
-            .run("sh", &["-c", REMOTE_WRITABLE_BASE_SCRIPT, purpose], Path::new("/"), &ChannelLabel::Noop)
+            .run("sh", &["-c", REMOTE_WRITABLE_BASE_SCRIPT, purpose], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("find writable directory on SSH host: {error}"))?;
         let base = base.trim();
@@ -111,7 +111,7 @@ impl CommandRunner for SshCommandRunner {
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        self.execute(cmd, args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+        self.execute(cmd, args, Path::new("/"), &ChannelLabel::Default).await.is_ok()
     }
 
     async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
@@ -132,13 +132,13 @@ impl CommandRunner for SshCommandRunner {
         let mut owned_args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        self.runner.run("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop).await
+        self.runner.run("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Noop, content.as_bytes()).await.map(|_| ())
+        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
 }
 
@@ -247,7 +247,7 @@ mod tests {
         let inner = std::sync::Arc::new(RecordingRunner::with_run_result(Ok("stdout".into())));
         let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
 
-        let output = runner.run("git", &["status", "--short"], Path::new("/repo with space"), &ChannelLabel::Noop).await;
+        let output = runner.run("git", &["status", "--short"], Path::new("/repo with space"), &ChannelLabel::Default).await;
 
         assert_eq!(output.unwrap(), "stdout");
         let calls = inner.calls();
@@ -270,7 +270,7 @@ mod tests {
         })));
         let runner = SshCommandRunner::new("alice@feta.local", true, inner.clone());
 
-        let output = runner.run_output("git", &["status"], Path::new("/repo"), &ChannelLabel::Noop).await.unwrap();
+        let output = runner.run_output("git", &["status"], Path::new("/repo"), &ChannelLabel::Default).await.unwrap();
 
         assert_eq!(output.stdout, "out");
         assert_eq!(output.stderr, "err");
@@ -349,7 +349,7 @@ mod tests {
                     "flotilla-ssh-config-base",
                 ],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
             )
             .await
             .expect("fall through unusable XDG state home");
@@ -380,7 +380,7 @@ mod tests {
                 "test",
                 &["-d", &remote_base.to_string_lossy(), "-a", "-w", &remote_base.to_string_lossy()],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
             )
             .await
             .expect("selected remote base is writable");
@@ -430,7 +430,7 @@ mod tests {
         let inner = std::sync::Arc::new(RecordingRunner::with_run_result(Err("ssh failed".into())));
         let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
 
-        let error = runner.run("git", &["status"], Path::new("/repo"), &ChannelLabel::Noop).await;
+        let error = runner.run("git", &["status"], Path::new("/repo"), &ChannelLabel::Default).await;
 
         assert_eq!(error.unwrap_err(), "ssh failed");
     }

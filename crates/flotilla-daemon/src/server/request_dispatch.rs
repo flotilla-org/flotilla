@@ -5,7 +5,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
 };
-use flotilla_protocol::{AgentHookEvent, Command, CommandAction, Message, RepoSelector, Request, Response};
+use flotilla_protocol::{AgentHookEvent, Command, CommandAction, CommandCaller, Message, RepoSelector, Request, Response};
 use tracing::warn;
 
 use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
@@ -16,9 +16,11 @@ pub(super) struct RequestDispatcher<'a> {
     agent_state_store: &'a SharedAgentStateStore,
     session_id: uuid::Uuid,
     query_subscriptions: QuerySubscriptions,
+    caller: CommandCaller,
 }
 
 impl<'a> RequestDispatcher<'a> {
+    #[cfg(test)]
     pub(super) fn new(
         daemon: &'a Arc<InProcessDaemon>,
         remote_command_router: &'a RemoteCommandRouter,
@@ -26,7 +28,22 @@ impl<'a> RequestDispatcher<'a> {
         session_id: uuid::Uuid,
         query_subscriptions: QuerySubscriptions,
     ) -> Self {
-        Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions }
+        Self::new_with_caller(daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, CommandCaller {
+            principal_ref: flotilla_protocol::PrincipalRef::default(),
+            process: None,
+            crew: None,
+        })
+    }
+
+    pub(super) fn new_with_caller(
+        daemon: &'a Arc<InProcessDaemon>,
+        remote_command_router: &'a RemoteCommandRouter,
+        agent_state_store: &'a SharedAgentStateStore,
+        session_id: uuid::Uuid,
+        query_subscriptions: QuerySubscriptions,
+        caller: CommandCaller,
+    ) -> Self {
+        Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, caller }
     }
 
     pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
@@ -49,7 +66,9 @@ impl<'a> RequestDispatcher<'a> {
                     // Non-query commands: existing dispatch path
                     match self.daemon.principal_for_surface(self.session_id) {
                         Ok(principal_ref) => {
-                            match self.remote_command_router.dispatch_execute_for_principal(command, principal_ref).await {
+                            let mut caller = self.caller.clone();
+                            caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
+                            match self.remote_command_router.dispatch_execute_for_caller(command, Some(caller)).await {
                                 Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                                 Err(e) => Message::error_response(id, e),
                             }

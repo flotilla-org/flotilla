@@ -33,6 +33,7 @@ reqwest = { workspace = true, features = ["json"] }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 futures = "0.3"
 visibility = "0.1.1"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -41,7 +42,6 @@ libc = "0.2"
 flotilla-test-support = { path = "../flotilla-test-support" }
 indexmap = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
-tempfile = "3"
 flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }

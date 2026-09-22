@@ -60,7 +60,10 @@ async fn shared_snapshots_are_collected_only_after_the_last_convoy_releases_them
     let result = collector.collect(Some("second")).await.expect("collect final references");
     assert_eq!(result.workflows_deleted, 1);
     assert_eq!(result.placements_deleted, 1);
-    assert!(matches!(backend.clone().using::<WorkflowTemplate>("flotilla").get(workflow_name).await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(
+        backend.clone().definitions::<WorkflowTemplate>("flotilla").get(workflow_name).await,
+        Err(ResourceError::NotFound { .. })
+    ));
     assert!(matches!(backend.using::<PlacementPolicy>("flotilla").get(placement_name).await, Err(ResourceError::NotFound { .. })));
 }
 

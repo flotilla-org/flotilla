@@ -12,6 +12,24 @@ use crate::{
 };
 
 macro_rules! define_resource {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr, validate_spec_update = $validator:path) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+
+            fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), $crate::ResourceError> {
+                $validator(current, requested)
+            }
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, validate_spec_update = $validator:path) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -138,6 +156,8 @@ pub struct FieldMergeMetadata {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub seen: BTreeMap<NodeId, u64>,
     pub written_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<crate::WriterIdentity>,
 }
 
 /// One causally-maximal value shown when a definitions field conflicts.

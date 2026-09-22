@@ -57,7 +57,7 @@ impl DockerEnvironmentRunner {
                     purpose,
                 ],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
             )
             .await
             .map_err(|error| format!("find writable directory in container: {error}"))?;
@@ -91,7 +91,7 @@ impl CommandRunner for DockerEnvironmentRunner {
 
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
         let docker_args = ["exec", &self.container_name, "which", cmd];
-        self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+        self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Default).await.is_ok()
     }
 
     async fn writable_scratch_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
@@ -99,7 +99,7 @@ impl CommandRunner for DockerEnvironmentRunner {
     }
 
     async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
-        self.run("sh", &["-c", "test -d /tmp && test -w /tmp", "flotilla-config-base"], Path::new("/"), &ChannelLabel::Noop)
+        self.run("sh", &["-c", "test -d /tmp && test -w /tmp", "flotilla-config-base"], Path::new("/"), &ChannelLabel::Default)
             .await
             .map_err(|error| format!("find writable config directory in container: {error}"))?;
         Ok(PathBuf::from(CONTAINED_WRITABLE_CONFIG_BASE))
@@ -115,13 +115,13 @@ impl CommandRunner for DockerEnvironmentRunner {
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        self.inner.run("docker", &arg_refs, Path::new("/"), &ChannelLabel::Noop).await
+        self.inner.run("docker", &arg_refs, Path::new("/"), &ChannelLabel::Default).await
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
         let args = ["exec", "-i", &self.container_name, "sh", "-lc", script.as_str()];
-        self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Noop, content.as_bytes()).await.map(|_| ())
+        self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
 }
 
@@ -170,7 +170,7 @@ mod tests {
         let runner = DockerEnvironmentRunner::new("my-container".into(), Arc::new(InvalidWorkdirHangingRunner));
 
         let output =
-            tokio::time::timeout(Duration::from_millis(100), runner.run("git", &["--version"], Path::new("."), &ChannelLabel::Noop))
+            tokio::time::timeout(Duration::from_millis(100), runner.run("git", &["--version"], Path::new("."), &ChannelLabel::Default))
                 .await
                 .expect("relative-cwd docker exec should be reaped")
                 .expect("version probe should succeed");
@@ -247,7 +247,7 @@ mod tests {
                     "infinity",
                 ],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
             )
             .await
             .expect("start non-root test container");
@@ -276,14 +276,19 @@ mod tests {
                     &agent_environment_arg,
                 ],
                 Path::new("/"),
-                &ChannelLabel::Noop,
+                &ChannelLabel::Default,
             )
             .await
             .expect("resolve exported delivery paths");
 
         assert_eq!(observed, format!("{}\n{}", git_config.display(), agent_environment.display()));
         runner
-            .run("sh", &["-c", "test -w \"$1\"", "flotilla-verify-codex-home", CONTAINED_CODEX_HOME], Path::new("/"), &ChannelLabel::Noop)
+            .run(
+                "sh",
+                &["-c", "test -w \"$1\"", "flotilla-verify-codex-home", CONTAINED_CODEX_HOME],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
             .await
             .expect("Codex home mount is writable as non-root user");
         assert!(!git_config.starts_with("/run/flotilla"));

@@ -131,11 +131,11 @@ async fn validate_checkout_target_with_prefix(
 
     let mut local_args = prefix.to_vec();
     local_args.extend(["show-ref", "--verify", "--quiet", local_ref.as_str()]);
-    let local_exists = runner.run("git", &local_args, cwd, &ChannelLabel::Noop).await.is_ok();
+    let local_exists = runner.run("git", &local_args, cwd, &ChannelLabel::Default).await.is_ok();
 
     let mut remote_args = prefix.to_vec();
     remote_args.extend(["show-ref", "--verify", "--quiet", remote_ref.as_str()]);
-    let remote_exists = runner.run("git", &remote_args, cwd, &ChannelLabel::Noop).await.is_ok();
+    let remote_exists = runner.run("git", &remote_args, cwd, &ChannelLabel::Default).await.is_ok();
 
     match intent {
         CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),

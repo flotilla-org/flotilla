@@ -36,7 +36,7 @@ impl CloneCheckoutManager {
         let ref_dir = self.ref_dir_str()?;
         let url = self
             .runner
-            .run("git", &["--git-dir", ref_dir, "remote", "get-url", "origin"], self.reference_dir.as_path(), &ChannelLabel::Noop)
+            .run("git", &["--git-dir", ref_dir, "remote", "get-url", "origin"], self.reference_dir.as_path(), &ChannelLabel::Default)
             .await?;
         Ok(url.trim().to_string())
     }
@@ -45,8 +45,10 @@ impl CloneCheckoutManager {
     /// does not depend on the remote advertising a usable symbolic HEAD.
     async fn reference_head_commit(&self) -> Result<String, String> {
         let ref_dir = self.ref_dir_str()?;
-        let commit =
-            self.runner.run("git", &["--git-dir", ref_dir, "rev-parse", "HEAD"], self.reference_dir.as_path(), &ChannelLabel::Noop).await?;
+        let commit = self
+            .runner
+            .run("git", &["--git-dir", ref_dir, "rev-parse", "HEAD"], self.reference_dir.as_path(), &ChannelLabel::Default)
+            .await?;
         Ok(commit.trim().to_string())
     }
 
@@ -73,7 +75,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         // List directories under /workspace/
         let output = self
             .runner
-            .run("ls", &["-1", WORKSPACE_ROOT], std::path::Path::new(WORKSPACE_ROOT), &ChannelLabel::Noop)
+            .run("ls", &["-1", WORKSPACE_ROOT], std::path::Path::new(WORKSPACE_ROOT), &ChannelLabel::Default)
             .await
             .unwrap_or_default();
 
@@ -88,7 +90,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
 
             // Check if it's a git repo
             let is_git =
-                self.runner.run("git", &["-C", &dir, "rev-parse", "--is-inside-work-tree"], dir_path, &ChannelLabel::Noop).await.is_ok();
+                self.runner.run("git", &["-C", &dir, "rev-parse", "--is-inside-work-tree"], dir_path, &ChannelLabel::Default).await.is_ok();
 
             if !is_git {
                 continue;
@@ -97,7 +99,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
             // Get the branch name
             let branch = self
                 .runner
-                .run("git", &["-C", &dir, "rev-parse", "--abbrev-ref", "HEAD"], dir_path, &ChannelLabel::Noop)
+                .run("git", &["-C", &dir, "rev-parse", "--abbrev-ref", "HEAD"], dir_path, &ChannelLabel::Default)
                 .await
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.to_string());
@@ -144,7 +146,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                     "git",
                     &["clone", "--reference", ref_dir, "--no-checkout", &remote_url, &checkout_dir],
                     std::path::Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
 
@@ -153,7 +155,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                     "git",
                     &["-C", &checkout_dir, "checkout", "-b", branch, &start_point],
                     std::path::Path::new(&checkout_dir),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         } else {
@@ -163,7 +165,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                     "git",
                     &["clone", "--reference", ref_dir, "-b", branch, &remote_url, &checkout_dir],
                     std::path::Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         }
@@ -187,7 +189,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         let checkout_dir = format!("{WORKSPACE_ROOT}/{sanitized}");
         info!(%branch, %checkout_dir, "clone: removing checkout");
 
-        self.runner.run("rm", &["-rf", &checkout_dir], std::path::Path::new("/"), &ChannelLabel::Noop).await?;
+        self.runner.run("rm", &["-rf", &checkout_dir], std::path::Path::new("/"), &ChannelLabel::Default).await?;
 
         Ok(())
     }
@@ -433,7 +435,7 @@ mod tests {
         assert!(checkout_dir.join("README.md").exists(), "fresh branch checkout should populate the working tree");
 
         let status =
-            runner.run("git", &["status", "--short"], &checkout_dir, &ChannelLabel::Noop).await.expect("git status should succeed");
+            runner.run("git", &["status", "--short"], &checkout_dir, &ChannelLabel::Default).await.expect("git status should succeed");
         assert!(status.trim().is_empty(), "fresh branch checkout should be clean, got: {status:?}");
     }
 

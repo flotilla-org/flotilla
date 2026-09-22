@@ -180,6 +180,15 @@ def topology():
             )
             assert result.returncode == 0, f"git init failed on {node}: {result.stderr}"
 
+        result = docker_exec(
+            "node-b",
+            "git init /home/flotilla/federated-repo && "
+            "git -C /home/flotilla/federated-repo commit --allow-empty -m init && "
+            "git -C /home/flotilla/federated-repo remote add origin "
+            "https://github.com/flotilla-org/compose-replica-source.git",
+        )
+        assert result.returncode == 0, f"federated repo init failed on node-b: {result.stderr}"
+
         # Write flotilla config: node-a is leader with node-b as peer
         result = docker_exec(
             "node-a",
@@ -240,6 +249,9 @@ def topology():
         for node in ("node-a", "node-b"):
             result = docker_exec(node, "flotilla repo add /home/flotilla/repo")
             assert result.returncode == 0, f"repo add failed on {node}: {result.stderr}"
+
+        result = docker_exec("node-b", "flotilla repo add /home/flotilla/federated-repo")
+        assert result.returncode == 0, f"federated repo add failed on node-b: {result.stderr}"
 
         # Wait for peering: node-a sees node-b as Connected
         def peers_connected():

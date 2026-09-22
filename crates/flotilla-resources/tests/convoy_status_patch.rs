@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
-use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
-    controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyProvisioningState, ConvoyStatus, ConvoyStatusPatch,
+    CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, PendingBrief, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority,
+    WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 fn ts(seconds: i64) -> chrono::DateTime<Utc> {
@@ -78,17 +78,114 @@ fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
     CrewWorkState::builder().phase(phase).started_at(ts(10)).build()
 }
 
+fn queue_pending_brief(status: &mut ConvoyStatus, role: &str) {
+    ConvoyStatusPatch::SetPendingBrief {
+        pending_brief: PendingBrief::builder()
+            .vessel("implement".to_string())
+            .role(role.to_string())
+            .content("address review".to_string())
+            .queued_at(ts(15))
+            .build(),
+    }
+    .apply(status);
+}
+
+#[test]
+fn crew_failure_clears_its_pending_brief() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        ..ConvoyStatus::default()
+    };
+    queue_pending_brief(&mut status, "coder");
+
+    external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "session failed".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Failed);
+    assert!(status.pending_brief().is_none());
+}
+
+#[test]
+fn crew_handoff_clears_the_senders_pending_brief() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), crew_work(CrewWorkPhase::Working)),
+                ("reviewer".to_string(), crew_work(CrewWorkPhase::Done)),
+            ]),
+        )]),
+        ..ConvoyStatus::default()
+    };
+    queue_pending_brief(&mut status, "coder");
+
+    external_patches::handoff_crew_work(
+        "implement".to_string(),
+        "coder".to_string(),
+        "reviewer".to_string(),
+        ts(20),
+        "ready for review".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::HandedBack);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
+    assert!(status.pending_brief().is_none());
+}
+
+#[test]
+fn kickoff_handoff_preserves_the_working_senders_pending_brief() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), crew_work(CrewWorkPhase::Working)),
+                ("reviewer".to_string(), crew_work(CrewWorkPhase::Pending)),
+            ]),
+        )]),
+        ..ConvoyStatus::default()
+    };
+    queue_pending_brief(&mut status, "coder");
+
+    external_patches::handoff_crew_work(
+        "implement".to_string(),
+        "coder".to_string(),
+        "reviewer".to_string(),
+        ts(20),
+        "please review".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.pending_brief().map(|brief| brief.role.as_str()), Some("coder"));
+}
+
+#[test]
+fn terminal_convoy_phase_clears_pending_brief() {
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
+    queue_pending_brief(&mut status, "coder");
+
+    controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(20))).apply(&mut status);
+
+    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert!(status.pending_brief().is_none());
+}
+
 #[test]
 fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     let first = PlacementDecision {
         policy_name: "host-direct-kiwi".to_string(),
-        target_host: PlacementTargetHost { reference: "kiwi-id".to_string(), display_name: "kiwi".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("kiwi-id"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
     let second = PlacementDecision {
         policy_name: "host-direct-feta".to_string(),
-        target_host: PlacementTargetHost { reference: "feta-id".to_string(), display_name: "feta".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-id"), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
@@ -106,6 +203,7 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
 #[test]
 fn abandon_convoy_stamps_convoy_and_open_work() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -123,6 +221,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "superseded by operator".to_string())
@@ -130,7 +229,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
 
     assert_eq!(status.phase, ConvoyPhase::Abandoned);
     assert_eq!(status.finished_at, Some(ts(50)));
-    assert_eq!(status.message.as_deref(), Some("abandoned by HumanOverride: superseded by operator"));
+    assert_eq!(status.message.as_deref(), Some("abandoned by human override: superseded by operator"));
     assert_eq!(status.work["implement"].phase, WorkPhase::Abandoned);
     assert_eq!(status.work["implement"].completion_authority, WorkCompletionAuthority::HumanOverride);
     assert_eq!(status.work["implement"].message.as_deref(), Some("superseded by operator"));
@@ -139,8 +238,22 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
 }
 
 #[test]
+fn abandoned_status_is_immutable_against_stale_and_duplicate_patches() {
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
+    external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "first reason".to_string()).apply(&mut status);
+    let abandoned = status.clone();
+
+    controller_patches::roll_up_phase(ConvoyPhase::Active, Some(ts(60)), None).apply(&mut status);
+    external_patches::mark_convoy_abandoned(ts(70), WorkCompletionAuthority::HumanOverride, "replacement reason".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status, abandoned);
+}
+
+#[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -169,6 +282,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::mark_crew_completed(
@@ -177,15 +291,24 @@ fn crew_completion_updates_only_the_calling_agent() {
         ts(20),
         Some("ready for review".to_string()),
         Some("changes-pushed".to_string()),
+        Some("https://example.test/pull/1#comment-2".to_string()),
     )
     .apply(&mut status);
-    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(30), Some("still ready".to_string()), None)
-        .apply(&mut status);
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(30),
+        Some("still ready".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, Some(ts(20)));
     assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("still ready"));
     assert_eq!(status.crew_work["implement"]["coder"].disposition.as_deref(), Some("changes-pushed"));
+    assert_eq!(status.crew_work["implement"]["coder"].decision_ledger_ref.as_deref(), Some("https://example.test/pull/1#comment-2"));
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
     assert_eq!(status.work["implement"].phase, WorkPhase::Running);
     assert_eq!(status.phase, ConvoyPhase::Active);
@@ -194,6 +317,7 @@ fn crew_completion_updates_only_the_calling_agent() {
 #[test]
 fn final_crew_completion_claim_enters_landing_idempotently() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -216,10 +340,11 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     let patch =
-        external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready".to_string()), None);
+        external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready".to_string()), None, None);
     patch.apply(&mut status);
     patch.apply(&mut status);
 
@@ -230,6 +355,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
 #[test]
 fn crew_failure_records_terminal_state_and_message() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -244,10 +370,18 @@ fn crew_failure_records_terminal_state_and_message() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
-    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(15), Some("initially done".to_string()), None)
-        .apply(&mut status);
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(15),
+        Some("initially done".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "blocked by missing credentials".to_string())
         .apply(&mut status);
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(30), "still blocked".to_string())
@@ -263,6 +397,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     let mut coder = crew_work(CrewWorkPhase::Done);
     coder.finished_at = Some(ts(15));
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Landed,
         workflow_snapshot: Some(sample_snapshot()),
@@ -288,6 +423,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::handoff_crew_work(
@@ -313,6 +449,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     coder.finished_at = Some(ts(15));
     coder.message = Some("ready".to_string());
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Landed,
         workflow_snapshot: Some(sample_snapshot()),
@@ -335,6 +472,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string())
@@ -351,6 +489,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
     let mut pending_coder = crew_work(CrewWorkPhase::Pending);
     pending_coder.started_at = None;
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -376,6 +515,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     provisioning_patches::work_running("implement".to_string(), ts(12), BTreeSet::from(["coder".to_string()])).apply(&mut status);
@@ -389,6 +529,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
 #[test]
 fn running_vessel_work_leaves_latent_agents_pending() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -418,6 +559,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     // The vessel launches only the first agent; `reviewer` has no session until
@@ -458,11 +600,13 @@ fn bootstrap_sets_snapshot_and_initial_work_map() {
         &BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])
     );
     assert_eq!(status.work, work);
+    assert_eq!(status.provisioning, Some(ConvoyProvisioningState::NotStarted));
 }
 
 #[test]
 fn advance_work_to_ready_updates_only_selected_vessels() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
@@ -488,6 +632,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::advance_work_to_ready(BTreeMap::from([("implement".to_string(), ts(10))]));
@@ -497,11 +642,23 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
     assert_eq!(status.work["implement"].ready_at, Some(ts(10)));
     assert_eq!(status.work["review"].phase, WorkPhase::Complete);
     assert_eq!(status.message.as_deref(), Some("keep"));
+    assert_eq!(status.provisioning, Some(ConvoyProvisioningState::Started { started_at: ts(10) }));
+}
+
+#[test]
+fn init_failure_records_that_provisioning_never_started() {
+    let mut status = ConvoyStatus::default();
+
+    ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, message: "invalid workflow".to_string(), finished_at: ts(9) }
+        .apply(&mut status);
+
+    assert_eq!(status.provisioning, Some(ConvoyProvisioningState::NotStarted));
 }
 
 #[test]
 fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -535,6 +692,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::fail_convoy(BTreeMap::from([("review".to_string(), ts(30))]), ts(30), Some("work failed".to_string()));
@@ -560,6 +718,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         placement: None,
     };
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
@@ -574,6 +733,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     let patch = controller_patches::roll_up_phase(ConvoyPhase::Landed, None, Some(ts(40)));
@@ -588,6 +748,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
 #[test]
 fn forced_work_completion_claim_enters_landing() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -610,6 +771,7 @@ fn forced_work_completion_claim_enters_landing() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     let patch =
@@ -626,6 +788,7 @@ fn forced_work_completion_claim_enters_landing() {
 #[test]
 fn forced_work_completion_preserves_agent_owned_state() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -654,6 +817,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
@@ -668,6 +832,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
 #[test]
 fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
+        provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
@@ -682,6 +847,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         target_mismatches: Vec::new(),
         turn_deliveries: BTreeMap::new(),
         attention: None,
+        lifecycle_mutations: Vec::new(),
     };
 
     ConvoyStatusPatch::AdvanceWorkToReady { ready: BTreeMap::from([("implement".to_string(), ts(10))]) }.apply(&mut status);

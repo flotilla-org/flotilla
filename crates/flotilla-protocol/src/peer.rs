@@ -44,6 +44,9 @@ pub enum RoutedPeerMessage {
         target_node_id: NodeId,
         remaining_hops: u8,
         command: Box<crate::Command>,
+        /// Caller attributed by the originating socket connection.
+        #[serde(default)]
+        caller: Option<Box<crate::CommandCaller>>,
         /// Session ID of the originating client, for cursor ownership on the target.
         #[serde(default)]
         session_id: Option<uuid::Uuid>,
@@ -219,12 +222,17 @@ mod tests {
             requester_node_id: NodeId::new("workstation"),
             target_node_id: NodeId::new("feta"),
             remaining_hops: 7,
-            command: Box::new(Command {
-                node_id: Some(NodeId::new("feta")),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
-            }),
+            command: Box::new(
+                Command::builder()
+                    .action(CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) })
+                    .node_id(NodeId::new("feta"))
+                    .build(),
+            ),
+            caller: Some(Box::new(crate::CommandCaller {
+                principal_ref: crate::PrincipalRef { namespace: "flotilla".into(), name: "governor agent".into() },
+                process: None,
+                crew: None,
+            })),
             session_id: None,
         };
         let json_value = serde_json::to_value(&msg).expect("serialize");
@@ -233,11 +241,12 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, .. } => {
+            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, caller, .. } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(requester_node_id, NodeId::new("workstation"));
                 assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 7);
+                assert_eq!(caller.expect("caller").principal_ref.name, "governor agent");
             }
             other => panic!("expected CommandRequest, got {:?}", other),
         }

@@ -33,7 +33,7 @@ impl CloneProvisioner for GitCloneProvisioner {
     async fn clone_repo(&self, repo_url: &str, target_path: &ExecutionEnvironmentPath) -> Result<(), String> {
         let target =
             target_path.as_path().to_str().ok_or_else(|| format!("target path is not valid UTF-8: {}", target_path.as_path().display()))?;
-        self.runner.run("git", &["clone", repo_url, target], Path::new("/"), &ChannelLabel::Noop).await?;
+        self.runner.run("git", &["clone", repo_url, target], Path::new("/"), &ChannelLabel::Default).await?;
         Ok(())
     }
 
@@ -41,13 +41,13 @@ impl CloneProvisioner for GitCloneProvisioner {
         let cwd = target_path.as_path();
         let default_branch = match self
             .runner
-            .run("git", &["-C", &cwd.to_string_lossy(), "symbolic-ref", "refs/remotes/origin/HEAD", "--short"], cwd, &ChannelLabel::Noop)
+            .run("git", &["-C", &cwd.to_string_lossy(), "symbolic-ref", "refs/remotes/origin/HEAD", "--short"], cwd, &ChannelLabel::Default)
             .await
         {
             Ok(head) => Some(head.trim().strip_prefix("origin/").unwrap_or(head.trim()).to_string()),
             Err(_) => match self
                 .runner
-                .run("git", &["-C", &cwd.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"], cwd, &ChannelLabel::Noop)
+                .run("git", &["-C", &cwd.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"], cwd, &ChannelLabel::Default)
                 .await
             {
                 Ok(branch) => {

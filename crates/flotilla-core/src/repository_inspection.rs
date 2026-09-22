@@ -28,6 +28,9 @@ pub struct RepositoryInspection {
     pub spec: RepositorySpec,
     pub checkout: LocalCheckoutInspection,
     pub transport_url: Option<String>,
+    /// The checkout path was associated with a different Repository whose
+    /// history could not be connected to this inspection.
+    pub replaces_prior_repository: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,12 @@ pub struct OperationalEntriesInspection {
     pub repository: RepositoryInspection,
     pub commit: String,
     pub files: Vec<OperationalEntryFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryContinuity {
+    Continuous { evidence: String },
+    Unproven { evidence: String },
 }
 
 impl RepositoryInspection {
@@ -65,6 +74,10 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(remote)
+    }
+
+    async fn verify_continuity(&self, _path: &Path, _previous: &RepositorySpec) -> RepositoryContinuity {
+        RepositoryContinuity::Unproven { evidence: "repository inspector cannot compare Git history".to_string() }
     }
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
@@ -113,19 +126,36 @@ impl GitRepositoryInspector {
 
     async fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
         self.runner
-            .run("git", args, cwd, &ChannelLabel::Noop)
+            .run("git", args, cwd, &ChannelLabel::Default)
             .await
             .map(|output| output.trim().to_string())
             .map_err(|error| format!("git {} in {}: {error}", args.join(" "), cwd.display()))
     }
 
-    async fn selected_remote(&self, cwd: &Path, branch: &str, requested: Option<&str>) -> Result<Option<String>, String> {
+    async fn configured_remote_url(&self, cwd: &Path, remote: &str) -> Result<String, String> {
+        let key = format!("remote.{remote}.url");
+        self.git(cwd, &["config", "--get-all", &key])
+            .await?
+            .lines()
+            .map(str::trim)
+            .find(|url| !url.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("remote `{remote}` has no configured URL"))
+    }
+
+    async fn remote_urls(&self, cwd: &Path, remote: &str) -> Result<(String, String), String> {
+        let configured = self.configured_remote_url(cwd, remote).await?;
+        let effective = self.git(cwd, &["remote", "get-url", remote]).await?;
+        Ok((configured, effective))
+    }
+
+    async fn selected_remote(&self, cwd: &Path, branch: &str, requested: Option<&str>) -> Result<Option<(String, String)>, String> {
         if let Some(requested) = requested {
             if looks_like_remote_url(requested) {
-                return Ok(Some(requested.to_string()));
+                return Ok(Some((requested.to_string(), requested.to_string())));
             }
             return self
-                .git(cwd, &["remote", "get-url", requested])
+                .remote_urls(cwd, requested)
                 .await
                 .map(Some)
                 .map_err(|_| format!("remote `{requested}` is not configured for {}", cwd.display()));
@@ -141,20 +171,22 @@ impl GitRepositoryInspector {
             .collect::<Vec<_>>();
         match remotes.as_slice() {
             [] => Ok(None),
-            [remote] => self.git(cwd, &["remote", "get-url", remote]).await.map(Some),
+            [remote] => self.remote_urls(cwd, remote).await.map(Some),
             _ => {
                 let branch_key = format!("branch.{branch}.remote");
                 let tracked = self.git(cwd, &["config", "--get", &branch_key]).await.ok();
                 match tracked.filter(|tracked| remotes.contains(tracked)) {
-                    Some(remote) => self.git(cwd, &["remote", "get-url", &remote]).await.map(Some),
+                    Some(remote) => self.remote_urls(cwd, &remote).await.map(Some),
                     None => {
                         let mut identities = std::collections::BTreeMap::new();
                         for remote in &remotes {
-                            let url = self.git(cwd, &["remote", "get-url", remote]).await?;
-                            identities.insert(self.canonical_remote(cwd, &url).await?, url);
+                            let url = self.configured_remote_url(cwd, remote).await?;
+                            identities.insert(self.canonical_remote(cwd, &url).await?, (remote.clone(), url));
                         }
                         if identities.len() == 1 {
-                            Ok(identities.into_values().next())
+                            let (remote, configured) = identities.into_values().next().expect("one identity has one remote");
+                            let effective = self.git(cwd, &["remote", "get-url", &remote]).await?;
+                            Ok(Some((configured, effective)))
                         } else {
                             Err(format!(
                                 "repository {} has multiple distinct remotes ({}); select one with --remote",
@@ -174,7 +206,7 @@ impl GitRepositoryInspector {
         };
         let ssh_config = self
             .runner
-            .run("ssh", &["-G", host], cwd, &ChannelLabel::Noop)
+            .run("ssh", &["-G", host], cwd, &ChannelLabel::Default)
             .await
             .map_err(|_| format!("unrecognised remote host alias `{host}`"))?;
         let resolved = ssh_config
@@ -213,7 +245,12 @@ impl RepositoryInspector for GitRepositoryInspector {
         let git_ref = if branch == "HEAD" { self.git(&top_level, &["rev-parse", "HEAD"]).await? } else { branch.clone() };
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
         let (spec, transport_url) = match selected_remote {
-            Some(remote) => (RepositorySpec::remote(self.canonical_remote(&top_level, &remote).await?)?, Some(remote)),
+            Some((configured, effective)) => {
+                let identity_remote = self.canonical_remote(&top_level, &configured).await?;
+                let live_remote =
+                    if configured == effective { identity_remote.clone() } else { self.canonical_remote(&top_level, &effective).await? };
+                (RepositorySpec::remote(identity_remote)?.update_remotes(live_remote)?, Some(effective))
+            }
             None => {
                 let common_dir = PathBuf::from(self.git(&top_level, &["rev-parse", "--git-common-dir"]).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
@@ -231,6 +268,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
             },
             transport_url,
+            replaces_prior_repository: false,
         })
     }
 
@@ -256,7 +294,12 @@ impl RepositoryInspector for GitRepositoryInspector {
         // repository.
         let grep = self
             .runner
-            .run_output("git", &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"], &repository.checkout.path, &ChannelLabel::Noop)
+            .run_output(
+                "git",
+                &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"],
+                &repository.checkout.path,
+                &ChannelLabel::Default,
+            )
             .await
             .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
         let paths = if grep.success || grep.stderr.trim().is_empty() {
@@ -278,6 +321,29 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
+    }
+
+    async fn verify_continuity(&self, path: &Path, previous: &RepositorySpec) -> RepositoryContinuity {
+        let Some(previous_remote) = previous.live_remote() else {
+            return RepositoryContinuity::Unproven { evidence: "previous Repository has no transport remote".to_string() };
+        };
+        let advertised = match self.git(path, &["ls-remote", "--refs", previous_remote]).await {
+            Ok(advertised) => advertised,
+            Err(error) => return RepositoryContinuity::Unproven { evidence: format!("old remote refs unavailable: {error}") },
+        };
+        let mut refs = 0;
+        for line in advertised.lines() {
+            let Some((commit, reference)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            refs += 1;
+            if self.git(path, &["merge-base", "--is-ancestor", commit, "HEAD"]).await.is_ok() {
+                return RepositoryContinuity::Continuous {
+                    evidence: format!("old remote ref {reference} ({commit}) is reachable from HEAD"),
+                };
+            }
+        }
+        RepositoryContinuity::Unproven { evidence: format!("none of {refs} advertised old-remote refs is reachable from HEAD") }
     }
 
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
@@ -319,7 +385,7 @@ mod tests {
 
     use flotilla_resources::{RepositoryIdentity, RepositorySpec};
 
-    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryInspection, RepositoryInspector};
+    use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -328,6 +394,34 @@ mod tests {
         std::fs::create_dir(&root).expect("repo dir");
         std::fs::create_dir(root.join(".git")).expect("git dir");
         (temp, root)
+    }
+
+    #[tokio::test]
+    async fn continuity_accepts_an_old_remote_ref_reachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Ok(String::new()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Continuous { .. }));
+    }
+
+    #[tokio::test]
+    async fn continuity_rejects_old_remote_refs_unreachable_from_head() {
+        let (_temp, root) = git_repo();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
+            .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Err("unrelated histories".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
+
+        assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Unproven { .. }));
     }
 
     #[tokio::test]
@@ -354,6 +448,7 @@ mod tests {
                 is_main: true,
             },
             transport_url: None,
+            replaces_prior_repository: false,
         };
 
         let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");
@@ -371,6 +466,7 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("work-github:org/repo.git\n".to_string()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("work-github:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "work-github"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
@@ -385,12 +481,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_https_remote_determines_identity_while_effective_url_drives_live_transport() {
+        let (_temp, root) = git_repo();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
+            .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
+            .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run(
+                "git",
+                &["config", "--get-all", "remote.origin.url"],
+                Ok("https://forgejo.lab.flotilla.work/fork-issues/ghostty.git\n".to_string()),
+            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("forgejo-manchego:fork-issues/ghostty.git\n".to_string()))
+            .on_run("ssh", &["-G", "forgejo-manchego"], Ok("hostname manchego.lab.flotilla.work\nuser git\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+
+        let inspected = inspector.inspect_path(&root, None).await.expect("inspection should use the configured URL");
+
+        assert!(matches!(
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote }
+                if canonical_remote == "https://forgejo.lab.flotilla.work/fork-issues/ghostty"
+        ));
+        assert_eq!(inspected.transport_url.as_deref(), Some("forgejo-manchego:fork-issues/ghostty.git"));
+        assert_eq!(inspected.spec.live_remote(), Some("https://manchego.lab.flotilla.work/fork-issues/ghostty"));
+        let forge = inspected.spec.forge().expect("effective live remote should determine forge attribution");
+        assert_eq!(forge.service_url, "https://manchego.lab.flotilla.work");
+        assert_eq!(forge.repository, "fork-issues/ghostty");
+    }
+
+    #[tokio::test]
+    async fn first_configured_url_determines_identity_for_a_multi_url_remote() {
+        let (_temp, root) = git_repo();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
+            .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
+            .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run(
+                "git",
+                &["config", "--get-all", "remote.origin.url"],
+                Ok("https://github.com/org/repo.git\nhttps://mirror.example/org/repo.git\n".to_string()),
+            )
+            .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/org/repo.git\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+
+        let inspected = inspector.inspect_path(&root, None).await.expect("multi-URL remote should use its first URL");
+
+        assert!(matches!(
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
+        ));
+    }
+
+    #[tokio::test]
     async fn unresolved_ssh_alias_fails_instead_of_becoming_a_repository_key() {
         let (_temp, root) = git_repo();
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("mystery:org/repo.git\n".to_string()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("mystery:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "mystery"], Ok("hostname mystery\n".to_string()))
             .build();
@@ -408,6 +560,7 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("github.work:org/repo.git\n".to_string()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("github.work:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "github.work"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
@@ -474,8 +627,8 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\nupstream\n".to_string()))
-            .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/fork/repo.git\n".to_string()))
-            .on_run("git", &["remote", "get-url", "upstream"], Ok("https://github.com/upstream/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/fork/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.upstream.url"], Ok("https://github.com/upstream/repo.git\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
 
@@ -492,7 +645,8 @@ mod tests {
             .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
             .on_run("git", &["remote"], Ok("origin\nmirror\n".to_string()))
-            .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/org/repo.git\n".to_string()))
+            .on_run("git", &["config", "--get-all", "remote.mirror.url"], Ok("git@github.com:org/repo.git\n".to_string()))
             .on_run("git", &["remote", "get-url", "mirror"], Ok("git@github.com:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))

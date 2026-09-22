@@ -1,5 +1,6 @@
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 
+use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     Convoy, InputMeta, LifecycleAuthority, ReadWatchEvent, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
     Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
@@ -22,12 +23,12 @@ pub struct VesselPlacementSync {
 pub struct VesselPlacementProjector {
     backend: ResourceBackend,
     namespace: String,
-    local_host_ref: String,
+    local_host_ref: CanonicalHostId,
 }
 
 impl VesselPlacementProjector {
-    pub fn new(backend: ResourceBackend, namespace: impl Into<String>, local_host_ref: impl Into<String>) -> Self {
-        Self { backend, namespace: namespace.into(), local_host_ref: local_host_ref.into() }
+    pub fn new(backend: ResourceBackend, namespace: impl Into<String>, local_host_ref: CanonicalHostId) -> Self {
+        Self { backend, namespace: namespace.into(), local_host_ref }
     }
 
     pub async fn run(&self) -> Result<(), ResourceError> {
@@ -105,7 +106,11 @@ impl VesselPlacementProjector {
             .items
             .into_iter()
             .filter(|vessel| {
-                vessel.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host_ref| host_ref == &self.local_host_ref)
+                vessel
+                    .metadata
+                    .annotations
+                    .get(ACTUATOR_HOST_REF_ANNOTATION)
+                    .is_some_and(|host_ref| host_ref == self.local_host_ref.as_str())
             })
             .map(|vessel| (vessel.metadata.name.clone(), vessel))
             .collect::<BTreeMap<_, _>>();
@@ -133,7 +138,7 @@ impl VesselPlacementProjector {
             let mut labels = source.metadata.labels.clone();
             labels.insert(flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string());
             let mut annotations = source.metadata.annotations.clone();
-            annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.to_string(), self.local_host_ref.clone());
+            annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.to_string(), self.local_host_ref.to_string());
             annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), origin_root);
             let mut meta = InputMeta::builder()
                 .name(name.clone())

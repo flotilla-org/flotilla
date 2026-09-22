@@ -105,13 +105,12 @@ impl std::fmt::Display for CrNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::CommandAction;
 
     use super::CrNoun;
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
     };
 
     fn parse(args: &[&str]) -> CrNoun {
@@ -121,79 +120,59 @@ mod tests {
     #[test]
     fn cr_open() {
         let resolved = parse(&["cr", "42", "open"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::OpenChangeRequest { id: "42".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::OpenChangeRequest { id: "42".into() },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
     fn cr_close() {
         let resolved = parse(&["cr", "42", "close"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::CloseChangeRequest { id: "42".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::CloseChangeRequest { id: "42".into() },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
     fn cr_merge_requires_surface_confirmation() {
         let resolved = parse(&["cr", "42", "merge"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
     fn cr_merge_yes_records_explicit_confirmation() {
         let resolved = parse(&["cr", "42", "merge", "--yes"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::MergeChangeRequest { id: "42".into(), confirmed: true }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::MergeChangeRequest { id: "42".into(), confirmed: true },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
     fn cr_link_issues() {
         let resolved = parse(&["cr", "42", "link-issues", "1", "5", "7"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::LinkIssuesToChangeRequest {
-                    change_request_id: "42".into(),
-                    issue_ids: vec!["1".into(), "5".into(), "7".into()],
-                },
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::LinkIssuesToChangeRequest {
+                change_request_id: "42".into(),
+                issue_ids: vec!["1".into(), "5".into(), "7".into()],
             },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]
@@ -201,16 +180,12 @@ mod tests {
         // The `pr` alias is registered at the CLI top level, not on the parser itself,
         // so we test the struct directly with the same args.
         let resolved = parse(&["pr", "42", "open"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::OpenChangeRequest { id: "42".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::ProviderHost,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::OpenChangeRequest { id: "42".into() },
+            RepoContext::Inferred,
+            HostResolution::ProviderHost,
+        );
     }
 
     #[test]

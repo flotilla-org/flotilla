@@ -119,7 +119,33 @@ cross-source guessing on bare numbers.
 
 A Project's awareness band is the union of its bindings' filtered results, each
 entity tagged with its source binding. Per-binding filters are what stop an
-additional upstream tracker from flooding it.
+additional upstream tracker from flooding it. Binding aliases default to the
+Project member alias; a source which is not derived from a member must declare
+its alias explicitly. This keeps one project-scoped name for a repository
+across issue addressing and the rest of the Project surface.
+
+Filters use a structured selector with Kubernetes vocabulary. The initial
+representation contains only `match_fields`: exact field assignments, ANDed
+together, whose tracker-field names are interpreted by the provider. An
+optional `match_expressions` field is the extension point for `In`, `NotIn`,
+`Exists`, and `DoesNotExist`; it is deliberately not part of v1. Ranges and a
+string query DSL are not defined. Open/closed state is awareness-band semantics
+and is not configurable per binding.
+
+### Amendment: issue creation destinations
+
+Reading unions sources, but creation selects one binding. Each binding therefore
+also carries `creatable` and `create_with`. `create_with` is a concrete map of
+tracker fields to values stamped on a newly created issue; callers may add or
+override values at creation time. It remains separate from `filter`, because a
+selector may eventually express predicates which cannot be stamped as values.
+
+A creatable binding is valid only when its `create_with` values satisfy its own
+`filter`. For v1 `match_fields`, this is a subset check: each scalar filter value
+must equal the created field value, and for a multi-valued created field the
+filter value must be present. Flotilla never derives `create_with` from a filter.
+Bare creation is legal only when exactly one binding is creatable; otherwise the
+same binding alias used for reads is required.
 
 ## The workspace set is convoy data; paths are hull-named
 

@@ -52,13 +52,12 @@ impl std::fmt::Display for WorkspaceNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::CommandAction;
 
     use super::WorkspaceNoun;
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
     };
 
     fn parse(args: &[&str]) -> WorkspaceNoun {
@@ -68,16 +67,12 @@ mod tests {
     #[test]
     fn workspace_select() {
         let resolved = parse(&["workspace", "feat-ws", "select"]).resolve().unwrap();
-        assert_eq!(resolved, Resolved::NeedsContext {
-            command: Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() }
-            },
-            repo: RepoContext::Inferred,
-            host: HostResolution::Local,
-        });
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() },
+            RepoContext::Inferred,
+            HostResolution::Local,
+        );
     }
 
     #[test]

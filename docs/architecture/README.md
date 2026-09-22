@@ -26,6 +26,12 @@ of creating a new dated design snapshot.
 5. [`extension-points.md`](extension-points.md) for the main open seams the
    GitHub backlog is still pushing on.
 
+## Provisional Designs
+
+- [Tender](tender.md): working publication, discovery, and connection model;
+  extraction assessment against Flotilla, cleat, and porthole. This is not yet
+  an accepted ADR or implemented architecture.
+
 ## Core Architectural Decisions
 
 - Providers gather facts from external tools; they do not build UI rows.
