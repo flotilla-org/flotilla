@@ -1448,18 +1448,21 @@ impl App {
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
-        let start_dir = self
-            .model
-            .active_repo_root_opt()
-            .and_then(|r| r.parent())
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok())
-            .or_else(dirs::home_dir)
-            .unwrap_or_default();
+        let start_dir = file_picker_start_dir(&self.model);
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
         let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
         self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
     }
+}
+
+pub(crate) fn file_picker_start_dir(model: &TuiModel) -> PathBuf {
+    model
+        .active_repo_root_opt()
+        .and_then(|root| root.parent())
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
 }
 
 fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
