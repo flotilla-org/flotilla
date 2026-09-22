@@ -115,7 +115,11 @@ enum SubCommand {
         timeout: Option<u64>,
     },
     /// Show the daemon's current multi-host routing view
-    Topology,
+    Topology {
+        /// Output the topology as a Graphviz DOT graph
+        #[arg(long, conflicts_with = "json")]
+        dot: bool,
+    },
     /// Read structured daemon logs from this host or a peer
     Logs {
         /// Peer host name; omit to read this host
@@ -550,7 +554,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Wait { leaves, namespace, fresher_than, timeout }) => {
             run_wait(&cli, leaves, namespace, fresher_than, timeout, format).await
         }
-        Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
+        Some(SubCommand::Topology { dot }) => run_topology_command(&cli, format, dot).await,
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
@@ -1679,9 +1683,10 @@ async fn dispatch(resolved: flotilla_commands::Resolved, cli: &Cli, format: Outp
     }
 }
 
-async fn run_topology_command(cli: &Cli, format: OutputFormat) -> Result<()> {
+async fn run_topology_command(cli: &Cli, format: OutputFormat, dot: bool) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
+    let format = if dot { flotilla_tui::cli::TopologyOutputFormat::Dot } else { format.into() };
     flotilla_tui::cli::run_topology(&*daemon, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
@@ -2175,15 +2180,27 @@ mod tests {
     #[test]
     fn cli_parses_topology_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "topology"]).expect("topology cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(!cli.json);
     }
 
     #[test]
     fn cli_parses_topology_with_global_json() {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_topology_dot() {
+        let cli = Cli::try_parse_from(["flotilla", "topology", "--dot"]).expect("topology dot should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: true })));
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn cli_rejects_topology_dot_with_json() {
+        assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());
     }
 
     #[test]
@@ -2710,7 +2727,7 @@ mod tests {
     #[test]
     fn cli_global_json_before_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "--json", "topology"]).expect("json before subcommand should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology)));
+        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
         assert!(cli.json);
     }
 
