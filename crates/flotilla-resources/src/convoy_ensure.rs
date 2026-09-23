@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use flotilla_protocol::AgentOverride;
 use serde::{Deserialize, Serialize};
 
 use crate::{checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
@@ -33,6 +34,9 @@ pub struct ConvoyEnsureSpec {
     pub repositories: Vec<RepositoryKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presents_as: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_overrides: Vec<AgentOverride>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,8 +170,9 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use serde_json::json;
 
-    use super::ConvoyEnsureStatus;
+    use super::{ConvoyEnsureSpec, ConvoyEnsureStatus};
 
     #[test]
     fn serialized_backoff_uses_operator_vocabulary() {
@@ -182,5 +187,19 @@ mod tests {
         assert_eq!(value["next_attempt"], "2026-08-25T21:30:00Z");
         assert!(value.get("restart_count").is_none());
         assert!(value.get("retry_at").is_none());
+    }
+
+    #[test]
+    fn agent_overrides_are_optional_and_empty_values_serialize_away() {
+        let spec: ConvoyEnsureSpec = serde_json::from_value(json!({
+            "project_ref": "flotilla",
+            "role": "governor",
+            "workflow_ref": "govern",
+            "repositories": []
+        }))
+        .expect("decode ensure without agent overrides");
+
+        assert!(spec.agent_overrides.is_empty());
+        assert!(serde_json::to_value(spec).expect("serialize ensure").get("agent_overrides").is_none());
     }
 }
