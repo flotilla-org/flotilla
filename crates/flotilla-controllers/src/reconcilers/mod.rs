@@ -11,7 +11,7 @@ pub use checkout::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
 pub use clone::{CloneReconciler, CloneRuntime};
-pub use environment::{DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler};
+pub use environment::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 pub use presentation::{
     AppliedPresentation, ApplyPresentationError, DefaultPolicy, HopChainContext, PolicyContext, PresentationPlan, PresentationPolicy,
     PresentationPolicyRegistry, PresentationPrepared, PresentationReconciler, PresentationRuntime, PreviousWorkspace,

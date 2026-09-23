@@ -18,13 +18,13 @@ use flotilla_resources::{
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewSource,
     CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentWaitReason, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec,
+    ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
+    TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -176,7 +176,6 @@ enum PlannedPatch {
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
-        wait_reason: Option<EnvironmentWaitReason>,
     },
     Ready {
         placement_decision: Option<PlacementDecision>,
@@ -220,7 +219,7 @@ impl VesselPrepared {
         actuations: Vec<Actuation>,
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
-        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for, None), actuations }
+        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
     }
 
     fn provisioning_for_environment(
@@ -231,13 +230,9 @@ impl VesselPrepared {
         actuations: Vec<Actuation>,
     ) -> Self {
         let fallback = fallback.into();
-        let (waiting_for, wait_reason) = environment
-            .status
-            .as_ref()
-            .map(|status| (status.message.clone().unwrap_or_else(|| fallback.clone()), status.wait_reason.clone()))
-            .unwrap_or((fallback, None));
+        let waiting_for = environment.status.as_ref().and_then(|status| status.message.clone()).unwrap_or(fallback);
         let waiting_for = legible_waiting_for(waiting_for, placement_decision.as_ref());
-        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for, wait_reason), actuations }
+        Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
     }
 
     fn failed(message: impl Into<String>) -> Self {
@@ -1024,14 +1019,13 @@ impl Reconciler for VesselReconciler {
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match &prepared.patch {
             PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for, wait_reason } => {
+            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version, placement_decision, waiting_for } => {
                 Some(VesselStatusPatch::MarkProvisioning {
                     observed_policy_ref: observed_policy_ref.clone(),
                     observed_policy_version: observed_policy_version.clone(),
                     placement_decision: placement_decision.clone(),
                     started_at: now,
-                    message: provisioning_stuck_message(obj, waiting_for, wait_reason.as_ref(), now),
-                    wait_reason: wait_reason.clone(),
+                    message: provisioning_stuck_message(obj, waiting_for, now),
                 })
             }
             PlannedPatch::Ready {
@@ -1149,29 +1143,16 @@ fn provisioning_patch(
     placement_policy: &ResourceObject<PlacementPolicy>,
     placement_decision: Option<PlacementDecision>,
     waiting_for: String,
-    wait_reason: Option<EnvironmentWaitReason>,
 ) -> PlannedPatch {
     PlannedPatch::Provisioning {
         observed_policy_ref: placement_policy.metadata.name.clone(),
         observed_policy_version: placement_policy.metadata.resource_version.clone(),
         placement_decision,
         waiting_for,
-        wait_reason,
     }
 }
 
-fn provisioning_stuck_message(
-    obj: &ResourceObject<Vessel>,
-    waiting_for: &str,
-    wait_reason: Option<&EnvironmentWaitReason>,
-    now: DateTime<Utc>,
-) -> Option<String> {
-    if matches!(wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })) {
-        // Pool exhaustion is admission queueing, not a stalled provisioning
-        // attempt. Persist the typed wait reason as the holding signal without
-        // also publishing the generic stuck message.
-        return None;
-    }
+fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, now: DateTime<Utc>) -> Option<String> {
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
         .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
@@ -1188,43 +1169,6 @@ fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&Plac
         waiting_for = waiting_for.replace(&target_environment, &display_environment);
     }
     waiting_for
-}
-
-#[cfg(test)]
-mod material_pool_wait_tests {
-    use flotilla_resources::ObjectMeta;
-
-    use super::*;
-
-    #[test]
-    fn material_pool_wait_is_not_reported_as_stuck() {
-        let now = Utc::now();
-        let vessel = ResourceObject::<Vessel> {
-            metadata: ObjectMeta {
-                name: "vessel-a".to_string(),
-                namespace: "flotilla".to_string(),
-                resource_version: "1".to_string(),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-                owner_references: Vec::new(),
-                finalizers: Vec::new(),
-                deletion_timestamp: None,
-                creation_timestamp: now,
-                merge: None,
-            },
-            spec: flotilla_resources::VesselSpec {
-                convoy_ref: "convoy-a".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "docker-a".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            },
-            status: None,
-        };
-        let message = "waiting for agent login material; 2 in pool, all leased";
-        let reason = EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() };
-
-        assert_eq!(provisioning_stuck_message(&vessel, message, Some(&reason), now), None);
-    }
 }
 
 fn environment_name(vessel_name: &str) -> String {

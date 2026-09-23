@@ -1,26 +1,21 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use async_trait::async_trait;
-use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler};
+use flotilla_controllers::reconcilers::{DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler};
 use flotilla_resources::{
     controller::Reconciler, DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, EnvironmentWaitReason, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceBackend, ResourceError,
-    StatusPatch,
+    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, InputMeta, ResourceBackend, ResourceError, StatusPatch,
 };
 
-struct WaitingDockerRuntime;
+struct FailingDockerRuntime;
 
 #[async_trait]
-impl DockerEnvironmentRuntime for WaitingDockerRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError> {
-        Err(DockerProvisioningError::Waiting {
-            message: "waiting for agent login material; 2 in pool, all leased".to_string(),
-            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "agent-login".to_string() },
-        })
+impl DockerEnvironmentRuntime for FailingDockerRuntime {
+    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+        Err("central Codex credential is not provisioned on this host".to_string())
     }
 
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
@@ -39,7 +34,7 @@ struct RecordingDockerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for RecordingDockerRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError> {
+    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         unreachable!("finalizer test does not provision")
     }
 
@@ -54,7 +49,7 @@ impl DockerEnvironmentRuntime for RecordingDockerRuntime {
 }
 
 #[tokio::test]
-async fn pool_exhaustion_stays_pending_with_a_legible_requeued_wait() {
+async fn a_provisioning_failure_marks_the_environment_failed() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environments = backend.clone().using::<Environment>("flotilla");
     let environment = environments
@@ -72,18 +67,15 @@ async fn pool_exhaustion_stays_pending_with_a_legible_requeued_wait() {
         })
         .await
         .expect("create environment");
-    let reconciler = EnvironmentReconciler::new(Arc::new(WaitingDockerRuntime), backend.clone(), "flotilla");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
 
-    let deps = reconciler.prepare(&environment).await.expect("fetch waiting state");
+    let deps = reconciler.prepare(&environment).await.expect("attempt provisioning");
     let outcome = reconciler.reconcile(&environment, &deps, chrono::Utc::now());
 
-    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));
+    assert_eq!(outcome.requeue_after, None, "a failed provisioning attempt is terminal, not admission queueing");
     assert!(matches!(
         outcome.patch,
-        Some(EnvironmentStatusPatch::MarkWaiting {
-            message,
-            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref },
-        }) if message == "waiting for agent login material; 2 in pool, all leased" && pool_ref == "agent-login"
+        Some(EnvironmentStatusPatch::MarkFailed { message }) if message == "central Codex credential is not provisioned on this host"
     ));
 }
 
@@ -98,7 +90,7 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
         })
         .await
         .expect("create environment");
-    let reconciler = EnvironmentReconciler::new(Arc::new(WaitingDockerRuntime), backend.clone(), "flotilla");
+    let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
     let error = ResourceError::other("failed to parse provisioned mount metadata: corrupt label");
 
     let patch = reconciler
@@ -150,7 +142,7 @@ struct ForeignEnvironmentRuntime;
 
 #[async_trait]
 impl DockerEnvironmentRuntime for ForeignEnvironmentRuntime {
-    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError> {
+    async fn provision(&self, _name: &str, _spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         panic!("a non-actuator must not provision a foreign environment")
     }
 
