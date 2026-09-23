@@ -150,7 +150,9 @@ to `forgejo.lab.flotilla.work` on the build host before publishing.
 ## Verify
 
 Pull the published image rather than relying on the local build cache, then
-run both adapter entry points:
+run both adapter entry points. `2026-08-25.1` below is the currently deployed
+tag, from before the CI workflow existed — a freshly built image will carry
+the `<date>.<short-sha>.<input-hash>` tag described above instead:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
