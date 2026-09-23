@@ -1184,7 +1184,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
                 .pool("cleat".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     host_ref: "remote-docker-host".to_string(),
-                    image: "crew:latest".to_string(),
+                    image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::from(["codex".to_string()]),
                     default_cwd: None,

@@ -881,7 +881,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
-                image: "ghcr.io/flotilla/dev:latest".to_string(),
+                image: "ghcr.io/flotilla/dev:latest".to_string().into(),
                 pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1113,7 +1113,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
-                image: "ghcr.io/flotilla/dev:latest".to_string(),
+                image: "ghcr.io/flotilla/dev:latest".to_string().into(),
                 pull_policy: Default::default(),
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1196,7 +1196,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
-                image: "flotilla-dev-env:latest".to_string(),
+                image: "flotilla-dev-env:latest".to_string().into(),
                 pull_policy: DockerImagePullPolicy::Never,
                 agent_adapters: Default::default(),
                 default_cwd: None,
@@ -1464,7 +1464,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: None,
@@ -1501,7 +1501,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
             agent_adapters: Default::default(),
             default_cwd: Some("/app".to_string()),
@@ -2567,4 +2567,88 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
         })
         .await
         .expect("terminal create should succeed");
+}
+
+#[rstest]
+#[case::memory(false)]
+#[case::sqlite(true)]
+#[tokio::test]
+async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edits(#[case] sqlite: bool) {
+    use flotilla_protocol::NodeId;
+    use flotilla_resources::{
+        CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, PlacementPolicy, SqliteBackend, VesselStatusPatch,
+    };
+
+    let mut hosts = Vec::new();
+    for name in ["kiwi", "feta", "udder"] {
+        let backend = if sqlite {
+            ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))
+        } else {
+            ResourceBackend::InMemory(Default::default())
+        }
+        .with_local_root(NodeId::new(name));
+        create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;
+        create_policy(
+            &backend,
+            NAMESPACE,
+            "crew-policy",
+            PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: name.to_string(),
+                    image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
+                    pull_policy: DockerImagePullPolicy::Always,
+                    agent_adapters: Default::default(),
+                    default_cwd: None,
+                    env: Default::default(),
+                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await;
+        let vessel = create_workspace(&backend, NAMESPACE, "vessel", "convoy", "implement", "crew-policy", REPO_URL).await;
+        let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+        let prepared = reconciler.prepare(&vessel).await.expect("prepare missing reference");
+        let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+        assert!(outcome.actuations.is_empty(), "missing reference cannot emit an Environment or any Docker pull");
+        assert!(
+            matches!(outcome.patch, Some(VesselStatusPatch::MarkFailed { message }) if message.contains("image-baseline `fleet-crew` missing/unresolved"))
+        );
+        let policy = backend.using::<PlacementPolicy>(NAMESPACE).get("crew-policy").await.expect("policy");
+        hosts.push((backend, vessel, policy.metadata.resource_version));
+    }
+
+    // Both releases are authored only on kiwi. The other two roots consume replicas.
+    for image in ["crew:v1", "crew:v2"] {
+        hosts[0]
+            .0
+            .definitions::<CrewImageBaseline>(NAMESPACE)
+            .apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: image.to_string() })
+            .await
+            .expect("single fleet edit");
+        let listed = hosts[0].0.using::<CrewImageBaseline>(NAMESPACE).list().await.expect("authored definitions");
+        for (backend, _, _) in &hosts[1..] {
+            backend
+                .replica_writer::<CrewImageBaseline>(NodeId::new("kiwi"), NAMESPACE)
+                .replace(&listed, Utc::now())
+                .await
+                .expect("federate image bump");
+        }
+        for (backend, vessel, policy_version) in &hosts {
+            let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+            let prepared = reconciler.prepare(vessel).await.expect("prepare");
+            let outcome = reconciler.reconcile(vessel, &prepared, Utc::now());
+            assert!(
+                outcome.actuations.iter().any(|actuation| matches!(actuation,
+                    Actuation::CreateEnvironment { spec, .. } if spec.docker.as_ref().is_some_and(|docker| docker.image == image)
+                )),
+                "each host must provision the new image: {:?}",
+                outcome.actuations
+            );
+            assert_eq!(
+                &backend.using::<PlacementPolicy>(NAMESPACE).get("crew-policy").await.expect("policy").metadata.resource_version,
+                policy_version
+            );
+        }
+    }
 }

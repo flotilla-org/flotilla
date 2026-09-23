@@ -181,7 +181,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
         .pool("docker".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: "01HXYZ".to_string(),
-            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: DockerImagePullPolicy::Never,
             agent_adapters: Default::default(),
             default_cwd: Some("/workspace".to_string()),

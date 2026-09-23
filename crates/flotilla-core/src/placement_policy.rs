@@ -82,8 +82,8 @@ mod tests {
             run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
             TransitionDriver, TransitionSequence, WorldBuilder,
         },
-        DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
-        HostDirectPlacementPolicySpec, InMemoryBackend, ResourceObject, VirtualClock,
+        DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
+        HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, ResourceObject, VirtualClock,
     };
 
     use super::*;
@@ -105,7 +105,7 @@ mod tests {
             .pool(pool.to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: host.to_string(),
-                image: "registration-default:latest".to_string(),
+                image: "registration-default:latest".to_string().into(),
                 pull_policy: DockerImagePullPolicy::IfNotPresent,
                 agent_adapters: BTreeSet::new(),
                 default_cwd: Some("/workspace".to_string()),
@@ -159,7 +159,7 @@ mod tests {
         let created = policies.get("docker-shared").await.expect("registered policy");
         let mut operator_spec = created.spec.clone();
         let runtime = operator_spec.docker_per_vessel.as_mut().expect("docker strategy");
-        runtime.image = "operator/custom:latest".to_string();
+        runtime.image = DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() };
         runtime.pull_policy = DockerImagePullPolicy::Never;
         runtime.agent_adapters = BTreeSet::from(["codex".to_string()]);
         runtime.default_cwd = Some("/operator-workspace".to_string());
@@ -179,7 +179,7 @@ mod tests {
         let runtime = refreshed.spec.docker_per_vessel.expect("docker strategy");
 
         assert_eq!(runtime.host_ref, "remote");
-        assert_eq!(runtime.image, "operator/custom:latest");
+        assert_eq!(runtime.image, DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() });
         assert_eq!(runtime.pull_policy, DockerImagePullPolicy::Never);
         assert_eq!(runtime.agent_adapters, BTreeSet::from(["codex".to_string()]));
         assert_eq!(runtime.default_cwd.as_deref(), Some("/operator-workspace"));

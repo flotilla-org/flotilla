@@ -1,14 +1,14 @@
 apiVersion: flotilla.work/v1
 kind: PlacementPolicy
 metadata:
-  name: docker-crew-image-kiwi
+  name: docker-crew-image-feta
   namespace: flotilla
   annotations:
     flotilla.work/image-recipe: .flotilla/Dockerfile.crew
 spec:
   pool: cleat
   docker_per_vessel:
-    host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
+    host_ref: d783f8a7-6b6f-44a9-bd04-5e6e2d43f878
     image:
       image_baseline_ref: fleet-crew
     pull_policy: always

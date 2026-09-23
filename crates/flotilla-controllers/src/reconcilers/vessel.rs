@@ -16,9 +16,9 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewSource,
-    CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline,
+    CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec,
     ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
@@ -41,6 +41,7 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
+    image_baselines: DefinitionResolver<CrewImageBaseline>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
@@ -58,6 +59,7 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
+            image_baselines: backend.definitions(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
@@ -290,7 +292,7 @@ impl Reconciler for VesselReconciler {
             }
             Err(err) => return Err(err),
         };
-        let mut strategy = match placement_strategy(&placement_policy.spec) {
+        let mut strategy = match placement_strategy(&placement_policy.spec, &self.image_baselines).await {
             Ok(strategy) => strategy,
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
@@ -1108,17 +1110,21 @@ fn environment_with_credentials(
     env
 }
 
-fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {
+async fn placement_strategy(
+    spec: &PlacementPolicySpec,
+    baselines: &DefinitionResolver<CrewImageBaseline>,
+) -> Result<PlacementStrategy, String> {
     if let Some(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree }) = &spec.host_direct {
         return Ok(PlacementStrategy::HostDirect { host_ref: host_ref.clone(), pool: spec.pool.clone() });
     }
 
     if let Some(docker) = &spec.docker_per_vessel {
+        let image = docker.image.resolve(baselines).await?;
         return match &docker.checkout {
             DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerWorktreeOnHostAndMount {
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
-                image: docker.image.clone(),
+                image: image.clone(),
                 pull_policy: docker.pull_policy,
                 env: docker.env.clone(),
                 mount_path: mount_path.clone(),
@@ -1127,7 +1133,7 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
             DockerCheckoutStrategy::FreshCloneInContainer { clone_path } => Ok(PlacementStrategy::DockerFreshCloneInContainer {
                 host_ref: docker.host_ref.clone(),
                 pool: spec.pool.clone(),
-                image: docker.image.clone(),
+                image: image.clone(),
                 pull_policy: docker.pull_policy,
                 env: docker.env.clone(),
                 clone_path: clone_path.clone(),
@@ -1396,8 +1402,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn placement_strategy_replaces_display_name_alias_with_canonical_host_reference() {
+    #[tokio::test]
+    async fn placement_strategy_replaces_display_name_alias_with_canonical_host_reference() {
         let policy = PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .host_direct(HostDirectPlacementPolicySpec {
@@ -1414,7 +1420,9 @@ mod tests {
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
         };
-        let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
+        let mut strategy = placement_strategy(&policy, &ResourceBackend::InMemory(Default::default()).definitions("flotilla"))
+            .await
+            .expect("host-direct policy should produce a placement strategy");
 
         strategy.canonicalize_host_ref(decision.target_host.reference.as_str());
 

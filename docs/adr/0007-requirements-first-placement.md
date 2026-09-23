@@ -59,3 +59,9 @@ Recipes are a strict subset: a fully-pinned requirement.
 - Clyde's boundary edges (token install, agent config, network setup — or a
   privileged crew member finishing setup; "refit" of a warm hull) are
   deliberately unpinned; see the project-map glossary.
+
+## Crew-image baseline amendment
+
+[ADR 0039](0039-crew-image-baseline-is-a-federated-definition.md) places the
+fleet crew-image pin in a federated Definition referenced by host placement
+policies. Image selection remains resolver-side.
