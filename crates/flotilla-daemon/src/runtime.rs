@@ -3170,6 +3170,41 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }))
     }
 
+    async fn observe_failure(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+        let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        let adapter = registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let pool = self.pool_for_spec(spec)?;
+        let screen = match pool.capture_screen(session_id).await {
+            Ok(Some(screen)) => screen,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                tracing::debug!(%session_id, %error, "could not capture terminal screen for failure observation");
+                return Ok(None);
+            }
+        };
+        let Some(reason) = adapter.classify_screen_failure(&screen) else { return Ok(None) };
+
+        let material = match &self.state.agent_material {
+            Some(registry) => match registry.describe_and_release(&spec.env_ref).await {
+                Ok(leases) if !leases.is_empty() => leases.join(", "),
+                Ok(_) => format!("credential codex-login (no leased slot for environment {})", spec.env_ref),
+                Err(error) => {
+                    return Ok(Some(format!(
+                        "Codex authentication failed for credential codex-login in environment {}: {reason}; failed to release its lease: {error}",
+                        spec.env_ref
+                    )));
+                }
+            },
+            None => format!("credential codex-login (no material registry for environment {})", spec.env_ref),
+        };
+        Ok(Some(format!("Codex authentication failed for {material}: {reason}")))
+    }
+
     async fn deliver_message(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec, message: &str) -> Result<(), String> {
         self.pool_for_spec(spec)?.deliver(session_id, message, true).await
     }
@@ -8179,6 +8214,8 @@ mod tests {
 
     #[tokio::test]
     async fn codex_interactive_prompt_is_observed_as_needing_input() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join("config");
         std::fs::create_dir_all(&config_path).expect("config dir");
@@ -8187,16 +8224,32 @@ mod tests {
         let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+        let slot = temp.path().join(".config/flotilla/credentials/codex-pool/slot-4");
+        std::fs::create_dir_all(&slot).expect("slot");
+        std::fs::write(slot.join("auth.json"), "{}").expect("auth");
+        std::fs::set_permissions(slot.join("auth.json"), std::fs::Permissions::from_mode(0o600)).expect("protect auth");
+        let material = Arc::new(AgentMaterialRegistry::new(
+            daemon.resource_backend(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])),
+        ));
+        material
+            .prepare(&profile.host_direct_environment_name(), &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
+            .await
+            .expect("lease slot");
         let runtime = TerminalControllerRuntime {
-            state: Arc::new(ControllerRuntimeState::new(
-                Arc::clone(&daemon),
-                config,
-                local_registry,
-                None,
-                profile.host_id.clone(),
-                None,
-                profile.host_direct_environment_name(),
-            )),
+            state: Arc::new(
+                ControllerRuntimeState::new(
+                    Arc::clone(&daemon),
+                    config,
+                    local_registry,
+                    None,
+                    profile.host_id.clone(),
+                    None,
+                    profile.host_direct_environment_name(),
+                )
+                .with_agent_material(Arc::clone(&material)),
+            ),
         };
         let session_name = "terminal-demo-work-coder";
         pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession {
@@ -8240,6 +8293,20 @@ mod tests {
         let attention =
             runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
         assert_eq!(attention.state, TerminalAttentionState::Idle);
+
+        pool.set_captured_screen(
+            session_name,
+            "codex_apps failed: HTTP 401 token_expired\nYour access token could not be refreshed. Please log out and sign in again.",
+        )
+        .await;
+        let failure = runtime.observe_failure(session_name, &spec).await.expect("observe auth failure").expect("fatal auth failure");
+        assert!(failure.contains("token_expired"));
+        assert!(failure.contains("codex-login"));
+        assert!(failure.contains("slot-4"));
+        material
+            .prepare("replacement-environment", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
+            .await
+            .expect("released slot should be reusable");
     }
 
     #[tokio::test]

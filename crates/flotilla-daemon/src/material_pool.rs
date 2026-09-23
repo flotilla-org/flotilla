@@ -102,6 +102,23 @@ impl MaterialPoolManager {
         self.retain_leases(|lease| lease.holder_ref != *holder_ref, None, "release").await
     }
 
+    pub(crate) async fn leases_for_holder(&self, holder_ref: &ResourceRef) -> Result<Vec<(String, String, MaterialPoolUnitSpec)>, String> {
+        let _guard = self.lock.lock().await;
+        let pools = self.pools.list().await.map_err(|error| format!("list material pools for lease lookup: {error}"))?;
+        let mut leases = Vec::new();
+        for pool in pools.items {
+            let status = pool.status.unwrap_or_default();
+            for (unit_name, lease) in status.leases {
+                if lease.holder_ref == *holder_ref {
+                    if let Some(unit) = pool.spec.units.get(&unit_name) {
+                        leases.push((pool.metadata.name.clone(), unit_name, unit.clone()));
+                    }
+                }
+            }
+        }
+        Ok(leases)
+    }
+
     pub(crate) async fn recover(&self, pool_refs: &BTreeSet<String>, active_holder_refs: &HashSet<ResourceRef>) -> Result<(), String> {
         self.retain_leases(|lease| active_holder_refs.contains(&lease.holder_ref), Some(pool_refs), "recover").await
     }

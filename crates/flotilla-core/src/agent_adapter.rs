@@ -482,6 +482,9 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    fn classify_screen_failure(&self, _screen: &str) -> Option<&'static str> {
+        None
+    }
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String>;
 }
 
@@ -637,6 +640,13 @@ impl AgentAdapter for CliAgentAdapter {
         }
     }
 
+    fn classify_screen_failure(&self, screen: &str) -> Option<&'static str> {
+        match &self.flavor {
+            AdapterFlavor::ClaudeCode { .. } => None,
+            AdapterFlavor::Codex { .. } => codex_auth_failure(screen),
+        }
+    }
+
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
         let mut env = request.environment.clone();
         if matches!(&self.flavor, AdapterFlavor::ClaudeCode { contained: true, .. })
@@ -679,6 +689,16 @@ fn codex_screen_needs_input(screen: &str) -> bool {
     .any(|prompt| screen.contains(prompt));
     let user_question = screen.contains("Question ") && (screen.contains(" to submit answer") || screen.contains(" to submit all"));
     approval_prompt || user_question
+}
+
+fn codex_auth_failure(screen: &str) -> Option<&'static str> {
+    if screen.contains("token_expired") {
+        Some("token_expired")
+    } else if screen.to_ascii_lowercase().contains("access token could not be refreshed") {
+        Some("access token could not be refreshed")
+    } else {
+        None
+    }
 }
 
 async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
@@ -1590,6 +1610,19 @@ mod tests {
         let screen = "• Working (57s • esc to interrupt)\n\n› Run /review on my current changes\n\ngpt-5.6-sol high · /workspace";
 
         assert_eq!(codex.classify_screen_attention(screen), None);
+    }
+
+    #[test]
+    fn codex_classifies_expired_and_unrefreshable_tokens_as_fatal() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+
+        assert_eq!(codex.classify_screen_failure("codex_apps: HTTP 401 token_expired"), Some("token_expired"));
+        assert_eq!(
+            codex.classify_screen_failure("Your access token could not be refreshed. Please log out and sign in again."),
+            Some("access token could not be refreshed")
+        );
+        assert_eq!(codex.classify_screen_failure("› Ask Codex to do something"), None);
     }
 
     #[tokio::test]

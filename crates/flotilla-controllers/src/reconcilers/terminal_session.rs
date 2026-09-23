@@ -38,6 +38,9 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Option<TerminalAttention>, String> {
         Ok(None)
     }
+    async fn observe_failure(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     async fn deliver_message(
         &self,
         _session_id: &str,
@@ -158,6 +161,9 @@ where
             if !running {
                 return Ok(TerminalDeps::Stopped);
             }
+            if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                return Ok(TerminalDeps::Failed(message));
+            }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
                     // A continuous attention signal must not starve a queued handoff.
@@ -244,6 +250,9 @@ where
                 message: None,
             }),
             TerminalSessionPhase::Running => match deps {
+                TerminalDeps::Failed(message) => {
+                    Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
+                }
                 TerminalDeps::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }

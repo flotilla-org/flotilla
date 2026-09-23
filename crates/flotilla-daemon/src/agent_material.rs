@@ -108,6 +108,19 @@ impl AgentMaterialRegistry {
         self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
+    pub(crate) async fn describe_and_release(&self, environment_ref: &str) -> Result<Vec<String>, String> {
+        let holder_ref = self.holder_ref(environment_ref);
+        let leases = self.pools.leases_for_holder(&holder_ref).await?;
+        self.pools.release_holder(&holder_ref).await?;
+        Ok(leases
+            .into_iter()
+            .map(|(pool_ref, unit_name, unit)| {
+                let slot = PathBuf::from(unit.directory).file_name().and_then(|name| name.to_str()).unwrap_or(&unit_name).to_string();
+                format!("credential {pool_ref} slot {slot}")
+            })
+            .collect())
+    }
+
     pub(crate) async fn recover(&self, active_environment_refs: impl IntoIterator<Item = String>) -> Result<(), String> {
         let active = active_environment_refs.into_iter().map(|name| self.holder_ref(&name)).collect::<HashSet<_>>();
         let pool_refs = self.adapters.values().map(|adapter| adapter.pool_ref().to_string()).collect::<BTreeSet<_>>();
