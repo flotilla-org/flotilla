@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Refresh a Codex auth.json via a direct OAuth grant_type=refresh_token call.
+
+Codex itself only refreshes on use, and only once the access token is
+within 5 minutes of expiry (`codex-rs/login/src/auth/manager.rs`,
+`should_refresh_proactively`). A crew handed a read-only, comfortably-fresh
+auth.json therefore never refreshes it. This script performs the same
+direct OAuth refresh codex would make (POST grant_type=refresh_token to
+codex's token endpoint) so a scheduled timer can keep one central login's
+auth.json fresh, handling the single-use refresh-token rotation write-back.
+
+Endpoint, client id, and the auth.json shape (`tokens.{access_token,
+refresh_token,id_token}`, top-level `last_refresh`) are verified against
+`codex-rs/login/src/auth/manager.rs`, `codex-rs/login/src/oauth/client.rs`,
+and `codex-rs/login/src/auth/storage.rs` in openai/codex.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_TOKEN_URL = "https://auth.openai.com/oauth/token"
+DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+# Same override env vars codex-rs itself honors, so this script and a real
+# codex CLI agree on where to refresh against without inventing new knobs.
+TOKEN_URL_ENV_VAR = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+CLIENT_ID_ENV_VAR = "CODEX_APP_SERVER_LOGIN_CLIENT_ID"
+
+REQUEST_TIMEOUT_SECONDS = 30
+
+EXIT_PERMANENT = 1  # refresh token is dead: named reason, needs operator re-login
+EXIT_TRANSIENT = 2  # network/server hiccup: safe to retry on the next timer tick
+EXIT_LOCAL = 3  # local auth.json/environment problem, not the token endpoint's fault
+
+# Mirrors manager.rs classify_refresh_token_failure's known dead-token codes.
+DEAD_REFRESH_TOKEN_REASONS = {
+    "refresh_token_expired": "refresh token has expired",
+    "refresh_token_reused": "refresh token was already used (rotated by another refresher)",
+    "refresh_token_invalidated": "refresh token was revoked",
+}
+
+
+class RefreshFailure(Exception):
+    def __init__(self, exit_code, reason, message):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.reason = reason
+
+
+def auth_file_path(codex_home):
+    return os.path.join(codex_home, "auth.json")
+
+
+def load_auth(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        raise RefreshFailure(EXIT_LOCAL, "auth_file_missing", f"no auth.json at {path}")
+    try:
+        auth = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RefreshFailure(EXIT_LOCAL, "auth_file_invalid", f"auth.json at {path} is not valid JSON: {error}")
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    refresh_token = tokens.get("refresh_token") if isinstance(tokens, dict) else None
+    if not refresh_token:
+        raise RefreshFailure(EXIT_LOCAL, "refresh_token_missing", f"auth.json at {path} has no tokens.refresh_token")
+    return auth, refresh_token
+
+
+def classify_rejection(status, detail):
+    code = None
+    description = None
+    if isinstance(detail, dict):
+        raw_code = detail.get("error")
+        if isinstance(raw_code, str):
+            code = raw_code.strip().lower() or None
+        raw_description = detail.get("error_description")
+        if isinstance(raw_description, str) and raw_description.strip():
+            description = raw_description.strip()[:200]
+
+    dead_reason = DEAD_REFRESH_TOKEN_REASONS.get(code)
+    is_invalid_grant_bad_request = status == 400 and code == "invalid_grant"
+
+    if dead_reason is not None:
+        return RefreshFailure(EXIT_PERMANENT, code, dead_reason)
+    if status == 401:
+        return RefreshFailure(EXIT_PERMANENT, "unauthorized", "token endpoint rejected the refresh token (401)")
+    if is_invalid_grant_bad_request:
+        return RefreshFailure(EXIT_PERMANENT, "invalid_grant", "refresh token was rejected (invalid_grant)")
+
+    message = f"token endpoint returned HTTP {status}"
+    if code:
+        message += f" ({code})"
+    if description:
+        message += f": {description}"
+    return RefreshFailure(EXIT_TRANSIENT, "refresh_rejected", message)
+
+
+def request_refresh(token_url, client_id, refresh_token):
+    body = json.dumps({"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token}).encode("utf-8")
+    request = urllib.request.Request(token_url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as error:
+        raw_detail = error.read()
+        try:
+            detail = json.loads(raw_detail.decode("utf-8")) if raw_detail else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            detail = {}
+        raise classify_rejection(error.code, detail)
+    except urllib.error.URLError as error:
+        raise RefreshFailure(EXIT_TRANSIENT, "network_error", f"could not reach token endpoint: {error.reason}")
+
+    try:
+        response_body = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RefreshFailure(EXIT_TRANSIENT, "invalid_response", f"token endpoint returned an unparseable response: {error}")
+    if not isinstance(response_body, dict):
+        raise RefreshFailure(EXIT_TRANSIENT, "invalid_response", "token endpoint returned an unexpected response shape")
+    return response_body
+
+
+def apply_refresh(auth, response):
+    tokens = auth.setdefault("tokens", {})
+    if not isinstance(tokens, dict):
+        raise RefreshFailure(EXIT_LOCAL, "auth_file_invalid", "auth.json 'tokens' field is not an object")
+
+    updated = []
+    for field in ("access_token", "refresh_token", "id_token"):
+        value = response.get(field)
+        if isinstance(value, str) and value:
+            tokens[field] = value
+            updated.append(field)
+    if not updated:
+        raise RefreshFailure(EXIT_TRANSIENT, "empty_refresh_response", "token endpoint returned no tokens to update")
+
+    auth["last_refresh"] = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return updated
+
+
+def write_auth_atomic(path, auth):
+    directory = os.path.dirname(path) or "."
+    fd, temp_path = tempfile.mkstemp(prefix=".auth.json.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(auth, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # tempfile.mkstemp already creates the file 0600, matching codex's own
+        # auth.json permissions; the rename below is same-directory so it's atomic.
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def decode_jwt_exp(jwt):
+    """Best-effort exp claim readout for the success summary. Never raises."""
+    try:
+        payload_b64 = jwt.split(".")[1]
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        exp = claims.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None
+        return datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def refresh(codex_home, token_url, client_id):
+    path = auth_file_path(codex_home)
+    auth, refresh_token = load_auth(path)
+    response = request_refresh(token_url, client_id, refresh_token)
+    updated = apply_refresh(auth, response)
+    write_auth_atomic(path, auth)
+    return path, auth, updated
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Refresh a Codex auth.json via direct OAuth grant_type=refresh_token.")
+    parser.add_argument(
+        "--codex-home",
+        default=os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex"),
+        help="Directory containing auth.json (default: $CODEX_HOME or ~/.codex).",
+    )
+    args = parser.parse_args(argv)
+
+    token_url = os.environ.get(TOKEN_URL_ENV_VAR) or DEFAULT_TOKEN_URL
+    client_id = (os.environ.get(CLIENT_ID_ENV_VAR) or "").strip() or DEFAULT_CLIENT_ID
+
+    try:
+        path, auth, updated = refresh(args.codex_home, token_url, client_id)
+    except RefreshFailure as failure:
+        print(f"codex-token-refresh: error: {failure.reason}: {failure}", file=sys.stderr)
+        return failure.exit_code
+    except OSError as error:
+        print(f"codex-token-refresh: error: write_failed: {error}", file=sys.stderr)
+        return EXIT_LOCAL
+
+    summary = f"codex-token-refresh: refreshed {path} ({', '.join(updated)} rotated)"
+    if "access_token" in updated:
+        expires_at = decode_jwt_exp(auth["tokens"]["access_token"])
+        if expires_at is not None:
+            summary += f"; access token expires {expires_at}"
+    print(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
