@@ -1260,9 +1260,12 @@ async fn reconcile_now_clears_an_active_restart_limit_and_admits_in_one_pass() {
 }
 
 #[tokio::test]
-async fn concurrent_ensure_admission_creates_only_one_live_generation() {
+async fn concurrent_periodic_and_explicit_ensure_admission_creates_only_one_live_generation() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
-    let (left, right) = tokio::join!(daemon.reconcile_convoy_ensures_once("flotilla"), daemon.reconcile_convoy_ensures_once("flotilla"));
+    let (left, right) = tokio::join!(
+        daemon.reconcile_convoy_ensures_once("flotilla"),
+        daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking)
+    );
     left.expect("left reconcile");
     right.expect("right reconcile");
 
@@ -1280,6 +1283,106 @@ async fn concurrent_ensure_admission_creates_only_one_live_generation() {
         backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.unwrap().convoy_ref,
         Some(live[0].metadata.name.clone())
     );
+}
+
+#[tokio::test]
+async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_generation() {
+    struct PausedBacking {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl StandingConvoyBackingInspector for PausedBacking {
+        async fn verify_backing_dead(&self, _convoy: &ResourceObject<ResourceConvoy>) -> Result<(), String> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err("backing is still live".to_string())
+        }
+    }
+
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    fail_ensured_generation(&backend, &clock).await;
+    let backing = Arc::new(PausedBacking { entered: Default::default(), release: Default::default() });
+    let periodic = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        let backing = Arc::clone(&backing);
+        async move { daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &*backing).await }
+    });
+    backing.entered.notified().await;
+    let mut forced = Box::pin(daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut forced).await.is_err(),
+        "explicit reconciliation must wait for the periodic transaction"
+    );
+    backing.release.notify_one();
+    periodic.await.expect("periodic task").expect("record backing hold");
+    forced.await.expect("forced recovery");
+    daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking).await.expect("idempotent forced pass");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("subsequent periodic pass");
+
+    let convoys = backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations");
+    assert_eq!(convoys.items.len(), 2, "one failed generation and one replacement");
+    let live =
+        convoys.items.iter().filter(|convoy| convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect::<Vec<_>>();
+    assert_eq!(live.len(), 1);
+    let status = backend.using::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure").status.expect("status");
+    assert_eq!(status.convoy_ref.as_deref(), Some(live[0].metadata.name.as_str()));
+    assert_eq!(status.last_failure, None, "a stale periodic pass must not overwrite the forced recovery");
+    assert_eq!(status.retry_at, None);
+}
+
+#[tokio::test]
+async fn generation_allocation_sees_live_and_terminal_replicated_convoys() {
+    let (daemon, source, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let writer = backend.replica_writer::<ResourceConvoy>(NodeId::new("other-root"), "flotilla");
+    writer.replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source convoys"), Utc::now()).await.expect("replicate");
+    let error = allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster")
+        .await
+        .expect_err("remote live generation blocks admission");
+    assert!(error.contains("generation 1 already exists"), "{error}");
+    assert!(error.contains("as of root other-root, last synced"), "{error}");
+    assert!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("local reconciliation view").items.is_empty());
+
+    fail_ensured_generation(&source, &clock).await;
+    writer
+        .replace(&source.using::<ResourceConvoy>("flotilla").list().await.expect("source history"), Utc::now())
+        .await
+        .expect("replicate terminal history");
+    assert_eq!(
+        allocate_convoy_generation(&backend, "flotilla", Some("standing-project"), "quartermaster").await.expect("next generation"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn ensure_dependency_fingerprint_tracks_replicated_placement_changes() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let mut ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("ensure");
+    ensure.spec.placement_policy = Some("remote-policy".to_string());
+    let absent = daemon.ensure_admission_dependency_hash("flotilla", &ensure).await.expect("absent fingerprint");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let mut policy = placement_policy(&source, "remote-policy", "other-host").await;
+    let writer = backend.replica_writer::<PlacementPolicy>(NodeId::new("other-root"), "flotilla");
+    writer
+        .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("policies"), Utc::now())
+        .await
+        .expect("replicate policy");
+    let present = daemon.ensure_admission_dependency_hash("flotilla", &ensure).await.expect("replica fingerprint");
+    assert_ne!(absent, present, "arrival must invalidate an admission refusal");
+    policy.spec.priority = 42;
+    source
+        .using::<PlacementPolicy>("flotilla")
+        .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec)
+        .await
+        .expect("change policy");
+    writer
+        .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("updated policies"), Utc::now())
+        .await
+        .expect("replicate change");
+    assert_ne!(present, daemon.ensure_admission_dependency_hash("flotilla", &ensure).await.expect("changed fingerprint"));
 }
 
 #[tokio::test]
@@ -2610,6 +2713,35 @@ async fn default_remote_placement_routes_before_admission() {
 
     assert_eq!(target.as_str(), "udder-id");
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").list().await, Ok(list) if list.items.is_empty()));
+}
+
+#[tokio::test]
+async fn placement_candidates_and_refusals_agree_across_roots() {
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
+    let feta = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("feta-root"));
+    placement_policy(&kiwi, "kiwi-policy", "kiwi").await;
+    placement_policy(&feta, "feta-policy", "feta").await;
+    let synced_at = Utc::now();
+    for (destination, source, origin) in [(&kiwi, &feta, "feta-root"), (&feta, &kiwi, "kiwi-root")] {
+        destination
+            .replica_writer::<PlacementPolicy>(NodeId::new(origin), "flotilla")
+            .replace(&source.using::<PlacementPolicy>("flotilla").list().await.expect("local policies"), synced_at)
+            .await
+            .expect("replicate policies");
+    }
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let left = default_convoy_placement_policy(&kiwi, "flotilla", None, &[], &workflow, None).await.expect("kiwi candidates");
+    let right = default_convoy_placement_policy(&feta, "flotilla", None, &[], &workflow, None).await.expect("feta candidates");
+    assert_eq!(left.refused_candidates, right.refused_candidates);
+    assert_eq!(left.refused_candidates.iter().map(|candidate| candidate.policy_name.as_str()).collect::<Vec<_>>(), vec![
+        "feta-policy",
+        "kiwi-policy"
+    ]);
+    for backend in [&kiwi, &feta] {
+        assert_eq!(backend.using::<PlacementPolicy>("flotilla").list().await.expect("controller view").items.len(), 1);
+    }
+    let replica = kiwi.including_replicas::<PlacementPolicy>("flotilla").get("feta-policy").await.expect("replica provenance");
+    assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: NodeId::new("feta-root"), last_synced_at: synced_at });
 }
 
 #[tokio::test]
