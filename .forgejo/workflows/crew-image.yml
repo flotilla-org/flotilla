@@ -1,0 +1,121 @@
+name: Build crew image
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_version:
+        description: '@openai/codex npm version'
+        required: true
+        type: string
+        default: '0.156.1'
+      claude_code_version:
+        description: '@anthropic-ai/claude-code npm version'
+        required: true
+        type: string
+        default: '2.1.280'
+      tea_version:
+        description: tea (Forgejo/Gitea CLI) release version
+        required: true
+        type: string
+        default: '0.16.0'
+      cleat_ref:
+        description: Exact 40-character commit from flotilla-org/cleat
+        required: true
+        type: string
+        default: '2694b71c593868af3b289a04ed6e468979c236bc'
+      zig_version:
+        description: "Zig version matching cleat_ref's ghostty-vt toolchain pin (see issue 1881)"
+        required: true
+        type: string
+        default: '0.15.2'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crew-image-${{ inputs.codex_version }}-${{ inputs.claude_code_version }}-${{ inputs.tea_version }}-${{ inputs.cleat_ref }}-${{ inputs.zig_version }}
+  cancel-in-progress: false
+
+env:
+  CREW_IMAGE_REPOSITORY: forgejo.lab.flotilla.work/image-builder/flotilla-crew
+
+jobs:
+  build:
+    name: Build and push the crew image
+    runs-on: crew-image-builder
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repository
+        uses: https://data.forgejo.org/actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Verify the buildx builder covers both platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          inspection="$(docker buildx inspect --bootstrap)"
+          echo "$inspection"
+          echo "$inspection" | grep -q 'linux/amd64'
+          echo "$inspection" | grep -q 'linux/arm64'
+
+      - name: Compute the release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(printf '%s' "${FORGEJO_SHA}" | cut -c1-8)"
+          tag="$(date -u +%Y-%m-%d).${short_sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+        env:
+          FORGEJO_SHA: ${{ forgejo.sha }}
+
+      - name: Log in to the lab registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${IMAGE_BUILDER_TOKEN}" \
+            | docker login forgejo.lab.flotilla.work --username image-builder --password-stdin
+        env:
+          IMAGE_BUILDER_TOKEN: ${{ secrets.IMAGE_BUILDER_TOKEN }}
+
+      - name: Build and push the multi-arch crew image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${CREW_IMAGE_REPOSITORY}:${{ steps.tag.outputs.tag }}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file .flotilla/Dockerfile.crew \
+            --build-arg CODEX_VERSION="${{ inputs.codex_version }}" \
+            --build-arg CLAUDE_CODE_VERSION="${{ inputs.claude_code_version }}" \
+            --build-arg TEA_VERSION="${{ inputs.tea_version }}" \
+            --build-arg CLEAT_REF="${{ inputs.cleat_ref }}" \
+            --build-arg ZIG_VERSION="${{ inputs.zig_version }}" \
+            --tag "$image" \
+            --push \
+            .
+          echo "CREW_IMAGE=${image}" >> "$GITHUB_ENV"
+
+      # The Dockerfile's own build-time RUN steps (claude/codex/tea --version,
+      # the clang+lld C-toolchain link-and-run check) already gate every
+      # platform during the build above. This step re-pulls the pushed
+      # manifest and re-runs the adapter checks against the exact bytes that
+      # were published, on the runner's native architecture.
+      - name: Verify the pushed image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$CREW_IMAGE"
+          docker run --rm "$CREW_IMAGE" claude --version
+          docker run --rm "$CREW_IMAGE" codex --version
+          docker run --rm "$CREW_IMAGE" tea --version
+          docker run --rm "$CREW_IMAGE" python3 --version
+
+      - name: Report the pushed tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Pushed ${CREW_IMAGE}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "The placement-policy retag (per host) is a follow-on, human-triggered step; see docs/crew-image.md." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

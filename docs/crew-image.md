@@ -91,8 +91,32 @@ fastest-changing:
 4. the cleat terminal runtime;
 5. Claude Code and Codex.
 
-From the repository root, a builder with amd64 and arm64 workers can publish
-the release with:
+**The `Build crew image` Forgejo Actions workflow does this.** Dispatch it
+from the repository's Actions tab on the lab Forgejo mirror
+(`.forgejo/workflows/crew-image.yml`) with `codex_version`,
+`claude_code_version`, `tea_version`, `cleat_ref`, and `zig_version` inputs —
+each defaults to the pin already baked into `.flotilla/Dockerfile.crew`, so a
+routine bump is just overriding the one input that changed. The workflow:
+
+- runs a multi-arch (`linux/amd64,linux/arm64`) `docker buildx build --push`
+  of `.flotilla/Dockerfile.crew` on the `crew-image-builder` runner (see
+  `ci/fork-actions/RUNNERS.md`);
+- gates on the Dockerfile's own build-time smoke checks (`claude`, `codex`,
+  `tea`, and the C toolchain), which run for both platforms as part of the
+  build, then re-verifies the pushed manifest by pulling it back and
+  re-running the adapter version checks;
+- authenticates to the registry with the `image-builder` `write:package`
+  identity via the `IMAGE_BUILDER_TOKEN` repository secret — the recipe
+  itself never sees a credential;
+- pushes an explicit `<date>.<short-sha>` tag (e.g. `2026-09-23.3f6f111e`),
+  derived from the triggering commit, and reports it in the run summary.
+
+Retagging a placement policy to the newly pushed tag is a deliberate,
+separate, human-triggered follow-on step (see Placement policy below) — the
+workflow does not do it.
+
+Manual `docker buildx build --push` from a build host with both amd64 and
+arm64 workers remains the fallback when the CI runner is unavailable:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1

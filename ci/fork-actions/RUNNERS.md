@@ -99,7 +99,47 @@ runner's non-interactive service context that the identity is visible, a copied
 system binary can be signed and strictly verified, and the SDK directory is
 readable.
 
-## 4. Activate and prove
+## 4. Crew image builder
+
+Unlike the fleet release runners above, `.forgejo/workflows/crew-image.yml`
+lives directly in this repository's active workflow directory (not the
+`ci/fork-actions` bundle) and runs on the lab mirror of
+`flotilla-org/flotilla` itself — see #1915. It replaces the manual
+`docker buildx build --push` described in `docs/crew-image.md`.
+
+Register the existing crew-image build host — the same host already used for
+today's hand-run `docker buildx build --push` with amd64 and arm64 workers —
+as a Forgejo Runner with:
+
+```yaml
+runner:
+  labels:
+    - crew-image-builder:host
+```
+
+Host execution, not `docker://`, because the job needs the runner's own
+Docker daemon and its already-configured multi-node buildx builder (the "both
+amd64 and arm64 workers" from the manual recipe), not a nested container. The
+account running the runner service must have:
+
+- Docker with the `buildx` plugin and a default builder whose nodes already
+  cover `linux/amd64` and `linux/arm64` (`docker buildx inspect --bootstrap`
+  must list both platforms — the workflow asserts this before building);
+- no local registry credential baked into the service account. The workflow
+  logs in itself, per dispatch, using the repository secret below.
+
+Add a repository (or organization) Actions secret named `IMAGE_BUILDER_TOKEN`
+holding the existing `image-builder` user's `write:package` PAT — the same
+identity used for today's hand-done registry login. This is the one place
+that credential is allowed to live outside a human's local Docker config; it
+never goes in the Dockerfile recipe or in this document.
+
+Start the runner as a supervised service and confirm the repository's runner
+page shows `crew-image-builder` online, then dispatch the workflow once by
+hand to prove a pushed multi-arch manifest and a green smoke-check gate
+before relying on it for routine bumps.
+
+## 5. Activate and prove
 
 1. Copy `runtime/` and the repository's template workflows as described in the
    README.
@@ -113,5 +153,7 @@ readable.
    and check the Flotilla binary wire generation.
 6. Only then allow slice 2 to pin the Forgejo release assets.
 
-Runner cache pruning and service monitoring are ongoing operator duties. The
-workflow deliberately does not build or push a crew image.
+Runner cache pruning and service monitoring are ongoing operator duties.
+Building and pushing the crew image is `crew-image.yml`'s job (§4), on its
+own `crew-image-builder` runner — deliberately separate from the fleet
+release runners this checklist otherwise covers.

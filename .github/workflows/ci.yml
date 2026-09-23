@@ -36,6 +36,8 @@ jobs:
         run: |
           ci/fleet-candidates/test-workflow.sh
           scripts/test-fleet-install.sh
+      - name: Test crew image workflow contract
+        run: ci/crew-image/test-workflow.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
