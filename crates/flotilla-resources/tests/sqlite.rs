@@ -477,7 +477,7 @@ async fn authoritative_name_tombstone_survives_backend_restart() {
 }
 
 #[tokio::test]
-async fn raw_delete_removes_real_pending_terminal_row_and_prevents_relay_resurrection() {
+async fn raw_delete_preserves_finalization_then_prevents_relay_resurrection() {
     // Extracted read-only from feta's resource_objects table on 2026-08-12.
     // The fixture preserves the stored row shape and values; only the opaque
     // brief body was elided because it has no resource-store semantics.
@@ -517,8 +517,14 @@ async fn raw_delete_removes_real_pending_terminal_row_and_prevents_relay_resurre
 
     let deleted = flotilla_resources::delete_resource_kind(&authority, "flotilla", "terminalsessions", NAME)
         .await
-        .expect("raw delete should force abandoned finalization");
+        .expect("raw delete should request finalization");
     assert!(!deleted.already_deleted);
+    let pending = terminals.get(NAME).await.expect("raw delete preserves finalizers");
+    assert!(pending.metadata.is_pending_finalization());
+    let mut meta = InputMeta::from(&pending.metadata);
+    meta.finalizers.clear();
+    terminals.update(&meta, &pending.metadata.resource_version, &pending.spec).await.expect("simulate finalizer completion");
+    flotilla_resources::delete_resource_kind(&authority, "flotilla", "terminalsessions", NAME).await.expect("retain name tombstone");
     assert!(matches!(terminals.get(NAME).await, Err(ResourceError::NotFound { .. })));
 
     let mut delete_events = Vec::new();

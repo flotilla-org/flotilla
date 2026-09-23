@@ -226,7 +226,7 @@ impl Harness {
         writer.apply(WatchEvent::Added(prior.clone()), fixed_time(2)).await.expect("seed prior-run add");
         writer.apply(WatchEvent::Deleted(prior), fixed_time(3)).await.expect("seed prior-run tombstone");
 
-        // An abandoned finalizer is removed only by the raw-delete recovery path.
+        // A finalizer must drain before raw deletion can propagate.
         self.nodes[2]
             .backend
             .using::<Host>(NAMESPACE)
@@ -332,6 +332,17 @@ impl Harness {
                 let name = format!("host-{index}");
                 let first =
                     delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
+                let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
+                if let Ok(pending) = resolver.get(&name).await {
+                    if !pending.metadata.is_pending_finalization() {
+                        return Err(format!("raw delete of {name} did not request finalization"));
+                    }
+                    // Model the owning controller completing its cleanup.
+                    let mut meta = InputMeta::from(&pending.metadata);
+                    meta.finalizers.clear();
+                    resolver.update(&meta, &pending.metadata.resource_version, &pending.spec).await.map_err(|error| error.to_string())?;
+                    delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
+                }
                 let repeated =
                     delete_resource_kind(&self.nodes[index].backend, NAMESPACE, "hosts", &name).await.map_err(|error| error.to_string())?;
                 if first.already_deleted {

@@ -19,6 +19,7 @@ mod in_memory;
 mod labels;
 mod landing_gate;
 mod leaf;
+mod owner_gc;
 mod placement_policy;
 mod prepared_snapshot;
 mod presentation;
@@ -105,6 +106,7 @@ pub use leaf::{
     admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
     UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
+pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec,

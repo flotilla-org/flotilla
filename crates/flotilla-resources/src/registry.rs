@@ -402,6 +402,52 @@ pub async fn get_resource_kind_including_replicas(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_typed_including_replicas(backend, namespace, name).await)
 }
 
+/// Collect only children authored here, never replica rows. A deleted owner
+/// filter makes the normal path precise; `None` is restart/backstop recovery.
+pub(crate) async fn collect_owned_resources(
+    backend: &ResourceBackend,
+    namespace: &str,
+    deleted_owner: Option<&OwnerReference>,
+) -> Result<(), ResourceError> {
+    for kind in REGISTERED_RESOURCE_KINDS {
+        dispatch_resource_kind!(kind.resource, collect_owned_typed(backend, namespace, deleted_owner).await)?;
+    }
+    Ok(())
+}
+
+async fn collect_owned_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    deleted_owner: Option<&OwnerReference>,
+) -> Result<(), ResourceError> {
+    let resolver = backend.using::<T>(namespace);
+    for child in resolver.list().await?.items {
+        if matches!(child.metadata.lifecycle_authority()?, Some(crate::LifecycleAuthority::Observed | crate::LifecycleAuthority::Adopted)) {
+            continue;
+        }
+        for owner in &child.metadata.owner_references {
+            if !owner.controller || deleted_owner.is_some_and(|deleted| deleted != owner) {
+                continue;
+            }
+            // Unknown groups/kinds are not evidence of an absent owner.
+            if owner.api_version != "flotilla.work/v1" || !REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind) {
+                continue;
+            }
+            match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {
+                Ok(_) => continue, // Also protects a replacement or another surviving authority.
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+            match resolver.delete(&child.metadata.name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub async fn delete_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -744,10 +790,20 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
                     already_deleted: false,
                 });
             }
-            force_pending_finalization(&resolver, name).await?;
             match resolver.get(name).await {
                 Err(ResourceError::NotFound { .. }) => {}
-                Ok(_) => return Err(ResourceError::other(format!("delete reported success but {name} remains in the resource store"))),
+                Ok(pending) if pending.metadata.deletion_timestamp.is_some() => {
+                    return Ok(DynamicResourceDelete {
+                        object: DynamicResourceObject {
+                            kind: T::API_PATHS.kind.to_string(),
+                            plural: T::API_PATHS.plural.to_string(),
+                            namespace: namespace.to_string(),
+                            value: object_value(&pending)?,
+                        },
+                        already_deleted: false,
+                    })
+                }
+                Ok(_) => return Err(ResourceError::conflict(name, "resource was recreated during deletion")),
                 Err(error) => return Err(error),
             }
             if T::REPLICATION_CLASS != crate::ReplicationClass::None {
@@ -787,33 +843,6 @@ async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, n
         },
         already_deleted,
     })
-}
-
-/// Raw resource deletion is the recovery path documented in the governor
-/// charter, so it must not leave an object stuck behind an abandoned
-/// finalizer. Ordinary controller deletion still goes through
-/// `TypedResolver::delete` and retains normal finalizer semantics.
-async fn force_pending_finalization<T: Resource>(resolver: &crate::TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
-    for _ in 0..3 {
-        let object = match resolver.get(name).await {
-            Err(ResourceError::NotFound { .. }) => return Ok(()),
-            Ok(object) => object,
-            Err(error) => return Err(error),
-        };
-        if !object.metadata.is_pending_finalization() {
-            return Err(ResourceError::other(format!("delete left {name} present without pending finalizers")));
-        }
-
-        let mut meta = InputMeta::from(&object.metadata);
-        meta.finalizers.clear();
-        match resolver.update(&meta, &object.metadata.resource_version, &object.spec).await {
-            Ok(_) => return Ok(()),
-            Err(ResourceError::Conflict { .. }) => continue,
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(ResourceError::conflict(name, "finalizer removal retry budget exhausted"))
 }
 
 async fn retain_authoritative_name_tombstone<T: Resource>(

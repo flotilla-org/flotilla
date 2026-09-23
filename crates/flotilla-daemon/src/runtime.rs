@@ -2162,7 +2162,20 @@ fn spawn_controller_loops(
         }};
     }
 
+    let gc_backend = backend.clone();
+    let gc_namespace = namespace_string.clone();
+    let gc_supervision = supervision.clone();
+    let gc_health = runtime_health.clone();
+    let gc = tokio::spawn(async move {
+        supervise_controller("owner_gc", gc_supervision, gc_health, move || {
+            let collector = flotilla_resources::OwnerGarbageCollector::new(gc_backend.clone(), gc_namespace.clone());
+            async move { collector.run(controller_resync_interval).await }
+        })
+        .await;
+    });
+
     vec![
+        gc,
         spawn_vessel_placement_projector(
             backend.clone(),
             namespace_string.clone(),
@@ -9000,7 +9013,7 @@ mod tests {
         let controller_handles = spawn_controller_loops(
             Arc::clone(&state),
             NAMESPACE,
-            Duration::from_millis(25),
+            Duration::from_secs(3600),
             ControllerSupervision::default(),
             RuntimeHealth::default(),
         );
@@ -9185,6 +9198,14 @@ mod tests {
                         && workspaces.list().await.is_ok_and(|list| list.items.is_empty())
                         && !Path::new(&checkout_path).exists()
                 }
+            })
+            .await;
+        }
+
+        if matches!(completion_action, CompletionAction::Delete) {
+            wait_until(|| {
+                let terminals = backend.using::<TerminalSession>(NAMESPACE);
+                async move { terminals.list().await.is_ok_and(|list| list.items.is_empty()) }
             })
             .await;
         }
