@@ -3117,15 +3117,19 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 )
                 .await?;
         } else if let Some(base_ref) = base_ref {
-            let local_base_ref = format!("refs/heads/{base_ref}");
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
+            if runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok() {
+                let refspec = format!("{base_ref}:refs/remotes/origin/{base_ref}");
+                if let Err(error) =
+                    runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default).await
+                {
+                    warn!(%base_ref, %error, "fetch convoy base ref failed; falling back to local ref for branch-off");
+                }
+            }
+            // A shared clone always has a local base_ref from its initial clone, but
+            // nothing keeps it advancing — prefer the freshly fetched remote tip and
+            // only fall back to the local ref when origin has no such branch.
             let resolved_base_ref = if runner
-                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .is_ok()
-            {
-                base_ref.to_string()
-            } else if runner
                 .run(
                     "git",
                     &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref],
@@ -6289,6 +6293,79 @@ mod tests {
             .expect("git should run");
         assert!(branch.status.success());
         assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/multi-repo");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_branches_convoy_off_fetched_origin_tip_when_local_base_is_stale() {
+        let temp = TempDir::new().expect("tempdir");
+        let origin = TestGitRepo::init(temp.path().join("origin")).with_initial_commit();
+        let origin_path = origin.path().to_str().expect("utf-8 origin path");
+
+        let clone_path_buf = temp.path().join("clone");
+        let clone_path = clone_path_buf.to_str().expect("utf-8 clone path");
+        assert!(ProcessCommand::new("git").args(["clone", origin_path, clone_path]).status().expect("git clone should run").success());
+
+        // Advance origin's main past what the shared clone saw at clone time; nothing
+        // ever fetches or fast-forwards a shared clone's local main on its own.
+        fs::write(origin.path().join("advance.txt"), "advance\n").expect("write advance file");
+        assert!(ProcessCommand::new("git").args(["-C", origin_path, "add", "advance.txt"]).status().expect("git add should run").success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", origin_path, "commit", "-m", "advance main"])
+            .status()
+            .expect("git commit should run")
+            .success());
+        let origin_tip =
+            ProcessCommand::new("git").args(["-C", origin_path, "rev-parse", "main"]).output().expect("git rev-parse should run");
+        let origin_tip = String::from_utf8(origin_tip.stdout).expect("utf-8 rev").trim().to_string();
+
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+
+        runtime
+            .create_worktree(clone_path, "feature/fresh-from-origin", Some("main"), target.to_str().expect("utf-8 target path"))
+            .await
+            .expect("worktree should create");
+
+        let head = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse should run");
+        let head = String::from_utf8(head.stdout).expect("utf-8 head").trim().to_string();
+
+        assert_eq!(
+            head, origin_tip,
+            "fresh convoy branch should start from the fetched origin tip, not the shared clone's stale local main"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_falls_back_to_local_base_ref_when_fetch_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        // A reachable but empty origin: `git remote get-url` and `ls-remote` for the
+        // (nonexistent) convoy branch succeed, but fetching `main` fails because origin
+        // never advertises it — exercising the same fetch-error path as an offline host.
+        let origin = TestGitRepo::init(temp.path().join("origin"));
+        let clone = TestGitRepo::init(temp.path().join("clone"))
+            .with_initial_commit()
+            .with_origin(origin.path().to_str().expect("utf-8 origin path"));
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/offline",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should still create when fetching the base ref fails");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/offline");
     }
 
     #[tokio::test]
