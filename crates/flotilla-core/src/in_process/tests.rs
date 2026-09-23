@@ -960,6 +960,7 @@ async fn standing_ensure_fixture_for(
                     stance: Some(Stance::Trusted),
                     repositories: vec![repository_key],
                     presents_as: Some("fleet".to_string()),
+                    agent_overrides: Vec::new(),
                 },
             )
             .await
@@ -1032,6 +1033,82 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
         .await
         .expect("fail generation");
     convoy.metadata.name
+}
+
+async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: Vec<flotilla_protocol::AgentOverride>) {
+    create_docker_placement(backend, "standing-agent", "standing-agent-host", BTreeSet::new()).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("standing-agent-host").await.expect("standing agent host");
+    let mut status = host.status.expect("standing agent host status");
+    status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
+    status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
+    hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host capacity");
+    let workflows = backend.using::<WorkflowTemplate>("flotilla");
+    let mut workflow = workflows.get("standing-project--quartermaster").await.expect("standing workflow");
+    workflow.spec.vessels[0].crew = vec![CrewSpec::builder()
+        .role("governor".to_string())
+        .source(CrewSource::Agent {
+            selector: Selector { capability: "governor".to_string(), adapter: Some("codex".to_string()), model: None },
+            prompt: None,
+            brief_template: None,
+        })
+        .build()];
+    workflows
+        .update(&InputMeta::from(&workflow.metadata), &workflow.metadata.resource_version, &workflow.spec)
+        .await
+        .expect("update standing workflow");
+
+    let ensures = backend.using::<ConvoyEnsure>("flotilla");
+    let mut ensure = ensures.get("quartermaster").await.expect("standing ensure");
+    ensure.spec.placement_policy = Some("standing-agent".to_string());
+    ensure.spec.stance = Some(Stance::Contained);
+    ensure.spec.agent_overrides = overrides;
+    ensures
+        .update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &ensure.spec)
+        .await
+        .expect("update standing ensure");
+}
+
+async fn admitted_standing_workflow(daemon: &InProcessDaemon, backend: &ResourceBackend) -> WorkflowTemplateSpec {
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit standing convoy");
+    let convoy = backend
+        .using::<ResourceConvoy>("flotilla")
+        .list()
+        .await
+        .expect("list admitted convoys")
+        .items
+        .into_iter()
+        .next()
+        .expect("admitted convoy");
+    let snapshot = convoy.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("workflow snapshot annotation");
+    backend.using::<WorkflowTemplate>("flotilla").get(snapshot).await.expect("workflow snapshot").spec
+}
+
+#[tokio::test]
+async fn standing_ensure_applies_agent_overrides_to_the_admitted_workflow_snapshot() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    configure_standing_ensure_agent(&backend, vec![flotilla_protocol::AgentOverride {
+        capability: "governor".to_string(),
+        adapter: "codex".to_string(),
+        model: Some("fable".to_string()),
+    }])
+    .await;
+
+    let workflow = admitted_standing_workflow(&daemon, &backend).await;
+    let CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else { panic!("governor must remain an agent") };
+    assert_eq!(selector.adapter.as_deref(), Some("codex"));
+    assert_eq!(selector.model.as_deref(), Some("fable"));
+}
+
+#[tokio::test]
+async fn standing_ensure_without_agent_overrides_preserves_the_workflow_selector() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    configure_standing_ensure_agent(&backend, Vec::new()).await;
+
+    let workflow = admitted_standing_workflow(&daemon, &backend).await;
+    let CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else { panic!("governor must remain an agent") };
+    assert_eq!(selector.adapter.as_deref(), Some("codex"));
+    assert_eq!(selector.model, None);
 }
 
 #[tokio::test]
@@ -1725,6 +1802,7 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
                 stance: Some(Stance::Trusted),
                 repositories: vec![repository_key.clone()],
                 presents_as: None,
+                agent_overrides: Vec::new(),
             },
         )
         .await

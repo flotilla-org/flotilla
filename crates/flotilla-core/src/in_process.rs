@@ -5517,6 +5517,7 @@ impl InProcessDaemon {
             .branch(ensure.spec.role.clone())
             .workflow_ref(ensure.spec.workflow_ref.clone())
             .maybe_placement_policy(ensure.spec.placement_policy.clone())
+            .agent_overrides(ensure.spec.agent_overrides.clone())
             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
             .build();
         let mut admission = self
@@ -6593,6 +6594,7 @@ impl InProcessDaemon {
                         stance: ensure.stance,
                         repositories: targets,
                         presents_as: ensure.presents_as,
+                        agent_overrides: Vec::new(),
                     };
                     if ensures.insert(ensure_name, (meta, spec)).is_some() {
                         return Err(format!("duplicate standing convoy role `{role}` in project `{project_name}`"));
