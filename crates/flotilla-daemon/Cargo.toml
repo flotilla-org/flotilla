@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 serde_yml = "0.0.12"
 async-trait = { workspace = true }
 tracing = { workspace = true }
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
@@ -39,6 +40,8 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+bytes = "1"
+http = "1"
 flotilla-test-support = { path = "../flotilla-test-support" }
 indexmap = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }

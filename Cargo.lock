@@ -1254,7 +1254,9 @@ name = "flotilla-daemon"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bon",
+ "bytes",
  "chrono",
  "flotilla-client",
  "flotilla-controllers",
@@ -1265,6 +1267,7 @@ dependencies = [
  "flotilla-test-support",
  "flotilla-transport",
  "futures",
+ "http",
  "indexmap",
  "jsonwebtoken",
  "libc",
