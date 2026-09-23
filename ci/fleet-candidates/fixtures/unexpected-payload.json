@@ -20,6 +20,7 @@
     "install.sh",
     "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
+    "share/flotilla/codex-home/config.toml",
     "etc/passwd"
   ],
   "skill_bundle": {

@@ -1,0 +1,29 @@
+# Generation-provided `CODEX_HOME` template (flotilla-org/flotilla#1913).
+#
+# This directory is baked into a fleet generation at
+# `share/flotilla/codex-home` and pointed at by `FLOTILLA_CODEX_HOME_TEMPLATE`
+# (`scripts/fleet-install`). At provision, `CodexMaterialAdapter::seed_scratch`
+# (`crates/flotilla-daemon/src/agent_material.rs`) copies every top-level entry
+# into the crew's `CODEX_HOME`, skipping entries the crew already has — so a
+# resumed crew keeps its own `sessions/`, history, and any local edits to this
+# file.
+#
+# The template is credential-free by contract: `auth.json` is host-owned
+# credential material, delivered separately as a read-only `0400` copy of the
+# single central login, and a generation carrying one under this directory
+# fails generation validation.
+#
+# Two things deliberately do not live here:
+#
+#   * `skills/` — skill staging owns that directory outright, replacing it
+#     wholesale from the generation-pinned skill bundle on every provision, so
+#     anything seeded here would be discarded.
+#   * Settings a crew already receives elsewhere — the model comes from
+#     `--model` at dispatch, sandbox and approval policy from Codex's launch
+#     flags, and per-workspace `[projects]` trust is written by the agent
+#     adapter at prepare time.
+#
+# What belongs here is fleet-wide Codex configuration that is the same for
+# every crew and is not supplied by any of those paths. There is none today,
+# so this file carries no settings — it is the pinned, editable base a crew
+# starts from.

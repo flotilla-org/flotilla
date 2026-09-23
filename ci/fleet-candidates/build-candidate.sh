@@ -135,6 +135,15 @@ PY
 
 python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle/.flotilla-sources.json"
 
+# The credential-free CODEX_HOME template each crew's scratch is seeded from
+# (flotilla-org/flotilla#1913). It ships as generation payload, pinned to the
+# flotilla source SHA like the rest of the bundle, and `scripts/fleet-install`
+# points FLOTILLA_CODEX_HOME_TEMPLATE at it.
+codex_home_bundle="$bundle/share/flotilla/codex-home"
+mkdir -p "$codex_home_bundle"
+cp -R "$flotilla_root/share/flotilla/codex-home/." "$codex_home_bundle/"
+python3 "$(dirname "$0")/generation_validation.py" codex-home "$codex_home_bundle"
+
 (
   cd "$flotilla_root"
   export FLOTILLA_BUILD_ID="${flotilla_sha:0:12}"
