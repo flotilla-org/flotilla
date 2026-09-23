@@ -91,8 +91,42 @@ fastest-changing:
 4. the cleat terminal runtime;
 5. Claude Code and Codex.
 
-From the repository root, a builder with amd64 and arm64 workers can publish
-the release with:
+**The `Build crew image` Forgejo Actions workflow does this.** Dispatch it
+from the repository's Actions tab on the lab Forgejo mirror
+(`.forgejo/workflows/crew-image.yml`) with `codex_version`,
+`claude_code_version`, `tea_version`, `cleat_ref`, and `zig_version` inputs —
+each defaults to the pin already baked into `.flotilla/Dockerfile.crew`, so a
+routine bump is just overriding the one input that changed. The workflow:
+
+- runs a multi-arch (`linux/amd64,linux/arm64`) `docker buildx build --push`
+  of `.flotilla/Dockerfile.crew` on the `crew-image-builder` runner (see
+  `ci/fork-actions/RUNNERS.md`);
+- gates on the Dockerfile's own build-time smoke checks (`claude`, `codex`,
+  `tea`, and the C toolchain), which run for both platforms as part of the
+  build, then re-verifies the pushed manifest by pulling it back and
+  re-running the adapter version checks;
+- authenticates to the registry with the `image-builder` `write:package`
+  identity via the `IMAGE_BUILDER_TOKEN` repository secret — the recipe
+  itself never sees a credential, and the workflow logs back out of the
+  registry when the job ends;
+- pushes an explicit `<date>.<short-sha>.<input-hash>` tag (e.g.
+  `2026-09-23.3f6f111e.cfce0cb5`), where `<short-sha>` is the triggering
+  commit and `<input-hash>` is a short hash of the five version inputs. The
+  input hash matters because a routine bump is *just* overriding one input,
+  with no new commit — without it, two same-day dispatches against the same
+  commit but different versions would collide on one tag and silently
+  overwrite each other in the registry.
+
+Retagging a placement policy to the newly pushed tag is a deliberate,
+separate, human-triggered follow-on step (see Placement policy below) — the
+workflow does not do it.
+
+Manual `docker buildx build --push` from a build host with both amd64 and
+arm64 workers remains the fallback when the CI runner is unavailable. The
+currently deployed tag below predates the workflow and follows the older
+`<date>.<sequence>` scheme; a fresh manual build should follow the workflow's
+`<date>.<short-sha>.<input-hash>` scheme instead so the two paths can't mint
+colliding tags:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
@@ -116,7 +150,9 @@ to `forgejo.lab.flotilla.work` on the build host before publishing.
 ## Verify
 
 Pull the published image rather than relying on the local build cache, then
-run both adapter entry points:
+run both adapter entry points. `2026-08-25.1` below is the currently deployed
+tag, from before the CI workflow existed — a freshly built image will carry
+the `<date>.<short-sha>.<input-hash>` tag described above instead:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
