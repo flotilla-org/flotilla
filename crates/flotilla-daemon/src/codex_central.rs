@@ -15,7 +15,6 @@
 //! path the crew-material pool can hand out — see [`codex_central_auth_path`].
 
 use std::{
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -167,14 +166,21 @@ pub(crate) struct CodexCentralRefresher {
 }
 
 impl CodexCentralRefresher {
-    pub(crate) fn new(auth_path: PathBuf) -> Self {
+    /// Honors the same `CODEX_REFRESH_TOKEN_URL_OVERRIDE` /
+    /// `CODEX_APP_SERVER_LOGIN_CLIENT_ID` overrides codex-rs and
+    /// `scripts/codex-token-refresh` do, so this and a real `codex` CLI
+    /// agree on where to refresh against without inventing new knobs.
+    pub(crate) fn new(auth_path: PathBuf, env: &dyn EnvVars) -> Self {
+        let token_url =
+            env.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE").filter(|value| !value.is_empty()).unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string());
+        let client_id = env
+            .get("CODEX_APP_SERVER_LOGIN_CLIENT_ID")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
         Self::new_with_refresher(
             auth_path,
-            Arc::new(RealCodexTokenRefresher {
-                http: Arc::new(ReqwestHttpClient::new()),
-                token_url: DEFAULT_TOKEN_URL.to_string(),
-                client_id: DEFAULT_CLIENT_ID.to_string(),
-            }),
+            Arc::new(RealCodexTokenRefresher { http: Arc::new(ReqwestHttpClient::new()), token_url, client_id }),
         )
     }
 
@@ -243,8 +249,10 @@ async fn write_auth_atomic(path: &Path, auth: &Value) -> Result<(), CodexRefresh
     contents.push(b'\n');
     let temp_path = directory.join(format!(".auth.json.{}.tmp", uuid::Uuid::new_v4()));
     let result = async {
-        let mut file = tokio::fs::File::create(&temp_path).await?;
-        tokio::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).await?;
+        // `.mode(0o600)` on the open, not a follow-up `set_permissions` call,
+        // so the file never briefly exists at the default (group/other
+        // readable) mode — it holds the freshly rotated OAuth tokens.
+        let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp_path).await?;
         file.write_all(&contents).await?;
         file.sync_all().await
     }
@@ -270,7 +278,7 @@ fn decode_jwt_exp(token: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex as StdMutex};
+    use std::{collections::VecDeque, os::unix::fs::PermissionsExt, sync::Mutex as StdMutex};
 
     use chrono::Duration;
     use tempfile::TempDir;
@@ -335,6 +343,8 @@ mod tests {
         assert_eq!(rotated["tokens"]["refresh_token"], "refresh-token-two");
         assert_eq!(rotated["tokens"]["id_token"], "id-token-original", "fields absent from the response are left untouched");
         assert!(rotated["last_refresh"].is_string());
+        let mode = std::fs::metadata(&path).expect("rotated auth metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rotated file must never be group/other readable, even briefly");
     }
 
     #[tokio::test]

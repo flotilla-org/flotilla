@@ -1518,7 +1518,7 @@ fn spawn_heartbeat_task_with_credentials(
 /// this task is always the sole writer of the file; a crew lease can never
 /// be handed the same `auth.json` a refresh is rotating.
 fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: Duration) -> JoinHandle<()> {
-    let refresher = Arc::new(CodexCentralRefresher::new(codex_central_auth_path(&*env)));
+    let refresher = Arc::new(CodexCentralRefresher::new(codex_central_auth_path(&*env), &*env));
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let refresher = Arc::clone(&refresher);
         async move {
