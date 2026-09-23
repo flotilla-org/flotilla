@@ -216,6 +216,18 @@ impl AgentMaterialRegistry {
         self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
+    pub(crate) async fn describe(&self, environment_ref: &str) -> Result<Vec<String>, String> {
+        let holder_ref = self.holder_ref(environment_ref);
+        let leases = self.pools.leases_for_holder(&holder_ref).await?;
+        Ok(leases
+            .into_iter()
+            .map(|(pool_ref, unit_name, unit)| {
+                let slot = PathBuf::from(unit.directory).file_name().and_then(|name| name.to_str()).unwrap_or(&unit_name).to_string();
+                format!("credential {pool_ref} slot {slot}")
+            })
+            .collect())
+    }
+
     pub(crate) async fn remove_environment_home(&self, environment_ref: &str) -> Result<(), String> {
         let home = self.homes_dir.join(environment_ref);
         match fs::remove_dir_all(&home).await {

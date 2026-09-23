@@ -76,6 +76,12 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Option<TerminalObservation>, String> {
         Ok(None)
     }
+    async fn observe_failure(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn cleanup_failed_session(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
     async fn deliver_message(
         &self,
         _session_id: &str,
@@ -249,6 +255,10 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        if phase == TerminalSessionPhase::Failed {
+            self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
+            return Ok(TerminalPrepared::None);
+        }
         if phase == TerminalSessionPhase::Running {
             let session_id = obj
                 .status
@@ -258,6 +268,9 @@ where
             let running = self.runtime.session_is_running(session_id, &obj.spec).await.map_err(ResourceError::other)?;
             if !running {
                 return Ok(TerminalPrepared::Stopped);
+            }
+            if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                return Ok(TerminalPrepared::Failed(message));
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
@@ -384,6 +397,9 @@ where
                 })
             }
             TerminalSessionPhase::Running => match prepared {
+                TerminalPrepared::Failed(message) => {
+                    Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
+                }
                 TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }

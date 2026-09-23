@@ -1370,3 +1370,66 @@ impl TerminalRuntime for HooklessTerminalRuntime {
         Ok(())
     }
 }
+
+struct AuthFailedTerminalRuntime;
+
+#[async_trait]
+impl TerminalRuntime for AuthFailedTerminalRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("running sessions should not be ensured")
+    }
+
+    async fn observe_failure(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+        Ok(Some(
+            "Codex authentication failed for credential codex-login slot slot-4: token_expired; access token could not be refreshed".into(),
+        ))
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn fatal_runtime_observation_fails_a_running_terminal_with_the_credential_slot() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".to_string(),
+            role: "coder".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "codex".to_string() },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "session-a".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "codex".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(AuthFailedTerminalRuntime), backend, "flotilla");
+
+    let prepared = reconciler.prepare(&session).await.expect("observe auth failure");
+    let patch = reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("failure patch");
+    patch.apply(&mut status);
+
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
+    let message = status.message.expect("failure reason");
+    assert!(message.contains("codex-login"));
+    assert!(message.contains("slot-4"));
+    assert!(message.contains("token_expired"));
+}
