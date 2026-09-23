@@ -48,6 +48,13 @@ jobs:
           python3 -m unittest scripts.tests.test_dag_fetch
           python3 -m unittest scripts.tests.test_dag_compose
 
+  codex-token-refresh:
+    name: codex-token-refresh script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest scripts.tests.test_codex_token_refresh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
