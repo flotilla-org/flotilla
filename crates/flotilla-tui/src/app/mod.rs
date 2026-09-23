@@ -436,6 +436,57 @@ pub(crate) struct RecentCommandFinish {
     row_error_message: Option<String>,
 }
 
+/// Command lifecycle events are broadcast to every TUI. Only the TUI that
+/// dispatched a command may run its local terminal attach effect. The finish
+/// event can arrive before the execute acknowledgement supplies its ID.
+#[derive(Default)]
+pub(crate) struct LocalAttachEffects {
+    pending_acks: usize,
+    acknowledged: HashSet<u64>,
+    finished_before_ack: HashMap<u64, Option<flotilla_protocol::ResolvedAttachPlan>>,
+}
+
+impl LocalAttachEffects {
+    pub(crate) fn begin(&mut self) {
+        self.pending_acks += 1;
+    }
+
+    pub(crate) fn acknowledge(&mut self, result: &Result<u64, String>) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+        if self.pending_acks == 0 {
+            return None;
+        }
+        self.pending_acks -= 1;
+        let plan = match result {
+            Ok(command_id) => match self.finished_before_ack.remove(command_id) {
+                Some(plan) => plan,
+                None => {
+                    self.acknowledged.insert(*command_id);
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if self.pending_acks == 0 {
+            self.finished_before_ack.clear();
+        }
+        plan
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        command_id: u64,
+        plan: Option<flotilla_protocol::ResolvedAttachPlan>,
+    ) -> Option<flotilla_protocol::ResolvedAttachPlan> {
+        if self.acknowledged.remove(&command_id) {
+            return plan;
+        }
+        if self.pending_acks > 0 {
+            self.finished_before_ack.insert(command_id, plan);
+        }
+        None
+    }
+}
+
 pub struct App {
     pub daemon: Arc<dyn DaemonHandle>,
     pub config: Arc<ConfigStore>,
@@ -460,6 +511,7 @@ pub struct App {
     /// unrelated finishes may appear here temporarily; the map is cleared as
     /// soon as this TUI has no acknowledgements left to reconcile.
     pub(crate) recent_command_finishes: HashMap<u64, RecentCommandFinish>,
+    pub(crate) local_attach_effects: LocalAttachEffects,
     pub next_project_issue_start_batch_id: u64,
     pub project_issue_start_batches: HashMap<u64, ProjectIssueStartBatch>,
     pub command_project_issue_starts: HashMap<u64, ProjectIssueStartContext>,
@@ -621,6 +673,7 @@ impl App {
             query_seqs: HashMap::new(),
             subscriptions_dirty: true,
             pending_attach_plan: None,
+            local_attach_effects: LocalAttachEffects::default(),
         }
     }
 
@@ -678,6 +731,7 @@ impl App {
         self.acknowledged_dispatches.clear();
         self.pending_dispatch_acks = 0;
         self.recent_command_finishes.clear();
+        self.local_attach_effects = LocalAttachEffects::default();
         self.project_issue_start_batches.clear();
         self.command_project_issue_starts.clear();
         self.pending_cancel = None;
@@ -1169,6 +1223,13 @@ impl App {
                         _ => None,
                     };
                     let project_issue_start = self.command_project_issue_starts.remove(&command_id);
+                    let attach_plan = match &result {
+                        CommandValue::ConvoyStarted { attach_plan, .. } => attach_plan.clone(),
+                        _ => None,
+                    };
+                    if let Some(plan) = self.local_attach_effects.finish(command_id, attach_plan) {
+                        self.pending_attach_plan = Some(plan);
+                    }
                     executor::handle_result(result.clone(), self);
                     if let Some(ctx) = project_issue_start {
                         match result {
@@ -1481,5 +1542,61 @@ fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
         | ViewAddress::Independents { .. }
         | ViewAddress::Checkouts { scope: None }
         | ViewAddress::Repo { repository_key: None, .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod command_effect_tests {
+    use super::*;
+
+    fn broadcast_convoy_start(app: &mut App) {
+        let repo_identity = app.model.repos.keys().next().expect("stub repo").clone();
+        app.handle_daemon_event(DaemonEvent::CommandStarted {
+            command_id: 42,
+            node_id: NodeId::new("node-local-test"),
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            description: "start convoy".into(),
+        });
+        app.handle_daemon_event(DaemonEvent::CommandFinished {
+            command_id: 42,
+            node_id: NodeId::new("node-local-test"),
+            repo_identity,
+            repo: None,
+            result: CommandValue::ConvoyStarted {
+                name: "codex-auth-fail-loud".into(),
+                attach_plan: Some(flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach vessel")),
+                binding: None,
+            },
+        });
+    }
+
+    #[test]
+    fn another_tui_does_not_attach_a_convoy_started_elsewhere() {
+        let mut observer = crate::app::test_support::stub_app();
+        observer.local_attach_effects.begin();
+        broadcast_convoy_start(&mut observer);
+        assert!(observer.pending_attach_plan.is_none());
+        executor::handle_dispatch_completion(Ok(43), None, &mut observer);
+        assert!(observer.pending_attach_plan.is_none());
+    }
+
+    #[test]
+    fn initiating_tui_attaches_when_acknowledgement_arrives_first() {
+        let mut initiator = crate::app::test_support::stub_app();
+        initiator.local_attach_effects.begin();
+        executor::handle_dispatch_completion(Ok(42), None, &mut initiator);
+        broadcast_convoy_start(&mut initiator);
+        assert!(initiator.pending_attach_plan.is_some());
+    }
+
+    #[test]
+    fn initiating_tui_attaches_when_finish_arrives_first() {
+        let mut initiator = crate::app::test_support::stub_app();
+        initiator.local_attach_effects.begin();
+        broadcast_convoy_start(&mut initiator);
+        assert!(initiator.pending_attach_plan.is_none());
+        executor::handle_dispatch_completion(Ok(42), None, &mut initiator);
+        assert!(initiator.pending_attach_plan.is_some());
     }
 }

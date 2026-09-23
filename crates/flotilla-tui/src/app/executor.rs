@@ -47,6 +47,7 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
         app.pending_dispatch_acks += 1;
     }
 
+    app.local_attach_effects.begin();
     let daemon = app.daemon.clone();
     tokio::spawn(async move {
         let result = daemon.execute(cmd).await;
@@ -54,6 +55,9 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
     });
 }
 pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Option<PendingActionContext>, app: &mut App) {
+    if let Some(plan) = app.local_attach_effects.acknowledge(&result) {
+        app.pending_attach_plan = Some(plan);
+    }
     if pending_ctx.is_some() {
         debug_assert!(app.pending_dispatch_acks > 0, "pending-action acknowledgement without a tracked dispatch");
         app.pending_dispatch_acks = app.pending_dispatch_acks.saturating_sub(1);
@@ -199,12 +203,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             };
             app.set_status_message(Some(format!("Convoy abandoned: {name}{warning}")));
         }
-        CommandValue::ConvoyStarted { name, attach_plan, .. } => {
+        CommandValue::ConvoyStarted { name, .. } => {
             info!(%name, "convoy started");
             app.set_status_message(Some(format!("Convoy started: {name}")));
-            if let Some(plan) = attach_plan {
-                app.pending_attach_plan = Some(plan);
-            }
         }
         CommandValue::WorkflowTemplateApplied { name } => {
             info!(%name, "workflow template applied");
