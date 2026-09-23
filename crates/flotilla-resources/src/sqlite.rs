@@ -1911,7 +1911,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{InputMeta, MaterialPool, MaterialPoolSpec};
+    use crate::{Environment, EnvironmentSpec, InputMeta};
 
     #[tokio::test]
     async fn quarantine_only_delete_refuses_a_concurrently_created_live_object() {
@@ -1919,11 +1919,10 @@ mod tests {
         let path = dir.path().join("resources.sqlite");
         let backend = SqliteBackend::open(&path).expect("sqlite backend should open");
         backend
-            .create_typed::<MaterialPool>(
-                "flotilla",
-                &InputMeta::builder().name("contended".to_string()).build(),
-                &MaterialPoolSpec::default(),
-            )
+            .create_typed::<Environment>("flotilla", &InputMeta::builder().name("contended".to_string()).build(), &EnvironmentSpec {
+                host_direct: None,
+                docker: None,
+            })
             .await
             .expect("create live resource");
 
@@ -1936,9 +1935,9 @@ mod tests {
                 VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'stale diagnosis', ?6)
                 "#,
                 params![
-                    MaterialPool::API_PATHS.group,
-                    MaterialPool::API_PATHS.version,
-                    MaterialPool::API_PATHS.kind,
+                    Environment::API_PATHS.group,
+                    Environment::API_PATHS.version,
+                    Environment::API_PATHS.kind,
                     "flotilla",
                     "contended",
                     Utc::now().to_rfc3339()
@@ -1948,14 +1947,11 @@ mod tests {
         drop(connection);
 
         let error = backend
-            .delete_decode_quarantine_typed::<MaterialPool>("flotilla", "contended")
+            .delete_decode_quarantine_typed::<Environment>("flotilla", "contended")
             .await
             .expect_err("quarantine-only deletion must not delete a live resource");
         assert!(matches!(error, ResourceError::Conflict { .. }), "unexpected quarantine-delete error: {error}");
-        assert!(
-            backend.get_typed::<MaterialPool>("flotilla", "contended").await.is_ok(),
-            "the concurrent live resource must remain intact"
-        );
+        assert!(backend.get_typed::<Environment>("flotilla", "contended").await.is_ok(), "the concurrent live resource must remain intact");
         assert_eq!(backend.diagnostics().await.expect("read diagnostics").decode_quarantines.len(), 1);
     }
 }

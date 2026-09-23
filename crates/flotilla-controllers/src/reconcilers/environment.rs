@@ -1,39 +1,19 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, EnvironmentWaitReason, Host, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver,
+    DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ResourceBackend, ResourceError, ResourceObject,
+    TypedResolver,
 };
 
 #[async_trait]
 pub trait DockerEnvironmentRuntime: Send + Sync {
-    async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, DockerProvisioningError>;
+    async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String>;
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String>;
     async fn cleanup(&self, _environment_ref: &str) -> Result<(), String> {
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DockerProvisioningError {
-    Waiting { message: String, reason: EnvironmentWaitReason },
-    Failed(String),
-}
-
-impl fmt::Display for DockerProvisioningError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Waiting { message, .. } | Self::Failed(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl From<String> for DockerProvisioningError {
-    fn from(message: String) -> Self {
-        Self::Failed(message)
     }
 }
 
@@ -88,7 +68,6 @@ pub enum EnvironmentPrepared {
     Foreign,
     None,
     Ready(DockerProvisioning),
-    Waiting { message: String, reason: EnvironmentWaitReason },
     Failed(String),
 }
 
@@ -108,8 +87,7 @@ where
                 if let Some(spec) = &obj.spec.docker {
                     match self.docker.provision(&obj.metadata.name, spec).await {
                         Ok(provisioning) => Ok(EnvironmentPrepared::Ready(provisioning)),
-                        Err(DockerProvisioningError::Waiting { message, reason }) => Ok(EnvironmentPrepared::Waiting { message, reason }),
-                        Err(DockerProvisioningError::Failed(message)) => Ok(EnvironmentPrepared::Failed(message)),
+                        Err(message) => Ok(EnvironmentPrepared::Failed(message)),
                     }
                 } else {
                     Ok(EnvironmentPrepared::None)
@@ -138,20 +116,13 @@ where
                     image_ref: Some(provisioning.image_ref.clone()),
                     image_digest: Some(provisioning.image_digest.clone()),
                 }),
-                EnvironmentPrepared::Waiting { message, reason } => {
-                    Some(EnvironmentStatusPatch::MarkWaiting { message: message.clone(), reason: reason.clone() })
-                }
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,
             },
             _ => None,
         };
 
-        let mut outcome = ReconcileOutcome::new(patch);
-        if matches!(prepared, EnvironmentPrepared::Waiting { .. }) {
-            outcome.requeue_after = Some(Duration::from_secs(5));
-        }
-        outcome
+        ReconcileOutcome::new(patch)
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

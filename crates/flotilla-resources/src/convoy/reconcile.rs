@@ -28,9 +28,8 @@ use crate::{
     terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
     workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, EnvironmentWaitReason, InputMeta, InputValue, OwnerReference,
-    PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue,
-    TypedResolver,
+    ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, InputMeta, InputValue, OwnerReference, PlacementStatus,
+    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
 };
 
 #[async_trait]
@@ -614,13 +613,7 @@ impl Reconciler for ConvoyReconciler {
                 _ => None,
             })
         });
-        let waiting_on_material_pool = vessels.values().any(|vessel| {
-            vessel
-                .status
-                .as_ref()
-                .is_some_and(|status| matches!(status.wait_reason, Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })))
-        });
-        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) && !waiting_on_material_pool {
+        let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             match &self.teardown_runtime {
                 Some(runtime) => {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();

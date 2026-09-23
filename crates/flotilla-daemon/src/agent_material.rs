@@ -1,6 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    os::unix::fs::PermissionsExt,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -14,23 +13,32 @@ use flotilla_core::providers::{
     },
     ChannelLabel, CommandRunner,
 };
-use flotilla_protocol::ResourceRef;
-use flotilla_resources::{api_version, Environment, MaterialPoolSpec, MaterialPoolUnitSpec, Resource, ResourceBackend};
-use tokio::fs;
-use tracing::{info, warn};
+use tokio::{fs, io::AsyncWriteExt};
+use tracing::info;
 
 use crate::{
-    material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
+    codex_central::codex_central_auth_path,
     vessel_config::{agent_environment_fragment, Fragment},
 };
 
 const CODEX_ADAPTER_ID: &str = "codex";
 const CLAUDE_CODE_ADAPTER_ID: &str = "claude-code";
-const CODEX_POOL_REF: &str = "codex-login";
 pub(crate) const FLOTILLA_SKILLS_DIR_ENV: &str = "FLOTILLA_SKILLS_DIR";
+/// Generation-provided, credential-free `CODEX_HOME` template that seeds each
+/// crew's writable scratch (`config.toml`, `skills/`, static defaults). The
+/// generation-side artifact and its `fleet-install` wiring are
+/// flotilla-org/flotilla#1913; this is the consumer contract it satisfies.
+/// Absent, a crew simply starts from an empty scratch directory.
+pub(crate) const FLOTILLA_CODEX_HOME_TEMPLATE_ENV: &str = "FLOTILLA_CODEX_HOME_TEMPLATE";
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
+/// The one credential file inside a crew's `CODEX_HOME`. Everything else under
+/// that directory is per-crew scratch Codex may write freely.
+const CODEX_AUTH_FILE: &str = "auth.json";
+/// Codex must never rewrite the delivered credential: a crew's copy is a
+/// read-only snapshot of the central login, kept fresh by the host refresher.
+const CODEX_AUTH_MODE: u32 = 0o400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentMaterialPreflight {
@@ -52,17 +60,9 @@ pub(crate) struct SkillSourceCredentialRequest {
     pub(crate) credential: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AgentMaterialOutcome {
-    NotRequired,
-    Ready(AgentMaterialDelivery),
-    Waiting { pool_ref: String, message: String },
-}
-
 #[async_trait]
 trait AgentMaterialAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn pool_ref(&self) -> Option<&'static str>;
     fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment>;
     fn config_home_variable(&self) -> &'static str;
     fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool;
@@ -91,38 +91,33 @@ trait AgentMaterialAdapter: Send + Sync {
         !self.externally_managed_home_opts_out_of_skills() || !environment.contains_key(self.config_home_variable())
     }
 
-    async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String>;
+    async fn prepare(&self, environment_ref: &str, environment: &BTreeMap<String, String>)
+        -> Result<Option<AgentMaterialDelivery>, String>;
 }
 
 pub(crate) struct AgentMaterialRegistry {
-    namespace: String,
-    pools: Arc<MaterialPoolManager>,
     homes_dir: PathBuf,
+    codex_central_auth_path: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
     skills: SkillBundle,
 }
 
 impl AgentMaterialRegistry {
-    pub(crate) fn new(backend: ResourceBackend, namespace: &str, env: Arc<dyn EnvVars>) -> Self {
-        let pools = Arc::new(MaterialPoolManager::new(backend, namespace));
-        let pool_dir = env
-            .get("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
-            .join(".config/flotilla/credentials/codex-pool");
-        let homes_dir = env
-            .get("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"))
-            .join(".local/share/flotilla/agent-homes");
+    pub(crate) fn new(env: Arc<dyn EnvVars>) -> Self {
+        let home = env.get("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/lib/flotilla"));
+        let homes_dir = home.join(".local/share/flotilla/agent-homes");
+        let codex_central_auth_path = codex_central_auth_path(&*env);
         let skills = SkillBundle::new(env.get(FLOTILLA_SKILLS_DIR_ENV).map(PathBuf::from));
-        let codex: Arc<dyn AgentMaterialAdapter> =
-            Arc::new(CodexMaterialAdapter::new(Arc::clone(&pools), pool_dir, homes_dir.clone(), cfg!(any(target_os = "linux", test))));
+        let codex: Arc<dyn AgentMaterialAdapter> = Arc::new(CodexMaterialAdapter::new(
+            codex_central_auth_path.clone(),
+            env.get(FLOTILLA_CODEX_HOME_TEMPLATE_ENV).map(PathBuf::from),
+            homes_dir.clone(),
+            cfg!(any(target_os = "linux", test)),
+        ));
         let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
         Self {
-            namespace: namespace.to_string(),
-            pools,
             homes_dir,
+            codex_central_auth_path,
             adapters: BTreeMap::from([(codex.id(), codex), (claude_code.id(), claude_code)]),
             skills,
         }
@@ -133,20 +128,14 @@ impl AgentMaterialRegistry {
         environment_ref: &str,
         required_adapters: &BTreeSet<String>,
         environment: &BTreeMap<String, String>,
-    ) -> Result<Vec<AgentMaterialDelivery>, AgentMaterialPrepareError> {
-        let holder_ref = self.holder_ref(environment_ref);
+    ) -> Result<Vec<AgentMaterialDelivery>, String> {
         let mut deliveries = Vec::new();
         for adapter_id in required_adapters {
             let Some(adapter) = self.adapters.get(adapter_id.as_str()) else {
                 continue;
             };
-            match adapter.prepare(&holder_ref, environment).await {
-                Ok(AgentMaterialOutcome::NotRequired) => {}
-                Ok(AgentMaterialOutcome::Ready(delivery)) => deliveries.push(delivery),
-                Ok(AgentMaterialOutcome::Waiting { pool_ref, message }) => {
-                    return Err(AgentMaterialPrepareError::Waiting { pool_ref, message });
-                }
-                Err(message) => return Err(AgentMaterialPrepareError::Failed(message)),
+            if let Some(delivery) = adapter.prepare(environment_ref, environment).await? {
+                deliveries.push(delivery);
             }
         }
         if required_adapters
@@ -154,8 +143,7 @@ impl AgentMaterialRegistry {
             .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
             .any(|adapter| adapter.requires_skills_for_prepare(environment))
         {
-            let delivery = self.skills.prepare().await.map_err(AgentMaterialPrepareError::Failed)?;
-            deliveries.push(delivery);
+            deliveries.push(self.skills.prepare().await?);
         }
         Ok(deliveries)
     }
@@ -206,26 +194,36 @@ impl AgentMaterialRegistry {
             .collect()
     }
 
-    pub(crate) async fn release(&self, environment_ref: &str) -> Result<(), String> {
-        let auth = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join("auth.json");
+    /// Drops the delivered credential copy for an environment that is being
+    /// discarded or torn down. Nothing is returned to a pool — the central
+    /// login is not scarce — this only avoids leaving a token behind in a home
+    /// whose environment no longer exists.
+    pub(crate) async fn discard_delivered_credentials(&self, environment_ref: &str) -> Result<(), String> {
+        let auth = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID).join(CODEX_AUTH_FILE);
         match fs::remove_file(&auth).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("remove released Codex login {}: {error}", auth.display())),
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove delivered Codex credential {}: {error}", auth.display())),
         }
-        self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
-    pub(crate) async fn describe(&self, environment_ref: &str) -> Result<Vec<String>, String> {
-        let holder_ref = self.holder_ref(environment_ref);
-        let leases = self.pools.leases_for_holder(&holder_ref).await?;
-        Ok(leases
-            .into_iter()
-            .map(|(pool_ref, unit_name, unit)| {
-                let slot = PathBuf::from(unit.directory).file_name().and_then(|name| name.to_str()).unwrap_or(&unit_name).to_string();
-                format!("credential {pool_ref} slot {slot}")
-            })
-            .collect())
+    /// Names the credential a Codex crew was handed, for operator-facing
+    /// failure reporting. Static material means every crew names the same
+    /// central login rather than a leased slot.
+    pub(crate) fn codex_credential_source(&self) -> &Path {
+        &self.codex_central_auth_path
+    }
+
+    /// Re-copies the central `auth.json` into an already-provisioned crew home
+    /// so a long-lived vessel never runs on a credential older than the last
+    /// refresher tick. Returns whether the delivered copy changed.
+    pub(crate) async fn refresh_delivered_credentials(&self, environment_ref: &str) -> Result<bool, String> {
+        let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
+        if !fs::try_exists(&home).await.map_err(|error| format!("inspect Codex home {}: {error}", home.display()))? {
+            return Ok(false);
+        }
+        let credential = read_central_credential(&self.codex_central_auth_path).await?;
+        install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
     }
 
     pub(crate) async fn remove_environment_home(&self, environment_ref: &str) -> Result<(), String> {
@@ -236,73 +234,133 @@ impl AgentMaterialRegistry {
             Err(error) => Err(format!("remove persistent agent home {}: {error}", home.display())),
         }
     }
-
-    pub(crate) async fn recover(&self, active_environment_refs: impl IntoIterator<Item = String>) -> Result<(), String> {
-        let active = active_environment_refs.into_iter().map(|name| self.holder_ref(&name)).collect::<HashSet<_>>();
-        let pool_refs = self.adapters.values().filter_map(|adapter| adapter.pool_ref().map(str::to_string)).collect::<BTreeSet<_>>();
-        self.pools.recover(&pool_refs, &active).await
-    }
-
-    fn holder_ref(&self, environment_ref: &str) -> ResourceRef {
-        ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, &self.namespace, environment_ref)
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AgentMaterialPrepareError {
-    Waiting { pool_ref: String, message: String },
-    Failed(String),
-}
-
+/// Delivers the host's single central Codex login — the `auth.json` the daemon
+/// refresher keeps fresh (`crates/flotilla-daemon/src/codex_central.rs`) — as a
+/// per-crew read-only copy.
+///
+/// There is no pool: one login serves every crew because exactly one refresher
+/// ever touches its single-use refresh token, so a crew handed a comfortably
+/// fresh access token never refreshes and never writes `auth.json`
+/// (flotilla-org/flotilla#1906). The delivery is a *copy* rather than a mount of
+/// the central file because the refresher rotates it by atomic temp+rename; a
+/// bind-mount would pin the pre-rotation inode and rot.
+///
+/// `CODEX_HOME` is split accordingly: `auth.json` is credential material owned
+/// by the host, and everything else under the home — `config.toml`, `skills/`,
+/// `*.sqlite`, `history`, `sessions/` — is per-crew scratch Codex writes
+/// freely, seeded from a credential-free generation template
+/// ([`FLOTILLA_CODEX_HOME_TEMPLATE_ENV`], flotilla-org/flotilla#1913).
 struct CodexMaterialAdapter {
-    pools: Arc<MaterialPoolManager>,
-    pool_dir: PathBuf,
+    central_auth_path: PathBuf,
+    home_template: Option<PathBuf>,
     homes_dir: PathBuf,
     supported: bool,
 }
 
 impl CodexMaterialAdapter {
-    fn new(pools: Arc<MaterialPoolManager>, pool_dir: PathBuf, homes_dir: PathBuf, supported: bool) -> Self {
-        Self { pools, pool_dir, homes_dir, supported }
+    fn new(central_auth_path: PathBuf, home_template: Option<PathBuf>, homes_dir: PathBuf, supported: bool) -> Self {
+        Self { central_auth_path, home_template, homes_dir, supported }
     }
 
-    async fn usable_units(&self) -> Result<BTreeMap<String, MaterialPoolUnitSpec>, String> {
-        let mut entries = match fs::read_dir(&self.pool_dir).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(error) => return Err(format!("read Codex login pool {}: {error}", self.pool_dir.display())),
+    /// Seeds the credential-free parts of a crew's `CODEX_HOME` from the
+    /// generation template, without ever overwriting scratch the crew already
+    /// wrote (a resumed crew keeps its `sessions/`, history, and any local
+    /// `config.toml` edits) and without importing a credential if a template
+    /// were ever built with one.
+    async fn seed_scratch(&self, home: &Path) -> Result<(), String> {
+        let Some(template) = self.home_template.as_deref() else {
+            return Ok(());
         };
-        let mut numbered: BTreeMap<u64, PathBuf> = BTreeMap::new();
-        while let Some(entry) =
-            entries.next_entry().await.map_err(|error| format!("read Codex login pool {}: {error}", self.pool_dir.display()))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(number) = name.strip_prefix("slot-").and_then(|suffix| suffix.parse::<u64>().ok()) else {
-                continue;
-            };
-            let path = entry.path();
-            let auth_path = path.join("auth.json");
-            let Ok(metadata) = fs::metadata(&auth_path).await else {
-                continue;
-            };
-            if metadata.is_file() && metadata.len() > 0 && metadata.permissions().mode() & 0o777 == 0o600 {
-                if let Some(kept_path) = numbered.get(&number) {
-                    warn!(
-                        slot_number = number,
-                        kept_path = %kept_path.display(),
-                        skipped_path = %path.display(),
-                        "duplicate numeric Codex login slot; skipping directory"
-                    );
-                    continue;
-                }
-                numbered.insert(number, path);
+        let mut entries = match fs::read_dir(template).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("Codex home template {} declared by {FLOTILLA_CODEX_HOME_TEMPLATE_ENV} is missing", template.display()))
             }
+            Err(error) => return Err(format!("read Codex home template {}: {error}", template.display())),
+        };
+        while let Some(entry) =
+            entries.next_entry().await.map_err(|error| format!("read Codex home template {}: {error}", template.display()))?
+        {
+            let name = entry.file_name();
+            if name == CODEX_AUTH_FILE {
+                return Err(format!("Codex home template {} must be credential-free, but carries {CODEX_AUTH_FILE}", template.display()));
+            }
+            let destination = home.join(&name);
+            if fs::try_exists(&destination).await.map_err(|error| format!("inspect {}: {error}", destination.display()))? {
+                continue;
+            }
+            copy_template_entry(&entry.path(), &destination).await?;
         }
-        Ok(numbered
-            .into_iter()
-            .map(|(number, path)| (format!("slot-{number:020}"), MaterialPoolUnitSpec { directory: path.to_string_lossy().into_owned() }))
-            .collect())
+        Ok(())
     }
+}
+
+/// Recursive copy of one template entry, used only for the credential-free
+/// scratch seed. Iterative so the future is `Send` without boxing.
+async fn copy_template_entry(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+    while let Some((source, destination)) = pending.pop() {
+        let metadata = fs::metadata(&source).await.map_err(|error| format!("inspect Codex home template {}: {error}", source.display()))?;
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination).await.map_err(|error| format!("seed Codex scratch {}: {error}", destination.display()))?;
+            let mut entries =
+                fs::read_dir(&source).await.map_err(|error| format!("read Codex home template {}: {error}", source.display()))?;
+            while let Some(entry) =
+                entries.next_entry().await.map_err(|error| format!("read Codex home template {}: {error}", source.display()))?
+            {
+                pending.push((entry.path(), destination.join(entry.file_name())));
+            }
+        } else {
+            fs::copy(&source, &destination)
+                .await
+                .map_err(|error| format!("seed Codex scratch {} from {}: {error}", destination.display(), source.display()))?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_central_credential(source: &Path) -> Result<Vec<u8>, String> {
+    fs::read(source).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("central Codex credential {} is not provisioned on this host", source.display())
+        } else {
+            format!("read central Codex credential {}: {error}", source.display())
+        }
+    })
+}
+
+/// Installs `contents` at `destination` as a read-only copy, replacing any
+/// previous copy atomically.
+///
+/// Atomic temp+rename rather than an in-place write for two reasons: the
+/// previous copy is mode `0400` and so cannot be opened for writing by its own
+/// owner, and the destination directory is bind-mounted into a live crew
+/// container, where a half-written `auth.json` would be observable. Returns
+/// whether the delivered bytes changed.
+async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<bool, String> {
+    if fs::read(destination).await.is_ok_and(|delivered| delivered == contents) {
+        return Ok(false);
+    }
+    let directory = destination.parent().unwrap_or_else(|| Path::new("."));
+    let temp_path = directory.join(format!(".{}.{}.tmp", CODEX_AUTH_FILE, uuid::Uuid::new_v4()));
+    let result = async {
+        // `.mode()` on the open, not a follow-up `set_permissions`, so the copy
+        // is never briefly writable or group/other readable.
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(CODEX_AUTH_MODE).open(&temp_path).await?;
+        file.write_all(contents).await?;
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(format!("write Codex credential copy {}: {error}", destination.display()));
+    }
+    fs::rename(&temp_path, destination)
+        .await
+        .map_err(|error| format!("install Codex credential copy {}: {error}", destination.display()))?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -522,13 +580,9 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         CODEX_ADAPTER_ID
     }
 
-    fn pool_ref(&self) -> Option<&'static str> {
-        Some(CODEX_POOL_REF)
-    }
-
     fn fragment(&self, environment: &BTreeMap<String, String>) -> Option<Fragment> {
         (!environment.contains_key("CODEX_HOME"))
-            .then(|| agent_environment_fragment("CODEX_HOME", CONTAINER_CODEX_HOME, format!("agent-material/codex {CODEX_POOL_REF}")))
+            .then(|| agent_environment_fragment("CODEX_HOME", CONTAINER_CODEX_HOME, "agent-material/codex codex-central".to_string()))
     }
 
     fn config_home_variable(&self) -> &'static str {
@@ -543,44 +597,32 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
         true
     }
 
-    async fn prepare(&self, holder_ref: &ResourceRef, environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
+    async fn prepare(
+        &self,
+        environment_ref: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<Option<AgentMaterialDelivery>, String> {
         if environment.contains_key("CODEX_HOME") {
-            return Ok(AgentMaterialOutcome::NotRequired);
+            return Ok(None);
         }
         if !self.supported {
             return Err("Codex login material delivery is supported only on Linux placement hosts".to_string());
         }
-
-        let spec = MaterialPoolSpec { units: self.usable_units().await? };
-        self.pools.reconcile_pool(CODEX_POOL_REF, &spec).await?;
-        match self.pools.acquire(CODEX_POOL_REF, holder_ref).await? {
-            MaterialLeaseOutcome::Leased { unit, .. } => {
-                let home = self.homes_dir.join(&holder_ref.name).join(CODEX_ADAPTER_ID);
-                fs::create_dir_all(&home).await.map_err(|error| format!("create persistent Codex home {}: {error}", home.display()))?;
-                let source = PathBuf::from(&unit.directory).join("auth.json");
-                let destination = home.join("auth.json");
-                fs::copy(&source, &destination)
-                    .await
-                    .map_err(|error| format!("install leased Codex login {} into {}: {error}", source.display(), destination.display()))?;
-                fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
-                    .await
-                    .map_err(|error| format!("protect leased Codex login {}: {error}", destination.display()))?;
-                Ok(AgentMaterialOutcome::Ready(AgentMaterialDelivery {
-                    mount: ProvisionedMount::new(home, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
-                    preflight: AgentMaterialPreflight {
-                        command: "codex".to_string(),
-                        args: vec!["login".to_string(), "status".to_string()],
-                        failure_context: "Codex login preflight failed".to_string(),
-                    },
-                }))
-            }
-            MaterialLeaseOutcome::Waiting { unit_count } => Ok(AgentMaterialOutcome::Waiting {
-                pool_ref: CODEX_POOL_REF.to_string(),
-                message: format!(
-                    "waiting for codex login material; {unit_count} in pool, all leased; mint another unit to increase concurrency"
-                ),
-            }),
-        }
+        // Read the host credential before touching the filesystem, so a host
+        // whose refresher has never run fails without leaving a crew home behind.
+        let credential = read_central_credential(&self.central_auth_path).await?;
+        let home = self.homes_dir.join(environment_ref).join(CODEX_ADAPTER_ID);
+        fs::create_dir_all(&home).await.map_err(|error| format!("create persistent Codex home {}: {error}", home.display()))?;
+        self.seed_scratch(&home).await?;
+        install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await?;
+        Ok(Some(AgentMaterialDelivery {
+            mount: ProvisionedMount::new(home, CONTAINER_CODEX_HOME, ProvisionedMountMode::Rw),
+            preflight: AgentMaterialPreflight {
+                command: "codex".to_string(),
+                args: vec!["login".to_string(), "status".to_string()],
+                failure_context: "Codex login preflight failed".to_string(),
+            },
+        }))
     }
 }
 
@@ -590,10 +632,6 @@ struct ClaudeCodeMaterialAdapter;
 impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
     fn id(&self) -> &'static str {
         CLAUDE_CODE_ADAPTER_ID
-    }
-
-    fn pool_ref(&self) -> Option<&'static str> {
-        None
     }
 
     fn fragment(&self, _environment: &BTreeMap<String, String>) -> Option<Fragment> {
@@ -612,18 +650,20 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
         false
     }
 
-    async fn prepare(&self, _holder_ref: &ResourceRef, _environment: &BTreeMap<String, String>) -> Result<AgentMaterialOutcome, String> {
-        Ok(AgentMaterialOutcome::NotRequired)
+    async fn prepare(
+        &self,
+        _environment_ref: &str,
+        _environment: &BTreeMap<String, String>,
+    ) -> Result<Option<AgentMaterialDelivery>, String> {
+        Ok(None)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io, path::Path, process::Command, sync::Mutex};
+    use std::{io, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::Mutex};
 
     use flotilla_core::providers::{discovery::test_support::TestEnvVars, CommandOutput};
-    use flotilla_protocol::NodeId;
-    use flotilla_resources::InMemoryBackend;
 
     use super::*;
 
@@ -774,17 +814,23 @@ esac
         }
     }
 
-    fn write_named_slot(root: &Path, name: &str, number: u64) -> PathBuf {
-        let slot = root.join(name);
-        std::fs::create_dir_all(&slot).expect("create slot");
-        let auth = slot.join("auth.json");
-        std::fs::write(&auth, format!("{{\"slot\":{number}}}")).expect("write auth");
-        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).expect("protect auth");
-        slot
+    /// Writes the host's central `auth.json` at exactly the path
+    /// [`codex_central_auth_path`] derives from `HOME`, so the tests bind to the
+    /// same contract the daemon refresher writes to.
+    fn write_central_auth(home: &Path, access_token: &str) -> PathBuf {
+        let path = home.join(".config/flotilla/credentials/codex-central/auth.json");
+        std::fs::create_dir_all(path.parent().expect("central credential directory")).expect("create central credential directory");
+        std::fs::write(&path, format!("{{\"tokens\":{{\"access_token\":\"{access_token}\"}}}}")).expect("write central auth");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("protect central auth");
+        path
     }
 
-    fn write_slot(root: &Path, number: u64) -> PathBuf {
-        write_named_slot(root, &format!("slot-{number}"), number)
+    fn write_home_template(root: &Path) -> PathBuf {
+        let template = root.join("generation/codex-home");
+        std::fs::create_dir_all(template.join("skills/codex-only")).expect("create Codex home template");
+        std::fs::write(template.join("config.toml"), "model = \"gpt-5-codex\"\n").expect("write template config");
+        std::fs::write(template.join("skills/codex-only/SKILL.md"), "# Codex only\n").expect("write template skill");
+        template
     }
 
     fn write_skill_sources(root: &Path) -> PathBuf {
@@ -800,21 +846,29 @@ esac
 
     fn registry(home: &Path) -> AgentMaterialRegistry {
         let skills = write_skill_sources(home);
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        AgentMaterialRegistry::new(
-            backend,
-            "flotilla",
-            Arc::new(TestEnvVars::new([
-                ("HOME", home.to_string_lossy().into_owned()),
-                (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
-            ])),
-        )
+        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.to_string_lossy().into_owned()),
+            (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
+        ])))
+    }
+
+    fn registry_with_home_template(home: &Path, template: &Path) -> AgentMaterialRegistry {
+        let skills = write_skill_sources(home);
+        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.to_string_lossy().into_owned()),
+            (FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned()),
+            (FLOTILLA_CODEX_HOME_TEMPLATE_ENV, template.to_string_lossy().into_owned()),
+        ])))
+    }
+
+    fn delivered_auth_mode(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("delivered credential metadata").permissions().mode() & 0o777
     }
 
     #[tokio::test]
-    async fn codex_adapter_specializes_a_generic_lease_as_codex_home() {
+    async fn codex_adapter_delivers_a_read_only_copy_of_the_central_credential() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let slot = write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
+        let central = write_central_auth(temp.path(), "access-token-one");
         let registry = registry(temp.path());
 
         let deliveries =
@@ -829,10 +883,13 @@ esac
                 ProvisionedMountMode::Rw,
             )
         );
+        let delivered = deliveries[0].mount.host_path.as_path().join(CODEX_AUTH_FILE);
         assert_eq!(
-            std::fs::read(deliveries[0].mount.host_path.join("auth.json")).expect("copied auth"),
-            std::fs::read(slot.join("auth.json")).expect("slot auth")
+            std::fs::read(&delivered).expect("delivered credential"),
+            std::fs::read(&central).expect("central credential"),
+            "the crew must receive the refresher's own auth.json byte for byte"
         );
+        assert_eq!(delivered_auth_mode(&delivered), CODEX_AUTH_MODE, "the delivered credential must be read-only");
         assert_eq!(
             deliveries[1].mount,
             ProvisionedMount::new(
@@ -847,22 +904,53 @@ esac
         )
         .expect("compose Codex home");
         assert_eq!(composed.environment, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
-        assert!(composed.contents.contains("# fragment: agent-material/codex codex-login"));
+        assert!(composed.contents.contains("# fragment: agent-material/codex codex-central"));
     }
 
     #[tokio::test]
-    async fn codex_login_material_is_leased_per_holder() {
+    async fn one_central_credential_serves_every_crew_without_contention() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
-        let first = write_slot(&pool, 0);
-        let second = write_slot(&pool, 1);
+        write_central_auth(temp.path(), "access-token-one");
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
 
-        registry.prepare("crew-alice", &required, &BTreeMap::new()).await.expect("prepare Alice");
-        registry.prepare("crew-bob", &required, &BTreeMap::new()).await.expect("prepare Bob");
+        let mut homes = BTreeSet::new();
+        for environment_ref in ["crew-alice", "crew-bob", "crew-carol"] {
+            let deliveries = registry.prepare(environment_ref, &required, &BTreeMap::new()).await.expect("prepare crew");
+            homes.insert(deliveries[0].mount.host_path.as_path().to_path_buf());
+        }
 
-        assert_ne!(first, second, "each holder must receive its own config home");
+        assert_eq!(homes.len(), 3, "every crew must get its own writable Codex home");
+        for home in &homes {
+            assert_eq!(
+                std::fs::read_to_string(home.join(CODEX_AUTH_FILE)).expect("delivered credential"),
+                std::fs::read_to_string(temp.path().join(".config/flotilla/credentials/codex-central/auth.json"))
+                    .expect("central credential")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unprovisioned_central_credential_fails_with_an_actionable_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+
+        let error = registry
+            .prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("a host without a central Codex login cannot deliver one");
+
+        assert!(error.contains("codex-central/auth.json"), "the failure must name the central path: {error}");
+        assert!(error.contains("not provisioned"), "the failure must say the host lacks the credential: {error}");
+        assert!(
+            !temp.path().join(".local/share/flotilla/agent-homes/env-a").exists(),
+            "a host that cannot deliver a credential must not leave a crew home behind"
+        );
+        assert_eq!(
+            registry.codex_credential_source(),
+            temp.path().join(".config/flotilla/credentials/codex-central/auth.json"),
+            "operator-facing failures name the one central login, not a per-crew slot"
+        );
     }
 
     #[tokio::test]
@@ -1175,81 +1263,120 @@ esac
     }
 
     #[tokio::test]
-    async fn duplicate_numeric_codex_slots_keep_one_unit_and_warn_with_both_paths() {
+    async fn redelivery_replaces_a_stale_copy_and_preserves_per_crew_scratch() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let pool_dir = temp.path().join("codex-pool");
-        let slot_zero = write_named_slot(&pool_dir, "slot-0", 0);
-        let slot_zero_padded = write_named_slot(&pool_dir, "slot-00", 0);
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        let adapter =
-            CodexMaterialAdapter::new(Arc::new(MaterialPoolManager::new(backend, "flotilla")), pool_dir, temp.path().join("homes"), true);
-        let log_output = Arc::new(Mutex::new(Vec::new()));
-
-        let units = {
-            let writer = LogCaptureWriter(Arc::clone(&log_output));
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_target(false)
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _guard = tracing::subscriber::set_default(subscriber);
-            adapter.usable_units().await.expect("discover usable units")
-        };
-
-        assert_eq!(units.len(), 1);
-        assert_eq!(units.keys().map(String::as_str).collect::<Vec<_>>(), ["slot-00000000000000000000"]);
-        let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
-        assert!(logs.contains("duplicate numeric Codex login slot; skipping directory"), "missing duplicate warning: {logs}");
-        assert!(logs.contains(&slot_zero.to_string_lossy().into_owned()), "warning should name slot-0: {logs}");
-        assert!(logs.contains(&slot_zero_padded.to_string_lossy().into_owned()), "warning should name slot-00: {logs}");
-    }
-
-    #[tokio::test]
-    async fn codex_adapter_waits_on_exhaustion_and_reconciles_new_units() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
-        write_slot(&pool, 0);
+        write_central_auth(temp.path(), "access-token-one");
         let registry = registry(temp.path());
         let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
 
-        registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("first lease");
-        assert!(matches!(
-            registry.prepare("env-b", &required, &BTreeMap::new()).await,
-            Err(AgentMaterialPrepareError::Waiting { pool_ref, .. }) if pool_ref == CODEX_POOL_REF
-        ));
-
-        write_slot(&pool, 1);
-        let delivery = registry.prepare("env-b", &required, &BTreeMap::new()).await.expect("lease new unit");
-        assert_eq!(delivery[0].mount.host_path.as_path(), temp.path().join(".local/share/flotilla/agent-homes/env-b/codex"));
-    }
-
-    #[tokio::test]
-    async fn codex_release_preserves_session_home_and_reacquire_installs_login_again() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
-        write_slot(&pool, 0);
-        let registry = registry(temp.path());
-        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
-
-        let delivery = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("initial lease");
-        let codex_home = delivery[0].mount.host_path.as_path();
+        let delivery = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("initial delivery");
+        let codex_home = delivery[0].mount.host_path.as_path().to_path_buf();
         std::fs::create_dir_all(codex_home.join("sessions/2026/09/13")).expect("real rollout tree");
         std::fs::write(codex_home.join("sessions/2026/09/13/rollout.jsonl"), "{\"type\":\"session_meta\"}\n").expect("rollout");
         std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5\"\n").expect("config");
 
-        registry.release("env-a").await.expect("release login");
-        assert!(!codex_home.join("auth.json").exists(), "released home must not retain pooled login material");
-        let resumed = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("reacquire login");
+        assert!(
+            !registry.refresh_delivered_credentials("env-a").await.expect("idempotent redelivery"),
+            "an unchanged central credential must not rewrite the copy"
+        );
+        write_central_auth(temp.path(), "access-token-two");
+        assert!(registry.refresh_delivered_credentials("env-a").await.expect("redeliver rotated credential"));
 
-        assert_eq!(resumed[0].mount.host_path.as_path(), codex_home);
-        assert!(codex_home.join("auth.json").exists());
+        let delivered = codex_home.join(CODEX_AUTH_FILE);
+        assert!(
+            std::fs::read_to_string(&delivered).expect("delivered credential").contains("access-token-two"),
+            "a long-lived crew must end up on the refresher's current token"
+        );
+        assert_eq!(delivered_auth_mode(&delivered), CODEX_AUTH_MODE, "redelivery must keep the copy read-only");
         assert_eq!(std::fs::read_to_string(codex_home.join("config.toml")).expect("preserved config"), "model = \"gpt-5\"\n");
         assert_eq!(
             std::fs::read_to_string(codex_home.join("sessions/2026/09/13/rollout.jsonl")).expect("preserved rollout"),
             "{\"type\":\"session_meta\"}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn redelivery_ignores_an_environment_with_no_codex_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let registry = registry(temp.path());
+
+        assert!(!registry.refresh_delivered_credentials("env-never-provisioned").await.expect("no home is not an error"));
+    }
+
+    #[tokio::test]
+    async fn discarding_an_environment_drops_only_its_delivered_credential() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let registry = registry(temp.path());
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+
+        let delivery = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("initial delivery");
+        let codex_home = delivery[0].mount.host_path.as_path().to_path_buf();
+        std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5\"\n").expect("config");
+
+        registry.discard_delivered_credentials("env-a").await.expect("discard delivered credential");
+
+        assert!(!codex_home.join(CODEX_AUTH_FILE).exists(), "a discarded environment must not retain a token");
+        assert!(codex_home.join("config.toml").exists(), "credential-free scratch is not credential material");
+        registry.discard_delivered_credentials("env-a").await.expect("repeat discard is idempotent");
+    }
+
+    #[tokio::test]
+    async fn the_generation_home_template_seeds_scratch_without_clobbering_crew_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let template = write_home_template(temp.path());
+        let registry = registry_with_home_template(temp.path(), &template);
+        let required = BTreeSet::from([CODEX_ADAPTER_ID.to_string()]);
+
+        let delivery = registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("seeded delivery");
+        let codex_home = delivery[0].mount.host_path.as_path().to_path_buf();
+
+        assert_eq!(std::fs::read_to_string(codex_home.join("config.toml")).expect("seeded config"), "model = \"gpt-5-codex\"\n");
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("skills/codex-only/SKILL.md")).expect("seeded nested template file"),
+            "# Codex only\n"
+        );
+
+        std::fs::write(codex_home.join("config.toml"), "model = \"crew-override\"\n").expect("crew edit");
+        registry.prepare("env-a", &required, &BTreeMap::new()).await.expect("reseeded delivery");
+
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).expect("preserved crew config"),
+            "model = \"crew-override\"\n",
+            "seeding must never overwrite scratch the crew already owns"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_home_template_carrying_a_credential_is_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let template = write_home_template(temp.path());
+        std::fs::write(template.join(CODEX_AUTH_FILE), "{\"tokens\":{}}").expect("write template credential");
+        let registry = registry_with_home_template(temp.path(), &template);
+
+        let error = registry
+            .prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("a template carrying auth.json must be refused");
+
+        assert!(error.contains("credential-free"), "unexpected failure: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_declared_but_missing_home_template_fails_loudly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_central_auth(temp.path(), "access-token-one");
+        let registry = registry_with_home_template(temp.path(), &temp.path().join("generation/absent-codex-home"));
+
+        let error = registry
+            .prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
+            .await
+            .expect_err("a declared template that is not on disk is a generation defect");
+
+        assert!(error.contains(FLOTILLA_CODEX_HOME_TEMPLATE_ENV), "unexpected failure: {error}");
     }
 
     #[tokio::test]
@@ -1270,40 +1397,21 @@ esac
     #[tokio::test]
     async fn missing_generation_skill_sources_fail_before_agent_container_creation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        write_slot(&temp.path().join(".config/flotilla/credentials/codex-pool"), 0);
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        let registry = AgentMaterialRegistry::new(
-            backend,
-            "flotilla",
-            Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])),
-        );
+        write_central_auth(temp.path(), "access-token-one");
+        let registry = AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([("HOME", temp.path().to_string_lossy().into_owned())])));
 
         let error = registry
             .prepare("env-a", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &BTreeMap::new())
             .await
             .expect_err("contained Claude must require pinned skill sources");
 
-        assert!(matches!(error, AgentMaterialPrepareError::Failed(message) if message.contains(FLOTILLA_SKILLS_DIR_ENV)));
+        assert!(error.contains(FLOTILLA_SKILLS_DIR_ENV), "unexpected failure: {error}");
 
         let codex_error = registry
             .prepare("env-b", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new())
             .await
             .expect_err("contained Codex must require pinned skill sources");
-        assert!(matches!(codex_error, AgentMaterialPrepareError::Failed(message) if message.contains(FLOTILLA_SKILLS_DIR_ENV)));
-    }
-
-    #[tokio::test]
-    async fn codex_specific_validation_stays_in_the_adapter() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let pool = temp.path().join(".config/flotilla/credentials/codex-pool");
-        let slot = write_slot(&pool, 0);
-        std::fs::set_permissions(slot.join("auth.json"), std::fs::Permissions::from_mode(0o644)).expect("weaken auth");
-        let registry = registry(temp.path());
-
-        assert!(matches!(
-            registry.prepare("env-a", &BTreeSet::from([CODEX_ADAPTER_ID.to_string()]), &BTreeMap::new()).await,
-            Err(AgentMaterialPrepareError::Waiting { .. })
-        ));
+        assert!(codex_error.contains(FLOTILLA_SKILLS_DIR_ENV), "unexpected failure: {codex_error}");
     }
 
     #[tokio::test]

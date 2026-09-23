@@ -19,7 +19,6 @@ mod in_memory;
 mod labels;
 mod landing_gate;
 mod leaf;
-mod material_pool;
 mod placement_policy;
 mod prepared_snapshot;
 mod presentation;
@@ -83,7 +82,7 @@ pub use definition::DefinitionResolver;
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, EnvironmentWaitReason, HostDirectEnvironmentSpec,
+    EnvironmentStatusPatch, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
 pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
@@ -105,9 +104,6 @@ pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGate
 pub use leaf::{
     admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
     UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
-};
-pub use material_pool::{
-    MaterialPool, MaterialPoolLease, MaterialPoolSpec, MaterialPoolStatus, MaterialPoolStatusPatch, MaterialPoolUnitSpec,
 };
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
@@ -189,7 +185,6 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
-        $callback::<$crate::MaterialPool>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);
         $callback::<$crate::Presentation>($($argument),*);
         $callback::<$crate::Project>($($argument),*);

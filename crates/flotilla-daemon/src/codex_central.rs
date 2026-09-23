@@ -11,8 +11,8 @@
 //!
 //! Codex's refresh tokens are single-use: exactly one refresher may ever
 //! touch a given token, or the two touching it race to invalidate each
-//! other's rotation. That means the central `auth.json` must never be a
-//! path the crew-material pool can hand out — see [`codex_central_auth_path`].
+//! other's rotation. That is why a crew never receives this file itself,
+//! only a read-only copy of it — see [`codex_central_auth_path`].
 
 use std::{
     path::{Path, PathBuf},
@@ -37,13 +37,10 @@ const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEAD_REFRESH_TOKEN_REASONS: &[&str] = &["refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"];
 
 /// Well-known location of the central Codex `auth.json` this host keeps
-/// fresh. Deliberately a sibling of, not a member of, `codex-pool/`
-/// (`crates/flotilla-daemon/src/agent_material.rs`) so
-/// `CodexMaterialAdapter::usable_units` never enumerates it as a leasable
-/// crew slot — the refresher must be the sole writer of this file.
-///
-/// flotilla-org/flotilla#1912 reads from this same path to deliver the file
-/// to crews read-only.
+/// fresh. This file lives outside any crew's `CODEX_HOME`, and the refresh
+/// task is its sole writer; `CodexMaterialAdapter`
+/// (`crates/flotilla-daemon/src/agent_material.rs`) reads from this same
+/// path to deliver read-only `0400` copies into crew homes.
 pub(crate) fn codex_central_auth_path(env: &dyn EnvVars) -> PathBuf {
     env.get("HOME")
         .map(PathBuf::from)
@@ -379,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_central_auth_path_lives_outside_the_leasable_pool() {
+    fn codex_central_auth_path_is_the_contract_the_adapter_delivers_from() {
         struct TestEnv;
         impl EnvVars for TestEnv {
             fn get(&self, key: &str) -> Option<String> {
@@ -391,8 +388,8 @@ mod tests {
 
         assert_eq!(path, PathBuf::from("/home/crew/.config/flotilla/credentials/codex-central/auth.json"));
         assert!(
-            !path.starts_with("/home/crew/.config/flotilla/credentials/codex-pool"),
-            "must not live inside the leasable codex-pool dir"
+            !path.starts_with("/home/crew/.local/share/flotilla/agent-homes"),
+            "the refresher's file must never sit inside a crew home, which crews may write"
         );
     }
 

@@ -17,9 +17,9 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler,
-    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, HopChainContext,
-    PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, HopChainContext, PreparedCheckout,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -52,11 +52,7 @@ struct FakeDockerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for FakeDockerRuntime {
-    async fn provision(
-        &self,
-        name: &str,
-        spec: &flotilla_resources::DockerEnvironmentSpec,
-    ) -> Result<DockerProvisioning, DockerProvisioningError> {
+    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         Ok(DockerProvisioning {
             container_id: format!("container-{name}"),
             image_ref: spec.image.clone(),

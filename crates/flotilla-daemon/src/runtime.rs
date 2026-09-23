@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, DockerProvisioningError, EnvironmentReconciler, ForgeDefaultBranchResolver,
-    HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation,
-    TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
+    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -42,11 +42,11 @@ use flotilla_resources::{
     watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, EnvironmentWaitReason,
-    ForgeIdentity, Host, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
-    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy,
-    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
+    HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
+    Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
     HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
 };
@@ -56,7 +56,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
+    agent_material::AgentMaterialRegistry,
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
@@ -516,11 +516,7 @@ impl DaemonRuntime {
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            &options.namespace,
-            Arc::clone(&daemon.discovery_runtime().env),
-        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
             generation: daemon
                 .observed_resource_backend()
@@ -538,16 +534,6 @@ impl DaemonRuntime {
             .await
             .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
-        let active_environments = daemon
-            .resource_backend()
-            .using::<Environment>(&options.namespace)
-            .list()
-            .await
-            .map_err(|error| format!("list environments for material lease recovery: {error}"))?
-            .items
-            .into_iter()
-            .map(|environment| environment.metadata.name);
-        agent_material.recover(active_environments).await?;
         apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
             .await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
@@ -649,7 +635,7 @@ impl DaemonRuntime {
                 options.namespace.clone(),
                 options.controller_resync_interval,
             ));
-            tasks.push(spawn_agent_material_lease_reconciliation_task(
+            tasks.push(spawn_codex_credential_redelivery_task(
                 Arc::clone(&state),
                 options.namespace.clone(),
                 options.controller_resync_interval,
@@ -1513,10 +1499,10 @@ fn spawn_heartbeat_task_with_credentials(
 /// Keeps this host's central Codex `auth.json` fresh forever by direct
 /// OAuth `grant_type=refresh_token` — the primitive `scripts/codex-token-refresh`
 /// also implements — against the well-known path from
-/// [`codex_central_auth_path`]. That path is deliberately outside
-/// `codex-pool/` (see `crates/flotilla-daemon/src/agent_material.rs`), so
-/// this task is always the sole writer of the file; a crew lease can never
-/// be handed the same `auth.json` a refresh is rotating.
+/// [`codex_central_auth_path`]. This task is the file's sole writer — crews
+/// receive read-only *copies* of it (`crates/flotilla-daemon/src/agent_material.rs`),
+/// never the file itself — which matters because Codex refresh tokens are
+/// single-use and two refreshers would invalidate each other's rotation.
 fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: Duration) -> JoinHandle<()> {
     let refresher = Arc::new(CodexCentralRefresher::new(codex_central_auth_path(&*env), &*env));
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
@@ -1634,29 +1620,32 @@ fn spawn_provisioned_environment_reconciliation_task(
     })
 }
 
-fn spawn_agent_material_lease_reconciliation_task(
-    state: Arc<ControllerRuntimeState>,
-    namespace: String,
-    interval: Duration,
-) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+/// Keeps every live Codex crew's read-only `auth.json` copy current with the
+/// central login this host refreshes.
+///
+/// The credential is static, so there is nothing to lease, queue for, or
+/// release — but a vessel can outlive the access token it was provisioned with,
+/// and a crew holding a read-only copy cannot refresh for itself
+/// (flotilla-org/flotilla#1906). Re-copying on the controller resync interval is
+/// what keeps "crews never refresh" true for a long-lived convoy, and replaces
+/// the reacquire-on-resume step the retired lease loop used to provide.
+fn spawn_codex_credential_redelivery_task(state: Arc<ControllerRuntimeState>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
         let state = Arc::clone(&state);
         let namespace = namespace.clone();
         async move {
-            if let Err(error) = reconcile_agent_material_leases(&state, &namespace).await {
-                warn!(%error, "failed to reconcile parked agent material leases");
+            if let Err(error) = redeliver_codex_credentials(&state, &namespace).await {
+                warn!(%error, "failed to redeliver the central Codex credential to live crews");
             }
         }
     })
 }
 
-async fn reconcile_agent_material_leases(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
+async fn redeliver_codex_credentials(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
     let Some(registry) = state.agent_material.as_deref() else {
         return Ok(());
     };
-    let backend = state.daemon.resource_backend();
-    let convoys = backend.using::<Convoy>(namespace);
-    let environments = backend.using::<Environment>(namespace);
+    let environments = state.daemon.resource_backend().using::<Environment>(namespace);
     for environment in environments.list().await.map_err(|error| error.to_string())?.items {
         let Some(spec) = environment.spec.docker.as_ref() else {
             continue;
@@ -1667,50 +1656,13 @@ async fn reconcile_agent_material_leases(state: &ControllerRuntimeState, namespa
         {
             continue;
         }
-        let Some(convoy_ref) = environment.metadata.labels.get(flotilla_resources::CONVOY_LABEL) else {
-            continue;
-        };
-        let convoy = match convoys.get(convoy_ref).await {
-            Ok(convoy) => convoy,
-            Err(ResourceError::NotFound { .. }) => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        let phase = convoy.status.as_ref().map(|status| status.phase);
-        let status = environment.status.as_ref().expect("ready environment has status");
-        let patch;
-        if phase == Some(flotilla_resources::ConvoyPhase::Landing) {
-            if !matches!(status.wait_reason, Some(EnvironmentWaitReason::MaterialLeaseReleased { .. })) {
-                registry.release(&environment.metadata.name).await?;
-                patch = EnvironmentStatusPatch::MarkMaterialReleased {
-                    message: "codex login lease released while convoy is Landing".to_string(),
-                    pool_ref: "codex-login".to_string(),
-                };
-            } else {
-                continue;
-            }
-        } else if matches!(phase, Some(flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Interrupted))
-            && !status.ready
-        {
-            match registry.prepare(&environment.metadata.name, &spec.required_agent_adapters, &spec.env).await {
-                Ok(_) => {
-                    patch = EnvironmentStatusPatch::MarkMaterialReady;
-                }
-                Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
-                    if status.message.as_ref() == Some(&message)
-                        && status.wait_reason == Some(EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: pool_ref.clone() })
-                    {
-                        continue;
-                    }
-                    patch = EnvironmentStatusPatch::MarkMaterialWaiting { message, pool_ref };
-                }
-                Err(AgentMaterialPrepareError::Failed(error)) => return Err(error),
-            }
-        } else {
-            continue;
+        // A redelivery failure is never fatal to the environment: the crew keeps
+        // the copy it already has, and the next tick retries.
+        match registry.refresh_delivered_credentials(&environment.metadata.name).await {
+            Ok(true) => info!(environment = %environment.metadata.name, "redelivered the central Codex credential"),
+            Ok(false) => {}
+            Err(error) => warn!(environment = %environment.metadata.name, %error, "failed to redeliver the central Codex credential"),
         }
-        flotilla_resources::apply_status_patch(&environments, &environment.metadata.name, &patch)
-            .await
-            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -2418,32 +2370,26 @@ struct DockerControllerRuntime {
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
-    async fn provision(
-        &self,
-        name: &str,
-        spec: &flotilla_resources::DockerEnvironmentSpec,
-    ) -> Result<DockerProvisioning, DockerProvisioningError> {
+    async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let tools = self.state.environment_tools.prepare(name).await?;
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
-                    EnvironmentToolAssetKind::UnixSocket => asset.environment_path.as_path().parent().ok_or_else(|| {
-                        DockerProvisioningError::Failed(format!("Unix socket asset {} has no parent directory", asset.environment_path))
-                    })?,
+                    EnvironmentToolAssetKind::UnixSocket => asset
+                        .environment_path
+                        .as_path()
+                        .parent()
+                        .ok_or_else(|| format!("Unix socket asset {} has no parent directory", asset.environment_path))?,
                     EnvironmentToolAssetKind::File | EnvironmentToolAssetKind::Directory => asset.environment_path.as_path(),
                 };
                 if spec.mounts.iter().any(|mount| Path::new(&mount.target_path) == reserved_path) {
-                    return Err(DockerProvisioningError::Failed(format!(
-                        "mount target {} is reserved for {}",
-                        reserved_path.display(),
-                        asset.purpose
-                    )));
+                    return Err(format!("mount target {} is reserved for {}", reserved_path.display(), asset.purpose));
                 }
             }
             for update in &tool.environment {
                 if let EnvironmentVariableUpdate::Set { name, purpose, .. } = update {
                     if spec.env.contains_key(name) {
-                        return Err(DockerProvisioningError::Failed(format!("environment variable {name} is reserved for {purpose}")));
+                        return Err(format!("environment variable {name} is reserved for {purpose}"));
                     }
                 }
             }
@@ -2476,12 +2422,11 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         name,
                         error,
                     )
-                    .await
-                    .into())
+                    .await)
                 }
             },
             None if credential_refs.is_empty() => Vec::new(),
-            None => return Err("host-local credential store unavailable".to_string().into()),
+            None => return Err("host-local credential store unavailable".to_string()),
         };
         let agent_material_fragments = self
             .state
@@ -2499,8 +2444,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         name,
                         error,
                     )
-                    .await
-                    .into())
+                    .await)
                 }
             };
         let creation_agent_environment = compose_agent_environment(agent_material_fragments.iter().cloned())
@@ -2515,28 +2459,14 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         let material_deliveries = match &self.state.agent_material {
             Some(registry) => match registry.prepare(name, &spec.required_agent_adapters, &spec.env).await {
                 Ok(deliveries) => deliveries,
-                Err(AgentMaterialPrepareError::Waiting { pool_ref, message }) => {
-                    let message = discard_uncreated_environment(
-                        self.state.credential_store.as_deref(),
-                        self.state.agent_material.as_deref(),
-                        name,
-                        message,
-                    )
-                    .await;
-                    return Err(DockerProvisioningError::Waiting {
-                        message,
-                        reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref },
-                    });
-                }
-                Err(AgentMaterialPrepareError::Failed(error)) => {
+                Err(error) => {
                     return Err(discard_uncreated_environment(
                         self.state.credential_store.as_deref(),
                         self.state.agent_material.as_deref(),
                         name,
                         error,
                     )
-                    .await
-                    .into())
+                    .await)
                 }
             },
             None => Vec::new(),
@@ -2551,12 +2481,11 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         name,
                         error,
                     )
-                    .await
-                    .into())
+                    .await)
                 }
             },
             None if credential_refs.is_empty() => None,
-            None => return Err("host-local credential store unavailable".to_string().into()),
+            None => return Err("host-local credential store unavailable".to_string()),
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
@@ -2579,9 +2508,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 let cleanup_errors =
                     forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), name).await;
                 if !cleanup_errors.is_empty() {
-                    return Err(format!("{error}; additionally failed to {}", cleanup_errors.join("; ")).into());
+                    return Err(format!("{error}; additionally failed to {}", cleanup_errors.join("; ")));
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
         let image_ref = handle.image().as_str().to_string();
@@ -2596,8 +2525,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     name,
                     format!("docker environment provider did not report an image digest for {name}"),
                 )
-                .await
-                .into())
+                .await)
             }
         };
 
@@ -2606,9 +2534,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             match store.prepare_scoped(name, &credential_refs, &credential_scopes, handle.runner()).await {
                 Ok(environment) => environment,
                 Err(error) => {
-                    return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error)
-                        .await
-                        .into())
+                    return Err(discard_failed_environment(&handle, Some(store), self.state.agent_material.as_deref(), name, error).await)
                 }
             }
         } else if !credential_refs.is_empty() {
@@ -2619,8 +2545,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 name,
                 "host-local credential store unavailable".to_string(),
             )
-            .await
-            .into());
+            .await);
         } else {
             Vec::new()
         };
@@ -2635,8 +2560,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                         name,
                         error,
                     )
-                    .await
-                    .into())
+                    .await)
                 }
             },
             None => Vec::new(),
@@ -2655,8 +2579,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     name,
                     error,
                 )
-                .await
-                .into());
+                .await);
             }
         }
         if let Some(agent_material) = &self.state.agent_material {
@@ -2674,8 +2597,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                             name,
                             error,
                         )
-                        .await
-                        .into())
+                        .await)
                     }
                 };
             if will_stage_skills {
@@ -2689,8 +2611,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                             name,
                             error,
                         )
-                        .await
-                        .into())
+                        .await)
                     }
                 };
                 let mut prepared_by_credential: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
@@ -2708,8 +2629,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                                 name,
                                 error,
                             )
-                            .await
-                            .into());
+                            .await);
                         }
                         token_file.clone()
                     } else {
@@ -2718,9 +2638,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                                 "skill source {} credential {} mint failed: host-local credential store unavailable",
                                 request.source, request.credential
                             );
-                            return Err(discard_failed_environment(&handle, None, self.state.agent_material.as_deref(), name, error)
-                                .await
-                                .into());
+                            return Err(discard_failed_environment(&handle, None, self.state.agent_material.as_deref(), name, error).await);
                         };
                         match store.prepare_skill_source(&request.credential, &request.repository, &*handle.runner()).await {
                             Ok(token_file) => {
@@ -2737,8 +2655,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                                     name,
                                     error,
                                 )
-                                .await
-                                .into());
+                                .await);
                             }
                         }
                     };
@@ -2755,23 +2672,20 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     name,
                     error,
                 )
-                .await
-                .into());
+                .await);
             }
         }
         for delivery in &material_deliveries {
             let args = delivery.preflight.args.iter().map(String::as_str).collect::<Vec<_>>();
             if let Err(error) = handle.runner().run(&delivery.preflight.command, &args, Path::new("/"), &ChannelLabel::Default).await {
-                return Err(DockerProvisioningError::Failed(
-                    discard_failed_environment(
-                        &handle,
-                        self.state.credential_store.as_deref(),
-                        self.state.agent_material.as_deref(),
-                        name,
-                        format!("{}: {error}", delivery.preflight.failure_context),
-                    )
-                    .await,
-                ));
+                return Err(discard_failed_environment(
+                    &handle,
+                    self.state.credential_store.as_deref(),
+                    self.state.agent_material.as_deref(),
+                    name,
+                    format!("{}: {error}", delivery.preflight.failure_context),
+                )
+                .await);
             }
         }
         let (bag, registry) = match probe_provisioned_environment(&self.state, &env_id, &handle).await {
@@ -2784,8 +2698,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     name,
                     error,
                 )
-                .await
-                .into());
+                .await);
             }
         };
         if let Err(error) = verify_declared_agent_adapters(spec, &registry) {
@@ -2796,8 +2709,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 name,
                 error,
             )
-            .await
-            .into());
+            .await);
         }
         if let Err(error) = self
             .state
@@ -2812,8 +2724,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 name,
                 error,
             )
-            .await
-            .into());
+            .await);
         }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
         Ok(DockerProvisioning { container_id, image_ref, image_digest })
@@ -2932,8 +2843,8 @@ async fn forget_environment_state(
         }
     }
     if let Some(registry) = agent_material {
-        if let Err(cleanup_error) = registry.release(environment_ref).await {
-            cleanup_errors.push(format!("release material lease: {cleanup_error}"));
+        if let Err(cleanup_error) = registry.discard_delivered_credentials(environment_ref).await {
+            cleanup_errors.push(format!("discard delivered agent credential: {cleanup_error}"));
         }
     }
     cleanup_errors
@@ -3789,29 +3700,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         let Some(reason) = adapter.classify_screen_failure(&screen) else { return Ok(None) };
 
+        // Static material means every crew runs the same central login, so the
+        // operator-facing name is that login's path, not a leased slot: if a
+        // crew saw an auth failure, the host's refresher is what needs looking at.
         let material = match &self.state.agent_material {
-            Some(registry) => match registry.describe(&spec.env_ref).await {
-                Ok(leases) if !leases.is_empty() => leases.join(", "),
-                Ok(_) => format!("credential codex-login (no leased slot for environment {})", spec.env_ref),
-                Err(error) => {
-                    return Ok(Some(format!(
-                        "Codex authentication failed for credential codex-login in environment {}: {reason}; failed to identify its slot: {error}",
-                        spec.env_ref
-                    )));
-                }
-            },
-            None => format!("credential codex-login (no material registry for environment {})", spec.env_ref),
+            Some(registry) => format!("the central Codex credential {}", registry.codex_credential_source().display()),
+            None => format!("the central Codex credential (no material registry for environment {})", spec.env_ref),
         };
-        Ok(Some(format!("Codex authentication failed for {material}: {reason}")))
-    }
-
-    async fn cleanup_failed_session(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
-        if matches!(spec.source, TerminalSessionSource::Agent { .. }) {
-            if let Some(registry) = &self.state.agent_material {
-                registry.release(&spec.env_ref).await?;
-            }
-        }
-        Ok(())
+        Ok(Some(format!("Codex authentication failed for {material} in environment {}: {reason}", spec.env_ref)))
     }
 
     async fn deliver_message(
@@ -3998,25 +3894,18 @@ mod tests {
     };
     use flotilla_protocol::{
         Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent, HostName, ImageId, ImageSource, NodeInfo,
-        PeerConnectionState, PlacementDecision, PlacementTargetHost, ResourceRef,
+        PeerConnectionState, PlacementDecision, PlacementTargetHost,
     };
     use flotilla_resources::{
-        api_version,
         controller::{Actuation, Reconciler},
-        delete_resource_kind,
-        test_support::{
-            run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
-            TransitionDriver, TransitionSequence, WorldBuilder,
-        },
-        Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec, CheckoutSpec as ResourceCheckoutSpec,
-        CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure, ConvoyEnsureSpec, ConvoyPhase, ConvoyRepositorySpec,
-        ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialLifecycle, CredentialPlacementRequirements,
-        CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec, InMemoryBackend, LifecycleAuthority, MaterialPool,
-        MaterialPoolSpec, MaterialPoolUnitSpec, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus,
+        delete_resource_kind, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
+        CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure,
+        ConvoyEnsureSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
+        CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
+        InMemoryBackend, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementStatus,
         RepositoryKey, RepositorySpec, Resource, ResourceList, Selector, SqliteBackend, StatusPatch, TerminalAttentionState,
         TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, VesselRequirement,
-        VesselSpec, VesselStatus, VirtualClock, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION,
-        CONVOY_LABEL,
+        VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
     };
     use futures::StreamExt;
     use tempfile::TempDir;
@@ -4029,7 +3918,6 @@ mod tests {
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
-        material_pool::{MaterialLeaseOutcome, MaterialPoolManager},
     };
 
     fn fixed_environment_tools(state_root: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
@@ -5528,14 +5416,10 @@ mod tests {
             Arc::new(ReplayHttpClient::new(mint_session.clone())),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(
-            backend,
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([
-                ("HOME", temp.path().join("home").display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
-            ])),
-        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", temp.path().join("home").display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, write_test_credentialed_skill_sources(temp.path()).display().to_string()),
+        ]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -5572,7 +5456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_adapter_delivers_leased_material_as_a_writable_codex_home() {
+    async fn codex_adapter_delivers_the_central_credential_in_a_writable_codex_home() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");
@@ -5581,11 +5465,10 @@ mod tests {
         fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-material-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
         let skill_sources = write_test_skill_sources(temp.path());
-        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
-        fs::create_dir_all(&slot).expect("slot directory");
-        let auth = slot.join("auth.json");
-        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let central = home.join(".config/flotilla/credentials/codex-central/auth.json");
+        fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
+        fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
         let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
@@ -5607,14 +5490,10 @@ mod tests {
             Arc::new(ProcessCommandRunner),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([
-                ("HOME", home.display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
-            ])),
-        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+        ]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -5663,23 +5542,23 @@ mod tests {
         assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), "/image/codex".to_string())]);
         assert!(
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
-            "a placement-provided CODEX_HOME must not be overwritten with a leased slot"
+            "a placement-provided CODEX_HOME must not be overwritten with a delivered Codex home"
         );
     }
 
     #[tokio::test]
-    async fn landing_releases_codex_lease_and_active_turn_waits_then_reacquires() {
+    async fn redelivery_refreshes_live_codex_crews_and_ignores_externally_managed_homes() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
-        fs::write(config_base.join("daemon.toml"), "machine_id = \"lease-lifecycle-test\"\n").expect("daemon config");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-redelivery-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
-        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
-        fs::create_dir_all(&slot).expect("slot directory");
-        fs::write(slot.join("auth.json"), "{\"tokens\":\"test\"}").expect("slot auth");
-        fs::set_permissions(slot.join("auth.json"), fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let central = home.join(".config/flotilla/credentials/codex-central/auth.json");
+        fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
+        fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
         let config = Arc::new(ConfigStore::with_base(config_base));
         let daemon = InProcessDaemon::new(
             Vec::new(),
@@ -5688,14 +5567,10 @@ mod tests {
             HostName::new("dinghy"),
         )
         .await;
-        let material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([
-                ("HOME", home.display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
-            ])),
-        ));
+        let material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+        ]))));
         let state = ControllerRuntimeState::new(
             Arc::clone(&daemon),
             config,
@@ -5707,25 +5582,15 @@ mod tests {
         )
         .with_agent_material(Arc::clone(&material));
         let required = BTreeSet::from(["codex".to_string()]);
-        material.prepare("work", &required, &BTreeMap::new()).await.expect("initial lease");
+        let deliveries = material.prepare("work", &required, &BTreeMap::new()).await.expect("initial delivery");
+        let codex_home = deliveries[0].mount.host_path.as_path().to_path_buf();
 
-        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
-        let convoy = convoys
-            .create(&empty_meta("lease-convoy"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-            .await
-            .expect("convoy");
-        convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                ..Default::default()
-            })
-            .await
-            .expect("landing");
         let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-        let environment = environments
-            .create(
-                &empty_meta_with_labels("work", BTreeMap::from([(CONVOY_LABEL.to_string(), "lease-convoy".to_string())])),
-                &EnvironmentSpec {
+        for (name, env) in
+            [("work", BTreeMap::new()), ("external-home", BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))]
+        {
+            let environment = environments
+                .create(&empty_meta(name), &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
                         host_ref: "host-test".to_string(),
@@ -5734,97 +5599,38 @@ mod tests {
                         required_agent_adapters: required.clone(),
                         pull_policy: Default::default(),
                         mounts: Vec::new(),
-                        env: BTreeMap::new(),
+                        env,
                     }),
-                },
-            )
-            .await
-            .expect("environment");
-        environments
-            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
-                phase: EnvironmentPhase::Ready,
-                ready: true,
-                ..Default::default()
-            })
-            .await
-            .expect("ready");
+                })
+                .await
+                .expect("environment");
+            environments
+                .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+                    phase: EnvironmentPhase::Ready,
+                    ready: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("ready");
+        }
 
-        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("release in Landing");
-        assert!(daemon
-            .resource_backend()
-            .using::<MaterialPool>(NAMESPACE)
-            .get("codex-login")
-            .await
-            .expect("pool")
-            .status
-            .expect("status")
-            .leases
-            .is_empty());
-        assert!(matches!(
-            environments.get("work").await.expect("released environment").status.expect("status").wait_reason,
-            Some(EnvironmentWaitReason::MaterialLeaseReleased { .. })
-        ));
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-two\"}}").expect("rotate central auth");
+        redeliver_codex_credentials(&state, NAMESPACE).await.expect("redeliver the rotated credential");
 
-        material.prepare("blocker", &required, &BTreeMap::new()).await.expect("occupy only unit");
-        let convoy = convoys.get("lease-convoy").await.expect("convoy");
-        convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                ..convoy.status.expect("status")
-            })
-            .await
-            .expect("deliver turn");
-        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("wait for exhausted pool");
-        assert!(matches!(
-            environments.get("work").await.expect("waiting environment").status.expect("status").wait_reason,
-            Some(EnvironmentWaitReason::MaterialPoolExhausted { .. })
-        ));
-
-        material.release("blocker").await.expect("free unit");
-        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("reacquire");
-        let status = environments.get("work").await.expect("resumed environment").status.expect("status");
-        assert!(status.ready);
-        assert!(status.wait_reason.is_none());
-
-        let external_convoy = convoys
-            .create(&empty_meta("external-home"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
-            .await
-            .expect("external-home convoy");
-        convoys
-            .update_status(&external_convoy.metadata.name, &external_convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                ..Default::default()
-            })
-            .await
-            .expect("external-home landing");
-        let external_environment = environments
-            .create(
-                &empty_meta_with_labels("external-home", BTreeMap::from([(CONVOY_LABEL.to_string(), "external-home".to_string())])),
-                &EnvironmentSpec {
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        host_ref: "host-test".to_string(),
-                        image: "test".to_string(),
-                        declared_agent_adapters: required.clone(),
-                        required_agent_adapters: required,
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env: BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]),
-                    }),
-                },
-            )
-            .await
-            .expect("external-home environment");
-        environments
-            .update_status(
-                &external_environment.metadata.name,
-                &external_environment.metadata.resource_version,
-                &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
-            )
-            .await
-            .expect("external-home ready");
-        reconcile_agent_material_leases(&state, NAMESPACE).await.expect("ignore external home");
-        assert!(environments.get("external-home").await.expect("external home").status.expect("status").ready);
+        let delivered = codex_home.join("auth.json");
+        assert!(
+            fs::read_to_string(&delivered).expect("delivered credential").contains("access-token-two"),
+            "a live crew must be moved onto the refresher's current token"
+        );
+        assert_eq!(
+            fs::metadata(&delivered).expect("delivered credential metadata").permissions().mode() & 0o777,
+            0o400,
+            "redelivery must keep the crew's copy read-only"
+        );
+        assert!(
+            !home.join(".local/share/flotilla/agent-homes/external-home").exists(),
+            "an externally managed CODEX_HOME is not ours to deliver into"
+        );
     }
 
     #[tokio::test]
@@ -5839,11 +5645,10 @@ mod tests {
         let skills = home.join(".codex/skills/pr-shepherd");
         fs::create_dir_all(&skills).expect("skill directory");
         fs::write(skills.join("SKILL.md"), "# PR shepherd\n").expect("skill definition");
-        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
-        fs::create_dir_all(&slot).expect("slot directory");
-        let auth = slot.join("auth.json");
-        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
+        let central = home.join(".config/flotilla/credentials/codex-central/auth.json");
+        fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
+        fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
+        fs::set_permissions(&central, fs::Permissions::from_mode(0o600)).expect("protect central auth");
         let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
@@ -5877,7 +5682,7 @@ mod tests {
             Arc::new(ProcessCommandRunner),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(daemon.resource_backend(), NAMESPACE, env));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(env));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -5912,26 +5717,19 @@ mod tests {
             .to_string();
 
         assert!(error.contains("CODEX_HOME"), "error must name the target key: {error}");
-        assert!(error.contains("agent-material/codex codex-login"), "error must name agent material: {error}");
+        assert!(error.contains("agent-material/codex codex-central"), "error must name agent material: {error}");
         assert!(error.contains("credential/codex openai"), "error must name the credential: {error}");
         assert!(provider.create_opts.lock().await.is_none(), "conflicting config must fail before creating a container");
     }
 
     #[tokio::test]
-    async fn material_pool_wait_skips_registry_preflight_and_leaves_no_credential_cache() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn an_unprovisioned_central_codex_credential_fails_before_registry_preflight() {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
-        fs::write(config_base.join("daemon.toml"), "machine_id = \"material-pool-registry-wait-test\"\n").expect("daemon config");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"codex-central-missing-test\"\n").expect("daemon config");
         let home = temp.path().join("home");
         let skill_sources = write_test_skill_sources(temp.path());
-        let slot = home.join(".config/flotilla/credentials/codex-pool/slot-0");
-        fs::create_dir_all(&slot).expect("slot directory");
-        let auth = slot.join("auth.json");
-        fs::write(&auth, "{\"tokens\":\"test\"}").expect("slot auth");
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("protect slot auth");
         let config = Arc::new(ConfigStore::with_base(config_base));
         let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
         let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
@@ -5965,18 +5763,10 @@ mod tests {
             registry_runner.clone(),
             config.state_dir().as_path().to_path_buf(),
         ));
-        let agent_material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([
-                ("HOME", home.display().to_string()),
-                (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
-            ])),
-        ));
-        agent_material
-            .prepare("slot-holder", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
-            .await
-            .expect("occupy only material unit");
+        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+        ]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -6004,16 +5794,19 @@ mod tests {
             )]),
         };
 
-        let error =
-            DockerControllerRuntime { state }.provision("waiting-environment", &spec).await.expect_err("exhausted Codex pool should wait");
+        let error = DockerControllerRuntime { state }
+            .provision("unprovisioned-environment", &spec)
+            .await
+            .expect_err("a host with no central Codex login cannot provision a Codex crew");
 
-        assert_eq!(error, DockerProvisioningError::Waiting {
-            message: "waiting for codex login material; 1 in pool, all leased; mint another unit to increase concurrency".to_string(),
-            reason: EnvironmentWaitReason::MaterialPoolExhausted { pool_ref: "codex-login".to_string() },
-        });
+        assert!(error.contains("codex-central/auth.json"), "the failure must name the central path: {error}");
+        assert!(error.contains("not provisioned"), "the failure must say the host lacks the credential: {error}");
         assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 0, "registry login and pull must not run before material is available");
-        assert!(provider.create_opts.lock().await.is_none(), "provider create must not run while waiting");
-        assert!(!config.state_dir().as_path().join("credential-runtime").exists(), "waiting must not leave a credential cache on disk");
+        assert!(provider.create_opts.lock().await.is_none(), "provider create must not run without agent material");
+        assert!(
+            !config.state_dir().as_path().join("credential-runtime").exists(),
+            "a failed provision must not leave a credential cache on disk"
+        );
     }
 
     #[tokio::test]
@@ -6046,11 +5839,7 @@ mod tests {
         let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
         fs::create_dir_all(environment_home.join("codex/sessions")).expect("persistent agent home");
         fs::write(environment_home.join("codex/sessions/rollout.jsonl"), "session state").expect("persistent session state");
-        let agent_material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([("HOME", home.display().to_string())])),
-        ));
+        let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([("HOME", home.display().to_string())]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
                 daemon,
@@ -8545,172 +8334,6 @@ mod tests {
         daemon_with_backend(tracked_repos, config, backend).await
     }
 
-    struct LeaseRecoveryWorld {
-        _temp: TempDir,
-        config: Arc<ConfigStore>,
-        daemon: Arc<InProcessDaemon>,
-        backend: ResourceBackend,
-        pools: MaterialPoolManager,
-        second_holder: ResourceRef,
-        runtime: Option<DaemonRuntime>,
-        pending_finalization: bool,
-        second_outcome: Option<MaterialLeaseOutcome>,
-    }
-
-    struct LeaseRecoveryWorldBuilder;
-
-    #[async_trait]
-    impl WorldBuilder for LeaseRecoveryWorldBuilder {
-        type World = LeaseRecoveryWorld;
-
-        async fn build(&self, _scenario: LivenessScenario) -> Result<Self::World, String> {
-            let temp = TempDir::new().map_err(|error| error.to_string())?;
-            std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"lease-recovery-world-test\"\n")
-                .map_err(|error| error.to_string())?;
-            let config = Arc::new(ConfigStore::with_base(temp.path()));
-            let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
-            let backend = daemon.resource_backend();
-            backend
-                .clone()
-                .using::<Environment>(NAMESPACE)
-                .create(
-                    &InputMeta::builder()
-                        .name("deleting-environment".to_string())
-                        .finalizers(vec!["flotilla.work/test-environment-finalizer".to_string()])
-                        .build(),
-                    &EnvironmentSpec {
-                        host_direct: Some(HostDirectEnvironmentSpec {
-                            host_ref: "host-test".to_string(),
-                            repo_default_dir: "/tmp/worktrees".to_string(),
-                        }),
-                        docker: None,
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-
-            let pools = MaterialPoolManager::new(backend.clone(), NAMESPACE);
-            pools
-                .reconcile_pool("codex-login", &MaterialPoolSpec {
-                    units: BTreeMap::from([("unit-0".to_string(), MaterialPoolUnitSpec {
-                        directory: "/var/lib/flotilla/material/unit-0".to_string(),
-                    })]),
-                })
-                .await?;
-            let deleting_holder =
-                ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "deleting-environment");
-            pools.acquire("codex-login", &deleting_holder).await?;
-            let second_holder =
-                ResourceRef::new(api_version(Environment::API_PATHS), Environment::API_PATHS.kind, NAMESPACE, "second-environment");
-
-            Ok(LeaseRecoveryWorld {
-                _temp: temp,
-                config,
-                daemon,
-                backend,
-                pools,
-                second_holder,
-                runtime: None,
-                pending_finalization: false,
-                second_outcome: None,
-            })
-        }
-    }
-
-    struct LeaseRecoveryStep;
-
-    #[async_trait]
-    impl ReconcileStep<LeaseRecoveryWorld> for LeaseRecoveryStep {
-        type Patch = ();
-        type Actuation = ();
-
-        async fn reconcile_step(&self, world: &mut LeaseRecoveryWorld) -> Result<LivenessStep<Self::Patch, Self::Actuation>, String> {
-            world.second_outcome = Some(world.pools.acquire("codex-login", &world.second_holder).await?);
-            Ok(LivenessStep::new(None, Vec::new()))
-        }
-
-        async fn apply_patch(&self, _world: &mut LeaseRecoveryWorld, _patch: Self::Patch) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn apply_actuation(&self, _world: &mut LeaseRecoveryWorld, _actuation: Self::Actuation) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl TransitionDriver<LeaseRecoveryWorld> for LeaseRecoveryStep {
-        type Field = ();
-        type Value = ();
-        type OriginRoot = String;
-
-        async fn external_spec_write(
-            &self,
-            _world: &mut LeaseRecoveryWorld,
-            _field: &Self::Field,
-            _value: &Self::Value,
-        ) -> Result<(), String> {
-            Err("external spec writes are not part of the lease recovery property".to_string())
-        }
-
-        async fn delete(&self, world: &mut LeaseRecoveryWorld) -> Result<(), String> {
-            let environments = world.backend.clone().using::<Environment>(NAMESPACE);
-            environments.delete("deleting-environment").await.map_err(|error| error.to_string())?;
-            world.pending_finalization =
-                environments.get("deleting-environment").await.map_err(|error| error.to_string())?.metadata.deletion_timestamp.is_some();
-            Ok(())
-        }
-
-        async fn restart_controller(&self, world: &mut LeaseRecoveryWorld) -> Result<(), String> {
-            let runtime = DaemonRuntime::start_with_options(Arc::clone(&world.daemon), Arc::clone(&world.config), None, RuntimeOptions {
-                heartbeat_interval: Duration::from_secs(300),
-                controller_resync_interval: Duration::from_secs(300),
-                start_controllers: false,
-                ..RuntimeOptions::default()
-            })
-            .await?;
-            world.runtime = Some(runtime);
-            Ok(())
-        }
-
-        async fn partition_store(&self, _world: &mut LeaseRecoveryWorld, _origin_root: &Self::OriginRoot) -> Result<(), String> {
-            Err("store partition is not part of the lease recovery property".to_string())
-        }
-    }
-
-    struct LeaseRecoveryFixpoint;
-
-    impl FixpointPredicate<LeaseRecoveryWorld> for LeaseRecoveryFixpoint {
-        fn at_fixpoint(&self, _world: &LeaseRecoveryWorld) -> bool {
-            false
-        }
-    }
-
-    /// Regression property from the #1242 review: deletion only timestamps a
-    /// holder while its finalizer is pending, so restart recovery must retain
-    /// its lease and refuse a second holder.
-    #[tokio::test]
-    async fn startup_recovery_retains_material_lease_for_environment_pending_finalization() {
-        let clock = Arc::new(VirtualClock::new(Utc::now()));
-        let enrollment = LivenessEnrollment::new(LeaseRecoveryWorldBuilder, LeaseRecoveryStep, LeaseRecoveryFixpoint, clock);
-        let sequence: TransitionSequence<LeaseRecoveryWorld, (), (), String> =
-            TransitionSequence::new([Transition::Delete, Transition::RestartController, Transition::Reconcile])
-                .sometimes("holder reached pending finalization before restart", |world: &LeaseRecoveryWorld| world.pending_finalization)
-                .sometimes("second holder was refused after restart", |world: &LeaseRecoveryWorld| {
-                    world.runtime.is_some() && matches!(world.second_outcome, Some(MaterialLeaseOutcome::Waiting { unit_count: 1 }))
-                });
-
-        let mut world = run_transition_sequence(&enrollment, LivenessScenario::Normal, &sequence)
-            .await
-            .expect("deleting-holder lease recovery sequence");
-        assert_eq!(
-            world.second_outcome,
-            Some(MaterialLeaseOutcome::Waiting { unit_count: 1 }),
-            "startup recovery must retain leases until an environment's finalizer removes it from the store"
-        );
-        world.runtime.take().expect("sequence restarted daemon runtime").shutdown();
-    }
-
     #[test]
     fn fleet_diagnosis_surfaces_event_decode_quarantines() {
         let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
@@ -10317,22 +9940,18 @@ mod tests {
         let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
-        let slot = temp.path().join(".config/flotilla/credentials/codex-pool/slot-4");
-        std::fs::create_dir_all(&slot).expect("slot");
-        std::fs::write(slot.join("auth.json"), "{}").expect("auth");
-        std::fs::set_permissions(slot.join("auth.json"), std::fs::Permissions::from_mode(0o600)).expect("protect auth");
-        let material = Arc::new(AgentMaterialRegistry::new(
-            daemon.resource_backend(),
-            NAMESPACE,
-            Arc::new(TestEnvVars::new([
-                ("HOME", temp.path().to_string_lossy().into_owned()),
-                (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
-            ])),
-        ));
+        let central = temp.path().join(".config/flotilla/credentials/codex-central/auth.json");
+        std::fs::create_dir_all(central.parent().expect("central credential directory")).expect("central credential directory");
+        std::fs::write(&central, "{\"tokens\":{\"access_token\":\"access-token-one\"}}").expect("central auth");
+        std::fs::set_permissions(&central, std::fs::Permissions::from_mode(0o600)).expect("protect central auth");
+        let material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", temp.path().to_string_lossy().into_owned()),
+            (FLOTILLA_SKILLS_DIR_ENV, write_test_skill_sources(temp.path()).display().to_string()),
+        ]))));
         material
             .prepare(&profile.host_direct_environment_name(), &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
             .await
-            .expect("lease slot");
+            .expect("deliver the central credential");
         let runtime = TerminalControllerRuntime {
             state: Arc::new(
                 ControllerRuntimeState::new(
@@ -10397,13 +10016,14 @@ mod tests {
         .await;
         let failure = runtime.observe_failure(session_name, &spec).await.expect("observe auth failure").expect("fatal auth failure");
         assert!(failure.contains("token_expired"));
-        assert!(failure.contains("codex-login"));
-        assert!(failure.contains("slot-4"));
-        runtime.cleanup_failed_session(&spec).await.expect("release failed session material");
+        assert!(
+            failure.contains(&central.display().to_string()),
+            "a static credential names the central login an operator must re-authenticate: {failure}"
+        );
         material
             .prepare("replacement-environment", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
             .await
-            .expect("released slot should be reusable");
+            .expect("a failed crew never blocks another crew from the same central login");
     }
 
     #[tokio::test]

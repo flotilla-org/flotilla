@@ -1386,7 +1386,7 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
 
     async fn observe_failure(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
         Ok(Some(
-            "Codex authentication failed for credential codex-login slot slot-4: token_expired; access token could not be refreshed".into(),
+            "Codex authentication failed for the central Codex credential /var/lib/flotilla/.config/flotilla/credentials/codex-central/auth.json in environment env-a: token_expired".into(),
         ))
     }
 
@@ -1396,7 +1396,7 @@ impl TerminalRuntime for AuthFailedTerminalRuntime {
 }
 
 #[tokio::test]
-async fn fatal_runtime_observation_fails_a_running_terminal_with_the_credential_slot() {
+async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credential() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<TerminalSession>("flotilla");
@@ -1429,7 +1429,6 @@ async fn fatal_runtime_observation_fails_a_running_terminal_with_the_credential_
 
     assert_eq!(status.phase, TerminalSessionPhase::Failed);
     let message = status.message.expect("failure reason");
-    assert!(message.contains("codex-login"));
-    assert!(message.contains("slot-4"));
-    assert!(message.contains("token_expired"));
+    assert!(message.contains("codex-central/auth.json"), "the failure must name the central credential: {message}");
+    assert!(message.contains("token_expired"), "the failure must carry the observed reason: {message}");
 }

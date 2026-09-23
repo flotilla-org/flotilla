@@ -444,25 +444,25 @@ mod tests {
         let composed = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
             "CODEX_HOME",
             "/run/flotilla/codex",
-            "agent-material/codex codex-login",
+            "agent-material/codex codex-central",
         )])
         .expect("agent environment should compose");
 
-        assert_eq!(composed.contents, "# fragment: agent-material/codex codex-login\nexport CODEX_HOME='/run/flotilla/codex'\n");
+        assert_eq!(composed.contents, "# fragment: agent-material/codex codex-central\nexport CODEX_HOME='/run/flotilla/codex'\n");
         assert_eq!(composed.environment, [("CODEX_HOME".to_string(), "/run/flotilla/codex".to_string())]);
     }
 
     #[test]
     fn credential_and_agent_material_conflict_names_both_contributors() {
         let error = compose(TargetId::AgentEnvironment, [
-            agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-login"),
+            agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-central"),
             agent_environment_fragment("CODEX_HOME", "/run/flotilla/credentials/openai/codex", "credential/codex openai"),
         ])
         .expect_err("two Codex homes must conflict")
         .to_string();
 
         assert!(error.contains("CODEX_HOME"), "error must name the key: {error}");
-        assert!(error.contains("agent-material/codex codex-login"), "error must name agent material: {error}");
+        assert!(error.contains("agent-material/codex codex-central"), "error must name agent material: {error}");
         assert!(error.contains("credential/codex openai"), "error must name the credential: {error}");
     }
 
