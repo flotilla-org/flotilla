@@ -3075,9 +3075,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Default)
             .await
             .is_ok();
-        if !local_exists
-            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok()
-        {
+        let has_origin = !local_exists
+            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok();
+        if has_origin {
             let remote_head = format!("refs/heads/{branch}");
             let advertised = runner
                 .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Default)
@@ -3118,8 +3118,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 .await?;
         } else if let Some(base_ref) = base_ref {
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
-            if runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok() {
-                let refspec = format!("{base_ref}:refs/remotes/origin/{base_ref}");
+            if has_origin {
+                // Force-update the tracking ref: a plain (non-force) fetch would fail on a
+                // rebased/force-pushed base branch and silently fall through to whatever
+                // origin/{base_ref} was last cached, reproducing a narrower version of the
+                // staleness bug this arm exists to fix.
+                let refspec = format!("+{base_ref}:refs/remotes/origin/{base_ref}");
                 if let Err(error) =
                     runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default).await
                 {
@@ -6335,6 +6339,54 @@ mod tests {
         assert_eq!(
             head, origin_tip,
             "fresh convoy branch should start from the fetched origin tip, not the shared clone's stale local main"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_branches_off_a_force_pushed_origin_base_ref() {
+        let temp = TempDir::new().expect("tempdir");
+        let origin = TestGitRepo::init(temp.path().join("origin")).with_initial_commit();
+        let origin_path = origin.path().to_str().expect("utf-8 origin path");
+
+        let clone_path_buf = temp.path().join("clone");
+        let clone_path = clone_path_buf.to_str().expect("utf-8 clone path");
+        assert!(ProcessCommand::new("git").args(["clone", origin_path, clone_path]).status().expect("git clone should run").success());
+
+        // Rewrite origin's main to a commit that is not a descendant of what the shared
+        // clone cached at clone time, simulating a rebase/force-push of the base branch.
+        // A plain (non-force) fetch cannot fast-forward onto this and must be rejected.
+        assert!(ProcessCommand::new("git")
+            .args(["-C", origin_path, "commit", "--amend", "-m", "rewritten root commit"])
+            .status()
+            .expect("git commit --amend should run")
+            .success());
+        let origin_tip =
+            ProcessCommand::new("git").args(["-C", origin_path, "rev-parse", "main"]).output().expect("git rev-parse should run");
+        let origin_tip = String::from_utf8(origin_tip.stdout).expect("utf-8 rev").trim().to_string();
+        let cached_tip = ProcessCommand::new("git")
+            .args(["-C", clone_path, "rev-parse", "refs/remotes/origin/main"])
+            .output()
+            .expect("git rev-parse should run");
+        let cached_tip = String::from_utf8(cached_tip.stdout).expect("utf-8 rev").trim().to_string();
+        assert_ne!(origin_tip, cached_tip, "the rewrite should actually diverge from what the clone cached");
+
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+
+        runtime
+            .create_worktree(clone_path, "feature/onto-rewritten-base", Some("main"), target.to_str().expect("utf-8 target path"))
+            .await
+            .expect("worktree should create");
+
+        let head = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse should run");
+        let head = String::from_utf8(head.stdout).expect("utf-8 head").trim().to_string();
+
+        assert_eq!(
+            head, origin_tip,
+            "a force-updating fetch should land on the rewritten origin tip, not the clone's cached pre-rewrite tracking ref"
         );
     }
 
