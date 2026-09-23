@@ -126,7 +126,10 @@ account running the runner service must have:
   cover `linux/amd64` and `linux/arm64` (`docker buildx inspect --bootstrap`
   must list both platforms — the workflow asserts this before building);
 - no local registry credential baked into the service account. The workflow
-  logs in itself, per dispatch, using the repository secret below.
+  logs in itself, per dispatch, using the repository secret below, and logs
+  back out at the end of the job — this is a `host`-execution runner, not a
+  fresh container per run, so `docker login`'s credential would otherwise
+  persist in the service account's `~/.docker/config.json` across dispatches.
 
 Add a repository (or organization) Actions secret named `IMAGE_BUILDER_TOKEN`
 holding the existing `image-builder` user's `write:package` PAT — the same

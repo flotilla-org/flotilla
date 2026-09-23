@@ -59,16 +59,32 @@ jobs:
           echo "$inspection" | grep -q 'linux/amd64'
           echo "$inspection" | grep -q 'linux/arm64'
 
+      # The tag must be collision-proof against two same-day, same-commit
+      # dispatches that differ only in their version inputs (the primary use
+      # case docs/crew-image.md describes: "a routine bump is just
+      # overriding the one input that changed"). Folding an input hash in
+      # keeps distinct content from ever landing under one tag, without a
+      # registry round-trip to allocate a sequence number.
       - name: Compute the release tag
         id: tag
         shell: bash
         run: |
           set -euo pipefail
           short_sha="$(printf '%s' "${FORGEJO_SHA}" | cut -c1-8)"
-          tag="$(date -u +%Y-%m-%d).${short_sha}"
+          input_hash="$(
+            printf '%s\n' \
+              "$CODEX_VERSION" "$CLAUDE_CODE_VERSION" "$TEA_VERSION" "$CLEAT_REF" "$ZIG_VERSION" \
+              | sha256sum | cut -c1-8
+          )"
+          tag="$(date -u +%Y-%m-%d).${short_sha}.${input_hash}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
         env:
           FORGEJO_SHA: ${{ forgejo.sha }}
+          CODEX_VERSION: ${{ inputs.codex_version }}
+          CLAUDE_CODE_VERSION: ${{ inputs.claude_code_version }}
+          TEA_VERSION: ${{ inputs.tea_version }}
+          CLEAT_REF: ${{ inputs.cleat_ref }}
+          ZIG_VERSION: ${{ inputs.zig_version }}
 
       - name: Log in to the lab registry
         shell: bash
@@ -79,23 +95,36 @@ jobs:
         env:
           IMAGE_BUILDER_TOKEN: ${{ secrets.IMAGE_BUILDER_TOKEN }}
 
+      # Dispatch inputs are free-form strings from workflow_dispatch. Pass
+      # them through env: and reference as "$VAR" rather than interpolating
+      # "${{ inputs.* }}" straight into this script's text — the latter
+      # would let a crafted input break out of the --build-arg literal and
+      # execute arbitrary commands on this host-execution runner, which also
+      # holds the just-logged-in registry credential.
       - name: Build and push the multi-arch crew image
         shell: bash
         run: |
           set -euo pipefail
-          image="${CREW_IMAGE_REPOSITORY}:${{ steps.tag.outputs.tag }}"
+          image="${CREW_IMAGE_REPOSITORY}:${IMAGE_TAG}"
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --file .flotilla/Dockerfile.crew \
-            --build-arg CODEX_VERSION="${{ inputs.codex_version }}" \
-            --build-arg CLAUDE_CODE_VERSION="${{ inputs.claude_code_version }}" \
-            --build-arg TEA_VERSION="${{ inputs.tea_version }}" \
-            --build-arg CLEAT_REF="${{ inputs.cleat_ref }}" \
-            --build-arg ZIG_VERSION="${{ inputs.zig_version }}" \
+            --build-arg CODEX_VERSION="${CODEX_VERSION}" \
+            --build-arg CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION}" \
+            --build-arg TEA_VERSION="${TEA_VERSION}" \
+            --build-arg CLEAT_REF="${CLEAT_REF}" \
+            --build-arg ZIG_VERSION="${ZIG_VERSION}" \
             --tag "$image" \
             --push \
             .
           echo "CREW_IMAGE=${image}" >> "$GITHUB_ENV"
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          CODEX_VERSION: ${{ inputs.codex_version }}
+          CLAUDE_CODE_VERSION: ${{ inputs.claude_code_version }}
+          TEA_VERSION: ${{ inputs.tea_version }}
+          CLEAT_REF: ${{ inputs.cleat_ref }}
+          ZIG_VERSION: ${{ inputs.zig_version }}
 
       # The Dockerfile's own build-time RUN steps (claude/codex/tea --version,
       # the clang+lld C-toolchain link-and-run check) already gate every
@@ -119,3 +148,12 @@ jobs:
           echo "Pushed ${CREW_IMAGE}" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "The placement-policy retag (per host) is a follow-on, human-triggered step; see docs/crew-image.md." \
             | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # This is a host-execution runner (RUNNERS.md §4), not a fresh
+      # container per run: without this, the token docker login wrote to
+      # this account's ~/.docker/config.json would persist on disk across
+      # dispatches instead of living only for this job.
+      - name: Log out of the lab registry
+        if: always()
+        shell: bash
+        run: docker logout forgejo.lab.flotilla.work

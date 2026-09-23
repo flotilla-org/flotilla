@@ -57,8 +57,31 @@ if grep -Eq ':(latest|"latest"|'"'"'latest'"'"')[[:space:]]*$' "$workflow"; then
 fi
 
 # The pushed tag must be date/sha-derived, not a hand-maintained sequence
-# number that would need a registry round-trip to compute.
+# number that would need a registry round-trip to compute, and must also
+# fold in the dispatch inputs so two same-day, same-commit dispatches with
+# different versions can never collide on one tag.
 grep -Fq "date -u +%Y-%m-%d" "$workflow"
 grep -Fq 'FORGEJO_SHA' "$workflow"
+grep -Fq 'input_hash' "$workflow"
+grep -Fq 'sha256sum' "$workflow"
+
+# Dispatch inputs are free-form workflow_dispatch strings. They must be
+# passed through env: and referenced as "$VAR" in run: scripts, never
+# interpolated as "${{ inputs.* }}" directly into --build-arg text — the
+# latter is a script-injection hole on a runner that also holds the
+# just-logged-in registry credential.
+if grep -Ee '--build-arg [A-Z_]+="\$\{\{ *inputs\.' "$workflow"; then
+  echo 'dispatch inputs must not be interpolated directly into --build-arg text; pass them through env: and reference as "$VAR"' >&2
+  exit 1
+fi
+for var in CODEX_VERSION CLAUDE_CODE_VERSION TEA_VERSION CLEAT_REF ZIG_VERSION; do
+  grep -Fq "${var}: \${{ inputs." "$workflow"
+done
+
+# The registry credential must not outlive the job on this host-execution
+# runner: a docker logout cleanup step must run even if the build fails.
+grep -Fq 'docker logout forgejo.lab.flotilla.work' "$workflow"
+logout_line="$(grep -Fn 'docker logout forgejo.lab.flotilla.work' "$workflow" | head -n1 | cut -d: -f1)"
+sed -n "$((logout_line - 5)),${logout_line}p" "$workflow" | grep -Fq 'if: always()'
 
 echo 'crew image workflow contract passed'

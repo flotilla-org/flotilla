@@ -107,16 +107,26 @@ routine bump is just overriding the one input that changed. The workflow:
   re-running the adapter version checks;
 - authenticates to the registry with the `image-builder` `write:package`
   identity via the `IMAGE_BUILDER_TOKEN` repository secret — the recipe
-  itself never sees a credential;
-- pushes an explicit `<date>.<short-sha>` tag (e.g. `2026-09-23.3f6f111e`),
-  derived from the triggering commit, and reports it in the run summary.
+  itself never sees a credential, and the workflow logs back out of the
+  registry when the job ends;
+- pushes an explicit `<date>.<short-sha>.<input-hash>` tag (e.g.
+  `2026-09-23.3f6f111e.cfce0cb5`), where `<short-sha>` is the triggering
+  commit and `<input-hash>` is a short hash of the five version inputs. The
+  input hash matters because a routine bump is *just* overriding one input,
+  with no new commit — without it, two same-day dispatches against the same
+  commit but different versions would collide on one tag and silently
+  overwrite each other in the registry.
 
 Retagging a placement policy to the newly pushed tag is a deliberate,
 separate, human-triggered follow-on step (see Placement policy below) — the
 workflow does not do it.
 
 Manual `docker buildx build --push` from a build host with both amd64 and
-arm64 workers remains the fallback when the CI runner is unavailable:
+arm64 workers remains the fallback when the CI runner is unavailable. The
+currently deployed tag below predates the workflow and follows the older
+`<date>.<sequence>` scheme; a fresh manual build should follow the workflow's
+`<date>.<short-sha>.<input-hash>` scheme instead so the two paths can't mint
+colliding tags:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
