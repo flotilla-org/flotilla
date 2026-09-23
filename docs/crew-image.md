@@ -87,7 +87,7 @@ fastest-changing:
 
 1. Ubuntu, certificates, Git, and curl;
 2. C, Rust stable, the repository's pinned `nightly-2026-03-12`, and Node.js;
-3. `gh` and general development and diagnostic utilities;
+3. `gh` and `tea` (GitHub and Forgejo/Gitea forge CLIs) and general development and diagnostic utilities;
 4. the cleat terminal runtime;
 5. Claude Code and Codex.
 
@@ -123,6 +123,7 @@ IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
 docker pull "$IMAGE"
 docker run --rm "$IMAGE" claude --version
 docker run --rm "$IMAGE" codex --version
+docker run --rm "$IMAGE" tea --version
 docker run --rm "$IMAGE" python3 --version
 docker run --rm "$IMAGE" strace --version
 docker run --rm "$IMAGE" clang --version
