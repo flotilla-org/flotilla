@@ -1134,10 +1134,15 @@ fn object_value<T: Resource>(object: &ResourceObject<T>) -> Result<Value, Resour
 
 fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Result<Value, ResourceError> {
     let mut value = object_value(&object.object)?;
+    let annotations = value["metadata"]["annotations"]
+        .as_object_mut()
+        .ok_or_else(|| ResourceError::decode("resource metadata annotations are not an object"))?;
+    // These are read-view metadata, not authored annotations. A copied
+    // manifest may retain either or both; never let those bytes misidentify
+    // a local source or poison the entire kind's relay stream.
+    annotations.remove(ORIGIN_ROOT_ANNOTATION);
+    annotations.remove(LAST_SYNCED_AT_ANNOTATION);
     if let ResourceProvenance::Replica { origin_root, last_synced_at } = &object.provenance {
-        let annotations = value["metadata"]["annotations"]
-            .as_object_mut()
-            .ok_or_else(|| ResourceError::decode("resource metadata annotations are not an object"))?;
         annotations.insert(ORIGIN_ROOT_ANNOTATION.to_string(), Value::String(origin_root.to_string()));
         annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), Value::String(last_synced_at.to_rfc3339()));
     }
@@ -1151,6 +1156,8 @@ fn read_watch_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Valu
         ReadWatchEvent::Deleted(object) => ("DELETED", object),
         ReadWatchEvent::DeletedByName { tombstone, provenance } => {
             let mut tombstone = tombstone.clone();
+            tombstone.annotations.remove(ORIGIN_ROOT_ANNOTATION);
+            tombstone.annotations.remove(LAST_SYNCED_AT_ANNOTATION);
             if let ResourceProvenance::Replica { origin_root, last_synced_at } = provenance {
                 tombstone.annotations.insert(ORIGIN_ROOT_ANNOTATION.to_string(), origin_root.to_string());
                 tombstone.annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), last_synced_at.to_rfc3339());
@@ -1228,6 +1235,69 @@ mod tests {
         Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InMemoryBackend, InputMeta, PrincipalRef, Regard,
         RegardExpiryPolicy, RegardSource, RegardSpec,
     };
+
+    #[tokio::test]
+    async fn replica_source_wire_provenance_comes_from_the_store() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let local = backend.using::<Convoy>("flotilla");
+        let mut watch = watch_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("watch sources");
+        let stale_annotations = BTreeMap::from([
+            (ORIGIN_ROOT_ANNOTATION.to_string(), "wrong-root".to_string()),
+            (LAST_SYNCED_AT_ANNOTATION.to_string(), "not-a-timestamp".to_string()),
+            ("example.com/note".to_string(), "retained".to_string()),
+        ]);
+        for annotations in [
+            BTreeMap::from([(ORIGIN_ROOT_ANNOTATION.to_string(), "wrong-root".to_string())]),
+            BTreeMap::from([(LAST_SYNCED_AT_ANNOTATION.to_string(), "not-a-timestamp".to_string())]),
+            stale_annotations.clone(),
+        ] {
+            local
+                .create(
+                    &InputMeta::builder().name("copied".to_string()).annotations(annotations.clone()).build(),
+                    &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+                )
+                .await
+                .expect("author copied manifest");
+            let listed = list_resource_kind_replica_sources(&backend, "flotilla", "convoys").await.expect("list sources");
+            let added = watch.stream.next().await.expect("added event").expect("encode added event");
+            local.delete("copied").await.expect("delete copied manifest");
+            let deleted = watch.stream.next().await.expect("deleted event").expect("encode deleted event");
+            for object in [&listed.value["items"][0], &added["object"], &deleted["object"]] {
+                let wire = &object["metadata"]["annotations"];
+                assert!(wire.get(ORIGIN_ROOT_ANNOTATION).is_none(), "local records must not masquerade as replicas");
+                assert!(wire.get(LAST_SYNCED_AT_ANNOTATION).is_none(), "partial provenance must not poison relay decoding");
+                assert_eq!(wire.get("example.com/note").and_then(Value::as_str), annotations.get("example.com/note").map(String::as_str));
+            }
+        }
+
+        let synced_at = Utc::now();
+        let mut tombstone = crate::ResourceTombstone {
+            name: "copied".to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            annotations: stale_annotations,
+        };
+        for provenance in
+            [ResourceProvenance::Local, ResourceProvenance::Replica { origin_root: NodeId::new("actual-root"), last_synced_at: synced_at }]
+        {
+            let event = ReadWatchEvent::<Convoy>::DeletedByName { tombstone: tombstone.clone(), provenance: provenance.clone() };
+            let encoded = read_watch_event_value(&event).expect("encode name-only tombstone");
+            let annotations = &encoded["object"]["metadata"]["annotations"];
+            match provenance {
+                ResourceProvenance::Local => {
+                    assert!(annotations.get(ORIGIN_ROOT_ANNOTATION).is_none());
+                    assert!(annotations.get(LAST_SYNCED_AT_ANNOTATION).is_none());
+                }
+                ResourceProvenance::Replica { .. } => {
+                    assert_eq!(annotations[ORIGIN_ROOT_ANNOTATION], "actual-root");
+                    assert_eq!(annotations[LAST_SYNCED_AT_ANNOTATION], synced_at.to_rfc3339());
+                }
+            }
+            assert_eq!(annotations["example.com/note"], "retained");
+        }
+        // Projection must not mutate stored authored metadata.
+        assert_eq!(tombstone.annotations.remove(ORIGIN_ROOT_ANNOTATION).as_deref(), Some("wrong-root"));
+    }
 
     #[tokio::test]
     async fn list_resource_kind_returns_k8s_wire_list() {
