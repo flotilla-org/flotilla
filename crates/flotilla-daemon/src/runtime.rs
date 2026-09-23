@@ -1371,7 +1371,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                 .pool(profile.docker_pool.clone())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     host_ref: profile.host_id.clone(),
-                    image: DEFAULT_DOCKER_IMAGE.to_string(),
+                    image: DEFAULT_DOCKER_IMAGE.to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::new(),
                     default_cwd: Some("/workspace".to_string()),
@@ -7174,7 +7174,7 @@ mod tests {
                 .pool("passthrough".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     host_ref: feta_host_ref.clone(),
-                    image: "test-image".to_string(),
+                    image: "test-image".to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::new(),
                     default_cwd: Some("/workspace".to_string()),
@@ -9550,7 +9550,7 @@ mod tests {
                     .priority(20)
                     .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                         host_ref: "operator-edited-host".to_string(),
-                        image: "operator/image:latest".to_string(),
+                        image: "operator/image:latest".to_string().into(),
                         pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
                         agent_adapters: BTreeSet::from(["codex".to_string()]),
                         default_cwd: Some("/operator-workspace".to_string()),
@@ -9572,7 +9572,7 @@ mod tests {
             reconciled.spec.docker_per_vessel,
             Some(DockerPerVesselPlacementPolicySpec {
                 host_ref: profile.host_id,
-                image: "operator/image:latest".to_string(),
+                image: "operator/image:latest".to_string().into(),
                 pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
                 agent_adapters: BTreeSet::from(["codex".to_string()]),
                 default_cwd: Some("/operator-workspace".to_string()),

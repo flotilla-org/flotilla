@@ -7,6 +7,7 @@ pub mod controller;
 mod convoy;
 mod convoy_ensure;
 mod credential;
+mod crew_image_baseline;
 mod definition;
 mod dispatch_observation;
 mod environment;
@@ -79,6 +80,7 @@ pub use credential::{
     CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG,
 };
+pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use definition::DefinitionResolver;
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
@@ -108,8 +110,8 @@ pub use leaf::{
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
-    DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec,
+    DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec,
 };
 pub use prepared_snapshot::{
     content_hash, is_prepared_snapshot, PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PLACEMENT_SNAPSHOT_KIND,
@@ -182,6 +184,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::ConvoyEnsure>($($argument),*);
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
+        $callback::<$crate::CrewImageBaseline>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);

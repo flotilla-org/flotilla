@@ -2663,7 +2663,7 @@ async fn default_remote_placement_routes_before_admission() {
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
                     host_ref: "udder-id".to_string(),
-                    image: "crew:latest".to_string(),
+                    image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::from(["claude-code".to_string()]),
                     default_cwd: None,
@@ -3081,7 +3081,7 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
                     host_ref: host_ref.to_string(),
-                    image: "crew:latest".to_string(),
+                    image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::from(["codex".to_string()]),
                     default_cwd: None,
@@ -3250,7 +3250,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
                     host_ref: "feta-host".to_string(),
-                    image: "crew:latest".to_string(),
+                    image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
                     agent_adapters: BTreeSet::new(),
                     default_cwd: None,
@@ -3441,4 +3441,45 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
         .await
         .expect_err("expired credential must refuse dispatch");
     assert_eq!(error, "credential `claude-max` expired on host `host-a` on 2020-02-01 — refresh its material before dispatching");
+}
+
+#[tokio::test]
+async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image() {
+    use flotilla_resources::{CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
+    let policies = backend.using::<PlacementPolicy>("flotilla");
+    let mut policy = policies.get("crew-policy").await.expect("policy");
+    policy.spec.docker_per_vessel.as_mut().expect("docker").image =
+        DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() };
+    policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("reference baseline");
+    let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
+    let error = daemon
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"))
+        .await
+        .expect_err("missing baseline must fail");
+    assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
+    let error = daemon
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, None)
+        .await
+        .expect_err("default selection must reject missing baseline");
+    assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
+    let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
+    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
+    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy")).await.expect("admit");
+    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string() }).await.expect("bump");
+    assert_eq!(admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v1"));
+    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy")).await.expect("next admission");
+    assert_eq!(next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v2"));
 }

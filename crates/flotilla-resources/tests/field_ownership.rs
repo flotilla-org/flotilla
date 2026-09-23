@@ -21,7 +21,7 @@ fn docker(pool: &str, priority: i32, host: &str, image: &str) -> PlacementPolicy
         .priority(priority)
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: host.to_string(),
-            image: image.to_string(),
+            image: image.to_string().into(),
             pull_policy: DockerImagePullPolicy::IfNotPresent,
             agent_adapters: BTreeSet::from(["codex".to_string()]),
             default_cwd: Some("/workspace".to_string()),
@@ -130,7 +130,7 @@ async fn operator_cannot_clear_loop_owned_docker_strategy_and_violation_remains_
 
     assert_eq!(updated.spec.priority, 9);
     assert!(updated.spec.host_direct.is_none());
-    assert_eq!(updated.spec.docker_per_vessel.expect("preserved docker strategy").image, "operator/image:latest");
+    assert_eq!(updated.spec.docker_per_vessel.expect("preserved docker strategy").image, "operator/image:latest".into());
     let diagnostics = backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics");
     assert!(
         diagnostics.field_ownership_violations.iter().any(|violation| violation.field == "spec.docker_per_vessel"),

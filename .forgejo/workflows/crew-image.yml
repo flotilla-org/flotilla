@@ -146,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Pushed ${CREW_IMAGE}" | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "The placement-policy retag (per host) is a follow-on, human-triggered step; see docs/crew-image.md." \
+          echo "The fleet crew-image baseline bump (one apply) is a follow-on, human-triggered step; see docs/crew-image.md." \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       # This is a host-execution runner (RUNNERS.md §4), not a fresh

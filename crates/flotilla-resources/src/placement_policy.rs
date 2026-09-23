@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, FieldOwnedResource,
-    FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
+    field_ownership::serialized_spec_field_value, resource::define_resource, status_patch::NoStatusPatch, CrewImageBaseline,
+    DefinitionResolver, FieldOwnedResource, FieldOwnership, OwnershipEnforcement, ReplicationClass, ResourceError, WriterRole,
 };
 
 define_resource!(
@@ -85,8 +85,8 @@ pub enum HostDirectPlacementPolicyCheckout {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
-    pub image: String,
-    /// Controls registry access for the literal image tag. Image build recipes
+    pub image: DockerImageSource,
+    /// Controls registry access for the resolved image tag. Image build recipes
     /// are intentionally outside placement policy and are tracked separately.
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
@@ -114,4 +114,52 @@ pub enum DockerImagePullPolicy {
 pub enum DockerCheckoutStrategy {
     WorktreeOnHostAndMount { mount_path: String },
     FreshCloneInContainer { clone_path: String },
+}
+
+/// Either a placement-specific image or a same-namespace fleet Definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DockerImageSource {
+    Literal(String),
+    Baseline { image_baseline_ref: String },
+}
+
+impl From<String> for DockerImageSource {
+    fn from(image: String) -> Self {
+        Self::Literal(image)
+    }
+}
+
+impl From<&str> for DockerImageSource {
+    fn from(image: &str) -> Self {
+        Self::Literal(image.to_string())
+    }
+}
+
+impl DockerImageSource {
+    /// Resolve before creating an Environment; the Docker provider only ever
+    /// receives a concrete image. Conflicted Definitions must be resolved by
+    /// an operator rather than silently using a deterministic merge winner.
+    pub async fn resolve(&self, baselines: &DefinitionResolver<CrewImageBaseline>) -> Result<String, String> {
+        match self {
+            Self::Literal(image) if !image.trim().is_empty() => Ok(image.clone()),
+            Self::Literal(_) => Err("placement image is empty".to_string()),
+            Self::Baseline { image_baseline_ref: name } => {
+                let baseline = baselines.get(name).await.map_err(|error| format!("image-baseline `{name}` missing/unresolved: {error}"))?;
+                let unresolved = if baseline.metadata.deletion_timestamp.is_some() {
+                    Some("baseline is deleted")
+                } else if baseline.metadata.merge.as_ref().is_some_and(|merge| !merge.conflicts.is_empty()) {
+                    Some("baseline has unresolved merge conflicts")
+                } else if baseline.spec.image.trim().is_empty() {
+                    Some("baseline image is empty")
+                } else {
+                    None
+                };
+                if let Some(reason) = unresolved {
+                    return Err(format!("image-baseline `{name}` missing/unresolved: {reason}"));
+                }
+                Ok(baseline.spec.image)
+            }
+        }
+    }
 }

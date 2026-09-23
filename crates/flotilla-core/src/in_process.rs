@@ -4031,18 +4031,23 @@ async fn validate_workflow_agent_adapters(
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
-
+    // Resolve each candidate's image once, even for tool-only workflows.
+    let capabilities = match placement {
+        Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
+            Some(placement_agent_adapters(backend, namespace, policy).await?)
+        }
+        _ => None,
+    };
     for adapter in required_adapters {
-        let Some(placement) = placement else {
+        let Some((available_adapters, detail)) = &capabilities else {
             return Err(format!("workflow requires agent adapter `{adapter}`, but no placement is available"));
         };
-        let (available_adapters, detail) = placement_agent_adapters(backend, namespace, placement).await?;
         if available_adapters.contains(&adapter) {
             continue;
         }
         return Err(format!(
             "workflow requires agent adapter `{adapter}`, which is not available in placement `{}` ({detail})",
-            placement.metadata.name
+            placement.expect("capabilities came from a placement").metadata.name
         ));
     }
 
@@ -4354,7 +4359,8 @@ async fn placement_agent_adapters(
     placement: &ResourceObject<PlacementPolicy>,
 ) -> Result<(BTreeSet<String>, String), String> {
     if let Some(docker) = &placement.spec.docker_per_vessel {
-        Ok((docker.agent_adapters.clone(), format!("image `{}`", docker.image)))
+        let image = docker.image.resolve(&backend.definitions(namespace)).await?;
+        Ok((docker.agent_adapters.clone(), format!("image `{image}`")))
     } else if placement.spec.host_direct.is_some() {
         let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
@@ -5787,7 +5793,7 @@ impl InProcessDaemon {
         placement_policy: Option<&str>,
     ) -> Result<PlacementResolution, String> {
         let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
-        let placement = match placement_policy {
+        let mut placement = match placement_policy {
             Some(policy) => {
                 let policy = required_admission_value(policy, "placement policy")?;
                 let resolved = self
@@ -5814,12 +5820,24 @@ impl InProcessDaemon {
                     local_host_id.as_ref(),
                 )
                 .await?;
+                if placement.selected.is_none() && !placement.refused_candidates.is_empty() {
+                    let reasons = placement
+                        .refused_candidates
+                        .iter()
+                        .map(|candidate| format!("- `{}`: {}", candidate.policy_name, candidate.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(format!("no placement policy satisfies workflow; candidates:\n{reasons}"));
+                }
                 if contained && placement.selected.is_none() {
                     return Err("contained workflow requires an available docker placement policy".to_string());
                 }
                 placement
             }
         };
+        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
+            docker.image = docker.image.resolve(&self.resource_backend.definitions(namespace)).await?.into();
+        }
         validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.selected.as_ref()).await?;
         Ok(placement)
     }

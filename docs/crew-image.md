@@ -6,8 +6,9 @@ Contained vessels use the curated image at:
 forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
 ```
 
-The explicit release tag is the deployment contract. Do not point placement
-policies at `latest`.
+The explicit release tag in `.flotilla/crew-image-baseline.yaml` is the
+deployment contract. Do not point the baseline at `latest`. All three host
+crew placements reference this one federated Definition (ADR 0039).
 
 Contained crew terminal sessions run inside the environment. A Docker
 placement therefore names `pool: cleat`, meaning the cleat discovered inside
@@ -41,7 +42,7 @@ spawn behavior.
 
 This document is curation advice for the Flotilla project. It is not a schema
 or a contract that Flotilla validates. Flotilla's contract stays deliberately
-narrow: a placement names an image and declares the adapters it promises,
+narrow: a placement resolves an image and declares the adapters it promises,
 admission checks those declarations, and provisioning records the named image
 reference together with the immutable digest actually run.
 
@@ -117,15 +118,14 @@ routine bump is just overriding the one input that changed. The workflow:
   commit but different versions would collide on one tag and silently
   overwrite each other in the registry.
 
-Retagging a placement policy to the newly pushed tag is a deliberate,
+Updating the fleet baseline to the newly pushed tag is a deliberate,
 separate, human-triggered follow-on step (see Placement policy below) — the
 workflow does not do it.
 
 Manual `docker buildx build --push` from a build host with both amd64 and
-arm64 workers remains the fallback when the CI runner is unavailable. The
-currently deployed tag below predates the workflow and follows the older
-`<date>.<sequence>` scheme; a fresh manual build should follow the workflow's
-`<date>.<short-sha>.<input-hash>` scheme instead so the two paths can't mint
+arm64 workers remains the fallback when the CI runner is unavailable. A fresh
+manual build should follow the workflow's
+`<date>.<short-sha>.<input-hash>` scheme so the two paths cannot mint
 colliding tags:
 
 ```bash
@@ -150,9 +150,7 @@ to `forgejo.lab.flotilla.work` on the build host before publishing.
 ## Verify
 
 Pull the published image rather than relying on the local build cache, then
-run both adapter entry points. `2026-08-25.1` below is the currently deployed
-tag, from before the CI workflow existed — a freshly built image will carry
-the `<date>.<short-sha>.<input-hash>` tag described above instead:
+run both adapter entry points using the tag published above:
 
 ```bash
 IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
@@ -201,29 +199,58 @@ Until the image bakes cleat, run its version check against a provisioned
 environment, where Flotilla supplies the interim bind mount. The Dockerfile
 currently checks both declared agent adapters while building.
 
-## Placement policy
+## Placement policy and fleet baseline
 
-The checked-in policy is stored on the active control-plane root, targets
-kiwi's Docker-capable host resource, and promises the `claude-code` and
-`codex` adapters:
+These manifests describe the target configuration. Live three-host rollout has
+not yet been verified; kiwi reported Docker unavailable during implementation.
+
+Deploy baseline support on all hosts before applying these manifests. Apply
+`.flotilla/crew-image-baseline.yaml` once, from any host in namespace
+`flotilla`, and verify `crewimagebaselines fleet-crew` resolves on each host.
+Then apply each host's policy on its own home:
+
+| Host | Policy manifest |
+| --- | --- |
+| kiwi | `.flotilla/placement-policy.crew-image.yaml` |
+| feta | `.flotilla/placement-policy.crew-image-feta.yaml` |
+| udder | `.flotilla/placement-policy.crew-image-udder.yaml` |
 
 ```bash
-flotilla resource apply \
-  --file .flotilla/placement-policy.crew-image.yaml
-
-flotilla resource get \
-  placementpolicies docker-crew-image-kiwi \
-  --json
+flotilla resource apply --file .flotilla/crew-image-baseline.yaml
+flotilla resource get crewimagebaselines fleet-crew --json
+# Run on kiwi; use the matching manifest on feta and udder.
+flotilla resource apply --file .flotilla/placement-policy.crew-image.yaml
+flotilla resource get placementpolicies docker-crew-image-kiwi --json
 ```
 
-The host reference is an identity assigned by Flotilla. If kiwi is
-re-registered as a new host, update `host_ref`, reapply the manifest, and
-commit that change.
+Host references are Flotilla identities. If a host is re-registered, update
+its manifest's `host_ref` and reapply it on that host. The policies promise
+the `claude-code` and `codex` adapters, which a replacement image must provide.
 
-`docker_per_vessel.image` remains a literal Docker image tag. Its
-`pull_policy` accepts `always` (the default), `if_not_present`, or `never`.
-Use `if_not_present` to prefer a locally-built image while retaining registry
-fallback, or `never` when the image must already exist on the placement host.
-This policy does not resolve or build the image recipe in
-`.flotilla/environment.yaml`; connecting placement tags to image recipes is a
-separate design concern.
+For subsequent fleet bumps, edit only `spec.image` in
+`.flotilla/crew-image-baseline.yaml` and apply that file once. Commit the new
+pin. Do not retag or reapply the host policies. Definition replication carries
+the edit to the other hosts; it is eventually consistent, so verify the
+merged baseline on all three before starting the rollout check. Admit one
+new contained convoy per host and verify its Environment/Vessel `image_ref`
+and immutable `image_digest`. Existing prepared placements and running vessels
+keep their pinned image. A disconnected host may see its previous baseline
+until replication resumes.
+
+The checked-in policy uses this reference shape:
+
+```yaml
+docker_per_vessel:
+  image:
+    image_baseline_ref: fleet-crew
+```
+
+The reference is namespace-local. Missing, deleted, empty, or conflicted
+baselines fail admission/provisioning with the reference named in an
+`image-baseline ... missing/unresolved` error before Docker can pull. Resolve
+concurrent Definition edits explicitly; there is no image fallback.
+
+Independent placements may still use a literal `docker_per_vessel.image`
+string. `pull_policy` remains per placement: `always` (default),
+`if_not_present`, or `never`. This does not resolve or build the recipe in
+`.flotilla/environment.yaml`.

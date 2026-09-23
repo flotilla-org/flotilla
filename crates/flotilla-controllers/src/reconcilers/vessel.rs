@@ -16,15 +16,15 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewSource,
-    CrewWorkPhase, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec,
-    ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
-    TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION,
-    CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
+    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline,
+    CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
+    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
+    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -41,6 +41,7 @@ pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
+    image_baselines: DefinitionResolver<CrewImageBaseline>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
@@ -58,6 +59,7 @@ impl VesselReconciler {
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
+            image_baselines: backend.definitions(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
@@ -141,7 +143,7 @@ enum PlacementStrategy {
     DockerWorktreeOnHostAndMount {
         host_ref: String,
         pool: String,
-        image: String,
+        image: DockerImageSource,
         pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         mount_path: String,
@@ -150,7 +152,7 @@ enum PlacementStrategy {
     DockerFreshCloneInContainer {
         host_ref: String,
         pool: String,
-        image: String,
+        image: DockerImageSource,
         pull_policy: DockerImagePullPolicy,
         env: BTreeMap<String, String>,
         clone_path: String,
@@ -427,6 +429,10 @@ impl Reconciler for VesselReconciler {
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
+                        let image = match image.resolve(&self.image_baselines).await {
+                            Ok(image) => image,
+                            Err(message) => return Ok(VesselPrepared::failed(message)),
+                        };
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
                             spec: EnvironmentSpec {
@@ -784,6 +790,10 @@ impl Reconciler for VesselReconciler {
                             target_path: git_common_dir,
                             mode: EnvironmentMountMode::Rw,
                         }));
+                        let image = match image.resolve(&self.image_baselines).await {
+                            Ok(image) => image,
+                            Err(message) => return Ok(VesselPrepared::failed(message)),
+                        };
                         actuations.push(Actuation::CreateEnvironment {
                             meta: owned_child_meta(&env_name, obj, BTreeMap::new()),
                             spec: EnvironmentSpec {
