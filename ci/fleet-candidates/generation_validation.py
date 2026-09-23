@@ -84,8 +84,10 @@ def allowed_payload(path, platform=None):
     # The single chokepoint for the credential-free contract: every consumer of
     # a generation payload (candidate build, promotion, Darwin signing, release
     # verification, install) rejects a `CODEX_HOME` template carrying a
-    # credential, not just the builder that assembled it.
-    if codex_home and pure.name == CODEX_CREDENTIAL_FILE:
+    # credential, not just the builder that assembled it. Every component is
+    # checked, not just the leaf: `seed_scratch` copies the template wholesale,
+    # so a *directory* named `auth.json` lands in the crew's home as one too.
+    if codex_home and CODEX_CREDENTIAL_FILE in pure.parts[len(CODEX_HOME_PREFIX):]:
         return False
     return (library
             or codex_home
@@ -190,8 +192,9 @@ def validate_codex_home_template(root):
     """Gate the assembled `CODEX_HOME` template before it becomes payload.
 
     `CodexMaterialAdapter::seed_scratch` copies this directory into every
-    crew's writable `CODEX_HOME`, so a credential, a symlink escaping the
-    generation, or a special file here would reach every crew on the fleet.
+    crew's writable `CODEX_HOME`, so a credential at any depth (file *or*
+    directory named `auth.json`), a symlink escaping the generation, or a
+    special file here would reach every crew on the fleet.
     """
     root = Path(root)
     if not root.is_dir() or root.is_symlink():
@@ -204,7 +207,9 @@ def validate_codex_home_template(root):
             raise ValidationError(f"codex home template entry is a symlink: {relative}")
         if not path.is_file() and not path.is_dir():
             raise ValidationError(f"codex home template entry is not a regular file or directory: {relative}")
-        if path.is_file() and not allowed_payload(str(PurePosixPath(*CODEX_HOME_PREFIX, *relative.parts))):
+        # Directories are checked too, so an empty one named `auth.json` — which
+        # contributes no payload file of its own — cannot slip past the walk.
+        if not allowed_payload(str(PurePosixPath(*CODEX_HOME_PREFIX, *relative.parts))):
             raise ValidationError(f"codex home template must be credential-free, but carries {relative}")
 
 

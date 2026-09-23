@@ -13,7 +13,7 @@ for tool in "${tools[@]}"; do
   # A generation predating the CODEX_HOME template stays valid, so a failed
   # health check can still roll back onto one.
   python3 "$tool" --validate-fixture "$fixtures/pre-codex-home.json"
-  for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v4-bundle-violation codex-credential-payload; do
+  for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v4-bundle-violation codex-credential-payload codex-credential-directory; do
     if python3 "$tool" --validate-fixture "$fixtures/$fixture.json" >/dev/null 2>&1; then
       echo "$(basename "$tool") accepted invalid fixture $fixture" >&2
       exit 1
@@ -23,7 +23,7 @@ done
 
 FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/valid.json"
 FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/pre-codex-home.json"
-for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v4-bundle-violation codex-credential-payload; do
+for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload source-set-mismatch v4-bundle-violation codex-credential-payload codex-credential-directory; do
   if FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/$fixture.json" >/dev/null 2>&1; then
     echo "fleet-install accepted invalid fixture $fixture" >&2
     exit 1
@@ -62,6 +62,13 @@ rm "$template/auth.json"
 printf '{"tokens":{}}\n' >"$template/prompts/auth.json"
 reject_template "$template" 'a template carrying a nested auth.json'
 rm "$template/prompts/auth.json"
+# seed_scratch copies the template wholesale, so a *directory* named auth.json
+# lands in the crew's home as one — with or without anything inside it.
+mkdir "$template/auth.json"
+reject_template "$template" 'a template carrying an empty directory named auth.json'
+printf 'token\n' >"$template/auth.json/refresh"
+reject_template "$template" 'a template hiding a credential inside a directory named auth.json'
+rm -r "$template/auth.json"
 ln -s /etc/passwd "$template/escape"
 reject_template "$template" 'a template carrying a symlink'
 rm "$template/escape"
