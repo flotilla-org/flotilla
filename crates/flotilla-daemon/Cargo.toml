@@ -40,6 +40,8 @@ tempfile = "3"
 libc = "0.2"
 
 [dev-dependencies]
+bytes = "1"
+http = "1"
 flotilla-test-support = { path = "../flotilla-test-support" }
 indexmap = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }

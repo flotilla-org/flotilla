@@ -395,4 +395,82 @@ mod tests {
             "must not live inside the leasable codex-pool dir"
         );
     }
+
+    struct FixedHttpClient {
+        status: u16,
+        body: String,
+    }
+
+    #[async_trait]
+    impl HttpClient for FixedHttpClient {
+        async fn execute(&self, _request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            Ok(http::Response::builder().status(self.status).body(bytes::Bytes::from(self.body.clone())).expect("build fixed response"))
+        }
+    }
+
+    fn real_refresher(status: u16, body: &str) -> RealCodexTokenRefresher {
+        RealCodexTokenRefresher {
+            http: Arc::new(FixedHttpClient { status, body: body.to_string() }),
+            token_url: DEFAULT_TOKEN_URL.to_string(),
+            client_id: DEFAULT_CLIENT_ID.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_refresher_parses_a_successful_token_response() {
+        let refresher = real_refresher(200, r#"{"access_token":"new-access","refresh_token":"new-refresh","id_token":"new-id"}"#);
+
+        let response = refresher.refresh("refresh-token").await.expect("refresh succeeds");
+
+        assert_eq!(response.access_token, Some("new-access".to_string()));
+        assert_eq!(response.refresh_token, Some("new-refresh".to_string()));
+        assert_eq!(response.id_token, Some("new-id".to_string()));
+    }
+
+    #[tokio::test]
+    async fn real_refresher_classifies_named_dead_token_reasons() {
+        for reason in DEAD_REFRESH_TOKEN_REASONS {
+            let refresher = real_refresher(400, &serde_json::json!({ "error": reason }).to_string());
+
+            let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
+
+            assert!(matches!(failure, CodexRefreshFailure::DeadRefreshToken(_)), "{reason} must classify as a dead refresh token");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_refresher_classifies_400_invalid_grant_as_dead() {
+        let refresher = real_refresher(400, r#"{"error":"invalid_grant"}"#);
+
+        let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
+
+        assert!(matches!(failure, CodexRefreshFailure::DeadRefreshToken(_)));
+    }
+
+    #[tokio::test]
+    async fn real_refresher_classifies_a_bare_401_as_dead() {
+        let refresher = real_refresher(401, "");
+
+        let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
+
+        assert!(matches!(failure, CodexRefreshFailure::DeadRefreshToken(_)));
+    }
+
+    #[tokio::test]
+    async fn real_refresher_classifies_a_server_error_as_transient() {
+        let refresher = real_refresher(500, r#"{"error":"internal_error"}"#);
+
+        let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
+
+        assert!(matches!(failure, CodexRefreshFailure::Transient(_)));
+    }
+
+    #[tokio::test]
+    async fn real_refresher_treats_an_empty_success_body_as_transient() {
+        let refresher = real_refresher(200, "{}");
+
+        let failure = refresher.refresh("refresh-token").await.expect_err("refresh fails");
+
+        assert!(matches!(failure, CodexRefreshFailure::Transient(_)));
+    }
 }
