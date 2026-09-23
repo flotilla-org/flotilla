@@ -48,6 +48,13 @@ add_test_skills() {
     "$mattpocock_repository" "$rjw_revision" >"$skills/.flotilla-sources.json"
 }
 
+add_test_codex_home() {
+  local bundle="$1"
+  local codex_home="$bundle/share/flotilla/codex-home"
+  mkdir -p "$codex_home"
+  printf '# test CODEX_HOME template\n' >"$codex_home/config.toml"
+}
+
 generation_one="20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa"
 generation_two="20260815T220000Z-r2-f222222222222-cbbbbbbbbbbbb"
 generation_incomplete="20260815T225000Z-r9-f999999999999-cffffffffffff"
@@ -82,6 +89,7 @@ make_generation() {
   cp "$repo_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
   chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle" "$skill_revision" "$skill_repository"
+  add_test_codex_home "$bundle"
 TEST_BUNDLE="$bundle" TEST_PLATFORM="$platform" TEST_PROTOCOL="$protocol" TEST_CORRUPT_INNER="$corrupt_inner" python3 - <<'PY'
 import hashlib
 import json
@@ -176,6 +184,7 @@ add_darwin_derivative() {
   cp "$repo_root/ci/fleet-candidates/generation_validation.py" "$bundle/generation_validation.py"
   chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle"
+  add_test_codex_home "$bundle"
   TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 - <<'PY'
 import hashlib
 import json
@@ -543,6 +552,8 @@ grep -Fxq 'Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin
   || fail 'systemd user unit does not expose the fleet binary PATH'
 grep -Fxq 'Environment="FLOTILLA_SKILLS_DIR=%h/.local/opt/flotilla-fleet/current/share/flotilla/skills"' "$unit" \
   || fail 'systemd user unit does not select the generation-pinned skills'
+grep -Fxq 'Environment="FLOTILLA_CODEX_HOME_TEMPLATE=%h/.local/opt/flotilla-fleet/current/share/flotilla/codex-home"' "$unit" \
+  || fail 'systemd user unit does not select the generation-pinned Codex home template'
 grep -Fxq 'Restart=always' "$unit" || fail 'systemd user unit does not always restart'
 grep -Fxq 'RestartSec=5' "$unit" || fail 'systemd user unit does not delay restarts'
 grep -Fxq -- '--user daemon-reload' "$test_root/systemctl.log" || fail 'systemd user manager was not reloaded'
@@ -741,6 +752,8 @@ grep -Fxq "Environment=\"PATH=$custom_bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:
   || fail 'systemd user unit ignored the configured fleet binary directory'
 grep -Fxq "Environment=\"FLOTILLA_SKILLS_DIR=$custom_root/current/share/flotilla/skills\"" "$unit" \
   || fail 'systemd user unit ignored the configured generation skills'
+grep -Fxq "Environment=\"FLOTILLA_CODEX_HOME_TEMPLATE=$custom_root/current/share/flotilla/codex-home\"" "$unit" \
+  || fail 'systemd user unit ignored the configured generation Codex home template'
 
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
@@ -792,6 +805,7 @@ assert agent["ProgramArguments"] == [
 ]
 assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
 assert agent["EnvironmentVariables"]["FLOTILLA_SKILLS_DIR"] == f"{home}/.local/opt/flotilla-fleet/current/share/flotilla/skills"
+assert agent["EnvironmentVariables"]["FLOTILLA_CODEX_HOME_TEMPLATE"] == f"{home}/.local/opt/flotilla-fleet/current/share/flotilla/codex-home"
 assert "/usr/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
 assert "/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
 assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/flotillad.stderr.log"

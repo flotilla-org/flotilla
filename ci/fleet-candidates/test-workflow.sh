@@ -66,6 +66,12 @@ if grep -Fq '"required_skills"' "$builder"; then
   echo 'skill manifest production must carry no universal required-skill list' >&2
   exit 1
 fi
+# The CODEX_HOME template ships as generation payload, gated credential-free.
+# The literals below are builder shell source, not expressions to expand here.
+# shellcheck disable=SC2016
+grep -Fq 'cp -R "$flotilla_root/share/flotilla/codex-home/." "$codex_home_bundle/"' "$builder"
+# shellcheck disable=SC2016
+grep -Fq 'generation_validation.py" codex-home "$codex_home_bundle"' "$builder"
 grep -Fq 'actions/cache/restore@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 grep -Fq 'actions/cache/save@6f8efc29b200d32929f49075959781ed54ec270c' "$workflow"
 test "$(grep -Fc 'actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32' "$workflow")" -eq 2

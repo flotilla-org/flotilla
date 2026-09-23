@@ -19,7 +19,8 @@
     "bin/cleat",
     "install.sh",
     "generation_validation.py",
-    "share/flotilla/skills/.flotilla-sources.json"
+    "share/flotilla/skills/.flotilla-sources.json",
+    "share/flotilla/codex-home/config.toml"
   ],
   "skill_bundle": {
     "schema_version": 5,

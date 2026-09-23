@@ -13,6 +13,31 @@ from pathlib import Path, PurePosixPath
 
 PLATFORMS = ("linux-x86_64-gnu2.36", "darwin-aarch64")
 SOURCE_NAMES = ("flotilla", "cleat", "mattpocock-skills", "rjw-skills")
+SKILLS_PREFIX = ("share", "flotilla", "skills")
+# Credential-free `CODEX_HOME` template seeding each crew's scratch
+# (flotilla-org/flotilla#1913). `scripts/fleet-install` points
+# `FLOTILLA_CODEX_HOME_TEMPLATE` at this directory inside the generation.
+#
+# Adding a payload path is a one-time crossing: by ADR 0037 the *installed*
+# generation's validator verifies the incoming one, so the first generation
+# carrying this directory is rejected as an unexpected path by every host still
+# on a validator that predates this line. The refusal is safe — it happens
+# before the flip, leaving the host on its working generation — but the
+# crossing has to be made deliberately (stage the incoming generation and run
+# its own `install.sh`, or point `FLEET_GENERATION_VALIDATOR` at the incoming
+# validator), and the rehearsal's upgrade-from-previous leg will say so first.
+CODEX_HOME_PREFIX = ("share", "flotilla", "codex-home")
+CODEX_HOME_CONFIG_FILE = "config.toml"
+# Host-owned credential material, delivered to crews separately as a read-only
+# `0400` copy of the central login. A generation must never carry one.
+CODEX_CREDENTIAL_FILE = "auth.json"
+# The CODEX_HOME template is deliberately absent here: `build-candidate.sh`
+# hard-requires it, so no generation can be *produced* without one, and by
+# ADR 0037 this same validator also verifies the generation a failed health
+# check rolls *back* to. Requiring the path would retroactively invalidate
+# every generation built before it existed, so a host whose first template-
+# carrying generation failed health confirmation could not roll back off it.
+# Enforce at production, tolerate at consumption.
 REQUIRED_PAYLOAD = {
     "bin/flotilla", "bin/flotillad", "bin/cleat", "install.sh", "generation_validation.py",
     "share/flotilla/skills/.flotilla-sources.json",
@@ -55,8 +80,16 @@ def allowed_payload(path, platform=None):
                and (pure.suffix == ".dylib" or pure.name.endswith(".so") or ".so." in pure.name))
     if platform == "darwin-aarch64" and library:
         library = pure.suffix == ".dylib"
+    codex_home = len(pure.parts) >= 4 and pure.parts[:3] == CODEX_HOME_PREFIX
+    # The single chokepoint for the credential-free contract: every consumer of
+    # a generation payload (candidate build, promotion, Darwin signing, release
+    # verification, install) rejects a `CODEX_HOME` template carrying a
+    # credential, not just the builder that assembled it.
+    if codex_home and pure.name == CODEX_CREDENTIAL_FILE:
+        return False
     return (library
-            or (len(pure.parts) >= 4 and pure.parts[:3] == ("share", "flotilla", "skills")))
+            or codex_home
+            or (len(pure.parts) >= 4 and pure.parts[:3] == SKILLS_PREFIX))
 
 
 def validate_skill_bundle(document, sources):
@@ -151,6 +184,28 @@ def validate_skill_source_paths(document):
                     raise ValidationError(f"skill source {name} declared path {declared_path} is missing at pinned revision {revision}")
                 if not any(path.rglob("SKILL.md")):
                     raise ValidationError(f"skill source {name} declared path {declared_path} has no SKILL.md at pinned revision {revision}")
+
+
+def validate_codex_home_template(root):
+    """Gate the assembled `CODEX_HOME` template before it becomes payload.
+
+    `CodexMaterialAdapter::seed_scratch` copies this directory into every
+    crew's writable `CODEX_HOME`, so a credential, a symlink escaping the
+    generation, or a special file here would reach every crew on the fleet.
+    """
+    root = Path(root)
+    if not root.is_dir() or root.is_symlink():
+        raise ValidationError("codex home template is missing or is not a directory")
+    if not (root / CODEX_HOME_CONFIG_FILE).is_file():
+        raise ValidationError(f"codex home template has no {CODEX_HOME_CONFIG_FILE}")
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            raise ValidationError(f"codex home template entry is a symlink: {relative}")
+        if not path.is_file() and not path.is_dir():
+            raise ValidationError(f"codex home template entry is not a regular file or directory: {relative}")
+        if path.is_file() and not allowed_payload(str(PurePosixPath(*CODEX_HOME_PREFIX, *relative.parts))):
+            raise ValidationError(f"codex home template must be credential-free, but carries {relative}")
 
 
 def validate_generation(document, generation, platform=None, trusted_team="973L4GV58R", require_installable=False):
@@ -257,6 +312,11 @@ def validate_release(root, outer, platform):
     if actual != expected or not REQUIRED_PAYLOAD.issubset(expected):
         raise ValidationError("release files do not match the manifest or required payload")
     validate_skill_bundle(json.loads((root / "share/flotilla/skills/.flotilla-sources.json").read_text()), sources)
+    # Present only from the generation that introduced it onward; a rollback
+    # target predating it is still a valid release. See REQUIRED_PAYLOAD.
+    codex_home = root.joinpath(*CODEX_HOME_PREFIX)
+    if codex_home.exists():
+        validate_codex_home_template(codex_home)
     for rel in ("bin/flotilla", "bin/flotillad", "bin/cleat"):
         if not os.access(root / rel, os.X_OK):
             raise ValidationError(f"release binary is not executable: {rel}")
@@ -289,12 +349,16 @@ def main():
     fixture.add_argument("path")
     skill_sources = sub.add_parser("skill-sources")
     skill_sources.add_argument("manifest")
+    codex_home = sub.add_parser("codex-home")
+    codex_home.add_argument("root")
     args = parser.parse_args()
     try:
         if args.command == "fixture":
             validate_fixture(args.path)
         elif args.command == "skill-sources":
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()))
+        elif args.command == "codex-home":
+            validate_codex_home_template(args.root)
         else:
             outer = json.loads(Path(args.manifest).read_text())
         if args.command == "generation":
