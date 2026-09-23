@@ -123,12 +123,17 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Forgejo/Gitea CLI for the lab hub (project-map and lab forks live on
 # forgejo.lab.flotilla.work; `gh` only covers GitHub). tea ships arch-named
-# static binaries; TARGETARCH (amd64/arm64) matches its asset naming directly.
-ARG TARGETARCH
+# static binaries; TARGETARCH (amd64/arm64) matches its asset naming directly
+# and is already in scope from the Node.js layer above. Verify the download's
+# published SHA-256, matching the Node.js integrity pattern in this file.
 ARG TEA_VERSION=0.16.0
-RUN curl -fsSL "https://dl.gitea.com/tea/${TEA_VERSION}/tea-${TEA_VERSION}-linux-${TARGETARCH}" \
-        -o /usr/local/bin/tea \
-    && chmod +x /usr/local/bin/tea \
+RUN cd /tmp \
+    && asset="tea-${TEA_VERSION}-linux-${TARGETARCH}" \
+    && curl -fsSLO "https://dl.gitea.com/tea/${TEA_VERSION}/${asset}" \
+    && curl -fsSLO "https://dl.gitea.com/tea/${TEA_VERSION}/${asset}.sha256" \
+    && sha256sum --check --strict "${asset}.sha256" \
+    && install -m 0755 "${asset}" /usr/local/bin/tea \
+    && rm -f "${asset}" "${asset}.sha256" \
     && tea --version
 
 # Cargo's registry/cache and rustup-installed proxies must be writable by the
