@@ -3,7 +3,7 @@
 Contained vessels use the curated image at:
 
 ```text
-forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
+forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
 ```
 
 The explicit release tag is the deployment contract. Do not point placement
@@ -129,7 +129,7 @@ currently deployed tag below predates the workflow and follows the older
 colliding tags:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --file .flotilla/Dockerfile.crew \
@@ -155,7 +155,7 @@ tag, from before the CI workflow existed — a freshly built image will carry
 the `<date>.<short-sha>.<input-hash>` tag described above instead:
 
 ```bash
-IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
+IMAGE=forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-23.4c0013d2.cfce0cb5
 docker pull "$IMAGE"
 docker run --rm "$IMAGE" claude --version
 docker run --rm "$IMAGE" codex --version
