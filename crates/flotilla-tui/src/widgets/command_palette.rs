@@ -14,7 +14,7 @@ use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::TuiModel,
+    app::{file_picker_start_dir, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     palette::{self, PaletteCompletion, PaletteEntry, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
@@ -181,14 +181,7 @@ impl CommandPaletteWidget {
                 Outcome::Swap(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter)))
             }
             Action::OpenFilePicker => {
-                let start_dir = ctx
-                    .model
-                    .active_repo_root_opt()
-                    .and_then(|r| r.parent())
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| std::env::current_dir().ok())
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_default();
+                let start_dir = file_picker_start_dir(ctx.model);
                 let input = Input::from(format!("{}/", start_dir.display()).as_str());
                 let dir_entries = refresh_dir_listing_standalone(input.value(), ctx.model);
                 let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries);

@@ -177,20 +177,18 @@ fn provider_descriptor_labeled_simple() {
 
 #[test]
 fn provider_category_slug_round_trip() {
-    let categories = [
-        (ProviderCategory::Vcs, "vcs"),
-        (ProviderCategory::CheckoutManager, "checkout_manager"),
-        (ProviderCategory::ChangeRequest, "change_request"),
-        (ProviderCategory::IssueProvider, "issue_tracker"),
-        (ProviderCategory::CloudAgent, "cloud_agent"),
-        (ProviderCategory::AiUtility, "ai_utility"),
-        (ProviderCategory::WorkspaceManager, "workspace_manager"),
-        (ProviderCategory::TerminalPool, "terminal_pool"),
-        (ProviderCategory::EnvironmentProvider, "environment_provider"),
+    let expected = [
+        "vcs",
+        "checkout_manager",
+        "change_request",
+        "issue_tracker",
+        "cloud_agent",
+        "ai_utility",
+        "workspace_manager",
+        "terminal_pool",
+        "environment_provider",
     ];
-    for (cat, expected_slug) in categories {
-        assert_eq!(cat.slug(), expected_slug);
-    }
+    assert_eq!(ProviderCategory::ALL.map(|category| category.slug()), expected);
 }
 
 #[test]
@@ -335,8 +333,8 @@ async fn host_scoped_provider_cache_probes_once_and_reuses_scans_within_an_envir
         .await;
     assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1, "the second repo must not probe host providers again");
 
-    let first_manager = &first.providers.presentation_managers[0].1;
-    let second_manager = &second.providers.presentation_managers[0].1;
+    let first_manager = &first.registry.presentation_managers[0].1;
+    let second_manager = &second.registry.presentation_managers[0].1;
     let (first_result, second_result) = tokio::join!(first_manager.list_workspaces(), second_manager.list_workspaces());
     first_result.expect("first environment scan");
     second_result.expect("shared environment scan");
@@ -345,7 +343,7 @@ async fn host_scoped_provider_cache_probes_once_and_reuses_scans_within_an_envir
     let distinct_environment = cache
         .discover_for_environment(&environment_b, &host_bag, &factories, &config, &ExecutionEnvironmentPath::new("/third"), runner)
         .await;
-    distinct_environment.providers.presentation_managers[0].1.list_workspaces().await.expect("distinct environment scan");
+    distinct_environment.registry.presentation_managers[0].1.list_workspaces().await.expect("distinct environment scan");
     assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

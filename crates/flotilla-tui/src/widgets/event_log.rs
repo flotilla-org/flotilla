@@ -2,6 +2,7 @@ use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use flotilla_core::providers::discovery::ProviderCategory;
 use flotilla_protocol::{
     CredentialAttentionSeverity, FleetHostRow, FleetHostStaleness, FleetObservationAgreement, PeerConnectionState, SleepInhibitionHealth,
 };
@@ -13,7 +14,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext, PROVIDER_CATEGORIES};
+use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{PeerStatus, ProviderStatus, TuiHostState, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode},
@@ -242,8 +243,10 @@ fn provider_table_header(theme: &Theme) -> Row<'static> {
 }
 
 fn provider_table_widths() -> [Constraint; 3] {
-    [Constraint::Length(16), Constraint::Length(24), Constraint::Length(6)]
+    [Constraint::Length(PROVIDER_ROLE_WIDTH), Constraint::Length(24), Constraint::Length(6)]
 }
+
+const PROVIDER_ROLE_WIDTH: u16 = 20;
 
 /// Return the worse of two provider statuses (Error > Ok > None).
 fn worse_status(a: Option<ProviderStatus>, b: Option<ProviderStatus>) -> Option<ProviderStatus> {
@@ -265,7 +268,8 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
 
     for repo_identity in &model.repo_order {
         let rm = &model.repos[repo_identity];
-        for &(_, key) in &PROVIDER_CATEGORIES {
+        for category in ProviderCategory::ALL {
+            let key = category.slug();
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
@@ -282,7 +286,9 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
 
     let mut rows: Vec<Row> = Vec::new();
 
-    for &(category, key) in &PROVIDER_CATEGORIES {
+    for category in ProviderCategory::ALL {
+        let key = category.slug();
+        let category = category.display_name();
         let entries = by_category.get(key);
         if let Some(providers) = entries {
             for (i, provider) in providers.iter().enumerate() {
@@ -515,6 +521,16 @@ mod tests {
     fn disabled_host_provider_is_not_rendered_as_healthy() {
         let provider = flotilla_protocol::HostProviderStatus::disabled("issue_tracker", "Issue Provider", "credentials unavailable");
         assert_eq!(format_host_provider_status(&provider), "Issue Provider (disabled: credentials unavailable)");
+    }
+
+    #[test]
+    fn provider_role_column_fits_all_category_display_names() {
+        let longest_category = ProviderCategory::ALL
+            .iter()
+            .map(|category| category.display_name().chars().count())
+            .max()
+            .expect("provider categories should not be empty");
+        assert!(longest_category <= usize::from(PROVIDER_ROLE_WIDTH));
     }
 
     // ── select_next ───────────────────────────────────────────────────

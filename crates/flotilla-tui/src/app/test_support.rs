@@ -20,6 +20,8 @@ use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostStat
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
 type FocusObservations = Arc<Mutex<Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)>>>;
+pub(crate) type ExecuteCalls = Arc<Mutex<Vec<Command>>>;
+pub(crate) type QueryCalls = Arc<Mutex<Vec<(Command, uuid::Uuid)>>>;
 
 #[derive(bon::Builder)]
 pub(crate) struct StubDaemon {
@@ -30,6 +32,10 @@ pub(crate) struct StubDaemon {
     execute_gate: Option<Arc<Semaphore>>,
     #[builder(default = Ok(1))]
     execute_result: Result<u64, String>,
+    #[builder(default = Arc::new(Mutex::new(Vec::new())))]
+    execute_calls: ExecuteCalls,
+    #[builder(default = Arc::new(Mutex::new(Vec::new())))]
+    query_calls: QueryCalls,
     #[builder(default = Arc::new(Mutex::new(Vec::new())))]
     observations: FocusObservations,
 }
@@ -76,14 +82,16 @@ impl DaemonHandle for StubDaemon {
         Ok(vec![])
     }
 
-    async fn execute(&self, _command: Command) -> Result<u64, String> {
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        self.execute_calls.lock().expect("execute calls lock").push(command);
         if let Some(gate) = &self.execute_gate {
             gate.acquire().await.expect("execute gate should remain open").forget();
         }
         self.execute_result.clone()
     }
 
-    async fn execute_query(&self, _command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
+    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
+        self.query_calls.lock().expect("query calls lock").push((command, session_id));
         self.query_result.lock().expect("query result lock").take().unwrap_or_else(|| Err("stub".into()))
     }
 

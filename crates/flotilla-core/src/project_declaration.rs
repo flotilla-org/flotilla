@@ -13,6 +13,7 @@ pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration
 #[serde(deny_unknown_fields)]
 pub struct ProjectDeclaration {
     pub name: String,
+    pub default_workflow: Option<String>,
     pub members: Vec<ProjectDeclarationMember>,
 }
 
@@ -27,6 +28,7 @@ pub struct ProjectDeclarationMember {
 pub fn parse_project_declaration(yaml: &str) -> Result<ProjectDeclaration, String> {
     let mut declaration: ProjectDeclaration = serde_yml::from_str(yaml).map_err(|error| format!("invalid {DECLARATION_FILE}: {error}"))?;
     declaration.name = required(declaration.name, "name")?;
+    declaration.default_workflow = declaration.default_workflow.map(|workflow| required(workflow, "default_workflow")).transpose()?;
     if declaration.members.is_empty() {
         return Err("project declaration must contain at least one member".to_string());
     }
@@ -66,6 +68,15 @@ mod tests {
         .expect("declaration");
         assert_eq!(declaration.members[0].url, "https://github.com/flotilla-org/flotilla");
         assert!(declaration.members[0].roles.contains(&ProjectRepositoryRole::Ops));
+    }
+
+    #[test]
+    fn parses_optional_default_workflow() {
+        let declaration = parse_project_declaration(
+            "name: flotilla\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: flotilla\n    url: https://github.com/flotilla-org/flotilla.git\n    roles: [code]\n",
+        )
+        .expect("declaration");
+        assert_eq!(declaration.default_workflow.as_deref(), Some("single-agent-trusted"));
     }
 
     #[test]

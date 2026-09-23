@@ -48,6 +48,8 @@ pub const KEY_ATTACH_REF: &str = "flotilla.attach.ref";
 // Catalog keys (`flotilla pm connect`, Entity targets, TTL'd).
 
 pub const KEY_PROJECT_NAME: &str = "flotilla.project.name";
+/// Terminal attempt with a newer generation of the same project and role.
+pub const KEY_CONVOY_SUPERSEDED: &str = "flotilla.convoy.superseded";
 pub const KEY_CONVOY_PHASE: &str = "flotilla.convoy.phase";
 pub const KEY_CONVOY_WORKFLOW: &str = "flotilla.convoy.workflow";
 pub const KEY_CONVOY_MESSAGE: &str = "flotilla.convoy.message";
@@ -69,6 +71,10 @@ pub const KEY_ENTITY_KIND: &str = "entity.kind";
 pub const KEY_ENTITY_ID: &str = "entity.id";
 /// Concise human label used by grouping levels and fallback rendering.
 pub const KEY_DISPLAY_LABEL: &str = "display.label";
+/// Optional medium-width, display-only companion to [`KEY_DISPLAY_LABEL`].
+pub const KEY_DISPLAY_LABEL_MEDIUM: &str = "display.label.medium";
+/// Optional shortest, acronym-like display companion to [`KEY_DISPLAY_LABEL`].
+pub const KEY_DISPLAY_LABEL_SHORT: &str = "display.label.short";
 /// Producer provenance suitable for a surface badge.
 pub const KEY_SOURCE: &str = "source";
 /// Badge state: `idle | waiting | active | done | failed`.

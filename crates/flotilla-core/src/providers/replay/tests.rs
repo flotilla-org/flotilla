@@ -849,7 +849,7 @@ async fn test_runner_passthrough_returns_process_runner() {
     // validates that Session::Passthrough produces a functional runner.
     let session = Session::Passthrough;
     let runner = test_runner(&session);
-    let result = runner.run("echo", &["hello"], Path::new("/tmp"), &ChannelLabel::Noop).await;
+    let result = runner.run("echo", &["hello"], Path::new("/tmp"), &ChannelLabel::Default).await;
     assert!(result.is_ok());
     assert!(result.unwrap().contains("hello"));
 }

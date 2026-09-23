@@ -9,7 +9,7 @@ spec:
   pool: cleat
   docker_per_vessel:
     host_ref: d49f4c59-811f-44aa-a4ca-d4cac66cf2a3
-    image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-15.1
+    image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-08-25.1
     pull_policy: always
     agent_adapters:
       - claude-code

@@ -53,7 +53,7 @@ impl std::fmt::Display for DispatchNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::CommandAction;
 
     use super::DispatchNoun;
 
@@ -61,11 +61,6 @@ mod tests {
     fn queue_resolves_to_a_read_only_query() {
         let noun = DispatchNoun::try_parse_from(["dispatch", "queue", "--project", "widgets"]).expect("parse");
         let crate::Resolved::NeedsContext { command, .. } = noun.resolve().expect("resolve") else { panic!("expected context command") };
-        assert_eq!(command, Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) },
-        });
+        assert_eq!(command.action, CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) });
     }
 }

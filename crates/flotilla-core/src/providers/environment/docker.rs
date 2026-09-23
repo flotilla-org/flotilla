@@ -56,12 +56,12 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                 let path_str = abs_path.to_string_lossy().into_owned();
                 self.inner
                     .runner
-                    .run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Noop)
+                    .run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Default)
                     .await?;
                 Ok(ImageId::new(tag))
             }
             ImageSource::Registry(image) => {
-                self.inner.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Noop).await?;
+                self.inner.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Default).await?;
                 Ok(ImageId::new(image.clone()))
             }
         }
@@ -176,7 +176,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         args.push("sleep");
         args.push("infinity");
 
-        self.inner.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Noop).await?;
+        self.inner.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await?;
         let image_digest = match self.inner.image_digest(&container_name).await {
             Ok(digest) => digest,
             Err(error) => {
@@ -196,7 +196,12 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let output = self
             .inner
             .runner
-            .run("docker", &["ps", "-a", "--filter", "label=flotilla.environment", "--format", format], Path::new("/"), &ChannelLabel::Noop)
+            .run(
+                "docker",
+                &["ps", "-a", "--filter", "label=flotilla.environment", "--format", format],
+                Path::new("/"),
+                &ChannelLabel::Default,
+            )
             .await?;
 
         let mut handles = Vec::new();
@@ -264,7 +269,7 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn image_exists(&self, tag: &str, cwd: &Path) -> Result<bool, String> {
-        match self.runner.run("docker", &["image", "inspect", tag], cwd, &ChannelLabel::Noop).await {
+        match self.runner.run("docker", &["image", "inspect", tag], cwd, &ChannelLabel::Default).await {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -291,8 +296,10 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn image_digest(&self, container_name: &str) -> Result<String, String> {
-        let output =
-            self.runner.run("docker", &["inspect", "--format", "{{.Image}}", container_name], Path::new("/"), &ChannelLabel::Noop).await?;
+        let output = self
+            .runner
+            .run("docker", &["inspect", "--format", "{{.Image}}", container_name], Path::new("/"), &ChannelLabel::Default)
+            .await?;
         let digest = output.trim();
         if !digest.starts_with("sha256:") || digest.len() == "sha256:".len() {
             return Err(format!("docker returned invalid image digest for container {container_name}: {digest:?}"));
@@ -303,7 +310,7 @@ impl DockerEnvironmentProviderInner {
     async fn status(&self, container_name: &str) -> Result<EnvironmentStatus, String> {
         let raw = self
             .runner
-            .run("docker", &["inspect", "--format", "{{.State.Status}}", container_name], Path::new("/"), &ChannelLabel::Noop)
+            .run("docker", &["inspect", "--format", "{{.State.Status}}", container_name], Path::new("/"), &ChannelLabel::Default)
             .await?;
         let status = raw.trim();
         Ok(match status {
@@ -315,7 +322,8 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn env_vars(&self, container_name: &str) -> Result<HashMap<String, String>, String> {
-        let output = self.runner.run("docker", &["exec", container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Noop).await?;
+        let output =
+            self.runner.run("docker", &["exec", container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Default).await?;
 
         // Note: `sh -lc env` output is line-delimited. Values containing newlines
         // (e.g. PEM certificates) will be silently truncated. Acceptable for now;
@@ -330,7 +338,7 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn destroy(&self, container_name: &str) -> Result<(), String> {
-        self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Noop).await?;
+        self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Default).await?;
         Ok(())
     }
 }

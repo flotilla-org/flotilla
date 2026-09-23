@@ -4,7 +4,7 @@
 //! one canonical entity and carries only flat facts. Presentation managers
 //! derive paths from those facts using their selected grouping template.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{
     result_set::{
@@ -18,12 +18,12 @@ use crate::{
     entity::{self, EntityRef},
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
-        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
-        KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_ENTITY_ID,
-        KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE,
-        KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORK_PHASE,
-        SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS,
+        KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
+        KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY,
+        KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME,
+        KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST,
+        KEY_VESSEL_NAME, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -168,6 +168,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         for node in nodes {
             project_awareness_node(&mut catalog, node, input.convoys, mint);
         }
+        mark_superseded_convoys(&mut catalog, input.convoys);
         return catalog;
     }
     for convoy in input.convoys {
@@ -176,13 +177,48 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     for independent in input.independents {
         project_independent(&mut catalog, independent, mint);
     }
+    mark_superseded_convoys(&mut catalog, input.convoys);
     catalog
+}
+
+// Lifecycle identity comes from role addressing, never from display labels.
+// Keep nonterminal attempts visible even if a newer generation also exists.
+fn mark_superseded_convoys(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
+    let mut latest = BTreeMap::new();
+    for row in convoys {
+        if let (Some(project), Some(role)) = (&row.project_ref, &row.address_role) {
+            let key = (&row.resource.namespace, project, role);
+            latest.entry(key).and_modify(|generation: &mut u64| *generation = (*generation).max(row.generation)).or_insert(row.generation);
+        }
+    }
+    let superseded = convoys
+        .iter()
+        .filter(|row| {
+            row.phase.is_terminal()
+                && match (&row.project_ref, &row.address_role) {
+                    (Some(project), Some(role)) => {
+                        latest.get(&(&row.resource.namespace, project, role)).is_some_and(|generation| *generation > row.generation)
+                    }
+                    _ => false,
+                }
+        })
+        .map(|row| entity::convoy(&row.resource.namespace, &row.resource.name, &entity::resource_origin(&row.resource)).id)
+        .collect::<BTreeSet<_>>();
+    for facts in catalog.facts.values_mut() {
+        let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
+            continue;
+        };
+        facts.insert(
+            KEY_CONVOY_SUPERSEDED.to_owned(),
+            MetadataValueUpdate::new(MetadataValue::Bool(superseded.contains(convoy)), Some(CATALOG_TTL_MS)),
+        );
+    }
 }
 
 fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
     let parent = awareness_parent_facts(node, convoys);
     if let Some((entity, mut facts)) = awareness_node_entity(node, convoys) {
-        facts.extend(status_and_counts(node.state, &node.counts));
+        facts.extend(status_and_counts(node.state, &node.counts, node.entries.len()));
         if let Some(recipe) = awareness_project_recipe(node, mint) {
             facts.extend(action_facts(&entity, &recipe, "workspace"));
         }
@@ -230,11 +266,13 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
                 Some((parts.next()?, parts.next()?))
             })?;
             let entity = entity::project(namespace, name, "fleet");
-            Some((entity.clone(), vec![
-                (SEGMENT_PROJECT, MetadataValue::text(entity.id)),
+            let mut facts = vec![
+                (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
                 (KEY_PROJECT_NAME, MetadataValue::text(node.label.clone())),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
-            ]))
+            ];
+            facts.extend(label_tier_facts(&node.label));
+            Some((entity, facts))
         }
         AwarenessKind::Convoy => {
             let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);
@@ -242,11 +280,17 @@ fn awareness_node_entity(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Option<
             let row = find_convoy(convoys, namespace, name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let entity = entity::convoy(namespace, name, &origin);
-            Some((entity.clone(), vec![
-                (KEY_CONVOY, MetadataValue::text(entity.id)),
-                (KEY_CONVOY_NAME, MetadataValue::text(node.label.clone())),
+            let semantic_label = row.map(|row| row.name.as_str()).unwrap_or(&node.label);
+            let mut facts = vec![
+                (KEY_CONVOY, MetadataValue::text(entity.id.clone())),
+                (KEY_CONVOY_NAME, MetadataValue::text(semantic_label)),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
-            ]))
+            ];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
+            facts.extend(label_tier_facts(semantic_label));
+            Some((entity, facts))
         }
         _ => None,
     }
@@ -298,10 +342,16 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let row = find_convoy(convoys, namespace, name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let entity = entity::convoy(namespace, name, &origin);
-            let mut facts = vec![
-                (KEY_CONVOY, MetadataValue::text(entity.id.clone())),
-                (KEY_CONVOY_NAME, MetadataValue::text(entry.annotations.get(KEY_CONVOY_NAME).cloned().unwrap_or_else(|| name.to_owned()))),
-            ];
+            let semantic_label = entry.annotations.get(KEY_CONVOY_NAME).map(String::as_str).unwrap_or(name);
+            let mut facts =
+                vec![(KEY_CONVOY, MetadataValue::text(entity.id.clone())), (KEY_CONVOY_NAME, MetadataValue::text(semantic_label))];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
+            facts.extend(label_tier_facts(semantic_label));
+            if let (None, Some(AwarenessPhase::Convoy(phase))) = (row, &entry.phase) {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
+            }
             if let Some(number) = entry.annotations.get(KEY_CHANGE_REQUEST_NUMBER) {
                 facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(number.clone())));
             }
@@ -314,16 +364,21 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             let row = find_convoy(convoys, namespace, convoy_name);
             let origin = row.map(|row| entity::resource_origin(&row.resource)).unwrap_or_else(|| "fleet".to_owned());
             let convoy = entity::convoy(namespace, convoy_name, &origin);
+            let convoy_label = row.map(|row| row.name.as_str()).unwrap_or(convoy_name);
             let vessel_origin = find_vessel(convoys, namespace, convoy_name, vessel_name)
                 .map(|vessel| vessel.host.to_string())
                 .unwrap_or_else(|| origin.clone());
             let entity = entity::vessel(namespace, convoy_name, vessel_name, &vessel_origin);
-            let facts = vec![
+            let mut facts = vec![
                 (KEY_CONVOY, MetadataValue::text(convoy.id)),
-                (KEY_CONVOY_NAME, MetadataValue::text(convoy_name)),
+                (KEY_CONVOY_NAME, MetadataValue::text(convoy_label)),
                 (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
                 (KEY_VESSEL_NAME, MetadataValue::text(label.clone())),
             ];
+            if let Some(row) = row {
+                facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
+            }
+            facts.extend(label_tier_facts(&label));
             (entity, facts)
         }
         AwarenessKind::Issue => {
@@ -345,7 +400,9 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
                 })
                 .unwrap_or_else(|| entry.id.clone());
             let entity = entity::session(&session_ref);
-            (entity.clone(), vec![(KEY_SESSION, MetadataValue::text(entity.id.clone())), (KEY_DISPLAY_LABEL, MetadataValue::text(value))])
+            let mut facts = vec![(KEY_SESSION, MetadataValue::text(entity.id.clone()))];
+            facts.extend(label_tier_facts(value));
+            (entity, facts)
         }
         AwarenessKind::Checkout => {
             let entity = entity::checkout(&entry.id);
@@ -415,7 +472,7 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
 }
 
 fn find_convoy<'a>(convoys: &'a [ConvoyRow], namespace: &str, name: &str) -> Option<&'a ConvoyRow> {
-    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.name == name)
+    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.resource.name == name)
 }
 
 fn find_vessel<'a>(convoys: &'a [ConvoyRow], namespace: &str, convoy_name: &str, vessel_name: &str) -> Option<&'a VesselRow> {
@@ -432,10 +489,10 @@ fn awareness_state(state: AwarenessState) -> &'static str {
     }
 }
 
-fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts) -> Vec<(&'static str, MetadataValue)> {
+fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts, visible: usize) -> Vec<(&'static str, MetadataValue)> {
     vec![
         (KEY_STATUS_STATE, MetadataValue::text(awareness_state(state))),
-        (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(counts))),
+        (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(counts, visible))),
         (KEY_COUNT_TOTAL, MetadataValue::Integer(counts.total as i64)),
         (KEY_COUNT_ISSUES, MetadataValue::Integer(counts.issues as i64)),
         (KEY_COUNT_CONVOYS, MetadataValue::Integer(counts.convoys as i64)),
@@ -445,8 +502,14 @@ fn status_and_counts(state: AwarenessState, counts: &AwarenessCounts) -> Vec<(&'
     ]
 }
 
-fn summary_text(counts: &AwarenessCounts) -> String {
-    format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts)
+fn summary_text(counts: &AwarenessCounts, visible: usize) -> String {
+    let mut summary =
+        format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts);
+    let omitted = counts.total.saturating_sub(visible);
+    if omitted > 0 {
+        summary.push_str(&format!(" · +{omitted} more"));
+    }
+    summary
 }
 
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
@@ -460,7 +523,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if let Some(repo) = &repo {
         assert_repo_entity(catalog, repo, &project_facts(&project));
     }
-    let convoy_entity = entity::convoy(namespace, &convoy.name, &origin);
+    let convoy_entity = entity::convoy(namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = convoy_badge(convoy.phase, convoy.initializing);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
@@ -477,6 +540,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         (KEY_CONVOY_WORKFLOW, MetadataValue::text(convoy.workflow_ref.clone())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
+    facts.extend(label_tier_facts(&convoy.name));
     if let Some(change_request) = &convoy.change_request {
         facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(change_request.id.clone())));
     }
@@ -486,12 +550,14 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if !convoy.vessels.is_empty() {
+    if let Some(message) = &convoy.message {
+        facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(message.clone())));
+    } else if !convoy.vessels.is_empty() {
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(format!("{done}/{} vessels done", convoy.vessels.len()))));
     }
     if let [vessel] = convoy.vessels.as_slice() {
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
-            let target = entity::vessel(namespace, &convoy.name, &vessel.name, vessel.host.as_str());
+            let target = entity::vessel(namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
             facts.extend(action_facts(&target, &recipe, "workspace"));
         }
     }
@@ -509,9 +575,9 @@ fn project_vessel(
     repo: Option<&str>,
     mint: &dyn RecipeMint,
 ) {
-    let entity = entity::vessel(&convoy.resource.namespace, &convoy.name, &vessel.name, vessel.host.as_str());
+    let entity = entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
     let origin = entity::resource_origin(&convoy.resource);
-    let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.name, &origin);
+    let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
     let badge = work_badge(vessel.phase);
     let mut facts = project_facts(project);
@@ -522,6 +588,7 @@ fn project_vessel(
     facts.extend([
         (KEY_CONVOY, MetadataValue::text(convoy_entity.id)),
         (KEY_CONVOY_NAME, MetadataValue::text(convoy.name.clone())),
+        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
         (KEY_VESSEL, MetadataValue::text(entity.id.clone())),
         (KEY_VESSEL_NAME, MetadataValue::text(vessel.name.clone())),
         (KEY_DISPLAY_LABEL, MetadataValue::text(vessel.name.clone())),
@@ -529,6 +596,7 @@ fn project_vessel(
         (KEY_VESSEL_HOST, MetadataValue::text(vessel.host.to_string())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
+    facts.extend(label_tier_facts(&vessel.name));
     if !vessel.crew.is_empty() {
         facts.push((KEY_CREW_ROLES, MetadataValue::StringList(vessel.crew.iter().map(|member| member.role.clone()).collect())));
     }
@@ -560,6 +628,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
         (KEY_INDEPENDENT_HOST, MetadataValue::text(independent.host.to_string())),
     ];
+    facts.extend(label_tier_facts(&independent.name));
     if let Some(repo) = repo {
         facts.push((SEGMENT_REPO, MetadataValue::text(repo)));
         facts.push((KEY_REPO_NAME, MetadataValue::text(repo_label(repo))));
@@ -581,16 +650,44 @@ fn project_fact(project_ref: Option<&str>, origin: &str) -> Option<(EntityRef, V
         _ => ("flotilla", project_ref.rsplit('/').next()?),
     };
     let entity = entity::project(namespace, name, origin);
-    let facts = vec![
+    let mut facts = vec![
         (SEGMENT_PROJECT, MetadataValue::text(entity.id.clone())),
         (KEY_PROJECT_NAME, MetadataValue::text(name)),
         (KEY_DISPLAY_LABEL, MetadataValue::text(name)),
     ];
+    facts.extend(label_tier_facts(name));
     Some((entity, facts))
 }
 
 fn project_facts(project: &Option<(EntityRef, Vec<(&'static str, MetadataValue)>)>) -> Vec<(&'static str, MetadataValue)> {
-    project.as_ref().map(|(_, facts)| facts.iter().filter(|(key, _)| *key != KEY_DISPLAY_LABEL).cloned().collect()).unwrap_or_default()
+    project
+        .as_ref()
+        .map(|(_, facts)| {
+            facts
+                .iter()
+                .filter(|(key, _)| !matches!(*key, KEY_DISPLAY_LABEL | KEY_DISPLAY_LABEL_MEDIUM | KEY_DISPLAY_LABEL_SHORT))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Derives stable width tiers from the semantic components of a role/name.
+/// The medium tier retains the final (usually noun) component while reducing
+/// its qualifiers to initials; the short tier is the component acronym.
+fn label_tier_facts(label: &str) -> Vec<(&'static str, MetadataValue)> {
+    let components: Vec<&str> = label.split(|character: char| !character.is_alphanumeric()).filter(|part| !part.is_empty()).collect();
+    let Some(last) = components.last() else {
+        return vec![];
+    };
+    let short: String = components.iter().filter_map(|part| part.chars().next()).collect();
+    let medium = if components.len() == 1 {
+        (*last).to_owned()
+    } else {
+        let qualifiers: String = components[..components.len() - 1].iter().filter_map(|part| part.chars().next()).collect();
+        format!("{qualifiers}-{last}")
+    };
+    vec![(KEY_DISPLAY_LABEL_MEDIUM, MetadataValue::text(medium)), (KEY_DISPLAY_LABEL_SHORT, MetadataValue::text(short))]
 }
 
 fn assert_repo_entity(catalog: &mut Catalog, repo: &str, parent: &[(&'static str, MetadataValue)]) {

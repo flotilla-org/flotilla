@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,12 +28,41 @@ pub struct CredentialSpecSpec {
 #[serde(tag = "adapter", rename_all = "kebab-case")]
 pub enum CredentialConsumer {
     Gh,
-    GithubApp { installation_id: u64 },
-    Forgejo { server_url: String, username: String },
+    GithubApp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installation_repository: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permissions: Option<BTreeMap<String, String>>,
+    },
+    Forgejo {
+        server_url: String,
+        username: String,
+    },
+    GitHttpToken {
+        host: String,
+        username: String,
+    },
     Claude,
-    ClaudeOauth { account_email: String },
+    ClaudeOauth {
+        account_email: String,
+    },
     Codex,
-    DockerRegistry { registry: String, username: String },
+    DockerRegistry {
+        registry: String,
+        username: String,
+    },
+    ReviewBundleStore {
+        endpoint: String,
+        bucket: String,
+        region: String,
+        public_base_url: String,
+        #[serde(default)]
+        allow_http: bool,
+        #[serde(default)]
+        virtual_hosted_style: bool,
+    },
 }
 
 impl CredentialConsumer {
@@ -42,10 +71,12 @@ impl CredentialConsumer {
             Self::Gh => "gh",
             Self::GithubApp { .. } => "github-app",
             Self::Forgejo { .. } => "forgejo",
+            Self::GitHttpToken { .. } => "git-http-token",
             Self::Claude => "claude",
             Self::ClaudeOauth { .. } => "claude-oauth",
             Self::Codex => "codex",
             Self::DockerRegistry { .. } => "docker-registry",
+            Self::ReviewBundleStore { .. } => "review-bundle-store",
         }
     }
 
@@ -100,6 +131,19 @@ pub struct CredentialPlacementRequirements {
 pub struct CredentialGrantSpec {
     pub selector: CredentialGrantSelector,
     pub credentials: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[builder(default)]
+    pub landing_credentials: BTreeMap<String, LandingCredentialScope>,
+}
+
+/// Constraint retained when a human-gate approval releases a landing
+/// credential. Temporal-only is the safe fallback where a forge cannot mint
+/// a branch-constrained token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LandingCredentialScope {
+    Branch { repository: RepositoryKey, branch: String },
+    TemporalOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -147,6 +191,17 @@ mod tests {
         assert_eq!(encoded, r#"{"adapter":"claude-oauth","account_email":"ops@example.com"}"#);
         assert_eq!(consumer.adapter_name(), "claude-oauth");
         assert_eq!(consumer.delivery_slot(), CredentialConsumer::Claude.delivery_slot());
+    }
+
+    #[test]
+    fn git_http_token_declares_a_forge_agnostic_host_and_username() {
+        let consumer =
+            CredentialConsumer::GitHttpToken { host: "forgejo.lab.flotilla.work".to_string(), username: "crew-reader".to_string() };
+
+        let encoded = serde_json::to_string(&consumer).expect("serialize consumer");
+
+        assert_eq!(encoded, r#"{"adapter":"git-http-token","host":"forgejo.lab.flotilla.work","username":"crew-reader"}"#);
+        assert_eq!(consumer.adapter_name(), "git-http-token");
     }
 
     #[test]

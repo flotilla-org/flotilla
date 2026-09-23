@@ -3,7 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-07-27
 **Relates to:** ADR 0017 (amends its phase vocabulary and refines one of its
-rules), ADR 0020 (hulls — the same warm-workspace economics), ADR 0009
+rules), ADR 0020 (hulls — the same warm-workspace economics), ADR 0036
+(adds the observed-digest settlement anchor), ADR 0009
 (stewards), issue #1113 (the grill that fixed this contract), #1026 (idle
 crews never reach Done — resolved by this model), #1071 (event-driven
 shepherding — given a home state here), #1111/#1114 (the disk-exhaustion
@@ -61,12 +62,18 @@ preserving ADR 0017's claims/conditions split:
   call-time-state-dependent: a verb firing before the CR is observed
   would skip Landing and tear down under an open PR.
 - **`Landing → Landed` is condition-written.** The sole writer is the
-  lifecycle reconciler, continuously evaluating the standing integration
-  condition: *no change request remains outstanding* — which uniformly
-  covers merged and closed change requests. A checkout for which no change
-  request ever existed satisfies `Landed` only when its branch has no commits
-  beyond its base ref; a divergent no-CR branch remains unsettled. Testimony
-  can never write `Landed`.
+  lifecycle reconciler, continuously evaluating the applicable settlement
+  anchors. The original anchor is the standing integration condition: *no
+  change request remains outstanding* — which uniformly covers merged and
+  closed change requests. A checkout for which no change request ever existed
+  satisfies `Landed` only when its branch has no commits beyond its base ref;
+  a divergent no-CR branch remains unsettled. ADR 0036 adds a coexisting,
+  forge-independent anchor for evidence-backed ref-pair claims: the claimed
+  remote ref is observed through Git transport at the claimed digest. An
+  observation at another digest holds settlement and raises attention. Once
+  either anchor writes `Landed`, that settlement is terminal for the claim; a
+  later force-push is a new claim cycle and cannot un-settle the old one.
+  Testimony can never write `Landed`.
 
 ### Refinement of ADR 0017's "No `Integrated` phase, ever"
 

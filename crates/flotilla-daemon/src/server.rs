@@ -1,3 +1,4 @@
+mod caller;
 mod client_connection;
 pub mod environment_sockets;
 mod peer_connection;
@@ -24,7 +25,9 @@ use std::{
 use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_VERSION};
+use flotilla_protocol::{
+    ConfigLabel, ConnectionRole, EnvironmentId, GoodbyeReason, HostName, Message, NodeId, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
+};
 use flotilla_resources::{ResourceBackend, SqliteBackend};
 use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
@@ -493,6 +496,7 @@ impl DaemonServer {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             accept_error_backoff.reset();
+                            let peer_credential = caller::socket_peer_credential(&stream);
                             let daemon = Arc::clone(&daemon);
                             let client_count = Arc::clone(&client_count);
                             let client_notify = Arc::clone(&client_notify);
@@ -505,7 +509,11 @@ impl DaemonServer {
 
                             let shutdown_request_tx = shutdown_request_tx.clone();
                             connection_tasks.spawn(async move {
-                                handle_client(
+                                let namespace = daemon.provisioning_namespace().await;
+                                let caller = tokio::task::spawn_blocking(move || caller::caller_from_peer(peer_credential, &namespace))
+                                    .await
+                                    .ok();
+                                handle_client_with_caller(
                                     stream,
                                     daemon,
                                     shutdown_request_tx,
@@ -518,6 +526,7 @@ impl DaemonServer {
                                     peer_connected_tx,
                                     agent_state_store,
                                     None,
+                                    caller,
                                 )
                                 .await;
                             });
@@ -623,7 +632,41 @@ fn spawn_peer_networking_runtime(
 /// `environment_id` the connection is dropped.  `None` means the main socket
 /// (forward-compatible with HTTP transport).
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_client(
+    stream: tokio::net::UnixStream,
+    daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    shutdown_rx: watch::Receiver<bool>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+) {
+    handle_client_with_caller(
+        stream,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        inbound_peer_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_with_caller(
     mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
@@ -636,6 +679,7 @@ async fn handle_client(
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
+    caller: Option<flotilla_protocol::CommandCaller>,
 ) {
     let mut first_byte = [0_u8; 1];
     match tokio::time::timeout(CONNECTION_PREFACE_TIMEOUT, tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte)).await {
@@ -660,7 +704,7 @@ async fn handle_client(
             return;
         }
     }
-    handle_client_session(
+    handle_client_session_with_caller(
         unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_request_tx,
@@ -673,12 +717,48 @@ async fn handle_client(
         peer_connected_tx,
         agent_state_store,
         environment_context,
+        caller,
     )
     .await;
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, feature = "test-support"))]
+#[allow(dead_code)]
 async fn handle_client_session(
+    session: MessageSession,
+    daemon: Arc<InProcessDaemon>,
+    shutdown_request_tx: mpsc::UnboundedSender<()>,
+    shutdown_rx: watch::Receiver<bool>,
+    inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
+    peer_manager: Arc<Mutex<PeerManager>>,
+    remote_command_router: RemoteCommandRouter,
+    client_count: Arc<AtomicUsize>,
+    client_notify: Arc<Notify>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
+    agent_state_store: SharedAgentStateStore,
+    environment_context: Option<EnvironmentId>,
+) {
+    handle_client_session_with_caller(
+        session,
+        daemon,
+        shutdown_request_tx,
+        shutdown_rx,
+        inbound_peer_tx,
+        peer_manager,
+        remote_command_router,
+        client_count,
+        client_notify,
+        peer_connected_tx,
+        agent_state_store,
+        environment_context,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_session_with_caller(
     session: MessageSession,
     daemon: Arc<InProcessDaemon>,
     shutdown_request_tx: mpsc::UnboundedSender<()>,
@@ -691,6 +771,7 @@ async fn handle_client_session(
     peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
+    caller: Option<flotilla_protocol::CommandCaller>,
 ) {
     let session = Arc::new(session);
     let first_msg = tokio::select! {
@@ -732,7 +813,7 @@ async fn handle_client_session(
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: daemon.node_id().clone(),
-                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID),
+                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID, PROTOCOL_FINGERPRINT),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
@@ -742,17 +823,21 @@ async fn handle_client_session(
                 {
                     return;
                 }
-                let client_generation = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+                let client_info = flotilla_protocol::hello_build_info(&display_name);
+                let client_build = client_info.map_or("unknown", |info| info.build_id);
+                let client_fingerprint = client_info.map_or("unknown", |info| info.protocol_fingerprint);
                 if protocol_version != PROTOCOL_VERSION {
                     warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
                     return;
                 }
-                if !flotilla_protocol::wire_generations_match(client_generation, BUILD_ID) {
+                if client_fingerprint != PROTOCOL_FINGERPRINT {
                     warn!(
-                        expected = BUILD_ID,
-                        got = client_generation,
+                        expected_fingerprint = PROTOCOL_FINGERPRINT,
+                        got_fingerprint = client_fingerprint,
+                        expected_build = BUILD_ID,
+                        got_build = client_build,
                         %node_id,
-                        "restricting client with wire generation mismatch to shutdown"
+                        "restricting client with protocol fingerprint mismatch to shutdown"
                     );
                     run_shutdown_only_session(&session, &shutdown_request_tx, &mut shutdown_rx).await;
                     return;
@@ -761,6 +846,16 @@ async fn handle_client_session(
                     Some(surface) => surface,
                     None => flotilla_protocol::SurfaceDeclaration::focal_for_namespace(daemon.provisioning_namespace().await),
                 };
+                let caller = caller
+                    .map(|mut caller| {
+                        caller.principal_ref = surface.principal_ref.clone();
+                        caller
+                    })
+                    .unwrap_or_else(|| flotilla_protocol::CommandCaller {
+                        principal_ref: surface.principal_ref.clone(),
+                        process: None,
+                        crew: None,
+                    });
                 ClientConnection::new(
                     daemon,
                     shutdown_request_tx,
@@ -769,6 +864,7 @@ async fn handle_client_session(
                     client_count,
                     client_notify,
                     agent_state_store,
+                    caller,
                 )
                 .run_stateful(Arc::clone(&session), session_id, surface)
                 .await;
@@ -797,13 +893,16 @@ async fn run_shutdown_only_session(
             match message {
                 Ok(Some(Message::Request { id, request: flotilla_protocol::Request::Shutdown })) => {
                     if session.write(Message::ok_response(id, flotilla_protocol::Response::Shutdown)).await.is_ok() {
-                        info!("graceful shutdown requested by same-protocol client from a different build");
+                        info!("graceful shutdown requested by same-version client with a different protocol fingerprint");
                         let _ = shutdown_request_tx.send(());
                     }
                 }
                 Ok(Some(Message::Request { id, .. })) => {
                     let _ = session
-                        .write(Message::error_response(id, "wire generation mismatch: only daemon shutdown is available across builds"))
+                        .write(Message::error_response(
+                            id,
+                            "protocol fingerprint mismatch: only daemon shutdown is available",
+                        ))
                         .await;
                 }
                 Ok(Some(other)) => warn!(msg = ?other, "unexpected message from shutdown-only client"),

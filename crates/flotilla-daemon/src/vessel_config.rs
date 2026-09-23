@@ -13,6 +13,10 @@ pub mod priority {
     pub const DEFAULT: u16 = 1000;
 }
 
+const CREW_GIT_IDENTITY_PROVENANCE: &str = "vessel/crew-identity";
+const CREW_GIT_USER_NAME: &str = "flotilla-crew[bot]";
+const CREW_GIT_USER_EMAIL: &str = "309902803+flotilla-crew[bot]@users.noreply.github.com";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TargetId {
     GitConfig,
@@ -144,6 +148,25 @@ pub fn agent_environment_fragment(name: impl Into<String>, value: impl Into<Stri
         .value(value)
         .provenance(Provenance::new(provenance))
         .build()
+}
+
+pub fn crew_gitconfig_fragments() -> [Fragment; 2] {
+    [
+        Fragment::builder()
+            .target(TargetId::GitConfig)
+            .key(TargetKey::GitConfig(GitConfigKey::new("user", "name")))
+            .value(CREW_GIT_USER_NAME)
+            .priority(priority::DEFAULT)
+            .provenance(Provenance::new(CREW_GIT_IDENTITY_PROVENANCE))
+            .build(),
+        Fragment::builder()
+            .target(TargetId::GitConfig)
+            .key(TargetKey::GitConfig(GitConfigKey::new("user", "email")))
+            .value(CREW_GIT_USER_EMAIL)
+            .priority(priority::DEFAULT)
+            .provenance(Provenance::new(CREW_GIT_IDENTITY_PROVENANCE))
+            .build(),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +404,24 @@ mod tests {
     fn sugar_constants_match_the_ratified_order_and_priority_contract() {
         assert_eq!((order::FIRST, order::EARLY, order::DEFAULT, order::LATE), (0, 500, 1000, 1500));
         assert_eq!((priority::FORCE, priority::NORMAL, priority::DEFAULT), (50, 100, 1000));
+    }
+
+    #[test]
+    fn crew_gitconfig_uses_the_canonical_github_app_identity() {
+        let composed = compose(TargetId::GitConfig, crew_gitconfig_fragments()).expect("crew Git identity should compose");
+
+        assert!(composed.contents.contains("[user]\n\tname = flotilla-crew[bot]"));
+        assert!(composed.contents.contains("[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com"));
+    }
+
+    #[test]
+    fn crew_gitconfig_identity_is_a_baseline_that_explicit_fragments_can_override() {
+        let explicit = git_fragment(GitConfigKey::new("user", "email"), "developer@example.com", "vessel/explicit-identity");
+        let composed = compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain([explicit]))
+            .expect("an explicit Git identity should override the crew baseline");
+
+        assert!(composed.contents.contains("[user]\n\temail = developer@example.com"));
+        assert!(!composed.contents.contains(CREW_GIT_USER_EMAIL));
     }
 
     #[test]

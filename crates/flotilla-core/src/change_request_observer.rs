@@ -28,7 +28,7 @@ impl ChangeRequestRef {
         Some(Self { namespace: namespace.to_string(), service: service.clone(), scope: scope.clone(), number: *number })
     }
 
-    fn record_name(&self) -> String {
+    pub(crate) fn record_name(&self) -> String {
         change_request_record_name(&self.service, &self.scope, self.number)
     }
 }
@@ -145,6 +145,7 @@ struct ChangeRequestRefresherInner {
     source: Arc<dyn ChangeRequestObservationSource>,
     cadence: ChangeRequestRefreshCadence,
     active: Mutex<HashMap<ChangeRequestRef, ActiveRefresh>>,
+    observation_errors: Mutex<HashMap<ChangeRequestRef, String>>,
 }
 
 impl ChangeRequestRefresher {
@@ -154,11 +155,24 @@ impl ChangeRequestRefresher {
         source: Arc<dyn ChangeRequestObservationSource>,
         cadence: ChangeRequestRefreshCadence,
     ) -> Self {
-        Self { inner: Arc::new(ChangeRequestRefresherInner { backend, authority, source, cadence, active: Mutex::new(HashMap::new()) }) }
+        Self {
+            inner: Arc::new(ChangeRequestRefresherInner {
+                backend,
+                authority,
+                source,
+                cadence,
+                active: Mutex::new(HashMap::new()),
+                observation_errors: Mutex::new(HashMap::new()),
+            }),
+        }
     }
 
     pub fn stale_after(&self) -> Duration {
         self.inner.cadence.stale_after
+    }
+
+    pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
+        self.inner.observation_errors.lock().await.get(subject).cloned()
     }
 
     pub async fn demand(
@@ -218,6 +232,7 @@ impl ChangeRequestRefresher {
             if active.contains_key(&subject) {
                 continue;
             }
+            self.inner.observation_errors.lock().await.remove(&subject);
             let result = self.inner.backend.using::<ChangeRequest>(&subject.namespace).delete(&subject.record_name()).await;
             if let Err(error) = result {
                 if !matches!(error, flotilla_resources::ResourceError::NotFound { .. }) {
@@ -251,11 +266,14 @@ impl ChangeRequestRefresher {
         loop {
             match self.inner.source.observe(&subject).await {
                 Ok(status) => {
-                    if let Err(error) = self.publish(&subject, &record_name, status.clone()).await {
-                        tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
-                    }
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
+                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded).await {
+                        self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                        tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
+                    } else {
+                        self.inner.observation_errors.lock().await.remove(&subject);
+                    }
                     let delay = if demanded {
                         self.inner.cadence.freshness_demanded
                     } else if status.checks.value == Some(ObservedChecks::Pending) {
@@ -268,6 +286,7 @@ impl ChangeRequestRefresher {
                     }
                 }
                 Err(error) => {
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
                     if !self.wait_for_next(&subject, self.inner.cadence.checks_pending).await {
                         break;
@@ -288,10 +307,10 @@ impl ChangeRequestRefresher {
         true
     }
 
-    async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus) -> Result<(), String> {
+    async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus, heartbeat: bool) -> Result<(), String> {
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         let current = self.get_or_create_record(subject, name).await?;
-        if current.status.as_ref().is_some_and(|current| observed_values_equal(current, &status)) {
+        if !heartbeat && current.status.as_ref().is_some_and(|current| observed_values_equal(current, &status)) {
             return Ok(());
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
@@ -522,6 +541,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn freshness_demand_heartbeats_identical_observations() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::new(AtomicUsize::new(0)))),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1699,
+        };
+        refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let first = records.get(&subject.record_name()).await.expect("first observation");
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let heartbeat = records.get(&subject.record_name()).await.expect("heartbeat observation");
+
+        assert_ne!(heartbeat.metadata.resource_version, first.metadata.resource_version);
+        assert!(heartbeat.status.expect("heartbeat status").state.observed_at > first.status.expect("first status").state.observed_at);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn late_freshness_demand_preempts_existing_state_cadence_sleep() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -554,5 +605,39 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
+    }
+
+    #[tokio::test]
+    async fn observation_failure_is_available_to_settlement_diagnostics() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let refresher = ChangeRequestRefresher::new(
+            backend,
+            "authority".to_string(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 1699,
+        };
+        let demand = uuid::Uuid::new_v4();
+        refresher.demand(demand, subject.clone(), Some(Utc::now())).await.expect("demand");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if refresher.observation_error(&subject).await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed observation should become diagnostic evidence");
+        assert_eq!(refresher.observation_error(&subject).await.as_deref(), Some("unavailable"));
+
+        refresher.release(demand).await;
+        assert_eq!(refresher.observation_error(&subject).await, None);
     }
 }

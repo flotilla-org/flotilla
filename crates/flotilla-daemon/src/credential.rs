@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::vessel_config::{agent_environment_fragment, compose, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey};
+use crate::vessel_config::{
+    agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
+};
 
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
@@ -32,12 +34,19 @@ struct GithubAppJwtClaims {
 #[derive(Serialize)]
 struct GithubAppTokenRequest {
     repositories: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct GithubAppTokenResponse {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct GithubAppInstallationResponse {
+    id: u64,
 }
 
 #[derive(Clone)]
@@ -52,11 +61,34 @@ struct GithubAppMintRequest {
     app_id_path: String,
     private_key_path: String,
     repositories: Vec<String>,
+    permissions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct GithubAppInstallationRequest {
+    repository: String,
+    app_id_path: String,
+    private_key_path: String,
+}
+
+#[derive(Debug)]
+enum GithubAppMintError {
+    InstallationNotFound(String),
+    Other(String),
+}
+
+impl std::fmt::Display for GithubAppMintError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InstallationNotFound(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
 }
 
 #[async_trait]
 trait GithubAppTokenMinter: Send + Sync {
-    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String>;
+    async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String>;
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError>;
 }
 
 struct RealGithubAppTokenMinter {
@@ -72,11 +104,84 @@ struct GithubAppMinting {
 
 #[async_trait]
 impl GithubAppTokenMinter for RealGithubAppTokenMinter {
-    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
-        let app_id = tokio::fs::read_to_string(expand_path(&*self.env, &request.app_id_path))
+    async fn resolve_installation(&self, request: &GithubAppInstallationRequest) -> Result<u64, String> {
+        let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await?;
+        let url = format!("https://api.github.com/repos/{}/installation", request.repository);
+        let http_request = flotilla_resources::tls::client()
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .build()
+            .map_err(|error| format!("build installation resolution request: {error}"))?;
+        let label = ChannelLabel::http_from_url(&url);
+        let response = self.http.execute(http_request, &label).await.map_err(|error| format!("resolve installation: {error}"))?;
+        if !response.status().is_success() {
+            let detail = String::from_utf8_lossy(response.body());
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!(
+                    "GitHub App is not installed on repository `{}` (HTTP {}): {detail}",
+                    request.repository,
+                    response.status()
+                ));
+            }
+            return Err(format!(
+                "failed to resolve GitHub App installation for repository `{}` (HTTP {}): {detail}",
+                request.repository,
+                response.status()
+            ));
+        }
+        serde_json::from_slice::<GithubAppInstallationResponse>(response.body())
+            .map(|response| response.id)
+            .map_err(|error| format!("decode installation resolution response for `{}`: {error}", request.repository))
+    }
+
+    async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
+        let jwt = self.jwt(&request.app_id_path, &request.private_key_path).await.map_err(GithubAppMintError::Other)?;
+        let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
+        let http_request = flotilla_resources::tls::client()
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&GithubAppTokenRequest { repositories: request.repositories.clone(), permissions: request.permissions.clone() })
+            .build()
+            .map_err(|error| GithubAppMintError::Other(format!("build installation token request: {error}")))?;
+        let label = ChannelLabel::http_from_url(&url);
+        let response = self
+            .http
+            .execute(http_request, &label)
+            .await
+            .map_err(|error| GithubAppMintError::Other(format!("mint installation token: {error}")))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let detail = String::from_utf8_lossy(response.body());
+            return Err(GithubAppMintError::InstallationNotFound(format!(
+                "mint installation token: GitHub returned HTTP {}: {detail}",
+                response.status()
+            )));
+        }
+        if !response.status().is_success() {
+            let detail = String::from_utf8_lossy(response.body());
+            return Err(GithubAppMintError::Other(format!(
+                "mint installation token: GitHub returned HTTP {}: {detail}",
+                response.status()
+            )));
+        }
+        let response: GithubAppTokenResponse = serde_json::from_slice(response.body())
+            .map_err(|error| GithubAppMintError::Other(format!("decode installation token response: {error}")))?;
+        if response.token.trim().is_empty() {
+            return Err(GithubAppMintError::Other("installation token response was empty".to_string()));
+        }
+        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+    }
+}
+
+impl RealGithubAppTokenMinter {
+    async fn jwt(&self, app_id_path: &str, private_key_path: &str) -> Result<String, String> {
+        let app_id = tokio::fs::read_to_string(expand_path(&*self.env, app_id_path))
             .await
             .map_err(|error| format!("read host-local App id: {error}"))?;
-        let private_key = tokio::fs::read(expand_path(&*self.env, &request.private_key_path))
+        let private_key = tokio::fs::read(expand_path(&*self.env, private_key_path))
             .await
             .map_err(|error| format!("read host-local private key: {error}"))?;
         let now = self.clock.now().timestamp();
@@ -85,28 +190,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
             return Err("host-local App id is empty".to_string());
         }
         let key = EncodingKey::from_rsa_pem(&private_key).map_err(|error| format!("decode host-local private key: {error}"))?;
-        let jwt =
-            jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))?;
-        let url = format!("https://api.github.com/app/installations/{}/access_tokens", request.installation_id);
-        let http_request = flotilla_resources::tls::client()
-            .post(&url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {jwt}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&GithubAppTokenRequest { repositories: request.repositories.clone() })
-            .build()
-            .map_err(|error| format!("build installation token request: {error}"))?;
-        let label = ChannelLabel::http_from_url(&url);
-        let response = self.http.execute(http_request, &label).await.map_err(|error| format!("mint installation token: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("mint installation token: GitHub returned HTTP {}", response.status()));
-        }
-        let response: GithubAppTokenResponse =
-            serde_json::from_slice(response.body()).map_err(|error| format!("decode installation token response: {error}"))?;
-        if response.token.trim().is_empty() {
-            return Err("installation token response was empty".to_string());
-        }
-        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).map_err(|error| format!("sign GitHub App JWT: {error}"))
     }
 }
 
@@ -141,6 +225,8 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
+    github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -152,7 +238,18 @@ struct GithubAppDelivery {
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     expires_at: DateTime<Utc>,
+    refresh_failures: usize,
+    installation_repository: Option<String>,
 }
+
+#[derive(Debug)]
+pub(crate) struct CredentialRefreshError {
+    pub(crate) environment_ref: String,
+    pub(crate) message: String,
+    pub(crate) should_surface: bool,
+}
+
+const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
 #[derive(Debug)]
 struct ResolvedMaterial {
@@ -200,6 +297,7 @@ enum GitCredentialPreflight {
     Gh,
     GithubApp { token_file: String },
     Forgejo { host: String, token_file: String, username: String },
+    GitHttpToken { host: String },
 }
 
 impl GitCredentialPreflight {
@@ -217,7 +315,7 @@ impl GitCredentialPreflight {
                             &git_config_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                         material.as_bytes(),
                     )
                     .await
@@ -235,7 +333,7 @@ impl GitCredentialPreflight {
                         &git_config_path,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -253,7 +351,23 @@ impl GitCredentialPreflight {
                         host,
                     ],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("Git credential preflight failed: {error}")),
+            Self::GitHttpToken { host } => runner
+                .run(
+                    "sh",
+                    &[
+                        "-c",
+                        "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=%s\\n\\n' \"$2\" | git credential fill >/dev/null",
+                        "flotilla-git-http-token-preflight",
+                        &git_config_path,
+                        host,
+                    ],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
                 )
                 .await
                 .map(|_| ())
@@ -274,7 +388,7 @@ impl CredentialStore {
         Self::new_with_http(backend, namespace, env, host_bag, host_runner, Arc::new(ReqwestHttpClient::new()), state_dir)
     }
 
-    fn new_with_http(
+    pub(crate) fn new_with_http(
         backend: ResourceBackend,
         namespace: &str,
         env: Arc<dyn EnvVars>,
@@ -319,6 +433,8 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_adoption_failures: Mutex::new(BTreeMap::new()),
+            github_app_installations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -432,6 +548,16 @@ impl CredentialStore {
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
+        self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, runner).await
+    }
+
+    async fn prepare_scoped_inner(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Vec<(String, String)>, String> {
         let mut specs = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
@@ -445,7 +571,27 @@ impl CredentialStore {
         // loudly instead (registry credentials multiplex per image in
         // prepare_registry_pull and are exempt).
         let mut seen_adapters = BTreeSet::new();
+        let mut seen_git_http_hosts = BTreeSet::new();
         for (name, spec) in &specs {
+            let git_http_host = match &spec.consumer {
+                CredentialConsumer::GitHttpToken { host, .. } => Some(canonical_git_http_host(host)),
+                CredentialConsumer::Forgejo { server_url, .. } => Some(forgejo_git_host(server_url)),
+                CredentialConsumer::Gh | CredentialConsumer::GithubApp { .. } => Some(Ok("github.com".to_string())),
+                _ => None,
+            };
+            if let Some(host) = git_http_host {
+                let host = host.map_err(|error| bounded_adapter_error(name, spec.consumer.adapter_name(), &error))?;
+                if !seen_git_http_hosts.insert(host) {
+                    return Err(bounded_adapter_error(
+                        name,
+                        spec.consumer.adapter_name(),
+                        "multiple granted credentials target the same Git HTTPS host",
+                    ));
+                }
+                if matches!(spec.consumer, CredentialConsumer::GitHttpToken { .. }) {
+                    continue;
+                }
+            }
             if !seen_adapters.insert(spec.consumer.delivery_slot()) {
                 return Err(bounded_adapter_error(
                     name,
@@ -463,8 +609,10 @@ impl CredentialStore {
                 CredentialConsumer::Gh
                     | CredentialConsumer::GithubApp { .. }
                     | CredentialConsumer::Forgejo { .. }
+                    | CredentialConsumer::GitHttpToken { .. }
                     | CredentialConsumer::ClaudeOauth { .. }
                     | CredentialConsumer::Codex
+                    | CredentialConsumer::ReviewBundleStore { .. }
             )
         }) {
             Some(self.delivery_paths(&*runner).await?)
@@ -521,6 +669,11 @@ impl CredentialStore {
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
                         expires_at,
+                        refresh_failures: 0,
+                        installation_repository: match &spec.consumer {
+                            CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
+                            _ => None,
+                        },
                     },
                 );
             }
@@ -545,10 +698,11 @@ impl CredentialStore {
             let mut fragments_by_environment = self.git_config_fragments.lock().await;
             let mut composed_fragments = fragments_by_environment.get(environment_ref).cloned().unwrap_or_default();
             composed_fragments.extend(new_git_config_fragments);
-            let gitconfig = match compose(TargetId::GitConfig, composed_fragments.values().cloned()) {
-                Ok(gitconfig) => gitconfig,
-                Err(error) => return Err(format!("compose shared Git config: {error}")),
-            };
+            let gitconfig =
+                match compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(composed_fragments.values().cloned())) {
+                    Ok(gitconfig) => gitconfig,
+                    Err(error) => return Err(format!("compose shared Git config: {error}")),
+                };
             let delivery_paths = delivery_paths.as_ref().expect("Git credential adapters resolve delivery paths");
             if let Err(error) = runner.write_file(&delivery_paths.git_config, &gitconfig.contents).await {
                 let (name, adapter, cache_key) = git_config_owner.expect("Git config fragments have an owner");
@@ -571,6 +725,56 @@ impl CredentialStore {
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
+    }
+
+    /// Rebuild refresh registrations for an already-running environment from
+    /// its durable credential requirements. Reconciliation calls this on every
+    /// pass, so a live registration makes the operation a no-op.
+    pub(crate) async fn adopt_github_app_deliveries(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), CredentialRefreshError> {
+        let mut github_app_refs = BTreeSet::new();
+        for name in credential_refs {
+            let spec = match self.spec(name).await {
+                Ok(spec) => spec,
+                Err(message) => return Err(self.record_adoption_failure(environment_ref, message).await),
+            };
+            if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                github_app_refs.insert(name.clone());
+            }
+        }
+        let deliveries = self.github_app_deliveries.lock().await;
+        let already_adopted = github_app_refs.iter().all(|name| deliveries.contains_key(&(environment_ref.to_string(), name.clone())));
+        drop(deliveries);
+        if github_app_refs.is_empty() || already_adopted {
+            self.github_app_adoption_failures.lock().await.remove(environment_ref);
+            return Ok(());
+        }
+        let github_app_scopes = credential_scopes
+            .iter()
+            .filter(|(name, _)| github_app_refs.contains(*name))
+            .map(|(name, scopes)| (name.clone(), scopes.clone()))
+            .collect();
+        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
+            return Err(self.record_adoption_failure(environment_ref, message).await);
+        }
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
+        Ok(())
+    }
+
+    async fn record_adoption_failure(&self, environment_ref: &str, message: String) -> CredentialRefreshError {
+        let mut failures = self.github_app_adoption_failures.lock().await;
+        let failures = failures.entry(environment_ref.to_string()).or_default();
+        *failures += 1;
+        CredentialRefreshError {
+            environment_ref: environment_ref.to_string(),
+            message,
+            should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
+        }
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -621,13 +825,13 @@ impl CredentialStore {
                     "docker",
                     &["--config", &config, "login", "--username", username, "--password-stdin", registry],
                     Path::new("/"),
-                    &ChannelLabel::Noop,
+                    &ChannelLabel::Default,
                     material.as_bytes(),
                 )
                 .await
                 .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
             self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Noop)
+                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
         }
@@ -644,11 +848,72 @@ impl CredentialStore {
         Ok(Some(config_dir))
     }
 
+    pub(crate) async fn prepare_skill_source(
+        &self,
+        credential_name: &str,
+        repository: &str,
+        runner: &dyn CommandRunner,
+    ) -> Result<PathBuf, String> {
+        let spec = self.spec(credential_name).await?;
+        let (
+            CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+            CredentialSource::GithubApp { app_id_path, private_key_path },
+        ) = (&spec.consumer, &spec.source)
+        else {
+            return Err(bounded_adapter_error(
+                credential_name,
+                spec.consumer.adapter_name(),
+                "skill-source credentials must use the github-app adapter and source",
+            ));
+        };
+        if spec.lifecycle != CredentialLifecycle::Refreshable {
+            return Err(bounded_adapter_error(
+                credential_name,
+                spec.consumer.adapter_name(),
+                "GitHub App credentials must use the refreshable lifecycle",
+            ));
+        }
+        let parsed = Url::parse(repository)
+            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &format!("invalid repository URL: {error}")))?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must be an HTTPS github.com URL"));
+        }
+        let components =
+            parsed.path().trim_matches('/').strip_suffix(".git").unwrap_or(parsed.path().trim_matches('/')).split('/').collect::<Vec<_>>();
+        if components.len() != 2 || components.iter().any(|component| component.is_empty()) {
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must identify one owner/repository"));
+        }
+        let installation_id = match (installation_id, installation_repository) {
+            (Some(id), None) => *id,
+            (None, Some(installation_repository)) => {
+                self.resolve_github_app_installation(installation_repository, app_id_path, private_key_path).await?
+            }
+            (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
+            (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
+        };
+        let mut request = GithubAppMintRequest {
+            installation_id,
+            app_id_path: app_id_path.clone(),
+            private_key_path: private_key_path.clone(),
+            repositories: vec![components[1].to_string()],
+            permissions: permissions.clone(),
+        };
+        let token = self
+            .mint_github_app(&mut request, installation_repository.as_deref())
+            .await
+            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
+        let paths = self.delivery_paths(runner).await?;
+        let token_file = paths.base.join("skill-sources").join(safe_component(credential_name)).join("token");
+        write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
+        Ok(token_file)
+    }
+
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
         self.github_app_deliveries.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
+        self.github_app_adoption_failures.lock().await.remove(environment_ref);
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
@@ -659,7 +924,7 @@ impl CredentialStore {
     /// Re-mint and atomically replace GitHub App files that are approaching
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
-    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<String> {
+    pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
         let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
         let due = self
             .github_app_deliveries
@@ -671,15 +936,22 @@ impl CredentialStore {
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for (key, delivery) in due {
-            let token = match self.github_app_minter.mint(&delivery.request).await {
+            let mut request = delivery.request.clone();
+            let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                 Ok(token) => token,
                 Err(error) => {
-                    errors.push(format!("credential `{}` adapter `github-app`: {error}", key.1));
+                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    errors.push(CredentialRefreshError {
+                        environment_ref: key.0.clone(),
+                        message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        should_surface,
+                    });
                     continue;
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                errors.push(error);
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -687,12 +959,29 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                errors.push(bounded_adapter_error(&key.1, "github-app", &error));
+                current.refresh_failures += 1;
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    message: bounded_adapter_error(&key.1, "github-app", &error),
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() >= current.expires_at,
+                });
                 continue;
             }
             current.expires_at = token.expires_at;
+            current.refresh_failures = 0;
+            current.request = request;
         }
         errors
+    }
+
+    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+            return false;
+        };
+        current.refresh_failures += 1;
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -733,7 +1022,7 @@ impl CredentialStore {
             CredentialSource::IssueCommand { command, args } => {
                 let args = args.iter().map(String::as_str).collect::<Vec<_>>();
                 self.host_runner
-                    .run(command, &args, Path::new("/"), &ChannelLabel::Noop)
+                    .run(command, &args, Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|_| "issue command failed".to_string())?
             }
@@ -752,7 +1041,10 @@ impl CredentialStore {
         repository_scope: Option<&BTreeSet<RepositoryKey>>,
     ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
-            (CredentialConsumer::GithubApp { installation_id }, CredentialSource::GithubApp { app_id_path, private_key_path }) => {
+            (
+                CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+                CredentialSource::GithubApp { app_id_path, private_key_path },
+            ) => {
                 if spec.lifecycle != CredentialLifecycle::Refreshable {
                     return Err(bounded_adapter_error(
                         name,
@@ -763,14 +1055,23 @@ impl CredentialStore {
                 let repository_scope = repository_scope
                     .filter(|scope| !scope.is_empty())
                     .ok_or_else(|| "grant resolved to an empty repository scope".to_string())?;
-                let request = GithubAppMintRequest {
-                    installation_id: *installation_id,
+                let mut repositories = self.github_repository_names(repository_scope).await?;
+                repositories.sort();
+                repositories.dedup();
+                let installation_id = match (installation_id, installation_repository) {
+                    (Some(id), None) => *id,
+                    (None, Some(repository)) => self.resolve_github_app_installation(repository, app_id_path, private_key_path).await?,
+                    (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".to_string()),
+                    (None, None) => return Err("declare either `installation_id` or `installation_repository`".to_string()),
+                };
+                let mut request = GithubAppMintRequest {
+                    installation_id,
                     app_id_path: app_id_path.clone(),
                     private_key_path: private_key_path.clone(),
-                    repositories: self.github_repository_names(repository_scope).await?,
+                    repositories,
+                    permissions: permissions.clone(),
                 };
-                self.github_app_minter
-                    .mint(&request)
+                self.mint_github_app(&mut request, installation_repository.as_deref())
                     .await
                     .map(|token| ResolvedMaterial { value: token.value, github_app: Some((request, token.expires_at)) })
             }
@@ -781,14 +1082,49 @@ impl CredentialStore {
         result.map_err(|error| bounded_adapter_error(name, spec.consumer.adapter_name(), &error))
     }
 
+    async fn resolve_github_app_installation(&self, repository: &str, app_id_path: &str, private_key_path: &str) -> Result<u64, String> {
+        let request = GithubAppInstallationRequest {
+            repository: repository.to_string(),
+            app_id_path: app_id_path.to_string(),
+            private_key_path: private_key_path.to_string(),
+        };
+        if let Some(id) = self.github_app_installations.lock().await.get(&request).copied() {
+            return Ok(id);
+        }
+        let id = self.github_app_minter.resolve_installation(&request).await?;
+        self.github_app_installations.lock().await.insert(request, id);
+        Ok(id)
+    }
+
+    async fn mint_github_app(
+        &self,
+        request: &mut GithubAppMintRequest,
+        installation_repository: Option<&str>,
+    ) -> Result<GithubAppToken, String> {
+        match self.github_app_minter.mint(request).await {
+            Ok(token) => Ok(token),
+            Err(GithubAppMintError::InstallationNotFound(_)) if installation_repository.is_some() => {
+                let repository = installation_repository.expect("guarded by is_some");
+                self.github_app_installations.lock().await.remove(&GithubAppInstallationRequest {
+                    repository: repository.to_string(),
+                    app_id_path: request.app_id_path.clone(),
+                    private_key_path: request.private_key_path.clone(),
+                });
+                request.installation_id =
+                    self.resolve_github_app_installation(repository, &request.app_id_path, &request.private_key_path).await?;
+                self.github_app_minter.mint(request).await.map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     async fn github_repository_names(&self, repository_scope: &BTreeSet<RepositoryKey>) -> Result<Vec<String>, String> {
         if repository_scope.len() > 500 {
             return Err("GitHub App repository scope exceeds the 500-repository API limit".to_string());
         }
         let repositories = self
             .backend
-            .clone()
-            .using::<Repository>(&self.namespace)
+            .including_replicas::<Repository>(&self.namespace)
             .list()
             .await
             .map_err(|error| format!("list repository identities: {error}"))?;
@@ -797,9 +1133,9 @@ impl CredentialStore {
             let repository = repositories
                 .items
                 .iter()
-                .find(|repository| repository.spec.key() == *key)
+                .find(|repository| repository.object.spec.key() == *key)
                 .ok_or_else(|| format!("repository scope references missing repository `{key}`"))?;
-            let forge = repository.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
+            let forge = repository.object.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
             let service = Url::parse(&forge.service_url).map_err(|error| format!("repository `{key}` has invalid forge URL: {error}"))?;
             if service.host_str() != Some("github.com") {
                 return Err(format!("repository `{key}` is not hosted on github.com"));
@@ -862,7 +1198,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "IFS= read -r token; GH_TOKEN=\"$token\" gh api user --silent"],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -881,7 +1217,7 @@ impl CredentialStore {
                 write_github_app_token_file(&*runner, &token_file, material).await?;
                 let token_file = token_file.to_string_lossy().into_owned();
                 let gh_path = runner
-                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "command -v gh"], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("locate gh binary: {error}"))?;
                 let gh_path = gh_path.trim();
@@ -889,7 +1225,7 @@ impl CredentialStore {
                     return Err("locate gh binary: command returned an empty path".to_string());
                 }
                 let path = runner
-                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Noop)
+                    .run("sh", &["-c", "printf '%s' \"$PATH\""], Path::new("/"), &ChannelLabel::Default)
                     .await
                     .map_err(|error| format!("read executable search path: {error}"))?;
                 let gh_wrapper = credential_dir.join("gh");
@@ -913,7 +1249,7 @@ impl CredentialStore {
                             &gh_wrapper_path,
                         ],
                         Path::new("/"),
-                        &ChannelLabel::Noop,
+                        &ChannelLabel::Default,
                     )
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
@@ -947,7 +1283,7 @@ impl CredentialStore {
                 if !already_prepared {
                     runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect token file: {error}"))?;
                     let helper = format!(
@@ -959,7 +1295,7 @@ impl CredentialStore {
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
                     runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Noop)
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
@@ -969,7 +1305,7 @@ impl CredentialStore {
                         sanitize_curl_config(&url)
                     );
                     runner
-                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, curl_config.as_bytes())
+                        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, curl_config.as_bytes())
                         .await
                         .map_err(|error| format!("authentication preflight failed: {error}"))?;
                 }
@@ -987,6 +1323,42 @@ impl CredentialStore {
                         token_file: path,
                         username: username.to_string(),
                     }),
+                });
+            }
+            CredentialConsumer::GitHttpToken { host, username } => {
+                let delivery_paths = delivery_paths.expect("git-http-token adapter resolves delivery paths");
+                let host = canonical_git_http_host(host)?;
+                let credential_url = format!("https://{host}");
+                if username.is_empty() || username.contains(['\n', '\r']) {
+                    return Err("Git HTTPS username must be non-empty and single-line".to_string());
+                }
+                let credential_dir = delivery_paths.credential_dir(name);
+                let path = credential_dir.join("token").to_string_lossy().into_owned();
+                let helper_path = credential_dir.join("git-credential-http-token").to_string_lossy().into_owned();
+                if !already_prepared {
+                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
+                    runner
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect token file: {error}"))?;
+                    let helper = format!(
+                        "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nrequest_host=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) request_host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$request_host\" = {} ] || exit 0\nprintf 'username=%s\\n' {}\nprintf 'password='\ncat {}\nprintf '\\n'\n",
+                        shell_single_quote(&host),
+                        shell_single_quote(username),
+                        shell_single_quote(&path),
+                    );
+                    runner
+                        .write_file(Path::new(&helper_path), &helper)
+                        .await
+                        .map_err(|error| format!("write Git credential helper: {error}"))?;
+                    runner
+                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
+                }
+                git_credential = Some(GitCredentialContribution {
+                    fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
+                    preflight: (!already_prepared).then_some(GitCredentialPreflight::GitHttpToken { host }),
                 });
             }
             CredentialConsumer::Claude => {
@@ -1020,7 +1392,7 @@ impl CredentialStore {
                 if !already_prepared {
                     let config_dir = self.claude_preflight_config_dir(name, &*runner).await?;
                     runner
-                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &config_dir], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable config directory: {error}"))?;
                     // Preflight: a trivial `claude -p` request under the token.
@@ -1048,7 +1420,7 @@ impl CredentialStore {
                                 &config_dir,
                             ],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1068,7 +1440,7 @@ impl CredentialStore {
                     // persistent-base fallback would otherwise accumulate
                     // whatever `claude -p` writes for the daemon's lifetime,
                     // and removal guarantees the next probe starts empty.
-                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Noop).await {
+                    if let Err(error) = runner.run("rm", &["-rf", &config_dir], Path::new("/"), &ChannelLabel::Default).await {
                         tracing::warn!(credential = %name, %error, "failed to remove Claude OAuth preflight scratch directory");
                     }
                     probe?;
@@ -1084,7 +1456,7 @@ impl CredentialStore {
                 let codex_home = delivery_paths.credential_dir(name).join("codex").to_string_lossy().into_owned();
                 if !already_prepared {
                     runner
-                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Noop)
+                        .run("mkdir", &["-p", &codex_home], Path::new("/"), &ChannelLabel::Default)
                         .await
                         .map_err(|error| format!("create writable login cache: {error}"))?;
                     runner
@@ -1092,7 +1464,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login --with-api-key", "flotilla-codex-login", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                             material.as_bytes(),
                         )
                         .await
@@ -1102,7 +1474,7 @@ impl CredentialStore {
                             "sh",
                             &["-c", "CODEX_HOME=\"$1\" codex login status", "flotilla-codex-status", &codex_home],
                             Path::new("/"),
-                            &ChannelLabel::Noop,
+                            &ChannelLabel::Default,
                         )
                         .await
                         .map_err(|error| format!("login preflight failed: {error}"))?;
@@ -1114,10 +1486,61 @@ impl CredentialStore {
                 }
                 env.insert("CODEX_HOME".to_string(), codex_home);
             }
+            CredentialConsumer::ReviewBundleStore { endpoint, bucket, region, public_base_url, allow_http, virtual_hosted_style } => {
+                let delivery_paths = delivery_paths.expect("review bundle store adapter resolves delivery paths");
+                serde_json::from_str::<flotilla_resources::ReviewBundleWriteCredential>(material)
+                    .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
+                let credential_file = delivery_paths.credential_dir(name).join("review-bundle.json");
+                if !already_prepared {
+                    runner.write_file(&credential_file, material).await.map_err(|error| format!("write credential file: {error}"))?;
+                    let path = credential_file.to_string_lossy();
+                    runner
+                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .await
+                        .map_err(|error| format!("protect credential file: {error}"))?;
+                }
+                env.insert("FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE".to_string(), credential_file.to_string_lossy().into_owned());
+                env.insert("FLOTILLA_REVIEW_STORE_ENDPOINT".to_string(), endpoint.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_BUCKET".to_string(), bucket.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_REGION".to_string(), region.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_PUBLIC_BASE_URL".to_string(), public_base_url.clone());
+                env.insert("FLOTILLA_REVIEW_STORE_ALLOW_HTTP".to_string(), allow_http.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_VIRTUAL_HOSTED_STYLE".to_string(), virtual_hosted_style.to_string());
+                env.insert("FLOTILLA_REVIEW_STORE_PREFIX".to_string(), format!("{}/", flotilla_resources::REVIEW_BUNDLE_ROOT));
+            }
             CredentialConsumer::DockerRegistry { .. } => {}
         }
         Ok(AdapterDelivery { env, git_credential })
     }
+}
+
+fn canonical_git_http_host(host: &str) -> Result<String, String> {
+    let parsed_url = Url::parse(&format!("https://{host}")).map_err(|error| format!("invalid Git HTTPS host: {error}"))?;
+    if parsed_url.username() != ""
+        || parsed_url.password().is_some()
+        || parsed_url.path() != "/"
+        || parsed_url.query().is_some()
+        || parsed_url.fragment().is_some()
+    {
+        return Err("Git HTTPS host must contain only a hostname and optional port".to_string());
+    }
+    let canonical_host = parsed_url.host_str().ok_or_else(|| "Git HTTPS host has no hostname".to_string())?;
+    Ok(match parsed_url.port() {
+        Some(port) => format!("{canonical_host}:{port}"),
+        None => canonical_host.to_string(),
+    })
+}
+
+fn forgejo_git_host(server_url: &str) -> Result<String, String> {
+    let parsed_url = Url::parse(server_url.trim_end_matches('/')).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
+    if parsed_url.scheme() != "https" {
+        return Err("Forgejo server URL must use HTTPS".to_string());
+    }
+    let host = parsed_url.host_str().ok_or_else(|| "Forgejo server URL has no host".to_string())?;
+    Ok(match parsed_url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
 }
 
 fn git_credential_fragment(credential_name: &str, adapter: &str, credential_url: impl Into<String>, helper: impl Into<String>) -> Fragment {
@@ -1142,7 +1565,7 @@ async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, to
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect token file: {error}"))
@@ -1152,7 +1575,7 @@ async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &st
     runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
     let path = path.to_string_lossy();
     runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Noop)
+        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
         .await
         .map(|_| ())
         .map_err(|error| format!("protect {context}: {error}"))
@@ -1175,7 +1598,7 @@ async fn api_key_preflight(runner: &dyn CommandRunner, url: &str, headers: &[(&s
     }
     config.push_str(&format!("url = \"{}\"\n", sanitize_curl_config(url)));
     runner
-        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Noop, config.as_bytes())
+        .run_with_input("curl", &["--config", "-"], Path::new("/"), &ChannelLabel::Default, config.as_bytes())
         .await
         .map(|_| ())
         .map_err(|error| format!("authentication preflight failed: {error}"))
@@ -1191,9 +1614,13 @@ async fn remove_registry_config(path: &Path) -> Result<(), std::io::Error> {
 
 /// The claude CLI writes millisecond epochs; treat implausibly-large
 /// second values as milliseconds so either unit decodes to the same instant.
+/// Non-positive values are sentinels for absent metadata, not dates.
 fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
     const MILLISECOND_THRESHOLD: i64 = 100_000_000_000;
-    if value.abs() >= MILLISECOND_THRESHOLD {
+    if value <= 0 {
+        return None;
+    }
+    if value >= MILLISECOND_THRESHOLD {
         DateTime::from_timestamp_millis(value)
     } else {
         DateTime::from_timestamp(value, 0)
@@ -1273,7 +1700,7 @@ mod tests {
     }
 
     struct FakeGithubAppTokenMinter {
-        tokens: StdMutex<VecDeque<GithubAppToken>>,
+        tokens: StdMutex<VecDeque<Result<GithubAppToken, String>>>,
         requests: StdMutex<Vec<GithubAppMintRequest>>,
     }
 
@@ -1286,7 +1713,11 @@ mod tests {
 
     #[async_trait]
     impl GithubAppTokenMinter for BlockingGithubAppTokenMinter {
-        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
+            Err("unexpected installation resolution".to_string())
+        }
+
+        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok(GithubAppToken { value: "initial-token".to_string(), expires_at: self.now + Duration::hours(1) }),
                 1 => {
@@ -1295,16 +1726,25 @@ mod tests {
                     Ok(GithubAppToken { value: "stale-refresh-token".to_string(), expires_at: self.now + Duration::hours(2) })
                 }
                 2 => Ok(GithubAppToken { value: "reprepared-token".to_string(), expires_at: self.now + Duration::hours(2) }),
-                call => Err(format!("unexpected mint call {call}")),
+                call => Err(GithubAppMintError::Other(format!("unexpected mint call {call}"))),
             }
         }
     }
 
     #[async_trait]
     impl GithubAppTokenMinter for FakeGithubAppTokenMinter {
-        async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, String> {
+        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
+            Err("unexpected installation resolution".to_string())
+        }
+
+        async fn mint(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
             self.requests.lock().expect("GitHub App requests lock").push(request.clone());
-            self.tokens.lock().expect("GitHub App tokens lock").pop_front().ok_or_else(|| "no fake token available".to_string())
+            self.tokens
+                .lock()
+                .expect("GitHub App tokens lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("no fake token available".to_string()))
+                .map_err(GithubAppMintError::Other)
         }
     }
 
@@ -1451,7 +1891,155 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_app_mints_a_repository_scoped_token_on_every_prepare_through_replayed_http() {
+    async fn ambient_claude_expiry_probe_treats_non_positive_timestamps_as_absent() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        tokio::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":0,"refreshTokenExpiresAt":-1}}"#)
+            .await
+            .expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        assert_eq!(store.credential_expiry().await, BTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn ambient_claude_expiry_probe_preserves_live_metadata_alongside_a_sentinel() {
+        let home = tempfile::tempdir().expect("home dir");
+        let claude_dir = home.path().join(".claude");
+        tokio::fs::create_dir_all(&claude_dir).await.expect("create claude dir");
+        let refresh_expires_at_ms: i64 = 1_756_000_000_000;
+        let credentials = format!(r#"{{"claudeAiOauth":{{"expiresAt":0,"refreshTokenExpiresAt":{refresh_expires_at_ms}}}}}"#);
+        tokio::fs::write(claude_dir.join(".credentials.json"), credentials).await.expect("write credentials file");
+        let store = store_with_env(BTreeMap::from([("HOME".to_string(), home.path().to_string_lossy().into_owned())]));
+
+        let expiry = store.credential_expiry().await;
+
+        let ambient = expiry.get(AMBIENT_CLAUDE_CREDENTIAL_SCOPE).expect("ambient claude entry");
+        assert_eq!(ambient.expires_at, None);
+        assert_eq!(ambient.refresh_expires_at, DateTime::from_timestamp_millis(refresh_expires_at_ms));
+    }
+
+    #[tokio::test]
+    async fn github_app_resolves_caches_and_invalidates_installation_ids_through_replayed_http() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("create repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: None,
+                    installation_repository: Some("flotilla-org/flotilla".to_string()),
+                    permissions: None,
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/flotilla-org/flotilla/installation"
+    status: 200
+    response_body: '{"id":9876}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 201
+    response_body: '{"token":"one","expires_at":"2026-08-03T17:00:00Z"}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 404
+    response_body: '{}'
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/flotilla-org/flotilla/installation"
+    status: 200
+    response_body: '{"id":9999}'
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9999/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 201
+    response_body: '{"token":"two","expires_at":"2026-08-03T18:00:00Z"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_http(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            Arc::new(ReplayHttpClient::new(session.clone())),
+            state.path().to_path_buf(),
+        );
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+
+        store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
+        store.prepare_scoped("env-a", &refs, &scopes, runner).await.expect("second preparation after invalidation");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_installation_resolution_error_names_the_declared_repository() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let session = Session::replaying_from_str(
+            r#"interactions:
+  - channel: http
+    method: GET
+    url: "https://api.github.com/repos/example/missing/installation"
+    status: 404
+    response_body: '{}'
+"#,
+            Masks::new(),
+        );
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let error = minter
+            .resolve_installation(&GithubAppInstallationRequest {
+                repository: "example/missing".to_string(),
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+            })
+            .await
+            .expect_err("missing installation must fail");
+        assert!(error.contains("example/missing"), "error must name the repository: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_mints_only_project_repositories_on_every_prepare() {
         let state = tempfile::tempdir().expect("create state directory");
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
@@ -1471,7 +2059,7 @@ mod tests {
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: app_id_path.to_string_lossy().into_owned(),
                     private_key_path: private_key_path.to_string_lossy().into_owned(),
@@ -1517,7 +2105,6 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-
         let first = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
         let second = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("second preparation");
 
@@ -1544,30 +2131,190 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_delivery_rotates_the_file_before_expiry_without_restarting_the_environment() {
+    async fn skill_source_credential_is_one_shot_and_narrowed_to_its_repository() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: app_id_path.to_string_lossy().into_owned(),
+                    private_key_path: private_key_path.to_string_lossy().into_owned(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create skill credential declaration");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["mattpocock-skills"],"permissions":{"contents":"read"}}'
+    status: 201
+    response_body: '{"token":"skill-token","expires_at":"2026-08-03T17:00:00Z"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_http(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            Arc::new(ReplayHttpClient::new(session.clone())),
+            state.path().to_path_buf(),
+        );
+
+        let token_file = store
+            .prepare_skill_source("github-skills-fork", "https://github.com/flotilla-org/mattpocock-skills.git", &*runner)
+            .await
+            .expect("mint narrowed skill-source credential");
+
+        assert!(token_file.ends_with("skill-sources/github-skills-fork/token"));
+        assert!(runner.writes.lock().expect("writes lock").iter().any(|(path, contents)| path == &token_file && contents == "skill-token"));
+        assert!(store.github_app_deliveries.lock().await.is_empty(), "one-shot skill tokens must not enter refresh registrations");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_sends_configured_permissions_and_surfaces_downscope_refusal_detail() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_headers:
+      accept: "application/vnd.github+json"
+      x-github-api-version: "2022-11-28"
+    request_body: '{"repositories":["flotilla"],"permissions":{"contents":"write"}}'
+    status: 422
+    response_body: '{"message":"The permissions requested are not granted to this installation."}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(VirtualClock::new(now)),
+        };
+        let result = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: Some(BTreeMap::from([("contents".to_string(), "write".to_string())])),
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("unsupported downscope must fail");
+        };
+
+        let error = error.to_string();
+        assert!(error.contains("HTTP 422 Unprocessable Entity"), "unexpected mint error: {error}");
+        assert!(error.contains("permissions requested are not granted"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_fixed_installation_id_preserves_404_response_detail() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("write App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("write App private key");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 404
+    response_body: '{"message":"installation was removed"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let result = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: None,
+            })
+            .await;
+        let Err(error) = result else {
+            panic!("removed fixed installation must fail");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("HTTP 404 Not Found"), "unexpected mint error: {error}");
+        assert!(error.contains("installation was removed"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_delivery_uses_replicated_scope_rebuilds_after_store_restart_and_rotates() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) },
-                GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) },
+                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Err("temporary adoption outage one".to_string()),
+                Err("temporary adoption outage two".to_string()),
+                Err("persistent adoption outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Err("temporary outage one".to_string()),
+                Err("temporary outage two".to_string()),
+                Err("persistent outage".to_string()),
+                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_root = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("repository-root"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("minting-root"));
         let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("GitHub repository spec");
         let repository_key = repository_spec.key();
-        backend
+        repository_root
             .clone()
             .using::<Repository>("flotilla")
             .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
             .await
             .expect("create repository");
+        let repositories = repository_root.using::<Repository>("flotilla").list().await.expect("list repository source");
+        backend
+            .replica_writer::<Repository>(NodeId::new("repository-root"), "flotilla")
+            .replace(&repositories, Utc::now())
+            .await
+            .expect("replicate repository to minting root");
+        assert!(backend.using::<Repository>("flotilla").list().await.expect("list local repositories").items.is_empty());
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -1579,7 +2326,7 @@ interactions:
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
         let store = CredentialStore::new_with_github_app_minter(
-            backend,
+            backend.clone(),
             "flotilla",
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
@@ -1603,31 +2350,75 @@ interactions:
         assert_eq!(environment.get("PATH"), Some(&"/state/credentials/github-app:/usr/bin:/bin".to_string()));
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 1);
 
-        clock.advance(Duration::minutes(54));
-        assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "fresh material must not be re-minted");
+        drop(store);
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error =
+                store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect_err("adoption outage");
+            assert_eq!(error.should_surface, expected_surface);
+        }
+        store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
-        clock.advance(Duration::minutes(1));
+        clock.advance(Duration::minutes(115));
+        let first_failure = store.refresh_due_github_app_tokens().await;
+        assert_eq!(first_failure.len(), 1);
+        assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
+        let second_failure = store.refresh_due_github_app_tokens().await;
+        assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        let third_failure = store.refresh_due_github_app_tokens().await;
+        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        assert_eq!(minter.requests.lock().expect("requests lock").len(), 2, "material is re-minted at the refresh margin");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
-        assert_eq!(token_writes.len(), 2);
+        assert_eq!(token_writes.len(), 3);
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
-        assert_eq!(token_writes[0].0, token_writes[1].0, "rotation replaces the file observed by the standing vessel");
-        let writes = runner.writes.lock().expect("writes lock");
-        let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
-        assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        let git_helper =
-            writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
-        assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
-        drop(writes);
-        let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls.iter().any(|(command, args, _)| {
-            command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
-        }));
-        assert!(calls.iter().any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        assert!(token_writes[2].1.contains("installation-token-three"));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
+        {
+            let writes = runner.writes.lock().expect("writes lock");
+            let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
+            assert!(gh_wrapper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+            let git_helper =
+                writes.iter().find(|(path, _)| path.ends_with("git-credential-github-app")).expect("GitHub App Git credential helper");
+            assert!(git_helper.1.contains("cat \"$GITHUB_TOKEN_FILE\""));
+        }
+        {
+            let calls = runner.calls.lock().expect("calls lock");
+            assert!(calls.iter().any(|(command, args, _)| {
+                command == "sh" && args.iter().any(|arg| arg.contains("GITHUB_TOKEN_FILE=\"$1\" \"$2\" api installation/repositories"))
+            }));
+            assert!(calls
+                .iter()
+                .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
+        }
+
+        let missing_store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter },
+            PathBuf::from("/state"),
+        );
+        for expected_surface in [false, false, true] {
+            let error = missing_store
+                .adopt_github_app_deliveries("missing-github-app", &refs, &scopes, runner.clone())
+                .await
+                .expect_err("missing scoped GitHub App declaration must remain visible");
+            assert_eq!(error.should_surface, expected_surface);
+        }
     }
 
     #[tokio::test]
@@ -1653,7 +2444,7 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -1711,7 +2502,7 @@ interactions:
             PathBuf::from("/tmp/flotilla-test-state"),
         );
         let spec = CredentialSpecSpec {
-            consumer: CredentialConsumer::GithubApp { installation_id: 9876 },
+            consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
             source: CredentialSource::GithubApp {
                 app_id_path: "/not-read/github-app.id".to_string(),
                 private_key_path: "/not-read/github-app.pem".to_string(),
@@ -2259,7 +3050,7 @@ interactions:
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".to_string()
+            "# fragment: credential/gh github\n[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
         )]);
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, input)| {
@@ -2273,7 +3064,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn gh_and_forgejo_helpers_compose_in_one_environment() {
+    async fn github_and_git_http_token_helpers_compose_without_cross_talk() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
@@ -2286,7 +3077,7 @@ interactions:
             })
             .await
             .expect("create GitHub credential declaration");
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_GITHUB_TOKEN".to_string(), "github-test-token".to_string()),
             ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string()),
@@ -2300,7 +3091,7 @@ interactions:
         let delivered: BTreeMap<String, String> = store
             .prepare("env-a", &BTreeSet::from(["github".to_string(), "lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect("prepare GitHub and Forgejo credentials")
+            .expect("prepare GitHub and Git HTTP credentials")
             .into_iter()
             .collect();
 
@@ -2318,10 +3109,10 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
         ));
         assert!(gitconfig.contains("# fragment: credential/gh github"));
-        assert!(gitconfig.contains("# fragment: credential/forgejo lab-forgejo"));
+        assert!(gitconfig.contains("# fragment: credential/git-http-token lab-forgejo"));
         let calls = runner.calls.lock().expect("calls lock");
         assert!(calls.iter().any(|(cmd, args, _)| {
             cmd == "sh"
@@ -2350,7 +3141,7 @@ interactions:
             })
             .await
             .expect("create GitHub credential declaration");
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([
             ("TEST_GITHUB_TOKEN".to_string(), "github-test-token".to_string()),
             ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string()),
@@ -2362,7 +3153,7 @@ interactions:
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
 
         store.prepare("env-a", &BTreeSet::from(["github".to_string()]), runner.clone()).await.expect("prepare GitHub credential");
-        store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+        store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Git HTTP credential");
 
         let writes = runner.writes.lock().expect("writes lock");
         let gitconfig = writes
@@ -2373,21 +3164,18 @@ interactions:
             .expect("staged shared Git config");
         assert!(gitconfig.contains("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential"));
         assert!(gitconfig.contains(
-            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"
+            "[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"
         ));
     }
 
     #[tokio::test]
-    async fn forgejo_material_is_delivered_as_a_protected_file_and_preflighted() {
+    async fn git_http_token_is_delivered_as_a_protected_file_and_persisted_helper() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo {
-                    server_url: "https://forgejo.lab".to_string(),
-                    username: "flotilla-crew".to_string(),
-                },
+                consumer: CredentialConsumer::GitHttpToken { host: "forgejo.lab".to_string(), username: "crew-reader".to_string() },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -2400,29 +3188,28 @@ interactions:
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
         let store = CredentialStore::new(backend, "flotilla", env, bag, runner.clone(), PathBuf::from("/tmp/flotilla-test-state"));
 
-        let delivered =
-            store.prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone()).await.expect("prepare Forgejo credential");
+        let delivered = store
+            .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
+            .await
+            .expect("prepare Git HTTP credential");
 
         assert_eq!(delivered, vec![
-            ("FORGEJO_API_URL".to_string(), "https://forgejo.lab/api/v1".to_string()),
-            ("FORGEJO_SERVER_URL".to_string(), "https://forgejo.lab".to_string()),
-            ("FORGEJO_TOKEN_FILE".to_string(), "/tmp/flotilla-test-state/credentials/lab-forgejo/token".to_string()),
-            ("FORGEJO_USERNAME".to_string(), "flotilla-crew".to_string()),
             ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
             ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
         ]);
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes[0], (PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), secret.to_string()));
-        assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"));
+        assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"));
         assert!(writes[1].1.contains("[ \"$protocol\" = https ]"));
-        assert!(writes[1].1.contains("[ \"$host\" = forgejo.lab ]"));
-        assert!(writes[1].1.contains("$FORGEJO_USERNAME"));
+        assert!(writes[1].1.contains("[ \"$request_host\" = 'forgejo.lab' ]"));
+        assert!(writes[1].1.contains("printf 'username=%s\\n' 'crew-reader'"));
+        assert!(writes[1].1.contains("cat '/tmp/flotilla-test-state/credentials/lab-forgejo/token'"));
         assert!(!writes[1].1.contains(secret));
         assert_eq!(
             writes[2],
             (
                 PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
-                "# fragment: credential/forgejo lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo\n".to_string()
+                "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
         let calls = runner.calls.lock().expect("calls lock");
@@ -2430,24 +3217,81 @@ interactions:
             .iter()
             .any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/tmp/flotilla-test-state/credentials/lab-forgejo/token"]));
         assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-forgejo"]
+            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"]
         }));
         assert!(calls.iter().any(|(cmd, args, input)| {
-            cmd == "curl"
-                && args == &["--config", "-"]
-                && String::from_utf8_lossy(input).contains("https://forgejo.lab/api/v1/user")
-                && String::from_utf8_lossy(input).contains(secret)
+            cmd == "sh"
+                && args.iter().any(|arg| arg.contains("GIT_CONFIG_NOSYSTEM=1"))
+                && args.iter().any(|arg| arg == "forgejo.lab")
+                && input.is_empty()
         }));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.starts_with("/run/flotilla")));
         assert!(calls.iter().flat_map(|(_, args, _)| args).all(|arg| !arg.contains(secret)));
     }
 
-    async fn create_forgejo_spec(backend: &ResourceBackend, name: &str, server_url: &str, source_env: &str) {
+    #[tokio::test]
+    async fn review_store_credential_is_staged_as_a_scoped_file() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("review-store".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::ReviewBundleStore {
+                    endpoint: "http://rustfs.lab:9000".to_string(),
+                    bucket: "flotilla".to_string(),
+                    region: "us-east-1".to_string(),
+                    public_base_url: "https://reviews.example/flotilla".to_string(),
+                    allow_http: true,
+                    virtual_hosted_style: false,
+                },
+                source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create review store credential declaration");
+        let material = r#"{"access_key_id":"crew","secret_access_key":"secret"}"#;
+        let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REVIEW_STORE_CREDENTIAL".to_string(), material.to_string())])));
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            env,
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let delivered: BTreeMap<_, _> = store
+            .prepare("env-a", &BTreeSet::from(["review-store".to_string()]), runner.clone())
+            .await
+            .expect("prepare review store credential")
+            .into_iter()
+            .collect();
+
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_PREFIX"], "reviews/");
+        assert_eq!(delivered["FLOTILLA_REVIEW_STORE_ENDPOINT"], "http://rustfs.lab:9000");
+        let credential_file = &delivered["FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE"];
+        assert!(runner
+            .writes
+            .lock()
+            .expect("writes lock")
+            .iter()
+            .any(|(path, contents)| path == Path::new(credential_file) && contents == material));
+        assert!(runner
+            .calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
+    }
+
+    async fn create_git_http_token_spec(backend: &ResourceBackend, name: &str, host: &str, source_env: &str) {
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { server_url: server_url.to_string(), username: "flotilla-crew".to_string() },
+                consumer: CredentialConsumer::GitHttpToken { host: host.to_string(), username: "crew-reader".to_string() },
                 source: CredentialSource::Env { name: source_env.to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -2457,9 +3301,9 @@ interactions:
     }
 
     #[tokio::test]
-    async fn forgejo_server_url_must_be_https() {
+    async fn git_http_token_host_rejects_a_url() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "http://forgejo.lab", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -2468,16 +3312,22 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect_err("plain-HTTP Forgejo server URL must be rejected");
+            .expect_err("a host containing a URL must be rejected");
 
-        assert!(error.contains("must use HTTPS"), "unexpected error: {error}");
+        assert!(error.contains("must contain only a hostname"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
     }
 
+    #[test]
+    fn git_http_token_host_is_canonicalized_before_delivery() {
+        assert_eq!(canonical_git_http_host("FORGEJO.LAB/"), Ok("forgejo.lab".to_string()));
+        assert_eq!(canonical_git_http_host("forgejo.lab:3000/"), Ok("forgejo.lab:3000".to_string()));
+    }
+
     #[tokio::test]
-    async fn forgejo_server_url_must_parse() {
+    async fn git_http_token_host_must_parse() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "not a url", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "not a host", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -2486,16 +3336,16 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect_err("an unparsable Forgejo server URL must be rejected");
+            .expect_err("an unparsable Git HTTPS host must be rejected");
 
-        assert!(error.contains("invalid Forgejo server URL"), "unexpected error: {error}");
+        assert!(error.contains("invalid Git HTTPS host"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written for a rejected URL");
     }
 
     #[tokio::test]
-    async fn forgejo_helper_and_git_config_agree_on_an_explicit_port() {
+    async fn git_http_token_helper_and_config_agree_on_an_explicit_port() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-forgejo", "https://forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
+        create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab:3000", "TEST_FORGEJO_TOKEN").await;
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "forgejo-test-token".to_string())])));
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
@@ -2504,32 +3354,64 @@ interactions:
         let delivered: BTreeMap<String, String> = store
             .prepare("env-a", &BTreeSet::from(["lab-forgejo".to_string()]), runner.clone())
             .await
-            .expect("prepare Forgejo credential with an explicit port")
+            .expect("prepare Git HTTP credential with an explicit port")
             .into_iter()
             .collect();
 
-        assert_eq!(delivered.get("FORGEJO_SERVER_URL"), Some(&"https://forgejo.lab:3000".to_string()));
         assert_eq!(delivered.get("GIT_CONFIG_GLOBAL"), Some(&"/tmp/flotilla-test-state/credentials/gitconfig".to_string()));
         let writes = runner.writes.lock().expect("writes lock");
         assert!(
-            writes[1].1.contains("[ \"$host\" = forgejo.lab:3000 ]"),
+            writes[1].1.contains("[ \"$request_host\" = 'forgejo.lab:3000' ]"),
             "helper must compare against the host:port form git passes when a port is present"
         );
         assert!(writes[2].1.contains("[credential \"https://forgejo.lab:3000\"]"));
     }
 
     #[tokio::test]
-    async fn a_second_credential_on_the_same_adapter_fails_loudly() {
+    async fn git_http_token_credentials_for_multiple_hosts_coexist() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
-        create_forgejo_spec(&backend, "lab-a", "https://forgejo.lab", "TEST_TOKEN_A").await;
-        create_forgejo_spec(&backend, "lab-b", "https://other.lab", "TEST_TOKEN_B").await;
+        create_git_http_token_spec(&backend, "lab-a", "forgejo.lab", "TEST_TOKEN_A").await;
+        create_git_http_token_spec(&backend, "lab-b", "other.lab", "TEST_TOKEN_B").await;
         let runner = Arc::new(RecordingRunner::default());
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("curl", "/usr/bin/curl"));
         let store = CredentialStore::new(
             backend,
             "flotilla",
-            Arc::new(TestEnv::default()),
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_TOKEN_A".to_string(), "token-a".to_string()),
+                ("TEST_TOKEN_B".to_string(), "token-b".to_string()),
+            ]))),
             bag,
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let delivered = store
+            .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
+            .await
+            .expect("host-specific helpers coexist");
+
+        assert!(delivered.iter().any(|(key, _)| key == "GIT_CONFIG_GLOBAL"));
+        let writes = runner.writes.lock().expect("writes lock");
+        let gitconfig = &writes.last().expect("composed Git config").1;
+        assert!(gitconfig.contains("[credential \"https://forgejo.lab\"]"));
+        assert!(gitconfig.contains("[credential \"https://other.lab\"]"));
+    }
+
+    #[tokio::test]
+    async fn git_http_token_credentials_for_the_same_canonical_host_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "lab-a", "FORGEJO.LAB", "TEST_TOKEN_A").await;
+        create_git_http_token_spec(&backend, "lab-b", "forgejo.lab/", "TEST_TOKEN_B").await;
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_TOKEN_A".to_string(), "token-a".to_string()),
+                ("TEST_TOKEN_B".to_string(), "token-b".to_string()),
+            ]))),
+            EnvironmentBag::new(),
             runner.clone(),
             PathBuf::from("/tmp/flotilla-test-state"),
         );
@@ -2537,10 +3419,87 @@ interactions:
         let error = store
             .prepare("env-a", &BTreeSet::from(["lab-a".to_string(), "lab-b".to_string()]), runner.clone())
             .await
-            .expect_err("two credentials on one adapter would silently clobber each other's delivery");
+            .expect_err("duplicate canonical hosts must be rejected");
 
-        assert!(error.contains("multiple granted credentials use this adapter"), "unexpected error: {error}");
-        assert!(runner.writes.lock().expect("writes lock").is_empty(), "no material may be written when preparation is rejected");
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgejo_and_git_http_token_credentials_for_the_same_host_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "git-only", "forgejo.lab", "TEST_GIT_TOKEN").await;
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo {
+                    server_url: "https://FORGEJO.LAB/".to_string(),
+                    username: "crew-reader".to_string(),
+                },
+                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create Forgejo credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_GIT_TOKEN".to_string(), "git-token".to_string()),
+                ("TEST_FORGEJO_TOKEN".to_string(), "forgejo-token".to_string()),
+            ]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["forgejo-api".to_string(), "git-only".to_string()]), runner.clone())
+            .await
+            .expect_err("cross-adapter duplicate hosts must be rejected");
+
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_and_git_http_token_credentials_for_github_fail_before_delivery() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        create_git_http_token_spec(&backend, "git-only", "GITHUB.COM/", "TEST_GIT_TOKEN").await;
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Gh,
+                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create GitHub credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([
+                ("TEST_GIT_TOKEN".to_string(), "git-token".to_string()),
+                ("TEST_GITHUB_TOKEN".to_string(), "github-token".to_string()),
+            ]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+
+        let error = store
+            .prepare("env-a", &BTreeSet::from(["git-only".to_string(), "github".to_string()]), runner.clone())
+            .await
+            .expect_err("GitHub cross-adapter duplicate hosts must be rejected");
+
+        assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
+        assert!(runner.writes.lock().expect("writes lock").is_empty());
     }
 
     #[tokio::test]

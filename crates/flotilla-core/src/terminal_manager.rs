@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use flotilla_protocol::{
-    arg, commands::AttachMode, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, TerminalStatus,
+    arg, commands::AttachMode, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, PaneExitAttention,
+    TerminalStatus,
 };
 use tracing::warn;
 
@@ -44,6 +45,7 @@ pub struct TerminalInfo {
     pub command: String,
     pub working_directory: ExecutionEnvironmentPath,
     pub status: TerminalStatus,
+    pub attention: Option<PaneExitAttention>,
 }
 
 /// Manages terminal session lifecycle using a `TerminalPool` for CLI operations
@@ -342,6 +344,7 @@ impl TerminalManager {
                             command: t.command.clone(),
                             working_directory: t.working_directory.clone(),
                             status: new_status,
+                            attention: t.exit_attention(),
                         });
                     }
                 }

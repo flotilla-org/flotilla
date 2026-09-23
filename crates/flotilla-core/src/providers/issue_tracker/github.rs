@@ -74,9 +74,14 @@ impl super::IssueProvider for GitHubIssueProvider {
         let (items, has_more, total) = match &params.search {
             None => {
                 let label = params.label.as_ref().map(|label| format!("&labels={}", urlencoding::encode(label))).unwrap_or_default();
+                let fields = params
+                    .match_fields
+                    .iter()
+                    .map(|(field, values)| format!("&{}={}", urlencoding::encode(field), urlencoding::encode(&values.join(","))))
+                    .collect::<String>();
                 let endpoint = format!(
-                    "repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}{}",
-                    source.scope, per_page, page, label
+                    "repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}{}{}",
+                    source.scope, per_page, page, label, fields
                 );
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
@@ -89,7 +94,12 @@ impl super::IssueProvider for GitHubIssueProvider {
             }
             Some(search_term) => {
                 let label = params.label.as_ref().map(|label| format!(" label:\"{label}\"")).unwrap_or_default();
-                let raw_query = format!("repo:{} is:issue is:open{} {}", source.scope, label, search_term);
+                let fields = params
+                    .match_fields
+                    .iter()
+                    .flat_map(|(field, values)| values.iter().map(move |value| format!(" {field}:\"{value}\"")))
+                    .collect::<String>();
+                let raw_query = format!("repo:{} is:issue is:open{}{} {}", source.scope, label, fields, search_term);
                 let encoded_query = urlencoding::encode(&raw_query);
                 let endpoint = format!("search/issues?q={}&sort=updated&order=desc&per_page={}&page={}", encoded_query, per_page, page);
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
@@ -261,7 +271,7 @@ mod tests {
         let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/neutral"));
 
         provider
-            .query(&source(), &IssueQuery { search: None, label: Some("ready now".into()) }, 2, 10)
+            .query(&source(), &IssueQuery { search: None, label: Some("ready now".into()), match_fields: Default::default() }, 2, 10)
             .await
             .expect("label-filtered issue query should succeed");
 
@@ -277,7 +287,7 @@ mod tests {
         let provider = mock_provider(vec![ok_response(body, true)]);
 
         let page = provider
-            .query(&source(), &IssueQuery { search: Some("bug".into()), label: None }, 2, 10)
+            .query(&source(), &IssueQuery { search: Some("bug".into()), label: None, match_fields: Default::default() }, 2, 10)
             .await
             .expect("issue search should succeed");
 

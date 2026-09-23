@@ -574,6 +574,7 @@ mod tests {
             ConvoySummary::builder()
                 .id(ConvoyId::new("dev", name))
                 .namespace("dev".to_string())
+                .resource_name(name.to_string())
                 .name(name.to_string())
                 .workflow_ref("implement-review".to_string())
                 .phase(phase)

@@ -28,10 +28,10 @@ use flotilla_manifest::entity;
 use flotilla_protocol::arg::Arg;
 use flotilla_resources::{
     controller::Reconciler, Convoy, ConvoyRepositorySpec, ConvoySpec, Environment, EnvironmentSpec, EnvironmentStatus,
-    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec,
-    PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch, TerminalSession,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL,
+    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, LifecycleAuthority, Presentation,
+    PresentationSpec, PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch,
+    TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, AUTHORITY_LABEL, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -42,11 +42,16 @@ struct FakePresentationRuntime {
     apply_calls: Mutex<Vec<PresentationPlan>>,
     tear_down_calls: Mutex<Vec<(String, String)>>,
     apply_results: Mutex<VecDeque<Result<AppliedPresentation, ApplyPresentationError>>>,
+    tear_down_results: Mutex<VecDeque<Result<(), String>>>,
 }
 
 impl FakePresentationRuntime {
     fn with_results(results: Vec<Result<AppliedPresentation, ApplyPresentationError>>) -> Self {
         Self { apply_results: Mutex::new(results.into()), ..Default::default() }
+    }
+
+    fn with_tear_down_results(results: Vec<Result<(), String>>) -> Self {
+        Self { tear_down_results: Mutex::new(results.into()), ..Default::default() }
     }
 }
 
@@ -66,7 +71,7 @@ impl PresentationRuntime for FakePresentationRuntime {
 
     async fn tear_down(&self, manager: &str, workspace_ref: &str) -> Result<(), String> {
         self.tear_down_calls.lock().expect("tear down calls lock").push((manager.to_string(), workspace_ref.to_string()));
-        Ok(())
+        self.tear_down_results.lock().expect("tear down results lock").pop_front().unwrap_or(Ok(()))
     }
 }
 
@@ -157,13 +162,167 @@ async fn no_sessions_and_no_observed_workspace_is_in_sync() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::InSync));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
     assert!(outcome.patch.is_none());
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn managed_presentation_without_its_convoy_is_failed_without_calling_the_runtime() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let presentation = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
+
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch.as_ref(),
+        Some(PresentationStatusPatch::MarkFailed { message }) if message == "convoy 'missing-convoy' no longer exists"
+    ));
+    let failed = update_presentation_status(&backend, &presentation, outcome.patch.expect("orphan should fail")).await;
+    let resynced = reconciler.prepare(&failed).await.expect("failed orphan should remain terminal");
+    assert!(matches!(resynced, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
+    assert!(reconciler.reconcile(&failed, &resynced, Utc::now()).patch.is_none());
+    assert!(matches!(
+        failed.status,
+        Some(PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Failed,
+            ref message,
+            ..
+        }) if message.as_deref() == Some("convoy 'missing-convoy' no longer exists")
+    ));
+    assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
+    assert!(runtime.tear_down_calls.lock().expect("tear down calls lock").is_empty());
+}
+
+#[tokio::test]
+async fn active_managed_presentation_without_its_convoy_is_torn_down_once() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let created = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let presentation = presentations
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Active,
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_presentation_manager: Some("fake-manager".to_string()),
+            observed_spec_hash: Some("hash-a".to_string()),
+            message: None,
+            ready_at: Some(Utc::now()),
+        })
+        .await
+        .expect("presentation status update should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    let prepared = reconciler.prepare(&presentation).await.expect("presentation should prepare");
+    let outcome = reconciler.reconcile(&presentation, &prepared, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(PresentationStatusPatch::MarkTornDown { ref message })
+            if message.as_deref() == Some("convoy 'missing-convoy' no longer exists")
+    ));
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
+        "fake-manager".to_string(),
+        "workspace-a".to_string()
+    )]);
+}
+
+#[tokio::test]
+async fn active_managed_orphan_does_not_retry_failed_teardown_on_resync() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentations = backend.clone().using::<Presentation>(NAMESPACE);
+    let created = presentations
+        .create(
+            &common::controller_meta()
+                .name("presentation-a")
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), "missing-convoy".to_string()),
+                ]))
+                .call(),
+            &PresentationSpec {
+                convoy_ref: "missing-convoy".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "missing-convoy".to_string(),
+                process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), "missing-convoy".to_string())]),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    let presentation = presentations
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &PresentationStatus {
+            phase: flotilla_resources::PresentationPhase::Active,
+            observed_workspace_ref: Some("workspace-a".to_string()),
+            observed_presentation_manager: Some("zellij".to_string()),
+            observed_spec_hash: Some("hash-a".to_string()),
+            message: None,
+            ready_at: Some(Utc::now()),
+        })
+        .await
+        .expect("presentation status update should succeed");
+    let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
+        "presentation manager 'zellij' no longer available".to_string()
+    )]));
+    let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
+
+    let prepared = reconciler.prepare(&presentation).await.expect("presentation should prepare");
+    let outcome = reconciler.reconcile(&presentation, &prepared, Utc::now());
+    let patch = outcome.patch.expect("orphan should receive a terminal patch");
+    assert!(matches!(
+        patch,
+        PresentationStatusPatch::MarkTornDown { ref message }
+            if message.as_deref() == Some(
+                "convoy 'missing-convoy' no longer exists; presentation teardown failed: presentation manager 'zellij' no longer available"
+            )
+    ));
+    let torn_down = update_presentation_status(&backend, &presentation, patch).await;
+
+    let resynced = reconciler.prepare(&torn_down).await.expect("resync should remain terminal");
+
+    assert!(matches!(resynced, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").len(), 1);
 }
 
 #[tokio::test]
@@ -186,7 +345,7 @@ async fn first_apply_marks_presentation_active() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     let plan = runtime.apply_calls.lock().expect("apply calls lock").clone();
@@ -249,7 +408,7 @@ async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect()
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend);
 
-    reconciler.fetch_dependencies(&presentation).await.expect("dependencies");
+    reconciler.prepare(&presentation).await.expect("dependencies");
 
     let plans = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(plans[0].stamp.as_ref().map(|stamp| &stamp.entity), Some(&entity::vessel("flotilla", "convoy-a", "implement", "local")));
@@ -287,7 +446,7 @@ async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("stopped crew should not prevent presentation");
+    reconciler.prepare(&presentation).await.expect("stopped crew should not prevent presentation");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(apply_calls.len(), 1);
@@ -314,17 +473,17 @@ async fn unchanged_world_is_a_no_op() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
     let created = create_presentation(&backend, "presentation-a", "default").await;
-    let first_deps = reconciler.fetch_dependencies(&created).await.expect("deps should load");
+    let first_deps = reconciler.prepare(&created).await.expect("deps should load");
     let first_outcome = reconciler.reconcile(&created, &first_deps, Utc::now());
     let first_patch = first_outcome.patch.expect("first reconcile should produce a patch");
     let updated = update_presentation_status(&backend, &created, first_patch).await;
 
     runtime.apply_calls.lock().expect("apply calls lock").clear();
 
-    let deps = reconciler.fetch_dependencies(&updated).await.expect("deps should load");
+    let deps = reconciler.prepare(&updated).await.expect("deps should load");
     let outcome = reconciler.reconcile(&updated, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::InSync));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::InSync));
     assert!(outcome.patch.is_none());
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
 }
@@ -360,7 +519,7 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    reconciler.prepare(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(apply_calls[0].crew.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(), vec![
@@ -383,10 +542,10 @@ async fn empty_sessions_trigger_teardown() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
-    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationDeps::TornDown { message: None }));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::PresentationPrepared::TornDown { message: None }));
     assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
         "fake-manager".to_string(),
         "workspace-a".to_string()
@@ -427,12 +586,12 @@ async fn retry_from_clean_slate_clears_previous_workspace_before_retry() {
     })
     .await;
 
-    let first_deps = reconciler.fetch_dependencies(&created).await.expect("deps should load");
+    let first_deps = reconciler.prepare(&created).await.expect("deps should load");
     let first_outcome = reconciler.reconcile(&created, &first_deps, Utc::now());
     let first_patch = first_outcome.patch.expect("first reconcile should patch");
     let updated = update_presentation_status(&backend, &created, first_patch).await;
 
-    let second_deps = reconciler.fetch_dependencies(&updated).await.expect("deps should load");
+    let second_deps = reconciler.prepare(&updated).await.expect("deps should load");
     let second_outcome = reconciler.reconcile(&updated, &second_deps, Utc::now());
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
@@ -471,12 +630,12 @@ async fn unknown_policy_fails_without_runtime_invocation() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    let deps = reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    let deps = reconciler.prepare(&presentation).await.expect("deps should load");
     let outcome = reconciler.reconcile(&presentation, &deps, Utc::now());
 
     assert!(matches!(
         deps,
-        flotilla_controllers::reconcilers::PresentationDeps::UnknownPolicy(ref name) if name == "missing-policy"
+        flotilla_controllers::reconcilers::PresentationPrepared::UnknownPolicy(ref name) if name == "missing-policy"
     ));
     assert!(runtime.apply_calls.lock().expect("apply calls lock").is_empty());
     assert!(matches!(
@@ -508,6 +667,31 @@ async fn finalizer_tears_down_recorded_workspace() {
 }
 
 #[tokio::test]
+async fn finalizer_allows_deletion_when_the_recorded_manager_is_unavailable() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let presentation = create_presentation_with_status(&backend, "presentation-a", "default", PresentationStatus {
+        phase: flotilla_resources::PresentationPhase::Active,
+        observed_workspace_ref: Some("workspace-a".to_string()),
+        observed_presentation_manager: Some("zellij".to_string()),
+        observed_spec_hash: Some("hash-a".to_string()),
+        message: None,
+        ready_at: Some(Utc::now()),
+    })
+    .await;
+    let runtime = Arc::new(FakePresentationRuntime::with_tear_down_results(vec![Err(
+        "presentation manager 'zellij' no longer available".to_string()
+    )]));
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    reconciler.run_finalizer(&presentation).await.expect("manager loss must not block presentation deletion");
+
+    assert_eq!(runtime.tear_down_calls.lock().expect("tear down calls lock").as_slice(), &[(
+        "zellij".to_string(),
+        "workspace-a".to_string()
+    )]);
+}
+
+#[tokio::test]
 async fn working_directory_fallback_is_separate_from_session_cwd() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
@@ -527,7 +711,7 @@ async fn working_directory_fallback_is_separate_from_session_cwd() {
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
 
-    reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
+    reconciler.prepare(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     let plan = &apply_calls[0];
@@ -657,7 +841,12 @@ fn reconciler(runtime: Arc<FakePresentationRuntime>, backend: ResourceBackend) -
         runtime,
         backend,
         NAMESPACE,
-        HopChainContext::new(HOST_REF, HostName::new("local"), temp_config_base(), move |_env_ref| Ok(Arc::clone(&registry))),
+        HopChainContext::new(
+            flotilla_protocol::CanonicalHostId::resolved(HOST_REF),
+            HostName::new("local"),
+            temp_config_base(),
+            move |_env_ref| Ok(Arc::clone(&registry)),
+        ),
         Arc::new(PresentationPolicyRegistry::with_defaults()),
     )
 }
