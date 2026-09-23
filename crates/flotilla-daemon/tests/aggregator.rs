@@ -314,6 +314,7 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
         .controller_resync_interval(Duration::from_secs(300))
         .controller_supervision(Default::default())
         .start_controllers(false)
+        .codex_central_refresh_interval(Duration::from_secs(300))
         .build();
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
     let query = QueryId::Checkouts { scope: None };

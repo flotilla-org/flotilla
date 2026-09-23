@@ -28,7 +28,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
-        discovery::{run_provisioned_host_detectors, EnvironmentBag},
+        discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSize},
@@ -57,6 +57,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     agent_material::{AgentMaterialPrepareError, AgentMaterialRegistry},
+    codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
@@ -288,6 +289,7 @@ pub struct RuntimeOptions {
     pub controller_resync_interval: Duration,
     pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
+    pub codex_central_refresh_interval: Duration,
 }
 
 impl Default for RuntimeOptions {
@@ -298,6 +300,11 @@ impl Default for RuntimeOptions {
             controller_resync_interval: Duration::from_secs(60),
             controller_supervision: ControllerSupervision::default(),
             start_controllers: true,
+            // Codex only proactively refreshes within 5 minutes of expiry; a
+            // central login's access token lives far longer than that, so a
+            // conservative fixed cadence comfortably inside that window
+            // (rather than tracking each token's own `exp`) is sufficient.
+            codex_central_refresh_interval: Duration::from_secs(4 * 60 * 60),
         }
     }
 }
@@ -559,6 +566,7 @@ impl DaemonRuntime {
             ),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
@@ -1497,6 +1505,34 @@ fn spawn_heartbeat_task_with_credentials(
                     .await
             {
                 warn!(%err, "failed to publish host heartbeat");
+            }
+        }
+    })
+}
+
+/// Keeps this host's central Codex `auth.json` fresh forever by direct
+/// OAuth `grant_type=refresh_token` — the primitive `scripts/codex-token-refresh`
+/// also implements — against the well-known path from
+/// [`codex_central_auth_path`]. That path is deliberately outside
+/// `codex-pool/` (see `crates/flotilla-daemon/src/agent_material.rs`), so
+/// this task is always the sole writer of the file; a crew lease can never
+/// be handed the same `auth.json` a refresh is rotating.
+fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: Duration) -> JoinHandle<()> {
+    let refresher = Arc::new(CodexCentralRefresher::new(codex_central_auth_path(&*env)));
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let refresher = Arc::clone(&refresher);
+        async move {
+            match refresher.refresh_once().await {
+                Ok(success) => {
+                    info!(
+                        rotated = ?success.rotated_fields,
+                        access_token_expires_at = ?success.access_token_expires_at,
+                        "refreshed central Codex credential"
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "failed to refresh central Codex credential; retrying next tick");
+                }
             }
         }
     })
@@ -9594,6 +9630,34 @@ mod tests {
 
         observed.get("adopted-checkout-periodic").await.expect("periodic reconciliation should restore the observed checkout");
         reconciliation.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_central_refresh_task_survives_repeated_local_failures_without_panicking() {
+        struct FixedHomeEnv(PathBuf);
+        impl EnvVars for FixedHomeEnv {
+            fn get(&self, key: &str) -> Option<String> {
+                (key == "HOME").then(|| self.0.to_string_lossy().into_owned())
+            }
+        }
+
+        let home = TempDir::new().expect("tempdir");
+        // Deliberately leave the central auth.json unprovisioned, mirroring a
+        // host before an operator has dedicated a pool slot as the central
+        // source. This must never reach the network: the task should fail
+        // locally and keep ticking, not panic the daemon.
+        let env: Arc<dyn EnvVars> = Arc::new(FixedHomeEnv(home.path().to_path_buf()));
+        let interval = Duration::from_secs(60);
+        let task = spawn_codex_central_refresh_task(env, interval);
+
+        for _ in 0..3 {
+            tokio::time::advance(interval).await;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "a missing central auth.json must log a warning and retry, never panic the daemon");
+        }
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
