@@ -1,7 +1,7 @@
 //! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -34,6 +34,8 @@ use tracing::debug;
 
 use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer};
 
+type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
+
 type PresentationKey = (String, String, String);
 type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
@@ -47,7 +49,7 @@ pub struct AggregatorResolvers {
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
-    durable_repositories: TypedResolver<Repository>,
+    durable_repositories: ReplicaReadResolver<Repository>,
     durable_regards: TypedResolver<Regard>,
     observed_convoys: TypedResolver<Convoy>,
     observed_presentations: TypedResolver<Presentation>,
@@ -63,7 +65,7 @@ struct AggregatorSourceRefs<'a> {
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
-    durable_repositories: &'a dyn AggregatorWatchSource<Repository>,
+    durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
     observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
@@ -178,6 +180,7 @@ pub struct Aggregator {
     origin_hosts: HashMap<flotilla_protocol::NodeId, HostName>,
     projects: HashMap<(String, String), ResourceObject<Project>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
+    repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
     #[builder(skip)]
     regards: HashMap<ResourceRef, ResourceObject<Regard>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
@@ -242,6 +245,7 @@ impl Aggregator {
             origin_hosts: HashMap::new(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
+            repository_sources: BTreeMap::new(),
             regards: HashMap::new(),
             observed_checkouts: HashMap::new(),
             bootstrapping: false,
@@ -508,7 +512,7 @@ impl Aggregator {
                     None => return Err(ResourceError::other("aggregator durable project watch ended")),
                 },
                 event = durable_repository_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_repository_event(event).await,
+                    Some(Ok(event)) => self.apply_repository_read_event(event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
                         durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
                     }
@@ -685,14 +689,17 @@ impl Aggregator {
 
     async fn recover_repository_watch(
         &mut self,
-        resolver: &dyn AggregatorWatchSource<Repository>,
-    ) -> Result<WatchStream<Repository>, ResourceError> {
-        loop {
-            match self.list_and_watch_repositories(resolver).await {
-                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
-                result => return result,
-            }
-        }
+        resolver: &dyn AggregatorReplicaWatchSource<Repository>,
+    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<Repository>, ResourceError>>, ResourceError> {
+        let (items, watch) = Self::recover_replica_watch(resolver).await?;
+        self.repository_sources = items
+            .into_iter()
+            .map(|source| {
+                (repository_source_key(&source.object.metadata.namespace, &source.object.metadata.name, &source.provenance), source)
+            })
+            .collect();
+        self.rebuild_repository_catalog().await;
+        Ok(watch)
     }
 
     async fn recover_checkout_watch(
@@ -802,17 +809,6 @@ impl Aggregator {
         let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_session_source(source, listed.items).await;
-        Ok(watch)
-    }
-
-    async fn list_and_watch_repositories(
-        &mut self,
-        resolver: &dyn AggregatorWatchSource<Repository>,
-    ) -> Result<WatchStream<Repository>, ResourceError> {
-        let listed = resolver.list().await?;
-        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
-        self.repositories = listed.items.into_iter().map(|repository| (repository.spec.key(), repository)).collect();
-        self.rebuild_store_catalog().await;
         Ok(watch)
     }
 
@@ -1380,17 +1376,38 @@ impl Aggregator {
         self.rebuild_store_catalog().await;
     }
 
+    #[cfg(test)]
     async fn apply_repository_event(&mut self, event: WatchEvent<Repository>) {
+        self.apply_repository_read_event(local_read_event(event)).await;
+    }
+
+    async fn apply_repository_read_event(&mut self, event: ReadWatchEvent<Repository>) {
         match event {
-            WatchEvent::Added(repository) | WatchEvent::Modified(repository) => {
-                self.repositories.insert(repository.spec.key(), repository);
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) => {
+                let key = repository_source_key(&source.object.metadata.namespace, &source.object.metadata.name, &source.provenance);
+                self.repository_sources.insert(key, source);
             }
-            WatchEvent::Deleted(repository) => {
-                self.repositories.remove(&repository.spec.key());
+            ReadWatchEvent::Deleted(source) => {
+                self.repository_sources.remove(&repository_source_key(
+                    &source.object.metadata.namespace,
+                    &source.object.metadata.name,
+                    &source.provenance,
+                ));
             }
-            WatchEvent::DeletedByName(tombstone) => {
-                self.repositories.retain(|_, repository| repository.metadata.name != tombstone.name);
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                self.repository_sources.remove(&repository_source_key(&tombstone.namespace, &tombstone.name, &provenance));
             }
+        }
+        self.rebuild_repository_catalog().await;
+    }
+
+    async fn rebuild_repository_catalog(&mut self) {
+        self.repositories.clear();
+        // Repository identity is convergent. Retain every source so deleting
+        // one root's observation cannot erase another root's catalogue entry.
+        // Ordered origins make the representative stable, with local first.
+        for source in self.repository_sources.values() {
+            self.repositories.entry(source.object.spec.key()).or_insert_with(|| source.object.clone());
         }
         self.rebuild_store_catalog().await;
     }
@@ -2068,6 +2085,14 @@ impl Drop for Aggregator {
     }
 }
 
+fn repository_source_key(namespace: &str, name: &str, provenance: &ResourceProvenance) -> RepositorySourceKey {
+    let origin = match provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+    };
+    (namespace.to_string(), name.to_string(), origin)
+}
+
 fn local_read_event<T: Resource>(event: WatchEvent<T>) -> ReadWatchEvent<T> {
     let local = |object| ReadResourceObject { object, provenance: ResourceProvenance::Local };
     match event {
@@ -2590,7 +2615,7 @@ mod tests {
                         .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                         .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                         .durable_projects(durable.including_replicas::<Project>("flotilla"))
-                        .durable_repositories(durable.using::<Repository>("flotilla"))
+                        .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                         .durable_regards(durable.using::<Regard>("flotilla"))
                         .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                         .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
@@ -3266,6 +3291,79 @@ mod tests {
             })
             .await
             .expect("create scripted environment")
+    }
+
+    #[tokio::test]
+    async fn repository_catalog_reads_replicas_and_retains_other_origins_after_deletion() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository = repository_object("https://github.com/flotilla-org/remote-only").await;
+        let key = repository.spec.key();
+        let now = Utc::now();
+        let writer = backend.replica_writer::<Repository>(flotilla_protocol::NodeId::new("feta-root"), "flotilla");
+        writer.apply(WatchEvent::Added(repository.clone()), now).await.expect("replicate repository");
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state, HostName::new("kiwi"), event_tx);
+        let mut events =
+            aggregator.recover_repository_watch(&backend.including_replicas::<Repository>("flotilla")).await.expect("merge-view watch");
+        assert!(aggregator.repository_labels().contains_key(&key), "replica-only repositories appear in the catalogue");
+
+        let local = backend.using::<Repository>("flotilla");
+        local.create(&InputMeta::from(&repository.metadata), &repository.spec).await.expect("local observation");
+        aggregator
+            .apply_repository_read_event(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .expect("watch event deadline")
+                    .expect("added event")
+                    .expect("valid event"),
+            )
+            .await;
+        writer.apply(WatchEvent::Deleted(repository.clone()), now).await.expect("delete replica");
+        aggregator
+            .apply_repository_read_event(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .expect("watch event deadline")
+                    .expect("deleted event")
+                    .expect("valid event"),
+            )
+            .await;
+        assert!(aggregator.repository_labels().contains_key(&key), "removing a replica retains the local observation");
+
+        writer.apply(WatchEvent::Added(repository.clone()), now + chrono::Duration::seconds(1)).await.expect("replica returns");
+        aggregator
+            .apply_repository_read_event(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .expect("watch event deadline")
+                    .expect("added event")
+                    .expect("valid event"),
+            )
+            .await;
+        local.delete(&repository.metadata.name).await.expect("delete local observation");
+        aggregator
+            .apply_repository_read_event(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .expect("watch event deadline")
+                    .expect("deleted event")
+                    .expect("valid event"),
+            )
+            .await;
+        assert!(aggregator.repository_labels().contains_key(&key), "removing the local observation retains the replica");
+
+        writer.apply(WatchEvent::Deleted(repository), now + chrono::Duration::seconds(2)).await.expect("delete final source");
+        aggregator
+            .apply_repository_read_event(
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+                    .await
+                    .expect("watch event deadline")
+                    .expect("deleted event")
+                    .expect("valid event"),
+            )
+            .await;
+        assert!(!aggregator.repository_labels().contains_key(&key));
     }
 
     async fn repository_object(url: &str) -> ResourceObject<Repository> {
@@ -4512,7 +4610,7 @@ mod tests {
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.including_replicas::<TerminalSession>("flotilla"))
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
-                    .durable_repositories(durable.using::<Repository>("flotilla"))
+                    .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                     .durable_regards(durable.using::<Regard>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                     .observed_presentations(observed.clone().using::<Presentation>("flotilla"))

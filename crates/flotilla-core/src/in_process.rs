@@ -1772,15 +1772,26 @@ pub struct LiveConvoyRecord {
 }
 
 async fn allocate_convoy_generation(backend: &ResourceBackend, namespace: &str, project: Option<&str>, role: &str) -> Result<u64, String> {
-    let generations = backend.clone().using::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?;
+    let generations = backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?;
     let mut maximum = 0;
-    for convoy in generations.items.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == project && convoy.spec.role == role) {
+    for source in generations
+        .items
+        .into_iter()
+        .filter(|source| source.object.spec.project_ref.as_deref() == project && source.object.spec.role == role)
+    {
+        let convoy = source.object;
         let generation =
             convoy.metadata.labels.get(GENERATION_LABEL).and_then(|value| value.parse::<u64>().ok()).unwrap_or(convoy.spec.generation);
         maximum = maximum.max(generation);
         let live = convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal());
         if live {
-            return Err(format!("live convoy {} generation {generation} already exists", convoy_address(role, project)));
+            let provenance = match source.provenance {
+                ResourceProvenance::Local => String::new(),
+                ResourceProvenance::Replica { origin_root, last_synced_at } => {
+                    format!(" (as of root {origin_root}, last synced {last_synced_at})")
+                }
+            };
+            return Err(format!("live convoy {} generation {generation} already exists{provenance}", convoy_address(role, project)));
         }
     }
     let generation =
@@ -2096,6 +2107,9 @@ pub struct InProcessDaemon {
     self_weak: Weak<InProcessDaemon>,
     pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
     ensure_admission_retries: Mutex<HashMap<(String, String), EnsureAdmissionRetry>>,
+    /// Keep periodic and explicit ensure passes in one transaction, including
+    /// status reads, backing inspection, admission, and status publication.
+    ensure_reconciliation: Mutex<()>,
     /// Serializes pending-brief state with its terminal-session delivery side effect.
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
     /// Serializes the identity selector check with Convoy creation. The owner
@@ -2398,6 +2412,7 @@ impl InProcessDaemon {
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
             ensure_admission_retries: Mutex::new(HashMap::new()),
+            ensure_reconciliation: Mutex::new(()),
             convoy_message_locks: Mutex::new(HashMap::new()),
             convoy_admission: Mutex::new(()),
             session_id: uuid::Uuid::new_v4(),
@@ -4763,6 +4778,7 @@ impl InProcessDaemon {
         namespace: &str,
         backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<Vec<String>, String> {
+        let _reconciliation = self.ensure_reconciliation.lock().await;
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace).list().await.map_err(|e| e.to_string())?;
         let ensure_names = ensures.iter().map(|ensure| ensure.metadata.name.clone()).collect::<HashSet<_>>();
         self.ensure_admission_retries
@@ -4920,6 +4936,7 @@ impl InProcessDaemon {
         name: &str,
         backing_inspector: &dyn StandingConvoyBackingInspector,
     ) -> Result<String, String> {
+        let _reconciliation = self.ensure_reconciliation.lock().await;
         let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let ensure = ensures.get(name).await.map_err(|error| error.to_string())?;
         if ensure.spec.driver_ref.is_some() {
@@ -4982,9 +4999,12 @@ impl InProcessDaemon {
             versions.insert(format!("WorkflowTemplate/{name}"), version);
         }
         if let Some(name) = &ensure.spec.placement_policy {
-            let policies = self.resource_backend.clone().definitions::<PlacementPolicy>(namespace);
-            let version =
-                policies.get(name).await.map(|policy| policy.metadata.resource_version).unwrap_or_else(|error| format!("absent:{error}"));
+            let policies = self.resource_backend.including_replicas::<PlacementPolicy>(namespace);
+            let version = policies
+                .get(name)
+                .await
+                .map(|policy| policy.object.metadata.resource_version)
+                .unwrap_or_else(|error| format!("absent:{error}"));
             versions.insert(format!("PlacementPolicy/{name}"), version);
         }
         let encoded = serde_json::to_vec(&versions).map_err(|error| format!("serialize ensure admission dependencies: {error}"))?;
