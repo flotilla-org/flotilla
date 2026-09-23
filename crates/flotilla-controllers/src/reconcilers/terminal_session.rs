@@ -79,6 +79,9 @@ pub trait TerminalRuntime: Send + Sync {
     async fn observe_failure(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
         Ok(None)
     }
+    async fn cleanup_failed_session(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
     async fn deliver_message(
         &self,
         _session_id: &str,
@@ -252,6 +255,10 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        if phase == TerminalSessionPhase::Failed {
+            self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
+            return Ok(TerminalPrepared::None);
+        }
         if phase == TerminalSessionPhase::Running {
             let session_id = obj
                 .status

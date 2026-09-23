@@ -3725,6 +3725,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .get(&requirement.adapter)
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
         let pool = self.pool_for_spec(spec)?;
+        let stable = pool
+            .list_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.session_name == session_id)
+            .and_then(|session| session.screen_activity)
+            == Some(ScreenActivity::Stable);
+        if !stable {
+            return Ok(None);
+        }
         let screen = match pool.capture_screen(session_id).await {
             Ok(Some(screen)) => screen,
             Ok(None) => return Ok(None),
@@ -3736,12 +3746,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let Some(reason) = adapter.classify_screen_failure(&screen) else { return Ok(None) };
 
         let material = match &self.state.agent_material {
-            Some(registry) => match registry.describe_and_release(&spec.env_ref).await {
+            Some(registry) => match registry.describe(&spec.env_ref).await {
                 Ok(leases) if !leases.is_empty() => leases.join(", "),
                 Ok(_) => format!("credential codex-login (no leased slot for environment {})", spec.env_ref),
                 Err(error) => {
                     return Ok(Some(format!(
-                        "Codex authentication failed for credential codex-login in environment {}: {reason}; failed to release its lease: {error}",
+                        "Codex authentication failed for credential codex-login in environment {}: {reason}; failed to identify its slot: {error}",
                         spec.env_ref
                     )));
                 }
@@ -3749,6 +3759,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None => format!("credential codex-login (no material registry for environment {})", spec.env_ref),
         };
         Ok(Some(format!("Codex authentication failed for {material}: {reason}")))
+    }
+
+    async fn cleanup_failed_session(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        if matches!(spec.source, TerminalSessionSource::Agent { .. }) {
+            if let Some(registry) = &self.state.agent_material {
+                registry.release(&spec.env_ref).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn deliver_message(
@@ -10187,6 +10206,7 @@ mod tests {
         assert!(failure.contains("token_expired"));
         assert!(failure.contains("codex-login"));
         assert!(failure.contains("slot-4"));
+        runtime.cleanup_failed_session(&spec).await.expect("release failed session material");
         material
             .prepare("replacement-environment", &BTreeSet::from(["codex".to_string()]), &BTreeMap::new())
             .await

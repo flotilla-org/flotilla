@@ -711,9 +711,10 @@ fn codex_screen_needs_input(screen: &str) -> bool {
 }
 
 fn codex_auth_failure(screen: &str) -> Option<&'static str> {
-    if screen.contains("token_expired") {
+    let normalized = screen.to_ascii_lowercase();
+    if normalized.contains("token_expired") {
         Some("token_expired")
-    } else if screen.to_ascii_lowercase().contains("access token could not be refreshed") {
+    } else if normalized.contains("access token could not be refreshed") {
         Some("access token could not be refreshed")
     } else {
         None
@@ -1710,7 +1711,7 @@ mod tests {
         let registry = discovered_registry();
         let codex = registry.get("codex").expect("codex adapter");
 
-        assert_eq!(codex.classify_screen_failure("codex_apps: HTTP 401 token_expired"), Some("token_expired"));
+        assert_eq!(codex.classify_screen_failure("codex_apps: HTTP 401 TOKEN_EXPIRED"), Some("token_expired"));
         assert_eq!(
             codex.classify_screen_failure("Your access token could not be refreshed. Please log out and sign in again."),
             Some("access token could not be refreshed")

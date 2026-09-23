@@ -216,10 +216,9 @@ impl AgentMaterialRegistry {
         self.pools.release_holder(&self.holder_ref(environment_ref)).await
     }
 
-    pub(crate) async fn describe_and_release(&self, environment_ref: &str) -> Result<Vec<String>, String> {
+    pub(crate) async fn describe(&self, environment_ref: &str) -> Result<Vec<String>, String> {
         let holder_ref = self.holder_ref(environment_ref);
         let leases = self.pools.leases_for_holder(&holder_ref).await?;
-        self.release(environment_ref).await?;
         Ok(leases
             .into_iter()
             .map(|(pool_ref, unit_name, unit)| {
