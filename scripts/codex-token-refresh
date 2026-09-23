@@ -116,7 +116,7 @@ def request_refresh(token_url, client_id, refresh_token):
             detail = json.loads(raw_detail.decode("utf-8")) if raw_detail else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             detail = {}
-        raise classify_rejection(error.code, detail)
+        raise classify_rejection(error.code, detail) from None
     except urllib.error.URLError as error:
         raise RefreshFailure(EXIT_TRANSIENT, "network_error", f"could not reach token endpoint: {error.reason}")
 

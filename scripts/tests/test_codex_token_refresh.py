@@ -160,6 +160,42 @@ class CodexTokenRefreshTest(unittest.TestCase):
         self.assertIn("refresh_token_expired", result.stderr)
         self.assertEqual(auth_path.read_text(), before, "a failed refresh must not touch the existing auth.json")
 
+    def test_reused_refresh_token_is_classified_as_permanent(self):
+        codex_home = self.codex_home
+        self.write_auth(codex_home, refresh_token="rt-dead")
+        self.server.queue(400, {"error": "refresh_token_reused"})
+
+        result = self.run_script(codex_home)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refresh_token_reused", result.stderr)
+
+    def test_invalidated_refresh_token_is_classified_as_permanent(self):
+        codex_home = self.codex_home
+        self.write_auth(codex_home, refresh_token="rt-dead")
+        self.server.queue(400, {"error": "refresh_token_invalidated"})
+
+        result = self.run_script(codex_home)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refresh_token_invalidated", result.stderr)
+
+    def test_ambiguous_400_without_a_recognized_error_code_is_transient(self):
+        # codex-rs (`classify_refresh_token_failure` in manager.rs) only
+        # escalates a 400 to a permanent, alert-worthy failure when it
+        # recognizes the `error` code (or it's exactly `invalid_grant`). A
+        # well-formed 400 body that carries no (or an unrecognized) `error`
+        # field is treated the same as any other unrecognized 400: transient,
+        # so a scheduled retry — not a false dead-token alert — happens next.
+        codex_home = self.codex_home
+        self.write_auth(codex_home, refresh_token="rt-ambiguous")
+        self.server.queue(400, {})
+
+        result = self.run_script(codex_home)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refresh_rejected", result.stderr)
+
     def test_invalid_grant_bad_request_is_classified_as_permanent(self):
         codex_home = self.codex_home
         self.write_auth(codex_home, refresh_token="rt-dead")
