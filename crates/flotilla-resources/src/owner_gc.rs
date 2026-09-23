@@ -43,6 +43,8 @@ impl OwnerGarbageCollector {
                     .boxed(),
             );
         }
+        // The interval's immediate first tick performs startup recovery after
+        // all watches are established. Delaying that tick would skip recovery.
         let mut backstop = tokio::time::interval(backstop_interval);
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
