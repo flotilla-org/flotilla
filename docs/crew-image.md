@@ -201,6 +201,9 @@ currently checks both declared agent adapters while building.
 
 ## Placement policy and fleet baseline
 
+These manifests describe the target configuration. Live three-host rollout has
+not yet been verified; kiwi reported Docker unavailable during implementation.
+
 Deploy baseline support on all hosts before applying these manifests. Apply
 `.flotilla/crew-image-baseline.yaml` once, from any host in namespace
 `flotilla`, and verify `crewimagebaselines fleet-crew` resolves on each host.

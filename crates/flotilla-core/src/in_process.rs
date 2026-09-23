@@ -4030,22 +4030,24 @@ async fn validate_workflow_agent_adapters(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
-    if let Some(docker) = placement.and_then(|policy| policy.spec.docker_per_vessel.as_ref()) {
-        docker.image.resolve(&backend.definitions(namespace)).await?;
-    }
     let required_adapters = required_workflow_agent_adapters(workflow)?;
-
+    // Resolve each candidate's image once, even for tool-only workflows.
+    let capabilities = match placement {
+        Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
+            Some(placement_agent_adapters(backend, namespace, policy).await?)
+        }
+        _ => None,
+    };
     for adapter in required_adapters {
-        let Some(placement) = placement else {
+        let Some((available_adapters, detail)) = &capabilities else {
             return Err(format!("workflow requires agent adapter `{adapter}`, but no placement is available"));
         };
-        let (available_adapters, detail) = placement_agent_adapters(backend, namespace, placement).await?;
         if available_adapters.contains(&adapter) {
             continue;
         }
         return Err(format!(
             "workflow requires agent adapter `{adapter}`, which is not available in placement `{}` ({detail})",
-            placement.metadata.name
+            placement.expect("capabilities came from a placement").metadata.name
         ));
     }
 

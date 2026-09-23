@@ -2652,3 +2652,88 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
         }
     }
 }
+
+#[rstest]
+#[case::fresh_clone(DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() })]
+#[case::worktree(DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() })]
+#[tokio::test]
+async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: DockerCheckoutStrategy) {
+    use flotilla_resources::{
+        apply_status_patch, CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, EnvironmentPhase, VesselStatusPatch,
+    };
+
+    let backend = ResourceBackend::InMemory(Default::default());
+    let baselines = backend.definitions::<CrewImageBaseline>(NAMESPACE);
+    baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
+    let mut convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;
+    convoy.spec.repositories.clear();
+    let convoy = backend
+        .using::<Convoy>(NAMESPACE)
+        .update(&InputMeta::from(&convoy.metadata), &convoy.metadata.resource_version, &convoy.spec)
+        .await
+        .expect("repositoryless convoy");
+    let mut status = convoy.status.expect("convoy status");
+    let requirement = &mut status.workflow_snapshot.as_mut().expect("snapshot").vessels[0];
+    requirement.crew.clear();
+    requirement.stance = Stance::Contained;
+    backend
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("repositoryless vessel");
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/repos").await;
+    create_policy(
+        &backend,
+        NAMESPACE,
+        "crew-policy",
+        PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: HOST_REF.to_string(),
+                image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
+                pull_policy: DockerImagePullPolicy::Always,
+                agent_adapters: Default::default(),
+                default_cwd: None,
+                env: Default::default(),
+                checkout,
+            })
+            .build(),
+    )
+    .await;
+    create_ready_docker_environment(&backend, NAMESPACE, "env-vessel", DockerEnvironmentSpec {
+        host_ref: HOST_REF.to_string(),
+        image: "crew:v1".to_string(),
+        declared_agent_adapters: Default::default(),
+        required_agent_adapters: Default::default(),
+        pull_policy: DockerImagePullPolicy::Always,
+        mounts: Vec::new(),
+        env: Default::default(),
+    })
+    .await;
+    let vessel = create_workspace(&backend, NAMESPACE, "vessel", "convoy", "implement", "crew-policy", REPO_URL).await;
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let prepared = reconciler.prepare(&vessel).await.expect("initial prepare");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    assert!(matches!(outcome.patch, Some(VesselStatusPatch::MarkReady { .. })), "{:?}", outcome.patch);
+    apply_status_patch(&backend.using::<Vessel>(NAMESPACE), "vessel", outcome.patch.as_ref().expect("ready patch"))
+        .await
+        .expect("persist Ready");
+    let vessel = backend.using::<Vessel>(NAMESPACE).get("vessel").await.expect("ready vessel");
+    baselines.delete("fleet-crew").await.expect("delete baseline");
+
+    let prepared = reconciler.prepare(&vessel).await.expect("resync");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    assert!(outcome.actuations.is_empty());
+    assert!(matches!(outcome.patch, Some(VesselStatusPatch::MarkReady { image_ref: Some(image), .. }) if image == "crew:v1"));
+
+    // A created but still provisioning Environment also owns its concrete image.
+    let environments = backend.using::<Environment>(NAMESPACE);
+    let environment = environments.get("env-vessel").await.expect("environment");
+    let mut status = environment.status.expect("environment status");
+    status.phase = EnvironmentPhase::Pending;
+    environments.update_status("env-vessel", &environment.metadata.resource_version, &status).await.expect("pending environment");
+    let prepared = reconciler.prepare(&vessel).await.expect("pending resync");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    assert!(outcome.actuations.is_empty());
+    assert!(matches!(outcome.patch, Some(VesselStatusPatch::MarkProvisioning { .. })));
+}
