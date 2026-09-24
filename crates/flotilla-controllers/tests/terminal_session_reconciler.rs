@@ -134,6 +134,81 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
     ));
 }
 
+struct GoneEnvironmentTerminalRuntime;
+
+#[async_trait]
+impl TerminalRuntime for GoneEnvironmentTerminalRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("deleted environments cannot launch sessions")
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Err("provider registry unavailable for deleted environment".to_string())
+    }
+
+    async fn cleanup_session_artifacts(&self, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Err("agent adapter unavailable for deleted environment".to_string())
+    }
+}
+
+#[tokio::test]
+async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-orphan".to_string())
+                .owner_references(vec![vessel_owner("deleted-vessel")])
+                .finalizers(vec!["flotilla.work/terminal-teardown".to_string()])
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "deleted-environment".to_string(),
+                role: "governor".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("create terminal session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "terminal-orphan".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "codex".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    sessions.update_status("terminal-orphan", &created.metadata.resource_version, &status).await.expect("running session");
+    sessions.delete("terminal-orphan").await.expect("delete terminal session");
+    let deleting = sessions.get("terminal-orphan").await.expect("finalizer holds the terminating record");
+    assert!(deleting.metadata.deletion_timestamp.is_some());
+    let demands = backend.clone().using::<flotilla_resources::Demand>("flotilla");
+    demands
+        .create(
+            &meta("terminal-attention-terminal-orphan").with_lifecycle_authority(LifecycleAuthority::Managed),
+            &flotilla_resources::DemandSpec::for_dispatching_principal(
+                flotilla_protocol::ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "terminal-orphan"),
+                flotilla_resources::DemandKind::HumanGate,
+                flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("attention demand");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(GoneEnvironmentTerminalRuntime), backend, "flotilla");
+
+    reconciler.run_finalizer(&deleting).await.expect("missing environment means there is no terminal process or artifact to tear down");
+    assert!(matches!(demands.get("terminal-attention-terminal-orphan").await, Err(ResourceError::NotFound { .. })));
+}
+
 fn vessel_owner(name: &str) -> OwnerReference {
     OwnerReference {
         api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
@@ -767,6 +842,7 @@ async fn deleted_terminal_session_is_not_resurrected_from_stale_state_after_rest
 #[tokio::test]
 async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "host-direct-feta").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let spec = TerminalSessionSpec {
         env_ref: "host-direct-feta".to_string(),
@@ -1189,6 +1265,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
 #[tokio::test]
 async fn terminal_finalizer_cleans_agent_artifacts() {
     let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
         .create(&meta("term-a"), &TerminalSessionSpec {
