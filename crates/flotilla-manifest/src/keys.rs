@@ -69,8 +69,11 @@ pub const KEY_ROLE_NAME: &str = "flotilla.role.name";
 pub const KEY_ROLE_PRESENTS_AS: &str = "flotilla.role.presents_as";
 /// Why automatic admission is suspended: `backing_unverified | restart_limit`.
 pub const KEY_ROLE_HOLD: &str = "flotilla.role.hold";
-/// Boolean on convoy and vessel entities: this attempt was admitted by a
-/// standing-role declaration, whether or not that declaration is still known.
+/// Boolean on every entity carrying [`KEY_CONVOY`] (the convoy, its vessels
+/// and entries grouped under it): that attempt was admitted by a standing-role
+/// declaration, whether or not the declaration is still known. [`KEY_ROLE`]
+/// propagates the same way while the declaration is known, like
+/// [`KEY_CONVOY_SUPERSEDED`].
 pub const KEY_CONVOY_STANDING: &str = "flotilla.convoy.standing";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
