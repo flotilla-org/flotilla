@@ -474,14 +474,24 @@ where
         if !self.actuates(obj) {
             return Ok(());
         }
+        let environment_exists = match self.environments.get(&obj.spec.env_ref).await {
+            Ok(_) => true,
+            Err(ResourceError::NotFound { .. }) => false,
+            Err(error) => return Err(error),
+        };
         let mut errors = Vec::new();
-        if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-            if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {
+        // Once the environment record is gone, its teardown has already removed the
+        // backing container. Its terminal pool and agent adapter are no longer
+        // available, so there is nothing left for either runtime hook to clean.
+        if environment_exists {
+            if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
+                if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {
+                    errors.push(error);
+                }
+            }
+            if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
                 errors.push(error);
             }
-        }
-        if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
-            errors.push(error);
         }
         match self.demands.get(&attention_demand_name(obj)).await {
             Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
