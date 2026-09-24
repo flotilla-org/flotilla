@@ -76,6 +76,8 @@ mod tests {
         assert_eq!(container_from_cgroup(&format!("0::/system.slice/docker-{id}.scope\n")), Some(id.to_string()));
     }
 
+    // Process identity is read from /proc, so it exists only on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unix_socket_peer_credentials_identify_the_connecting_process() {
         let directory = tempfile::tempdir().expect("tempdir");

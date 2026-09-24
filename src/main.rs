@@ -1099,7 +1099,7 @@ fn start_fleet_daemon_service() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         flotilla_tui::socket::launchd::bootstrap_agent().map_err(|error| color_eyre::eyre::eyre!(error))?;
-        return flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error));
+        flotilla_tui::socket::launchd::kickstart_agent().map_err(|error| color_eyre::eyre::eyre!(error))
     }
     #[cfg(target_os = "linux")]
     return flotilla_tui::socket::systemd::start_unit().map_err(|error| color_eyre::eyre::eyre!(error));

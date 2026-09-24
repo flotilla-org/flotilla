@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(test, target_os = "linux"))]
+use std::path::PathBuf;
 
 pub const UNIT_NAME: &str = "flotillad.service";
 #[cfg(any(test, target_os = "linux"))]
