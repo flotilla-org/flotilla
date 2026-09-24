@@ -1353,6 +1353,8 @@ impl App {
                     flotilla_protocol::Rows::Awareness { rows, .. } => {
                         self.query_tables.awareness.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
+                    // Consumed by presentation-manager connectors; the TUI has no role table.
+                    flotilla_protocol::Rows::StandingRoles { .. } => {}
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1427,6 +1429,7 @@ impl App {
                             |left, right| left.reference.cmp_id_desc(&right.reference),
                         );
                     }
+                    flotilla_protocol::QueryChanges::StandingRoles { .. } => {}
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
                         let result = self.query_tables.checkouts.entry(query).or_default();
                         result.apply_delta(

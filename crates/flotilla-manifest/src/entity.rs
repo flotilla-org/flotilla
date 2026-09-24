@@ -44,6 +44,11 @@ pub fn convoy(namespace: &str, name: &str, origin: &str) -> EntityRef {
     EntityRef::new("convoy", format!("{namespace}/{name}@{origin}"))
 }
 
+/// A standing project role. Stable across the convoy attempts backing it.
+pub fn role(namespace: &str, project: &str, role: &str, origin: &str) -> EntityRef {
+    EntityRef::new("role", format!("{namespace}/{project}/{role}@{origin}"))
+}
+
 pub fn vessel(namespace: &str, convoy_name: &str, vessel_name: &str, origin: &str) -> EntityRef {
     EntityRef::new("vessel", format!("{namespace}/{convoy_name}/{vessel_name}@{origin}"))
 }
@@ -70,6 +75,7 @@ mod tests {
     fn constructors_pin_one_id_dialect_per_kind() {
         assert_eq!(convoy("dev", "cutover", "kiwi").id, "dev/cutover@kiwi");
         assert_eq!(vessel("dev", "cutover", "coder", "kiwi").id, "dev/cutover/coder@kiwi");
+        assert_eq!(role("dev", "andamento", "governor", "fleet").id, "dev/andamento/governor@fleet");
         assert_eq!(repo("github.com:flotilla-org/flotilla").id, "github.com:flotilla-org/flotilla");
         assert_eq!(
             issue(&IssueRef {

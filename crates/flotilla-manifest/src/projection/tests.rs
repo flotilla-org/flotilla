@@ -9,7 +9,8 @@ use crate::{
     keys::{
         KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_NAME, KEY_COUNT_CHECKOUTS,
         KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID,
-        KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL,
+        KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET,
         SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
@@ -63,7 +64,8 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-cutover-coder").call()])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[] }, &mint())
+        .reassert_patches();
 
     assert!(
         patches.iter().all(|patch| matches!(patch.target, MetadataTarget::Entity(_))),
@@ -109,7 +111,8 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
         .phase(SessionPhase::Running)
         .build();
 
-    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[independent] }, &mint());
+    let catalog =
+        project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[independent], standing_roles: &[] }, &mint());
     let first = catalog.reassert_patches();
     let second = catalog.reassert_patches();
     assert_eq!(first, second, "re-assertion must reuse the same label facts");
@@ -153,7 +156,9 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
         .entries(vec![issue])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let issue_patch = find_entity(&patches, &entity::issue(&issue_ref));
     let project_patch = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
     assert_eq!(text(issue_patch, KEY_ENTITY_KIND), "issue");
@@ -203,7 +208,9 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
         .entries(vec![convoy, checkout])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let convoy = find_entity(&patches, &entity::convoy("dev", "landing", "fleet"));
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing · PR #1044");
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_MEDIUM), "landing");
@@ -252,7 +259,9 @@ fn truncated_awareness_summary_reports_exact_omitted_count() {
         ])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let project = find_entity(&patches, &entity::project("dev", "platform", "fleet"));
     assert!(text(project, KEY_SUMMARY_TEXT).ends_with("+3 more"));
 }
@@ -291,7 +300,8 @@ fn same_role_remote_governors_project_as_distinct_catalog_entities() {
     let awareness = [awareness("governor-andamento-01234567", "andamento"), awareness("governor-wheelhouse-89abcdef", "wheelhouse")];
 
     let patches =
-        project_catalog(&CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[] }, &mint()).reassert_patches();
+        project_catalog(&CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     for (resource_name, project) in [("governor-andamento-01234567", "andamento"), ("governor-wheelhouse-89abcdef", "wheelhouse")] {
         let governor = find_entity(&patches, &entity::convoy("flotilla", resource_name, "udder"));
         assert_eq!(text(governor, SEGMENT_PROJECT), format!("flotilla/{project}@fleet"));
@@ -331,7 +341,9 @@ fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_
         .entries(vec![standing, convoy_owned])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let standing = find_entity(&patches, &entity::checkout("standing"));
     assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --transient --host 'kiwi' '/work/standing'");
     assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), entity::checkout("standing").action_target());
@@ -352,7 +364,9 @@ fn empty_project_is_an_idle_zero_count_latent_that_opens_its_scoped_view() {
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let project = find_entity(&patches, &entity::project("dev", "empty", "fleet"));
 
     assert_eq!(text(project, KEY_STATUS_STATE), "idle");
@@ -387,7 +401,8 @@ fn awareness_children_use_their_convoys_canonical_origin() {
     let convoy = ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
 
     let patches =
-        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
     let issue_patch = find_entity(&patches, &entity::issue(&issue_ref));
 
     assert_eq!(text(issue_patch, KEY_CONVOY), "dev/cutover@kiwi");
@@ -412,7 +427,9 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
         .entries(vec![independent])
         .build();
 
-    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let patches =
+        project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[] }, &mint())
+            .reassert_patches();
 
     find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
     let independent = find_entity(&patches, &entity::session("independent/dev/governor"));
@@ -434,7 +451,8 @@ fn independent_session_uses_the_canonical_session_ref() {
         .attach("scratch")
         .phase(SessionPhase::Running)
         .build();
-    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[row] }, &mint()).reassert_patches();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[row], standing_roles: &[] }, &mint())
+        .reassert_patches();
     let session = entity::session("feta/dev/scratch");
     let patch = find_entity(&patches, &session);
     assert_eq!(text(patch, KEY_SESSION), session.id);
@@ -453,8 +471,10 @@ fn catalog_diff_unsets_removed_entity_facts() {
         .build();
     let without_message =
         ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
-    let previous = project_catalog(&CatalogInput { awareness: None, convoys: &[with_message], independents: &[] }, &mint());
-    let current = project_catalog(&CatalogInput { awareness: None, convoys: &[without_message], independents: &[] }, &mint());
+    let previous =
+        project_catalog(&CatalogInput { awareness: None, convoys: &[with_message], independents: &[], standing_roles: &[] }, &mint());
+    let current =
+        project_catalog(&CatalogInput { awareness: None, convoys: &[without_message], independents: &[], standing_roles: &[] }, &mint());
     let diff = current.diff_patches(&previous);
     let patch = find_entity(&diff, &entity::convoy("dev", "cutover", "kiwi"));
     assert!(patch.unset.contains(&KEY_CONVOY_MESSAGE.to_owned()));
@@ -480,7 +500,8 @@ fn convoy_summary_surfaces_status_message_ahead_of_progress() {
         .message("2 in pool, all leased")
         .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Pending).call()])
         .build();
-    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[] }, &mint())
+        .reassert_patches();
     let patch = find_entity(&patches, &entity::convoy("dev", "waiting", "kiwi"));
 
     assert_eq!(text(patch, KEY_STATUS_STATE), "waiting");
@@ -504,7 +525,8 @@ fn crew_roles_remain_a_flat_fact() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![coder])
         .build();
-    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint()).reassert_patches();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[] }, &mint())
+        .reassert_patches();
     let patch = find_entity(&patches, &entity::vessel("dev", "cutover", "coder", "feta"));
     assert_eq!(patch.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned()]));
 }
@@ -566,7 +588,7 @@ fn only_older_terminal_role_generations_are_superseded() {
             .build()
     })
     .collect::<Vec<_>>();
-    let mut catalog = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[] }, &mint());
+    let mut catalog = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[], standing_roles: &[] }, &mint());
     // A detached vessel in Attention must receive the same visibility fact.
     catalog.assert_entity(
         entity::vessel("dev", "old", "govern", "kiwi"),
@@ -609,7 +631,8 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
                 .build()
         })
         .collect::<Vec<_>>();
-    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[] }, &mint()).reassert_patches();
+    let patches = project_catalog(&CatalogInput { awareness: None, convoys: &rows, independents: &[], standing_roles: &[] }, &mint())
+        .reassert_patches();
     for row in &rows {
         let convoy = entity::convoy("dev", &row.resource.name, "kiwi");
         let vessel = entity::vessel("dev", &row.resource.name, "govern", "feta");
@@ -623,4 +646,193 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
             assert_eq!(patch.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.generation == 1));
         }
     }
+}
+
+fn standing_role(project: &str, role: &str) -> StandingRoleRow {
+    StandingRoleRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "ConvoyEnsure", "dev", format!("ensure-{project}-{role}")))
+        .project_ref(project)
+        .role(role)
+        .build()
+}
+
+#[bon::builder]
+fn attempt(name: &str, role: &str, generation: u64, phase: ConvoyPhase, ensured_from: Option<&str>, vessels: Option<usize>) -> ConvoyRow {
+    let reference = convoy_ref("dev", name);
+    let vessels = (0..vessels.unwrap_or(1))
+        .map(|index| {
+            vessel()
+                .convoy(&reference)
+                .name(&format!("govern{}", if index == 0 { String::new() } else { index.to_string() }))
+                .phase(WorkPhase::Running)
+                .materialize(&format!("terminal-{name}-{index}"))
+                .call()
+        })
+        .collect();
+    ConvoyRow::builder()
+        .resource(reference)
+        .name(role)
+        .project_ref("p")
+        .address_role(role)
+        .maybe_ensured_from(ensured_from.map(str::to_owned))
+        .generation(generation)
+        .phase(phase)
+        .workflow_ref("standing")
+        .vessels(vessels)
+        .build()
+}
+
+fn role_catalog(roles: &[StandingRoleRow], convoys: &[ConvoyRow]) -> Catalog {
+    project_catalog(&CatalogInput { awareness: None, convoys, independents: &[], standing_roles: roles }, &mint())
+}
+
+fn role_entity_for(project: &str, role: &str) -> EntityRef {
+    entity::role("dev", project, role, "fleet")
+}
+
+#[test]
+fn live_standing_role_resolves_its_current_vessel_behind_a_stable_intent() {
+    let role = standing_role("p", "governor");
+    let convoys =
+        [attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call()];
+    let patches = role_catalog(&[role], &convoys).reassert_patches();
+
+    let entity = role_entity_for("p", "governor");
+    let facts = find_entity(&patches, &entity);
+    let vessel = entity::vessel("dev", "convoy-a", "govern", "feta");
+    assert_eq!(text(facts, KEY_ENTITY_KIND), "role");
+    assert_eq!(text(facts, SEGMENT_PROJECT), entity::project("dev", "p", "fleet").id);
+    assert_eq!(text(facts, KEY_ROLE_NAME), "governor");
+    assert_eq!(text(facts, KEY_PRIMARY_ACTION_TARGET), entity.action_target());
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "ready");
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), vessel.action_target());
+    assert!(text(facts, KEY_PRIMARY_ACTION_RECIPE).contains("terminal-convoy-a-0"));
+    assert_eq!(text(facts, KEY_STATUS_STATE), "active");
+    // The role must not create grouping segments of its backing attempt.
+    assert!(!facts.set.contains_key(KEY_CONVOY) && !facts.set.contains_key(KEY_VESSEL));
+
+    for attempt in [entity::convoy("dev", "convoy-a", "kiwi"), vessel] {
+        let facts = find_entity(&patches, &attempt);
+        assert_eq!(text(facts, KEY_ROLE), entity.id);
+        assert_eq!(facts.set[KEY_CONVOY_STANDING].value, MetadataValue::Bool(true));
+    }
+}
+
+#[test]
+fn replacement_generation_changes_the_resolved_target_but_not_the_intent() {
+    let role = standing_role("p", "governor");
+    let old = attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Failed).ensured_from("ensure-p-governor").call();
+    let new = attempt().name("convoy-b").role("governor").generation(2).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
+    let live_old =
+        attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
+    let before = role_catalog(std::slice::from_ref(&role), &[live_old]);
+    let after = role_catalog(std::slice::from_ref(&role), &[old, new]);
+
+    let entity = role_entity_for("p", "governor");
+    let patches = after.reassert_patches();
+    let facts = find_entity(&patches, &entity);
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "ready");
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), entity::vessel("dev", "convoy-b", "govern", "feta").action_target());
+    assert_eq!(text(facts, KEY_STATUS_STATE), "active", "a superseded failure is not the role's state");
+
+    let diff = after.diff_patches(&before);
+    let role_diff = find_entity(&diff, &entity);
+    assert!(role_diff.set.contains_key(KEY_WORKSPACE_PRIMARY_TARGET));
+    assert!(!role_diff.set.contains_key(KEY_PRIMARY_ACTION_TARGET), "the stable intent is unchanged");
+}
+
+#[test]
+fn standing_role_between_generations_is_held_without_attention() {
+    let role = standing_role("p", "governor");
+    let failed =
+        attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Failed).ensured_from("ensure-p-governor").call();
+    let patches = role_catalog(&[role], &[failed]).reassert_patches();
+    let facts = find_entity(&patches, &role_entity_for("p", "governor"));
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "held");
+    assert_eq!(text(facts, KEY_STATUS_STATE), "waiting");
+    assert!(!facts.set.contains_key(KEY_STATUS_ATTENTION));
+    assert!(!facts.set.contains_key(KEY_WORKSPACE_PRIMARY_TARGET));
+    assert!(!facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+}
+
+#[test]
+fn held_standing_role_without_an_attempt_remains_visible_and_asks_for_attention() {
+    let mut role = standing_role("p", "governor");
+    role.hold = Some(StandingRoleHold::RestartLimit);
+    role.last_failure = Some("crew exited".to_owned());
+    let patches = role_catalog(&[role], &[]).reassert_patches();
+    let facts = find_entity(&patches, &role_entity_for("p", "governor"));
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "held");
+    assert_eq!(text(facts, KEY_ROLE_HOLD), "restart_limit");
+    assert_eq!(text(facts, KEY_STATUS_STATE), "failed");
+    assert_eq!(facts.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
+    assert_eq!(text(facts, KEY_SUMMARY_TEXT), "crew exited");
+}
+
+#[test]
+fn live_attempt_without_a_single_attachable_vessel_stays_held() {
+    let role = standing_role("p", "governor");
+    let convoys = [attempt()
+        .name("convoy-a")
+        .role("governor")
+        .generation(1)
+        .phase(ConvoyPhase::Active)
+        .ensured_from("ensure-p-governor")
+        .vessels(2)
+        .call()];
+    let patches = role_catalog(&[role], &convoys).reassert_patches();
+    let facts = find_entity(&patches, &role_entity_for("p", "governor"));
+    assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "held");
+    assert_eq!(text(facts, KEY_STATUS_STATE), "active");
+}
+
+#[test]
+fn two_standing_roles_on_one_project_are_distinct_entities() {
+    let roles = [standing_role("p", "governor"), standing_role("p", "quartermaster")];
+    let convoys = [
+        attempt().name("convoy-g").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call(),
+        attempt()
+            .name("convoy-q")
+            .role("quartermaster")
+            .generation(1)
+            .phase(ConvoyPhase::Active)
+            .ensured_from("ensure-p-quartermaster")
+            .call(),
+    ];
+    let patches = role_catalog(&roles, &convoys).reassert_patches();
+    for (role, convoy) in [("governor", "convoy-g"), ("quartermaster", "convoy-q")] {
+        let facts = find_entity(&patches, &role_entity_for("p", role));
+        assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), entity::vessel("dev", convoy, "govern", "feta").action_target());
+    }
+}
+
+#[test]
+fn task_convoy_sharing_a_role_name_is_not_standing() {
+    let role = standing_role("p", "governor");
+    let task = attempt().name("convoy-task").role("governor").generation(1).phase(ConvoyPhase::Active).call();
+    let patches = role_catalog(&[role], std::slice::from_ref(&task)).reassert_patches();
+    let facts = find_entity(&patches, &entity::convoy("dev", "convoy-task", "kiwi"));
+    assert!(!facts.set.contains_key(KEY_ROLE));
+    assert!(!facts.set.contains_key(KEY_CONVOY_STANDING));
+    let role = find_entity(&patches, &role_entity_for("p", "governor"));
+    assert_eq!(text(role, KEY_WORKSPACE_PRIMARY_STATE), "held", "a task convoy never backs the role");
+}
+
+#[test]
+fn removed_declaration_retracts_the_role_but_keeps_its_attempts_standing() {
+    let role = standing_role("p", "governor");
+    let convoys =
+        [attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call()];
+    let declared = role_catalog(&[role], &convoys);
+    let removed = role_catalog(&[], &convoys);
+
+    let diff = removed.diff_patches(&declared);
+    let retracted = find_entity(&diff, &role_entity_for("p", "governor"));
+    assert!(retracted.set.keys().all(|key| key == KEY_SOURCE));
+    assert!(retracted.unset.iter().any(|key| key == KEY_WORKSPACE_PRIMARY_STATE));
+
+    let patches = removed.reassert_patches();
+    let convoy = find_entity(&patches, &entity::convoy("dev", "convoy-a", "kiwi"));
+    assert_eq!(convoy.set[KEY_CONVOY_STANDING].value, MetadataValue::Bool(true));
+    assert!(!convoy.set.contains_key(KEY_ROLE), "an unknown declaration is not confirmed");
 }

@@ -334,3 +334,40 @@ async fn reconnect_loop_retries_unavailable_daemon_but_exits_for_incompatible_da
     assert!(error.contains("protocol version mismatch"));
     assert_eq!(attempts.load(Ordering::SeqCst), 3, "ordinary connection failures must keep retrying");
 }
+
+fn standing_role_row(role: &str) -> StandingRoleRow {
+    StandingRoleRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "ConvoyEnsure", "dev", format!("ensure-{role}")))
+        .project_ref("platform")
+        .role(role)
+        .build()
+}
+
+#[test]
+fn standing_roles_publish_and_retract_role_entities() {
+    let mut state = ConnectorState::default();
+    let governor = standing_role_row("governor");
+    let set = DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::StandingRoles { scope: None, rows: vec![governor.clone()] },
+        state: Default::default(),
+    }));
+    assert_eq!(state.apply_event(&set), Applied::Updated);
+    let target = MetadataTarget::Entity(entity::role("dev", "platform", "governor", "fleet"));
+    let published = state.rebuild(&mint());
+    assert!(published.iter().any(|patch| patch.target == target && patch.set.contains_key("workspace.primary.state")));
+    assert!(
+        state.cursors().iter().any(|cursor| cursor.query == QueryId::StandingRoles { scope: None }),
+        "pm connector subscribes to standing roles"
+    );
+
+    let removal = DaemonEvent::ResultDelta(Box::new(ResultDelta {
+        seq: 2,
+        changes: QueryChanges::StandingRoles { scope: None, changed: vec![], removed: vec![governor.resource] },
+        state: None,
+    }));
+    assert_eq!(state.apply_event(&removal), Applied::Updated);
+    let retracted = state.rebuild(&mint());
+    let patch = retracted.iter().find(|patch| patch.target == target).expect("role retraction");
+    assert!(patch.unset.iter().any(|key| key == "workspace.primary.state"));
+}

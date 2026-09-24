@@ -31,7 +31,10 @@ use flotilla_manifest::{
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
-    result_set::{AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows},
+    result_set::{
+        AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows,
+        StandingRoleRow,
+    },
     DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -102,6 +105,7 @@ pub struct ConnectorState {
     awareness: Vec<AwarenessNode>,
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
+    standing_roles: HashMap<ResourceRef, StandingRoleRow>,
     seqs: HashMap<QueryId, u64>,
     catalog: Catalog,
     subscriber_id: uuid::Uuid,
@@ -113,6 +117,7 @@ impl Default for ConnectorState {
             awareness: Vec::new(),
             convoys: HashMap::new(),
             independents: HashMap::new(),
+            standing_roles: HashMap::new(),
             seqs: HashMap::new(),
             catalog: Catalog::default(),
             subscriber_id: uuid::Uuid::new_v4(),
@@ -143,6 +148,10 @@ impl ConnectorState {
                 self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
             Rows::Independents { scope: Some(_), .. } => return Applied::Ignored,
+            Rows::StandingRoles { scope: None, rows } => {
+                self.standing_roles = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+            }
+            Rows::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Awareness { rows, .. } => {
                 self.awareness = rows.clone();
             }
@@ -182,6 +191,15 @@ impl ConnectorState {
                 }
             }
             QueryChanges::Independents { scope: Some(_), .. } => return Applied::Ignored,
+            QueryChanges::StandingRoles { scope: None, changed: rows, removed } => {
+                for row in rows {
+                    self.standing_roles.insert(row.resource.clone(), row.clone());
+                }
+                for removed in removed {
+                    self.standing_roles.remove(removed);
+                }
+            }
+            QueryChanges::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Awareness { changed: rows, removed, .. } => {
                 self.awareness.retain(|node| !removed.contains(&node.id));
                 for row in rows {
@@ -206,8 +224,12 @@ impl ConnectorState {
     pub fn rebuild(&mut self, mint: &dyn RecipeMint) -> Vec<MetadataPatch> {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
         let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
+        let standing_roles: Vec<StandingRoleRow> = self.standing_roles.values().cloned().collect();
         let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
-        let next = project_catalog(&CatalogInput { awareness, convoys: &convoys, independents: &independents }, mint);
+        let next = project_catalog(
+            &CatalogInput { awareness, convoys: &convoys, independents: &independents, standing_roles: &standing_roles },
+            mint,
+        );
         let patches = next.diff_patches(&self.catalog);
         self.catalog = next;
         patches

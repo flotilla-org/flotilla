@@ -61,6 +61,17 @@ pub const KEY_VESSEL_HOST: &str = "flotilla.vessel.host";
 pub const KEY_INDEPENDENT_HOST: &str = "flotilla.independent.host";
 pub const KEY_VESSEL_ENV: &str = "flotilla.vessel.env";
 pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
+/// Standing project role (a `ConvoyEnsure` declaration). Distinct from
+/// `flotilla.crew.role(s)`, which name crew members aboard a vessel.
+pub const KEY_ROLE: &str = "flotilla.role";
+pub const KEY_ROLE_NAME: &str = "flotilla.role.name";
+/// Optional presentation annotation from the declaration, e.g. `fleet`.
+pub const KEY_ROLE_PRESENTS_AS: &str = "flotilla.role.presents_as";
+/// Why automatic admission is suspended: `backing_unverified | restart_limit`.
+pub const KEY_ROLE_HOLD: &str = "flotilla.role.hold";
+/// Boolean on convoy and vessel entities: this attempt was admitted by a
+/// standing-role declaration, whether or not that declaration is still known.
+pub const KEY_CONVOY_STANDING: &str = "flotilla.convoy.standing";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
 
@@ -106,6 +117,12 @@ pub const KEY_PRIMARY_ACTION_KEY: &str = "action.primary.key";
 pub const KEY_PRIMARY_ACTION_LABEL: &str = "action.primary.label";
 pub const KEY_PRIMARY_ACTION_VEHICLE: &str = "action.primary.vehicle";
 pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
+/// Managed primary content (Andamento): `ready | held`. Published together
+/// with [`KEY_WORKSPACE_PRIMARY_TARGET`], the recipe and the cwd.
+pub const KEY_WORKSPACE_PRIMARY_STATE: &str = "workspace.primary.state";
+/// Identity of the backing instance currently resolving the stable intent in
+/// [`KEY_PRIMARY_ACTION_TARGET`]. Changes whenever that instance is replaced.
+pub const KEY_WORKSPACE_PRIMARY_TARGET: &str = "workspace.primary.target";
 /// Labels for facts used as grouping levels. Identity facts stay canonical;
 /// these are display-only companions selected through `label-key`.
 pub const KEY_REPO_NAME: &str = "vcs.repo.name";

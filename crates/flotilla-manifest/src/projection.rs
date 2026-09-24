@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow,
-        IndependentRow, SessionPhase, VesselRow, WorkPhase,
+        IndependentRow, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
     },
     ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -18,12 +18,14 @@ use crate::{
     entity::{self, EntityRef},
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
-        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS,
-        KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
-        KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY,
-        KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME,
-        KEY_REPO_NAME, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST,
-        KEY_VESSEL_NAME, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW,
+        KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS,
+        KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
+        KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
+        KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS,
+        KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME,
+        KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT,
+        SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -34,6 +36,7 @@ pub struct CatalogInput<'a> {
     pub awareness: Option<&'a [AwarenessNode]>,
     pub convoys: &'a [ConvoyRow],
     pub independents: &'a [IndependentRow],
+    pub standing_roles: &'a [StandingRoleRow],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +172,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
             project_awareness_node(&mut catalog, node, input.convoys, mint);
         }
         mark_superseded_convoys(&mut catalog, input.convoys);
+        project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
         return catalog;
     }
     for convoy in input.convoys {
@@ -178,7 +182,119 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         project_independent(&mut catalog, independent, mint);
     }
     mark_superseded_convoys(&mut catalog, input.convoys);
+    project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
     catalog
+}
+
+/// Publish one stable entity per declared standing role and mark the attempts
+/// its declaration admitted. Attempts are related by `ensured_from`, never by
+/// convoy or role names: a task convoy sharing a role name is not standing.
+fn project_standing_roles(catalog: &mut Catalog, roles: &[StandingRoleRow], convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
+    let mut role_by_convoy = BTreeMap::new();
+    for convoy in convoys {
+        if convoy.ensured_from.is_none() {
+            continue;
+        }
+        let declared = roles
+            .iter()
+            .find(|role| role.resource.namespace == convoy.resource.namespace && Some(&role.resource.name) == convoy.ensured_from.as_ref());
+        let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+        role_by_convoy.insert(convoy_entity.id, declared.map(role_entity));
+    }
+    for facts in catalog.facts.values_mut() {
+        let Some(MetadataValue::Text(convoy)) = facts.get(KEY_CONVOY).map(|fact| &fact.value) else {
+            continue;
+        };
+        let Some(role) = role_by_convoy.get(convoy).cloned() else {
+            continue;
+        };
+        facts.insert(KEY_CONVOY_STANDING.to_owned(), MetadataValueUpdate::new(MetadataValue::Bool(true), Some(CATALOG_TTL_MS)));
+        if let Some(role) = role {
+            facts.insert(KEY_ROLE.to_owned(), MetadataValueUpdate::new(MetadataValue::text(role.id), Some(CATALOG_TTL_MS)));
+        }
+    }
+    for role in roles {
+        project_standing_role(catalog, role, convoys, mint);
+    }
+}
+
+fn role_project(role: &StandingRoleRow) -> &str {
+    role.project_ref.rsplit('/').next().unwrap_or(&role.project_ref)
+}
+
+fn role_entity(role: &StandingRoleRow) -> EntityRef {
+    entity::role(&role.resource.namespace, role_project(role), &role.role, "fleet")
+}
+
+fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
+    let entity = role_entity(role);
+    let project_name = role_project(role);
+    let project = entity::project(&role.resource.namespace, project_name, "fleet");
+    let mut attempts = convoys
+        .iter()
+        .filter(|convoy| convoy.resource.namespace == role.resource.namespace && convoy.ensured_from.as_ref() == Some(&role.resource.name))
+        .collect::<Vec<_>>();
+    attempts.sort_by_key(|convoy| convoy.generation);
+    let latest = attempts.last().copied();
+    let live = attempts.iter().rev().copied().find(|convoy| !convoy.phase.is_terminal());
+
+    // The primary target is the live attempt's only vessel. Multi-vessel
+    // attempts have no single attach target yet and stay held.
+    let attach =
+        live.and_then(|convoy| match convoy.vessels.as_slice() {
+            [vessel] => vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)).map(|recipe| {
+                (entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str()), recipe)
+            }),
+            _ => None,
+        });
+
+    let badge = match (role.hold, live) {
+        (Some(StandingRoleHold::RestartLimit), _) => Badge { state: BadgeState::Failed, attention: true },
+        (Some(StandingRoleHold::BackingUnverified), _) => Badge { state: BadgeState::Waiting, attention: true },
+        (None, Some(convoy)) => convoy_badge(convoy.phase, convoy.initializing),
+        // Between generations the ensure loop is expected to admit the next
+        // attempt; a superseded failure is not the role's current state.
+        (None, _) => Badge { state: BadgeState::Waiting, attention: false },
+    };
+    let summary = match (role.hold, live) {
+        (Some(_), _) | (None, None) => role.last_failure.clone().or_else(|| latest.and_then(|convoy| convoy.message.clone())),
+        (None, Some(convoy)) => convoy.message.clone(),
+    };
+
+    let mut facts = vec![
+        (SEGMENT_PROJECT, MetadataValue::text(project.id)),
+        (KEY_PROJECT_NAME, MetadataValue::text(project_name)),
+        (KEY_ROLE, MetadataValue::text(entity.id.clone())),
+        (KEY_ROLE_NAME, MetadataValue::text(role.role.clone())),
+        (KEY_DISPLAY_LABEL, MetadataValue::text(role.role.clone())),
+        (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
+    ];
+    facts.extend(label_tier_facts(&role.role));
+    if let Some(presents_as) = &role.presents_as {
+        facts.push((KEY_ROLE_PRESENTS_AS, MetadataValue::text(presents_as.clone())));
+    }
+    if let Some(hold) = role.hold {
+        facts.push((KEY_ROLE_HOLD, MetadataValue::text(hold.as_str())));
+    }
+    if let Some(convoy) = live {
+        facts.push((KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())));
+    }
+    if badge.attention {
+        facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
+    }
+    if let Some(summary) = summary {
+        facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(summary)));
+    }
+    match attach {
+        Some((target, recipe)) if role.hold.is_none() => {
+            facts.extend(action_facts(&entity, &recipe, "workspace"));
+            facts.push((KEY_WORKSPACE_PRIMARY_STATE, MetadataValue::text("ready")));
+            facts.push((KEY_WORKSPACE_PRIMARY_TARGET, MetadataValue::text(target.action_target())));
+        }
+        // Held retains whatever content a bound workspace already shows.
+        _ => facts.push((KEY_WORKSPACE_PRIMARY_STATE, MetadataValue::text("held"))),
+    }
+    catalog.assert_entity(entity, facts, None);
 }
 
 // Lifecycle identity comes from role addressing, never from display labels.

@@ -56,6 +56,9 @@ pub enum QueryId {
         #[serde(default)]
         limit: AwarenessLimit,
     },
+    /// Standing project roles declared by `ConvoyEnsure`, fleet-wide
+    /// (`None`) or in one Project. Rows are [`StandingRoleRow`].
+    StandingRoles { scope: Option<QueryScope> },
 }
 
 /// The Project scope owned by a curated query family. Repository membership
@@ -76,8 +79,12 @@ impl QueryScope {
 impl QueryId {
     /// Finite query families that are always materialized. Parameterized
     /// demand-backed queries cannot appear in a static list.
-    pub const ALWAYS_MATERIALIZED: &'static [QueryId] =
-        &[QueryId::Convoys { scope: None }, QueryId::Independents { scope: None }, QueryId::Checkouts { scope: None }];
+    pub const ALWAYS_MATERIALIZED: &'static [QueryId] = &[
+        QueryId::Convoys { scope: None },
+        QueryId::Independents { scope: None },
+        QueryId::Checkouts { scope: None },
+        QueryId::StandingRoles { scope: None },
+    ];
 
     pub fn family(&self) -> &'static str {
         match self {
@@ -86,6 +93,7 @@ impl QueryId {
             Self::Issues { .. } => "issues",
             Self::Checkouts { .. } => "checkouts",
             Self::Awareness { .. } => "awareness",
+            Self::StandingRoles { .. } => "standing_roles",
         }
     }
 }
@@ -176,6 +184,12 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<String>,
     },
+    StandingRoles {
+        scope: Option<QueryScope>,
+        changed: Vec<StandingRoleRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<ResourceRef>,
+    },
 }
 
 impl QueryChanges {
@@ -190,6 +204,7 @@ impl QueryChanges {
             Self::Awareness { scope, grouping, limit, .. } => {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
+            Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
         }
     }
 
@@ -200,12 +215,16 @@ impl QueryChanges {
             Self::Issues { changed, .. } => changed.len(),
             Self::Checkouts { changed, .. } => changed.len(),
             Self::Awareness { changed, .. } => changed.len(),
+            Self::StandingRoles { changed, .. } => changed.len(),
         }
     }
 
     pub fn removed_len(&self) -> usize {
         match self {
-            Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => removed.len(),
+            Self::Convoys { removed, .. }
+            | Self::Independents { removed, .. }
+            | Self::Checkouts { removed, .. }
+            | Self::StandingRoles { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
             Self::Awareness { removed, .. } => removed.len(),
         }
@@ -250,9 +269,19 @@ impl QueryChanges {
         }
     }
 
+    pub fn as_standing_roles(&self) -> Option<&[StandingRoleRow]> {
+        match self {
+            Self::StandingRoles { changed, .. } => Some(changed),
+            _ => None,
+        }
+    }
+
     pub fn removed_resources(&self) -> Option<&[ResourceRef]> {
         match self {
-            Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => Some(removed),
+            Self::Convoys { removed, .. }
+            | Self::Independents { removed, .. }
+            | Self::Checkouts { removed, .. }
+            | Self::StandingRoles { removed, .. } => Some(removed),
             Self::Issues { .. } | Self::Awareness { .. } => None,
         }
     }
@@ -260,7 +289,11 @@ impl QueryChanges {
     pub fn removed_issues(&self) -> Option<&[IssueRef]> {
         match self {
             Self::Issues { removed, .. } => Some(removed),
-            Self::Convoys { .. } | Self::Independents { .. } | Self::Checkouts { .. } | Self::Awareness { .. } => None,
+            Self::Convoys { .. }
+            | Self::Independents { .. }
+            | Self::Checkouts { .. }
+            | Self::Awareness { .. }
+            | Self::StandingRoles { .. } => None,
         }
     }
 }
@@ -340,6 +373,10 @@ pub enum Rows {
         limit: AwarenessLimit,
         rows: Vec<AwarenessNode>,
     },
+    StandingRoles {
+        scope: Option<QueryScope>,
+        rows: Vec<StandingRoleRow>,
+    },
 }
 
 impl Rows {
@@ -354,6 +391,7 @@ impl Rows {
             Self::Awareness { scope, grouping, limit, .. } => {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
+            Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
         }
     }
 
@@ -364,6 +402,7 @@ impl Rows {
             Self::Issues { rows, .. } => rows.len(),
             Self::Checkouts { rows, .. } => rows.len(),
             Self::Awareness { rows, .. } => rows.len(),
+            Self::StandingRoles { rows, .. } => rows.len(),
         }
     }
 
@@ -402,6 +441,13 @@ impl Rows {
     pub fn as_awareness(&self) -> Option<&[AwarenessNode]> {
         match self {
             Self::Awareness { rows, .. } => Some(rows),
+            _ => None,
+        }
+    }
+
+    pub fn as_standing_roles(&self) -> Option<&[StandingRoleRow]> {
+        match self {
+            Self::StandingRoles { rows, .. } => Some(rows),
             _ => None,
         }
     }
@@ -708,6 +754,52 @@ pub struct IndependentRow {
     pub phase: SessionPhase,
 }
 
+/// One row of the [`QueryId::StandingRoles`] result set: a standing
+/// project role as declared by its `ConvoyEnsure`. Attempts are related by
+/// [`ConvoyRow::ensured_from`] naming `resource.name`, never by display names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct StandingRoleRow {
+    /// The `ConvoyEnsure`; row identity and merge key across hosts.
+    pub resource: ResourceRef,
+    pub project_ref: String,
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presents_as: Option<String>,
+    /// Current attempt as recorded by the ensure controller. Driver-managed
+    /// ensures leave this empty; consumers resolve attempts through
+    /// [`ConvoyRow::ensured_from`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<StandingRoleHold>,
+    /// Consecutive failed generations in the current retry episode.
+    #[builder(default)]
+    #[serde(default)]
+    pub strikes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+}
+
+/// Why automatic admission of a standing role is suspended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandingRoleHold {
+    BackingUnverified,
+    RestartLimit,
+}
+
+impl StandingRoleHold {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BackingUnverified => "backing_unverified",
+            Self::RestartLimit => "restart_limit",
+        }
+    }
+}
+
 /// Convoy lifecycle phase as reported on query rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -827,6 +919,10 @@ pub struct ConvoyRow {
     /// The Project this convoy belongs to, from `ConvoySpec.project_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ref: Option<String>,
+    /// Name of the `ConvoyEnsure` that admitted this attempt. `None` for task
+    /// convoys, even when they carry a role address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensured_from: Option<String>,
     /// Issues represented by this convoy, captured at admission time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]

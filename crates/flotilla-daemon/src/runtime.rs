@@ -2356,6 +2356,7 @@ fn spawn_aggregator_task(
                     .run(
                         AggregatorResolvers::builder()
                             .durable_convoys(durable.including_replicas::<Convoy>(&namespace))
+                            .durable_convoy_ensures(durable.including_replicas::<flotilla_resources::ConvoyEnsure>(&namespace))
                             .durable_demands(durable.clone().using::<Demand>(&namespace))
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
                             .durable_presentations(durable.using::<Presentation>(&namespace))
