@@ -41,7 +41,8 @@ that Ghostty commit is `64daa599c531e6938bc4c52d9198a91f1e6ce8cf`
 from `rjwittams/ghostty`. Ghostty is MIT licensed; its `LICENSE` is copied
 to `/usr/share/doc/ghostty-terminfo/copyright`. The image does not set `TERM`:
 Cleat chooses the identity for each new session, and environments without this
-entry can still use `xterm-256color`.
+entry can still use `xterm-256color`. Update the recorded Ghostty commit when
+changing `CLEAT_REF`.
 
 The mounted Flotilla CLI connects back to the host daemon through the socket
 named by `FLOTILLA_DAEMON_SOCKET`. Docker mounts the socket's parent directory,
