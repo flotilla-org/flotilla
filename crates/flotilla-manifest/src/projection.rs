@@ -294,7 +294,15 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     let badge = match (role.hold, live) {
         (Some(StandingRoleHold::RestartLimit), _) => Badge { state: BadgeState::Failed, attention: true },
         (Some(StandingRoleHold::BackingUnverified), _) => Badge { state: BadgeState::Waiting, attention: true },
-        (None, Some(convoy)) => convoy_badge(convoy.phase, convoy.initializing),
+        // Presentations may show the role in place of its attempt, so the
+        // attempt's own attention (e.g. a vessel waiting for input) surfaces here.
+        (None, Some(convoy)) => {
+            let badge = convoy_badge(convoy.phase, convoy.initializing);
+            // The Aggregator folds vessel needs_attention into the convoy's, but
+            // other ConvoyRow producers need not, so vessels are checked too.
+            let vessel_attention = convoy.vessels.iter().any(|vessel| vessel.needs_attention || work_badge(vessel.phase).attention);
+            Badge { attention: badge.attention || convoy.needs_attention || vessel_attention, ..badge }
+        }
         // Between generations the ensure loop is expected to admit the next
         // attempt; a superseded failure is not the role's current state.
         (None, _) => Badge { state: BadgeState::Waiting, attention: false },

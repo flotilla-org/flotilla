@@ -1000,3 +1000,18 @@ fn shared_repository_entity_is_independent_of_convoy_generation_order() {
     assert_eq!(forward_patch.set, backward_patch.set);
     assert!(!forward_patch.set.contains_key(SEGMENT_PROJECT));
 }
+
+#[test]
+fn live_role_carries_its_attempts_vessel_attention() {
+    let role = standing_role("p", "governor");
+    let mut live =
+        attempt().name("convoy-a").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
+    let quiet = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
+    assert!(!find_entity(&quiet, &role_entity_for("p", "governor")).set.contains_key(KEY_STATUS_ATTENTION));
+
+    live.vessels[0].phase = WorkPhase::Ready;
+    let waiting = role_catalog(&[role], &[live]).reassert_patches();
+    let facts = find_entity(&waiting, &role_entity_for("p", "governor"));
+    assert_eq!(facts.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
+    assert_eq!(text(facts, KEY_STATUS_STATE), "active", "attention does not replace the attempt's state");
+}
