@@ -209,7 +209,7 @@ impl GitRepositoryInspector {
         };
         let ssh_config = match self.runner.run("ssh", &["-G", host], cwd, &ChannelLabel::Default).await {
             Ok(config) => config,
-            Err(_) if host.eq_ignore_ascii_case("forgejo-manchego") => return flotilla_resources::canonicalize_repo_url(remote),
+            Err(_) if flotilla_resources::is_known_forge_host(host) => return flotilla_resources::canonicalize_repo_url(remote),
             Err(_) => return Err(format!("unrecognised remote host alias `{host}`")),
         };
         let resolved = ssh_config
@@ -508,7 +508,6 @@ mod tests {
 
         assert_eq!(inspected.spec.live_remote(), Some("https://manchego.lab.flotilla.work/fork-issues/ghostty"));
         assert_eq!(inspected.transport_url.as_deref(), Some("forgejo-manchego:fork-issues/ghostty.git"));
-        assert_eq!(inspected.spec.live_remote(), Some("https://manchego.lab.flotilla.work/fork-issues/ghostty"));
         let forge = inspected.spec.forge().expect("effective live remote should determine forge attribution");
         assert_eq!(forge.service_url, "https://forgejo.lab.flotilla.work");
         assert_eq!(forge.repository, "fork-issues/ghostty");

@@ -412,6 +412,39 @@ fn declared_remotes_must_include_the_observed_repository_and_remain_unique() {
 }
 
 #[test]
+fn replacing_declared_remotes_requires_transport_continuity() {
+    let stable = "https://github.com/example/old-name";
+    let moved = "https://github.com/example/new-name";
+    let unrelated = "https://gitlab.com/other/project";
+    let original = RepositorySpec::remote(stable).expect("original repository");
+    assert!(original.clone().with_declared_remotes([unrelated]).is_err());
+    let moved_spec = original.update_remotes(moved).expect("observed move").with_declared_remotes([moved]).expect("retain observed remote");
+    assert_eq!(moved_spec.key(), RepositorySpec::remote(stable).expect("original repository").key());
+    assert_eq!(moved_spec.remotes(), [moved]);
+}
+
+#[tokio::test]
+async fn ensure_repository_promotes_an_existing_alias_when_it_becomes_live() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.using::<Repository>("flotilla");
+    let stable = "https://forgejo.lab.flotilla.work/robert/porthole-ops";
+    let alias = "https://manchego.lab.flotilla.work/robert/porthole-ops";
+    let stored = RepositorySpec::remote(stable)
+        .expect("repository")
+        .update_remotes(alias)
+        .expect("alias")
+        .update_remotes(stable)
+        .expect("stable live");
+    let observed = stored.clone().update_remotes(alias).expect("alias becomes live");
+    repositories.create(&InputMeta::builder().name(stored.key().to_string()).build(), &stored).await.expect("stored repository");
+
+    let updated = flotilla_resources::ensure_repository(&repositories, &observed.key(), &observed).await.expect("merge observation");
+
+    assert_eq!(updated.spec.live_remote(), Some(alias));
+    assert_eq!(updated.spec.remotes(), [alias, stable]);
+}
+
+#[test]
 fn remote_move_preserves_identity_and_tracks_live_forge() {
     let original = "https://github.com/example/old-name";
     let moved = "https://github.com/example/new-name";

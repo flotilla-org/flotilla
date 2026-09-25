@@ -129,7 +129,7 @@ impl RepositorySpec {
     pub fn remote(remote: impl Into<String>) -> Result<Self, String> {
         let remote = remote.into();
         if let Some(host) = ssh_remote_host(&remote) {
-            if !host.contains('.') && !host.eq_ignore_ascii_case("forgejo-manchego") {
+            if !host.contains('.') && !crate::is_known_forge_host(host) {
                 return Err(format!("SSH remote host `{host}` must be resolved before creating RepositorySpec"));
             }
         }
@@ -260,6 +260,9 @@ impl RepositorySpec {
         let mut unique = BTreeSet::new();
         if remotes.is_empty() || remotes.iter().any(|remote| !unique.insert(remote.clone())) {
             return Err("repository remotes must be non-empty and unique".to_string());
+        }
+        if !remotes.iter().any(|remote| self.remotes.contains(remote)) {
+            return Err("declared remotes must retain a previously known transport remote".to_string());
         }
         self.forge = Some(forge_from_canonical_remote(&remotes[0])?);
         self.remotes = remotes;
@@ -526,9 +529,7 @@ pub async fn ensure_repository(
         }
         let mut merged = repository.spec.clone();
         for remote in spec.remotes.iter().rev() {
-            if !merged.remotes.contains(remote) {
-                merged = merged.update_remotes(remote).map_err(ResourceError::invalid)?;
-            }
+            merged = merged.update_remotes(remote).map_err(ResourceError::invalid)?;
         }
         // Identity-only observations are common during provisioning and must not
         // erase provenance supplied by the per-repository config authority.

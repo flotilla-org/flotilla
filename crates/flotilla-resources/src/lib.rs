@@ -130,8 +130,8 @@ pub use project::{
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{
-    canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_repository_id, forge_repository_key, forge_service_host, repo_key,
-    ForgeRepositoryId,
+    canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_repository_id, forge_repository_key, forge_service_host,
+    is_known_forge_host, repo_key, ForgeRepositoryId,
 };
 pub use registry::{
     apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, delete_resource_kind, get_resource_kind,

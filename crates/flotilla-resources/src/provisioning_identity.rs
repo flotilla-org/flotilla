@@ -29,6 +29,10 @@ pub fn forge_service_host(forge_id: &str) -> &str {
     KNOWN_FORGES.iter().find(|forge| forge.id == forge_id).map_or(forge_id, |forge| forge.service_host)
 }
 
+pub fn is_known_forge_host(host: &str) -> bool {
+    KNOWN_FORGES.iter().any(|forge| forge.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(host)))
+}
+
 pub fn forge_repository_id(remote: &str) -> Result<ForgeRepositoryId, String> {
     let canonical = canonicalize_repo_url(remote)?;
     let (_, rest) = canonical.split_once("://").expect("canonical URL has scheme");
