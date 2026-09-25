@@ -115,10 +115,18 @@ Machinery lands in the research's build order (ownership enforcement → vocabul
 with the week's bugs as hand-written failing sequences → differential oracles →
 generated sequences → authority assertion → tables-as-monitor-δ). Resources enroll
 convoy-first (most-transitioned, and #1232/#1233 will grow it — it must be a
-checked machine before that growth), then Environment + MaterialPool lease (first
-fully-enforced machine; violations destroy credentials), then TerminalSession, then
-Checkout. PlacementPolicy is an ownership-first enrollee, refactoring #1236's
-unified write helper into the declared form.
+checked machine before that growth), then Environment (first fully-enforced
+machine), then TerminalSession, then Checkout. PlacementPolicy is an
+ownership-first enrollee, refactoring #1236's unified write helper into the
+declared form.
+
+> **Amendment (2026-09-25, #1932):** #1912 (PR #1931) removed the `MaterialPool`
+> resource, its lease machinery, and the `EnvironmentWaitReason` plumbing — the
+> codex credential is now static read-only material with no pool to lease from.
+> The enrollment order above dropped the `MaterialPool` lease enrollee, and the
+> lease-based safety-predicate examples in §4 (e.g. "a lease is never released
+> while its holder is pending") no longer describe a live resource; they remain
+> only as illustrations of the predicate *form*.
 
 ### 6. Explicitly rejected for now
 
