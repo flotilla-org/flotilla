@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv6Addr,
+};
 
 use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
@@ -210,9 +213,26 @@ pub enum IssueSourceResolution {
 /// Keep explicit schemes: a non-HTTPS service may be a distinct issue tracker.
 pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
     let service = source.service.trim().trim_end_matches('/');
-    let bare_host =
-        service.contains('.') || service.rsplit_once(':').is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
-    let service = if !service.contains("://") && bare_host { format!("https://{service}") } else { service.to_string() };
+    let service = if service.contains("://") {
+        service.to_string()
+    } else {
+        let authority = service.split('/').next().unwrap_or(service);
+        let path = &service[authority.len()..];
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port);
+        let bracketed_ipv6 = host_port.strip_prefix('[').and_then(|rest| rest.split_once(']')).is_some_and(|(address, suffix)| {
+            address.parse::<Ipv6Addr>().is_ok()
+                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(|port| port.parse::<u16>().is_ok()))
+        });
+        let host_with_port =
+            host_port.split_once(':').is_some_and(|(host, port)| !host.is_empty() && !port.contains(':') && port.parse::<u16>().is_ok());
+        if authority.parse::<Ipv6Addr>().is_ok() {
+            format!("https://[{authority}]{path}")
+        } else if host_port.contains('.') || bracketed_ipv6 || host_with_port {
+            format!("https://{service}")
+        } else {
+            service.to_string()
+        }
+    };
     let service = match service.split_once("://") {
         Some((scheme, authority)) => {
             let (host, path) = authority.split_once('/').unwrap_or((authority, ""));
@@ -422,7 +442,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn issue_source_normalization_preserves_userinfo_and_service_path() {
+    fn issue_source_normalization_handles_authority_and_path() {
         assert_eq!(
             normalize_issue_source(&IssueSource {
                 service: "https://user:Pass@Forge.Example/IssueRoot/".into(),
@@ -434,6 +454,18 @@ mod tests {
             service: "https://localhost:3000".into(),
             scope: "Org/Repo".into()
         });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "::1".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://[::1]".into(),
+            scope: "Org/Repo".into()
+        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
     }
 
     #[test]
