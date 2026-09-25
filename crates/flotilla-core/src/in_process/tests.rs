@@ -24,6 +24,17 @@ use crate::providers::{
 };
 
 #[test]
+fn missing_change_request_binding_explains_the_crew_role_without_a_placeholder() {
+    let explanation = explain_unmet_expectation(UnmetSettlementExpectation::MissingChangeRequestBinding {
+        vessel: "work".to_string(),
+        role: "coder".to_string(),
+    });
+    assert_eq!(explanation.reason, "missing_change_request_binding");
+    assert_eq!(explanation.subject, "crew/work/coder");
+    assert!(explanation.detail.contains("create and bind a ready PR"));
+}
+
+#[test]
 fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
     let claimed_at = chrono::Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).single().expect("timestamp");
     let status = ConvoyStatus {

@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    controller_patches, expected_checkout_refs, instantiate_exit, provisioning_patches, select_convoy_children, Convoy, ConvoyPhase,
-    ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InstantiatedExit, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    controller_patches, expected_change_request_leaves, expected_checkout_refs, instantiate_exit, provisioning_patches,
+    select_convoy_children, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InstantiatedExit, VesselRequirement,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -217,6 +217,8 @@ pub enum SettlementMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum UnmetSettlementExpectation {
+    MissingDecisionLedger { vessel: String, role: String },
+    ChangeRequestNotReady { record: String, detail: String },
     InvalidExpectedCheckouts { message: String },
     ExitEntryAwaitingBinding { disposition: String, subject: String },
     MissingCheckout { checkout: String },
@@ -225,12 +227,102 @@ pub enum UnmetSettlementExpectation {
     CheckoutConditionUnknown { checkout: String, condition: String },
     StaleCheckoutEvidence { checkout: String, condition: String, observed_at: Option<String> },
     MissingChangeRequest { record: String },
+    MissingChangeRequestBinding { vessel: String, role: String },
     StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
     ChangeRequestConditionFalse { record: String, value: Option<String> },
     InvalidCondition { subject: String, message: String },
     MissingObservedRef { reference: String },
     StaleObservedRef { reference: String, observed_at: String },
     ObservedDigestMismatch { reference: String, claimed: String, observed: String },
+}
+
+/// Preconditions for a crew member's claim, selected by the pinned workflow
+/// role. World-terminal exit leaves remain separate: a PR need not be merged
+/// when its author files the claim.
+pub struct CrewCompletionClaim<'a> {
+    pub vessel: &'a str,
+    pub role: &'a str,
+    pub decision_ledger_ref: Option<&'a str>,
+}
+
+pub fn evaluate_crew_completion(
+    convoy: &ResourceObject<Convoy>,
+    claim: CrewCompletionClaim<'_>,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    stale_after: std::time::Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<UnmetSettlementExpectation>, String> {
+    let CrewCompletionClaim { vessel, role, decision_ledger_ref } = claim;
+    let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    let crew = snapshot
+        .vessels
+        .iter()
+        .find(|candidate| candidate.name == vessel)
+        .and_then(|requirement| requirement.crew.iter().find(|candidate| candidate.role == role))
+        .ok_or_else(|| format!("workflow has no crew role `{vessel}/{role}`"))?;
+    let mut unmet = Vec::new();
+    for expectation in &crew.completion_expectations {
+        match expectation {
+            crate::CrewCompletionExpectation::DecisionLedger => {
+                if decision_ledger_ref.is_none() {
+                    unmet.push(UnmetSettlementExpectation::MissingDecisionLedger { vessel: vessel.to_string(), role: role.to_string() });
+                }
+            }
+            crate::CrewCompletionExpectation::ChangeRequestReady => {
+                if expected_checkout_refs(convoy)?.is_empty() && convoy.spec.change_request.is_none() {
+                    continue;
+                }
+                let leaves = expected_change_request_leaves(convoy, checkouts)?;
+                let names = leaves
+                    .iter()
+                    .filter_map(|leaf| match &leaf.address {
+                        flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
+                            Some(crate::change_request_record_name(service, scope, *number))
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if names.is_empty() {
+                    unmet.push(UnmetSettlementExpectation::MissingChangeRequestBinding {
+                        vessel: vessel.to_string(),
+                        role: role.to_string(),
+                    });
+                }
+                for name in names {
+                    match change_requests.get(&name) {
+                        None => unmet.push(UnmetSettlementExpectation::MissingChangeRequest { record: name }),
+                        Some(record) => {
+                            let Some(status) = record.status.as_ref() else {
+                                unmet.push(UnmetSettlementExpectation::ChangeRequestNotReady {
+                                    record: name,
+                                    detail: "change request has no observation".to_string(),
+                                });
+                                continue;
+                            };
+                            let fresh = |observed_at| now.signed_duration_since(observed_at).to_std().is_ok_and(|age| age <= stale_after);
+                            let merged = status.state.value == Some(crate::ObservedChangeRequestState::Merged);
+                            let detail = if !fresh(status.state.observed_at) || (!merged && !fresh(status.checks.observed_at)) {
+                                Some("change request observation is stale".to_string())
+                            } else if !merged && status.state.value != Some(crate::ObservedChangeRequestState::Open) {
+                                Some(format!("PR not ready (state: {:?})", status.state.value))
+                            } else if !merged && status.checks.value != Some(crate::ObservedChecks::Pass) {
+                                Some(format!("PR checks have not passed ({:?})", status.checks.value))
+                            } else {
+                                None
+                            };
+                            if let Some(detail) = detail {
+                                unmet.push(UnmetSettlementExpectation::ChangeRequestNotReady { record: name, detail });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(unmet)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

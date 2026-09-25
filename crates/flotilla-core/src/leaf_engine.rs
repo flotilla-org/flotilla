@@ -205,6 +205,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.observation_error(subject).await
     }
 
+    pub async fn refresh_change_request_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+        self.inner.change_requests.refresh_once(subject).await
+    }
+
     pub async fn rows(&self) -> Vec<LeafSubscriptionRow> {
         self.inner.rows.lock().await.values().cloned().collect()
     }

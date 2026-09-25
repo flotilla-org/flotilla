@@ -10138,6 +10138,7 @@ mod tests {
                         .crew(vec![
                             CrewSpec::builder()
                                 .role("coder".to_string())
+                                .completion_expectations(vec![flotilla_resources::CrewCompletionExpectation::DecisionLedger])
                                 .source(CrewSource::Agent {
                                     selector: Selector::for_capability("coding"),
                                     prompt: Some(
@@ -10267,8 +10268,7 @@ mod tests {
             .await
             .expect("dispatch refused completion");
         assert_eq!(wait_for_command_result(&mut rx, refused_complete_id).await, CommandValue::Error {
-            message: "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
-                .to_string(),
+            message: "crew completion expectations unmet: crew/implement/coder: post the decision ledger comment and pass its URL with `--decision-ledger-ref`".to_string(),
         });
         let after_refusal =
             convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");

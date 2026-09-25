@@ -6195,6 +6195,47 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
 }
 
 #[tokio::test]
+async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("unclaimed-work".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("record unclaimed work");
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "unclaimed-work".to_string() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain convoy");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("expected convoy explanation") };
+    assert_eq!(explanation.unclaimed_work.len(), 1);
+    assert_eq!(explanation.unclaimed_work[0].evidence, "work_complete");
+    assert!(explanation.decision_ledgers.is_empty());
+}
+
+#[tokio::test]
 async fn crew_completion_without_a_decision_ledger_is_refused() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
     let backend = daemon.resource_backend();
@@ -6217,6 +6258,11 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
                     flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
                 )]),
             )]),
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: flotilla_resources::interactive_single_workflow_spec().vessels,
+            }),
             ..Default::default()
         })
         .await
@@ -6249,10 +6295,7 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         )
         .await
         .expect_err("refuse completion without a ledger");
-    assert_eq!(
-        error,
-        "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
-    );
+    assert!(error.contains("post the decision ledger comment and pass its URL with `--decision-ledger-ref`"), "{error}");
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
     assert_eq!(status, before);

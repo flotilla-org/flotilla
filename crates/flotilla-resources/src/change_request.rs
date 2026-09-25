@@ -52,6 +52,7 @@ impl<T> Observation<T> {
 #[serde(rename_all = "snake_case")]
 pub enum ObservedChangeRequestState {
     Open,
+    Draft,
     Merged,
     Closed,
 }

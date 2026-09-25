@@ -248,8 +248,18 @@ pub struct CrewSpec {
     #[serde(flatten)]
     pub source: CrewSource,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completion_expectations: Vec<CrewCompletionExpectation>,
+    #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrewCompletionExpectation {
+    DecisionLedger,
+    ChangeRequestReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,6 +306,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Contained)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
+                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
                 .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
@@ -315,6 +326,7 @@ pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
+                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
                 .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
@@ -330,6 +342,7 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("shepherd".to_string())
+                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -348,6 +361,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
+                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -368,10 +382,12 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![
                 CrewSpec::builder()
                     .role("coder".to_string())
+                    .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
                     .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                     .build(),
                 CrewSpec::builder()
                     .role("reviewer".to_string())
+                    .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger])
                     .source(CrewSource::Agent {
                         selector: Selector::for_capability("code-review"),
                         prompt: None,

@@ -11,18 +11,102 @@ use common::{
 use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, Reconciler},
-    controller_patches, evaluate_landing_settlement, interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest,
-    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase,
-    CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
-    ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue,
-    IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
-    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, ReviewRefPair,
-    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase,
-    WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, implement_review_workflow_spec,
+    interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec,
+    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock,
+    ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource,
+    CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
+    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec,
+    RepositoryKey, ResourceBackend, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 struct AlwaysEligible;
+
+#[test]
+fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
+    let now = timestamp(100);
+    let mut spec = task_provisioning_convoy_spec();
+    spec.repositories[0].url = "https://github.com/flotilla-org/flotilla.git".to_string();
+    let repository_ref = spec.repositories[0].repo_ref.clone();
+    spec.adopted_checkout_refs.insert(repository_ref.clone(), "checkout-a".to_string());
+    spec.change_request =
+        Some(BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("Work".to_string()).build());
+    let workflow = implement_review_workflow_spec();
+    let status = ConvoyStatus {
+        workflow_snapshot: Some(WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels }),
+        ..Default::default()
+    };
+    let convoy = convoy_object("completion", spec, Some(status));
+    let record_name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+    let checkouts = BTreeMap::new();
+    let mut change_requests = BTreeMap::new();
+    let evaluate = |role: &str, ledger: Option<&str>, records: &BTreeMap<_, _>| {
+        evaluate_crew_completion(
+            &convoy,
+            flotilla_resources::CrewCompletionClaim { vessel: "work", role, decision_ledger_ref: ledger },
+            &checkouts,
+            records,
+            Duration::from_secs(300),
+            now,
+        )
+        .expect("evaluate role")
+    };
+    let missing = evaluate("coder", None, &change_requests);
+    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingDecisionLedger { .. })));
+    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingChangeRequest { .. })));
+    let mut unbound = convoy.clone();
+    unbound.spec.change_request = None;
+    let missing_binding = evaluate_crew_completion(
+        &unbound,
+        flotilla_resources::CrewCompletionClaim {
+            vessel: "work",
+            role: "coder",
+            decision_ledger_ref: Some("https://example.test/comment"),
+        },
+        &checkouts,
+        &change_requests,
+        Duration::from_secs(300),
+        now,
+    )
+    .expect("evaluate unbound PR");
+    assert_eq!(missing_binding, vec![UnmetSettlementExpectation::MissingChangeRequestBinding {
+        vessel: "work".to_string(),
+        role: "coder".to_string()
+    }]);
+    let reviewer = evaluate("reviewer", Some("https://example.test/comment"), &change_requests);
+    assert!(reviewer.is_empty(), "reviewer does not carry the coder's PR readiness obligation");
+
+    let record = |state, checks| flotilla_resources::ResourceObject::<ChangeRequest> {
+        metadata: common::object_meta(&record_name, "flotilla", "1"),
+        spec: ChangeRequestSpec::builder()
+            .service("github.com".to_string())
+            .scope("flotilla-org/flotilla".to_string())
+            .number(42)
+            .observing_authority("test".to_string())
+            .build(),
+        status: Some(ChangeRequestStatus {
+            state: Observation::known(state, now),
+            head_sha: Observation::known("abc".to_string(), now),
+            checks: Observation::known(checks, now),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, now),
+        }),
+    };
+    change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Draft, ObservedChecks::Pass));
+    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests)
+        .iter()
+        .any(|expectation| matches!(expectation, UnmetSettlementExpectation::ChangeRequestNotReady { detail, .. } if detail.contains("PR not ready"))));
+    change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Open, ObservedChecks::Pending));
+    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).iter().any(
+        |expectation| matches!(expectation, UnmetSettlementExpectation::ChangeRequestNotReady { detail, .. } if detail.contains("checks"))
+    ));
+    change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Open, ObservedChecks::Pass));
+    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).is_empty());
+    change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Merged, ObservedChecks::Pending));
+    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).is_empty());
+}
 
 #[async_trait]
 impl ConvoyTeardownRuntime for AlwaysEligible {
