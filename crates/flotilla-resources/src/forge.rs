@@ -2,9 +2,38 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass};
+use crate::{status_patch::NoStatusPatch, ApiPaths, InputMeta, ReplicationClass, Resource, ResourceError};
 
-define_resource!(Forge, "forges", ForgeSpec, (), NoStatusPatch, replication = ReplicationClass::Definitions);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Forge;
+
+impl Resource for Forge {
+    type Spec = ForgeSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "forges", kind: "Forge" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
+
+    fn validate_spec(meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
+        if meta.name != spec.forge_id || spec.forge_id.trim().is_empty() {
+            return Err(ResourceError::invalid("Forge resource name must equal a non-empty forge_id"));
+        }
+        if spec.hosts.is_empty() || spec.hosts.iter().any(|host| host.trim().is_empty() || host.contains('/')) {
+            return Err(ResourceError::invalid("Forge hosts must be non-empty hostnames or SSH aliases"));
+        }
+        let Some(front) = spec.https_url.strip_prefix("https://") else {
+            return Err(ResourceError::invalid("Forge https_url must use HTTPS"));
+        };
+        if front.trim_matches('/').is_empty() || front.trim_end_matches('/').contains('/') {
+            return Err(ResourceError::invalid("Forge https_url must name a host without a path"));
+        }
+        if spec.git_ssh_host.trim().is_empty() || spec.git_ssh_host.contains('/') || spec.git_ssh_host.contains(char::is_whitespace) {
+            return Err(ResourceError::invalid("Forge git_ssh_host must be a hostname or SSH alias"));
+        }
+        Ok(())
+    }
+}
 
 /// A fleet-wide identity and transport declaration for one forge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

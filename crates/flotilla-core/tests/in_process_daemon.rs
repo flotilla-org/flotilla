@@ -4625,6 +4625,22 @@ struct ForgeAliasInspector {
     path: PathBuf,
 }
 
+fn lab_forge_spec() -> flotilla_resources::ForgeSpec {
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
+    ForgeSpec::builder()
+        .forge_id("flotilla-lab".to_string())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from([
+            "forgejo.lab.flotilla.work".to_string(),
+            "manchego.lab.flotilla.work".to_string(),
+            "forgejo-manchego".to_string(),
+        ]))
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("manchego.lab.flotilla.work".to_string())
+        .build()
+}
+
 #[async_trait]
 impl RepositoryInspector for ForgeAliasInspector {
     async fn inspect_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
@@ -4645,7 +4661,7 @@ impl RepositoryInspector for ForgeAliasInspector {
 
 #[tokio::test]
 async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
-    use flotilla_resources::{Forge, ForgeKind, ForgeSpec, RepositoryIdentity};
+    use flotilla_resources::{Forge, ProjectRepositoryRole, RepositoryIdentity};
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
@@ -4653,17 +4669,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let daemon =
         InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
     daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
-    let forge = ForgeSpec::builder()
-        .forge_id("flotilla-lab".to_string())
-        .kind(ForgeKind::Forgejo)
-        .hosts(BTreeSet::from([
-            "forgejo.lab.flotilla.work".to_string(),
-            "manchego.lab.flotilla.work".to_string(),
-            "forgejo-manchego".to_string(),
-        ]))
-        .https_url("https://forgejo.lab.flotilla.work".to_string())
-        .git_ssh_host("manchego.lab.flotilla.work".to_string())
-        .build();
+    let forge = lab_forge_spec();
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -4687,8 +4693,20 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
             issue_sources: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
-                ProjectRepositorySpec { repo: front.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
-                ProjectRepositorySpec { repo: ssh.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+                ProjectRepositorySpec {
+                    repo: front.key(),
+                    alias: None,
+                    roles: [ProjectRepositoryRole::Code].into(),
+                    subpath: None,
+                    default_branch: None,
+                },
+                ProjectRepositorySpec {
+                    repo: ssh.key(),
+                    alias: None,
+                    roles: [ProjectRepositoryRole::Ops].into(),
+                    subpath: None,
+                    default_branch: None,
+                },
             ],
         })
         .await
@@ -4704,6 +4722,121 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let project = projects.get("ghostty").await.expect("migrated project");
     assert_eq!(project.spec.repositories.len(), 1);
     assert_eq!(project.spec.repositories[0].repo, inspected.key());
+    assert_eq!(project.spec.repositories[0].roles, [ProjectRepositoryRole::Code, ProjectRepositoryRole::Ops].into());
+
+    let mut overlap = lab_forge_spec();
+    overlap.forge_id = "other-lab".to_string();
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("other-lab".to_string()).build(), &overlap)
+        .await
+        .expect("declare overlapping forge");
+    let error = daemon.inspect_repository_path(&repo, None).await.expect_err("overlapping Forge hosts must be ambiguous");
+    assert!(error.contains("multiple Forge definitions"), "{error}");
+}
+
+#[tokio::test]
+async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_repositories() {
+    use flotilla_resources::{Forge, ProjectRepositoryRole};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("ghostty-ops");
+    std::fs::create_dir_all(&repo).expect("create repository path");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &lab_forge_spec())
+        .await
+        .expect("declare forge");
+    let front = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops").expect("front");
+    let ssh = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops").expect("ssh");
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    for spec in [&front, &ssh] {
+        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("legacy Repository");
+    }
+    daemon
+        .resource_backend()
+        .definitions::<Project>("flotilla")
+        .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            display_name: "ghostty".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_sources: Vec::new(),
+            dispatch_policy: None,
+            repositories: vec![
+                ProjectRepositorySpec {
+                    repo: front.key(),
+                    alias: Some("front".to_string()),
+                    roles: [ProjectRepositoryRole::Code].into(),
+                    subpath: None,
+                    default_branch: None,
+                },
+                ProjectRepositorySpec {
+                    repo: ssh.key(),
+                    alias: Some("ssh".to_string()),
+                    roles: [ProjectRepositoryRole::Ops].into(),
+                    subpath: None,
+                    default_branch: None,
+                },
+            ],
+        })
+        .await
+        .expect("legacy project");
+
+    let error = daemon.inspect_repository_path(&repo, None).await.expect_err("aliases need operator resolution");
+    assert!(error.contains("aliases `front` and `ssh`") && error.contains("resolve the aliases"), "{error}");
+    let target = ssh.clone().on_forge(&lab_forge_spec()).expect("forge identity").key();
+    assert!(matches!(repositories.get(&target.to_string()).await, Err(ResourceError::NotFound { .. })));
+    repositories.get(&front.key().to_string()).await.expect("front legacy Repository preserved");
+    repositories.get(&ssh.key().to_string()).await.expect("ssh legacy Repository preserved");
+}
+
+#[tokio::test]
+async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
+    use flotilla_resources::{Forge, InMemoryBackend};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("ghostty-ops");
+    std::fs::create_dir_all(&repo).expect("create repository path");
+    let source_root = NodeId::new("source-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(source_root.clone());
+    let target = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("target-root"));
+    let old = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops")
+        .expect("legacy Repository")
+        .with_allow_reviewless_workflows(true);
+    source
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(old.key().to_string()).build(), &old)
+        .await
+        .expect("author legacy Repository");
+    let snapshot = source.using::<Repository>("flotilla").list().await.expect("source list");
+    target
+        .replica_writer::<Repository>(source_root, "flotilla")
+        .replace(&snapshot, chrono::Utc::now())
+        .await
+        .expect("replicate Repository");
+    target
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &lab_forge_spec())
+        .await
+        .expect("declare forge");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        test_config_store(temp.path().join("config")),
+        fake_discovery(false),
+        HostName::local(),
+        target.clone(),
+    )
+    .await;
+    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+
+    let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve replica-only identity");
+    let merged = target.using::<Repository>("flotilla").get(&inspected.key().to_string()).await.expect("local canonical Repository");
+    assert!(merged.spec.allows_reviewless_workflows());
+    assert_eq!(merged.spec.remotes().len(), 2);
 }
 
 #[tokio::test]

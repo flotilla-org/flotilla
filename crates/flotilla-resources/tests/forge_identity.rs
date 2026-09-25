@@ -73,3 +73,19 @@ async fn forge_definition_is_visible_from_a_replica() {
     let replica = destination.definitions::<Forge>("flotilla").get("flotilla-lab").await.expect("replicated forge");
     assert_eq!(replica.spec, lab());
 }
+
+#[tokio::test]
+async fn malformed_forge_definition_is_rejected_when_authored() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let forges = backend.definitions::<Forge>("flotilla");
+    let wrong_name = forges.create(&InputMeta::builder().name("other".to_string()).build(), &lab()).await;
+    assert!(wrong_name.expect_err("forge_id must match resource name").to_string().contains("forge_id"));
+    let mut no_hosts = lab();
+    no_hosts.hosts.clear();
+    let invalid_hosts = forges.create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &no_hosts).await;
+    assert!(invalid_hosts.expect_err("empty aliases must be rejected").to_string().contains("hosts"));
+    let mut insecure_front = lab();
+    insecure_front.https_url = "http://forgejo.lab.flotilla.work".to_string();
+    let invalid_front = forges.create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &insecure_front).await;
+    assert!(invalid_front.expect_err("HTTPS front is required").to_string().contains("HTTPS"));
+}

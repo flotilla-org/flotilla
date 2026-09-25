@@ -16,6 +16,9 @@ spec:
       schema:
         openAPIV3Schema:
           type: object
+          x-kubernetes-validations:
+            - rule: "self.metadata.name == self.spec.forge_id"
+              message: "Forge resource name must equal forge_id"
           properties:
             spec:
               type: object
@@ -23,14 +26,19 @@ spec:
               properties:
                 forge_id:
                   type: string
+                  minLength: 1
                 kind:
                   type: string
                   enum: [github, forgejo]
                 hosts:
                   type: array
+                  minItems: 1
                   items:
                     type: string
+                    minLength: 1
                 https_url:
                   type: string
+                  pattern: '^https://[^/]+/?$'
                 git_ssh_host:
                   type: string
+                  minLength: 1
