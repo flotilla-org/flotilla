@@ -23,7 +23,12 @@ struct Record {
     publication: Publication,
     expires_at: u64,
     sender: Option<mpsc::UnboundedSender<ByteStream>>,
-    streams: Vec<JoinHandle<()>>,
+    streams: Vec<OpenStream>,
+}
+
+struct OpenStream {
+    caller: Fingerprint,
+    task: JoinHandle<()>,
 }
 
 struct State {
@@ -63,7 +68,25 @@ impl MemoryTender {
 
     pub fn grant(&self, grant: Grant) {
         let mut state = self.inner.lock().expect("state lock");
-        state.grants.insert((grant.grantee.clone(), grant.namespace.clone()), grant);
+        state.grants.insert((grant.grantee.clone(), grant.namespace.clone()), grant.clone());
+        let current = grant;
+        let now = state.now;
+        for record in state.records.values_mut() {
+            if record.publication.publisher == current.grantee && record.publication.namespace == current.namespace {
+                record.expires_at = current.expires_at;
+                record.publication.audience.retain(|member| current.audience_ceiling.contains(member));
+                for stream in &record.streams {
+                    if !record.publication.audience.contains(&stream.caller) {
+                        stream.task.abort();
+                    }
+                }
+                record.streams.retain(|stream| !stream.task.is_finished());
+                if current.expires_at <= now {
+                    retire(record, false);
+                }
+            }
+        }
+        state.notify();
     }
 
     pub fn allow_browse(&self, caller: Fingerprint) {
@@ -121,7 +144,7 @@ impl MemoryTender {
 
 fn abort_streams(record: &mut Record) {
     for stream in record.streams.drain(..) {
-        stream.abort();
+        stream.task.abort();
     }
 }
 
@@ -169,7 +192,7 @@ impl State {
         if !self.connect.contains(&session.caller) {
             return Err(Error::Denied);
         }
-        let record = self.records.get_mut(&id).ok_or(Error::UnknownPublication)?;
+        let record = self.records.get_mut(&id).ok_or(Error::Denied)?;
         if !record.publication.audience.contains(&session.caller) {
             return Err(Error::Denied);
         }
@@ -295,10 +318,11 @@ impl Tender for MemoryTender {
         let (client, mut relay_client) = io::duplex(64);
         let (service, mut relay_service) = io::duplex(64);
         sender.send(Box::new(service)).map_err(|_| Error::Unavailable)?;
-        record.streams.retain(|stream| !stream.is_finished());
-        record.streams.push(tokio::spawn(async move {
+        record.streams.retain(|stream| !stream.task.is_finished());
+        let task = tokio::spawn(async move {
             let _ = io::copy_bidirectional(&mut relay_client, &mut relay_service).await;
-        }));
+        });
+        record.streams.push(OpenStream { caller: session.caller.clone(), task });
         Ok(Box::new(client))
     }
 
@@ -308,7 +332,7 @@ impl Tender for MemoryTender {
         if !state.connect.contains(&session.caller) {
             return Err(Error::Denied);
         }
-        let record = state.records.get(&id).ok_or(Error::UnknownPublication)?;
+        let record = state.records.get(&id).ok_or(Error::Denied)?;
         if !record.publication.audience.contains(&session.caller) {
             return Err(Error::Denied);
         }

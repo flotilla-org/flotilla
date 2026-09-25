@@ -281,6 +281,25 @@ async fn publisher_receiver_closure(rig: Rig) {
     assert!(matches!(rig.tender.connect(&client, id).await, Err(Error::Unavailable)));
 }
 
+async fn narrowed_grant_removes_live_audience(rig: Rig) {
+    let publisher = session("owner", &rig.host_id);
+    let kept = reader(&rig, "kept");
+    let removed = reader(&rig, "removed");
+    grant(&rig, "owner", "n", &["kept", "removed"], 100);
+    let mut published = rig.tender.publish(&publisher, request("n", "service", &["kept", "removed"], None)).await.expect("publish");
+    let mut watch = rig.tender.watch(&removed).await.expect("watch");
+    assert_eq!(watch.recv().await.expect("initial").len(), 1);
+    let mut old_stream = rig.tender.connect(&removed, published.lease.id).await.expect("old access");
+    let _service = published.incoming.recv().await.expect("incoming");
+    grant(&rig, "owner", "n", &["kept"], 100);
+    assert!(watch.recv().await.expect("narrowed").is_empty());
+    assert!(matches!(rig.tender.connect(&removed, published.lease.id).await, Err(Error::Denied)));
+    assert!(matches!(rig.tender.connect(&removed, PublicationId(u64::MAX)).await, Err(Error::Denied)));
+    let mut byte = [0];
+    assert_eq!(timeout(Duration::from_secs(1), old_stream.read(&mut byte)).await.expect("removed stream closes").expect("read"), 0);
+    round_trip(&rig, &kept, published.lease.id, &mut published.incoming).await;
+}
+
 async fn backpressure_and_cancel(rig: Rig) {
     let publisher = session("owner", &rig.host_id);
     let client = reader(&rig, "consumer");
@@ -324,4 +343,5 @@ contract!(grant_loss_and_expiry);
 contract!(no_replay_or_rebind);
 contract!(restart_and_replacement);
 contract!(publisher_receiver_closure);
+contract!(narrowed_grant_removes_live_audience);
 contract!(backpressure_and_cancel);
