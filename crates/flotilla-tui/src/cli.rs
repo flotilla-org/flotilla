@@ -696,7 +696,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     }
 
     if !explanation.unclaimed_work.is_empty() {
-        output.push_str("\nWork done, settlement claim missing:\n");
+        output.push_str("\nCrew work needing a settlement claim:\n");
         for work in &explanation.unclaimed_work {
             let _ = writeln!(output, "  - {}/{} ({})", work.vessel, work.role, work.evidence.replace('_', " "));
         }

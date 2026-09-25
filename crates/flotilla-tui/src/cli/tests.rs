@@ -57,7 +57,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 
     let output = format_convoy_explanation_human(&explanation);
     assert!(output.contains("Message: waiting for review evidence"));
-    assert!(output.contains("Work done, settlement claim missing:\n  - work/coder (work complete)"));
+    assert!(output.contains("Crew work needing a settlement claim:\n  - work/coder (work complete)"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
     assert!(output.contains(
