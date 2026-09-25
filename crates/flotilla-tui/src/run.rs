@@ -116,8 +116,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     crate::terminal::restore_terminal();
                     return Ok(EventLoopExit::DaemonDisconnected(Box::new(app)));
                 }
-                Event::CommandDispatchCompleted { result, pending_ctx } => {
-                    app::executor::handle_dispatch_completion(result, pending_ctx, &mut app);
+                Event::CommandDispatchCompleted { session_id, result, pending_ctx } => {
+                    app::executor::handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
                 }
                 Event::AttachDispatchCompleted(result) => {
                     app::executor::handle_attach_dispatch_completion(result, &mut app);

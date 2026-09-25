@@ -17,7 +17,7 @@ pub enum Event {
     Mouse(crossterm::event::MouseEvent),
     Daemon(Box<DaemonEvent>),
     DaemonDisconnected,
-    CommandDispatchCompleted { result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
+    CommandDispatchCompleted { session_id: uuid::Uuid, result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
     AttachDispatchCompleted(Result<CommandValue, String>),
     FleetHealthRefreshed(Result<CommandValue, String>),
 }
@@ -173,12 +173,17 @@ mod tests {
         handler.pause_terminal_input().await;
         let sender = handler.sender();
         sender.send(Event::Tick).expect("event handler should remain open");
-        sender.send(Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None }).expect("event handler should remain open");
+        let session_id = uuid::Uuid::new_v4();
+        sender
+            .send(Event::CommandDispatchCompleted { session_id, result: Ok(42), pending_ctx: None })
+            .expect("event handler should remain open");
         sender.send(Event::AttachDispatchCompleted(Err("attach failed".into()))).expect("event handler should remain open");
 
         handler.pause_terminal_input().await;
 
-        assert!(matches!(handler.try_next(), Some(Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None })));
+        assert!(
+            matches!(handler.try_next(), Some(Event::CommandDispatchCompleted { session_id: id, result: Ok(42), pending_ctx: None }) if id == session_id)
+        );
         assert!(matches!(handler.try_next(), Some(Event::AttachDispatchCompleted(Err(message))) if message == "attach failed"));
         assert!(handler.try_next().is_none(), "ticks should not survive a terminal pause");
     }
