@@ -3,7 +3,7 @@
 display_name: Jackstay push
 default_workflow_ref: implement-review
 
-issue_sources:
+issue_source_bindings:
   - role: primary
     source:
       service: https://github.com

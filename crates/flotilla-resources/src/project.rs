@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::Ipv6Addr,
+};
 
 use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
@@ -16,7 +19,7 @@ pub struct ProjectSpec {
     pub default_workflow_ref: String,
     #[builder(default)]
     #[serde(default)]
-    pub issue_sources: Vec<IssueSourceBindingSpec>,
+    pub issue_source_bindings: Vec<IssueSourceBindingSpec>,
     #[builder(default)]
     #[serde(default)]
     pub repositories: Vec<ProjectRepositorySpec>,
@@ -206,6 +209,49 @@ pub enum IssueSourceResolution {
     Unavailable(IssueSourceUnavailable),
 }
 
+/// Use the same HTTPS host identity as repository remotes for bare forge hosts.
+/// Keep explicit schemes: a non-HTTPS service may be a distinct issue tracker.
+pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
+    let service = source.service.trim().trim_end_matches('/');
+    let service = if service.contains("://") {
+        service.to_string()
+    } else {
+        let authority = service.split('/').next().unwrap_or(service);
+        let path = &service[authority.len()..];
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port);
+        let bracketed_ipv6 = host_port.strip_prefix('[').and_then(|rest| rest.split_once(']')).is_some_and(|(address, suffix)| {
+            address.parse::<Ipv6Addr>().is_ok()
+                && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(|port| port.parse::<u16>().is_ok()))
+        });
+        let host_with_port =
+            host_port.split_once(':').is_some_and(|(host, port)| !host.is_empty() && !port.contains(':') && port.parse::<u16>().is_ok());
+        if authority.parse::<Ipv6Addr>().is_ok() {
+            format!("https://[{authority}]{path}")
+        } else if host_port.contains('.') || bracketed_ipv6 || host_with_port {
+            format!("https://{service}")
+        } else {
+            service.to_string()
+        }
+    };
+    let service = match service.split_once("://") {
+        Some((scheme, authority)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            let (host, path) = authority.split_once('/').unwrap_or((authority, ""));
+            let host = match host.rsplit_once('@') {
+                Some((userinfo, host)) => format!("{userinfo}@{}", host.to_ascii_lowercase()),
+                None => host.to_ascii_lowercase(),
+            };
+            if path.is_empty() {
+                format!("{scheme}://{host}")
+            } else {
+                format!("{scheme}://{host}/{path}")
+            }
+        }
+        None => service,
+    };
+    IssueSource { service, scope: source.scope.trim().trim_matches('/').to_string() }
+}
+
 pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
     let mut bindings = Vec::new();
     for project_repository in &project.repositories {
@@ -219,8 +265,8 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
             }
         };
         if let Some(forge) = repository.object.spec.issue_source_forge() {
-            let source = IssueSource { service: forge.service_url, scope: forge.repository };
-            let declaration = project.issue_sources.iter().find(|binding| binding.source == source);
+            let source = normalize_issue_source(&IssueSource { service: forge.service_url, scope: forge.repository });
+            let declaration = project.issue_source_bindings.iter().find(|binding| binding.source == source);
             if declaration.is_some_and(|binding| binding.exclude) {
                 continue;
             }
@@ -240,7 +286,7 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
         }
     }
 
-    for declaration in project.issue_sources.iter().filter(|binding| !binding.exclude) {
+    for declaration in project.issue_source_bindings.iter().filter(|binding| !binding.exclude) {
         if bindings.iter().any(|binding| binding.source == declaration.source) {
             continue;
         }
@@ -273,12 +319,13 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
     spec.display_name = required_value(spec.display_name, "display_name")?;
     spec.default_workflow_ref = required_value(spec.default_workflow_ref, "default_workflow_ref")?;
-    for binding in &mut spec.issue_sources {
-        binding.source.service = required_value(std::mem::take(&mut binding.source.service), "issue_sources[].source.service")?;
-        binding.source.scope = required_value(std::mem::take(&mut binding.source.scope), "issue_sources[].source.scope")?;
-        binding.alias = binding.alias.take().map(|alias| required_value(alias, "issue_sources[].alias")).transpose()?;
-        normalize_issue_fields(&mut binding.filter.match_fields, "issue_sources[].filter.match_fields")?;
-        normalize_issue_fields(&mut binding.create_with, "issue_sources[].create_with")?;
+    for binding in &mut spec.issue_source_bindings {
+        binding.source.service = required_value(std::mem::take(&mut binding.source.service), "issue_source_bindings[].source.service")?;
+        binding.source.scope = required_value(std::mem::take(&mut binding.source.scope), "issue_source_bindings[].source.scope")?;
+        binding.source = normalize_issue_source(&binding.source);
+        binding.alias = binding.alias.take().map(|alias| required_value(alias, "issue_source_bindings[].alias")).transpose()?;
+        normalize_issue_fields(&mut binding.filter.match_fields, "issue_source_bindings[].filter.match_fields")?;
+        normalize_issue_fields(&mut binding.create_with, "issue_source_bindings[].create_with")?;
         if binding.filter.match_fields.keys().chain(binding.create_with.keys()).any(|field| field.eq_ignore_ascii_case("state")) {
             return Err("issue source bindings cannot configure state".to_string());
         }
@@ -315,12 +362,12 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
     if aliases.len() != spec.repositories.iter().filter(|repository| repository.alias.is_some()).count() {
         return Err("project contains a duplicate repository alias".to_string());
     }
-    let declared_aliases = spec.issue_sources.iter().filter_map(|binding| binding.alias.as_deref()).collect::<BTreeSet<_>>();
-    if declared_aliases.len() != spec.issue_sources.iter().filter(|binding| binding.alias.is_some()).count() {
+    let declared_aliases = spec.issue_source_bindings.iter().filter_map(|binding| binding.alias.as_deref()).collect::<BTreeSet<_>>();
+    if declared_aliases.len() != spec.issue_source_bindings.iter().filter(|binding| binding.alias.is_some()).count() {
         return Err("project contains a duplicate issue source alias".to_string());
     }
-    spec.issue_sources.sort_by(|left, right| left.source.cmp(&right.source));
-    if spec.issue_sources.windows(2).any(|pair| pair[0].source == pair[1].source) {
+    spec.issue_source_bindings.sort_by(|left, right| left.source.cmp(&right.source));
+    if spec.issue_source_bindings.windows(2).any(|pair| pair[0].source == pair[1].source) {
         return Err("project contains duplicate issue source declarations".to_string());
     }
     spec.repositories.sort_by(|left, right| (&left.repo, &left.subpath).cmp(&(&right.repo, &right.subpath)));
@@ -396,6 +443,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue_source_normalization_handles_authority_and_path() {
+        assert_eq!(
+            normalize_issue_source(&IssueSource {
+                service: "https://user:Pass@Forge.Example/IssueRoot/".into(),
+                scope: "/Org/Repo/".into(),
+            }),
+            IssueSource { service: "https://user:Pass@forge.example/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "localhost:3000".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://localhost:3000".into(),
+            scope: "Org/Repo".into()
+        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "::1".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://[::1]".into(),
+            scope: "Org/Repo".into()
+        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "HTTPS://GitHub.COM".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://github.com".into(),
+            scope: "Org/Repo".into()
+        });
+    }
+
+    #[test]
     fn dispatch_policy_defaults_to_enabled_with_a_staleness_threshold() {
         let policy: DispatchPolicy = serde_json::from_str("{}").expect("policy defaults");
 
@@ -408,7 +486,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
-            issue_sources: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
+            issue_source_bindings: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("acme/widgets".to_string()),
                 alias: None,
@@ -438,7 +516,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             repositories: vec![member("ghostty"), member("ghostty-ops")],
             dispatch_policy: None,
         };

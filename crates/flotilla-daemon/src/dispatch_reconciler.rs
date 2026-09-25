@@ -481,7 +481,7 @@ mod tests {
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
                 display_name: "Widgets".to_string(),
                 default_workflow_ref: "implement".to_string(),
-                issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+                issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
                     .source(source())
                     .alias("widgets".to_string())
                     .build()],

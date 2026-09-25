@@ -2,7 +2,7 @@
 display_name: Presentation
 default_workflow_ref: single-agent-contained
 
-issue_sources:
+issue_source_bindings:
   - role: primary
     source:
       service: https://github.com
