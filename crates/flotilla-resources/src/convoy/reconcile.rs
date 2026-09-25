@@ -485,47 +485,14 @@ fn evaluate_landing_settlement_with_disposition(
     }
 
     let mut unmet = if disposition.is_some() { Vec::new() } else { table_unmet };
-    let bound_repository = convoy.spec.change_request.as_ref().map(|bound| &bound.repository_ref);
+    // The exit table evaluates bound and observed change requests. A present
+    // checkout without one is context, so its landed condition cannot block settlement.
     for name in expected {
         if disposition.is_some() && !checkouts.contains_key(&name) && checkout_expectation_is_discharged(convoy, vessels, &name) {
             continue;
         }
-        let Some(checkout) = checkouts.get(&name) else {
+        if !checkouts.contains_key(&name) {
             unmet.push(UnmetSettlementExpectation::MissingCheckout { checkout: name });
-            continue;
-        };
-        let has_expected_change_request = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()).is_some()
-            || bound_repository == Some(checkout.spec.repo_ref());
-        if has_expected_change_request {
-            continue;
-        }
-        let Some(status) = checkout.status.as_ref() else {
-            unmet.push(UnmetSettlementExpectation::MissingCheckoutStatus { checkout: name });
-            continue;
-        };
-        let condition = &status.integration.landed;
-        match condition.value {
-            crate::ConditionValue::False => {
-                unmet.push(UnmetSettlementExpectation::CheckoutConditionFalse { checkout: name, condition: "landed".to_string() })
-            }
-            crate::ConditionValue::Unknown => {
-                unmet.push(UnmetSettlementExpectation::CheckoutConditionUnknown { checkout: name, condition: "landed".to_string() })
-            }
-            crate::ConditionValue::True => {
-                let fresh = condition
-                    .observed_at
-                    .as_deref()
-                    .and_then(|observed_at| DateTime::parse_from_rfc3339(observed_at).ok())
-                    .and_then(|observed_at| now.signed_duration_since(observed_at).to_std().ok())
-                    .is_some_and(|age| age < landing_evidence_stale_after);
-                if !fresh {
-                    unmet.push(UnmetSettlementExpectation::StaleCheckoutEvidence {
-                        checkout: name,
-                        condition: "landed".to_string(),
-                        observed_at: condition.observed_at.clone(),
-                    });
-                }
-            }
         }
     }
 
