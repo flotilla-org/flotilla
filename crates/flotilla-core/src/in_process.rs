@@ -11604,28 +11604,34 @@ impl DaemonHandle for InProcessDaemon {
                 let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
                 let mut value = visible.value;
                 if visible.kind == "Project" {
-                    if let Ok(spec) = serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {
-                        match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &spec).await
-                        {
-                            IssueSourceResolution::Available { bindings } => {
-                                value["resolvedIssueSources"] = serde_json::Value::Array(
-                                    bindings
-                                        .into_iter()
-                                        .map(|binding| {
-                                            serde_json::json!({
-                                                "service": binding.source.service,
-                                                "scope": binding.source.scope,
-                                                "alias": binding.alias,
-                                                "creatable": binding.creatable,
+                    match serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {
+                        Ok(spec) => {
+                            match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &spec)
+                                .await
+                            {
+                                IssueSourceResolution::Available { bindings } => {
+                                    value["resolvedIssueSources"] = serde_json::Value::Array(
+                                        bindings
+                                            .into_iter()
+                                            .map(|binding| {
+                                                serde_json::json!({
+                                                    "service": binding.source.service,
+                                                    "scope": binding.source.scope,
+                                                    "alias": binding.alias,
+                                                    "creatable": binding.creatable,
+                                                })
                                             })
-                                        })
-                                        .collect(),
-                                );
+                                            .collect(),
+                                    );
+                                }
+                                IssueSourceResolution::Unavailable(reason) => {
+                                    value["resolvedIssueSources"] = serde_json::Value::Array(Vec::new());
+                                    value["issueSourceResolutionError"] = serde_json::Value::String(format!("{reason:?}"));
+                                }
                             }
-                            IssueSourceResolution::Unavailable(reason) => {
-                                value["resolvedIssueSources"] = serde_json::Value::Array(Vec::new());
-                                value["issueSourceResolutionError"] = serde_json::Value::String(format!("{reason:?}"));
-                            }
+                        }
+                        Err(error) => {
+                            warn!(resource_kind = %visible.kind, resource = %name, %error, "failed to decode project spec for resource read");
                         }
                     }
                 }

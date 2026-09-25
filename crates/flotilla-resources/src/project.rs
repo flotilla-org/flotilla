@@ -210,14 +210,20 @@ pub enum IssueSourceResolution {
 /// Keep explicit schemes: a non-HTTPS service may be a distinct issue tracker.
 pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
     let service = source.service.trim().trim_end_matches('/');
-    let service = if !service.contains("://") && service.contains('.') { format!("https://{service}") } else { service.to_string() };
+    let bare_host =
+        service.contains('.') || service.rsplit_once(':').is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+    let service = if !service.contains("://") && bare_host { format!("https://{service}") } else { service.to_string() };
     let service = match service.split_once("://") {
         Some((scheme, authority)) => {
             let (host, path) = authority.split_once('/').unwrap_or((authority, ""));
+            let host = match host.rsplit_once('@') {
+                Some((userinfo, host)) => format!("{userinfo}@{}", host.to_ascii_lowercase()),
+                None => host.to_ascii_lowercase(),
+            };
             if path.is_empty() {
-                format!("{scheme}://{}", host.to_ascii_lowercase())
+                format!("{scheme}://{host}")
             } else {
-                format!("{scheme}://{}/{path}", host.to_ascii_lowercase())
+                format!("{scheme}://{host}/{path}")
             }
         }
         None => service,
@@ -414,6 +420,21 @@ fn normalize_subpath(subpath: String) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_source_normalization_preserves_userinfo_and_service_path() {
+        assert_eq!(
+            normalize_issue_source(&IssueSource {
+                service: "https://user:Pass@Forge.Example/IssueRoot/".into(),
+                scope: "/Org/Repo/".into(),
+            }),
+            IssueSource { service: "https://user:Pass@forge.example/IssueRoot".into(), scope: "Org/Repo".into() }
+        );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "localhost:3000".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://localhost:3000".into(),
+            scope: "Org/Repo".into()
+        });
+    }
 
     #[test]
     fn dispatch_policy_defaults_to_enabled_with_a_staleness_threshold() {
