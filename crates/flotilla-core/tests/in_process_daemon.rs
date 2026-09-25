@@ -55,11 +55,11 @@ use flotilla_resources::{
     CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
     HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryRelation, RepositorySpec, ResourceBackend, ResourceError,
-    SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart,
-    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY,
-    MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceBackend,
+    ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver,
+    WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -863,6 +863,43 @@ async fn resource_list_and_get_queries_return_wire_json() {
     assert_eq!(fetched_object["metadata"]["name"], "resource-demo");
     assert_eq!(fetched_object["spec"]["workflow_ref"], "wf");
     assert_eq!(fetched.cursor.position().expect("decode cursor").0, listed.cursor.position().expect("decode cursor").0);
+
+    daemon
+        .resource_backend()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
+            display_name: "Missing repository".into(),
+            default_workflow_ref: "wf".into(),
+            issue_source_bindings: Vec::new(),
+            repositories: vec![ProjectRepositorySpec {
+                repo: RepositoryKey("missing".into()),
+                alias: None,
+                roles: Default::default(),
+                subpath: None,
+                default_branch: None,
+            }],
+            dispatch_policy: None,
+        })
+        .await
+        .expect("create project with unresolved repository");
+    let project = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
+                    namespace: "flotilla".to_string(),
+                    kind: "projects".to_string(),
+                    name: "missing-repository".to_string(),
+                })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("get project with unresolved source");
+    let CommandValue::ResourceRead(project) = project else { panic!("expected project read") };
+    let project_object = project.records[0].object.as_ref().expect("project object");
+    let error = project_object["issueSourceResolutionError"].as_str().expect("plain resolution error");
+    assert!(error.starts_with("repository missing:"), "{error}");
+    assert!(!error.contains("RepositoryUnavailable"), "{error}");
 }
 
 #[tokio::test]

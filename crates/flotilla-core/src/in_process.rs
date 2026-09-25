@@ -11626,7 +11626,14 @@ impl DaemonHandle for InProcessDaemon {
                                 }
                                 IssueSourceResolution::Unavailable(reason) => {
                                     value["resolvedIssueSources"] = serde_json::Value::Array(Vec::new());
-                                    value["issueSourceResolutionError"] = serde_json::Value::String(format!("{reason:?}"));
+                                    let message = match reason {
+                                        IssueSourceUnavailable::RepositoryUnavailable { repository, message } => {
+                                            format!("repository {repository}: {message}")
+                                        }
+                                        IssueSourceUnavailable::InvalidBindings { message } => message,
+                                        IssueSourceUnavailable::NoIssueSource => format!("project {name} has no issue source"),
+                                    };
+                                    value["issueSourceResolutionError"] = serde_json::Value::String(message);
                                 }
                             }
                         }

@@ -235,6 +235,7 @@ pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
     };
     let service = match service.split_once("://") {
         Some((scheme, authority)) => {
+            let scheme = scheme.to_ascii_lowercase();
             let (host, path) = authority.split_once('/').unwrap_or((authority, ""));
             let host = match host.rsplit_once('@') {
                 Some((userinfo, host)) => format!("{userinfo}@{}", host.to_ascii_lowercase()),
@@ -466,6 +467,10 @@ mod tests {
             normalize_issue_source(&IssueSource { service: "[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
             IssueSource { service: "https://[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }
         );
+        assert_eq!(normalize_issue_source(&IssueSource { service: "HTTPS://GitHub.COM".into(), scope: "Org/Repo".into() }), IssueSource {
+            service: "https://github.com".into(),
+            scope: "Org/Repo".into()
+        });
     }
 
     #[test]
