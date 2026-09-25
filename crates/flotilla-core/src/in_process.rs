@@ -43,18 +43,18 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, change_request_address,
     change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_crew_completion,
     evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
-    get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
-    patch_resource_annotation, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target,
-    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
-    BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource,
-    CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
-    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, HoldAct, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
+    get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source,
+    normalize_project_spec, patch_resource_annotation, repository_display_labels, resolve_project_issue_sources,
+    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
+    watch_resource_kind_replica_sources, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
+    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
+    CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
+    DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, HoldAct,
+    Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot,
+    IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
@@ -4034,7 +4034,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     normalize_project_spec(ProjectSpec {
         display_name,
         default_workflow_ref: "single-agent-contained".to_string(),
-        issue_sources: Vec::new(),
+        issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
             repo: repository_key,
             alias: None,
@@ -4672,13 +4672,30 @@ impl InProcessDaemon {
             };
         let issue = match selector {
             flotilla_protocol::IssueSelector::Reference(reference) => {
-                if !sources.iter().any(|binding| binding.source == reference.source) {
+                let source = normalize_issue_source(&reference.source);
+                let Some(binding) = sources.iter().find(|binding| binding.source == source) else {
+                    let available = sources
+                        .iter()
+                        .map(|binding| format!("{} {}", binding.source.service, binding.source.scope))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let requested_host = source.service.split_once("://").map_or(source.service.as_str(), |(_, host)| host);
+                    let suggestion = sources.iter().find(|binding| {
+                        binding.source.scope == source.scope
+                            && binding.source.service.split_once("://").map_or(binding.source.service.as_str(), |(_, host)| host)
+                                == requested_host
+                    });
+                    let hint = suggestion.map_or_else(String::new, |binding| format!("; did you mean `{}`?", binding.source.service));
                     return Err(format!(
-                        "issue source {} {} is not part of project {}",
+                        "issue source {} {} is not part of project {}; available issue sources: {available}{hint}",
                         reference.source.service, reference.source.scope, project.metadata.name
                     ));
-                }
-                self.resolve_convoy_issue_snapshot(reference).await?
+                };
+                self.resolve_convoy_issue_snapshot(&flotilla_protocol::IssueRef {
+                    source: binding.source.clone(),
+                    id: reference.id.clone(),
+                })
+                .await?
             }
             flotilla_protocol::IssueSelector::Alias { alias, id } => {
                 let binding = sources
@@ -6410,7 +6427,7 @@ impl InProcessDaemon {
         let spec = normalize_project_spec(ProjectSpec {
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent-contained".to_string()),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             repositories: members,
             dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
         })?;
@@ -7753,7 +7770,7 @@ impl InProcessDaemon {
                     .display_name(project.spec.display_name)
                     .address(ViewAddress::Project { namespace: project.metadata.namespace, name: project.metadata.name })
                     .repositories(repositories)
-                    .maybe_issue_source(project.spec.issue_sources.first().map(|binding| binding.source.clone()))
+                    .maybe_issue_source(project.spec.issue_source_bindings.first().map(|binding| binding.source.clone()))
                     .default_workflow_ref(project.spec.default_workflow_ref)
                     .conflicts(conflicts)
                     .build()
@@ -11586,6 +11603,32 @@ impl DaemonHandle for InProcessDaemon {
                 let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
                 let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
                 let mut value = visible.value;
+                if visible.kind == "Project" {
+                    if let Ok(spec) = serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {
+                        match resolve_project_issue_sources(&self.resource_backend.including_replicas::<Repository>(namespace), &spec).await
+                        {
+                            IssueSourceResolution::Available { bindings } => {
+                                value["resolvedIssueSources"] = serde_json::Value::Array(
+                                    bindings
+                                        .into_iter()
+                                        .map(|binding| {
+                                            serde_json::json!({
+                                                "service": binding.source.service,
+                                                "scope": binding.source.scope,
+                                                "alias": binding.alias,
+                                                "creatable": binding.creatable,
+                                            })
+                                        })
+                                        .collect(),
+                                );
+                            }
+                            IssueSourceResolution::Unavailable(reason) => {
+                                value["resolvedIssueSources"] = serde_json::Value::Array(Vec::new());
+                                value["issueSourceResolutionError"] = serde_json::Value::String(format!("{reason:?}"));
+                            }
+                        }
+                    }
+                }
                 if visible.kind != "Event" {
                     let object_name = value["metadata"]["name"].as_str().unwrap_or(name);
                     let regarding = EventRegarding {

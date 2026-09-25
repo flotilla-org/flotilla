@@ -35,7 +35,7 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_sources: vec![IssueSourceBindingSpec::builder().source(override_source.clone()).alias("widgets".to_string()).build()],
+        issue_source_bindings: vec![IssueSourceBindingSpec::builder().source(override_source.clone()).alias("widgets".to_string()).build()],
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: RepositoryKey("repository-not-present-on-this-host".into()),
@@ -64,7 +64,7 @@ async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let project = ProjectSpec {
         display_name: "Zellij".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_sources: vec![
+        issue_source_bindings: vec![
             IssueSourceBindingSpec::builder().source(github_source).exclude(true).build(),
             IssueSourceBindingSpec::builder()
                 .source(forgejo_source.clone())
@@ -104,7 +104,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
     let spec = ProjectSpec {
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
-        issue_sources: vec![binding],
+        issue_source_bindings: vec![binding],
         repositories: vec![ProjectRepositorySpec::builder().repo(RepositoryKey("app".into())).build()],
         dispatch_policy: None,
     };
@@ -119,7 +119,7 @@ fn issue_bindings_reject_state_as_band_semantics() {
     let spec = ProjectSpec {
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
-        issue_sources: vec![IssueSourceBindingSpec::builder()
+        issue_source_bindings: vec![IssueSourceBindingSpec::builder()
             .source(IssueSource { service: "https://github.com".into(), scope: "acme/app".into() })
             .filter(IssueFilter { match_fields: BTreeMap::from([("state".into(), IssueFieldValue::One("open".into()))]) })
             .build()],
@@ -143,7 +143,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     let project = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_sources: vec![IssueSourceBindingSpec::builder()
+        issue_source_bindings: vec![IssueSourceBindingSpec::builder()
             .source(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() })
             .filter(IssueFilter { match_fields: BTreeMap::from([("labels".into(), IssueFieldValue::One("ready".into()))]) })
             .build()],
@@ -200,7 +200,7 @@ async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
         display_name: "ghostty".into(),
         default_workflow_ref: "single-agent-contained".into(),
         repositories: vec![ProjectRepositorySpec::builder().repo(key).roles([ProjectRepositoryRole::Code].into()).build()],
-        issue_sources: Vec::new(),
+        issue_source_bindings: Vec::new(),
         dispatch_policy: None,
     };
 
@@ -222,7 +222,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     let local_only = ProjectSpec {
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent-contained".into(),
-        issue_sources: Vec::new(),
+        issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
             repo: local.key(),
@@ -417,7 +417,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let normalized = normalize_project_spec(ProjectSpec {
         display_name: " Example ".to_string(),
         default_workflow_ref: " single-agent-contained ".to_string(),
-        issue_sources: Vec::new(),
+        issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
@@ -441,7 +441,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let duplicate = ProjectSpec {
         display_name: "Example".to_string(),
         default_workflow_ref: "single-agent-contained".to_string(),
-        issue_sources: Vec::new(),
+        issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec { repo: repo_b.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
@@ -461,7 +461,7 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
         let spec = ProjectSpec {
             display_name: "Example".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("repo".to_string()),

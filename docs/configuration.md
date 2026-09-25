@@ -15,7 +15,7 @@ configuration belongs in replicated Repository and Project specs.
 
 Repositories that are maintained as forks declare their upstream provenance in
 the replicated Repository spec. Issue-source bindings belong to the Project
-spec's `issue_sources` list, not the host's observation roots:
+spec's `issue_source_bindings` list, not the host's observation roots:
 
 ```json
 { "upstream": { "url": "https://github.com/zellij-org/zellij", "relation": "fork" } }

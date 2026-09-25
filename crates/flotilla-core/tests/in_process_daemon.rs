@@ -1657,7 +1657,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         .expect("contained policy create");
 }
 
-async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_sources: Option<IssueSource>) {
+async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_source_bindings: Option<IssueSource>) {
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
     backend
         .clone()
@@ -1678,7 +1678,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: issue_sources.into_iter().map(Into::into).collect(),
+            issue_source_bindings: issue_source_bindings.into_iter().map(Into::into).collect(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -1757,7 +1757,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
             display_name: "Zellij".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+            issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
                 .source(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() })
                 .alias("zellij".to_string())
                 .build()],
@@ -1880,7 +1880,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository_key.clone(),
@@ -2065,7 +2065,7 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-trusted".into(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2189,7 +2189,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2312,7 +2312,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2456,7 +2456,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: vec![flotilla_resources::IssueSourceBindingSpec::builder()
+            issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
                 .source(reference.source.clone())
                 .alias("planning".to_string())
                 .build()],
@@ -2537,6 +2537,66 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted_issue.snapshot.title, issue.title);
     assert_eq!(persisted_issue.snapshot.body, issue.body);
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
+
+    let project_read = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryResourceGet { namespace: "flotilla".into(), kind: "projects".into(), name: "flotilla".into() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("get project");
+    let CommandValue::ResourceRead(project_read) = project_read else { panic!("expected project read") };
+    let project_object = project_read.records[0].object.as_ref().expect("project object");
+    assert_eq!(project_object["spec"]["issue_source_bindings"].as_array().expect("explicit bindings").len(), 1);
+    assert!(project_object["spec"].get("issue_sources").is_none());
+    assert_eq!(project_object["resolvedIssueSources"].as_array().expect("resolved sources").len(), 2);
+    assert!(project_object["resolvedIssueSources"]
+        .as_array()
+        .expect("resolved sources")
+        .iter()
+        .any(|source| { source["service"] == "https://github.com" && source["scope"] == "flotilla-org/planning" }));
+
+    for (service, scope, name, expected_error) in [
+        ("github.com", "flotilla-org/planning/", "host-issue", None),
+        ("github.com", "flotilla-org/wrong", "wrong-scope", Some("available issue sources: https://github.com flotilla-org/flotilla")),
+        ("http://github.com", "flotilla-org/planning", "wrong-scheme", Some("did you mean `https://github.com`?")),
+    ] {
+        let issue_ref = IssueRef { source: IssueSource { service: service.into(), scope: scope.into() }, id: reference.id.clone() };
+        let command_id = daemon
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(ConvoyStartIntent {
+                            namespace: None,
+                            project_ref: "flotilla".into(),
+                            change_request: None,
+                            issues: vec![IssueSelector::Reference(issue_ref)],
+                            name: Some(name.into()),
+                            branch: Some(format!("fix/{name}")),
+                            workflow_ref: Some("single-agent-contained".into()),
+                            inputs: Vec::new(),
+                            instruction: None,
+                            placement_policy: None,
+                            agent_overrides: Vec::new(),
+                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+                        }),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("source-addressed start accepted");
+        let result = recv_command_finished(&mut events, command_id).await;
+        if let Some(expected_error) = expected_error {
+            let CommandValue::Error { message } = result else { panic!("expected mismatch error: {result:?}") };
+            assert!(message.contains(expected_error), "{message}");
+            assert!(message.contains("https://github.com flotilla-org/planning"), "{message}");
+        } else {
+            assert_eq!(result, CommandValue::ConvoyStarted { name: format!("{name}@flotilla"), attach_plan: None, binding: None });
+            assert_eq!(admitted_convoy(&backend, name).await.spec.issues[0].reference, reference);
+        }
+    }
 
     let bare_id = daemon
         .execute(
@@ -2702,7 +2762,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -2714,6 +2774,24 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         })
         .await
         .expect("project with unresolved default should persist");
+    let empty_bindings_project = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryResourceGet {
+                    namespace: "flotilla".into(),
+                    kind: "projects".into(),
+                    name: "explicit-workflow".into(),
+                })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("get project with derived source");
+    let CommandValue::ResourceRead(empty_bindings_project) = empty_bindings_project else { panic!("expected project read") };
+    let project_object = empty_bindings_project.records[0].object.as_ref().expect("project object");
+    assert!(project_object["spec"]["issue_source_bindings"].as_array().expect("explicit bindings").is_empty());
+    assert_eq!(project_object["resolvedIssueSources"][0]["service"], "https://github.com");
+    assert_eq!(project_object["resolvedIssueSources"][0]["scope"], "flotilla-org/planning");
     let explicit_id = daemon
         .execute(
             Command::builder()
@@ -2864,7 +2942,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
                 repo: repository.key(),
@@ -4557,7 +4635,7 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
             display_name: "repo suite".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec { repo: tracked.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
@@ -4690,7 +4768,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec {
@@ -4764,7 +4842,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent-contained".to_string(),
-            issue_sources: Vec::new(),
+            issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec {

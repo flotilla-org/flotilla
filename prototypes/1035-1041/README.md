@@ -36,7 +36,7 @@ Project only declares how it uses that repository.
 - `slices` — explicit path scopes. A slice can narrow or override its parent
   repository role and claim. Whole-repository membership and slice membership
   must not silently imply one another.
-- `issue_sources` — ordered, explicit tracker bindings. `primary` is the
+- `issue_source_bindings` — ordered, explicit tracker bindings. `primary` is the
   default dispatch source; `associated` sources are visible and selectable.
 - `important_refs` — named branches or revisions the Project treats as
   durable working topology in addition to the membership's current `ref`.
