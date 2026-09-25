@@ -13,7 +13,7 @@ use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL,
     result_set::{
         AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta,
-        ResultSet, ResultSetState, Rows,
+        ResultSet, ResultSetState, Rows, StandingRoleRow,
     },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
@@ -25,6 +25,7 @@ use crate::{
     query_registry::QueryRegistry,
     salience::SalienceFacts,
     scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
+    standing_roles::StandingRoleProjection,
 };
 
 /// A typed row of some named query's result set.
@@ -130,6 +131,8 @@ pub struct AggregatorProjectionState {
     #[builder(skip)]
     checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
     #[builder(skip)]
+    standing_roles: Arc<RwLock<StandingRoleProjection>>,
+    #[builder(skip)]
     salience: Arc<RwLock<SalienceProjection>>,
     #[builder(skip)]
     project_catalog: Arc<RwLock<ProjectCatalogProjection>>,
@@ -217,6 +220,12 @@ impl AggregatorProjectionState {
 
     pub async fn replace_checkout_replica_rows(&self, replicas: HashMap<HostName, Vec<CheckoutRow>>) -> Vec<ResultDelta> {
         self.checkouts.write().await.replace_replica_rows(replicas)
+    }
+
+    /// Replace the fleet-wide standing-role declarations. Ensures replicate as
+    /// definitions, so these rows are already fleet-merged.
+    pub async fn replace_standing_role_rows(&self, rows: Vec<StandingRoleRow>) -> Vec<ResultDelta> {
+        self.standing_roles.write().await.replace_rows(rows)
     }
 
     /// Replace the mesh-side facts used by the central salience join. Returns
@@ -307,6 +316,7 @@ impl AggregatorProjectionState {
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
             QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
+            QueryId::StandingRoles { scope } => Some(self.standing_roles.write().await.result_set(scope)),
         };
         if let Some(result_set) = result_set.as_ref().filter(|result_set| matches!(result_set.query(), QueryId::Convoys { scope: Some(_) }))
         {

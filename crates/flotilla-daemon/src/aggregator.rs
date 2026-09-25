@@ -9,24 +9,25 @@ use async_trait::async_trait;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
+    ops_entry::ENSURED_FROM_ANNOTATION,
     path_context::canonical_or_original,
     salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact, SalienceFacts},
 };
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
-        ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
+        ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
     ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
-    Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
-    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason,
+    ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee, DemandState, Environment, Presentation, Project,
+    ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, ReplicaReadResolver, Repository,
+    RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
+    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -38,12 +39,14 @@ type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
 type PresentationKey = (String, String, String);
 type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
+type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
 type ChangeRequestFingerprint = HashMap<String, (String, String)>;
 
 #[derive(bon::Builder)]
 pub struct AggregatorResolvers {
     durable_convoys: ReplicaReadResolver<Convoy>,
+    durable_convoy_ensures: ReplicaReadResolver<ConvoyEnsure>,
     durable_demands: TypedResolver<Demand>,
     durable_environments: TypedResolver<Environment>,
     durable_presentations: TypedResolver<Presentation>,
@@ -60,6 +63,7 @@ pub struct AggregatorResolvers {
 #[derive(bon::Builder)]
 struct AggregatorSourceRefs<'a> {
     durable_convoys: &'a dyn AggregatorReplicaWatchSource<Convoy>,
+    durable_convoy_ensures: &'a dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
     durable_demands: &'a dyn AggregatorWatchSource<Demand>,
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
@@ -179,6 +183,8 @@ pub struct Aggregator {
     attachable_sessions: HashSet<SessionKey>,
     origin_hosts: HashMap<flotilla_protocol::NodeId, HostName>,
     projects: HashMap<(String, String), ResourceObject<Project>>,
+    #[builder(skip)]
+    convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
     #[builder(skip)]
@@ -244,6 +250,7 @@ impl Aggregator {
             attachable_sessions: HashSet::new(),
             origin_hosts: HashMap::new(),
             projects: HashMap::new(),
+            convoy_ensures: BTreeMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
             regards: HashMap::new(),
@@ -295,6 +302,7 @@ impl Aggregator {
     ) -> Result<(), ResourceError> {
         let AggregatorResolvers {
             durable_convoys,
+            durable_convoy_ensures,
             durable_demands,
             durable_environments,
             durable_presentations,
@@ -309,6 +317,7 @@ impl Aggregator {
         } = resolvers;
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
+            .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
             .durable_presentations(&durable_presentations)
@@ -331,6 +340,7 @@ impl Aggregator {
     ) -> Result<(), ResourceError> {
         let AggregatorSourceRefs {
             durable_convoys,
+            durable_convoy_ensures,
             durable_demands,
             durable_environments,
             durable_presentations,
@@ -369,6 +379,7 @@ impl Aggregator {
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
+        let mut durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
         let mut durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
@@ -510,6 +521,14 @@ impl Aggregator {
                     }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable project watch ended")),
+                },
+                event = durable_ensure_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_convoy_ensure_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable convoy ensure watch ended")),
                 },
                 event = durable_repository_stream.next() => match event {
                     Some(Ok(event)) => self.apply_repository_read_event(event).await,
@@ -684,6 +703,21 @@ impl Aggregator {
             })
             .collect();
         self.rebuild_store_catalog().await;
+        Ok(watch)
+    }
+
+    async fn recover_convoy_ensure_watch(
+        &mut self,
+        resolver: &dyn AggregatorReplicaWatchSource<ConvoyEnsure>,
+    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<ConvoyEnsure>, ResourceError>>, ResourceError> {
+        let (items, watch) = Self::recover_replica_watch(resolver).await?;
+        self.convoy_ensures = items
+            .into_iter()
+            .map(|ensure| {
+                (repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance), ensure.object)
+            })
+            .collect();
+        self.rebuild_standing_roles().await;
         Ok(watch)
     }
 
@@ -1376,6 +1410,39 @@ impl Aggregator {
         self.rebuild_store_catalog().await;
     }
 
+    async fn apply_convoy_ensure_event(&mut self, event: ReadWatchEvent<ConvoyEnsure>) {
+        match event {
+            ReadWatchEvent::Added(ensure) | ReadWatchEvent::Modified(ensure) => {
+                let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
+                self.convoy_ensures.insert(key, ensure.object);
+            }
+            ReadWatchEvent::Deleted(ensure) => {
+                let key = repository_source_key(&ensure.object.metadata.namespace, &ensure.object.metadata.name, &ensure.provenance);
+                self.convoy_ensures.remove(&key);
+            }
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => {
+                self.convoy_ensures.remove(&tombstone_key(&tombstone, &provenance));
+            }
+        }
+        self.rebuild_standing_roles().await;
+    }
+
+    /// One row per declared role. Several roots may hold a copy of the same
+    /// definition, but only the admitting root records controller status, so
+    /// the representative is the copy carrying that status (local first).
+    async fn rebuild_standing_roles(&self) {
+        let mut representatives: BTreeMap<(&str, &str), &ResourceObject<ConvoyEnsure>> = BTreeMap::new();
+        for ((namespace, name, _), ensure) in &self.convoy_ensures {
+            let slot = representatives.entry((namespace.as_str(), name.as_str())).or_insert(ensure);
+            if !ensure_has_controller_status(slot) && ensure_has_controller_status(ensure) {
+                *slot = ensure;
+            }
+        }
+        let rows = representatives.into_values().map(standing_role_row).collect();
+        let deltas = self.state.replace_standing_role_rows(rows).await;
+        self.emit_store_deltas(deltas).await;
+    }
+
     #[cfg(test)]
     async fn apply_repository_event(&mut self, event: WatchEvent<Repository>) {
         self.apply_repository_read_event(local_read_event(event)).await;
@@ -1577,7 +1644,9 @@ impl Aggregator {
             let mut checkout_rows = Vec::new();
             for result_set in snapshot.result_sets {
                 match result_set.rows {
-                    Rows::Convoys { .. } | Rows::Independents { .. } => {}
+                    // Ensures replicate as definitions; their rows are read
+                    // fleet-wide rather than federated through snapshots.
+                    Rows::Convoys { .. } | Rows::Independents { .. } | Rows::StandingRoles { .. } => {}
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
                     }
@@ -1944,6 +2013,7 @@ impl Aggregator {
         ConvoyRow::builder()
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
+            .maybe_ensured_from(convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).cloned())
             .name(name)
             .generation(convoy.spec.generation)
             .workflow_ref(&convoy.spec.workflow_ref)
@@ -2091,6 +2161,35 @@ fn repository_source_key(namespace: &str, name: &str, provenance: &ResourceProve
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     };
     (namespace.to_string(), name.to_string(), origin)
+}
+
+fn ensure_has_controller_status(ensure: &ResourceObject<ConvoyEnsure>) -> bool {
+    ensure.status.as_ref().is_some_and(|status| {
+        status.convoy_ref.is_some() || status.hold_reason.is_some() || status.restart_count > 0 || status.last_failure.is_some()
+    })
+}
+
+fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
+    let status = ensure.status.clone().unwrap_or_default();
+    StandingRoleRow::builder()
+        .resource(ResourceRef::new(
+            api_version(ConvoyEnsure::API_PATHS),
+            ConvoyEnsure::API_PATHS.kind,
+            &ensure.metadata.namespace,
+            &ensure.metadata.name,
+        ))
+        .project_ref(&ensure.spec.project_ref)
+        .role(&ensure.spec.role)
+        .maybe_presents_as(ensure.spec.presents_as.clone())
+        .maybe_convoy_ref(status.convoy_ref)
+        .maybe_hold(status.hold_reason.map(|hold| match hold {
+            ConvoyEnsureHoldReason::BackingUnverified => StandingRoleHold::BackingUnverified,
+            ConvoyEnsureHoldReason::RestartLimit => StandingRoleHold::RestartLimit,
+        }))
+        .strikes(status.restart_count)
+        .maybe_next_attempt(status.retry_at)
+        .maybe_last_failure(status.last_failure)
+        .build()
 }
 
 fn local_read_event<T: Resource>(event: WatchEvent<T>) -> ReadWatchEvent<T> {
@@ -2610,6 +2709,7 @@ mod tests {
                 .run(
                     AggregatorResolvers::builder()
                         .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
+                        .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
                         .durable_demands(durable.clone().using::<Demand>("flotilla"))
                         .durable_environments(durable.clone().using::<Environment>("flotilla"))
                         .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
@@ -2653,6 +2753,92 @@ mod tests {
             .expect_err("closed replica channel should stop run")
             .to_string()
             .contains("replica channel closed"));
+    }
+
+    async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let mut ensure = backend
+            .using::<ConvoyEnsure>("flotilla")
+            .create(
+                &InputMeta::builder().name(format!("ensure-{role}")).build(),
+                &flotilla_resources::ConvoyEnsureSpec::builder()
+                    .project_ref("widgets".to_string())
+                    .role(role.to_string())
+                    .workflow_ref("govern".to_string())
+                    .repositories(Vec::new())
+                    .presents_as("fleet".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create scripted convoy ensure");
+        ensure.status = status;
+        ensure
+    }
+
+    #[tokio::test]
+    async fn standing_roles_follow_ensures_and_prefer_the_copy_with_controller_status() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let query = QueryId::StandingRoles { scope: None };
+
+        // A non-admitting root's copy carries no controller status; the
+        // admitting root's replica does, and must win in either order.
+        let local = convoy_ensure_object("governor", None).await;
+        let admitting = convoy_ensure_object(
+            "governor",
+            Some(flotilla_resources::ConvoyEnsureStatus {
+                convoy_ref: Some("convoy-a".to_string()),
+                hold_reason: Some(ConvoyEnsureHoldReason::RestartLimit),
+                restart_count: 3,
+                ..Default::default()
+            }),
+        )
+        .await;
+        aggregator
+            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject {
+                object: admitting,
+                provenance: ResourceProvenance::Replica {
+                    origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
+                    last_synced_at: Utc::now(),
+                },
+            }))
+            .await;
+        aggregator
+            .apply_convoy_ensure_event(ReadWatchEvent::Added(ReadResourceObject { object: local, provenance: ResourceProvenance::Local }))
+            .await;
+
+        let set = state.result_set_for(&query).await.expect("standing roles result set");
+        let rows = set.rows.as_standing_roles().expect("standing role rows");
+        assert_eq!(rows.len(), 1, "copies of one declaration fold onto one role");
+        assert_eq!(rows[0].role, "governor");
+        assert_eq!(rows[0].project_ref, "widgets");
+        assert_eq!(rows[0].presents_as.as_deref(), Some("fleet"));
+        assert_eq!(rows[0].convoy_ref.as_deref(), Some("convoy-a"));
+        assert_eq!(rows[0].hold, Some(StandingRoleHold::RestartLimit));
+        assert_eq!(rows[0].strikes, 3);
+
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        convoy.metadata.annotations.insert(ENSURED_FROM_ANNOTATION.to_string(), "ensure-governor".to_string());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let convoys = state.result_set().await;
+        let row = convoys.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert_eq!(row.ensured_from.as_deref(), Some("ensure-governor"));
+
+        for provenance in [ResourceProvenance::Local, ResourceProvenance::Replica {
+            origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
+            last_synced_at: Utc::now(),
+        }] {
+            let tombstone = flotilla_resources::ResourceTombstone {
+                name: "ensure-governor".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "2".to_string(),
+                annotations: BTreeMap::new(),
+            };
+            aggregator.apply_convoy_ensure_event(ReadWatchEvent::DeletedByName { tombstone, provenance }).await;
+        }
+        let set = state.result_set_for(&query).await.expect("standing roles result set");
+        assert!(set.rows.is_empty(), "a removed declaration retracts its role");
     }
 
     #[tokio::test]
@@ -3130,6 +3316,7 @@ mod tests {
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -3141,6 +3328,7 @@ mod tests {
             .durable_presentations(durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
+            .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .observed_convoys(observed_convoys)
@@ -3840,6 +4028,7 @@ mod tests {
                 Ok(pending_watch()),
             ]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -3853,6 +4042,7 @@ mod tests {
             .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
+            .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .observed_convoys(&observed_convoys)
@@ -4605,6 +4795,7 @@ mod tests {
             .run(
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
+                    .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
                     .durable_demands(durable.clone().using::<Demand>("flotilla"))
                     .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
@@ -4691,6 +4882,7 @@ mod tests {
             vec![Ok(expiring_watch()), Ok(pending_watch())],
         ));
         let durable_projects = Arc::new(ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_convoy_ensures = Arc::new(ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
@@ -4711,6 +4903,7 @@ mod tests {
                 .durable_presentations(durable_presentations.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
+                .durable_convoy_ensures(durable_convoy_ensures.as_ref())
                 .durable_repositories(durable_repositories.as_ref())
                 .durable_regards(durable_regards.as_ref())
                 .observed_convoys(observed_convoys.as_ref())

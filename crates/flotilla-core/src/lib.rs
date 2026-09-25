@@ -36,6 +36,7 @@ pub mod repository_inspection;
 pub mod resolve;
 pub mod salience;
 mod scoped_store;
+mod standing_roles;
 pub mod step;
 pub mod template;
 pub mod terminal_manager;
