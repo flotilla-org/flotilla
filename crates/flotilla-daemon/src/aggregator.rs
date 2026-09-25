@@ -1836,8 +1836,17 @@ impl Aggregator {
             return canonical_or_original(std::path::Path::new(&spec.path)) == canonical_or_original(std::path::Path::new(&repo.path));
         }
         let Some(repository) = self.repositories.get(&spec.repo_ref) else { return false };
-        let ResourceRepositoryIdentity::Remote { canonical_remote } = repository.spec.identity() else { return false };
-        RepoIdentity::from_remote_url(canonical_remote).as_ref() == Some(repo)
+        if matches!(repository.spec.identity(), ResourceRepositoryIdentity::Local { .. }) {
+            return false;
+        }
+        let canonical_forge_url = repository.spec.forge().map(|forge| format!("{}/{}", forge.service_url, forge.repository));
+        repository
+            .spec
+            .remotes()
+            .iter()
+            .map(String::as_str)
+            .chain(canonical_forge_url.as_deref())
+            .any(|remote| RepoIdentity::from_remote_url(remote).as_ref() == Some(repo))
     }
 
     fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {

@@ -14,6 +14,7 @@ mod environment;
 mod error;
 mod event;
 mod field_ownership;
+mod forge;
 mod host;
 mod http;
 mod in_memory;
@@ -91,6 +92,7 @@ pub use error::ResourceError;
 pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
+pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use host::{
     canonical_host_id, CredentialExpiry, Host, HostCondition, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY,
     AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CREDENTIAL_EXPIRY_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HELD_CREDENTIALS_CAPABILITY,
@@ -129,7 +131,7 @@ pub use project::{
     ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
-pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
+pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
 pub use registry::{
     apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, delete_resource_kind, get_resource_kind,
     get_resource_kind_including_replicas, home_bound_authorship_collisions, list_resource_kind, list_resource_kind_including_replicas,
@@ -188,6 +190,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
+        $callback::<$crate::Forge>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);

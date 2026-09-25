@@ -4621,6 +4621,91 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
     assert!(projects.items.is_empty());
 }
 
+struct ForgeAliasInspector {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl RepositoryInspector for ForgeAliasInspector {
+    async fn inspect_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        let remote = "https://manchego.lab.flotilla.work/robert/ghostty-ops.git";
+        Ok(RepositoryInspection {
+            spec: RepositorySpec::remote(remote)?,
+            checkout: LocalCheckoutInspection {
+                path: self.path.clone(),
+                host_ref: "host-test".to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: Some(remote.to_string()),
+            replaces_prior_repository: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec, RepositoryIdentity};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("ghostty-ops");
+    std::fs::create_dir_all(&repo).expect("create repository path");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+    let forge = ForgeSpec::builder()
+        .forge_id("flotilla-lab".to_string())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from([
+            "forgejo.lab.flotilla.work".to_string(),
+            "manchego.lab.flotilla.work".to_string(),
+            "forgejo-manchego".to_string(),
+        ]))
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("manchego.lab.flotilla.work".to_string())
+        .build();
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
+        .await
+        .expect("declare forge");
+
+    let front = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops").expect("front spec");
+    let ssh = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops")
+        .expect("ssh host spec")
+        .with_allow_reviewless_workflows(true);
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    for spec in [&front, &ssh] {
+        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("legacy Repository");
+    }
+    let projects = daemon.resource_backend().definitions::<Project>("flotilla");
+    projects
+        .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            display_name: "ghostty".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_sources: Vec::new(),
+            dispatch_policy: None,
+            repositories: vec![
+                ProjectRepositorySpec { repo: front.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+                ProjectRepositorySpec { repo: ssh.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ],
+        })
+        .await
+        .expect("legacy project");
+
+    let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve and sweep identities");
+    assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
+    let merged = repositories.get(&inspected.key().to_string()).await.expect("merged Repository");
+    assert!(merged.spec.allows_reviewless_workflows());
+    assert_eq!(merged.spec.remotes().len(), 2);
+    assert!(matches!(repositories.get(&front.key().to_string()).await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(repositories.get(&ssh.key().to_string()).await, Err(ResourceError::NotFound { .. })));
+    let project = projects.get("ghostty").await.expect("migrated project");
+    assert_eq!(project.spec.repositories.len(), 1);
+    assert_eq!(project.spec.repositories[0].repo, inspected.key());
+}
+
 #[tokio::test]
 async fn associated_checkout_remote_move_updates_repository_in_place() {
     let temp = tempfile::tempdir().expect("create tempdir");

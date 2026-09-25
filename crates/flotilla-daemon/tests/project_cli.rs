@@ -137,6 +137,10 @@ impl RepositoryInspector for DeclarationInspector {
         let commit = self.commit.read().expect("commit lock should not be poisoned").clone();
         Ok(ProjectDeclarationInspection { repository, yaml, commit })
     }
+
+    async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        RepositorySpec::remote(flotilla_resources::canonicalize_repo_url(remote)?)
+    }
 }
 
 #[async_trait]
@@ -452,6 +456,67 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
     assert_eq!(reconciled.metadata.resource_version, registered.metadata.resource_version);
     assert_eq!(reconciled.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(reconciled.spec.repositories[0].roles.len(), 3);
+}
+
+#[tokio::test]
+async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_checkout() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let forge = ForgeSpec::builder()
+        .forge_id("flotilla-lab".to_string())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from([
+            "forgejo.lab.flotilla.work".to_string(),
+            "manchego.lab.flotilla.work".to_string(),
+            "forgejo-manchego".to_string(),
+        ]))
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("manchego.lab.flotilla.work".to_string())
+        .build();
+    backend
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
+        .await
+        .expect("declare lab forge");
+    let checkout = tmp.path().join("ghostty-ops");
+    std::fs::create_dir(&checkout).expect("checkout dir");
+    let observed = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops.git").expect("observed repository");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: observed,
+            commit: Arc::new(RwLock::new("declaration-commit".to_string())),
+        }))
+        .await;
+    daemon.add_repo(&checkout).await.expect("track observed checkout");
+    let observed_key = daemon.repository_key_for_path(&checkout).await.expect("tracked Repository key");
+    let mut rx = daemon.subscribe();
+    for (index, url) in [
+        "https://forgejo.lab.flotilla.work/robert/ghostty-ops",
+        "https://manchego.lab.flotilla.work/robert/ghostty-ops.git",
+        "forgejo-manchego:robert/ghostty-ops.git",
+        "git@forgejo.lab.flotilla.work:robert/ghostty-ops",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(
+            checkout.join("project.yaml"),
+            format!("name: ghostty\nmembers:\n  - alias: ops\n    url: {url}\n    roles: [code, ops]\n"),
+        )
+        .expect("write declaration");
+        let result = if index == 0 {
+            execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: checkout.to_string_lossy().into_owned() })
+                .await
+        } else {
+            execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "ghostty".to_string() }).await
+        };
+        assert!(matches!(result, CommandValue::ProjectRegistered { .. } | CommandValue::ProjectRefreshed { .. }), "{result:?}");
+        let project = backend.definitions::<Project>("flotilla").get("ghostty").await.expect("project");
+        assert_eq!(project.spec.repositories.len(), 1);
+        assert_eq!(project.spec.repositories[0].repo, observed_key);
+        assert!(project.status.as_ref().and_then(|status| status.operational_entries.as_ref()).is_none_or(|condition| condition.ready));
+    }
 }
 
 #[tokio::test]

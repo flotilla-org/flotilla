@@ -1,0 +1,36 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: forges.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: forges
+    singular: forge
+    kind: Forge
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [forge_id, kind, hosts, https_url, git_ssh_host]
+              properties:
+                forge_id:
+                  type: string
+                kind:
+                  type: string
+                  enum: [github, forgejo]
+                hosts:
+                  type: array
+                  items:
+                    type: string
+                https_url:
+                  type: string
+                git_ssh_host:
+                  type: string
