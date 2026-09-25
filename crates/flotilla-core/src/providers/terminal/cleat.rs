@@ -40,18 +40,12 @@ enum ScreenActivityWire {
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
-    terminal_env_defaults: TerminalEnvVars,
     attach_capability: tokio::sync::OnceCell<()>,
 }
 
 impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>) -> Self {
-        Self { runner, binary: binary.into(), terminal_env_defaults: vec![], attach_capability: tokio::sync::OnceCell::new() }
-    }
-
-    pub fn with_terminal_env_defaults(mut self, defaults: TerminalEnvVars) -> Self {
-        self.terminal_env_defaults = defaults;
-        self
+        Self { runner, binary: binary.into(), attach_capability: tokio::sync::OnceCell::new() }
     }
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
@@ -85,12 +79,11 @@ impl CleatTerminalPool {
             return Ok(());
         }
 
-        let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
-        let effective_cmd = if !has_env {
+        let effective_cmd = if env_vars.is_empty() {
             command.to_string()
         } else {
             let mut parts = vec!["env".to_string()];
-            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
+            for (key, value) in env_vars {
                 parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
             }
             parts.push(command.to_string());
@@ -580,21 +573,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_terminal_env_defaults_appear_before_caller_env() {
-        let create_json = r#"{"id":"sess","cwd":"/repo","cmd":"env TERM='xterm-256color' FOO='bar' claude","status":"Detached"}"#;
-        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok(create_json.into())]));
-        let env_defaults = vec![("TERM".to_string(), "xterm-256color".to_string())];
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat").with_terminal_env_defaults(env_defaults);
-        let caller_env = vec![("FOO".to_string(), "bar".to_string())];
+    async fn ensure_session_preserves_explicit_terminal_identity_and_unrelated_env() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let caller_env = vec![
+            ("TERM".to_string(), "screen-256color".to_string()),
+            ("TERM_PROGRAM".to_string(), "my-terminal".to_string()),
+            ("TERM_PROGRAM_VERSION".to_string(), "2.0".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+            ("FOO".to_string(), "bar".to_string()),
+        ];
 
         pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env, &[]).await.expect("ensure session");
 
         let calls = runner.calls();
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
-        let cmd_val = &calls[1].1[cmd_idx + 1];
-        let term_pos = cmd_val.find("TERM=").expect("should contain TERM");
-        let foo_pos = cmd_val.find("FOO=").expect("should contain FOO");
-        assert!(term_pos < foo_pos, "terminal defaults should appear before caller env vars: {cmd_val}");
+        assert_eq!(
+            calls[1].1[cmd_idx + 1],
+            "env TERM='screen-256color' TERM_PROGRAM='my-terminal' TERM_PROGRAM_VERSION='2.0' COLORTERM='truecolor' FOO='bar' claude"
+        );
     }
 
     #[tokio::test]

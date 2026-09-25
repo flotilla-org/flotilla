@@ -15,7 +15,7 @@ pub mod zellij;
 use super::{EnvironmentBag, FactoryRegistry};
 use crate::providers::terminal::TerminalEnvVars;
 
-/// Extract TERM/COLORTERM defaults from discovery for terminal pool session creation.
+/// Extract TERM/COLORTERM defaults from discovery for shpool session creation.
 /// When the daemon runs without a TTY (e.g. remote SSH), these provide fallback values
 /// so sessions get color support. Uses xterm-256color as the safe universal default.
 pub(super) fn terminal_env_defaults_from_bag(env: &EnvironmentBag) -> TerminalEnvVars {
