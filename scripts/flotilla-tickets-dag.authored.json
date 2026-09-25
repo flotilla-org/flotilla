@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "pulse": "4 Aug: THE LEAF ENGINE IS COMPLETE — grilled and shipped in ~24h (evaluator+wait #1365, CR observer #1366, ReconcilerWake #1374). Autonomous settlement LIVE: #1370 deploy -> six convoys Landing->Landed in ~15s, first machine-observed settlements ever. Latch ruled+shipped (#1343/#1373). Facet spike measured (+64% incremental, mirrored attrs, SHAPE works) — ruling PARKED on Robert's research read (circularity counterpoint recorded). Contained GitHub delivery proven (bot identity, #1359). Deploy wave for ReconcilerWake in flight. Next: leaf-engine ADR carry, exit tables, #1351 fragments ratification, #1142 grill. PM: #1384 grilled -> rounds are EMERGENT, declarations frozen at rules; exit-tables amended (absence = STANDING CONVOY) -> independents ruled as ensured no-exit convoys (QM/governors first users, in project-map); dispatch re-scoped propose-and-observe; explain + ops-materialization + fragment chains all landed.",
+  "pulse": "25 Sep: r263 live on all hosts — #1939 substrate cluster shipped (reactive GC #1944, merge-view reads #1945, crew-image baseline #1947, relay provenance #1948) + terminal-finalizer drain #1954 (clean governor cycling). All 5 governors now ensure-managed, self-healing, on Fable; katzensteg+porthole on lab ops-repo ensures. Design queue: forge-relative repo identity #1955, state-machine/DST testing #1953, delivered≠failed #1949, git-meta ledger #1951, ops-file model field #1927.",
   "groups": {
     "trackA": {
       "title": "A · Substrate hardening — docker, creds, provisioning (map #1046)"
@@ -19,16 +19,16 @@
     },
     "later": {
       "title": "Later horizons — web/uishell, porthole, fork housekeeping"
+    },
+    "trackE": {
+      "title": "E · Tender — multi-host data & publication (map #1861)"
     }
   },
   "tickets": {
     "flotilla-org/flotilla#1046": {
-      "detail": "Map: contained crews, scoped creds, visible ops. Frontier: #1050 #1051 #1088.",
       "stage": "design",
       "group": "trackA",
-      "shape": "stadium",
-      "dagLabel": "MAP #1046 substrate",
-      "title": "MAP #1046 substrate solidification"
+      "dagLabel": "MAP #1046 substrate solidification<br>scoped creds · visible ops"
     },
     "flotilla-org/flotilla#1124": {
       "detail": "PR #1130 merged — contained crews can register adapters",
@@ -481,11 +481,9 @@
       "title": "#1139 CredentialSpec + adapters + preflight"
     },
     "flotilla-org/flotilla#1140": {
-      "detail": "Codex pool live: 2 slots minted via device-auth on feta, N=3 concurrency verified, CODEX_HOME write confirmed. Design fully walked+ruled (conch lease, mint-vessel, waiting+mint-on-exhaustion, not host-locked, proxy-compatible). Remaining = unbuilt code; ADR 0022 amendment carried",
-      "stage": "waiting",
+      "stage": "landed",
       "group": "trackA",
-      "dagLabel": "#1140 creds + seeding<br>POOL BOOTSTRAPPED",
-      "title": "#1140 machine account + host tokens"
+      "dagLabel": "#1140 operator setup<br>Forgejo crew user · host tokens"
     },
     "flotilla-org/flotilla#1143": {
       "detail": "PR #1174 merged 27 Jul night — image testimony stamped, step-results deleted",
@@ -1115,7 +1113,7 @@
     "flotilla-org/flotilla#labforks": {
       "detail": "LIVE 31 Jul: lab/ org seeded (andamento/cleat/flotilla), cheddar runner proven (isolated VLAN, Debian 12 floor), flotilla-crew identity + contained-only grant, PR delivery plumbing merged (#1291). Next: Forgejo workflow wrappers + claude-review port, phase-1 promotion flow.",
       "statusAtAuthoring": "at-sea",
-      "stage": "flight",
+      "stage": "landed",
       "group": "trackA",
       "shape": "stadium",
       "dagLabel": "#917 releases",
@@ -1169,7 +1167,7 @@
     "flotilla-org/flotilla#c182": {
       "detail": "Ruled: plain build = functional or loud build-time failure. PR #183 in review (CLAUDE.md point addressed). Flake #184 fixed via first cleat crew (PR #185 merged).",
       "statusAtAuthoring": "at-sea",
-      "stage": "flight",
+      "stage": "landed",
       "group": "trackA",
       "shape": "box",
       "dagLabel": "stability",
@@ -1384,6 +1382,96 @@
       "stage": "waiting",
       "group": "trackC",
       "title": "<a href=\"https://github.com/flotilla-org/flotilla/issues/1396\">#1396 ensured convoys (the ensure loop)</a>"
+    },
+    "flotilla-org/flotilla#1893": {
+      "stage": "landed",
+      "group": "trackA",
+      "dagLabel": "#1893 per-source skill creds<br>MERGED → r233"
+    },
+    "flotilla-org/flotilla#1896": {
+      "stage": "landed",
+      "group": "trackA",
+      "dagLabel": "#1896 lazy-fetch cred fix<br>MERGED → r233"
+    },
+    "flotilla-org/flotilla#1887": {
+      "stage": "flight",
+      "group": "trackA",
+      "dagLabel": "#1887 lab-Forgejo creds<br>convoy at sea"
+    },
+    "flotilla-org/flotilla#1759": {
+      "stage": "waiting",
+      "group": "trackC",
+      "dagLabel": "#1759 ghostty fork project<br>waits on #1887"
+    },
+    "flotilla-org/flotilla#1861": {
+      "stage": "design",
+      "group": "trackE",
+      "dagLabel": "MAP #1861 Tender contract & extraction"
+    },
+    "flotilla-org/flotilla#1866": {
+      "stage": "landed",
+      "group": "trackE",
+      "dagLabel": "#1866 stream & endpoint contract<br>RESOLVED (grilled)"
+    },
+    "flotilla-org/flotilla#1867": {
+      "stage": "design",
+      "group": "trackE",
+      "dagLabel": "#1867 integration · daemonless targets"
+    },
+    "flotilla-org/flotilla#1868": {
+      "stage": "design",
+      "group": "trackE",
+      "dagLabel": "#1868 initial slices & proof gates"
+    },
+    "flotilla-org/flotilla#1883": {
+      "stage": "landed",
+      "group": "trackE",
+      "dagLabel": "#1883 adopt provisional design<br>MERGED"
+    },
+    "flotilla-org/flotilla#1892": {
+      "stage": "landed",
+      "group": "trackE",
+      "dagLabel": "#1892 jackstay nesting<br>MERGED"
+    },
+    "flotilla-org/flotilla#1894": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#1894 TerminalSession GC leak<br>convoy at sea"
+    },
+    "flotilla-org/flotilla#549": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#549 derive PROVIDER_CATEGORIES"
+    },
+    "flotilla-org/flotilla#521": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#521 file_picker_start_dir helper"
+    },
+    "flotilla-org/flotilla#469": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#469 align ensure_running"
+    },
+    "flotilla-org/flotilla#453": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#453 dispatch() test coverage"
+    },
+    "flotilla-org/flotilla#355": {
+      "stage": "flight",
+      "group": "dogfood",
+      "dagLabel": "#355 topology --dot"
+    },
+    "flotilla-org/flotilla#1890": {
+      "stage": "landed",
+      "group": "dogfood",
+      "dagLabel": "#1890 PM recipe exe path<br>MERGED"
+    },
+    "flotilla-org/flotilla#1891": {
+      "stage": "landed",
+      "group": "dogfood",
+      "dagLabel": "#1891 agent-home cleanup<br>MERGED"
     }
   },
   "edges": [
@@ -1754,6 +1842,38 @@
       "to": "flotilla-org/flotilla#1394",
       "style": "dashed",
       "label": "observations feed"
+    },
+    {
+      "from": "flotilla-org/flotilla#1046",
+      "to": "flotilla-org/flotilla#1893"
+    },
+    {
+      "from": "flotilla-org/flotilla#1140",
+      "to": "flotilla-org/flotilla#1887"
+    },
+    {
+      "from": "flotilla-org/flotilla#1893",
+      "to": "flotilla-org/flotilla#1896"
+    },
+    {
+      "from": "flotilla-org/flotilla#1896",
+      "to": "flotilla-org/flotilla#1887"
+    },
+    {
+      "from": "flotilla-org/flotilla#1887",
+      "to": "flotilla-org/flotilla#1759"
+    },
+    {
+      "from": "flotilla-org/flotilla#1861",
+      "to": "flotilla-org/flotilla#1866"
+    },
+    {
+      "from": "flotilla-org/flotilla#1861",
+      "to": "flotilla-org/flotilla#1867"
+    },
+    {
+      "from": "flotilla-org/flotilla#1861",
+      "to": "flotilla-org/flotilla#1868"
     }
   ],
   "stages": [
