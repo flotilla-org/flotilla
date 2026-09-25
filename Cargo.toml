@@ -11,6 +11,7 @@ members = [
     "crates/flotilla-daemon",
     "crates/flotilla-tui",
     "crates/flotilla-test-support",
+    "crates/tender",
 ]
 exclude = ["lints/long_inline_paths", "crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
