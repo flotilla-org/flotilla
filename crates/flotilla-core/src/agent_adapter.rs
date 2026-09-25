@@ -530,7 +530,7 @@ enum AdapterFlavor {
     ClaudeCode { state_config: Option<ClaudeStateConfig>, state_lock: Arc<Mutex<()>>, contained: bool },
     /// Codex gates on a persisted per-project trust level, so the workspace has
     /// to be marked trusted in its config before launch.
-    Codex { trust_config: Option<CodexTrustConfig> },
+    Codex { trust_config: Option<CodexTrustConfig>, contained: bool },
 }
 
 impl AdapterFlavor {
@@ -631,15 +631,19 @@ impl AgentAdapter for CliAgentAdapter {
                 }
                 let mut settings = crate::agents::claude_code_hook_settings();
                 settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+                if *contained {
+                    settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
+                    settings["includeCoAuthoredBy"] = serde_json::Value::Bool(false);
+                }
                 let settings =
                     serde_json::to_string_pretty(&settings).map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
                 self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
             }
-            AdapterFlavor::Codex { trust_config } => {
+            AdapterFlavor::Codex { trust_config, contained } => {
                 let config = trust_config
                     .as_ref()
                     .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
-                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config).await?;
+                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config, *contained).await?;
             }
         }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
@@ -721,7 +725,12 @@ fn codex_auth_failure(screen: &str) -> Option<&'static str> {
     }
 }
 
-async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
+async fn seed_codex_workspace_trust(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    config: &CodexTrustConfig,
+    contained: bool,
+) -> Result<(), String> {
     let _guard = config.lock.lock().await;
     let output = runner
         .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
@@ -736,6 +745,10 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
     }
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
+    let needs_attribution = contained && document.get("commit_attribution").and_then(Item::as_str) != Some("");
+    if needs_attribution {
+        document["commit_attribution"] = value("");
+    }
     let projects = document
         .as_table_mut()
         .entry("projects")
@@ -747,7 +760,7 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .ok_or_else(|| format!("Codex config {} has a non-table project entry for {canonical_cwd}", config.path.display()))?;
-    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") {
+    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") && !needs_attribution {
         return Ok(());
     }
     project["trust_level"] = value("trusted");
@@ -869,6 +882,7 @@ impl AgentAdapterRegistry {
                 runner,
                 flavor: AdapterFlavor::Codex {
                     trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::new(Mutex::new(())) }),
+                    contained: env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some(),
                 },
             }));
         }
@@ -908,6 +922,7 @@ mod tests {
         agent_adapter::{
             append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
             CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
+            CLAUDE_MANAGED_SETTINGS_PATH,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -1478,6 +1493,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&claude_config).expect("Claude config");
         let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-claude"))
             .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
@@ -1485,7 +1501,10 @@ mod tests {
         let brief =
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
 
-        let invocation_environment = vec![("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string())];
+        let invocation_environment = vec![
+            ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), claude_config.display().to_string()),
+        ];
         claude
             .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &invocation_environment)
             .await
@@ -1507,6 +1526,8 @@ mod tests {
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "flotilla hook claude-code session-start");
         assert_eq!(settings["hooks"]["Notification"][0]["matcher"], "permission_prompt");
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+        assert_eq!(settings["attribution"], serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false }));
+        assert_eq!(settings["includeCoAuthoredBy"], false);
 
         let state: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(claude_config.join(".claude.json")).expect("read Claude state"))
@@ -1615,6 +1636,11 @@ mod tests {
             .expect("prepare host-direct Claude");
 
         assert_eq!(std::fs::read_to_string(global_state).expect("global Claude state"), r#"{"existing":true}"#);
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(workspace.join(CLAUDE_MANAGED_SETTINGS_PATH)).expect("settings overlay"))
+                .expect("parse settings overlay");
+        assert!(settings.get("attribution").is_none());
+        assert!(settings.get("includeCoAuthoredBy").is_none());
     }
 
     #[test]
@@ -1675,7 +1701,39 @@ mod tests {
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
         let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.6-sol"));
+        assert!(parsed.get("commit_attribution").is_none(), "host-direct Codex config should retain operator attribution");
         assert_eq!(parsed["projects"]["/existing"]["trust_level"].as_str(), Some("trusted"));
+        assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    #[tokio::test]
+    async fn contained_codex_disables_commit_attribution_for_an_already_trusted_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "commit_attribution = \"Codex <noreply@openai.com>\"\n\n[projects.{canonical_workspace:?}]\ntrust_level = \"trusted\"\n"
+            ),
+        )
+        .expect("initial Codex config");
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-codex"))
+            .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.display().to_string()))
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+
+        registry.get("codex").expect("codex adapter").prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare");
+
+        let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
+        let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
+        assert_eq!(parsed["commit_attribution"].as_str(), Some(""));
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 
