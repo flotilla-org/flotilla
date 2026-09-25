@@ -1114,36 +1114,47 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     for (environment_ref, previously_delivered) in store.tracked_work_deliveries().await {
         deliveries.entry(environment_ref).or_default().0.extend(previously_delivered);
     }
+    let mut errors = Vec::new();
     for (environment_ref, (granted, running, scopes)) in deliveries {
         if granted.is_empty() {
             continue;
         }
-        let runner = if environment_ref == state.host_direct_environment_name {
-            state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable for credential delivery".to_string())?
-        } else {
-            match state.daemon.command_runner_for_environment(&EnvironmentId::new(environment_ref.clone())) {
-                Some(runner) => runner,
-                None if !current_environments.contains(&environment_ref) => {
-                    // The vessel and its contained filesystem are gone. Clear
-                    // refresh registrations and cached material as well.
-                    store.forget_environment(&environment_ref).await?;
-                    continue;
+        let result = async {
+            let runner = if environment_ref == state.host_direct_environment_name {
+                state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable for credential delivery".to_string())?
+            } else {
+                match state.daemon.command_runner_for_environment(&EnvironmentId::new(environment_ref.clone())) {
+                    Some(runner) => runner,
+                    None if !current_environments.contains(&environment_ref) => {
+                        // The vessel and its contained filesystem are gone. Clear
+                        // refresh registrations and cached material as well.
+                        store.forget_environment(&environment_ref).await?;
+                        return Ok(());
+                    }
+                    None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
                 }
-                None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
+            };
+            if !running.is_empty() {
+                store
+                    .adopt_github_app_deliveries(&environment_ref, &running, &scopes, runner.clone())
+                    .await
+                    .map_err(|error| format!("mint work credentials for environment {environment_ref}: {}", error.message))?;
             }
-        };
-        if !running.is_empty() {
             store
-                .adopt_github_app_deliveries(&environment_ref, &running, &scopes, runner.clone())
+                .reconcile_work_delivery(&environment_ref, &granted, &running, &scopes, runner)
                 .await
-                .map_err(|error| format!("mint work credentials for environment {environment_ref}: {}", error.message))?;
+                .map_err(|error| format!("reconcile work credentials for environment {environment_ref}: {error}"))
         }
-        store
-            .reconcile_work_delivery(&environment_ref, &granted, &running, &scopes, runner)
-            .await
-            .map_err(|error| format!("reconcile work credentials for environment {environment_ref}: {error}"))?;
+        .await;
+        if let Err(error) = result {
+            errors.push(error);
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn fail_unavailable_environment(
@@ -7628,6 +7639,38 @@ mod tests {
                 convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("settle work");
             }
         };
+
+        let current = convoys.get("credential-work").await.expect("read convoy");
+        let mut status = current.status.expect("convoy status");
+        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(
+            VesselRequirement::builder()
+                .name("unavailable".to_string())
+                .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                .crew(Vec::new())
+                .build(),
+        );
+        status.work.insert("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build());
+        convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("add unavailable work");
+        let unavailable_vessel = vessels
+            .create(&empty_meta("unavailable-work-vessel"), &VesselSpec {
+                convoy_ref: "credential-work".to_string(),
+                vessel_name: "unavailable".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("create unavailable vessel");
+        vessels
+            .update_status(&unavailable_vessel.metadata.name, &unavailable_vessel.metadata.resource_version, &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some("aaa-unavailable".to_string()),
+                ..VesselStatus::default()
+            })
+            .await
+            .expect("place unavailable vessel");
+        assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
+        assert!(can_fill_git_credential().await);
+        vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
 
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
         assert!(can_fill_git_credential().await);
