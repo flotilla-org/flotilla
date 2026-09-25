@@ -50,6 +50,14 @@ grep -Fq 'secrets.IMAGE_BUILDER_TOKEN' "$workflow"
 grep -Fq 'claude --version' "$workflow"
 grep -Fq 'codex --version' "$workflow"
 grep -Fq 'tea --version' "$workflow"
+grep -Fq 'infocmp xterm-ghostty' "$dockerfile"
+grep -Fq 'infocmp xterm-ghostty' "$workflow"
+grep -Fq 'docker run --rm --user 12345:12345' "$workflow"
+grep -Fq 'ghostty-src/LICENSE' "$dockerfile"
+if grep -Eq '^ENV TERM( |=)' "$dockerfile"; then
+  echo 'crew image must leave TERM selection to Cleat' >&2
+  exit 1
+fi
 python3 "$repo_root/ci/crew-image/test-tea-auth.py"
 
 if grep -Eq ':(latest|"latest"|'"'"'latest'"'"')[[:space:]]*$' "$workflow"; then
