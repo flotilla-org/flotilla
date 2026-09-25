@@ -1522,7 +1522,12 @@ impl Aggregator {
             .projects
             .values()
             .map(|project| ProjectRepositoriesRow {
-                resource: ResourceRef::new(api_version(Project::API_PATHS), "Project", &project.metadata.namespace, &project.metadata.name),
+                resource: ResourceRef::new(
+                    api_version(Project::API_PATHS),
+                    Project::API_PATHS.kind,
+                    &project.metadata.namespace,
+                    &project.metadata.name,
+                ),
                 display_name: project.spec.display_name.clone(),
                 repositories: project
                     .spec
@@ -2783,9 +2788,12 @@ mod tests {
         let query = QueryId::ProjectRepositories { scope: None };
         assert!(state.result_set_for(&query).await.expect("query").rows.is_empty());
 
+        let repository = repository_object("https://github.com/flotilla-org/remote-only").await;
+        let repository_key = repository.spec.key();
+        let expected_slug = repository.spec.catalog_slug();
         let mut project = project_object("widgets").await;
         project.spec.repositories = vec![
-            flotilla_resources::ProjectRepositorySpec::builder().repo(RepositoryKey("repo-a".into())).subpath("src".to_owned()).build(),
+            flotilla_resources::ProjectRepositorySpec::builder().repo(repository_key).subpath("src".to_owned()).build(),
             flotilla_resources::ProjectRepositorySpec::builder().repo(RepositoryKey("repo-b".into())).build(),
         ];
         aggregator.apply_project_event(local_read_event(WatchEvent::Added(project.clone()))).await;
@@ -2793,6 +2801,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].repositories.len(), 2);
         assert_eq!(rows[0].repositories[0].subpath.as_deref(), Some("src"));
+        assert_eq!(rows[0].repositories[0].slug, None, "membership exists before repository definition");
+
+        aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows[0].repositories[0].slug.as_deref(), Some(expected_slug.as_str()));
+
+        aggregator.apply_repository_event(WatchEvent::Deleted(repository)).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows[0].repositories[0].slug, None, "slug retracts when repository definition disappears");
 
         project.spec.repositories.clear();
         aggregator.apply_project_event(local_read_event(WatchEvent::Modified(project.clone()))).await;
