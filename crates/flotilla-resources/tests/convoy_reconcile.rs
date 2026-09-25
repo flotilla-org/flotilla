@@ -56,6 +56,25 @@ fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
     let missing = evaluate("coder", None, &change_requests);
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingDecisionLedger { .. })));
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingChangeRequest { .. })));
+    let mut unbound = convoy.clone();
+    unbound.spec.change_request = None;
+    let missing_binding = evaluate_crew_completion(
+        &unbound,
+        flotilla_resources::CrewCompletionClaim {
+            vessel: "work",
+            role: "coder",
+            decision_ledger_ref: Some("https://example.test/comment"),
+        },
+        &checkouts,
+        &change_requests,
+        Duration::from_secs(300),
+        now,
+    )
+    .expect("evaluate unbound PR");
+    assert_eq!(missing_binding, vec![UnmetSettlementExpectation::MissingChangeRequestBinding {
+        vessel: "work".to_string(),
+        role: "coder".to_string()
+    }]);
     let reviewer = evaluate("reviewer", Some("https://example.test/comment"), &change_requests);
     assert!(reviewer.is_empty(), "reviewer does not carry the coder's PR readiness obligation");
 

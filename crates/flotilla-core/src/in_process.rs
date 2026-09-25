@@ -391,11 +391,12 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
         UnmetSettlementExpectation::MissingChangeRequest { record } => ExplainedUnmetExpectation {
             reason: "missing_record".to_string(),
             subject: format!("change_request/{record}"),
-            detail: if record == "$cr" {
-                "change request missing; create and bind a ready PR before completing".to_string()
-            } else {
-                "expected change request has no federated observation".to_string()
-            },
+            detail: "expected change request has no federated observation".to_string(),
+        },
+        UnmetSettlementExpectation::MissingChangeRequestBinding { vessel, role } => ExplainedUnmetExpectation {
+            reason: "missing_change_request_binding".to_string(),
+            subject: format!("crew/{vessel}/{role}"),
+            detail: "change request missing; create and bind a ready PR before completing".to_string(),
         },
         UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
             reason: "stale_evidence".to_string(),

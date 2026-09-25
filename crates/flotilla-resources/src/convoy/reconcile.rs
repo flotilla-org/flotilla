@@ -227,6 +227,7 @@ pub enum UnmetSettlementExpectation {
     CheckoutConditionUnknown { checkout: String, condition: String },
     StaleCheckoutEvidence { checkout: String, condition: String, observed_at: Option<String> },
     MissingChangeRequest { record: String },
+    MissingChangeRequestBinding { vessel: String, role: String },
     StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
     ChangeRequestConditionFalse { record: String, value: Option<String> },
     InvalidCondition { subject: String, message: String },
@@ -285,7 +286,10 @@ pub fn evaluate_crew_completion(
                     })
                     .collect::<BTreeSet<_>>();
                 if names.is_empty() {
-                    unmet.push(UnmetSettlementExpectation::MissingChangeRequest { record: "$cr".to_string() });
+                    unmet.push(UnmetSettlementExpectation::MissingChangeRequestBinding {
+                        vessel: vessel.to_string(),
+                        role: role.to_string(),
+                    });
                 }
                 for name in names {
                     match change_requests.get(&name) {
