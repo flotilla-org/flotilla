@@ -221,6 +221,7 @@ pub(crate) struct CredentialStore {
     github_app_minter: Arc<dyn GithubAppTokenMinter>,
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
+    work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
@@ -429,6 +430,7 @@ impl CredentialStore {
             github_app_minter: github_app.minter,
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
+            work_deliveries: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
@@ -909,6 +911,7 @@ impl CredentialStore {
     }
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
+        self.work_deliveries.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
@@ -917,6 +920,83 @@ impl CredentialStore {
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn tracked_work_deliveries(&self) -> BTreeMap<String, BTreeSet<String>> {
+        self.work_deliveries.lock().await.clone()
+    }
+
+    /// Reconcile the files and cached material for one work environment. The
+    /// caller supplies every grant for that environment, including settled
+    /// work, so a restarted daemon can remove files it did not prepare itself.
+    pub(crate) async fn reconcile_work_delivery(
+        &self,
+        environment_ref: &str,
+        granted: &BTreeSet<String>,
+        running: &BTreeSet<String>,
+        scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), String> {
+        let mut delivered = BTreeSet::new();
+        for name in granted {
+            if !matches!(self.spec(name).await?.consumer, CredentialConsumer::DockerRegistry { .. }) {
+                delivered.insert(name.clone());
+            }
+        }
+        if delivered.is_empty() {
+            self.work_deliveries.lock().await.remove(environment_ref);
+            return Ok(());
+        }
+        let paths = self.delivery_paths(&*runner).await?;
+        for name in delivered.difference(running) {
+            let directory = paths.credential_dir(name);
+            runner
+                .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+                .await
+                .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
+            let key = (environment_ref.to_string(), name.clone());
+            self.prepared.lock().await.remove(&key);
+            self.materials.lock().await.remove(&key);
+            self.github_app_deliveries.lock().await.remove(&key);
+            self.git_config_fragments.lock().await.entry(environment_ref.to_string()).and_modify(|fragments| {
+                fragments.remove(name);
+            });
+        }
+        let missing = {
+            let prepared = self.prepared.lock().await;
+            running
+                .iter()
+                .filter(|name| delivered.contains(*name) && !prepared.contains(&(environment_ref.to_string(), (*name).clone())))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        if !missing.is_empty() {
+            let missing_scopes =
+                scopes.iter().filter(|(name, _)| missing.contains(*name)).map(|(name, scope)| (name.clone(), scope.clone())).collect();
+            self.prepare_scoped(environment_ref, &missing, &missing_scopes, runner.clone()).await?;
+        }
+        let fragments = self.git_config_fragments.lock().await.get(environment_ref).cloned().unwrap_or_default();
+        if fragments.is_empty() {
+            runner
+                .run("rm", &["-f", "--", &paths.git_config.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+                .await
+                .map_err(|error| format!("remove settled Git credential configuration: {error}"))?;
+        } else {
+            let gitconfig = compose(TargetId::GitConfig, crew_gitconfig_fragments().into_iter().chain(fragments.values().cloned()))
+                .map_err(|error| format!("compose active Git credential configuration: {error}"))?;
+            runner
+                .write_file(&paths.git_config, &gitconfig.contents)
+                .await
+                .map_err(|error| format!("stage active Git credential configuration: {error}"))?;
+        }
+        let mut tracked = self.work_deliveries.lock().await;
+        let running_delivered = running.intersection(&delivered).cloned().collect::<BTreeSet<_>>();
+        if running_delivered.is_empty() {
+            tracked.remove(environment_ref);
+        } else {
+            tracked.insert(environment_ref.to_string(), running_delivered);
         }
         Ok(())
     }
@@ -2290,6 +2370,7 @@ interactions:
                 Err("temporary outage two".to_string()),
                 Err("persistent outage".to_string()),
                 Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
+                Ok(GithubAppToken { value: "installation-token-four".to_string(), expires_at: now + Duration::hours(4) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2402,6 +2483,17 @@ interactions:
                 .iter()
                 .any(|(command, args, _)| { command == "sh" && args.iter().any(|arg| arg.contains("git credential fill")) }));
         }
+
+        store
+            .reconcile_work_delivery("standing-vessel", &refs, &BTreeSet::new(), &scopes, runner.clone())
+            .await
+            .expect("settled work revokes the installation delivery");
+        assert!(store.github_app_deliveries.lock().await.is_empty());
+        store
+            .adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone())
+            .await
+            .expect("reactivated work mints a fresh installation token");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 10);
 
         let missing_store = CredentialStore::new_with_github_app_minter(
             ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("missing-root")),
@@ -3017,6 +3109,74 @@ interactions:
             BTreeMap::from([(("env-b".to_string(), "model-api".to_string()), "secret-b".to_string())])
         );
         assert_eq!(store.git_config_fragments.lock().await.keys().cloned().collect::<Vec<_>>(), vec!["env-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn work_delivery_reconciles_running_complete_and_reactivated_turns() {
+        let state = tempfile::tempdir().expect("state directory");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-work".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create issued credential");
+        let runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(RotatingTokenEnv(StdMutex::new(VecDeque::from(["first-token".to_string(), "second-token".to_string()])))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            state.path().to_path_buf(),
+        );
+        let granted = BTreeSet::from(["github-work".to_string()]);
+        let absent = BTreeSet::new();
+        let scopes = BTreeMap::new();
+        let git_config = state.path().join("credentials/gitconfig");
+        let git_config = git_config.to_string_lossy().into_owned();
+        let can_fill_git_credential = || {
+            let runner = runner.clone();
+            let git_config = git_config.clone();
+            async move {
+                runner
+                    .run(
+                        "sh",
+                        &[
+                            "-c",
+                            "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill",
+                            "credential-probe",
+                            &git_config,
+                        ],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await
+                    .is_ok()
+            }
+        };
+
+        store.reconcile_work_delivery("env-a", &granted, &granted, &scopes, runner.clone()).await.expect("running work mints");
+        assert!(can_fill_git_credential().await);
+
+        store.reconcile_work_delivery("env-a", &granted, &absent, &scopes, runner.clone()).await.expect("completed work revokes");
+        assert!(!can_fill_git_credential().await);
+
+        store.reconcile_work_delivery("env-a", &granted, &granted, &scopes, runner.clone()).await.expect("reactivated work re-mints");
+        assert!(can_fill_git_credential().await);
+
+        store.reconcile_work_delivery("env-a", &granted, &absent, &scopes, runner.clone()).await.expect("settle second turn");
+        assert!(!can_fill_git_credential().await);
+        let error = store
+            .reconcile_work_delivery("env-a", &granted, &granted, &scopes, runner)
+            .await
+            .expect_err("a missing source must report a mint failure");
+        assert!(error.contains("TEST_CLAUDE_TOKEN"), "actual source failure should be reported: {error}");
     }
 
     #[tokio::test]

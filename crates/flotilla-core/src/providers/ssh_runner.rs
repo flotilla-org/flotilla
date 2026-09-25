@@ -125,9 +125,15 @@ impl CommandRunner for SshCommandRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let helper_path =
-            install_managed_helper_script(&*self.runner, "ssh", &self.ssh_prefix_args(), FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT)
-                .await?;
+        let helper_path = install_managed_helper_script(
+            &*self.runner,
+            "ssh",
+            &self.ssh_prefix_args(),
+            "-lc",
+            FLOTILLA_HELPER_NAME,
+            FLOTILLA_HELPER_SCRIPT,
+        )
+        .await?;
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
         let mut owned_args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);

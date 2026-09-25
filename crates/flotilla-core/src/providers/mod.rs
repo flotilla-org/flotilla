@@ -187,10 +187,13 @@ pub(crate) fn atomic_write_script(path: &Path, temp_suffix: &str) -> Result<Stri
     ))
 }
 
+/// `shell_flag` follows the runner's shell policy: contained writes avoid
+/// login files, while static SSH hosts retain their configured login path.
 pub(crate) async fn install_managed_helper_script(
     runner: &dyn CommandRunner,
     command: &str,
     command_prefix: &[&str],
+    shell_flag: &str,
     helper_name: &str,
     helper_content: &str,
 ) -> Result<String, String> {
@@ -198,7 +201,7 @@ pub(crate) async fn install_managed_helper_script(
     let mut owned_args: Vec<String> = command_prefix.iter().map(|arg| (*arg).to_string()).collect();
     owned_args.extend([
         "sh".to_string(),
-        "-lc".to_string(),
+        shell_flag.to_string(),
         INSTALL_MANAGED_SCRIPT.to_string(),
         // `sh -c` treats the next argument as `$0`; this is only a diagnostic
         // placeholder for the one-time bootstrap script text above.
