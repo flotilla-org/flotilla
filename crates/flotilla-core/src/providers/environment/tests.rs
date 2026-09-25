@@ -910,6 +910,49 @@ async fn environment_runner_supports_factory_probe() {
     assert!(calls.is_empty(), "factory probe should not invoke runner during binary check");
 }
 
+#[tokio::test]
+async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
+    use crate::{
+        config::ConfigStore,
+        path_context::ExecutionEnvironmentPath,
+        providers::{
+            discovery::{factories::cleat::CleatTerminalPoolFactory, EnvironmentAssertion, EnvironmentBag, Factory},
+            testing::MockRunner,
+        },
+    };
+
+    let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+    let env_runner = Arc::new(DockerEnvironmentRunner::new("test-container".to_string(), inner.clone()));
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"))
+        .with(EnvironmentAssertion::env_var("TERM", "screen-256color"))
+        .with(EnvironmentAssertion::env_var("TERM_PROGRAM", "outer-terminal"))
+        .with(EnvironmentAssertion::env_var("TERM_PROGRAM_VERSION", "1.2.3"))
+        .with(EnvironmentAssertion::env_var("COLORTERM", "truecolor"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = ConfigStore::with_base(dir.path());
+    let repo_root = ExecutionEnvironmentPath::new("/repo");
+
+    let pool = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner).await.expect("cleat pool in Docker");
+    pool.ensure_session("session", "codex", &repo_root, &vec![], &[]).await.expect("launch in Docker");
+
+    assert_eq!(inner.calls()[1].1, vec![
+        "exec",
+        "-w",
+        "/",
+        "test-container",
+        "/usr/local/bin/cleat",
+        "launch",
+        "--json",
+        "--record",
+        "session",
+        "--cwd",
+        "/repo",
+        "--cmd",
+        "codex",
+    ]);
+}
+
 /// Verifies that DockerEnvironmentRunner correctly transforms command calls into docker exec form,
 /// matching the pattern that discovery factories would issue inside a container.
 #[tokio::test]
