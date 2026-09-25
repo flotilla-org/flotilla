@@ -108,19 +108,25 @@ impl CommandRunner for DockerEnvironmentRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let helper_path =
-            install_managed_helper_script(&*self.inner, "docker", &self.docker_exec_prefix(), FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT)
-                .await?;
+        let helper_path = install_managed_helper_script(
+            &*self.inner,
+            "docker",
+            &self.docker_exec_prefix(),
+            "-c",
+            FLOTILLA_HELPER_NAME,
+            FLOTILLA_HELPER_SCRIPT,
+        )
+        .await?;
         let mut owned_args: Vec<String> = self.docker_exec_prefix().into_iter().map(str::to_string).collect();
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
-        owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
+        owned_args.extend(["sh".to_string(), "-c".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         self.inner.run("docker", &arg_refs, Path::new("/"), &ChannelLabel::Default).await
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
-        let args = ["exec", "-i", &self.container_name, "sh", "-lc", script.as_str()];
+        let args = ["exec", "-i", &self.container_name, "sh", "-c", script.as_str()];
         self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
 }
@@ -312,7 +318,7 @@ mod tests {
         assert!(install_args.contains(&"exec".to_string()));
         assert!(install_args.contains(&"my-container".to_string()));
         assert!(install_args.contains(&"sh".to_string()));
-        assert!(install_args.contains(&"-lc".to_string()));
+        assert!(install_args.contains(&"-c".to_string()));
         let bootstrap_script = install_args.get(4).expect("should have install bootstrap script arg");
         assert!(bootstrap_script.contains("helpers/$helper_hash"));
         assert_eq!(install_args.get(5).map(String::as_str), Some("flotilla-bootstrap-install-managed-script"));
@@ -324,7 +330,7 @@ mod tests {
         assert!(args.contains(&"exec".to_string()));
         assert!(args.contains(&"my-container".to_string()));
         assert_eq!(args.get(2).map(String::as_str), Some("sh"));
-        assert_eq!(args.get(3).map(String::as_str), Some("-lc"));
+        assert_eq!(args.get(3).map(String::as_str), Some("-c"));
         let script = args.get(4).expect("docker helper script");
         assert!(script.contains("PATH='/remote/state/flotilla/helpers/helper-hash':\"$PATH\""));
         assert!(script.contains("exec 'flotilla-helper' 'ensure-file-if-absent'"));

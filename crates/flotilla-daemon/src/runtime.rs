@@ -624,6 +624,9 @@ impl DaemonRuntime {
             if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
                 warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
             }
+            if let Err(error) = reconcile_work_credentials(&state, &options.namespace).await {
+                warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
+            }
             tasks.push(spawn_convoy_ensure_reconciler_task(
                 Arc::clone(&state),
                 options.namespace.clone(),
@@ -1043,18 +1046,6 @@ async fn reconcile_provisioned_environment(
         }
     }
 
-    if let Some(store) = &state.credential_store {
-        let credential_refs = credential_refs_from_environment(spec)?;
-        let credential_scopes = credential_scopes_from_environment(spec)?;
-        if let Err(error) = store.adopt_github_app_deliveries(env_id.as_str(), &credential_refs, &credential_scopes, handle.runner()).await
-        {
-            if error.should_surface {
-                surface_credential_refresh_error(&state.daemon, namespace, &error).await?;
-            }
-            return Err(format!("credential delivery adoption failed: {}; will retry", error.message));
-        }
-    }
-
     if state.daemon.environment_registry_for_environment(&env_id).is_none() {
         let adoption = async {
             let (bag, registry) = probe_provisioned_environment(state, &env_id, &handle).await?;
@@ -1072,6 +1063,86 @@ async fn reconcile_provisioned_environment(
         info!(environment = %env_id, container = %container_id, "restored provisioned environment registration");
     }
     state.provisioned_environments.lock().await.entry(container_id).or_insert(ActiveProvisionedEnvironment { handle });
+    Ok(())
+}
+
+/// Project active work into the credential files used by its environment.
+/// Completed work contributes grants to remove; a resumed or review turn
+/// contributes them again, causing a fresh mint after the settled cache clears.
+async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
+    let Some(store) = &state.credential_store else { return Ok(()) };
+    let backend = state.daemon.resource_backend();
+    let convoy_sources =
+        backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| format!("list credential convoys: {error}"))?;
+    let convoys =
+        convoy_sources.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
+    let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list credential vessels: {error}"))?;
+    type Delivery = (BTreeSet<String>, BTreeSet<String>, BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>);
+    let mut deliveries = BTreeMap::<String, Delivery>::new();
+    for vessel in vessels.items {
+        let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
+        let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
+        let Some(status) = &convoy.status else { continue };
+        let Some(work) = status.work.get(&vessel.spec.vessel_name) else { continue };
+        // Provisioning may already be staging a credential for the first
+        // launch. Once a turn has started, every non-running phase means the
+        // delivery is no longer needed, including interruption and teardown.
+        if matches!(
+            work.phase,
+            flotilla_resources::WorkPhase::Pending | flotilla_resources::WorkPhase::Ready | flotilla_resources::WorkPhase::Launching
+        ) && !status.phase.is_terminal()
+        {
+            continue;
+        }
+        let Some(requirement) = status
+            .workflow_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+        else {
+            continue;
+        };
+        let (granted, running, scopes) = deliveries.entry(environment_ref.clone()).or_default();
+        granted.extend(requirement.credential_refs.iter().cloned());
+        if work.phase == flotilla_resources::WorkPhase::Running && !status.phase.is_terminal() {
+            running.extend(requirement.credential_refs.iter().cloned());
+            for (name, repositories) in &requirement.credential_scopes {
+                scopes.entry(name.clone()).or_default().extend(repositories.iter().cloned());
+            }
+        }
+    }
+    let current_environments = deliveries.keys().cloned().collect::<BTreeSet<_>>();
+    for (environment_ref, previously_delivered) in store.tracked_work_deliveries().await {
+        deliveries.entry(environment_ref).or_default().0.extend(previously_delivered);
+    }
+    for (environment_ref, (granted, running, scopes)) in deliveries {
+        if granted.is_empty() {
+            continue;
+        }
+        let runner = if environment_ref == state.host_direct_environment_name {
+            state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable for credential delivery".to_string())?
+        } else {
+            match state.daemon.command_runner_for_environment(&EnvironmentId::new(environment_ref.clone())) {
+                Some(runner) => runner,
+                None if !current_environments.contains(&environment_ref) => {
+                    // The vessel and its contained filesystem are gone. Clear
+                    // refresh registrations and cached material as well.
+                    store.forget_environment(&environment_ref).await?;
+                    continue;
+                }
+                None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
+            }
+        };
+        if !running.is_empty() {
+            store
+                .adopt_github_app_deliveries(&environment_ref, &running, &scopes, runner.clone())
+                .await
+                .map_err(|error| format!("mint work credentials for environment {environment_ref}: {}", error.message))?;
+        }
+        store
+            .reconcile_work_delivery(&environment_ref, &granted, &running, &scopes, runner)
+            .await
+            .map_err(|error| format!("reconcile work credentials for environment {environment_ref}: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1619,6 +1690,9 @@ fn spawn_provisioned_environment_reconciliation_task(
         async move {
             if let Err(error) = reconcile_provisioned_environments(&state, &namespace).await {
                 warn!(%error, "failed to reconcile provisioned environment registrations");
+            }
+            if let Err(error) = reconcile_work_credentials(&state, &namespace).await {
+                warn!(%error, "failed to reconcile work credentials");
             }
         }
     })
@@ -7421,6 +7495,190 @@ mod tests {
             Arc::new(AdoptionEnvironmentProvider { handles }),
         );
         Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"credential-work-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("test-host"),
+        )
+        .await;
+        let backend = daemon.resource_backend();
+        backend
+            .clone()
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&empty_meta("work-token"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("credential declaration");
+        let runner = Arc::new(ProcessCommandRunner);
+        let store = Arc::new(CredentialStore::new(
+            backend.clone(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("TEST_WORK_TOKEN", "test-token")])),
+            EnvironmentBag::new(),
+            runner.clone(),
+            temp.path().to_path_buf(),
+        ));
+        let env_id = EnvironmentId::new("env-work");
+        daemon
+            .register_provisioned_environment(
+                env_id.clone(),
+                Arc::new(TestInteriorEnvironment {
+                    id: env_id.clone(),
+                    image: ImageId::new("test-image"),
+                    runner: runner.clone(),
+                    env_vars: HashMap::new(),
+                    destroyed: Arc::new(AtomicBool::new(false)),
+                }),
+                EnvironmentBag::new(),
+                Some(passthrough_registry()),
+            )
+            .expect("register test environment");
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("credential-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("mark work running");
+        let vessels = backend.using::<Vessel>(NAMESPACE);
+        let vessel = vessels
+            .create(&empty_meta("credential-work-vessel"), &VesselSpec {
+                convoy_ref: "credential-work".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("create vessel");
+        vessels
+            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some(env_id.as_str().to_string()),
+                ..VesselStatus::default()
+            })
+            .await
+            .expect("place vessel");
+        let state = ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            passthrough_registry(),
+            None,
+            "test-host".to_string(),
+            None,
+            "host-direct-test".to_string(),
+        )
+        .with_credential_store(store);
+        let git_config = temp.path().join("credentials/gitconfig").to_string_lossy().into_owned();
+        let can_fill_git_credential = || {
+            let runner = runner.clone();
+            let git_config = git_config.clone();
+            async move {
+                runner
+                    .run(
+                        "sh",
+                        &[
+                            "-c",
+                            "export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=\"$1\" GIT_TERMINAL_PROMPT=0; printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill",
+                            "credential-probe",
+                            &git_config,
+                        ],
+                        Path::new("/"),
+                        &ChannelLabel::Default,
+                    )
+                    .await
+                    .is_ok()
+            }
+        };
+        let settle = |phase| {
+            let convoys = &convoys;
+            async move {
+                let current = convoys.get("credential-work").await.expect("read convoy");
+                let mut status = current.status.expect("convoy status");
+                status.phase = phase;
+                status.work.get_mut("work").expect("work").phase = WorkPhase::Complete;
+                convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("settle work");
+            }
+        };
+
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
+        assert!(can_fill_git_credential().await);
+        settle(ConvoyPhase::Landing).await;
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke settled credentials");
+        assert!(!can_fill_git_credential().await);
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            "credential-work",
+            &flotilla_resources::external_patches::resume_crew_work(
+                "work".to_string(),
+                "coder".to_string(),
+                Utc::now(),
+                "follow-up".to_string(),
+            ),
+        )
+        .await
+        .expect("deliver resume brief");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("re-mint resumed credentials");
+        assert!(can_fill_git_credential().await);
+
+        settle(ConvoyPhase::Landing).await;
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke review boundary credentials");
+        assert!(!can_fill_git_credential().await);
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            "credential-work",
+            &flotilla_resources::external_patches::record_turn_delivery(
+                "actionable-review".to_string(),
+                flotilla_resources::TurnDeliveryEpisode::builder()
+                    .head_sha("abc".to_string())
+                    .evidence_at(Utc::now())
+                    .judged_claim_at(Utc::now())
+                    .outcome(flotilla_resources::TurnDeliveryOutcome::Delivered {
+                        rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                        delivered_at: Utc::now(),
+                    })
+                    .build(),
+                "work".to_string(),
+                "coder".to_string(),
+                "address review".to_string(),
+            ),
+        )
+        .await
+        .expect("deliver review turn");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("re-mint review credentials");
+        assert!(can_fill_git_credential().await);
+
+        vessels.delete("credential-work-vessel").await.expect("tear down vessel");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke credentials after vessel teardown");
+        assert!(!can_fill_git_credential().await);
     }
 
     #[tokio::test]

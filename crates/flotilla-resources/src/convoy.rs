@@ -1103,7 +1103,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt } => {
+                status.phase = ConvoyPhase::Active;
+                status.finished_at = None;
                 if let Some(work) = status.work.get_mut(vessel) {
+                    work.phase = WorkPhase::Running;
+                    work.finished_at = None;
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {

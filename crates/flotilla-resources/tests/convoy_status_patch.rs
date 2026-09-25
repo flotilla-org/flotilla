@@ -481,6 +481,9 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string())
         .apply(&mut status);
 
+    assert_eq!(status.phase, ConvoyPhase::Active);
+    assert_eq!(status.work["implement"].phase, WorkPhase::Running);
+    assert_eq!(status.work["implement"].finished_at, None);
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["coder"].started_at, Some(ts(10)));
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, None);
