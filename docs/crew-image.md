@@ -31,6 +31,18 @@ records sessions by default, so recordings remain on the host after container
 teardown. A future image release should bake cleat into the image; the shared
 runtime root remains the durability boundary either way.
 
+The image supplies `xterm-ghostty` terminfo in `/usr/share/terminfo`, which is
+readable by the host-mapped crew user without a home-directory or host mount.
+The entry is generated from Ghostty's `src/terminfo/ghostty.zig` at the commit
+pinned by `tools/ghostty-toolchain.toml` in the Dockerfile's `CLEAT_REF`
+checkout, using `ci/crew-image/emit-ghostty-terminfo.zig` as a small encoder
+entry point. With the current `CLEAT_REF` (`2694b71c593868af3b289a04ed6e468979c236bc`),
+that Ghostty commit is `64daa599c531e6938bc4c52d9198a91f1e6ce8cf`
+from `rjwittams/ghostty`. Ghostty is MIT licensed; its `LICENSE` is copied
+to `/usr/share/doc/ghostty-terminfo/copyright`. The image does not set `TERM`:
+Cleat chooses the identity for each new session, and environments without this
+entry can still use `xterm-256color`.
+
 The mounted Flotilla CLI connects back to the host daemon through the socket
 named by `FLOTILLA_DAEMON_SOCKET`. Docker mounts the socket's parent directory,
 so replacing the socket inode during a host daemon restart remains visible
@@ -103,9 +115,9 @@ routine bump is just overriding the one input that changed. The workflow:
   of `.flotilla/Dockerfile.crew` on the `crew-image-builder` runner (see
   `ci/fork-actions/RUNNERS.md`);
 - gates on the Dockerfile's own build-time smoke checks (`claude`, `codex`,
-  `tea`, and the C toolchain), which run for both platforms as part of the
-  build, then re-verifies the pushed manifest by pulling it back and
-  re-running the adapter version checks;
+  `tea`, the C toolchain, and both Ghostty and fallback terminfo), which run
+  for both platforms as part of the build, then re-verifies the pushed
+  manifest by pulling it back and running adapter and non-root terminfo checks;
 - authenticates to the registry with the `image-builder` `write:package`
   identity via the `IMAGE_BUILDER_TOKEN` repository secret — the recipe
   itself never sees a credential, and the workflow logs back out of the
@@ -164,7 +176,22 @@ docker run --rm "$IMAGE" clang --version
 docker run --rm "$IMAGE" ld.lld --version
 docker run --rm "$IMAGE" make --version
 docker run --rm "$IMAGE" pkg-config --version
+docker run --rm --user 12345:12345 "$IMAGE" sh -c '
+  set -eu
+  infocmp xterm-ghostty >/dev/null
+  infocmp xterm-256color >/dev/null
+  TERM=xterm-ghostty python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
+  TERM=xterm-256color python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
+'
 ```
+
+After updating the fleet baseline and admitting a **new** contained crew,
+launch a fresh Cleat session in that vessel without a TERM or identity
+override. Inspect the child with `printf '%s\n' "$TERM"` and
+`infocmp "$TERM"`; expect `xterm-ghostty` and successful capability lookup.
+Also run `TERM=xterm-ghostty python3 -c 'import curses; curses.setupterm()'`
+and a noninteractive `sh -c 'true'`. Existing crews retain their pinned image
+and are not restarted by the image build or baseline update.
 
 The build-time smoke check also compiles and links a small C program with
 Clang and LLD, exercising the common C and Linux headers. To verify the
