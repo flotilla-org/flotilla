@@ -5868,12 +5868,16 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
         panic!("review session should remain agent-backed")
     };
-    assert_eq!(review_message.expect("queued review delivery").text, "Start the review");
+    let review_message = review_message.expect("queued review delivery").text;
+    assert!(review_message.starts_with("Start the review"));
+    assert!(review_message.contains("file a fresh settlement claim"));
     let coder_session = sessions.get("idle-coder-session").await.expect("read queued coder session");
     let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
         panic!("coder session should remain agent-backed")
     };
-    assert_eq!(coder_message.expect("queued coder delivery").text, "Start the next turn");
+    let coder_message = coder_message.expect("queued coder delivery").text;
+    assert!(coder_message.starts_with("Start the next turn"));
+    assert!(coder_message.contains("file a fresh settlement claim"));
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
@@ -5895,6 +5899,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     convoys
         .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
             phase: ConvoyPhase::Active,
+            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
             crew_work: BTreeMap::from([(
                 "work".to_string(),
                 BTreeMap::from([(
@@ -5973,7 +5978,74 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
-    assert_eq!(message.expect("next turn message").text, "Begin the follow-up turn");
+    let message = message.expect("next turn message").text;
+    assert!(message.starts_with("Begin the follow-up turn"));
+    assert!(message.contains("file a fresh settlement claim"));
+    assert!(message.contains("flotilla crew complete"));
+
+    daemon
+        .crew_complete_with_disposition_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("turn-boundary".to_string()),
+                vessel_ref: Some("work-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            Some("follow-up turn complete".to_string()),
+            Some("satisfied".to_string()),
+            Some("https://example.test/pull/1#follow-up-ledger".to_string()),
+        )
+        .await
+        .expect("complete resumed turn without operator intervention");
+    let status = convoys.get("turn-boundary").await.expect("read completed convoy").status.expect("convoy status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+}
+
+#[tokio::test]
+async fn convoy_explain_reports_completed_work_without_a_crew_claim() {
+    let (_temp, _repo, daemon) = daemon_for_cwd().await;
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("unclaimed-work".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("record completed work without a claim");
+
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "unclaimed-work".to_string() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain convoy");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("expected convoy explanation") };
+    assert_eq!(explanation.phase, "Active");
+    assert_eq!(explanation.unclaimed_work.len(), 1);
+    assert_eq!(explanation.unclaimed_work[0].vessel, "work");
+    assert_eq!(explanation.unclaimed_work[0].role, "coder");
+    assert_eq!(explanation.unclaimed_work[0].evidence, "work_complete");
+    assert!(explanation.decision_ledgers.is_empty());
 }
 
 #[tokio::test]

@@ -28,15 +28,15 @@ use flotilla_protocol::{
     ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
     CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow,
-    FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress,
-    ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
-    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan,
-    ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType,
-    ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
+    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -1627,8 +1627,14 @@ async fn crew_brief_repo_roots(
     roots
 }
 
+const STANDING_TURN_CONTRACT: &str = "When this turn is finished, post a `## Decision ledger` comment on the bound pull request or issue. Record each decision the brief left open with Brief silence, Choice, Alternative, and If asking were free; if there were none, write `No decisions beyond the brief.`. Then file a fresh settlement claim with `flotilla crew complete --decision-ledger-ref '<comment URL>' --message '...'` as your final act. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.";
+
+fn delivered_turn_brief(content: &str) -> String {
+    format!("{}\n\n{STANDING_TURN_CONTRACT}", content.trim_end())
+}
+
 fn pending_crew_message(text: &str) -> TerminalCrewMessage {
-    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
+    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: delivered_turn_brief(text) }
 }
 
 fn ensure_crew_work_is_defined(
@@ -8582,15 +8588,17 @@ impl InProcessDaemon {
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
         };
-        let delivery_message =
-            TerminalCrewMessage { id: format!("turn-delivery:{}:{}", request.source, request.head_sha), text: request.brief.clone() };
+        let delivery_message = TerminalCrewMessage {
+            id: format!("turn-delivery:{}:{}", request.source, request.head_sha),
+            text: delivered_turn_brief(&request.brief),
+        };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         match plan {
             TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
                 *message = Some(delivery_message);
             }
             TurnDeliverySessionPlan::RestartFresh => {
-                brief.content = request.brief.clone();
+                brief.content = delivered_turn_brief(&request.brief);
                 *message = None;
             }
         }
@@ -11039,13 +11047,15 @@ impl InProcessDaemon {
             })
             .collect();
 
-        let mut crew_deliveries = self
+        let terminal_sessions = self
             .resource_backend
             .including_replicas::<ResourceTerminalSession>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
-            .items
+            .items;
+        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), &terminal_sessions, name);
+        let mut crew_deliveries = terminal_sessions
             .into_iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
             .map(|source| ExplainedCrewDelivery {
@@ -11104,12 +11114,54 @@ impl InProcessDaemon {
             change_requests,
             subscriptions,
             crew_deliveries,
+            unclaimed_work,
             decision_ledgers,
             settlement,
             recent_events,
             lifecycle_mutations,
         })
     }
+}
+
+fn explained_unclaimed_work(
+    status: Option<&ConvoyStatus>,
+    sessions: &[ReadResourceObject<ResourceTerminalSession>],
+    convoy_name: &str,
+) -> Vec<ExplainedUnclaimedWork> {
+    let Some(status) = status else { return Vec::new() };
+    status
+        .crew_work
+        .iter()
+        .flat_map(|(vessel, crew)| {
+            crew.iter().filter_map(move |(role, state)| {
+                if state.phase != CrewWorkPhase::Working {
+                    return None;
+                }
+                let session = sessions.iter().find(|source| {
+                    let labels = &source.object.metadata.labels;
+                    labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy_name)
+                        && labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
+                        && labels.get(ROLE_LABEL).is_some_and(|value| value == role)
+                });
+                let evidence = if status.work.get(vessel).is_some_and(|work| work.phase == ResourceWorkPhase::Complete) {
+                    "work_complete"
+                } else if session.is_some_and(|source| {
+                    source.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
+                }) {
+                    "session_stopped"
+                } else if session.is_some_and(|source| {
+                    source.object.status.as_ref().is_some_and(|status| {
+                        status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
+                    })
+                }) {
+                    "turn_idle"
+                } else {
+                    return None;
+                };
+                Some(ExplainedUnclaimedWork { vessel: vessel.clone(), role: role.clone(), evidence: evidence.to_string() })
+            })
+        })
+        .collect()
 }
 
 fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {

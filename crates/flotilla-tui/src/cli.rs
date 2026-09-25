@@ -695,6 +695,13 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    if !explanation.unclaimed_work.is_empty() {
+        output.push_str("\nWork done, settlement claim missing:\n");
+        for work in &explanation.unclaimed_work {
+            let _ = writeln!(output, "  - {}/{} ({})", work.vessel, work.role, work.evidence.replace('_', " "));
+        }
+    }
+
     output.push_str("\nDecision ledgers:\n");
     if explanation.decision_ledgers.is_empty() {
         output.push_str("  (no settlement claims)\n");

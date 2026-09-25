@@ -53,6 +53,22 @@ fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
 }
 
 #[test]
+fn completed_work_without_a_crew_claim_is_distinct_from_working_crew() {
+    let status = ConvoyStatus {
+        work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(ResourceWorkPhase::Complete).build())]),
+        crew_work: BTreeMap::from([(
+            "work".to_string(),
+            BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+
+    let unclaimed = explained_unclaimed_work(Some(&status), &[], "stuck-convoy");
+    assert_eq!(unclaimed, vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "work_complete".into() }]);
+    assert!(explained_decision_ledgers(Some(&status)).is_empty());
+}
+
+#[test]
 fn recursive_attach_preserves_take_preference_and_explicit_watch() {
     let host = HostName::new("udder");
     let take = flotilla_protocol::arg::flatten(&recursive_attach_command(&host, "crew-session", AttachMode::PreferTake), 0);
