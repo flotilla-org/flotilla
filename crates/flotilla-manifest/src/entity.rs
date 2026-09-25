@@ -40,6 +40,22 @@ pub fn repo(forge_slug: &str) -> EntityRef {
     EntityRef::new("repo", forge_slug)
 }
 
+/// Length-prefixed components keep repository keys and subpaths unambiguous.
+pub fn project_repository(namespace: &str, project: &str, repository_key: &str, subpath: Option<&str>) -> EntityRef {
+    let component = |value: &str| format!("{}:{value}", value.len());
+    let subpath_presence = if subpath.is_some() { "1" } else { "0" };
+    EntityRef::new(
+        "project_repository",
+        format!(
+            "{}{}{}{subpath_presence}{}",
+            component(namespace),
+            component(project),
+            component(repository_key),
+            component(subpath.unwrap_or(""))
+        ),
+    )
+}
+
 pub fn convoy(namespace: &str, name: &str, origin: &str) -> EntityRef {
     EntityRef::new("convoy", format!("{namespace}/{name}@{origin}"))
 }

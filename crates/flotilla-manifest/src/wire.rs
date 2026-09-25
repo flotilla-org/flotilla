@@ -23,6 +23,11 @@
 //! | `flotilla.crew.role` | One bound pane's crew role. |
 //! | `flotilla.attach.ref` | Address accepted by `flotilla attach`. |
 //! | `flotilla.project.name` | Human-readable name of a Project group. |
+//! | `flotilla.project.repository_count` | Count from an available Project definition; zero means known-empty, absence means unavailable. |
+//! | `flotilla.membership.project` | Stable `<namespace>/<project>@fleet` Project entity id on a `project_repository` relation. |
+//! | `flotilla.membership.repository_key` | Authoritative RepositoryKey on a `project_repository` relation. |
+//! | `flotilla.membership.repository_slug` | Optional display slug for that repository. |
+//! | `flotilla.membership.subpath` | Optional configured subpath; absence means whole repository. |
 //! | `flotilla.convoy.name` | Human-readable convoy name without an associated change-request suffix. |
 //! | `flotilla.vessel.name` | Human-readable vessel name. |
 //! | `flotilla.convoy.phase` | Raw [`flotilla_protocol::ConvoyPhase`] value. |

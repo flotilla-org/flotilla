@@ -59,6 +59,8 @@ pub enum QueryId {
     /// Standing project roles declared by `ConvoyEnsure`, fleet-wide
     /// (`None`) or in one Project. Rows are [`StandingRoleRow`].
     StandingRoles { scope: Option<QueryScope> },
+    /// Authoritative Project repository definitions, including known-empty projects.
+    ProjectRepositories { scope: Option<QueryScope> },
 }
 
 /// The Project scope owned by a curated query family. Repository membership
@@ -84,6 +86,7 @@ impl QueryId {
         QueryId::Independents { scope: None },
         QueryId::Checkouts { scope: None },
         QueryId::StandingRoles { scope: None },
+        QueryId::ProjectRepositories { scope: None },
     ];
 
     pub fn family(&self) -> &'static str {
@@ -94,6 +97,7 @@ impl QueryId {
             Self::Checkouts { .. } => "checkouts",
             Self::Awareness { .. } => "awareness",
             Self::StandingRoles { .. } => "standing_roles",
+            Self::ProjectRepositories { .. } => "project_repositories",
         }
     }
 }
@@ -190,6 +194,12 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
     },
+    ProjectRepositories {
+        scope: Option<QueryScope>,
+        changed: Vec<ProjectRepositoriesRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<ResourceRef>,
+    },
 }
 
 impl QueryChanges {
@@ -205,6 +215,7 @@ impl QueryChanges {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
+            Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
         }
     }
 
@@ -216,6 +227,7 @@ impl QueryChanges {
             Self::Checkouts { changed, .. } => changed.len(),
             Self::Awareness { changed, .. } => changed.len(),
             Self::StandingRoles { changed, .. } => changed.len(),
+            Self::ProjectRepositories { changed, .. } => changed.len(),
         }
     }
 
@@ -224,7 +236,8 @@ impl QueryChanges {
             Self::Convoys { removed, .. }
             | Self::Independents { removed, .. }
             | Self::Checkouts { removed, .. }
-            | Self::StandingRoles { removed, .. } => removed.len(),
+            | Self::StandingRoles { removed, .. }
+            | Self::ProjectRepositories { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
             Self::Awareness { removed, .. } => removed.len(),
         }
@@ -276,12 +289,20 @@ impl QueryChanges {
         }
     }
 
+    pub fn as_project_repositories(&self) -> Option<&[ProjectRepositoriesRow]> {
+        match self {
+            Self::ProjectRepositories { changed, .. } => Some(changed),
+            _ => None,
+        }
+    }
+
     pub fn removed_resources(&self) -> Option<&[ResourceRef]> {
         match self {
             Self::Convoys { removed, .. }
             | Self::Independents { removed, .. }
             | Self::Checkouts { removed, .. }
-            | Self::StandingRoles { removed, .. } => Some(removed),
+            | Self::StandingRoles { removed, .. }
+            | Self::ProjectRepositories { removed, .. } => Some(removed),
             Self::Issues { .. } | Self::Awareness { .. } => None,
         }
     }
@@ -293,7 +314,8 @@ impl QueryChanges {
             | Self::Independents { .. }
             | Self::Checkouts { .. }
             | Self::Awareness { .. }
-            | Self::StandingRoles { .. } => None,
+            | Self::StandingRoles { .. }
+            | Self::ProjectRepositories { .. } => None,
         }
     }
 }
@@ -377,6 +399,10 @@ pub enum Rows {
         scope: Option<QueryScope>,
         rows: Vec<StandingRoleRow>,
     },
+    ProjectRepositories {
+        scope: Option<QueryScope>,
+        rows: Vec<ProjectRepositoriesRow>,
+    },
 }
 
 impl Rows {
@@ -392,6 +418,7 @@ impl Rows {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
+            Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
         }
     }
 
@@ -403,6 +430,7 @@ impl Rows {
             Self::Checkouts { rows, .. } => rows.len(),
             Self::Awareness { rows, .. } => rows.len(),
             Self::StandingRoles { rows, .. } => rows.len(),
+            Self::ProjectRepositories { rows, .. } => rows.len(),
         }
     }
 
@@ -448,6 +476,13 @@ impl Rows {
     pub fn as_standing_roles(&self) -> Option<&[StandingRoleRow]> {
         match self {
             Self::StandingRoles { rows, .. } => Some(rows),
+            _ => None,
+        }
+    }
+
+    pub fn as_project_repositories(&self) -> Option<&[ProjectRepositoriesRow]> {
+        match self {
+            Self::ProjectRepositories { rows, .. } => Some(rows),
             _ => None,
         }
     }
@@ -752,6 +787,24 @@ pub struct IndependentRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
     pub phase: SessionPhase,
+}
+
+/// One authoritative Project definition. Presence of this row makes an empty
+/// `repositories` list known-empty; absence means the definition is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRepositoriesRow {
+    pub resource: ResourceRef,
+    pub display_name: String,
+    pub repositories: Vec<ProjectRepositoryMembership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectRepositoryMembership {
+    pub key: RepositoryKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subpath: Option<String>,
 }
 
 /// One row of the [`QueryId::StandingRoles`] result set: a standing

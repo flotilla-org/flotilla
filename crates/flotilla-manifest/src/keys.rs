@@ -48,6 +48,12 @@ pub const KEY_ATTACH_REF: &str = "flotilla.attach.ref";
 // Catalog keys (`flotilla pm connect`, Entity targets, TTL'd).
 
 pub const KEY_PROJECT_NAME: &str = "flotilla.project.name";
+/// Known-empty is represented by zero; absence means the Project definition is unavailable.
+pub const KEY_PROJECT_REPOSITORY_COUNT: &str = "flotilla.project.repository_count";
+pub const KEY_MEMBERSHIP_PROJECT: &str = "flotilla.membership.project";
+pub const KEY_MEMBERSHIP_REPOSITORY_KEY: &str = "flotilla.membership.repository_key";
+pub const KEY_MEMBERSHIP_REPOSITORY_SLUG: &str = "flotilla.membership.repository_slug";
+pub const KEY_MEMBERSHIP_SUBPATH: &str = "flotilla.membership.subpath";
 /// Terminal attempt with a newer generation of the same project and role.
 pub const KEY_CONVOY_SUPERSEDED: &str = "flotilla.convoy.superseded";
 pub const KEY_CONVOY_PHASE: &str = "flotilla.convoy.phase";

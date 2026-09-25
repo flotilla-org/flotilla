@@ -239,6 +239,7 @@ fn issue_demand_query(query: &QueryId) -> Option<QueryId> {
         | QueryId::Independents { .. }
         | QueryId::Checkouts { .. }
         | QueryId::StandingRoles { .. }
+        | QueryId::ProjectRepositories { .. }
         | QueryId::Awareness { scope: None, .. } => None,
     }
 }

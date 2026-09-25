@@ -12,8 +12,8 @@ use std::{
 use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL,
     result_set::{
-        AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta,
-        ResultSet, ResultSetState, Rows, StandingRoleRow,
+        AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, ProjectRepositoriesRow, QueryId,
+        QueryScope, ResultDelta, ResultSet, ResultSetState, Rows, StandingRoleRow,
     },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     awareness_projection::{project_awareness, AwarenessInput, ScopedIssueRow},
+    project_repositories::ProjectRepositoryProjection,
     query_registry::QueryRegistry,
     salience::SalienceFacts,
     scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
@@ -133,6 +134,8 @@ pub struct AggregatorProjectionState {
     #[builder(skip)]
     standing_roles: Arc<RwLock<StandingRoleProjection>>,
     #[builder(skip)]
+    project_repositories: Arc<RwLock<ProjectRepositoryProjection>>,
+    #[builder(skip)]
     salience: Arc<RwLock<SalienceProjection>>,
     #[builder(skip)]
     project_catalog: Arc<RwLock<ProjectCatalogProjection>>,
@@ -228,6 +231,10 @@ impl AggregatorProjectionState {
         self.standing_roles.write().await.replace_rows(rows)
     }
 
+    pub async fn replace_project_repository_rows(&self, rows: Vec<ProjectRepositoriesRow>) -> Vec<ResultDelta> {
+        self.project_repositories.write().await.replace_rows(rows)
+    }
+
     /// Replace the mesh-side facts used by the central salience join. Returns
     /// whether any projected salience may have changed.
     pub async fn replace_salience_facts(&self, facts: SalienceFacts) -> bool {
@@ -317,6 +324,7 @@ impl AggregatorProjectionState {
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
             QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
             QueryId::StandingRoles { scope } => Some(self.standing_roles.write().await.result_set(scope)),
+            QueryId::ProjectRepositories { scope } => Some(self.project_repositories.write().await.result_set(scope)),
         };
         if let Some(result_set) = result_set.as_ref().filter(|result_set| matches!(result_set.query(), QueryId::Convoys { scope: Some(_) }))
         {

@@ -27,6 +27,7 @@ pub mod path_context;
 pub mod path_policy;
 pub mod placement_policy;
 pub mod project_declaration;
+mod project_repositories;
 pub mod provider_data;
 pub mod providers;
 pub mod query_registry;
