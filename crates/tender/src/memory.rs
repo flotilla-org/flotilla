@@ -21,6 +21,7 @@ pub struct MemoryTender {
 
 struct Record {
     publication: Publication,
+    requested_audience: BTreeSet<Fingerprint>,
     expires_at: u64,
     sender: Option<mpsc::UnboundedSender<ByteStream>>,
     streams: Vec<OpenStream>,
@@ -72,9 +73,12 @@ impl MemoryTender {
         let current = grant;
         let now = state.now;
         for record in state.records.values_mut() {
-            if record.publication.publisher == current.grantee && record.publication.namespace == current.namespace {
+            if record.publication.publisher == current.grantee
+                && record.publication.namespace == current.namespace
+                && record.publication.availability != Availability::Withdrawn
+            {
                 record.expires_at = current.expires_at;
-                record.publication.audience.retain(|member| current.audience_ceiling.contains(member));
+                record.publication.audience = record.requested_audience.intersection(&current.audience_ceiling).cloned().collect();
                 for stream in &record.streams {
                     if !record.publication.audience.contains(&stream.caller) {
                         stream.task.abort();
@@ -208,12 +212,12 @@ impl State {
         if session.caller != lease.publisher {
             return Err(Error::Denied);
         }
-        let record = self.records.get(&lease.id).ok_or(Error::UnknownPublication)?;
+        let record = self.records.get(&lease.id).ok_or(Error::Denied)?;
+        if record.publication.publisher != session.caller {
+            return Err(Error::Denied);
+        }
         if record.publication.generation != lease.generation {
             return Err(Error::StaleGeneration);
-        }
-        if record.publication.publisher != lease.publisher {
-            return Err(Error::Denied);
         }
         if record.publication.availability == Availability::Withdrawn {
             return Err(Error::Withdrawn);
@@ -248,6 +252,7 @@ impl Tender for MemoryTender {
             }
             record.publication.publisher = session.caller.clone();
             record.publication.name = request.name;
+            record.requested_audience = request.audience;
             record.publication.audience = audience;
             record.publication.generation += 1;
             record.publication.availability = Availability::Available;
@@ -266,7 +271,13 @@ impl Tender for MemoryTender {
                 generation: 1,
                 availability: Availability::Available,
             };
-            state.records.insert(id, Record { publication, expires_at: grant.expires_at, sender: Some(sender), streams: Vec::new() });
+            state.records.insert(id, Record {
+                publication,
+                requested_audience: request.audience,
+                expires_at: grant.expires_at,
+                sender: Some(sender),
+                streams: Vec::new(),
+            });
             Lease { id, generation: 1, publisher: session.caller.clone() }
         };
         state.notify();

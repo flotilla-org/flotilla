@@ -169,6 +169,10 @@ async fn lifecycle_and_stale_teardown(rig: Rig) {
     grant(&rig, "owner", "n", &["consumer"], 100);
     grant(&rig, "contender", "n", &["consumer"], 100);
     let first = rig.tender.publish(&publisher, request("n", "service", &["consumer"], None)).await.expect("first");
+    let forged_existing = tender::Lease { id: first.lease.id, generation: 1, publisher: fp("contender") };
+    let forged_missing = tender::Lease { id: PublicationId(u64::MAX), generation: 1, publisher: fp("contender") };
+    assert!(matches!(rig.tender.withdraw(&contender, &forged_existing).await, Err(Error::Denied)));
+    assert!(matches!(rig.tender.withdraw(&contender, &forged_missing).await, Err(Error::Denied)));
     assert!(matches!(
         rig.tender.publish(&publisher, request("n", "service", &["consumer"], Some(first.lease.id))).await,
         Err(Error::LivePublisher)
@@ -263,7 +267,7 @@ async fn restart_and_replacement(rig: Rig) {
     let second =
         rig.tender.publish(&replacement, request("n", "service", &["consumer"], Some(first.lease.id))).await.expect("explicit assignment");
     assert_eq!(second.lease.generation, 2);
-    assert!(matches!(rig.tender.disconnect(&original, &first.lease).await, Err(Error::StaleGeneration)));
+    assert!(matches!(rig.tender.disconnect(&original, &first.lease).await, Err(Error::Denied)));
 }
 
 async fn publisher_receiver_closure(rig: Rig) {
@@ -298,6 +302,9 @@ async fn narrowed_grant_removes_live_audience(rig: Rig) {
     let mut byte = [0];
     assert_eq!(timeout(Duration::from_secs(1), old_stream.read(&mut byte)).await.expect("removed stream closes").expect("read"), 0);
     round_trip(&rig, &kept, published.lease.id, &mut published.incoming).await;
+    grant(&rig, "owner", "n", &["kept", "removed"], 100);
+    assert_eq!(watch.recv().await.expect("widened")[0].audience, set(&["kept", "removed"]));
+    round_trip(&rig, &removed, published.lease.id, &mut published.incoming).await;
 }
 
 async fn backpressure_and_cancel(rig: Rig) {
