@@ -27,8 +27,8 @@ use flotilla_resources::{
     ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee, DemandState, Environment, Presentation, Project,
     ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, ReplicaReadResolver, Repository,
     RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent,
+    WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
@@ -1883,7 +1883,7 @@ impl Aggregator {
                 if attention.state == TerminalAttentionState::Unobservable {
                     return None;
                 }
-                attention.as_of.checked_add_signed(flotilla_resources::TerminalAttention::FRESH_FOR)
+                attention.as_of.checked_add_signed(TerminalAttention::FRESH_FOR)
             })
             .filter(|expiry| self.attention_expired_through.is_none_or(|through| *expiry > through))
             .min()
