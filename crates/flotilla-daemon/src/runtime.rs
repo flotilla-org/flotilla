@@ -508,7 +508,7 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
-        let ssh_profiles = discover_agentless_ssh_profiles(&daemon, &config).await?;
+        let ssh_profiles = discover_agentless_ssh_profiles(&daemon, &config).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
@@ -536,10 +536,20 @@ impl DaemonRuntime {
             .await
             .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
-        for ssh in &ssh_profiles {
-            register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, ssh).await?;
-            apply_agentless_ssh_observation(&daemon, &options.namespace, ssh, Some(&credential_store)).await?;
+        let mut registered_ssh_profiles = Vec::new();
+        for ssh in ssh_profiles {
+            if let Err(error) =
+                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+            {
+                warn!(host = %ssh.provisioning.host_id, %error, "failed to register agentless SSH host; continuing startup");
+                continue;
+            }
+            if let Err(error) = apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store)).await {
+                warn!(host = %ssh.provisioning.host_id, %error, "failed to observe agentless SSH host; continuing startup");
+            }
+            registered_ssh_profiles.push(ssh);
         }
+        let ssh_profiles = registered_ssh_profiles;
         apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
             .await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
@@ -758,42 +768,56 @@ struct AgentlessSshProfile {
     provisioning: LocalProvisioningProfile,
     environment_id: EnvironmentId,
     destination: String,
+    env_bag: EnvironmentBag,
     runner: Arc<dyn CommandRunner>,
 }
 
-async fn discover_agentless_ssh_profiles(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Vec<AgentlessSshProfile>, String> {
+async fn discover_agentless_ssh_profiles(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Vec<AgentlessSshProfile> {
     let mut profiles = Vec::new();
     for (environment_id, direct) in daemon.agentless_ssh_environments() {
-        let host_id = direct.host_id.as_ref().expect("agentless SSH environment has a host ID").to_string();
-        let home = direct.env_bag.find_env_var("HOME").ok_or_else(|| format!("SSH host {host_id} has no HOME"))?;
-        let probe_root = ExecutionEnvironmentPath::new(home);
-        let remote_state_root =
-            direct.env_bag.find_env_var("XDG_STATE_HOME").map(str::to_string).unwrap_or_else(|| format!("{home}/.local/state"));
-        let remote_config = ConfigStore::new(config.base_path().clone(), DaemonHostPath::new(format!("{remote_state_root}/flotilla")));
-        let registry = Arc::new(
-            daemon.discovery_runtime().factories.probe_all(&direct.env_bag, &remote_config, &probe_root, Arc::clone(&direct.runner)).await,
-        );
-        let pool = ["cleat", "shpool"]
-            .into_iter()
-            .find(|name| registry.terminal_pools.contains_key(name))
-            .ok_or_else(|| format!("SSH host {host_id} has no persistent terminal pool (cleat or shpool)"))?
-            .to_string();
-        let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
-        let provisioning = LocalProvisioningProfile {
-            host_id,
-            display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
-            repo_default_dir: format!("{home}/{DEFAULT_REPO_DIR_SUFFIX}"),
-            host_direct_pool: pool,
-            docker_pool: "cleat".to_string(),
-            available_pools,
-            available_agent_adapters: registry.agent_adapters.ids().map(ToString::to_string).collect(),
-            docker_available: false,
-        };
-        daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
-        let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
-        profiles.push(AgentlessSshProfile { provisioning, environment_id, destination, runner: direct.runner });
+        let profile = discover_agentless_ssh_profile(daemon, config, environment_id, direct).await;
+        match profile {
+            Ok(profile) => profiles.push(profile),
+            Err(error) => warn!(%error, "failed to discover agentless SSH host; continuing startup"),
+        }
     }
-    Ok(profiles)
+    profiles
+}
+
+async fn discover_agentless_ssh_profile(
+    daemon: &Arc<InProcessDaemon>,
+    config: &ConfigStore,
+    environment_id: EnvironmentId,
+    direct: flotilla_core::environment_manager::DirectEnvironmentState,
+) -> Result<AgentlessSshProfile, String> {
+    let host_id = direct.host_id.as_ref().expect("agentless SSH environment has a host ID").to_string();
+    let home = direct.env_bag.find_env_var("HOME").ok_or_else(|| format!("SSH host {host_id} has no HOME"))?;
+    let probe_root = ExecutionEnvironmentPath::new(home);
+    let remote_state_root =
+        direct.env_bag.find_env_var("XDG_STATE_HOME").map(str::to_string).unwrap_or_else(|| format!("{home}/.local/state"));
+    let remote_config = ConfigStore::new(config.base_path().clone(), DaemonHostPath::new(format!("{remote_state_root}/flotilla")));
+    let registry = Arc::new(
+        daemon.discovery_runtime().factories.probe_all(&direct.env_bag, &remote_config, &probe_root, Arc::clone(&direct.runner)).await,
+    );
+    let pool = ["cleat", "shpool"]
+        .into_iter()
+        .find(|name| registry.terminal_pools.contains_key(name))
+        .ok_or_else(|| format!("SSH host {host_id} has no persistent terminal pool (cleat or shpool)"))?
+        .to_string();
+    let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
+    let provisioning = LocalProvisioningProfile {
+        host_id,
+        display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
+        repo_default_dir: format!("{home}/{DEFAULT_REPO_DIR_SUFFIX}"),
+        host_direct_pool: pool,
+        docker_pool: "cleat".to_string(),
+        available_pools,
+        available_agent_adapters: registry.agent_adapters.ids().map(ToString::to_string).collect(),
+        docker_available: false,
+    };
+    daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
+    let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
+    Ok(AgentlessSshProfile { provisioning, environment_id, destination, env_bag: direct.env_bag, runner: direct.runner })
 }
 
 async fn register_agentless_ssh_resources(
@@ -849,10 +873,17 @@ async fn apply_agentless_ssh_observation(
         None
     };
     let ready = probe_succeeded && free_bytes.is_some();
-    let (held_credentials, credential_expiry) = match credential_store {
-        Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
-        None => (BTreeSet::new(), BTreeMap::new()),
+    // Declared credentials are resolved by the owning daemon and delivered
+    // through this SSH runner. Ambient login instead belongs to the remote
+    // GUI user and must be observed on that host.
+    let held_credentials = match credential_store {
+        Some(store) => store.held_credentials().await?,
+        None => BTreeSet::new(),
     };
+    let mut credential_expiry = BTreeMap::new();
+    if let Some(expiry) = CredentialStore::remote_ambient_claude_expiry(&ssh.env_bag, ssh.runner.as_ref()).await {
+        credential_expiry.insert(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE.to_string(), expiry);
+    }
     let mut conditions = probe
         .err()
         .map(|error| {
@@ -3835,7 +3866,12 @@ async fn remove_empty_checkout_parents(runner: &dyn CommandRunner, clone_path: &
         let path = parent.to_string_lossy();
         match runner.run_output("rmdir", &[&path], Path::new("/"), &ChannelLabel::Default).await {
             Ok(output) if output.success => {}
-            Ok(_) => break,
+            Ok(_) => {
+                let exists = runner.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Default).await?;
+                if exists.success {
+                    break;
+                }
+            }
             Err(error) => return Err(format!("remove empty checkout parent {}: {error}", parent.display())),
         }
         let Some(next) = parent.parent() else {
@@ -5052,14 +5088,24 @@ mod tests {
             },
             environment_id: environment_id.clone(),
             destination: "crew@beaufort.example".to_string(),
+            env_bag: EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string())),
             runner,
         };
         register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
             .await
             .expect("register SSH resources");
+        let claude_dir = temp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create remote Claude dir");
+        std::fs::write(claude_dir.join(".credentials.json"), r#"{"claudeAiOauth":{"expiresAt":1756000000000}}"#)
+            .expect("write remote credential metadata");
         apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("publish SSH observation");
         let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
-        assert!(host.status.expect("SSH status").ready);
+        let status = host.status.expect("SSH status");
+        assert!(status.ready);
+        assert!(status
+            .credential_expiry()
+            .expect("SSH credential expiry")
+            .contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
         assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
         let state = Arc::new(
             ControllerRuntimeState::new(
