@@ -119,6 +119,10 @@ pub trait Resource: Send + Sync + 'static {
     const API_PATHS: ApiPaths;
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
+    fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
     fn validate_spec_update(_current: &Self::Spec, _requested: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
     }

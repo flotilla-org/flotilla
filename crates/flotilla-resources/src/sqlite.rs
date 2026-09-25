@@ -1386,6 +1386,7 @@ impl SqliteBackend {
         spec: &T::Spec,
         merge: Option<MergeMetadata>,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        T::validate_spec(meta, spec)?;
         let key = Self::store_key::<T>(namespace);
         let namespace = namespace.to_string();
         let meta = meta.clone();
@@ -1497,6 +1498,7 @@ impl SqliteBackend {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
             T::validate_spec_update(&object.spec, &spec)?;
+            T::validate_spec(&meta, &spec)?;
             if object.matches_update(&meta, &spec)?
                 && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
             {

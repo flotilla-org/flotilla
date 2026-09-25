@@ -43,8 +43,16 @@ pub fn repo_key(canonical_url: &str) -> String {
     keyed_hash("repo-v1", &[canonical_url])
 }
 
+pub fn forge_repo_key(forge_ref: &str, owner: &str, repo_name: &str) -> String {
+    keyed_hash("repo-v2", &[forge_ref, owner, repo_name])
+}
+
 pub fn clone_key(canonical_url: &str, env_ref: &str) -> String {
     keyed_hash("clone-v1", &[canonical_url, env_ref])
+}
+
+pub fn forge_clone_key(forge_ref: &str, owner: &str, repo_name: &str, env_ref: &str) -> String {
+    keyed_hash("clone-v2", &[forge_ref, owner, repo_name, env_ref])
 }
 
 pub fn descriptive_repo_slug(canonical_url: &str) -> String {

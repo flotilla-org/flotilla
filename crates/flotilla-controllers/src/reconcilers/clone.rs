@@ -2,9 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use flotilla_resources::{
-    clone_key,
     controller::{ReconcileOutcome, Reconciler},
-    Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, RepositoryIdentity, ResourceError, ResourceObject, TypedResolver,
+    Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject, TypedResolver,
 };
 
 const CLONE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -49,13 +48,10 @@ where
         if let Err(message) = repository.spec.verify_key(&obj.spec.repo_ref) {
             return Ok(ClonePrepared::Failed(message));
         }
-        let canonical_repo = match repository.spec.identity() {
-            RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
-            RepositoryIdentity::Local { .. } => {
-                return Ok(ClonePrepared::Failed("clone repository must have a transport remote".to_string()))
-            }
+        let expected_name = match repository.spec.clone_key(&obj.spec.env_ref) {
+            Ok(key) => format!("clone-{key}"),
+            Err(error) => return Ok(ClonePrepared::Failed(error)),
         };
-        let expected_name = format!("clone-{}", clone_key(canonical_repo, &obj.spec.env_ref));
         if obj.metadata.name != expected_name {
             return Ok(ClonePrepared::Failed(format!("clone name mismatch: expected {expected_name}")));
         }

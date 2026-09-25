@@ -38,8 +38,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
-    watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
+    canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, watch_resource_kind,
+    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
     CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
@@ -1295,6 +1295,10 @@ async fn discover_local_clones(
         };
         let canonical_url = match inspection.spec.identity() {
             flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+            flotilla_resources::RepositoryIdentity::Forge { .. } => {
+                let forge = inspection.spec.forge().expect("forge Repository has a service");
+                format!("{}/{}", forge.service_url, forge.repository)
+            }
             flotilla_resources::RepositoryIdentity::Local { .. } => continue,
         };
         let repository_spec = inspection.spec;
@@ -1303,7 +1307,7 @@ async fn discover_local_clones(
             .await
             .map_err(|error| error.to_string())?;
         let repo_key_value = repository_key.to_string();
-        let name = format!("clone-{}", clone_key(&canonical_url, &host_direct_env_ref));
+        let name = format!("clone-{}", repository_spec.clone_key(&host_direct_env_ref)?);
         let expected_spec = CloneSpec {
             repo_ref: repository_key.clone(),
             url: transport_url.clone(),
@@ -3911,6 +3915,7 @@ mod tests {
         PeerConnectionState, PlacementDecision, PlacementTargetHost,
     };
     use flotilla_resources::{
+        clone_key,
         controller::{Actuation, Reconciler},
         delete_resource_kind, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
         CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure,

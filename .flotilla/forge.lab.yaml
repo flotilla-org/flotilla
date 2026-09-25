@@ -1,0 +1,14 @@
+apiVersion: flotilla.work/v1
+kind: Forge
+metadata:
+  name: flotilla-lab
+  namespace: flotilla
+spec:
+  forge_id: flotilla-lab
+  kind: forgejo
+  hosts:
+    - forgejo.lab.flotilla.work
+    - manchego.lab.flotilla.work
+    - forgejo-manchego
+  https_url: https://forgejo.lab.flotilla.work
+  git_ssh_host: manchego.lab.flotilla.work

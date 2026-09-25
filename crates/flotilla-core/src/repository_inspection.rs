@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_resources::{RepositoryKey, RepositorySpec};
+use flotilla_resources::{ForgeSpec, RepositoryKey, RepositorySpec};
 
 use crate::{
     ops_entry::OperationalEntryFile,
@@ -117,11 +117,17 @@ fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Ve
 pub struct GitRepositoryInspector {
     runner: Arc<dyn CommandRunner>,
     host_ref: String,
+    forges: Vec<ForgeSpec>,
 }
 
 impl GitRepositoryInspector {
     pub fn new(runner: Arc<dyn CommandRunner>, host_ref: impl Into<String>) -> Self {
-        Self { runner, host_ref: host_ref.into() }
+        Self { runner, host_ref: host_ref.into(), forges: Vec::new() }
+    }
+
+    pub fn with_forges(mut self, forges: Vec<ForgeSpec>) -> Self {
+        self.forges = forges;
+        self
     }
 
     async fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -181,7 +187,19 @@ impl GitRepositoryInspector {
                         let mut identities = std::collections::BTreeMap::new();
                         for remote in &remotes {
                             let url = self.configured_remote_url(cwd, remote).await?;
-                            identities.insert(self.canonical_remote(cwd, &url).await?, (remote.clone(), url));
+                            let canonical = self.canonical_remote(cwd, &url).await?;
+                            let identity = self
+                                .forges
+                                .iter()
+                                .find_map(|forge| {
+                                    forge
+                                        .repository_path(&canonical)
+                                        .ok()
+                                        .flatten()
+                                        .map(|(owner, repo)| format!("{}:{owner}/{repo}", forge.forge_id))
+                                })
+                                .unwrap_or(canonical);
+                            identities.insert(identity, (remote.clone(), url));
                         }
                         if identities.len() == 1 {
                             let (remote, configured) = identities.into_values().next().expect("one identity has one remote");
@@ -204,6 +222,9 @@ impl GitRepositoryInspector {
         let Some(host) = ssh_remote_host(remote) else {
             return flotilla_resources::canonicalize_repo_url(remote);
         };
+        if self.forges.iter().any(|forge| forge.matches_host(host)) {
+            return flotilla_resources::canonicalize_repo_url(remote);
+        }
         let ssh_config = self
             .runner
             .run("ssh", &["-G", host], cwd, &ChannelLabel::Default)
@@ -381,9 +402,9 @@ fn ssh_remote_host(remote: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
-    use flotilla_resources::{RepositoryIdentity, RepositorySpec};
+    use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::providers::discovery::test_support::DiscoveryMockRunner;
@@ -478,6 +499,22 @@ mod tests {
             inspected.spec.identity(),
             RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
         ));
+    }
+
+    #[tokio::test]
+    async fn federated_forge_alias_resolves_without_local_ssh_config() {
+        let forge = ForgeSpec::builder()
+            .forge_id("flotilla-lab".to_string())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo-manchego".to_string(), "forgejo.lab.flotilla.work".to_string()]))
+            .https_url("https://forgejo.lab.flotilla.work".to_string())
+            .git_ssh_host("manchego.lab.flotilla.work".to_string())
+            .build();
+        let inspector =
+            GitRepositoryInspector::new(Arc::new(DiscoveryMockRunner::builder().build()), "host-01").with_forges(vec![forge.clone()]);
+        let resolved = inspector.resolve_remote("forgejo-manchego:robert/ghostty-ops.git").await.expect("resolve alias");
+        let on_forge = resolved.on_forge(&forge).expect("forge identity");
+        assert!(matches!(on_forge.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
     }
 
     #[tokio::test]

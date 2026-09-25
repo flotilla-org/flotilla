@@ -2531,12 +2531,18 @@ impl InProcessDaemon {
         }
         let runner = self.local_command_runner().ok_or_else(|| "local repository inspector is unavailable".to_string())?;
         let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?;
-        Ok(Arc::new(GitRepositoryInspector::new(runner, host_ref.to_string())))
+        let namespace = self.provisioning_namespace().await;
+        let forges =
+            self.resource_backend.definitions::<flotilla_resources::Forge>(&namespace).list().await.map_err(|error| error.to_string())?;
+        Ok(Arc::new(
+            GitRepositoryInspector::new(runner, host_ref.to_string()).with_forges(forges.into_iter().map(|forge| forge.spec).collect()),
+        ))
     }
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
-        let (spec, replaces_prior_repository) = self.configure_inspected_repository(&inspection.checkout.path, inspection.spec).await?;
+        let spec = self.resolve_forge_identity(inspection.spec).await?;
+        let (spec, replaces_prior_repository) = self.configure_inspected_repository(&inspection.checkout.path, spec).await?;
         inspection.spec = spec;
         inspection.replaces_prior_repository = replaces_prior_repository;
         Ok(inspection)
@@ -2590,7 +2596,178 @@ impl InProcessDaemon {
 
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
         let spec = self.repository_inspector().await?.resolve_remote(remote).await?;
-        self.resolve_declared_repository(spec).await
+        self.resolve_declared_repository(self.resolve_forge_identity(spec).await?).await
+    }
+
+    async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        if spec.live_remote().is_none() {
+            return Ok(spec);
+        }
+        let namespace = self.provisioning_namespace().await;
+        let forges =
+            self.resource_backend.definitions::<flotilla_resources::Forge>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut matching = Vec::new();
+        for forge in forges {
+            if forge.spec.repository_path(spec.live_remote().expect("remote Repository has a live remote"))?.is_some() {
+                if forge.metadata.name != forge.spec.forge_id {
+                    return Err(format!("Forge {} must use its forge_id as its resource name", forge.metadata.name));
+                }
+                matching.push(forge);
+            }
+        }
+        let Some(forge) = matching.first() else { return Ok(spec) };
+        if matching.len() > 1 {
+            return Err("repository remote matches multiple Forge definitions".to_string());
+        }
+        let resolved = spec.on_forge(&forge.spec)?;
+        self.sweep_split_forge_repositories(&resolved, &forge.spec).await
+    }
+
+    async fn sweep_split_forge_repositories(
+        &self,
+        observed: &RepositorySpec,
+        forge: &flotilla_resources::ForgeSpec,
+    ) -> Result<RepositorySpec, String> {
+        let namespace = self.provisioning_namespace().await;
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let target_key = observed.key();
+        let mut merged = observed.clone();
+        let mut old_sources = Vec::new();
+        let mut old_local = Vec::new();
+        let mut replacements = BTreeSet::new();
+        let sources =
+            self.resource_backend.clone().including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        for source in sources.items {
+            let repository = source.object;
+            let Ok(normalized) = repository.spec.clone().on_forge(forge) else { continue };
+            if normalized.key() != target_key {
+                continue;
+            }
+            merged = merged.merge_forge_migration(&normalized)?;
+            if repository.metadata.name != target_key.to_string() {
+                replacements.insert(RepositoryKey(repository.metadata.name.clone()));
+                if matches!(source.provenance, ResourceProvenance::Local) {
+                    old_local.push(repository.clone());
+                }
+                old_sources.push(repository);
+            }
+        }
+        if replacements.is_empty() {
+            return Ok(merged);
+        }
+        let target_name = target_key.to_string();
+        let existing = match repositories.get(&target_name).await {
+            Ok(existing) => Some(existing),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut target_meta = existing
+            .as_ref()
+            .map_or_else(|| InputMeta::builder().name(target_name.clone()).build(), |existing| InputMeta::from(&existing.metadata));
+        for source in &old_sources {
+            for (label, value) in &source.metadata.labels {
+                if target_meta.labels.insert(label.clone(), value.clone()).is_some_and(|previous| previous != *value) {
+                    return Err(format!("Repository metadata label `{label}` conflicts during forge identity sweep"));
+                }
+            }
+            for (annotation, value) in &source.metadata.annotations {
+                if annotation == SUPERSEDED_BY_ANNOTATION {
+                    continue;
+                }
+                if target_meta.annotations.insert(annotation.clone(), value.clone()).is_some_and(|previous| previous != *value) {
+                    return Err(format!("Repository metadata annotation `{annotation}` conflicts during forge identity sweep"));
+                }
+            }
+        }
+        let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
+        let mut project_updates = Vec::new();
+        for project in projects.list().await.map_err(|error| error.to_string())? {
+            let mut spec = project.spec.clone();
+            let mut meta = InputMeta::from(&project.metadata);
+            let mut changed = false;
+            for member in &mut spec.repositories {
+                if replacements.contains(&member.repo) {
+                    member.repo = target_key.clone();
+                    changed = true;
+                }
+            }
+            for value in meta.annotations.values_mut() {
+                if replacements.contains(&RepositoryKey(value.clone())) {
+                    *value = target_name.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                let mut by_repository = BTreeMap::new();
+                for member in spec.repositories.drain(..) {
+                    let key = (member.repo.clone(), member.subpath.clone());
+                    match by_repository.entry(key) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(member);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let prior: &mut flotilla_resources::ProjectRepositorySpec = entry.get_mut();
+                            if prior.alias.is_some() && member.alias.is_some() && prior.alias != member.alias {
+                                return Err(format!(
+                                    "Project {} has aliases `{}` and `{}` for the same forge Repository {}; resolve the aliases before migration",
+                                    project.metadata.name,
+                                    prior.alias.as_deref().expect("alias checked"),
+                                    member.alias.as_deref().expect("alias checked"),
+                                    target_key
+                                ));
+                            }
+                            if prior.default_branch.is_some()
+                                && member.default_branch.is_some()
+                                && prior.default_branch != member.default_branch
+                            {
+                                return Err(format!(
+                                    "Project {} has conflicting default branches for forge Repository {}; resolve them before migration",
+                                    project.metadata.name, target_key
+                                ));
+                            }
+                            prior.alias = prior.alias.take().or(member.alias);
+                            prior.default_branch = prior.default_branch.take().or(member.default_branch);
+                            prior.roles.extend(member.roles);
+                        }
+                    }
+                }
+                spec.repositories = by_repository.into_values().collect();
+                project_updates.push((meta, spec));
+            }
+        }
+        match existing {
+            Some(existing) if existing.spec != merged || InputMeta::from(&existing.metadata) != target_meta => {
+                repositories.update(&target_meta, &existing.metadata.resource_version, &merged).await.map_err(|error| error.to_string())?;
+            }
+            None => {
+                repositories.create(&target_meta, &merged).await.map_err(|error| error.to_string())?;
+            }
+            Some(_) => {}
+        }
+        for tracked in self.repository_keys_by_path.write().await.values_mut() {
+            if replacements.contains(tracked) {
+                *tracked = target_key.clone();
+            }
+        }
+        for (meta, spec) in project_updates {
+            projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        }
+        let durable_checkouts =
+            self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
+        for source in old_local {
+            let key = RepositoryKey(source.metadata.name.clone());
+            if durable_checkouts.items.iter().any(|checkout| checkout.spec.repo_ref() == &key) {
+                let mut meta = InputMeta::from(&source.metadata);
+                meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), target_name.clone());
+                repositories.update(&meta, &source.metadata.resource_version, &source.spec).await.map_err(|error| error.to_string())?;
+            } else {
+                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, &key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                repositories.delete(&source.metadata.name).await.map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(merged)
     }
 
     async fn resolve_declared_repository(&self, observed: RepositorySpec) -> Result<RepositorySpec, String> {
@@ -3904,6 +4081,7 @@ fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKe
 
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
+        flotilla_resources::RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),
         flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
         flotilla_resources::RepositoryIdentity::Local { .. } => "local".to_string(),
     }
@@ -3914,7 +4092,7 @@ fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::re
         flotilla_resources::RepositoryIdentity::Local { host_ref, git_common_dir } => {
             host_ref == &checkout.host_ref && Path::new(git_common_dir).parent() == Some(checkout.path.as_path())
         }
-        flotilla_resources::RepositoryIdentity::Remote { .. } => false,
+        flotilla_resources::RepositoryIdentity::Remote { .. } | flotilla_resources::RepositoryIdentity::Forge { .. } => false,
     }
 }
 
@@ -6126,9 +6304,10 @@ impl InProcessDaemon {
     async fn materialize_project_declaration(
         &self,
         declaration: ProjectDeclaration,
-        inspection: ProjectDeclarationInspection,
+        mut inspection: ProjectDeclarationInspection,
     ) -> Result<(Vec<String>, Vec<String>), String> {
         validate_project_name(&declaration.name)?;
+        inspection.repository.spec = self.resolve_forge_identity(inspection.repository.spec).await?;
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
@@ -6163,7 +6342,7 @@ impl InProcessDaemon {
         let mut converged = false;
         let mut members = Vec::with_capacity(declaration.members.len());
         for member in declaration.members {
-            let declared_spec = RepositorySpec::remote(member.url)?;
+            let declared_spec = self.resolve_repository_remote(&member.url).await?;
             let key = match aliases.get(&member.alias) {
                 Some(existing_key) => match repositories.get(&existing_key.to_string()).await {
                     Ok(existing)
@@ -6322,6 +6501,7 @@ impl InProcessDaemon {
                 }
             };
             let mut source = inspector.inspect_operational_entries(&path).await?;
+            source.repository.spec = self.resolve_forge_identity(source.repository.spec).await?;
             if member.repo == bootstrap.repository.key() {
                 source.commit.clone_from(&bootstrap.commit);
                 source.repository = bootstrap.repository.clone();

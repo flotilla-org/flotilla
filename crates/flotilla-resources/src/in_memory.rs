@@ -587,6 +587,7 @@ impl InMemoryBackend {
         spec: &T::Spec,
         merge: Option<MergeMetadata>,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        T::validate_spec(meta, spec)?;
         self.with_store_mut::<T, _>(namespace, |store| {
             if store.objects.contains_key(&meta.name) {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
@@ -658,6 +659,7 @@ impl InMemoryBackend {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
             T::validate_spec_update(&object.spec, spec)?;
+            T::validate_spec(meta, spec)?;
             if object.matches_update(meta, spec)?
                 && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
             {

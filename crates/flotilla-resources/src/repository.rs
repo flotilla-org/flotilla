@@ -20,6 +20,7 @@ define_resource!(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RepositoryIdentity {
+    Forge { forge_ref: String, owner: String, repo_name: String },
     Remote { canonical_remote: String },
     Local { host_ref: String, git_common_dir: String },
 }
@@ -91,6 +92,77 @@ impl RepositoryProviderPreference {
 }
 
 impl RepositorySpec {
+    fn validate_forge_remotes(&self, remotes: &[String]) -> Result<(), String> {
+        if let RepositoryIdentity::Forge { owner, repo_name, .. } = &self.identity {
+            let expected = format!("{owner}/{repo_name}");
+            for remote in remotes {
+                if forge_from_canonical_remote(remote)?.repository != expected {
+                    return Err(format!("remote `{remote}` does not match forge repository `{expected}`"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a transport URL against a federated Forge definition.
+    pub fn on_forge(mut self, forge: &crate::ForgeSpec) -> Result<Self, String> {
+        let mut path = None;
+        for remote in &self.remotes {
+            if let Some(candidate) = forge.repository_path(remote)? {
+                if path.as_ref().is_some_and(|existing| existing != &candidate) {
+                    return Err("repository remotes disagree on forge repository path".to_string());
+                }
+                path = Some(candidate);
+            }
+        }
+        let (owner, repo_name) = path.ok_or_else(|| "repository remote does not belong to Forge".to_string())?;
+        if forge.forge_id.trim().is_empty() {
+            return Err("forge_id cannot be empty".to_string());
+        }
+        self.identity = RepositoryIdentity::Forge { forge_ref: forge.forge_id.clone(), owner: owner.clone(), repo_name: repo_name.clone() };
+        self.forge = Some(ForgeIdentity {
+            service_url: forge.https_url.trim_end_matches('/').to_string(),
+            repository: format!("{owner}/{repo_name}"),
+        });
+        Ok(self)
+    }
+
+    /// Combine declarations that were previously split by transport hostname.
+    /// Configuration conflicts need operator resolution rather than a lossy sweep.
+    pub fn merge_forge_migration(mut self, other: &Self) -> Result<Self, String> {
+        if self.identity != other.identity {
+            return Err("cannot merge distinct Repository identities".to_string());
+        }
+        for remote in &other.remotes {
+            if !self.remotes.contains(remote) {
+                self.remotes.push(remote.clone());
+            }
+        }
+        match (&self.upstream, &other.upstream) {
+            (None, Some(value)) => self.upstream = Some(value.clone()),
+            (Some(left), Some(right)) if left != right => return Err("repository upstream declarations conflict".to_string()),
+            _ => {}
+        }
+        self.allow_reviewless_workflows |= other.allow_reviewless_workflows;
+        for (name, command) in &other.verification_commands {
+            if self.verification_commands.insert(name.clone(), command.clone()).is_some_and(|existing| existing != *command) {
+                return Err(format!("repository verification command `{name}` conflicts"));
+            }
+        }
+        fn merge_option(target: &mut Option<String>, source: &Option<String>, field: &str) -> Result<(), String> {
+            match (target.as_ref(), source) {
+                (None, Some(value)) => *target = Some(value.clone()),
+                (Some(left), Some(right)) if left != right => return Err(format!("repository {field} declarations conflict")),
+                _ => {}
+            }
+            Ok(())
+        }
+        merge_option(&mut self.vcs.git.checkout_strategy, &other.vcs.git.checkout_strategy, "checkout strategy")?;
+        merge_option(&mut self.vcs.git.checkout_path, &other.vcs.git.checkout_path, "checkout path")?;
+        merge_option(&mut self.change_request.backend, &other.change_request.backend, "change request backend")?;
+        Ok(self)
+    }
+
     pub fn remote(remote: impl Into<String>) -> Result<Self, String> {
         let remote = remote.into();
         if let Some(host) = ssh_remote_host(&remote) {
@@ -135,10 +207,19 @@ impl RepositorySpec {
 
     pub fn key(&self) -> RepositoryKey {
         match &self.identity {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => RepositoryKey(crate::forge_repo_key(forge_ref, owner, repo_name)),
             RepositoryIdentity::Remote { canonical_remote } => RepositoryKey(crate::repo_key(canonical_remote)),
             RepositoryIdentity::Local { host_ref, git_common_dir } => {
                 RepositoryKey(crate::repo_key(&format!("local\0{host_ref}\0{git_common_dir}")))
             }
+        }
+    }
+
+    pub fn clone_key(&self, env_ref: &str) -> Result<String, String> {
+        match &self.identity {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => Ok(crate::forge_clone_key(forge_ref, owner, repo_name, env_ref)),
+            RepositoryIdentity::Remote { canonical_remote } => Ok(crate::clone_key(canonical_remote, env_ref)),
+            RepositoryIdentity::Local { .. } => Err("a local Repository cannot be cloned".to_string()),
         }
     }
 
@@ -154,6 +235,7 @@ impl RepositorySpec {
 
     pub fn with_remotes(mut self, remotes: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, String> {
         let remotes = remotes.into_iter().map(|remote| crate::canonicalize_repo_url(&remote.into())).collect::<Result<Vec<_>, _>>()?;
+        self.validate_forge_remotes(&remotes)?;
         if remotes.is_empty() {
             return Err("repository remotes cannot be empty".to_string());
         }
@@ -162,6 +244,7 @@ impl RepositorySpec {
             return Err("repository remotes must be unique".to_string());
         }
         let observed = match &self.identity {
+            RepositoryIdentity::Forge { .. } => &remotes[0],
             RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
             RepositoryIdentity::Local { .. } => return Err("a local Repository cannot declare transport remotes".to_string()),
         };
@@ -169,8 +252,12 @@ impl RepositorySpec {
             return Err(format!("declared remotes do not include observed remote `{observed}`"));
         }
         let canonical_remote = remotes[0].clone();
-        self.forge = Some(forge_from_canonical_remote(&canonical_remote)?);
-        self.identity = RepositoryIdentity::Remote { canonical_remote };
+        if !matches!(self.identity, RepositoryIdentity::Forge { .. }) {
+            self.forge = Some(forge_from_canonical_remote(&canonical_remote)?);
+        }
+        if !matches!(self.identity, RepositoryIdentity::Forge { .. }) {
+            self.identity = RepositoryIdentity::Remote { canonical_remote };
+        }
         self.remotes = remotes;
         Ok(self)
     }
@@ -178,15 +265,20 @@ impl RepositorySpec {
     /// Record a newly observed live remote without changing Repository identity.
     pub fn update_remotes(mut self, live_remote: impl Into<String>) -> Result<Self, String> {
         let live_remote = crate::canonicalize_repo_url(&live_remote.into())?;
-        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
-            return Err("a local Repository cannot declare transport remotes".to_string());
+        self.validate_forge_remotes(std::slice::from_ref(&live_remote))?;
+        let canonical_remote = match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+            RepositoryIdentity::Forge { .. } => self.remotes.first().ok_or("forge Repository has no remote")?.clone(),
+            RepositoryIdentity::Local { .. } => return Err("a local Repository cannot declare transport remotes".to_string()),
         };
         let mut remotes = vec![live_remote.clone()];
         remotes.extend(self.remotes.into_iter().filter(|remote| remote != &live_remote));
-        if !remotes.contains(canonical_remote) {
-            remotes.push(canonical_remote.clone());
+        if !remotes.contains(&canonical_remote) {
+            remotes.push(canonical_remote);
         }
-        self.forge = Some(forge_from_canonical_remote(&live_remote)?);
+        if !matches!(self.identity, RepositoryIdentity::Forge { .. }) {
+            self.forge = Some(forge_from_canonical_remote(&live_remote)?);
+        }
         self.remotes = remotes;
         Ok(self)
     }
@@ -196,41 +288,54 @@ impl RepositorySpec {
     /// [`Self::update_remotes`] and remain additive.
     pub fn remove_remote(mut self, remote: impl Into<String>) -> Result<Self, String> {
         let remote = crate::canonicalize_repo_url(&remote.into())?;
-        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
-            return Err("a local Repository cannot declare transport remotes".to_string());
-        };
-        if &remote == canonical_remote {
-            return Err(format!("cannot remove stable identity remote `{canonical_remote}`"));
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } if &remote == canonical_remote => {
+                return Err(format!("cannot remove stable identity remote `{canonical_remote}`"));
+            }
+            RepositoryIdentity::Forge { .. } if self.remotes.len() == 1 => {
+                return Err("cannot remove the last forge Repository remote".to_string());
+            }
+            RepositoryIdentity::Local { .. } => return Err("a local Repository cannot declare transport remotes".to_string()),
+            _ => {}
         }
         if !self.remotes.iter().any(|declared| declared == &remote) {
             return Err(format!("remote `{remote}` is not declared by this Repository"));
         }
         self.remotes.retain(|declared| declared != &remote);
-        self.forge =
-            Some(forge_from_canonical_remote(self.remotes.first().expect("remote Repository retains its stable identity remote"))?);
+        if !matches!(self.identity, RepositoryIdentity::Forge { .. }) {
+            self.forge =
+                Some(forge_from_canonical_remote(self.remotes.first().expect("remote Repository retains its stable identity remote"))?);
+        }
         Ok(self)
     }
 
     pub fn with_declared_remotes(mut self, remotes: impl IntoIterator<Item = impl Into<String>>) -> Result<Self, String> {
         let remotes = remotes.into_iter().map(|remote| crate::canonicalize_repo_url(&remote.into())).collect::<Result<Vec<_>, _>>()?;
-        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
-            return Err("a local Repository cannot declare transport remotes".to_string());
-        };
-        if !remotes.contains(canonical_remote) {
-            return Err(format!("declared remotes do not include stable identity remote `{canonical_remote}`"));
+        self.validate_forge_remotes(&remotes)?;
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } if !remotes.contains(canonical_remote) => {
+                return Err(format!("declared remotes do not include stable identity remote `{canonical_remote}`"));
+            }
+            RepositoryIdentity::Local { .. } => return Err("a local Repository cannot declare transport remotes".to_string()),
+            _ => {}
         }
         let mut unique = BTreeSet::new();
         if remotes.is_empty() || remotes.iter().any(|remote| !unique.insert(remote.clone())) {
             return Err("repository remotes must be non-empty and unique".to_string());
         }
-        self.forge = Some(forge_from_canonical_remote(&remotes[0])?);
+        if !matches!(self.identity, RepositoryIdentity::Forge { .. }) {
+            self.forge = Some(forge_from_canonical_remote(&remotes[0])?);
+        }
         self.remotes = remotes;
         Ok(self)
     }
 
     pub fn with_stable_identity_from(mut self, stable: &Self) -> Result<Self, String> {
         match (&self.identity, &stable.identity) {
-            (RepositoryIdentity::Remote { .. }, RepositoryIdentity::Remote { .. }) => {
+            (
+                RepositoryIdentity::Remote { .. } | RepositoryIdentity::Forge { .. },
+                RepositoryIdentity::Remote { .. } | RepositoryIdentity::Forge { .. },
+            ) => {
                 self.identity = stable.identity.clone();
                 self.remotes = stable.remotes.clone();
                 self.forge = stable.forge.clone();
@@ -260,8 +365,10 @@ impl RepositorySpec {
     /// the live forge identity.
     pub fn issue_source_forge(&self) -> Option<ForgeIdentity> {
         let live = self.forge.as_ref()?;
-        let RepositoryIdentity::Remote { canonical_remote } = &self.identity else {
-            return Some(live.clone());
+        let canonical_remote = match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
+            RepositoryIdentity::Forge { .. } => return Some(live.clone()),
+            RepositoryIdentity::Local { .. } => return Some(live.clone()),
         };
         let stable = forge_from_canonical_remote(canonical_remote).unwrap_or_else(|_| live.clone());
         if stable.repository == live.repository {
@@ -332,6 +439,7 @@ impl RepositorySpec {
 
     pub fn leaf_slug(&self) -> String {
         match &self.identity {
+            RepositoryIdentity::Forge { repo_name, .. } => repo_name.to_ascii_lowercase(),
             RepositoryIdentity::Remote { canonical_remote } => {
                 canonical_remote.split('/').next_back().unwrap_or("repository").trim_end_matches(".git").to_ascii_lowercase()
             }
@@ -349,6 +457,7 @@ impl RepositorySpec {
             return true;
         }
         match &self.identity {
+            RepositoryIdentity::Forge { owner, repo_name, .. } => target == format!("{owner}/{repo_name}") || self.catalog_slug() == target,
             RepositoryIdentity::Remote { canonical_remote } => {
                 self.forge.as_ref().is_some_and(|forge| forge.repository == target)
                     || crate::descriptive_repo_slug(canonical_remote) == target
@@ -359,6 +468,9 @@ impl RepositorySpec {
 
     pub fn catalog_slug(&self) -> String {
         match &self.identity {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => {
+                crate::descriptive_repo_slug(&format!("https://{forge_ref}/{owner}/{repo_name}"))
+            }
             RepositoryIdentity::Remote { canonical_remote } => crate::descriptive_repo_slug(canonical_remote),
             RepositoryIdentity::Local { .. } => self.leaf_slug(),
         }
@@ -374,6 +486,7 @@ impl RepositorySpec {
     /// Globally qualified, human-readable label suitable for fleet exchange.
     pub fn qualified_label(&self) -> String {
         match &self.identity {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),
             RepositoryIdentity::Remote { canonical_remote } => {
                 canonical_remote.split_once("://").map_or_else(|| canonical_remote.clone(), |(_, label)| label.to_string())
             }
@@ -526,6 +639,37 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             return Err(serde::de::Error::custom("a local Repository cannot declare transport remotes"));
         }
         let mut normalized = match &stored.identity {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => {
+                if forge_ref.trim().is_empty()
+                    || owner.trim().is_empty()
+                    || repo_name.trim().is_empty()
+                    || repo_name.contains('/')
+                    || repo_name.ends_with(".git")
+                {
+                    return Err(serde::de::Error::custom("forge Repository identity is not normalized"));
+                }
+                let expected_path = format!("{owner}/{repo_name}");
+                if stored.forge.as_ref().is_none_or(|forge| forge.repository != expected_path) {
+                    return Err(serde::de::Error::custom("forge Repository must declare its matching service and repository path"));
+                }
+                let canonical = stored
+                    .remotes
+                    .iter()
+                    .map(|remote| crate::canonicalize_repo_url(remote))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(serde::de::Error::custom)?;
+                if canonical != stored.remotes || canonical.iter().collect::<BTreeSet<_>>().len() != canonical.len() {
+                    return Err(serde::de::Error::custom("forge Repository remotes must be canonical and unique"));
+                }
+                let first = stored.remotes.first().ok_or_else(|| serde::de::Error::custom("forge Repository requires a remote"))?;
+                RepositorySpec::remote(first).map(|mut spec| {
+                    spec.remotes = stored.remotes.clone();
+                    spec.identity =
+                        RepositoryIdentity::Forge { forge_ref: forge_ref.clone(), owner: owner.clone(), repo_name: repo_name.clone() };
+                    spec.forge = stored.forge.clone();
+                    spec
+                })
+            }
             RepositoryIdentity::Remote { canonical_remote } => RepositorySpec::remote(canonical_remote).and_then(|mut spec| {
                 let remotes = if stored.remotes.is_empty() { vec![canonical_remote.clone()] } else { stored.remotes.clone() };
                 for remote in remotes.iter().rev() {
@@ -536,6 +680,7 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             RepositoryIdentity::Local { host_ref, git_common_dir } => RepositorySpec::local(host_ref, git_common_dir),
         }
         .map_err(serde::de::Error::custom)?;
+        normalized.validate_forge_remotes(&normalized.remotes).map_err(serde::de::Error::custom)?;
         if normalized.identity != stored.identity {
             return Err(serde::de::Error::custom("repository identity is not canonical"));
         }
@@ -672,6 +817,7 @@ fn normalize_absolute_path(path: &std::path::Path) -> Result<String, String> {
 
 fn identity_description(identity: &RepositoryIdentity) -> String {
     match identity {
+        RepositoryIdentity::Forge { forge_ref, owner, repo_name } => format!("{forge_ref}/{owner}/{repo_name}"),
         RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
         RepositoryIdentity::Local { host_ref, git_common_dir } => format!("{host_ref}:{git_common_dir}"),
     }

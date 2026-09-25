@@ -12,7 +12,7 @@ use flotilla_core::agent_adapter::{
 };
 use flotilla_protocol::{CanonicalHostId, PlacementDecision};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key,
+    canonicalize_repo_url,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
@@ -20,11 +20,11 @@ use flotilla_resources::{
     CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
     Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
+    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
+    TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -513,15 +513,15 @@ impl Reconciler for VesselReconciler {
                 return Ok(VesselPrepared::failed(message));
             }
             fork_stance |= repository_spec.is_fork();
-            let canonical_repo = match repository_spec.identity() {
-                RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
-                RepositoryIdentity::Local { .. } => return Ok(VesselPrepared::failed("convoy repository must have a transport remote")),
+            let clone_identity = match repository_spec.clone_key(&clone_env_ref) {
+                Ok(key) => key,
+                Err(error) => return Ok(VesselPrepared::failed(error)),
             };
             let repository_key = convoy_repository.repo_ref.clone();
             let repo_key = repository_key.to_string();
             let adopted_checkout_ref = obj.spec.adopted_checkout_refs.get(&repository_key).cloned();
             let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
-                let clone_name = format!("clone-{}", clone_key(&canonical_repo, &clone_env_ref));
+                let clone_name = format!("clone-{clone_identity}");
                 match self.clones.get(&clone_name).await {
                     Ok(existing) => {
                         if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {

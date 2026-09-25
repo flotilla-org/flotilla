@@ -530,6 +530,8 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             clone_key(
                 match repository.identity() {
                     flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
+                    flotilla_resources::RepositoryIdentity::Forge { .. } =>
+                        repository.live_remote().expect("forge Repository has a remote"),
                     flotilla_resources::RepositoryIdentity::Local { .. } => panic!("expected remote repository"),
                 },
                 &host_direct_env_name()
