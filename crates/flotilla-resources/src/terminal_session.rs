@@ -259,11 +259,13 @@ impl TerminalSessionTag {
 }
 
 impl TerminalAttention {
-    pub const FRESH_FOR: chrono::Duration = chrono::Duration::seconds(30);
+    // Replica refreshes run every 30 seconds. Leave room for observation
+    // persistence, replication, and a delayed refresh before expiring it.
+    pub const FRESH_FOR: chrono::Duration = chrono::Duration::seconds(120);
     pub const DEBOUNCE_FOR: chrono::Duration = chrono::Duration::seconds(5);
 
     pub fn is_stale_at(&self, now: DateTime<Utc>) -> bool {
-        self.state != TerminalAttentionState::Unobservable && now.signed_duration_since(self.as_of) > Self::FRESH_FOR
+        self.state != TerminalAttentionState::Unobservable && now.signed_duration_since(self.as_of) >= Self::FRESH_FOR
     }
 
     /// Whether persisting `incoming` would add information. Hook observations
@@ -454,7 +456,8 @@ mod tests {
     use super::*;
 
     fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {
-        TerminalAttention { state, source, as_of: Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, second).single().expect("valid timestamp") }
+        let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("valid timestamp");
+        TerminalAttention { state, source, as_of: base + chrono::Duration::seconds(i64::from(second)) }
     }
 
     #[test]
@@ -484,7 +487,8 @@ mod tests {
     #[test]
     fn stale_hook_observation_yields_to_screen_fallback() {
         let hook = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 0);
-        let screen = attention(TerminalAttentionState::Idle, TerminalAttentionSource::Screen, 31);
+        let expiry_second = u32::try_from(TerminalAttention::FRESH_FOR.num_seconds()).expect("freshness fits test timestamp");
+        let screen = attention(TerminalAttentionState::Idle, TerminalAttentionSource::Screen, expiry_second);
 
         assert!(hook.should_replace_with(&screen));
     }

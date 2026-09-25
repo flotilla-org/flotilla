@@ -190,6 +190,8 @@ pub struct Aggregator {
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
     #[builder(skip)]
     regards: HashMap<ResourceRef, ResourceObject<Regard>>,
+    #[builder(skip)]
+    attention_expired_through: Option<chrono::DateTime<chrono::Utc>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
@@ -255,6 +257,7 @@ impl Aggregator {
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
             regards: HashMap::new(),
+            attention_expired_through: None,
             observed_checkouts: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
@@ -395,6 +398,7 @@ impl Aggregator {
 
         loop {
             let regard_expiry_delay = self.next_regard_expiry_delay();
+            let attention_expiry_delay = self.next_attention_expiry_delay();
             let regard_expiry = async move {
                 match regard_expiry_delay {
                     Some(delay) => tokio::time::sleep(delay).await,
@@ -402,12 +406,22 @@ impl Aggregator {
                 }
             };
             tokio::pin!(regard_expiry);
+            let attention_expiry = async move {
+                match attention_expiry_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => futures::future::pending().await,
+                }
+            };
+            tokio::pin!(attention_expiry);
             tokio::select! {
                 () = &mut regard_expiry => {
                     self.prune_expired_regards(chrono::Utc::now());
                     if self.rebuild_salience_projection().await {
                         self.emit_awareness_result_sets().await;
                     }
+                }
+                () = &mut attention_expiry => {
+                    self.expire_due_attention().await;
                 }
                 demand = demand_rx.changed() => {
                     if demand.is_err() {
@@ -1853,6 +1867,34 @@ impl Aggregator {
         self.next_regard_expiry_delay_at(chrono::Utc::now())
     }
 
+    fn next_attention_expiry_delay(&self) -> Option<std::time::Duration> {
+        self.next_attention_expiry_delay_at(chrono::Utc::now())
+    }
+
+    fn next_attention_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        self.terminal_sessions
+            .values()
+            .filter_map(|session| {
+                let status = session.object.status.as_ref()?;
+                if status.phase != TerminalSessionPhase::Running {
+                    return None;
+                }
+                let attention = status.attention.as_ref()?;
+                if attention.state == TerminalAttentionState::Unobservable {
+                    return None;
+                }
+                attention.as_of.checked_add_signed(flotilla_resources::TerminalAttention::FRESH_FOR)
+            })
+            .filter(|expiry| self.attention_expired_through.is_none_or(|through| *expiry > through))
+            .min()
+            .map(|expiry| (expiry - now).to_std().unwrap_or_default())
+    }
+
+    async fn expire_due_attention(&mut self) {
+        self.attention_expired_through = Some(chrono::Utc::now());
+        self.rebuild_local_projection().await;
+    }
+
     fn next_regard_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
         self.regards.values().filter_map(regard_expiry_at).min().map(|expiry| (expiry - now).to_std().unwrap_or_default())
     }
@@ -2540,6 +2582,79 @@ mod tests {
         assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-a-implement-coder"));
         assert!(vessel.needs_attention);
         assert!(convoy.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn replicated_idle_attention_stays_stable_across_refreshes_and_unrelated_rebuilds() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("kiwi"), event_tx).with_attach_resolver(resolver);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work status").placement =
+            Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!("feta"))]) });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let now = Utc::now();
+        let mut session = session_object("terminal-convoy-a-implement-coder").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        for age in [80, 40, 0] {
+            session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: now - chrono::Duration::seconds(age),
+                source: TerminalAttentionSource::Screen,
+            });
+            aggregator
+                .apply_replica_session_event(ReadWatchEvent::Modified(ReadResourceObject {
+                    object: session.clone(),
+                    provenance: ResourceProvenance::Replica {
+                        origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
+                        last_synced_at: now,
+                    },
+                }))
+                .await;
+            let before = state.result_set().await;
+            let convoy = before.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+            assert!(convoy.needs_attention, "attention dropped at observation age {age}s");
+            assert!(convoy.vessels[0].needs_attention);
+            aggregator.apply_environment_event(WatchEvent::Added(environment_object("unrelated").await)).await;
+            let after = state.result_set().await;
+            assert_eq!(after.seq, before.seq, "unrelated rebuild changed attention at observation age {age}s");
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_attention_observation_expires_once_at_its_deadline() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        let now = Utc::now();
+        session.status.as_mut().expect("running status").attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            as_of: now - TerminalAttention::FRESH_FOR + chrono::Duration::milliseconds(200),
+            source: TerminalAttentionSource::Screen,
+        });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+        let before = state.result_set().await;
+        assert!(before.rows.as_convoys().expect("convoy rows")[0].needs_attention);
+        let delay = aggregator.next_attention_expiry_delay_at(now).expect("attention expiry is scheduled");
+        assert_eq!(delay, Duration::from_millis(200));
+        tokio::time::sleep(aggregator.next_attention_expiry_delay().expect("attention expiry delay") + Duration::from_millis(5)).await;
+        assert_eq!(aggregator.next_attention_expiry_delay(), Some(Duration::ZERO), "overdue expiry remains scheduled");
+        aggregator.expire_due_attention().await;
+        let expired = state.result_set().await;
+        let convoy = &expired.rows.as_convoys().expect("convoy rows")[0];
+        assert!(!convoy.needs_attention);
+        assert!(!convoy.vessels[0].needs_attention);
+        assert_eq!(expired.seq, before.seq + 1);
+        assert_eq!(aggregator.next_attention_expiry_delay(), None);
+        aggregator.rebuild_local_projection().await;
+        assert_eq!(state.result_set().await.seq, expired.seq, "expiry is reported only once");
     }
 
     #[tokio::test]

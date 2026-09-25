@@ -2418,7 +2418,7 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
     assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::DeliveryUnconfirmed));
     status.degraded = None;
 
-    status.attention.as_mut().expect("attention").as_of = now - chrono::Duration::seconds(31);
+    status.attention.as_mut().expect("attention").as_of = now - TerminalAttention::FRESH_FOR;
     assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Unobservable));
 
     status.phase = ResourceTerminalSessionPhase::Stopped;

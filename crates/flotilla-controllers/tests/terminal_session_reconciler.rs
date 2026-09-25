@@ -1415,7 +1415,7 @@ async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
     .apply(&mut status);
     status.attention = Some(TerminalAttention {
         state: TerminalAttentionState::Working,
-        as_of: Utc::now() - chrono::Duration::seconds(31),
+        as_of: Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1),
         source: TerminalAttentionSource::Hook,
     });
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
