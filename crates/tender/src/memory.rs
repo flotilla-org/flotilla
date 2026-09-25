@@ -240,15 +240,15 @@ impl Tender for MemoryTender {
         let closure_sender = sender.clone();
         let lease = if let Some(id) = request.reclaim {
             let assigned = state.assignments.get(&id) == Some(&session.caller);
-            let record = state.records.get_mut(&id).ok_or(Error::UnknownPublication)?;
+            let record = state.records.get_mut(&id).ok_or(Error::Denied)?;
+            if record.publication.namespace != request.namespace || (record.publication.publisher != session.caller && !assigned) {
+                return Err(Error::Denied);
+            }
             if record.publication.availability == Availability::Withdrawn {
                 return Err(Error::Withdrawn);
             }
             if record.publication.availability == Availability::Available {
                 return Err(Error::LivePublisher);
-            }
-            if record.publication.namespace != request.namespace || (record.publication.publisher != session.caller && !assigned) {
-                return Err(Error::Denied);
             }
             record.publication.publisher = session.caller.clone();
             record.publication.name = request.name;

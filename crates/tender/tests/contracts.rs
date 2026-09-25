@@ -179,6 +179,11 @@ async fn lifecycle_and_stale_teardown(rig: Rig) {
     ));
     assert!(matches!(
         rig.tender.publish(&contender, request("n", "service", &["consumer"], Some(first.lease.id))).await,
+        Err(Error::Denied)
+    ));
+    rig.host.assign_replacement(first.lease.id, fp("contender"));
+    assert!(matches!(
+        rig.tender.publish(&contender, request("n", "service", &["consumer"], Some(first.lease.id))).await,
         Err(Error::LivePublisher)
     ));
     rig.tender.disconnect(&publisher, &first.lease).await.expect("disconnect");
@@ -192,6 +197,19 @@ async fn lifecycle_and_stale_teardown(rig: Rig) {
         rig.tender.publish(&publisher, request("n", "service", &["consumer"], Some(first.lease.id))).await,
         Err(Error::Withdrawn)
     ));
+}
+
+async fn reclaim_cannot_probe_other_namespaces(rig: Rig) {
+    let owner = session("owner", &rig.host_id);
+    let outsider = session("outsider", &rig.host_id);
+    grant(&rig, "owner", "private", &["alice"], 100);
+    grant(&rig, "outsider", "scratch", &["outsider"], 100);
+    let published = rig.tender.publish(&owner, request("private", "service", &["alice"], None)).await.expect("publish");
+    let probe = |id| request("scratch", "probe", &["outsider"], Some(id));
+    assert!(matches!(rig.tender.publish(&outsider, probe(published.lease.id)).await, Err(Error::Denied)));
+    rig.tender.withdraw(&owner, &published.lease).await.expect("withdraw");
+    assert!(matches!(rig.tender.publish(&outsider, probe(published.lease.id)).await, Err(Error::Denied)));
+    assert!(matches!(rig.tender.publish(&outsider, probe(PublicationId(u64::MAX))).await, Err(Error::Denied)));
 }
 
 async fn grant_loss_and_expiry(rig: Rig) {
@@ -346,6 +364,7 @@ contract!(existing_service_on_ssh_host);
 contract!(scoped_container_publisher);
 contract!(roaming_via_pinned_intermediary);
 contract!(lifecycle_and_stale_teardown);
+contract!(reclaim_cannot_probe_other_namespaces);
 contract!(grant_loss_and_expiry);
 contract!(no_replay_or_rebind);
 contract!(restart_and_replacement);
