@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow,
-        IndependentRow, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
+        IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
     },
     ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -21,11 +21,12 @@ use crate::{
         KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW,
         KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS,
         KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
-        KEY_INDEPENDENT_HOST, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
-        KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS,
-        KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME,
-        KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT,
-        SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
+        KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
+        KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME,
+        KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL,
+        KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT,
+        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -37,6 +38,7 @@ pub struct CatalogInput<'a> {
     pub convoys: &'a [ConvoyRow],
     pub independents: &'a [IndependentRow],
     pub standing_roles: &'a [StandingRoleRow],
+    pub project_repositories: &'a [ProjectRepositoriesRow],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +175,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         }
         mark_superseded_convoys(&mut catalog, input.convoys);
         project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
+        project_repository_memberships(&mut catalog, input.project_repositories);
         return catalog;
     }
     for convoy in input.convoys {
@@ -183,7 +186,47 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     }
     mark_superseded_convoys(&mut catalog, input.convoys);
     project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
+    project_repository_memberships(&mut catalog, input.project_repositories);
     catalog
+}
+
+/// Definitions publish even when no convoy or awareness entry exists.
+fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepositoriesRow]) {
+    for project in projects {
+        let project_entity = entity::project(&project.resource.namespace, &project.resource.name, "fleet");
+        catalog.assert_entity(
+            project_entity.clone(),
+            vec![
+                (SEGMENT_PROJECT, MetadataValue::text(project_entity.id.clone())),
+                (KEY_PROJECT_NAME, MetadataValue::text(&project.display_name)),
+                (KEY_DISPLAY_LABEL, MetadataValue::text(&project.display_name)),
+                (KEY_PROJECT_REPOSITORY_COUNT, MetadataValue::Integer(project.repositories.len() as i64)),
+            ],
+            None,
+        );
+        for membership in &project.repositories {
+            let relation = entity::project_repository(
+                &project.resource.namespace,
+                &project.resource.name,
+                &membership.key.0,
+                membership.subpath.as_deref(),
+            );
+            let mut facts = vec![
+                (KEY_MEMBERSHIP_PROJECT, MetadataValue::text(&project_entity.id)),
+                (KEY_MEMBERSHIP_REPOSITORY_KEY, MetadataValue::text(&membership.key.0)),
+                (SEGMENT_PROJECT, MetadataValue::text(&project_entity.id)),
+                (KEY_DISPLAY_LABEL, MetadataValue::text(membership.slug.as_deref().unwrap_or(&membership.key.0))),
+            ];
+            if let Some(slug) = &membership.slug {
+                facts.push((KEY_MEMBERSHIP_REPOSITORY_SLUG, MetadataValue::text(slug)));
+                facts.push((SEGMENT_REPO, MetadataValue::text(slug)));
+            }
+            if let Some(subpath) = &membership.subpath {
+                facts.push((KEY_MEMBERSHIP_SUBPATH, MetadataValue::text(subpath)));
+            }
+            catalog.assert_entity(relation, facts, None);
+        }
+    }
 }
 
 /// Publish one stable entity per declared standing role and mark the attempts
@@ -421,7 +464,7 @@ fn project_awareness_entry(
 ) {
     let repo = entry.annotations.get(SEGMENT_REPO).cloned();
     if let Some(repo) = &repo {
-        assert_repo_entity(catalog, repo, parent);
+        assert_repo_entity(catalog, repo);
     }
     let Some((entity, mut own_facts)) = awareness_entry_entity(entry, convoys) else {
         return;
@@ -637,7 +680,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         catalog.assert_entity(entity.clone(), facts.clone(), None);
     }
     if let Some(repo) = &repo {
-        assert_repo_entity(catalog, repo, &project_facts(&project));
+        assert_repo_entity(catalog, repo);
     }
     let convoy_entity = entity::convoy(namespace, &convoy.resource.name, &origin);
     let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
@@ -734,7 +777,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     let entity = entity::session(&session_ref);
     let repo = independent.repo_fact.as_ref().map(|repo| repo.0.as_str());
     if let Some(repo) = repo {
-        assert_repo_entity(catalog, repo, &[]);
+        assert_repo_entity(catalog, repo);
     }
     let ordinal = repo.is_none().then_some(ARCHIPELAGO_ORDINAL);
     let badge = session_badge(independent.phase);
@@ -806,13 +849,12 @@ fn label_tier_facts(label: &str) -> Vec<(&'static str, MetadataValue)> {
     vec![(KEY_DISPLAY_LABEL_MEDIUM, MetadataValue::text(medium)), (KEY_DISPLAY_LABEL_SHORT, MetadataValue::text(short))]
 }
 
-fn assert_repo_entity(catalog: &mut Catalog, repo: &str, parent: &[(&'static str, MetadataValue)]) {
-    let mut facts = parent.to_vec();
-    facts.extend([
+fn assert_repo_entity(catalog: &mut Catalog, repo: &str) {
+    let facts = vec![
         (SEGMENT_REPO, MetadataValue::text(repo)),
         (KEY_REPO_NAME, MetadataValue::text(repo_label(repo))),
         (KEY_DISPLAY_LABEL, MetadataValue::text(repo_label(repo))),
-    ]);
+    ];
     catalog.assert_entity(entity::repo(repo), facts, None);
 }
 

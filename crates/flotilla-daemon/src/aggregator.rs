@@ -15,8 +15,9 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     result_set::{
-        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
-        ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
+        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
+        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow,
+        VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
     ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
@@ -1516,7 +1517,31 @@ impl Aggregator {
                 (scope, repositories)
             })
             .collect();
-        let deltas = self.state.replace_store_catalog(repositories, projects).await;
+        let mut deltas = self.state.replace_store_catalog(repositories, projects).await;
+        let rows = self
+            .projects
+            .values()
+            .map(|project| ProjectRepositoriesRow {
+                resource: ResourceRef::new(
+                    api_version(Project::API_PATHS),
+                    Project::API_PATHS.kind,
+                    &project.metadata.namespace,
+                    &project.metadata.name,
+                ),
+                display_name: project.spec.display_name.clone(),
+                repositories: project
+                    .spec
+                    .repositories
+                    .iter()
+                    .map(|membership| ProjectRepositoryMembership {
+                        key: membership.repo.clone(),
+                        slug: self.repositories.get(&membership.repo).map(|repo| repo.spec.catalog_slug()),
+                        subpath: membership.subpath.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        deltas.extend(self.state.replace_project_repository_rows(rows).await);
         self.emit_store_deltas(deltas).await;
     }
 
@@ -1646,7 +1671,7 @@ impl Aggregator {
                 match result_set.rows {
                     // Ensures replicate as definitions; their rows are read
                     // fleet-wide rather than federated through snapshots.
-                    Rows::Convoys { .. } | Rows::Independents { .. } | Rows::StandingRoles { .. } => {}
+                    Rows::Convoys { .. } | Rows::Independents { .. } | Rows::StandingRoles { .. } | Rows::ProjectRepositories { .. } => {}
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
                     }
@@ -2753,6 +2778,47 @@ mod tests {
             .expect_err("closed replica channel should stop run")
             .to_string()
             .contains("replica channel closed"));
+    }
+
+    #[tokio::test]
+    async fn project_repository_query_follows_definition_without_activity() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let query = QueryId::ProjectRepositories { scope: None };
+        assert!(state.result_set_for(&query).await.expect("query").rows.is_empty());
+
+        let repository = repository_object("https://github.com/flotilla-org/remote-only").await;
+        let repository_key = repository.spec.key();
+        let expected_slug = repository.spec.catalog_slug();
+        let mut project = project_object("widgets").await;
+        project.spec.repositories = vec![
+            flotilla_resources::ProjectRepositorySpec::builder().repo(repository_key).subpath("src".to_owned()).build(),
+            flotilla_resources::ProjectRepositorySpec::builder().repo(RepositoryKey("repo-b".into())).build(),
+        ];
+        aggregator.apply_project_event(local_read_event(WatchEvent::Added(project.clone()))).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repositories.len(), 2);
+        assert_eq!(rows[0].repositories[0].subpath.as_deref(), Some("src"));
+        assert_eq!(rows[0].repositories[0].slug, None, "membership exists before repository definition");
+
+        aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows[0].repositories[0].slug.as_deref(), Some(expected_slug.as_str()));
+
+        aggregator.apply_repository_event(WatchEvent::Deleted(repository)).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows[0].repositories[0].slug, None, "slug retracts when repository definition disappears");
+
+        project.spec.repositories.clear();
+        aggregator.apply_project_event(local_read_event(WatchEvent::Modified(project.clone()))).await;
+        let rows = state.result_set_for(&query).await.expect("query").rows.as_project_repositories().expect("rows").to_vec();
+        assert_eq!(rows.len(), 1, "known-empty Project retains its row");
+        assert!(rows[0].repositories.is_empty());
+
+        aggregator.apply_project_event(local_read_event(WatchEvent::Deleted(project))).await;
+        assert!(state.result_set_for(&query).await.expect("query").rows.is_empty());
     }
 
     async fn convoy_ensure_object(role: &str, status: Option<flotilla_resources::ConvoyEnsureStatus>) -> ResourceObject<ConvoyEnsure> {

@@ -32,8 +32,8 @@ use flotilla_manifest::{
 };
 use flotilla_protocol::{
     result_set::{
-        AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows,
-        StandingRoleRow,
+        AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, ProjectRepositoriesRow, QueryChanges, ResultDelta,
+        ResultSet, Rows, StandingRoleRow,
     },
     DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
@@ -106,6 +106,7 @@ pub struct ConnectorState {
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
     standing_roles: HashMap<ResourceRef, StandingRoleRow>,
+    project_repositories: HashMap<ResourceRef, ProjectRepositoriesRow>,
     seqs: HashMap<QueryId, u64>,
     catalog: Catalog,
     subscriber_id: uuid::Uuid,
@@ -118,6 +119,7 @@ impl Default for ConnectorState {
             convoys: HashMap::new(),
             independents: HashMap::new(),
             standing_roles: HashMap::new(),
+            project_repositories: HashMap::new(),
             seqs: HashMap::new(),
             catalog: Catalog::default(),
             subscriber_id: uuid::Uuid::new_v4(),
@@ -152,6 +154,10 @@ impl ConnectorState {
                 self.standing_roles = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
             Rows::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
+            Rows::ProjectRepositories { scope: None, rows } => {
+                self.project_repositories = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+            }
+            Rows::ProjectRepositories { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Awareness { rows, .. } => {
                 self.awareness = rows.clone();
             }
@@ -200,6 +206,15 @@ impl ConnectorState {
                 }
             }
             QueryChanges::StandingRoles { scope: Some(_), .. } => return Applied::Ignored,
+            QueryChanges::ProjectRepositories { scope: None, changed, removed } => {
+                for row in changed {
+                    self.project_repositories.insert(row.resource.clone(), row.clone());
+                }
+                for resource in removed {
+                    self.project_repositories.remove(resource);
+                }
+            }
+            QueryChanges::ProjectRepositories { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Awareness { changed: rows, removed, .. } => {
                 self.awareness.retain(|node| !removed.contains(&node.id));
                 for row in rows {
@@ -225,9 +240,16 @@ impl ConnectorState {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
         let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
         let standing_roles: Vec<StandingRoleRow> = self.standing_roles.values().cloned().collect();
+        let project_repositories: Vec<ProjectRepositoriesRow> = self.project_repositories.values().cloned().collect();
         let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
         let next = project_catalog(
-            &CatalogInput { awareness, convoys: &convoys, independents: &independents, standing_roles: &standing_roles },
+            &CatalogInput {
+                awareness,
+                convoys: &convoys,
+                independents: &independents,
+                standing_roles: &standing_roles,
+                project_repositories: &project_repositories,
+            },
             mint,
         );
         let patches = next.diff_patches(&self.catalog);

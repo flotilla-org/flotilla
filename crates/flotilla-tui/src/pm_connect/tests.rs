@@ -371,3 +371,56 @@ fn standing_roles_publish_and_retract_role_entities() {
     let patch = retracted.iter().find(|patch| patch.target == target).expect("role retraction");
     assert!(patch.unset.iter().any(|key| key == "workspace.primary.state"));
 }
+
+#[test]
+fn project_membership_full_refresh_and_delta_retract_without_activity() {
+    let mut state = ConnectorState::default();
+    let project = ProjectRepositoriesRow {
+        resource: ResourceRef::new("flotilla.work/v1", "Project", "dev", "alpha"),
+        display_name: "Alpha".to_owned(),
+        repositories: vec![flotilla_protocol::ProjectRepositoryMembership {
+            key: flotilla_protocol::RepositoryKey("repo-a".to_owned()),
+            slug: Some("github.com:org/a".to_owned()),
+            subpath: Some("src".to_owned()),
+        }],
+    };
+    let relation = entity::project_repository("dev", "alpha", "repo-a", Some("src"));
+    assert!(state.cursors().iter().any(|cursor| cursor.query == QueryId::ProjectRepositories { scope: None }));
+    assert_eq!(
+        state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+            seq: 0,
+            rows: Rows::ProjectRepositories { scope: None, rows: vec![] },
+            state: Default::default()
+        }))),
+        Applied::Updated
+    );
+    assert!(state.rebuild(&mint()).is_empty(), "unavailable definition makes no empty-membership claim");
+    assert_eq!(
+        state.apply_event(&DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq: 1,
+            changes: QueryChanges::ProjectRepositories { scope: None, changed: vec![project.clone()], removed: vec![] },
+            state: None
+        }))),
+        Applied::Updated
+    );
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == MetadataTarget::Entity(relation.clone())));
+    let empty = ProjectRepositoriesRow { repositories: vec![], ..project.clone() };
+    assert_eq!(
+        state.apply_event(&DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq: 2,
+            changes: QueryChanges::ProjectRepositories { scope: None, changed: vec![empty], removed: vec![] },
+            state: None
+        }))),
+        Applied::Updated
+    );
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == MetadataTarget::Entity(relation.clone()) && !patch.unset.is_empty()));
+    assert_eq!(
+        state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+            seq: 3,
+            rows: Rows::ProjectRepositories { scope: None, rows: vec![project] },
+            state: Default::default()
+        }))),
+        Applied::Updated
+    );
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == MetadataTarget::Entity(relation.clone())));
+}
