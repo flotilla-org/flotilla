@@ -26,6 +26,7 @@ spec:
     - name: implement
       crew:
         - role: coder
+          completion_expectations: [decision-ledger, change-request-ready]
           selector:
             capability: code
           prompt: |
@@ -38,6 +39,7 @@ spec:
         - implement
       crew:
         - role: reviewer
+          completion_expectations: [decision-ledger]
           selector:
             capability: code-review
           prompt: Review branch {{inputs.branch}} for correctness and style.

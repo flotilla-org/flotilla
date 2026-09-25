@@ -28,21 +28,21 @@ use flotilla_protocol::{
     ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
     CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness,
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow,
-    FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress,
-    ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
-    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan,
-    ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType,
-    ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
+    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, change_request_address,
-    change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_landing_settlement,
-    expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
+    change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_crew_completion,
+    evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
     get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec,
     patch_resource_annotation, repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target,
     watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources,
@@ -50,8 +50,8 @@ use flotilla_resources::{
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
     ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionPending, CrewSource, CrewWorkPhase,
-    Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource,
+    CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
     Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
@@ -345,6 +345,16 @@ fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: 
 
 fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
     match expectation {
+        UnmetSettlementExpectation::MissingDecisionLedger { vessel, role } => ExplainedUnmetExpectation {
+            reason: "missing_decision_ledger".to_string(),
+            subject: format!("crew/{vessel}/{role}"),
+            detail: "post the decision ledger comment and pass its URL with `--decision-ledger-ref`".to_string(),
+        },
+        UnmetSettlementExpectation::ChangeRequestNotReady { record, detail } => ExplainedUnmetExpectation {
+            reason: "change_request_not_ready".to_string(),
+            subject: format!("change_request/{record}"),
+            detail,
+        },
         UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
             ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
         }
@@ -381,7 +391,11 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
         UnmetSettlementExpectation::MissingChangeRequest { record } => ExplainedUnmetExpectation {
             reason: "missing_record".to_string(),
             subject: format!("change_request/{record}"),
-            detail: "expected change request has no federated observation".to_string(),
+            detail: if record == "$cr" {
+                "change request missing; create and bind a ready PR before completing".to_string()
+            } else {
+                "expected change request has no federated observation".to_string()
+            },
         },
         UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
             reason: "stale_evidence".to_string(),
@@ -3602,6 +3616,7 @@ impl InProcessDaemon {
             let Some(state) = observation.object.status.as_ref().and_then(|status| status.state.value) else { continue };
             let status = match state {
                 ObservedChangeRequestState::Open => flotilla_protocol::ChangeRequestStatus::Open,
+                ObservedChangeRequestState::Draft => flotilla_protocol::ChangeRequestStatus::Draft,
                 ObservedChangeRequestState::Merged => flotilla_protocol::ChangeRequestStatus::Merged,
                 ObservedChangeRequestState::Closed => flotilla_protocol::ChangeRequestStatus::Closed,
             };
@@ -7939,14 +7954,72 @@ impl InProcessDaemon {
             .is_some_and(|claim| {
                 claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
             });
-        if decision_ledger_ref.is_none() && forced_by.is_none() && !existing_claim_is_admitted {
-            return Err(
-                "crew completion requires a decision ledger comment on the bound change request or issue; post it and pass its URL with `--decision-ledger-ref`"
-                    .to_string(),
-            );
-        }
         if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
             return Ok(());
+        }
+        if forced_by.is_none() && !existing_claim_is_admitted {
+            let checkout_sources =
+                self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
+            let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
+            let requires_ready_change_request = convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
+                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
+                .is_some_and(|crew| {
+                    crew.completion_expectations.contains(&flotilla_resources::CrewCompletionExpectation::ChangeRequestReady)
+                });
+            let mut observation_errors = Vec::new();
+            if requires_ready_change_request && (!expected_checkout_refs(&convoy)?.is_empty() || convoy.spec.change_request.is_some()) {
+                let mut subjects = BTreeSet::new();
+                for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
+                    if let Some(subject) = crate::change_request_observer::ChangeRequestRef::from_address(namespace, &leaf.address) {
+                        subjects.insert((subject.service, subject.scope, subject.number));
+                    }
+                }
+                for (service, scope, number) in subjects {
+                    let subject =
+                        crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
+                    if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
+                        observation_errors.push(format!("cannot verify change request readiness: {error}"));
+                    }
+                }
+            }
+            let change_request_sources = self
+                .resource_backend
+                .including_replicas::<ResourceChangeRequest>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut change_requests = BTreeMap::new();
+            for source in change_request_sources.items {
+                let name = source.object.metadata.name.clone();
+                if !change_requests.contains_key(&name) || matches!(source.provenance, ResourceProvenance::Local) {
+                    change_requests.insert(name, source.object);
+                }
+            }
+            let unmet = evaluate_crew_completion(
+                &convoy,
+                CrewCompletionClaim {
+                    vessel: &context.vessel,
+                    role: &context.caller_role,
+                    decision_ledger_ref: decision_ledger_ref.as_deref(),
+                },
+                &checkouts,
+                &change_requests,
+                self.change_request_stale_after(),
+                self.clock.now(),
+            )?;
+            if !unmet.is_empty() || !observation_errors.is_empty() {
+                let mut reasons = unmet
+                    .into_iter()
+                    .map(explain_unmet_expectation)
+                    .map(|expectation| format!("{}: {}", expectation.subject, expectation.detail))
+                    .collect::<Vec<_>>();
+                reasons.extend(observation_errors);
+                return Err(format!("crew completion expectations unmet: {}", reasons.join("; ")));
+            }
         }
         if let Some(pending) = convoy
             .status
@@ -11039,13 +11112,15 @@ impl InProcessDaemon {
             })
             .collect();
 
-        let mut crew_deliveries = self
+        let terminal_sessions = self
             .resource_backend
             .including_replicas::<ResourceTerminalSession>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
-            .items
+            .items;
+        let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), &terminal_sessions, name);
+        let mut crew_deliveries = terminal_sessions
             .into_iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
             .map(|source| ExplainedCrewDelivery {
@@ -11104,12 +11179,54 @@ impl InProcessDaemon {
             change_requests,
             subscriptions,
             crew_deliveries,
+            unclaimed_work,
             decision_ledgers,
             settlement,
             recent_events,
             lifecycle_mutations,
         })
     }
+}
+
+fn explained_unclaimed_work(
+    status: Option<&ConvoyStatus>,
+    sessions: &[ReadResourceObject<ResourceTerminalSession>],
+    convoy_name: &str,
+) -> Vec<ExplainedUnclaimedWork> {
+    let Some(status) = status else { return Vec::new() };
+    status
+        .crew_work
+        .iter()
+        .flat_map(|(vessel, crew)| {
+            crew.iter().filter_map(move |(role, state)| {
+                if state.phase != CrewWorkPhase::Working {
+                    return None;
+                }
+                let session = sessions.iter().find(|source| {
+                    let labels = &source.object.metadata.labels;
+                    labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy_name)
+                        && labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
+                        && labels.get(ROLE_LABEL).is_some_and(|value| value == role)
+                });
+                let evidence = if status.work.get(vessel).is_some_and(|work| work.phase == ResourceWorkPhase::Complete) {
+                    "work_complete"
+                } else if session.is_some_and(|source| {
+                    source.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
+                }) {
+                    "session_stopped"
+                } else if session.is_some_and(|source| {
+                    source.object.status.as_ref().is_some_and(|status| {
+                        status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
+                    })
+                }) {
+                    "turn_idle"
+                } else {
+                    return None;
+                };
+                Some(ExplainedUnclaimedWork { vessel: vessel.clone(), role: role.clone(), evidence: evidence.to_string() })
+            })
+        })
+        .collect()
 }
 
 fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {

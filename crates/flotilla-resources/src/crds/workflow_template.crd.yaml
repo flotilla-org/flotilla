@@ -136,6 +136,12 @@ spec:
                             role:
                               type: string
                               minLength: 1
+                            completion_expectations:
+                              type: array
+                              uniqueItems: true
+                              items:
+                                type: string
+                                enum: [decision-ledger, change-request-ready]
                             selector:
                               type: object
                               required:

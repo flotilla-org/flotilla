@@ -303,6 +303,7 @@ impl LeafSubject for ChangeRequestLeafSubject<'_> {
         let value = match field_path {
             ".state" => match status.state.value? {
                 crate::ObservedChangeRequestState::Open => "open".to_string(),
+                crate::ObservedChangeRequestState::Draft => "draft".to_string(),
                 crate::ObservedChangeRequestState::Merged => "merged".to_string(),
                 crate::ObservedChangeRequestState::Closed => "closed".to_string(),
             },

@@ -282,6 +282,13 @@ pub struct ExplainedUnmetExpectation {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedUnclaimedWork {
+    pub vessel: String,
+    pub role: String,
+    pub evidence: String,
+}
+
 pub const SETTLEMENT_MODE_STANDING: &str = "standing";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +312,8 @@ pub struct ConvoyExplanation {
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unclaimed_work: Vec<ExplainedUnclaimedWork>,
     pub decision_ledgers: Vec<ExplainedDecisionLedger>,
     pub settlement: ExplainedSettlement,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -36,6 +36,10 @@ impl ChangeRequestRef {
 #[async_trait]
 pub trait ChangeRequestObservationSource: Send + Sync {
     async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String>;
+
+    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+        self.observe(subject).await
+    }
 }
 
 pub struct GhChangeRequestObservationSource {
@@ -63,11 +67,34 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
         )?;
         parse_gh_observation(&output, Utc::now())
     }
+
+    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+        if subject.service != "github.com" {
+            return Err(format!("change request observation service `{}` is not available on this host", subject.service));
+        }
+        let number = subject.number.to_string();
+        let output = run!(
+            self.runner,
+            "gh",
+            &[
+                "pr",
+                "view",
+                &number,
+                "--repo",
+                &subject.scope,
+                "--json",
+                "state,isDraft,headRefOid,statusCheckRollup,reviewDecision,mergeable"
+            ],
+            Path::new("/"),
+        )?;
+        parse_gh_observation(&output, Utc::now())
+    }
 }
 
 fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| format!("decode gh pr observation: {error}"))?;
     let state = match value["state"].as_str() {
+        Some("OPEN") if value["isDraft"] == true => Some(ObservedChangeRequestState::Draft),
         Some("OPEN") => Some(ObservedChangeRequestState::Open),
         Some("MERGED") => Some(ObservedChangeRequestState::Merged),
         Some("CLOSED") => Some(ObservedChangeRequestState::Closed),
@@ -173,6 +200,13 @@ impl ChangeRequestRefresher {
 
     pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
         self.inner.observation_errors.lock().await.get(subject).cloned()
+    }
+
+    /// Refresh a claim-time observation even before Landing has armed its
+    /// standing leaf subscriptions.
+    pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+        let status = self.inner.source.observe_for_completion(subject).await?;
+        self.publish(subject, &subject.record_name(), status, true).await
     }
 
     pub async fn demand(
@@ -404,6 +438,16 @@ mod tests {
         assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
         assert_eq!(status.review.actionable_at_head.value, Some(true));
         assert_eq!(status.mergeable.value, Some(ObservedMergeability::Conflicting));
+    }
+
+    #[test]
+    fn draft_pr_is_not_ready_for_a_crew_claim() {
+        let status = parse_gh_observation(
+            r#"{"state":"OPEN","isDraft":true,"headRefOid":"abc","statusCheckRollup":[],"reviewDecision":null,"mergeable":"MERGEABLE"}"#,
+            "2026-08-03T20:00:00Z".parse().expect("time"),
+        )
+        .expect("parse draft");
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Draft));
     }
 
     #[test]
