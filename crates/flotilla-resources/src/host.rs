@@ -18,6 +18,10 @@ pub const CREDENTIAL_EXPIRY_CAPABILITY: &str = "credential_expiry";
 /// is held material without a `CredentialSpec` declaring it.
 pub const AMBIENT_CLAUDE_CREDENTIAL_SCOPE: &str = "ambient:claude";
 pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
+pub const AGENTLESS_CAPABILITY: &str = "agentless";
+pub const TRANSPORT_CAPABILITY: &str = "transport";
+pub const PLACEMENT_CAPABILITY: &str = "placement";
+pub const OWNING_DAEMON_CAPABILITY: &str = "owning_daemon";
 pub const HEARTBEAT_READY_TTL_SECS: i64 = 60;
 pub const SLEEP_INHIBITION_CONDITION_TYPE: &str = "SleepInhibition";
 
@@ -45,6 +49,26 @@ pub fn canonical_host_id<'a>(
 pub struct HostSpec {
     #[serde(default)]
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "HostConnection::is_daemon")]
+    pub connection: HostConnection,
+}
+
+/// How the owning daemon reaches this Host for actuation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostConnection {
+    #[default]
+    Daemon,
+    AgentlessSsh {
+        owning_daemon: String,
+        destination: String,
+    },
+}
+
+impl HostConnection {
+    pub fn is_daemon(&self) -> bool {
+        matches!(self, Self::Daemon)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -82,6 +106,16 @@ pub struct HostStatus {
 }
 
 impl HostStatus {
+    pub fn is_agentless_ssh(&self) -> bool {
+        self.capabilities.get(AGENTLESS_CAPABILITY) == Some(&serde_json::Value::Bool(true))
+            && self.capabilities.get(TRANSPORT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("ssh")
+            && self.capabilities.get(PLACEMENT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("host_direct_only")
+    }
+
+    pub fn agentless_ssh_owner(&self) -> Option<&str> {
+        self.is_agentless_ssh().then(|| self.capabilities.get(OWNING_DAEMON_CAPABILITY)).flatten()?.as_str()
+    }
+
     pub fn agent_adapters(&self) -> Result<BTreeSet<String>, serde_json::Error> {
         self.capabilities.get(AGENT_ADAPTERS_CAPABILITY).cloned().map(serde_json::from_value).transpose().map(Option::unwrap_or_default)
     }

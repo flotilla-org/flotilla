@@ -105,6 +105,7 @@ pub struct TerminalSessionReconciler<R> {
     vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
     local_host_ref: Option<CanonicalHostId>,
+    additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
 
 impl<R> TerminalSessionReconciler<R> {
@@ -117,6 +118,7 @@ impl<R> TerminalSessionReconciler<R> {
             vessels: backend.clone().using::<Vessel>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
+            additional_host_refs: Default::default(),
         }
     }
 
@@ -125,15 +127,19 @@ impl<R> TerminalSessionReconciler<R> {
         self
     }
 
+    pub fn with_additional_host_refs(mut self, host_refs: impl IntoIterator<Item = CanonicalHostId>) -> Self {
+        self.additional_host_refs = host_refs.into_iter().collect();
+        self
+    }
+
     fn actuates(&self, session: &ResourceObject<TerminalSession>) -> bool {
         // Unannotated sessions are independent or predate actuator projection;
         // their local authoritative store remains their actuator.
         self.local_host_ref.as_ref().is_none_or(|local_host_ref| {
-            session
-                .metadata
-                .annotations
-                .get(ACTUATOR_HOST_REF_ANNOTATION)
-                .is_none_or(|actuator_host_ref| &CanonicalHostId::resolved(actuator_host_ref) == local_host_ref)
+            session.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_none_or(|actuator_host_ref| {
+                let target = CanonicalHostId::resolved(actuator_host_ref);
+                &target == local_host_ref || self.additional_host_refs.contains(&target)
+            })
         })
     }
 

@@ -12,6 +12,12 @@ const CLONE_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub trait CloneRuntime: Send + Sync {
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String>;
     async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String>;
+    async fn clone_and_inspect_in(&self, _env_ref: &str, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
+        self.clone_and_inspect(repo_url, target_path).await
+    }
+    async fn inspect_existing_in(&self, _env_ref: &str, target_path: &str) -> Result<Option<String>, String> {
+        self.inspect_existing(target_path).await
+    }
 }
 
 pub struct CloneReconciler<R> {
@@ -61,9 +67,9 @@ where
         }
 
         let result = if obj.metadata.labels.get("flotilla.work/discovered").map(String::as_str) == Some("true") {
-            self.runtime.inspect_existing(&obj.spec.path).await
+            self.runtime.inspect_existing_in(&obj.spec.env_ref, &obj.spec.path).await
         } else {
-            self.runtime.clone_and_inspect(&obj.spec.url, &obj.spec.path).await
+            self.runtime.clone_and_inspect_in(&obj.spec.env_ref, &obj.spec.url, &obj.spec.path).await
         };
         Ok(match result {
             Ok(default_branch) => ClonePrepared::Ready { default_branch },

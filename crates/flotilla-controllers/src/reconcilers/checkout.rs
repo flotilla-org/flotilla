@@ -65,6 +65,37 @@ pub trait CheckoutRuntime: Send + Sync {
         convoy: Option<&ResourceObject<Convoy>>,
     ) -> Result<CheckoutIntegrationStatus, String>;
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
+    async fn create_worktree_in(
+        &self,
+        _env_ref: &str,
+        clone_path: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.create_worktree(clone_path, branch, base_ref, target_path).await
+    }
+    async fn create_fresh_clone_in(
+        &self,
+        _env_ref: &str,
+        repo_url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+    }
+    async fn inspect_integration_in(
+        &self,
+        _env_ref: &str,
+        checkout: &ResourceObject<Checkout>,
+        convoy: Option<&ResourceObject<Convoy>>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        self.inspect_integration(checkout, convoy).await
+    }
+    async fn remove_checkout_in(&self, _env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        self.remove_checkout(removal).await
+    }
 }
 
 pub struct CheckoutReconciler<R> {
@@ -212,7 +243,7 @@ where
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))
             }) {
-                return Ok(match self.runtime.inspect_integration(obj, convoy.as_ref()).await {
+                return Ok(match self.runtime.inspect_integration_in(obj.spec.env_ref().unwrap_or(""), obj, convoy.as_ref()).await {
                     Ok(status) => CheckoutPrepared::Integration { status: Box::new(status) },
                     Err(err) => CheckoutPrepared::Failed(err),
                 });
@@ -245,17 +276,27 @@ where
                 if clone.spec.env_ref != spec.env_ref {
                     return Ok(CheckoutPrepared::Failed("worktree clone env_ref mismatch".to_string()));
                 }
-                Ok(match self.runtime.create_worktree(&clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
+                Ok(
+                    match self
+                        .runtime
+                        .create_worktree_in(&spec.env_ref, &clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path)
+                        .await
+                    {
+                        Ok(prepared) => CheckoutPrepared::Ready { prepared },
+                        Err(err) => CheckoutPrepared::Failed(err),
+                    },
+                )
+            }
+            CheckoutSpec::FreshClone(spec) => Ok(
+                match self
+                    .runtime
+                    .create_fresh_clone_in(&spec.env_ref, &spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path)
+                    .await
+                {
                     Ok(prepared) => CheckoutPrepared::Ready { prepared },
                     Err(err) => CheckoutPrepared::Failed(err),
-                })
-            }
-            CheckoutSpec::FreshClone(spec) => {
-                Ok(match self.runtime.create_fresh_clone(&spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
-                    Ok(prepared) => CheckoutPrepared::Ready { prepared },
-                    Err(err) => CheckoutPrepared::Failed(err),
-                })
-            }
+                },
+            ),
             // Observed checkouts are facts from the observed-resource backend.
             // The managed checkout reconciler must not actuate or patch them.
             CheckoutSpec::Observed(_) => Ok(CheckoutPrepared::None),
@@ -347,7 +388,7 @@ where
             CheckoutSpec::FreshClone(spec) => CheckoutRemoval::FreshClone { target_path: spec.target_path.clone() },
             CheckoutSpec::Observed(_) => return Ok(()),
         };
-        let outcome = self.runtime.remove_checkout(&removal).await.map_err(ResourceError::other)?;
+        let outcome = self.runtime.remove_checkout_in(obj.spec.env_ref().unwrap_or(""), &removal).await.map_err(ResourceError::other)?;
         if let CheckoutRemovalOutcome::PreservedBranch { branch, reason } = outcome {
             warn!(%branch, ?reason, "preserved branch during checkout cleanup");
         }

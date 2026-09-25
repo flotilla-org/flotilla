@@ -49,6 +49,7 @@ pub struct VesselReconciler {
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
     local_host_ref: Option<CanonicalHostId>,
+    additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
     brief_templates: CrewBriefTemplateResolver,
 }
@@ -67,6 +68,7 @@ impl VesselReconciler {
             federated_convoys: None,
             federated_placement_policies: None,
             local_host_ref: None,
+            additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
             brief_templates: CrewBriefTemplateResolver::default(),
         }
@@ -80,6 +82,11 @@ impl VesselReconciler {
         self.federated_convoys = Some(backend.including_replicas::<Convoy>(&self.namespace));
         self.federated_placement_policies = Some(backend.including_replicas::<PlacementPolicy>(&self.namespace));
         self.local_host_ref = Some(local_host_ref);
+        self
+    }
+
+    pub fn with_additional_host_refs(mut self, host_refs: impl IntoIterator<Item = CanonicalHostId>) -> Self {
+        self.additional_host_refs = host_refs.into_iter().collect();
         self
     }
 
@@ -270,12 +277,9 @@ impl Reconciler for VesselReconciler {
             Err(err) => return Err(err),
         };
         let placement_decision = convoy.status.as_ref().and_then(|status| status.placement_decision.clone());
-        if self
-            .local_host_ref
-            .as_ref()
-            .zip(placement_decision.as_ref())
-            .is_some_and(|(local_host_ref, decision)| &decision.target_host.reference != local_host_ref)
-        {
+        if self.local_host_ref.as_ref().zip(placement_decision.as_ref()).is_some_and(|(local_host_ref, decision)| {
+            &decision.target_host.reference != local_host_ref && !self.additional_host_refs.contains(&decision.target_host.reference)
+        }) {
             return Ok(VesselPrepared::none());
         }
         let placement_policy = match Self::dependency(
@@ -573,13 +577,13 @@ impl Reconciler for VesselReconciler {
                     &convoy.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
                 ),
                 PlacementStrategy::DockerFreshCloneInContainer { .. } => checkout_name(
                     &obj.metadata.name,
                     &convoy_repository.workspace_slug,
                     multi_repository,
-                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(CanonicalHostId::as_str)).as_deref(),
+                    checkout_placement_scope(&convoy, self.local_host_ref.as_ref().map(|_| strategy.host_ref())).as_deref(),
                 ),
             });
             let checkout_target_path = match &strategy {

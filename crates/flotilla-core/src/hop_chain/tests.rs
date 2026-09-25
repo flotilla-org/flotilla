@@ -49,6 +49,7 @@ fn ssh_resolver() -> SshRemoteHopResolver {
             expected_node_id: None,
             user: Some("alice".to_string()),
             ssh_multiplex: Some(false),
+            agentless_ssh: false,
         }),
         ("jump".to_string(), RemoteHostConfig {
             hostname: "jump.example".to_string(),
@@ -56,6 +57,7 @@ fn ssh_resolver() -> SshRemoteHopResolver {
             expected_node_id: None,
             user: None,
             ssh_multiplex: Some(false),
+            agentless_ssh: false,
         }),
     ]);
     SshRemoteHopResolver::new(DaemonHostPath::new(std::env::temp_dir().join("flotilla-hop-chain-tests")), HostsConfig {

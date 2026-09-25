@@ -157,7 +157,10 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
     let hosts = backend.using::<Host>("flotilla");
     for host in ["kiwi", "udder"] {
         hosts
-            .create(&InputMeta::builder().name(host.to_string()).build(), &HostSpec { display_name: host.to_string() })
+            .create(&InputMeta::builder().name(host.to_string()).build(), &HostSpec {
+                display_name: host.to_string(),
+                connection: Default::default(),
+            })
             .await
             .expect("create host identity");
     }

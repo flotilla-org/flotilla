@@ -28,15 +28,21 @@ pub struct EnvironmentReconciler<R> {
     docker: Arc<R>,
     hosts: TypedResolver<Host>,
     local_host_ref: Option<CanonicalHostId>,
+    additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
 
 impl<R> EnvironmentReconciler<R> {
     pub fn new(docker: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
-        Self { docker, hosts: backend.using::<Host>(namespace), local_host_ref: None }
+        Self { docker, hosts: backend.using::<Host>(namespace), local_host_ref: None, additional_host_refs: Default::default() }
     }
 
     pub fn with_local_host_ref(mut self, local_host_ref: CanonicalHostId) -> Self {
         self.local_host_ref = Some(local_host_ref);
+        self
+    }
+
+    pub fn with_additional_host_refs(mut self, host_refs: impl IntoIterator<Item = CanonicalHostId>) -> Self {
+        self.additional_host_refs = host_refs.into_iter().collect();
         self
     }
 
@@ -60,7 +66,7 @@ impl<R> EnvironmentReconciler<R> {
             Ok(Some(canonical)) => canonical,
             Ok(None) | Err(_) => return Ok(false),
         };
-        Ok(&canonical == local_host_ref)
+        Ok(&canonical == local_host_ref || self.additional_host_refs.contains(&canonical) && environment.spec.host_direct.is_some())
     }
 }
 

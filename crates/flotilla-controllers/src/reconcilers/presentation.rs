@@ -679,7 +679,7 @@ mod tests {
                 creation_timestamp: Utc::now(),
                 merge: None,
             },
-            spec: HostSpec { display_name: "local-host".to_string() },
+            spec: HostSpec { display_name: "local-host".to_string(), connection: Default::default() },
             status: None,
         }];
         let canonical =

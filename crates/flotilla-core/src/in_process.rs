@@ -502,9 +502,12 @@ async fn register_static_ssh_direct_environment(
     discovery: &DiscoveryRuntime,
     config_key: &str,
     environment: &StaticEnvironmentConfig,
+    host_direct: bool,
+    multiplex: bool,
 ) -> Result<(), String> {
     let fallback_env_id = static_ssh_environment_id(config_key);
-    let runner = Arc::new(SshCommandRunner::new(environment.hostname.clone(), true, Arc::clone(&discovery.runner)));
+    let destination = crate::config::ssh_destination(&environment.hostname, environment.user.as_deref());
+    let runner = Arc::new(SshCommandRunner::new(destination.clone(), multiplex, Arc::clone(&discovery.runner)));
     tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Default))
         .await
         .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
@@ -512,8 +515,13 @@ async fn register_static_ssh_direct_environment(
     let remote_env_vars =
         tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, load_env_vars(&*runner, Path::new("/"))).await.unwrap_or_default();
     let remote_env = StaticEnvVars { vars: remote_env_vars };
-    let env_id = resolve_or_create_remote_environment_id(&*runner, &remote_env, fallback_env_id).await?;
     let host_id = resolve_or_create_remote_host_id(&*runner, &remote_env).await?;
+    let env_id = if host_direct {
+        let host_id = host_id.as_ref().ok_or_else(|| format!("SSH host {} has no writable stable host identity", environment.hostname))?;
+        EnvironmentId::new(format!("host-direct-{host_id}"))
+    } else {
+        resolve_or_create_remote_environment_id(&*runner, &remote_env, fallback_env_id).await?
+    };
     let mut env_bag =
         tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, run_host_detectors(&discovery.host_detectors, &*runner, &remote_env))
             .await
@@ -521,7 +529,11 @@ async fn register_static_ssh_direct_environment(
     if let Some(display_name) = environment.display_name.as_ref() {
         env_bag = env_bag.with(EnvironmentAssertion::env_var("DISPLAY_NAME", display_name));
     }
-    environment_manager.register_direct_environment(env_id, runner, env_bag, host_id)
+    environment_manager.register_direct_environment(env_id.clone(), runner, env_bag, host_id)?;
+    if host_direct {
+        environment_manager.set_direct_environment_ssh_destination(&env_id, destination)?;
+    }
+    Ok(())
 }
 
 async fn register_static_ssh_direct_environments(
@@ -538,7 +550,8 @@ async fn register_static_ssh_direct_environments(
     };
 
     for (config_key, environment) in &daemon_config.environments {
-        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment).await {
+        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment, false, true).await
+        {
             warn!(
                 environment = %config_key,
                 hostname = %environment.hostname,
@@ -546,6 +559,31 @@ async fn register_static_ssh_direct_environments(
                 "failed to register static SSH direct environment; continuing startup"
             );
         }
+    }
+    match config.load_hosts() {
+        Ok(hosts) => {
+            for (label, remote) in hosts.hosts.iter().filter(|(_, host)| host.agentless_ssh) {
+                let environment = StaticEnvironmentConfig {
+                    hostname: remote.hostname.clone(),
+                    user: remote.user.clone(),
+                    display_name: Some(remote.expected_host_name.clone()),
+                    flotilla_command: None,
+                };
+                if let Err(err) = register_static_ssh_direct_environment(
+                    environment_manager,
+                    discovery,
+                    label,
+                    &environment,
+                    true,
+                    hosts.resolved_ssh_multiplex(label),
+                )
+                .await
+                {
+                    warn!(host = %label, %err, "failed to register agentless SSH host; continuing startup");
+                }
+            }
+        }
+        Err(err) => warn!(%err, "failed to load agentless SSH hosts"),
     }
 }
 
@@ -857,10 +895,7 @@ fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObjec
 }
 
 fn ssh_destination(remote: &RemoteHostConfig) -> String {
-    match remote.user.as_deref() {
-        Some(user) if !user.is_empty() => format!("{user}@{}", remote.hostname),
-        _ => remote.hostname.clone(),
-    }
+    crate::config::ssh_destination(&remote.hostname, remote.user.as_deref())
 }
 
 fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<String> {
@@ -1322,6 +1357,28 @@ fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<
     crate::admission::check_measured_free_space(&target_host.display_name, free_bytes, floor_bytes)
 }
 
+async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str, policy: &ResourceObject<PlacementPolicy>) -> bool {
+    let Ok(target) = placement_target_host(backend, namespace, policy).await else {
+        return false;
+    };
+    authoritative_placement_host(backend, namespace, &target, &policy.metadata.name)
+        .await
+        .ok()
+        .is_some_and(|host| matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. }))
+}
+
+async fn placement_actuator_host_ref(
+    backend: &ResourceBackend,
+    namespace: &str,
+    target: &PlacementTargetHost,
+) -> Result<CanonicalHostId, String> {
+    let host = authoritative_placement_host(backend, namespace, target, "actuator routing").await?;
+    match host.spec.connection {
+        flotilla_resources::HostConnection::AgentlessSsh { owning_daemon, .. } => Ok(CanonicalHostId::resolved(owning_daemon)),
+        flotilla_resources::HostConnection::Daemon => Ok(target.reference.clone()),
+    }
+}
+
 async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1344,8 +1401,15 @@ async fn default_convoy_placement_policy(
     let mut refused_candidates = Vec::new();
     for policy in policies {
         let mut candidate_workflow = workflow.clone();
+        let agentless_ssh = policy_targets_agentless_ssh(backend, namespace, &policy).await;
+        let agentless_unready =
+            if agentless_ssh && !contained { placement_agent_adapters(backend, namespace, &policy).await.err() } else { None };
         let refusal = if contained && policy.spec.docker_per_vessel.is_none() {
             Some(format!("contained workflow requires a docker placement policy, but {} is not contained", policy.metadata.name))
+        } else if contained && agentless_ssh {
+            Some(format!("contained workflow cannot use agentless SSH host in placement {}", policy.metadata.name))
+        } else if let Some(reason) = agentless_unready {
+            Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await {
             Some(reason)
         } else {
@@ -2945,6 +3009,31 @@ impl InProcessDaemon {
         self.environment_manager.environment_registry(env_id)
     }
 
+    /// Direct SSH environments explicitly opted into host-direct placement.
+    /// Their environment key is derived from the remote host's stable ID.
+    pub fn agentless_ssh_environments(&self) -> Vec<(EnvironmentId, crate::environment_manager::DirectEnvironmentState)> {
+        self.environment_manager
+            .managed_environments()
+            .into_iter()
+            .filter_map(|(id, managed)| match managed {
+                crate::environment_manager::ManagedEnvironmentKind::Direct(state)
+                    if state.host_id.as_ref().is_some_and(|host| id.as_str() == format!("host-direct-{host}")) =>
+                {
+                    Some((id, state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn set_direct_environment_registry(
+        &self,
+        env_id: &EnvironmentId,
+        registry: Arc<crate::providers::registry::ProviderRegistry>,
+    ) -> Result<(), String> {
+        self.environment_manager.set_direct_environment_registry(env_id, registry)
+    }
+
     pub fn environment_container_name(&self, env_id: &EnvironmentId) -> Option<String> {
         self.environment_manager.environment_container_name(env_id)
     }
@@ -3304,10 +3393,11 @@ impl InProcessDaemon {
             .map(|source| source.object)
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
         let target_host = placement_target_host(&self.resource_backend, namespace, &policy).await?;
-        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
+        let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &target_host).await?;
+        if self.canonical_local_host_id().as_ref() == Some(&actuator) {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
     }
 
     pub async fn convoy_start_placement_host(
@@ -3345,10 +3435,11 @@ impl InProcessDaemon {
             return Ok(None);
         };
         let target_host = placement_target_host(&self.resource_backend, &project_namespace, &policy).await?;
-        if self.canonical_local_host_id().as_ref().is_some_and(|host_id| host_id == &target_host.reference) {
+        let actuator = placement_actuator_host_ref(&self.resource_backend, &project_namespace, &target_host).await?;
+        if self.canonical_local_host_id().as_ref() == Some(&actuator) {
             return Ok(None);
         }
-        Ok(Some(flotilla_protocol::qualified_path::HostId::new(target_host.reference.as_str())))
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
     }
 
     pub async fn resolve_existing_convoy_target(
@@ -7592,7 +7683,11 @@ impl InProcessDaemon {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
         let host_list = self.list_hosts_internal().await?;
-        let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let configured_hosts = self
+            .config
+            .load_hosts()
+            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.agentless_ssh).collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         let configured_names =
             configured_hosts.values().map(|remote| HostName::new(remote.expected_host_name.clone())).collect::<HashSet<_>>();
         let configured_by_node = configured_hosts
@@ -7812,7 +7907,11 @@ impl InProcessDaemon {
         let (mut rows, _generation) = self.local_fleet_rows(&namespace).await?;
         let mut replicas = Vec::new();
         let now = Utc::now();
-        let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let configured_hosts = self
+            .config
+            .load_hosts()
+            .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.agentless_ssh).collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         let failures = self.resource_replication_failures.read().await.clone();
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
@@ -8915,12 +9014,20 @@ impl InProcessDaemon {
         let hosts = self.config.load_hosts()?;
         let namespace = self.provisioning_namespace().await;
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
-        let configured: HashSet<_> = hosts.hosts.values().map(|remote| HostName::new(remote.expected_host_name.clone())).collect();
+        let configured: HashSet<_> = hosts
+            .hosts
+            .values()
+            .filter(|remote| !remote.agentless_ssh)
+            .map(|remote| HostName::new(remote.expected_host_name.clone()))
+            .collect();
         {
             let mut cache = self.fleet_replica_cache.write().await;
             cache.retain(|host, _| configured.contains(host));
         }
         for (label, remote) in &hosts.hosts {
+            if remote.agentless_ssh {
+                continue;
+            }
             let host = HostName::new(remote.expected_host_name.clone());
             let multiplex = hosts.resolved_ssh_multiplex(label);
             let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
@@ -9446,7 +9553,14 @@ impl InProcessDaemon {
         let configured_replica_hosts: HashSet<HostName> = self
             .config
             .load_hosts()
-            .map(|hosts| hosts.hosts.into_values().map(|remote| HostName::new(remote.expected_host_name)).collect())
+            .map(|hosts| {
+                hosts
+                    .hosts
+                    .into_values()
+                    .filter(|remote| !remote.agentless_ssh)
+                    .map(|remote| HostName::new(remote.expected_host_name))
+                    .collect()
+            })
             .unwrap_or_default();
         let cache = self.fleet_replica_cache.read().await;
         for host in configured_replica_hosts {
@@ -9557,6 +9671,38 @@ impl InProcessDaemon {
             .map(|spec| spec.host_ref.as_str())
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
+        if let Some(destination) =
+            self.environment_manager.managed_environments().into_iter().find(|(id, _)| id.as_str() == session.spec.env_ref).and_then(
+                |(_, state)| match state {
+                    crate::environment_manager::ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination,
+                    _ => None,
+                },
+            )
+        {
+            let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
+            let registry = self.registry_for_resource_environment(&environment, cwd.as_path()).await?;
+            let pool = registry
+                .terminal_pools
+                .get(&session.spec.pool)
+                .map(|(_, pool)| Arc::clone(pool))
+                .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
+            let attach_target = terminal_session_attach_target(session)?;
+            pool.preflight_attach(seat).await?;
+            let attach_args = pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new(), seat)?;
+            let plan = ResolvedAttachPlan::command(vec![
+                Arg::Literal("ssh".to_string()),
+                Arg::Literal("-tt".to_string()),
+                Arg::Literal("-o".to_string()),
+                Arg::Literal("BatchMode=yes".to_string()),
+                Arg::Quoted(destination),
+                Arg::Literal("sh".to_string()),
+                Arg::Literal("-lc".to_string()),
+                Arg::NestedCommand(attach_args),
+            ]);
+            // The owning daemon resolves future attach requests; the target
+            // has no flotillad to receive a recursive attach command.
+            return Ok((plan, self.host_name.clone()));
+        }
         let target_host = self.target_host_for_resource_ref(&namespace, host_ref).await?;
         if target_host != self.host_name {
             let plan = self.recursive_attach_plan_for_remote(&target_host, reference, seat).await?;

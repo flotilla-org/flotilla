@@ -24,11 +24,17 @@ pub struct VesselPlacementProjector {
     backend: ResourceBackend,
     namespace: String,
     local_host_ref: CanonicalHostId,
+    additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
 
 impl VesselPlacementProjector {
     pub fn new(backend: ResourceBackend, namespace: impl Into<String>, local_host_ref: CanonicalHostId) -> Self {
-        Self { backend, namespace: namespace.into(), local_host_ref }
+        Self { backend, namespace: namespace.into(), local_host_ref, additional_host_refs: Default::default() }
+    }
+
+    pub fn with_additional_host_refs(mut self, host_refs: impl IntoIterator<Item = CanonicalHostId>) -> Self {
+        self.additional_host_refs = host_refs.into_iter().collect();
+        self
     }
 
     pub async fn run(&self) -> Result<(), ResourceError> {
@@ -61,7 +67,7 @@ impl VesselPlacementProjector {
             .collect::<HashMap<_, _>>();
 
         let vessel_sources = self.backend.including_replicas::<Vessel>(&self.namespace).list().await?;
-        let mut desired = BTreeMap::<String, (String, ResourceObject<Vessel>)>::new();
+        let mut desired = BTreeMap::<String, (String, CanonicalHostId, ResourceObject<Vessel>)>::new();
         for source in vessel_sources.items {
             let ResourceProvenance::Replica { origin_root, .. } = source.provenance else {
                 continue;
@@ -75,18 +81,19 @@ impl VesselPlacementProjector {
             let Some(convoy) = convoys_by_origin.get(&(origin_root.clone(), source.object.spec.convoy_ref.clone())) else {
                 continue;
             };
-            let placed_here = convoy
+            let target_host = convoy
                 .status
                 .as_ref()
                 .and_then(|status| status.placement_decision.as_ref())
-                .is_some_and(|decision| decision.target_host.reference == self.local_host_ref);
-            if !placed_here {
+                .map(|decision| decision.target_host.reference.clone());
+            let Some(target_host) = target_host.filter(|host| host == &self.local_host_ref || self.additional_host_refs.contains(host))
+            else {
                 continue;
-            }
+            };
 
             match desired.entry(source.object.metadata.name.clone()) {
                 Entry::Vacant(entry) => {
-                    entry.insert((origin_root, source.object));
+                    entry.insert((origin_root, target_host, source.object));
                 }
                 Entry::Occupied(entry) => {
                     warn!(
@@ -106,17 +113,15 @@ impl VesselPlacementProjector {
             .items
             .into_iter()
             .filter(|vessel| {
-                vessel
-                    .metadata
-                    .annotations
-                    .get(ACTUATOR_HOST_REF_ANNOTATION)
-                    .is_some_and(|host_ref| host_ref == self.local_host_ref.as_str())
+                vessel.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).is_some_and(|host_ref| {
+                    host_ref == self.local_host_ref.as_str() || self.additional_host_refs.contains(&CanonicalHostId::resolved(host_ref))
+                })
             })
             .map(|vessel| (vessel.metadata.name.clone(), vessel))
             .collect::<BTreeMap<_, _>>();
 
         let mut result = VesselPlacementSync::default();
-        for (name, (origin_root, source)) in desired {
+        for (name, (origin_root, target_host, source)) in desired {
             let current = match vessels.get(&name).await {
                 Ok(current) => Some(current),
                 Err(ResourceError::NotFound { .. }) => None,
@@ -138,7 +143,7 @@ impl VesselPlacementProjector {
             let mut labels = source.metadata.labels.clone();
             labels.insert(flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string());
             let mut annotations = source.metadata.annotations.clone();
-            annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.to_string(), self.local_host_ref.to_string());
+            annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.to_string(), target_host.to_string());
             annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), origin_root);
             let mut meta = InputMeta::builder()
                 .name(name.clone())

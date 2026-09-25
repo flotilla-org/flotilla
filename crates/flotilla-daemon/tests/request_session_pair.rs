@@ -1163,6 +1163,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     let host = hosts
         .create(&InputMeta::builder().name("remote-docker-host".to_string()).build(), &HostSpec {
             display_name: "remote-docker".to_string(),
+            connection: Default::default(),
         })
         .await
         .expect("create remote Docker host");

@@ -38,6 +38,8 @@ pub struct DirectEnvironmentState {
     pub env_bag: EnvironmentBag,
     pub host_id: Option<HostId>,
     pub display_name: Option<String>,
+    pub registry: Option<Arc<ProviderRegistry>>,
+    pub ssh_destination: Option<String>,
 }
 
 #[derive(Clone)]
@@ -88,6 +90,8 @@ impl EnvironmentManager {
                 env_bag,
                 host_id: Some(local_host_id.clone()),
                 display_name,
+                registry: None,
+                ssh_destination: None,
             }),
         );
 
@@ -126,7 +130,14 @@ impl EnvironmentManager {
             },
             Entry::Vacant(entry) => {
                 let display_name = Self::display_name_for_bag(&env_bag);
-                entry.insert(ManagedEnvironmentKind::Direct(DirectEnvironmentState { runner, env_bag, host_id, display_name }));
+                entry.insert(ManagedEnvironmentKind::Direct(DirectEnvironmentState {
+                    runner,
+                    env_bag,
+                    host_id,
+                    display_name,
+                    registry: None,
+                    ssh_destination: None,
+                }));
                 Ok(())
             }
         }
@@ -161,8 +172,31 @@ impl EnvironmentManager {
 
     pub fn environment_registry(&self, env_id: &EnvironmentId) -> Option<Arc<ProviderRegistry>> {
         match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(_) => None,
+            ManagedEnvironmentKind::Direct(state) => state.registry,
             ManagedEnvironmentKind::Provisioned(state) => state.registry,
+        }
+    }
+
+    pub fn set_direct_environment_registry(&self, env_id: &EnvironmentId, registry: Arc<ProviderRegistry>) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.registry = Some(registry);
+                Ok(())
+            }
+            Some(ManagedEnvironmentKind::Provisioned(_)) => Err(format!("environment is provisioned, not direct: {env_id}")),
+            None => Err(format!("direct environment not found: {env_id}")),
+        }
+    }
+
+    pub fn set_direct_environment_ssh_destination(&self, env_id: &EnvironmentId, destination: String) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.ssh_destination = Some(destination);
+                Ok(())
+            }
+            _ => Err(format!("direct environment not found: {env_id}")),
         }
     }
 
@@ -929,6 +963,8 @@ mod tests {
                     env_bag: direct_bag.clone(),
                     host_id: Some(HostId::new("direct-host-id")),
                     display_name: Some("direct-env".to_string()),
+                    registry: None,
+                    ssh_destination: None,
                 }),
             );
         }

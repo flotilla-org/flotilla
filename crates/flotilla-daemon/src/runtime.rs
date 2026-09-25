@@ -43,12 +43,13 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
-    HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
-    Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
-    HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass,
+    Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -507,6 +508,7 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
+        let ssh_profiles = discover_agentless_ssh_profiles(&daemon, &config).await?;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
@@ -534,6 +536,10 @@ impl DaemonRuntime {
             .await
             .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
+        for ssh in &ssh_profiles {
+            register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, ssh).await?;
+            apply_agentless_ssh_observation(&daemon, &options.namespace, ssh, Some(&credential_store)).await?;
+        }
         apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
             .await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
@@ -578,6 +584,23 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ];
+        for ssh in &ssh_profiles {
+            let daemon = Arc::clone(&daemon);
+            let namespace = options.namespace.clone();
+            let ssh = ssh.clone();
+            let credential_store = Arc::clone(&credential_store);
+            tasks.push(spawn_periodic_task(options.heartbeat_interval, PeriodicTaskStart::AfterInterval, move || {
+                let daemon = Arc::clone(&daemon);
+                let namespace = namespace.clone();
+                let ssh = ssh.clone();
+                let credential_store = Arc::clone(&credential_store);
+                async move {
+                    if let Err(error) = apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store)).await {
+                        warn!(host = %ssh.provisioning.host_id, %error, "failed to publish SSH host observation");
+                    }
+                }
+            }));
+        }
         if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
@@ -611,6 +634,7 @@ impl DaemonRuntime {
                     local_repo_root,
                     profile.host_direct_environment_name(),
                 )
+                .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(credential_store)
                 .with_agent_material(agent_material),
             );
@@ -729,6 +753,153 @@ struct LocalProvisioningProfile {
     docker_available: bool,
 }
 
+#[derive(Clone)]
+struct AgentlessSshProfile {
+    provisioning: LocalProvisioningProfile,
+    environment_id: EnvironmentId,
+    destination: String,
+    runner: Arc<dyn CommandRunner>,
+}
+
+async fn discover_agentless_ssh_profiles(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Vec<AgentlessSshProfile>, String> {
+    let mut profiles = Vec::new();
+    for (environment_id, direct) in daemon.agentless_ssh_environments() {
+        let host_id = direct.host_id.as_ref().expect("agentless SSH environment has a host ID").to_string();
+        let home = direct.env_bag.find_env_var("HOME").ok_or_else(|| format!("SSH host {host_id} has no HOME"))?;
+        let probe_root = ExecutionEnvironmentPath::new(home);
+        let remote_state_root =
+            direct.env_bag.find_env_var("XDG_STATE_HOME").map(str::to_string).unwrap_or_else(|| format!("{home}/.local/state"));
+        let remote_config = ConfigStore::new(config.base_path().clone(), DaemonHostPath::new(format!("{remote_state_root}/flotilla")));
+        let registry = Arc::new(
+            daemon.discovery_runtime().factories.probe_all(&direct.env_bag, &remote_config, &probe_root, Arc::clone(&direct.runner)).await,
+        );
+        let pool = ["cleat", "shpool"]
+            .into_iter()
+            .find(|name| registry.terminal_pools.contains_key(name))
+            .ok_or_else(|| format!("SSH host {host_id} has no persistent terminal pool (cleat or shpool)"))?
+            .to_string();
+        let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
+        let provisioning = LocalProvisioningProfile {
+            host_id,
+            display_name: direct.display_name.unwrap_or_else(|| environment_id.to_string()),
+            repo_default_dir: format!("{home}/{DEFAULT_REPO_DIR_SUFFIX}"),
+            host_direct_pool: pool,
+            docker_pool: "cleat".to_string(),
+            available_pools,
+            available_agent_adapters: registry.agent_adapters.ids().map(ToString::to_string).collect(),
+            docker_available: false,
+        };
+        daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
+        let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
+        profiles.push(AgentlessSshProfile { provisioning, environment_id, destination, runner: direct.runner });
+    }
+    Ok(profiles)
+}
+
+async fn register_agentless_ssh_resources(
+    backend: &ResourceBackend,
+    namespace: &str,
+    owner_host_id: &str,
+    profile: &AgentlessSshProfile,
+) -> Result<(), String> {
+    let provisioning = &profile.provisioning;
+    if provisioning.host_id == owner_host_id {
+        return Err(format!("agentless SSH host {} shares the owning daemon's Host identity", provisioning.host_id));
+    }
+    let hosts = backend.clone().using::<Host>(namespace);
+    let spec = HostSpec {
+        display_name: provisioning.display_name.clone(),
+        connection: HostConnection::AgentlessSsh { owning_daemon: owner_host_id.to_string(), destination: profile.destination.clone() },
+    };
+    match hosts.get(&provisioning.host_id).await {
+        Ok(existing) if existing.spec == spec => {}
+        Ok(existing) => {
+            hosts
+                .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Err(ResourceError::NotFound { .. }) => {
+            hosts.create(&empty_meta(&provisioning.host_id), &spec).await.map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
+    ensure_default_policies(backend, namespace, provisioning).await
+}
+
+async fn apply_agentless_ssh_observation(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+    ssh: &AgentlessSshProfile,
+    credential_store: Option<&CredentialStore>,
+) -> Result<(), String> {
+    let profile = &ssh.provisioning;
+    let hosts = daemon.resource_backend().using::<Host>(namespace);
+    let host = hosts.get(&profile.host_id).await.map_err(|error| error.to_string())?;
+    let probe = ssh.runner.run("mkdir", &["-p", &profile.repo_default_dir], Path::new("/"), &ChannelLabel::Default).await;
+    let probe_succeeded = probe.is_ok();
+    let free_bytes = if probe_succeeded {
+        let output = ssh.runner.run("df", &["-Pk", &profile.repo_default_dir], Path::new("/"), &ChannelLabel::Default).await;
+        output
+            .ok()
+            .and_then(|output| output.lines().last()?.split_whitespace().nth(3)?.parse::<u64>().ok())
+            .and_then(|kib| kib.checked_mul(1024))
+    } else {
+        None
+    };
+    let ready = probe_succeeded && free_bytes.is_some();
+    let (held_credentials, credential_expiry) = match credential_store {
+        Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
+        None => (BTreeSet::new(), BTreeMap::new()),
+    };
+    let mut conditions = probe
+        .err()
+        .map(|error| {
+            vec![HostCondition::builder()
+                .condition_type("Transport/SSH")
+                .value(ConditionValue::False)
+                .reason("Unreachable")
+                .message(error)
+                .observed_at(Utc::now())
+                .build()]
+        })
+        .unwrap_or_default();
+    if probe_succeeded && free_bytes.is_none() {
+        conditions.push(
+            HostCondition::builder()
+                .condition_type("Capacity/FreeSpace")
+                .value(ConditionValue::False)
+                .reason("MeasurementUnavailable")
+                .message(format!("could not measure free space at {} over SSH", profile.repo_default_dir))
+                .observed_at(Utc::now())
+                .build(),
+        );
+    }
+    let status = HostStatus {
+        capabilities: BTreeMap::from([
+            (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
+            (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
+            (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
+            ("terminal_pools".to_string(), json!(profile.available_pools)),
+            (AGENTLESS_CAPABILITY.to_string(), json!(true)),
+            (TRANSPORT_CAPABILITY.to_string(), json!("ssh")),
+            (PLACEMENT_CAPABILITY.to_string(), json!("host_direct_only")),
+            (OWNING_DAEMON_CAPABILITY.to_string(), json!(daemon.local_host_id().map(|id| id.to_string()))),
+        ]),
+        // This timestamp is the owning daemon's last successful SSH probe,
+        // never a heartbeat emitted by a daemon on the target host.
+        heartbeat_at: probe_succeeded.then(Utc::now),
+        ready,
+        disk_free_bytes: free_bytes,
+        admission_free_space_floor_bytes: Some(daemon.admission_free_space_floor_bytes()?),
+        conditions,
+        ..HostStatus::default()
+    };
+    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 impl LocalProvisioningProfile {
     fn host_direct_environment_name(&self) -> String {
         format!("host-direct-{}", self.host_id)
@@ -750,6 +921,7 @@ struct ControllerRuntimeState {
     local_host_ref: String,
     local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
+    agentless_ssh: HashMap<String, AgentlessSshProfile>,
     environment_tools: EnvironmentToolProvisioner,
     credential_store: Option<Arc<CredentialStore>>,
     agent_material: Option<Arc<AgentMaterialRegistry>>,
@@ -817,6 +989,7 @@ impl ControllerRuntimeState {
             local_host_ref,
             local_repo_root,
             host_direct_environment_name,
+            agentless_ssh: HashMap::new(),
             environment_tools,
             credential_store: None,
             agent_material: None,
@@ -824,6 +997,15 @@ impl ControllerRuntimeState {
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
         }
+    }
+
+    fn with_agentless_ssh(mut self, profiles: Vec<AgentlessSshProfile>) -> Self {
+        self.agentless_ssh = profiles.into_iter().map(|profile| (profile.environment_id.to_string(), profile)).collect();
+        self
+    }
+
+    fn agentless_host_refs(&self) -> Vec<CanonicalHostId> {
+        self.agentless_ssh.values().map(|profile| CanonicalHostId::resolved(&profile.provisioning.host_id)).collect()
     }
 
     fn with_credential_store(mut self, credential_store: Arc<CredentialStore>) -> Self {
@@ -1314,6 +1496,7 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
             return hosts
                 .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &HostSpec {
                     display_name: display_name.to_string(),
+                    connection: Default::default(),
                 })
                 .await
                 .map(|_| ())
@@ -1323,7 +1506,7 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
         Err(err) => return Err(format!("check host {host_name}: {err}")),
     }
     hosts
-        .create(&empty_meta(host_name), &HostSpec { display_name: display_name.to_string() })
+        .create(&empty_meta(host_name), &HostSpec { display_name: display_name.to_string(), connection: Default::default() })
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -1503,6 +1686,7 @@ fn spawn_vessel_placement_projector(
     backend: ResourceBackend,
     namespace: String,
     local_host_ref: String,
+    additional_host_refs: Vec<CanonicalHostId>,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
@@ -1510,7 +1694,8 @@ fn spawn_vessel_placement_projector(
         // The projector and the Vessel reconciler need distinct health keys, while both remain tied to the resource they manage.
         supervise_controller(Vessel::API_PATHS.plural, supervision, runtime_health, move || {
             let projector =
-                VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()));
+                VesselPlacementProjector::new(backend.clone(), namespace.clone(), CanonicalHostId::resolved(local_host_ref.clone()))
+                    .with_additional_host_refs(additional_host_refs.clone());
             async move { projector.run().await }
         })
         .await;
@@ -2269,6 +2454,7 @@ fn spawn_controller_loops(
             backend.clone(),
             namespace_string.clone(),
             state.local_host_ref.clone(),
+            state.agentless_host_refs(),
             supervision.clone(),
             runtime_health.clone(),
         ),
@@ -2289,23 +2475,23 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
+                let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
-                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref)),
+                        .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                        .with_additional_host_refs(additional_host_refs),
                 )
             }
         }),
         controller!(Clone, {
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
-                let runner = state.daemon.local_command_runner().expect("local runner should exist");
-                let flights = Arc::clone(&state.clone_flights);
                 (
                     vec![],
                     CloneReconciler::new(
-                        Arc::new(CloneControllerRuntime { runner, flights }),
+                        Arc::new(RoutingCloneRuntime { state: Arc::clone(&state) }),
                         backend.using::<Repository>(&namespace_string),
                     ),
                 )
@@ -2315,12 +2501,11 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let state = Arc::clone(&state);
-                let runner = state.daemon.local_command_runner().expect("local runner should exist");
                 (
-                    CheckoutReconciler::<CheckoutControllerRuntime>::federated_secondary_watches(&backend, &namespace_string),
+                    CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
                     CheckoutReconciler::new(
-                        Arc::new(CheckoutControllerRuntime {
-                            runner,
+                        Arc::new(RoutingCheckoutRuntime {
+                            state,
                             change_requests: Some(backend.including_replicas::<ChangeRequest>(&namespace_string)),
                         }),
                         backend.clone(),
@@ -2334,11 +2519,13 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
+                let additional_host_refs = state.agentless_host_refs();
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     TerminalSessionReconciler::new(Arc::new(TerminalControllerRuntime { state }), backend.clone(), &namespace_string)
                         .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
+                        .with_additional_host_refs(additional_host_refs)
                         .with_federated_convoys(&backend, &namespace_string),
                 )
             }
@@ -2346,13 +2533,16 @@ fn spawn_controller_loops(
         controller!(Vessel, {
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let local_host_ref = state.local_host_ref.clone();
+            let additional_host_refs = state.agentless_host_refs();
             move |backend: ResourceBackend, namespace_string: String| {
                 let config_dir = config_dir.clone();
                 let local_host_ref = local_host_ref.clone();
+                let additional_host_refs = additional_host_refs.clone();
                 (
                     VesselReconciler::secondary_watches(),
                     VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
-                        .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref)),
+                        .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
+                        .with_additional_host_refs(additional_host_refs),
                 )
             }
         }),
@@ -2990,6 +3180,41 @@ struct CloneControllerRuntime {
     flights: Arc<CloneFlights>,
 }
 
+struct RoutingCloneRuntime {
+    state: Arc<ControllerRuntimeState>,
+}
+
+impl RoutingCloneRuntime {
+    fn runtime_for(&self, env_ref: &str) -> Result<CloneControllerRuntime, String> {
+        let runner = if env_ref == self.state.host_direct_environment_name {
+            self.state.daemon.local_command_runner()
+        } else {
+            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
+        }
+        .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
+        Ok(CloneControllerRuntime { runner, flights: Arc::clone(&self.state.clone_flights) })
+    }
+}
+
+#[async_trait]
+impl CloneRuntime for RoutingCloneRuntime {
+    async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.clone_and_inspect(repo_url, target_path).await
+    }
+
+    async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.inspect_existing(target_path).await
+    }
+
+    async fn clone_and_inspect_in(&self, env_ref: &str, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
+        self.runtime_for(env_ref)?.clone_and_inspect(repo_url, target_path).await
+    }
+
+    async fn inspect_existing_in(&self, env_ref: &str, target_path: &str) -> Result<Option<String>, String> {
+        self.runtime_for(env_ref)?.inspect_existing(target_path).await
+    }
+}
+
 #[async_trait]
 impl CloneRuntime for CloneControllerRuntime {
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
@@ -3012,7 +3237,7 @@ impl CloneRuntime for CloneControllerRuntime {
             Ok(inspection) => inspection,
             Err(error) => return Err(cleanup_failed_checkout(&*self.runner, &staging_path, error).await),
         };
-        if let Err(error) = tokio::fs::rename(&staging_path, target_path).await {
+        if let Err(error) = self.runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Default).await {
             let error = cleanup_failed_checkout(&*self.runner, &staging_path, format!("publish clone: {error}")).await;
             return match recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await {
                 Ok(Some(inspection)) => Ok(inspection.default_branch),
@@ -3064,6 +3289,93 @@ async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_
 struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+}
+
+struct RoutingCheckoutRuntime {
+    state: Arc<ControllerRuntimeState>,
+    change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+}
+
+impl RoutingCheckoutRuntime {
+    fn runtime_for(&self, env_ref: &str) -> Result<CheckoutControllerRuntime, String> {
+        let runner = if env_ref == self.state.host_direct_environment_name {
+            self.state.daemon.local_command_runner()
+        } else {
+            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
+        }
+        .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
+        Ok(CheckoutControllerRuntime { runner, change_requests: self.change_requests.clone() })
+    }
+}
+
+#[async_trait]
+impl CheckoutRuntime for RoutingCheckoutRuntime {
+    async fn create_worktree(
+        &self,
+        clone_path: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.create_worktree(clone_path, branch, base_ref, target_path).await
+    }
+
+    async fn create_fresh_clone(
+        &self,
+        repo_url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+    }
+
+    async fn inspect_integration(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        convoy: Option<&ResourceObject<Convoy>>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.inspect_integration(checkout, convoy).await
+    }
+
+    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        self.runtime_for(&self.state.host_direct_environment_name)?.remove_checkout(removal).await
+    }
+
+    async fn create_worktree_in(
+        &self,
+        env_ref: &str,
+        clone_path: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.runtime_for(env_ref)?.create_worktree(clone_path, branch, base_ref, target_path).await
+    }
+
+    async fn create_fresh_clone_in(
+        &self,
+        env_ref: &str,
+        repo_url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<PreparedCheckout, String> {
+        self.runtime_for(env_ref)?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+    }
+
+    async fn inspect_integration_in(
+        &self,
+        env_ref: &str,
+        checkout: &ResourceObject<Checkout>,
+        convoy: Option<&ResourceObject<Convoy>>,
+    ) -> Result<CheckoutIntegrationStatus, String> {
+        self.runtime_for(env_ref)?.inspect_integration(checkout, convoy).await
+    }
+
+    async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        self.runtime_for(env_ref)?.remove_checkout(removal).await
+    }
 }
 
 impl CheckoutControllerRuntime {
@@ -3284,7 +3596,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
             }
         };
-        if let Err(error) = tokio::fs::rename(&staging_path, target_path).await {
+        if let Err(error) = runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Default).await {
             return Err(cleanup_failed_checkout(&*runner, &staging_path, format!("publish fresh clone: {error}")).await);
         }
         Ok(PreparedCheckout { commit, branch_provenance: CheckoutBranchProvenance::PreExisting })
@@ -3357,7 +3669,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 }
                 remove_checkout_path(&*runner, target_path).await?;
                 runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
-                remove_empty_checkout_parents(clone_path, target_path).await?;
+                remove_empty_checkout_parents(&*runner, clone_path, target_path).await?;
 
                 let branch_ref = format!("refs/heads/{branch}");
                 let bootstrap_ref = bootstrap_branch_ref(branch);
@@ -3512,7 +3824,7 @@ fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 
-async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> Result<(), String> {
+async fn remove_empty_checkout_parents(runner: &dyn CommandRunner, clone_path: &str, target_path: &str) -> Result<(), String> {
     let Some(checkout_root) = Path::new(clone_path).parent() else {
         return Ok(());
     };
@@ -3520,10 +3832,10 @@ async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> R
         return Ok(());
     };
     while parent != checkout_root && parent.starts_with(checkout_root) {
-        match tokio::fs::remove_dir(parent).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+        let path = parent.to_string_lossy();
+        match runner.run_output("rmdir", &[&path], Path::new("/"), &ChannelLabel::Default).await {
+            Ok(output) if output.success => {}
+            Ok(_) => break,
             Err(error) => return Err(format!("remove empty checkout parent {}: {error}", parent.display())),
         }
         let Some(next) = parent.parent() else {
@@ -4494,7 +4806,7 @@ mod tests {
         let kiwi_store = ResourceBackend::InMemory(Default::default());
         let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
         kiwi_hosts
-            .create(&empty_meta("kiwi-host"), &HostSpec { display_name: "kiwi".to_string() })
+            .create(&empty_meta("kiwi-host"), &HostSpec { display_name: "kiwi".to_string(), connection: Default::default() })
             .await
             .expect("kiwi holds a replicable Host");
 
@@ -4678,6 +4990,134 @@ mod tests {
     }
 
     struct NoPrProcessRunner;
+
+    struct SshProvisioningRecordingRunner {
+        commands: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for SshProvisioningRecordingRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.commands.lock().expect("command log").push(cmd.to_string());
+            ProcessCommandRunner.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.commands.lock().expect("command log").push(cmd.to_string());
+            ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+        }
+
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            ProcessCommandRunner.exists(cmd, args).await
+        }
+    }
+
+    #[tokio::test]
+    async fn agentless_ssh_host_provisions_clone_and_worktree_through_its_runner() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).expect("config directory");
+        fs::write(config_dir.join("daemon.toml"), "machine_id = \"agentless-ssh-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_dir));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let local_host_id = daemon.local_host_id().expect("local host ID").to_string();
+        let host_id = "ssh-test-host";
+        let environment_id = EnvironmentId::new(format!("host-direct-{host_id}"));
+        let commands = Arc::new(StdMutex::new(Vec::new()));
+        let runner: Arc<dyn CommandRunner> = Arc::new(SshProvisioningRecordingRunner { commands: Arc::clone(&commands) });
+        daemon
+            .register_direct_environment_for_test(
+                environment_id.clone(),
+                Arc::clone(&runner),
+                EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string())),
+                Some(flotilla_protocol::qualified_path::HostId::new(host_id)),
+            )
+            .expect("register SSH environment");
+        let pool = Arc::new(FakeTerminalPool::new());
+        let mut registry = ProviderRegistry::new();
+        registry.terminal_pools.insert(
+            "cleat",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "cleat"),
+            Arc::clone(&pool) as Arc<dyn TerminalPool>,
+        );
+        daemon.set_direct_environment_registry(&environment_id, Arc::new(registry)).expect("register SSH terminal pool");
+        let profile = AgentlessSshProfile {
+            provisioning: LocalProvisioningProfile {
+                repo_default_dir: temp.path().join("ssh-repos").display().to_string(),
+                display_name: "beaufort".to_string(),
+                host_direct_pool: "cleat".to_string(),
+                available_pools: vec!["cleat".to_string()],
+                ..manual_profile(host_id, false)
+            },
+            environment_id: environment_id.clone(),
+            destination: "crew@beaufort.example".to_string(),
+            runner,
+        };
+        register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
+            .await
+            .expect("register SSH resources");
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("publish SSH observation");
+        let host = daemon.resource_backend().using::<Host>(NAMESPACE).get(host_id).await.expect("SSH Host");
+        assert!(host.status.expect("SSH status").ready);
+        assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
+        let state = Arc::new(
+            ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                passthrough_registry(),
+                None,
+                local_host_id.clone(),
+                None,
+                format!("host-direct-{local_host_id}"),
+            )
+            .with_agentless_ssh(vec![profile]),
+        );
+        let clone_runtime = RoutingCloneRuntime { state: Arc::clone(&state) };
+        let clone_path = temp.path().join("ssh-repos/base");
+        clone_runtime
+            .clone_and_inspect_in(
+                environment_id.as_str(),
+                source.path().to_str().expect("source path"),
+                clone_path.to_str().expect("clone path"),
+            )
+            .await
+            .expect("clone over SSH runner");
+        let checkout_runtime = RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None };
+        let worktree_path = temp.path().join("ssh-repos/work");
+        checkout_runtime
+            .create_worktree_in(
+                environment_id.as_str(),
+                clone_path.to_str().expect("clone path"),
+                "feature/ssh-crew",
+                Some("main"),
+                worktree_path.to_str().expect("worktree path"),
+            )
+            .await
+            .expect("worktree over SSH runner");
+        assert!(worktree_path.join(".git").exists());
+        let terminal = TerminalControllerRuntime { state };
+        terminal
+            .ensure_session(
+                "ssh-crew",
+                &flotilla_resources::TerminalSessionSpec::builder()
+                    .env_ref(environment_id.to_string())
+                    .role("shell".to_string())
+                    .source(TerminalSessionSource::Tool { command: "sh".to_string() })
+                    .cwd(worktree_path.display().to_string())
+                    .pool("cleat".to_string())
+                    .build(),
+                &[],
+            )
+            .await
+            .expect("crew terminal pool provisioned through the SSH environment");
+        let ensured = pool.ensured.lock().await;
+        assert_eq!(ensured.len(), 1);
+        assert_eq!(ensured[0].cwd.as_path(), worktree_path.as_path());
+        let commands = commands.lock().expect("command log");
+        assert!(commands.iter().any(|command| command == "git"));
+        assert!(commands.iter().any(|command| command == "mv"));
+    }
 
     #[async_trait]
     impl CommandRunner for NoPrProcessRunner {
