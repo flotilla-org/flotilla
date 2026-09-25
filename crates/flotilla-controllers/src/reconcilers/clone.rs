@@ -50,7 +50,7 @@ where
             return Ok(ClonePrepared::Failed(message));
         }
         let canonical_repo = match repository.spec.identity() {
-            RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
+            RepositoryIdentity::Remote { .. } => repository.spec.live_remote().expect("remote Repository has a transport URL"),
             RepositoryIdentity::Local { .. } => {
                 return Ok(ClonePrepared::Failed("clone repository must have a transport remote".to_string()))
             }

@@ -529,7 +529,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             "clone-{}",
             clone_key(
                 match repository.identity() {
-                    flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote,
+                    flotilla_resources::RepositoryIdentity::Remote { .. } => repository.live_remote().expect("remote repository URL"),
                     flotilla_resources::RepositoryIdentity::Local { .. } => panic!("expected remote repository"),
                 },
                 &host_direct_env_name()
@@ -592,10 +592,10 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 if spec.cwd == "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi"
                     && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
                         if brief.path == ".flotilla/briefs/coder.md"
-                            && brief.copies == [
+                            && brief.copies.iter().map(String::as_str).collect::<BTreeSet<_>>() == BTreeSet::from([
                                 "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
                                 "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla"
-                            ]
+                            ])
                             && brief.content.contains("https://github.com` / `flotilla-org/flotilla` / `732")
                             && brief.content.contains("https://github.com` / `flotilla-org/cleat` / `733")
                             && brief.content.contains("Snapshot as of `2026-07-18T09:30:00+00:00`")

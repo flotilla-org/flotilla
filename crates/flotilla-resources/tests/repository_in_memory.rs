@@ -1,11 +1,95 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{
-    normalize_project_spec, repository_display_labels, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance,
-    InMemoryBackend, InputMeta, IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution,
-    IssueSourceUnavailable, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryGitSpec, RepositoryIdentity,
-    RepositoryKey, RepositoryProviderPreference, RepositoryRelation, RepositorySpec, RepositoryVcsSpec, ResourceBackend, SqliteBackend,
+    migrate_repository_identities, normalize_project_spec, repository_display_labels, resolve_project_issue_sources,
+    DefaultBranchObservation, DefaultBranchProvenance, InMemoryBackend, InputMeta, IssueFieldValue, IssueFilter, IssueSource,
+    IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable, Project, ProjectRepositoryRole, ProjectRepositorySpec,
+    ProjectSpec, Repository, RepositoryGitSpec, RepositoryIdentity, RepositoryKey, RepositoryProviderPreference, RepositoryRelation,
+    RepositorySpec, RepositoryVcsSpec, ResourceBackend, SqliteBackend,
 };
+
+#[test]
+fn lab_forge_declarations_and_checkout_urls_share_one_repository_key() {
+    let urls = [
+        "https://forgejo.lab.flotilla.work/robert/porthole-ops",
+        "https://manchego.lab.flotilla.work/robert/porthole-ops.git",
+        "forgejo-manchego:robert/porthole-ops.git",
+        "git@manchego.lab.flotilla.work:robert/porthole-ops.git",
+    ];
+    let specs = urls.iter().map(|url| RepositorySpec::remote(*url).expect("known lab forge URL")).collect::<Vec<_>>();
+    assert!(specs.iter().all(|spec| spec.key() == specs[0].key()));
+    assert!(specs.iter().all(|spec| spec.identity() == specs[0].identity()));
+}
+
+#[test]
+fn legacy_url_identity_decodes_to_forge_relative_identity() {
+    let legacy = serde_json::json!({
+        "identity": { "kind": "remote", "canonical_remote": "https://manchego.lab.flotilla.work/robert/porthole-ops" },
+        "remotes": ["https://manchego.lab.flotilla.work/robert/porthole-ops"],
+        "forge": { "service_url": "https://manchego.lab.flotilla.work", "repository": "robert/porthole-ops" }
+    });
+    let migrated: RepositorySpec = serde_json::from_value(legacy).expect("legacy URL identity should decode");
+    let declared = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/porthole-ops").expect("declaration");
+    assert_eq!(migrated.identity(), declared.identity());
+    assert_eq!(migrated.key(), declared.key());
+}
+
+#[tokio::test]
+async fn migration_merges_split_repository_resources_and_rebinds_project_members() {
+    for backend in [
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend")),
+    ] {
+        let repositories = backend.using::<Repository>("flotilla");
+        let projects = backend.using::<Project>("flotilla");
+        let first = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/porthole-ops").expect("first remote");
+        let second = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/porthole-ops.git").expect("second remote");
+        for (name, spec) in [("old-forgejo", &first), ("old-manchego", &second)] {
+            repositories
+                .create(
+                    &InputMeta::builder()
+                        .name(name.to_string())
+                        .annotations(BTreeMap::from([(format!("flotilla.work/{name}"), name.to_string())]))
+                        .build(),
+                    spec,
+                )
+                .await
+                .expect("legacy Repository");
+        }
+        let project = ProjectSpec {
+            display_name: "Porthole Ops".into(),
+            default_workflow_ref: "default".into(),
+            issue_sources: vec![],
+            repositories: vec![ProjectRepositorySpec::builder()
+                .repo(RepositoryKey("old-forgejo".into()))
+                .roles(BTreeSet::from([ProjectRepositoryRole::Ops]))
+                .build()],
+            dispatch_policy: None,
+        };
+        projects
+            .create(
+                &InputMeta::builder()
+                    .name("porthole-ops".to_string())
+                    .annotations(BTreeMap::from([("flotilla.work/project-bootstrap-repository".to_string(), "old-forgejo".to_string())]))
+                    .build(),
+                &project,
+            )
+            .await
+            .expect("legacy Project");
+
+        assert_eq!(migrate_repository_identities(&backend).await.expect("migrate split identities"), 2);
+        let migrated = repositories.list().await.expect("list repositories").items;
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].metadata.name, first.key().to_string());
+        assert_eq!(migrated[0].spec.remotes().len(), 2);
+        assert_eq!(migrated[0].metadata.annotations["flotilla.work/old-forgejo"], first.key().to_string());
+        assert_eq!(migrated[0].metadata.annotations["flotilla.work/old-manchego"], first.key().to_string());
+        let project = projects.get("porthole-ops").await.expect("project after migration");
+        assert_eq!(project.spec.repositories[0].repo, first.key());
+        assert_eq!(project.metadata.annotations["flotilla.work/project-bootstrap-repository"], first.key().to_string());
+        assert_eq!(migrate_repository_identities(&backend).await.expect("repeat migration"), 0);
+    }
+}
 
 #[test]
 fn repository_provider_configuration_roundtrips_in_the_spec() {
@@ -386,7 +470,10 @@ fn repository_workspace_slugs_are_short_and_qualify_basename_collisions() {
 #[test]
 fn repository_declarations_reject_unresolved_aliases_and_inconsistent_forges() {
     assert!(RepositorySpec::remote("work-github:flotilla-org/flotilla.git").is_err());
-    assert!(RepositorySpec::remote("git@github.com:flotilla-org/flotilla.git").is_err());
+    assert_eq!(
+        RepositorySpec::remote("git@github.com:flotilla-org/flotilla.git").expect("literal SSH host").key(),
+        RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("HTTPS host").key()
+    );
 
     let inconsistent = serde_json::json!({
         "identity": { "kind": "remote", "canonical_remote": "https://github.com/flotilla-org/flotilla" },

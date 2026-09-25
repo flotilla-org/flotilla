@@ -129,7 +129,10 @@ pub use project::{
     ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
-pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
+pub use provisioning_identity::{
+    canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_repository_id, forge_repository_key, forge_service_host, repo_key,
+    ForgeRepositoryId,
+};
 pub use registry::{
     apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, delete_resource_kind, get_resource_kind,
     get_resource_kind_including_replicas, home_bound_authorship_collisions, list_resource_kind, list_resource_kind_including_replicas,
@@ -141,10 +144,10 @@ pub use registry::{
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
-    ensure_repository, repository_display_labels, repository_workspace_slugs, resolve_default_branch, DefaultBranchObservation,
-    DefaultBranchProvenance, ForgeIdentity, Repository, RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryGitSpec,
-    RepositoryIdentity, RepositoryKey, RepositoryProviderPreference, RepositoryRelation, RepositorySpec, RepositoryStatus,
-    RepositoryStatusPatch, RepositoryUpstream, RepositoryVcsSpec,
+    ensure_repository, migrate_repository_identities, repository_display_labels, repository_workspace_slugs, resolve_default_branch,
+    DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository, RepositoryCheckoutKind, RepositoryCheckoutRef,
+    RepositoryGitSpec, RepositoryIdentity, RepositoryKey, RepositoryProviderPreference, RepositoryRelation, RepositorySpec,
+    RepositoryStatus, RepositoryStatusPatch, RepositoryUpstream, RepositoryVcsSpec,
 };
 pub use resource::{
     api_version, ApiPaths, CausalDot, FieldMergeMetadata, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,

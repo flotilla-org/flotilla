@@ -521,6 +521,41 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
 }
 
 #[tokio::test]
+async fn ops_member_uses_observed_checkout_across_lab_forge_aliases() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let observed = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/porthole-ops").expect("observed checkout");
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            bootstrap: observed.clone(),
+            commit: Arc::new(RwLock::new("ops-commit".to_string())),
+        }))
+        .await;
+    std::fs::write(
+        tmp.path().join("project.yaml"),
+        "name: porthole-ops\nmembers:\n  - alias: operations\n    url: https://forgejo.lab.flotilla.work/robert/porthole-ops.git\n    roles: [ops]\n",
+    )
+    .expect("write declaration");
+    std::fs::write(
+        tmp.path().join("workflow.entry"),
+        "---\nkind: workflow_template\nname: lab-ops\nrepos: [operations]\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+    )
+    .expect("write operational entry");
+
+    let mut rx = daemon.subscribe();
+    execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: tmp.path().to_string_lossy().into_owned() }).await;
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "porthole-ops".to_string() }).await;
+    assert!(
+        matches!(&result, CommandValue::ProjectRefreshed { operational_entries, .. }
+            if operational_entries.iter().any(|entry| entry.contains("WorkflowTemplate/lab-ops accepted"))
+                && operational_entries.iter().all(|entry| !entry.contains("no local checkout"))),
+        "unexpected project refresh: {result:?}"
+    );
+    let project = backend.definitions::<Project>("flotilla").get("porthole-ops").await.expect("project");
+    assert_eq!(project.spec.repositories[0].repo, observed.key());
+    assert_eq!(backend.using::<Repository>("flotilla").list().await.expect("repositories").items.len(), 1);
+}
+
+#[tokio::test]
 async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_converge_drift() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");

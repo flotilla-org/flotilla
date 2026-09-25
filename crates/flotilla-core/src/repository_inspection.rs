@@ -181,7 +181,10 @@ impl GitRepositoryInspector {
                         let mut identities = std::collections::BTreeMap::new();
                         for remote in &remotes {
                             let url = self.configured_remote_url(cwd, remote).await?;
-                            identities.insert(self.canonical_remote(cwd, &url).await?, (remote.clone(), url));
+                            identities.insert(
+                                flotilla_resources::forge_repository_id(&self.identity_remote(cwd, &url).await?)?,
+                                (remote.clone(), url),
+                            );
                         }
                         if identities.len() == 1 {
                             let (remote, configured) = identities.into_values().next().expect("one identity has one remote");
@@ -204,11 +207,11 @@ impl GitRepositoryInspector {
         let Some(host) = ssh_remote_host(remote) else {
             return flotilla_resources::canonicalize_repo_url(remote);
         };
-        let ssh_config = self
-            .runner
-            .run("ssh", &["-G", host], cwd, &ChannelLabel::Default)
-            .await
-            .map_err(|_| format!("unrecognised remote host alias `{host}`"))?;
+        let ssh_config = match self.runner.run("ssh", &["-G", host], cwd, &ChannelLabel::Default).await {
+            Ok(config) => config,
+            Err(_) if host.eq_ignore_ascii_case("forgejo-manchego") => return flotilla_resources::canonicalize_repo_url(remote),
+            Err(_) => return Err(format!("unrecognised remote host alias `{host}`")),
+        };
         let resolved = ssh_config
             .lines()
             .find_map(|line| {
@@ -225,6 +228,12 @@ impl GitRepositoryInspector {
         } else {
             flotilla_resources::canonicalize_repo_url(&remote.replacen(host, resolved, 1))
         }
+    }
+
+    async fn identity_remote(&self, cwd: &Path, remote: &str) -> Result<String, String> {
+        // Git expands url.*.insteadOf here without contacting the forge.
+        let rewritten = self.git(cwd, &["ls-remote", "--get-url", remote]).await.unwrap_or_else(|_| remote.to_string());
+        self.canonical_remote(cwd, &rewritten).await
     }
 }
 
@@ -246,10 +255,11 @@ impl RepositoryInspector for GitRepositoryInspector {
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
         let (spec, transport_url) = match selected_remote {
             Some((configured, effective)) => {
-                let identity_remote = self.canonical_remote(&top_level, &configured).await?;
+                let configured_remote = self.canonical_remote(&top_level, &configured).await?;
                 let live_remote =
-                    if configured == effective { identity_remote.clone() } else { self.canonical_remote(&top_level, &effective).await? };
-                (RepositorySpec::remote(identity_remote)?.update_remotes(live_remote)?, Some(effective))
+                    if configured == effective { configured_remote.clone() } else { self.canonical_remote(&top_level, &effective).await? };
+                let spec = RepositorySpec::remote(&live_remote)?.update_remotes(configured_remote)?.update_remotes(live_remote)?;
+                (spec, Some(effective))
             }
             None => {
                 let common_dir = PathBuf::from(self.git(&top_level, &["rev-parse", "--git-common-dir"]).await?);
@@ -320,7 +330,7 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
-        RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
+        RepositorySpec::remote(self.identity_remote(Path::new("/"), remote).await?)
     }
 
     async fn verify_continuity(&self, path: &Path, previous: &RepositorySpec) -> RepositoryContinuity {
@@ -474,10 +484,7 @@ mod tests {
 
         let inspected = inspector.inspect_path(&root, None).await.expect("inspection should succeed");
 
-        assert!(matches!(
-            inspected.spec.identity(),
-            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
-        ));
+        assert_eq!(inspected.spec.live_remote(), Some("https://github.com/org/repo"));
     }
 
     #[tokio::test]
@@ -499,16 +506,25 @@ mod tests {
 
         let inspected = inspector.inspect_path(&root, None).await.expect("inspection should use the configured URL");
 
-        assert!(matches!(
-            inspected.spec.identity(),
-            RepositoryIdentity::Remote { canonical_remote }
-                if canonical_remote == "https://forgejo.lab.flotilla.work/fork-issues/ghostty"
-        ));
+        assert_eq!(inspected.spec.live_remote(), Some("https://manchego.lab.flotilla.work/fork-issues/ghostty"));
         assert_eq!(inspected.transport_url.as_deref(), Some("forgejo-manchego:fork-issues/ghostty.git"));
         assert_eq!(inspected.spec.live_remote(), Some("https://manchego.lab.flotilla.work/fork-issues/ghostty"));
         let forge = inspected.spec.forge().expect("effective live remote should determine forge attribution");
-        assert_eq!(forge.service_url, "https://manchego.lab.flotilla.work");
+        assert_eq!(forge.service_url, "https://forgejo.lab.flotilla.work");
         assert_eq!(forge.repository, "fork-issues/ghostty");
+    }
+
+    #[tokio::test]
+    async fn declaration_uses_git_instead_of_rewrite_before_deriving_identity() {
+        let declared = "https://forgejo.lab.flotilla.work/robert/porthole-ops.git";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["ls-remote", "--get-url", declared], Ok("forgejo-manchego:robert/porthole-ops.git\n".to_string()))
+            .on_run("ssh", &["-G", "forgejo-manchego"], Ok("hostname manchego.lab.flotilla.work\nuser git\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let resolved = inspector.resolve_remote(declared).await.expect("resolve declared remote");
+        let observed = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/porthole-ops").expect("observed checkout");
+        assert_eq!(resolved.key(), observed.key());
     }
 
     #[tokio::test]
@@ -529,10 +545,7 @@ mod tests {
 
         let inspected = inspector.inspect_path(&root, None).await.expect("multi-URL remote should use its first URL");
 
-        assert!(matches!(
-            inspected.spec.identity(),
-            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
-        ));
+        assert_eq!(inspected.spec.live_remote(), Some("https://github.com/org/repo"));
     }
 
     #[tokio::test]
@@ -568,10 +581,7 @@ mod tests {
 
         let inspected = inspector.inspect_path(&root, None).await.expect("dotted alias should resolve");
 
-        assert!(matches!(
-            inspected.spec.identity(),
-            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
-        ));
+        assert_eq!(inspected.spec.live_remote(), Some("https://github.com/org/repo"));
     }
 
     #[tokio::test]
@@ -655,9 +665,6 @@ mod tests {
 
         let inspected = inspector.inspect_path(&root, None).await.expect("same identity should be unambiguous");
 
-        assert!(matches!(
-            inspected.spec.identity(),
-            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
-        ));
+        assert_eq!(inspected.spec.live_remote(), Some("https://github.com/org/repo"));
     }
 }

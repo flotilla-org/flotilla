@@ -1294,7 +1294,9 @@ async fn discover_local_clones(
             continue;
         };
         let canonical_url = match inspection.spec.identity() {
-            flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+            flotilla_resources::RepositoryIdentity::Remote { .. } => {
+                inspection.spec.live_remote().expect("remote Repository has a transport URL").to_string()
+            }
             flotilla_resources::RepositoryIdentity::Local { .. } => continue,
         };
         let repository_spec = inspection.spec;

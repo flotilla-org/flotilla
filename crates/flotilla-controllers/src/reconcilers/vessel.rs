@@ -514,7 +514,9 @@ impl Reconciler for VesselReconciler {
             }
             fork_stance |= repository_spec.is_fork();
             let canonical_repo = match repository_spec.identity() {
-                RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+                RepositoryIdentity::Remote { .. } => {
+                    repository_spec.live_remote().expect("remote Repository has a transport URL").to_string()
+                }
                 RepositoryIdentity::Local { .. } => return Ok(VesselPrepared::failed("convoy repository must have a transport remote")),
             };
             let repository_key = convoy_repository.repo_ref.clone();

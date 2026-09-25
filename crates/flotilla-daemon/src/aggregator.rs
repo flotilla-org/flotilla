@@ -1811,8 +1811,9 @@ impl Aggregator {
             return canonical_or_original(std::path::Path::new(&spec.path)) == canonical_or_original(std::path::Path::new(&repo.path));
         }
         let Some(repository) = self.repositories.get(&spec.repo_ref) else { return false };
-        let ResourceRepositoryIdentity::Remote { canonical_remote } = repository.spec.identity() else { return false };
-        RepoIdentity::from_remote_url(canonical_remote).as_ref() == Some(repo)
+        let ResourceRepositoryIdentity::Remote { forge_id, owner, repo_name } = repository.spec.identity() else { return false };
+        flotilla_resources::forge_repository_id(&format!("https://{}/{}", repo.authority, repo.path))
+            .is_ok_and(|requested| requested.forge_id == *forge_id && requested.owner == *owner && requested.repo_name == *repo_name)
     }
 
     fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {

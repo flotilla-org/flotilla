@@ -2283,6 +2283,9 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
+        if let Err(error) = flotilla_resources::migrate_repository_identities(&resource_backend).await {
+            tracing::warn!(%error, "Repository identity migration will retry on next startup");
+        }
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -2594,9 +2597,10 @@ impl InProcessDaemon {
     }
 
     async fn resolve_declared_repository(&self, observed: RepositorySpec) -> Result<RepositorySpec, String> {
-        let flotilla_resources::RepositoryIdentity::Remote { canonical_remote } = observed.identity() else {
+        let flotilla_resources::RepositoryIdentity::Remote { .. } = observed.identity() else {
             return Ok(observed);
         };
+        let canonical_remote = observed.live_remote().expect("remote Repository has a transport URL");
         let namespace = self.provisioning_namespace().await;
         let matching_sources = self
             .resource_backend
@@ -3904,7 +3908,7 @@ fn is_whole_repository_project(spec: &ProjectSpec, repository_key: &RepositoryKe
 
 fn repository_identity_display(spec: &RepositorySpec) -> String {
     match spec.identity() {
-        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+        flotilla_resources::RepositoryIdentity::Remote { .. } => spec.live_remote().unwrap_or("remote").to_string(),
         flotilla_resources::RepositoryIdentity::Local { .. } => "local".to_string(),
     }
 }
