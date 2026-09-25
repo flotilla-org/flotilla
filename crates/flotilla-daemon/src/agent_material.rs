@@ -497,11 +497,19 @@ impl SkillBundle {
             args[5] = (index + 1 == destination_count).to_string();
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await;
-            result.map_err(|error| format!("stage generation-pinned skills for {environment_ref}: {error}"))?;
+            result.map_err(|error| skill_stage_error(environment_ref, &error))?;
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
         }
         Ok(())
     }
+}
+
+fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
+    // The stage script emits its actionable failure last. Git can write hints
+    // and fetch progress first, which otherwise hides the failure in convoy
+    // summaries that show only the beginning of the message.
+    let reason = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("skill staging command failed");
+    format!("stage generation-pinned skills for {environment_ref}: {reason}")
 }
 
 async fn remove_source_token_files(source_token_files: &BTreeMap<String, PathBuf>, runner: &dyn CommandRunner) -> Result<(), String> {
@@ -994,6 +1002,16 @@ esac
         assert!(calls[0].1[1].contains("skill source $name declared path $path is missing at pinned revision $revision"));
         assert!(calls[0].1[1].contains("skill source $name declared path $path has no SKILL.md at pinned revision $revision"));
         assert!(!calls[0].1[1].contains("required"), "staging must carry no skill-name policy; demand validation is #1790's contract");
+    }
+
+    #[test]
+    fn skill_stage_error_leads_with_declared_path_failure() {
+        let stderr = "hint: Using 'master' as the name for the initial branch.\nFrom https://github.com/flotilla-org/cleat\n * branch 0f23944 -> FETCH_HEAD\nskill source cleat declared path skills is missing at pinned revision 0f23944\n";
+        let message = skill_stage_error("crew-work", stderr);
+        assert_eq!(
+            message,
+            "stage generation-pinned skills for crew-work: skill source cleat declared path skills is missing at pinned revision 0f23944"
+        );
     }
 
     #[tokio::test]
