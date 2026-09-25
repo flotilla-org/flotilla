@@ -95,24 +95,28 @@ skill_repo="$skill_test_root/source"
 git init --quiet "$skill_repo"
 git -C "$skill_repo" config user.name test
 git -C "$skill_repo" config user.email test@example.invalid
+printf '# Source before skill layout\n' >"$skill_repo/README.md"
+git -C "$skill_repo" add .
+git -C "$skill_repo" commit --quiet -m before-skills
+pre_skills_pin="$(git -C "$skill_repo" rev-parse HEAD)"
 mkdir -p "$skill_repo/skills/example"
 printf '# Example\n' >"$skill_repo/skills/example/SKILL.md"
 git -C "$skill_repo" add .
-git -C "$skill_repo" commit --quiet -m fixture
+git -C "$skill_repo" commit --quiet -m add-skills
 skill_pin="$(git -C "$skill_repo" rev-parse HEAD)"
 skill_manifest="$skill_test_root/sources.json"
-python3 - "$skill_manifest" "$skill_repo" "$skill_pin" <<'PY'
+python3 - "$skill_manifest" "$skill_repo" "$skill_pin" "$pre_skills_pin" <<'PY'
 import json
 import sys
 
-manifest, repository, revision = sys.argv[1:]
+manifest, repository, revision, pre_skills_revision = sys.argv[1:]
 sources = []
 for name in ("mattpocock-skills", "rjw-skills", "cleat", "flotilla"):
     source = {"name": name, "repository": repository, "revision": revision}
     if name == "mattpocock-skills":
         source["repository"] = "https://github.com/flotilla-org/mattpocock-skills.git"
-    if name == "rjw-skills":
-        source["paths"] = ["missing/skills"]
+    if name == "cleat":
+        source["revision"] = pre_skills_revision
     sources.append(source)
 with open(manifest, "w") as output:
     json.dump({"schema_version": 5, "sources": sources}, output)
@@ -124,7 +128,7 @@ if GIT_CONFIG_GLOBAL="$git_config" python3 "$repo_root/ci/fleet-candidates/gener
   echo 'accepted a declared skill path absent at its pinned revision' >&2
   exit 1
 fi
-expected="skill source rjw-skills declared path missing/skills is missing at pinned revision $skill_pin"
+expected="skill source cleat declared path skills is missing at pinned revision $pre_skills_pin"
 grep -Fq "$expected" "$skill_test_root/stderr"
 if grep -Fq 'remote: Enumerating objects' "$skill_test_root/stderr"; then
   echo 'skill path validation leaked git fetch chatter' >&2
