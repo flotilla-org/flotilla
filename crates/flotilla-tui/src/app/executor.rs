@@ -49,12 +49,21 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
 
     app.local_attach_effects.begin();
     let daemon = app.daemon.clone();
+    let session_id = app.session_id;
     tokio::spawn(async move {
         let result = daemon.execute(cmd).await;
-        let _ = event_tx.send(Event::CommandDispatchCompleted { result, pending_ctx });
+        let _ = event_tx.send(Event::CommandDispatchCompleted { session_id, result, pending_ctx });
     });
 }
-pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Option<PendingActionContext>, app: &mut App) {
+pub fn handle_dispatch_completion(
+    session_id: uuid::Uuid,
+    result: Result<u64, String>,
+    pending_ctx: Option<PendingActionContext>,
+    app: &mut App,
+) {
+    if session_id != app.session_id {
+        return;
+    }
     if let Some(plan) = app.local_attach_effects.acknowledge(&result) {
         app.pending_attach_plan = Some(plan);
     }
@@ -236,7 +245,8 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use flotilla_protocol::{commands::AttachMode, IssueRef, IssueSource, RepoSelector, ViewAddress};
+    use flotilla_protocol::{commands::AttachMode, IssueRef, IssueSource, QueryId, RepoSelector, ViewAddress};
+    use tokio::sync::Semaphore;
 
     use super::*;
     use crate::{
@@ -244,7 +254,7 @@ mod tests {
             test_support::{stub_app_with_daemon, ExecuteCalls, QueryCalls, StubDaemon},
             ui_state::ProjectIssueStartContext,
         },
-        table_view::RowId,
+        table_view::{PendingRowContext, RowId, RowState},
     };
 
     fn dispatch_channels() -> (mpsc::UnboundedSender<Event>, mpsc::UnboundedReceiver<Event>) {
@@ -262,7 +272,9 @@ mod tests {
         dispatch(command.clone(), &mut app, None, event_tx);
 
         let event = event_rx.recv().await.expect("dispatch completion event");
-        assert!(matches!(event, Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None }));
+        assert!(
+            matches!(event, Event::CommandDispatchCompleted { session_id, result: Ok(42), pending_ctx: None } if session_id == app.session_id)
+        );
         assert_eq!(*execute_calls.lock().expect("execute calls lock"), vec![command]);
     }
 
@@ -309,10 +321,11 @@ mod tests {
         dispatch(command, &mut app, Some(pending_ctx), event_tx);
         assert_eq!(app.pending_dispatch_acks, 1);
 
-        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event") else {
+        let Event::CommandDispatchCompleted { session_id, result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event")
+        else {
             panic!("expected command dispatch completion");
         };
-        handle_dispatch_completion(result, pending_ctx, &mut app);
+        handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
 
         assert_eq!(app.pending_dispatch_acks, 0);
         assert!(app.acknowledged_dispatches.contains(&73));
@@ -327,11 +340,57 @@ mod tests {
         let (event_tx, mut event_rx) = dispatch_channels();
 
         dispatch(command, &mut app, None, event_tx);
-        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event") else {
+        let Event::CommandDispatchCompleted { session_id, result, pending_ctx } = event_rx.recv().await.expect("dispatch completion event")
+        else {
             panic!("expected command dispatch completion");
         };
-        handle_dispatch_completion(result, pending_ctx, &mut app);
+        handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
 
         assert_eq!(app.model.status_message.as_deref(), Some("dispatch failed"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_ignores_old_completion_before_new_pending_row_and_attach_acknowledgement() {
+        let old_gate = Arc::new(Semaphore::new(0));
+        let old_daemon = Arc::new(StubDaemon::builder().execute_gate(old_gate.clone()).execute_result(Ok(41)).build());
+        let mut app = stub_app_with_daemon(old_daemon, vec![]);
+        app.views.open_or_focus(ViewAddress::Convoys { namespace: "default".into(), scope: None });
+        let (event_tx, mut event_rx) = dispatch_channels();
+        let row = |id| PendingRowContext {
+            address: ViewAddress::Convoys { namespace: "default".into(), scope: None },
+            panel: None,
+            query: QueryId::Convoys { scope: None },
+            row_id: RowId::new(id),
+        };
+        let old_row = row("old");
+        let new_row = row("new");
+
+        let old_command = app.command(CommandAction::Refresh { repo: None });
+        dispatch(old_command, &mut app, Some(PendingActionContext::table_row(old_row, "old command".into())), event_tx.clone());
+
+        let new_gate = Arc::new(Semaphore::new(0));
+        let new_daemon = Arc::new(StubDaemon::builder().execute_gate(new_gate.clone()).execute_result(Ok(42)).build());
+        app.reconnect_daemon(new_daemon, vec![]);
+        let new_command = app.command(CommandAction::Refresh { repo: None });
+        dispatch(new_command, &mut app, Some(PendingActionContext::table_row(new_row.clone(), "new command".into())), event_tx);
+        assert_eq!(app.pending_dispatch_acks, 1);
+
+        old_gate.add_permits(1);
+        let Event::CommandDispatchCompleted { session_id, result, pending_ctx } = event_rx.recv().await.expect("old completion") else {
+            panic!("expected old completion");
+        };
+        handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
+        assert_eq!(app.pending_dispatch_acks, 1, "old completion must not acknowledge new dispatch");
+        assert!(matches!(app.views.active_table_state().row_state(&new_row.row_id), Some(RowState::Submitting { .. })));
+
+        new_gate.add_permits(1);
+        let Event::CommandDispatchCompleted { session_id, result, pending_ctx } = event_rx.recv().await.expect("new completion") else {
+            panic!("expected new completion");
+        };
+        handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
+        assert_eq!(app.pending_dispatch_acks, 0);
+        assert!(matches!(app.views.active_table_state().row_state(&new_row.row_id), Some(RowState::Pending { command_id: 42, .. })));
+        let plan = flotilla_protocol::ResolvedAttachPlan::shell_command("cleat attach new vessel");
+        assert_eq!(app.local_attach_effects.finish(42, Some(plan.clone())), Some(plan));
     }
 }

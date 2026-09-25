@@ -1581,7 +1581,7 @@ mod command_effect_tests {
         observer.local_attach_effects.begin();
         broadcast_convoy_start(&mut observer);
         assert!(observer.pending_attach_plan.is_none());
-        executor::handle_dispatch_completion(Ok(43), None, &mut observer);
+        executor::handle_dispatch_completion(observer.session_id, Ok(43), None, &mut observer);
         assert!(observer.pending_attach_plan.is_none());
     }
 
@@ -1589,7 +1589,7 @@ mod command_effect_tests {
     fn initiating_tui_attaches_when_acknowledgement_arrives_first() {
         let mut initiator = crate::app::test_support::stub_app();
         initiator.local_attach_effects.begin();
-        executor::handle_dispatch_completion(Ok(42), None, &mut initiator);
+        executor::handle_dispatch_completion(initiator.session_id, Ok(42), None, &mut initiator);
         broadcast_convoy_start(&mut initiator);
         assert!(initiator.pending_attach_plan.is_some());
     }
@@ -1600,7 +1600,7 @@ mod command_effect_tests {
         initiator.local_attach_effects.begin();
         broadcast_convoy_start(&mut initiator);
         assert!(initiator.pending_attach_plan.is_none());
-        executor::handle_dispatch_completion(Ok(42), None, &mut initiator);
+        executor::handle_dispatch_completion(initiator.session_id, Ok(42), None, &mut initiator);
         assert!(initiator.pending_attach_plan.is_some());
     }
 }
