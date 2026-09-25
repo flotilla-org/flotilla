@@ -87,6 +87,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
+| `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
 | `cleat` | Terminal I/O: PTY management, VT engine, session persistence |
 | `flotilla` (root) | Thin `src/main.rs` entry point |
 

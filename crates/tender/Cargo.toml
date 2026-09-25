@@ -1,0 +1,9 @@
+[package]
+name = "tender"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }
