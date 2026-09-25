@@ -118,7 +118,6 @@ terminal pool through SSH. No container image is built or pulled.
 The admission free-space floor below is checked against the SSH host's
 `~/dev/flotilla-repos` checkout volume using its remote `df` result.
 
-
 Each daemon host refuses new convoy placement when the volume containing its Flotilla
 state directory is below a free-space floor. The default is 20 GiB. Override it
 per host in that host's `~/.config/flotilla/daemon.toml`:
