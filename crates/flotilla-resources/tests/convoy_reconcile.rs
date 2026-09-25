@@ -12,14 +12,15 @@ use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, Reconciler},
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, implement_review_workflow_spec,
-    interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec,
-    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock,
-    ConditionValue, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource,
-    CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
-    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec,
-    RepositoryKey, ResourceBackend, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation,
+    ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
+    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase,
+    ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
+    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, ReviewRefPair,
+    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase,
+    WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 struct AlwaysEligible;
@@ -1015,14 +1016,10 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
 }
 
 #[tokio::test]
-async fn landing_with_open_change_request_stays_warm() {
+async fn landing_discharges_checkout_without_change_request_despite_false_landed_condition() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None, timestamp(40)).await;
 
-    assert_eq!(outcome.patch, None);
-    assert!(!outcome.actuations.iter().any(|actuation| matches!(
-        actuation,
-        Actuation::DeletePresentation { .. } | Actuation::DeleteVessel { .. } | Actuation::DeleteCheckout { .. }
-    )));
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
@@ -1059,16 +1056,17 @@ async fn landing_without_checkout_evidence_stays_landing() {
 }
 
 #[tokio::test]
-async fn landing_holds_on_stale_vacuous_landed_evidence() {
+async fn landing_discharges_checkout_without_change_request_despite_stale_landed_evidence() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), None, timestamp(9)).await;
 
-    assert_eq!(outcome.patch, None);
+    assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 async fn reconcile_terminal_bound_change_request(
     checkout_present: bool,
     vessel_present: bool,
-) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
+    untouched_checkout: bool,
+) -> (flotilla_resources::SettlementEvaluation, flotilla_resources::controller::ReconcileOutcome<Convoy>) {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -1102,6 +1100,26 @@ async fn reconcile_terminal_bound_change_request(
         .workspace_slug("repo-a".to_string())
         .subpaths(Vec::new())
         .build()];
+    if untouched_checkout {
+        let context_repo_ref = RepositoryKey("repo-context".to_string());
+        spec.repositories.push(
+            flotilla_resources::ConvoyRepositorySpec::builder()
+                .url("https://example.com/repo-context".to_string())
+                .repo_ref(context_repo_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("repo-context".to_string())
+                .subpaths(Vec::new())
+                .build(),
+        );
+        status.work.get_mut("implement").expect("implement work").placement.as_mut().expect("placement").fields.insert(
+            "checkout_refs".to_string(),
+            serde_json::json!(BTreeMap::from([
+                (repo_ref.clone(), "checkout-a".to_string()),
+                (context_repo_ref, "checkout-context".to_string()),
+            ])),
+        );
+    }
     spec.change_request = Some(
         BoundChangeRequest::builder()
             .id("42".to_string())
@@ -1149,6 +1167,39 @@ async fn reconcile_terminal_bound_change_request(
             .await
             .expect("checkout status update");
     }
+    if untouched_checkout {
+        let checkout = checkouts
+            .create(
+                &InputMeta {
+                    name: "checkout-context".to_string(),
+                    labels: BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]),
+                    ..Default::default()
+                },
+                &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                    r#ref: "main".to_string(),
+                    path: "/tmp/checkout-context".to_string(),
+                    repo_ref: RepositoryKey("repo-context".to_string()),
+                    host_ref: "host-a".to_string(),
+                    is_main: false,
+                }),
+            )
+            .await
+            .expect("context checkout create");
+        checkouts
+            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some("/tmp/checkout-context".to_string()),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
+                    ..Default::default()
+                },
+                message: None,
+            })
+            .await
+            .expect("context checkout status update");
+    }
 
     let record_name = change_request_record_name("example.com", "repo-a", 42);
     let record = change_requests
@@ -1182,34 +1233,58 @@ async fn reconcile_terminal_bound_change_request(
     }
 
     let current = convoys.get("convoy-a").await.expect("convoy get");
+    let checkout_objects = checkouts.list().await.expect("checkouts").items;
+    let change_request_objects = change_requests.list().await.expect("change requests").items;
+    let evaluation = evaluate_landing_settlement(
+        &current,
+        &BTreeMap::new(),
+        &checkout_objects.into_iter().map(|checkout| (checkout.metadata.name.clone(), checkout)).collect(),
+        &change_request_objects.into_iter().map(|record| (record.metadata.name.clone(), record)).collect(),
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+        timestamp(40),
+    );
     let reconciler = ConvoyReconciler::new(templates)
         .with_vessels(vessels)
         .with_checkouts(checkouts)
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
-    reconciler.reconcile(&current, &deps, timestamp(40))
+    (evaluation, reconciler.reconcile(&current, &deps, timestamp(40)))
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
-    let outcome = reconcile_terminal_bound_change_request(true, true).await;
+    let (_, outcome) = reconcile_terminal_bound_change_request(true, true, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
-    let outcome = reconcile_terminal_bound_change_request(false, false).await;
+    let (_, outcome) = reconcile_terminal_bound_change_request(false, false, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
-    let outcome = reconcile_terminal_bound_change_request(false, true).await;
+    let (_, outcome) = reconcile_terminal_bound_change_request(false, true, false).await;
 
     assert_eq!(outcome.patch, None);
+}
+
+#[tokio::test]
+async fn merged_change_request_discharges_present_context_checkout_without_change_request() {
+    let (evaluation, outcome) = reconcile_terminal_bound_change_request(true, true, true).await;
+
+    assert!(evaluation.satisfied, "the untouched context checkout must not block the merged exit: {:?}", evaluation.unmet);
+    assert!(evaluation.unmet.is_empty());
+    let patch = outcome.patch.expect("merged disposition should settle the convoy");
+    assert_eq!(patch, controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40)));
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Landing, ..Default::default() };
+    patch.apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landed);
 }
 
 #[tokio::test]
@@ -1273,6 +1348,14 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
             branch_provenance: Default::default(),
             integration: CheckoutIntegrationStatus {
                 landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
+                change_request: Some(
+                    ChangeRequestObservation::builder()
+                        .id("42".to_string())
+                        .state(ChangeRequestState::Open)
+                        .mergeability(ChangeRequestMergeability::Mergeable)
+                        .observed_at(timestamp(40).to_rfc3339())
+                        .build(),
+                ),
                 ..Default::default()
             },
             message: None,
