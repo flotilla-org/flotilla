@@ -241,6 +241,18 @@ pub struct RemoteHostConfig {
     pub expected_node_id: Option<NodeId>,
     pub user: Option<String>,
     pub ssh_multiplex: Option<bool>,
+    /// This host has no flotillad. The owning daemon may use SSH to actuate
+    /// host-direct placements there, but it must not enter the peer mesh.
+    pub agentless_ssh: bool,
+}
+
+/// The same login-address rule is used for daemon peers and direct SSH
+/// environments. A configured user is the account that executes commands.
+pub fn ssh_destination(hostname: &str, user: Option<&str>) -> String {
+    match user {
+        Some(user) if !user.is_empty() => format!("{user}@{hostname}"),
+        _ => hostname.to_string(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +271,8 @@ struct RawRemoteHostConfig {
     expected_node_id: Option<NodeId>,
     user: Option<String>,
     ssh_multiplex: Option<bool>,
+    #[serde(default)]
+    agentless_ssh: bool,
 }
 
 impl<'de> Deserialize<'de> for HostsConfig {
@@ -279,6 +293,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                     expected_node_id: host.expected_node_id,
                     user: host.user,
                     ssh_multiplex: host.ssh_multiplex,
+                    agentless_ssh: host.agentless_ssh,
                 })
             })
             .collect();
@@ -395,6 +410,8 @@ const fn default_free_space_floor_gib() -> u64 {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StaticEnvironmentConfig {
     pub hostname: String,
+    #[serde(default)]
+    pub user: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]

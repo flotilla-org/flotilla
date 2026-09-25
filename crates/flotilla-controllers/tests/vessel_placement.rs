@@ -104,3 +104,56 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         "actuator teardown may proceed after owner deletion intent is observed"
     );
 }
+
+#[tokio::test]
+async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
+    let admitting_root = NodeId::new("admitting-root");
+    let admitting = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(admitting_root.clone());
+    let owner = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("owning-root"));
+    let convoys = admitting.using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("ssh-placement".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("admitting convoy");
+    convoys
+        .update_status("ssh-placement", &convoy.metadata.resource_version, &ConvoyStatus {
+            placement_decision: Some(PlacementDecision {
+                policy_name: "host-direct-ssh-host".to_string(),
+                target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("ssh-host"), display_name: "beaufort".to_string() },
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+            }),
+            ..ConvoyStatus::default()
+        })
+        .await
+        .expect("placement decision");
+    admitting
+        .using::<Vessel>(NAMESPACE)
+        .create(&InputMeta::builder().name("ssh-placement-work".to_string()).build(), &VesselSpec {
+            convoy_ref: "ssh-placement".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "host-direct-ssh-host".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("admitting Vessel");
+    owner
+        .replica_writer::<Convoy>(admitting_root.clone(), NAMESPACE)
+        .replace(&convoys.list().await.expect("convoys"), Utc::now())
+        .await
+        .expect("replicate convoy");
+    owner
+        .replica_writer::<Vessel>(admitting_root, NAMESPACE)
+        .replace(&admitting.using::<Vessel>(NAMESPACE).list().await.expect("vessels"), Utc::now())
+        .await
+        .expect("replicate vessel");
+
+    let projector = VesselPlacementProjector::new(owner.clone(), NAMESPACE, CanonicalHostId::resolved("owner-host"))
+        .with_additional_host_refs([CanonicalHostId::resolved("ssh-host")]);
+    assert_eq!(projector.sync_once().await.expect("project SSH Vessel").created, 1);
+    let actuator = owner.using::<Vessel>(NAMESPACE).get("ssh-placement-work").await.expect("owned actuator");
+    assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some("ssh-host"));
+}

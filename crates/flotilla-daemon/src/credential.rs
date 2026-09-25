@@ -517,22 +517,37 @@ impl CredentialStore {
             None => self.expand_path("~/.claude/.credentials.json"),
         };
         let contents = tokio::fs::read(&path).await.ok()?;
-        let metadata: AmbientClaudeCredentialsMetadata = match serde_json::from_slice(&contents) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::debug!(path = %path.display(), line = error.line(), "ambient claude credentials file is not readable as JSON");
-                return None;
-            }
-        };
-        let oauth = metadata.claude_ai_oauth?;
-        let expires_at = oauth.expires_at.and_then(epoch_to_datetime);
-        let refresh_expires_at = oauth.refresh_token_expires_at.and_then(epoch_to_datetime);
-        if expires_at.is_none() && refresh_expires_at.is_none() {
-            return None;
-        }
-        Some(CredentialExpiry::builder().maybe_expires_at(expires_at).maybe_refresh_expires_at(refresh_expires_at).build())
+        parse_ambient_claude_expiry(&contents, &path)
     }
 
+    pub(crate) async fn remote_ambient_claude_expiry(host_bag: &EnvironmentBag, runner: &dyn CommandRunner) -> Option<CredentialExpiry> {
+        let path = match host_bag.find_env_var("CLAUDE_CONFIG_DIR").filter(|dir| !dir.trim().is_empty()) {
+            Some(dir) => PathBuf::from(dir).join(".credentials.json"),
+            None => PathBuf::from(host_bag.find_env_var("HOME")?).join(".claude/.credentials.json"),
+        };
+        let contents = runner.run("cat", &[path.to_str()?], Path::new("/"), &ChannelLabel::Default).await.ok()?;
+        parse_ambient_claude_expiry(contents.as_bytes(), &path)
+    }
+}
+
+fn parse_ambient_claude_expiry(contents: &[u8], path: &Path) -> Option<CredentialExpiry> {
+    let metadata: AmbientClaudeCredentialsMetadata = match serde_json::from_slice(contents) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), line = error.line(), "ambient claude credentials file is not readable as JSON");
+            return None;
+        }
+    };
+    let oauth = metadata.claude_ai_oauth?;
+    let expires_at = oauth.expires_at.and_then(epoch_to_datetime);
+    let refresh_expires_at = oauth.refresh_token_expires_at.and_then(epoch_to_datetime);
+    if expires_at.is_none() && refresh_expires_at.is_none() {
+        return None;
+    }
+    Some(CredentialExpiry::builder().maybe_expires_at(expires_at).maybe_refresh_expires_at(refresh_expires_at).build())
+}
+
+impl CredentialStore {
     #[cfg(test)]
     pub(crate) async fn prepare(
         &self,

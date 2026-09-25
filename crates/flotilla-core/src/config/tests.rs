@@ -274,6 +274,17 @@ hostname = "desktop.local"
     assert_eq!(config.hosts["desktop"].hostname, "desktop.local");
     assert_eq!(config.hosts["desktop"].expected_host_name, "desktop");
     assert_eq!(config.hosts["desktop"].expected_node_id, None);
+    assert!(!config.hosts["desktop"].agentless_ssh);
+}
+
+#[test]
+fn parse_agentless_ssh_host_reuses_peer_ssh_destination_fields() {
+    let config: HostsConfig = toml::from_str("[hosts.beaufort]\nhostname = \"beaufort.example\"\nuser = \"crew\"\nagentless_ssh = true\n")
+        .expect("agentless SSH host config");
+    let host = &config.hosts["beaufort"];
+    assert!(host.agentless_ssh);
+    assert_eq!(host.expected_host_name, "beaufort");
+    assert_eq!(ssh_destination(&host.hostname, host.user.as_deref()), "crew@beaufort.example");
 }
 
 #[test]

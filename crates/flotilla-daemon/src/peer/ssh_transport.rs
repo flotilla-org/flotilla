@@ -881,6 +881,7 @@ mod tests {
                 expected_node_id: None,
                 user: None,
                 ssh_multiplex: None,
+                agentless_ssh: false,
             },
             None,
             uuid::Uuid::nil(),
@@ -898,6 +899,7 @@ mod tests {
             expected_node_id: None,
             user: Some("dev".to_string()),
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -921,6 +923,7 @@ mod tests {
             expected_node_id: None,
             user: Some("test-user".to_string()),
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let local_node = NodeId::new("local-node");
         let mut transport = SshTransport::new(
@@ -968,6 +971,7 @@ mod tests {
             expected_node_id: None,
             user: Some("test-user".to_string()),
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local-node"),
@@ -1009,6 +1013,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(
@@ -1067,6 +1072,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let events = Arc::new(StdMutex::new(Vec::new()));
         let runner = Arc::new(FakeCommandRunner::new(
@@ -1106,6 +1112,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         match SshTransport::new(
             NodeId::new("local"),
@@ -1130,6 +1137,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -1234,6 +1242,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let transport = SshTransport::new(
             NodeId::new("local"),
@@ -1257,6 +1266,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local"),
@@ -1288,6 +1298,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local"),
@@ -1351,6 +1362,7 @@ mod tests {
             expected_node_id: None,
             user: None,
             ssh_multiplex: None,
+            agentless_ssh: false,
         };
         let mut transport = SshTransport::new(
             NodeId::new("local-test"),

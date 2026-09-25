@@ -93,7 +93,32 @@ model are separate axes: `--agent claude-code:opus` and
 
 ## Convoy placement admission
 
-Each host refuses new convoy placement when the volume containing its Flotilla
+### Agentless SSH hosts
+
+An owning daemon can place a trusted, host-direct crew on an SSH host without
+running `flotillad` there. Add the host to the owning daemon's
+`~/.config/flotilla/hosts.toml`:
+
+```toml
+[hosts.beaufort]
+hostname = "beaufort.example"
+user = "gui-session-user"
+agentless_ssh = true
+```
+
+The `user` is the SSH login account and the account in which the crew runs.
+The remote account needs a writable `HOME`, Git, and either `cleat` or `shpool`
+plus the selected agent adapter. SSH access must work in batch mode. The
+owning daemon probes the host, publishes its stable Host identity and a
+`host-direct-<host-id>` PlacementPolicy, and provisions the checkout and
+terminal pool through its SSH connection. Agentless hosts are excluded from
+the daemon peer mesh and from contained placement. Attach opens the remote
+terminal pool through SSH. No container image is built or pulled.
+
+The admission free-space floor below is checked against the SSH host's
+`~/dev/flotilla-repos` checkout volume using its remote `df` result.
+
+Each daemon host refuses new convoy placement when the volume containing its Flotilla
 state directory is below a free-space floor. The default is 20 GiB. Override it
 per host in that host's `~/.config/flotilla/daemon.toml`:
 

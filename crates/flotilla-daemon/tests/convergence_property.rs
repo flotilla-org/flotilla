@@ -203,7 +203,10 @@ impl Harness {
         let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
         let stale = stale_source.using::<Host>(NAMESPACE);
         let stale_object = stale
-            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec { display_name: "stale-self-copy".into() })
+            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
+                display_name: "stale-self-copy".into(),
+                connection: Default::default(),
+            })
             .await
             .expect("create stale self-origin fixture");
         stale
@@ -232,7 +235,7 @@ impl Harness {
             .using::<Host>(NAMESPACE)
             .create(
                 &InputMeta::builder().name("host-2".to_string()).finalizers(vec!["abandoned.example/finalizer".into()]).build(),
-                &HostSpec { display_name: "abandoned-finalizer".into() },
+                &HostSpec { display_name: "abandoned-finalizer".into(), connection: Default::default() },
             )
             .await
             .expect("seed abandoned finalizer");
@@ -285,7 +288,10 @@ impl Harness {
                 let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
                 if matches!(resolver.get(&name).await, Err(ResourceError::NotFound { .. })) {
                     resolver
-                        .create(&InputMeta::builder().name(name).build(), &HostSpec { display_name: format!("created-by-{}", self.seed) })
+                        .create(&InputMeta::builder().name(name).build(), &HostSpec {
+                            display_name: format!("created-by-{}", self.seed),
+                            connection: Default::default(),
+                        })
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -297,6 +303,7 @@ impl Harness {
                     resolver
                         .update(&InputMeta::builder().name(name).build(), &current.metadata.resource_version, &HostSpec {
                             display_name: format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version),
+                            connection: Default::default(),
                         })
                         .await
                         .map_err(|error| error.to_string())?;
@@ -473,7 +480,10 @@ impl Harness {
         let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
         let stale = stale_source
             .using::<Host>(NAMESPACE)
-            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec { display_name: "watch-shadow".to_string() })
+            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
+                display_name: "watch-shadow".to_string(),
+                connection: Default::default(),
+            })
             .await
             .map_err(|error| error.to_string())?;
         node.backend

@@ -540,7 +540,7 @@ async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_h
     let local_host = daemon.local_host_id().expect("local host identity").to_string();
     backend
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&local_host), &HostSpec { display_name: "standing-test".to_string() })
+        .create(&test_meta(&local_host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
         .await
         .expect("local host resource");
     let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
@@ -1482,7 +1482,10 @@ async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
 
     let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
     let hosts = host_origin.using::<ResourceHost>("flotilla");
-    let host = hosts.create(&test_meta(&driver_id), &HostSpec { display_name: "udder".to_string() }).await.expect("driver host");
+    let host = hosts
+        .create(&test_meta(&driver_id), &HostSpec { display_name: "udder".to_string(), connection: Default::default() })
+        .await
+        .expect("driver host");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus { ready: true, ..Default::default() })
         .await
@@ -1599,7 +1602,7 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     hosts
-        .create(&test_meta("missing-driver"), &HostSpec { display_name: "missing-driver".to_string() })
+        .create(&test_meta("missing-driver"), &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default() })
         .await
         .expect("known but unreachable driver");
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
@@ -1619,7 +1622,10 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     let driver_id = daemon.local_host_id().expect("driver host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts.create(&test_meta(&driver_id), &HostSpec { display_name: "local".to_string() }).await.expect("driver host");
+    let host = hosts
+        .create(&test_meta(&driver_id), &HostSpec { display_name: "local".to_string(), connection: Default::default() })
+        .await
+        .expect("driver host");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus { ready: true, ..Default::default() })
         .await
@@ -1838,7 +1844,7 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
     let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
     target
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&driver_ref), &HostSpec { display_name: "root-b".to_string() })
+        .create(&test_meta(&driver_ref), &HostSpec { display_name: "root-b".to_string(), connection: Default::default() })
         .await
         .expect("root B host resource");
     let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
@@ -2451,7 +2457,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
     let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
     stale_source
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string() })
+        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
         .await
         .expect("stale self-origin host");
     backend
@@ -2461,8 +2467,10 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         .expect("seed stale self-origin replica");
 
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let local =
-        hosts.create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string() }).await.expect("authoritative local host");
+    let local = hosts
+        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .await
+        .expect("authoritative local host");
     hosts
         .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
             disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
@@ -2539,8 +2547,10 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
     .await;
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let local =
-        hosts.create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string() }).await.expect("authoritative local host");
+    let local = hosts
+        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .await
+        .expect("authoritative local host");
     hosts
         .update_status(&host_id, &local.metadata.resource_version, &HostStatus {
             disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
@@ -2650,7 +2660,10 @@ async fn default_remote_placement_routes_before_admission() {
         .await
         .expect("workflow");
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts.create(&test_meta("udder-id"), &HostSpec { display_name: "udder".to_string() }).await.expect("remote host");
+    let host = hosts
+        .create(&test_meta("udder-id"), &HostSpec { display_name: "udder".to_string(), connection: Default::default() })
+        .await
+        .expect("remote host");
     hosts
         .update_status("udder-id", &host.metadata.resource_version, &HostStatus {
             capabilities: [
@@ -2760,7 +2773,10 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host in ["local-host", "replica-host"] {
-        hosts.create(&test_meta(host), &HostSpec { display_name: host.to_string() }).await.expect("placement host");
+        hosts
+            .create(&test_meta(host), &HostSpec { display_name: host.to_string(), connection: Default::default() })
+            .await
+            .expect("placement host");
     }
 
     backend
@@ -2846,7 +2862,10 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host_id in ["host-id-a", "host-id-b"] {
-        hosts.create(&test_meta(host_id), &HostSpec { display_name: "shared-name".to_string() }).await.expect("host");
+        hosts
+            .create(&test_meta(host_id), &HostSpec { display_name: "shared-name".to_string(), connection: Default::default() })
+            .await
+            .expect("host");
     }
     let policy = placement_policy(&backend, "ambiguous-host", "shared-name").await;
     let error = placement_target_host(&backend, "flotilla", &policy).await.expect_err("ambiguous host alias must be rejected");
@@ -2855,7 +2874,10 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 
 async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let host = hosts.create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
+    let host = hosts
+        .create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string(), connection: Default::default() })
+        .await
+        .expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
@@ -2866,6 +2888,89 @@ async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &s
         .await
         .expect("host status update");
     placement_policy(backend, policy_name, host_ref).await;
+}
+
+#[tokio::test]
+async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts
+        .create(&test_meta("ssh-host"), &HostSpec {
+            display_name: "beaufort".to_string(),
+            connection: flotilla_resources::HostConnection::AgentlessSsh {
+                owning_daemon: "owner-host".to_string(),
+                destination: "crew@beaufort.example".to_string(),
+            },
+        })
+        .await
+        .expect("SSH Host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: BTreeMap::from([
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([])),
+                ("agentless".to_string(), serde_json::json!(true)),
+                ("transport".to_string(), serde_json::json!("ssh")),
+                ("placement".to_string(), serde_json::json!("host_direct_only")),
+                ("owning_daemon".to_string(), serde_json::json!("owner-host")),
+            ]),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("SSH observation");
+    let policy = placement_policy(&backend, "host-direct-ssh-host", "ssh-host").await;
+    let trusted = WorkflowTemplateSpec::builder()
+        .vessels(vec![flotilla_resources::VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![flotilla_resources::CrewSpec::builder()
+                .role("shell".to_string())
+                .source(flotilla_resources::CrewSource::Tool { command: "sh".to_string() })
+                .build()])
+            .build()])
+        .build();
+    let accepted = default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("placement scoring");
+    assert_eq!(accepted.selected.expect("SSH host selected").metadata.name, policy.metadata.name);
+    let target = placement_target_host(&backend, "flotilla", &policy).await.expect("target host");
+    assert_eq!(placement_actuator_host_ref(&backend, "flotilla", &target).await.expect("owner").as_str(), "owner-host");
+
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &test_meta("docker-ssh-host"),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    host_ref: "ssh-host".to_string(),
+                    image: "crew:latest".to_string().into(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: flotilla_resources::DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                })
+                .build(),
+        )
+        .await
+        .expect("synthetic Docker policy for SSH host");
+
+    let contained = flotilla_resources::single_agent_contained_workflow_spec();
+    let refused = default_convoy_placement_policy(&backend, "flotilla", None, &[], &contained, None)
+        .await
+        .expect_err("host-direct only host cannot place contained crew");
+    assert!(refused.contains("agentless SSH host"), "{refused}");
+
+    backend.using::<PlacementPolicy>("flotilla").delete("docker-ssh-host").await.expect("remove synthetic Docker policy");
+
+    let observed = hosts.get("ssh-host").await.expect("SSH Host");
+    let mut unreachable = observed.status.expect("observed SSH status");
+    unreachable.ready = false;
+    hosts.update_status("ssh-host", &observed.metadata.resource_version, &unreachable).await.expect("failed SSH probe");
+    let unavailable =
+        default_convoy_placement_policy(&backend, "flotilla", None, &[], &trusted, None).await.expect("score unreachable host");
+    assert!(unavailable.selected.is_none());
+    assert!(unavailable.refused_candidates.iter().any(|candidate| candidate.reason.contains("not ready")));
 }
 
 fn trusted_codex_workflow() -> WorkflowTemplateSpec {
@@ -2879,7 +2984,10 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
-    let local = hosts.create(&test_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string() }).await.expect("local host");
+    let local = hosts
+        .create(&test_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .await
+        .expect("local host");
     hosts
         .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
@@ -3057,7 +3165,10 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     let ambiguous_env = create_test_environment(&daemon, "ambiguous-env", "shared-host").await;
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
-        hosts.create(&test_meta(host_id), &HostSpec { display_name: "shared-host".to_string() }).await.expect("ambiguous host");
+        hosts
+            .create(&test_meta(host_id), &HostSpec { display_name: "shared-host".to_string(), connection: Default::default() })
+            .await
+            .expect("ambiguous host");
     }
     create_running_session(&daemon, &ambiguous_env, "terminal-ambiguous", "convoy-ambiguous", "watcher").await;
     create_running_session(&daemon, &local_env, "terminal-local", "convoy-local", "watcher").await;
@@ -3070,7 +3181,10 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
 
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host = hosts.create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string() }).await.expect("host create");
+    let host = hosts
+        .create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string(), connection: Default::default() })
+        .await
+        .expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials))]
@@ -3225,7 +3339,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
     let feta = ResourceBackend::InMemory(InMemoryBackend::default());
     let feta_hosts = feta.using::<ResourceHost>("flotilla");
     let fresh = feta_hosts
-        .create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string() })
+        .create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string(), connection: Default::default() })
         .await
         .expect("create fresh feta self-report");
     feta_hosts
