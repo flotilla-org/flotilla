@@ -50,21 +50,21 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
     ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
-    CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
-    DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, HoldAct,
-    Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot,
-    IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource,
+    CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
+    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder,
+    EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    ReadResourceObject, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
-    WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION,
-    DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
-    PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION,
+    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -107,12 +107,11 @@ use crate::{
     },
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
-        change_request::{github::GitHubChangeRequest, ChangeRequestTracker},
+        change_request::ChangeRequestTracker,
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
         },
-        github_api::GhApiClient,
         issue_tracker::{forge_issue_source, IssueProvider},
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -3850,35 +3849,86 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let Some(forge) = repository.spec.forge() else {
+            let Some(identity) = repository.spec.forge() else {
                 failures.push(format!("repository {repository_key}: no forge identity"));
                 continue;
             };
-            if forge.service_url.trim_end_matches('/') != "https://github.com" {
-                failures.push(format!("repository {}: change request provider unavailable for {}", forge.repository, forge.service_url));
-                continue;
-            }
             if let Some(cached) = self.repository_change_requests.read().await.get(repository_key) {
-                if cached.service_url == forge.service_url && cached.repository == forge.repository {
-                    candidates.push((repository_key.clone(), forge.repository.clone(), Arc::clone(&cached.provider)));
+                if cached.service_url == identity.service_url && cached.repository == identity.repository {
+                    candidates.push((repository_key.clone(), identity.repository.clone(), Arc::clone(&cached.provider)));
                     continue;
                 }
             }
-            let runner = self.discovery.runner.clone();
-            let provider = Arc::new(GitHubChangeRequest::new(
-                "github".to_string(),
-                forge.repository.clone(),
-                Arc::new(GhApiClient::new(runner.clone())),
-                runner,
-            )) as Arc<dyn ChangeRequestTracker>;
+            let provider = match self.discover_repository_change_request(&namespace, &repository.spec).await {
+                Ok(provider) => provider,
+                Err(error) => {
+                    failures.push(format!("repository {}: {error}", identity.repository));
+                    continue;
+                }
+            };
             self.repository_change_requests.write().await.insert(repository_key.clone(), RepositoryChangeRequestProvider {
-                service_url: forge.service_url.clone(),
-                repository: forge.repository.clone(),
+                service_url: identity.service_url.clone(),
+                repository: identity.repository.clone(),
                 provider: Arc::clone(&provider),
             });
-            candidates.push((repository_key.clone(), forge.repository.clone(), provider));
+            candidates.push((repository_key.clone(), identity.repository.clone(), provider));
         }
         (candidates, failures)
+    }
+
+    async fn discover_repository_change_request(
+        &self,
+        namespace: &str,
+        repository: &RepositorySpec,
+    ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        let identity = repository.forge().ok_or("no forge identity")?;
+        let remote = repository.live_remote().ok_or("no repository remote")?;
+        let forge = match repository.identity() {
+            RepositoryIdentity::Forge { forge_ref, .. } => Some(
+                self.resource_backend
+                    .definitions::<Forge>(namespace)
+                    .get(forge_ref)
+                    .await
+                    .map_err(|error| format!("Forge {forge_ref}: {error}"))?
+                    .spec,
+            ),
+            _ => forge_for_remote(&self.resource_backend, namespace, remote).await?,
+        };
+        let remote_assertion = crate::providers::discovery::detectors::git::remote_assertion(remote, "origin")
+            .ok_or_else(|| format!("invalid repository remote {remote}"))?;
+        let mut bag = self.local_environment_bag().unwrap_or_default().with(remote_assertion);
+        if let Some(forge) = &forge {
+            bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
+            if forge.kind == ForgeKind::Forgejo {
+                let credentials =
+                    self.resource_backend.definitions::<CredentialSpec>(namespace).list().await.map_err(|error| error.to_string())?;
+                let paths = credentials
+                    .into_iter()
+                    .filter_map(|credential| match (&credential.spec.consumer, &credential.spec.source) {
+                        (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path })
+                            if forge_ref == &forge.forge_id =>
+                        {
+                            Some(path.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match paths.as_slice() {
+                    [path] => bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path)),
+                    [] => {}
+                    _ => return Err(format!("multiple Forgejo credentials for Forge {}", forge.forge_id)),
+                }
+            }
+        }
+        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
+        let mut unmet = Vec::new();
+        for factory in &self.discovery.factories.change_requests {
+            match factory.probe(&bag, &self.config, &probe_root, Arc::clone(&self.discovery.runner)).await {
+                Ok(provider) => return Ok(provider),
+                Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
+            }
+        }
+        Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
     }
 
     /// Resolve the first change request whose head matches a convoy branch

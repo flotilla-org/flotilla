@@ -17,11 +17,117 @@ use flotilla_resources::{
 use super::*;
 use crate::providers::{
     discovery::test_support::{
-        fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeDiscoveryProviders, FakeTerminalPool,
+        fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
+        FakeTerminalPool,
     },
     terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
     testing::MockRunner,
 };
+
+struct ForgeAwareTestChangeRequestFactory(Arc<dyn ChangeRequestTracker>);
+
+#[async_trait]
+impl crate::providers::discovery::Factory for ForgeAwareTestChangeRequestFactory {
+    type Descriptor = crate::providers::discovery::ProviderDescriptor;
+    type Output = dyn ChangeRequestTracker;
+
+    fn descriptor(&self) -> Self::Descriptor {
+        crate::providers::discovery::ProviderDescriptor::named(crate::providers::discovery::ProviderCategory::ChangeRequest, "test-forgejo")
+    }
+
+    async fn probe(
+        &self,
+        env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        _runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<crate::providers::discovery::UnmetRequirement>> {
+        assert_eq!(env.find_origin_forge().map(|forge| forge.kind), Some(flotilla_resources::ForgeKind::Forgejo));
+        assert!(env.find_auth_path("forgejo").is_some());
+        Ok(Arc::clone(&self.0))
+    }
+}
+
+#[tokio::test]
+async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credential() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"forgejo-cr-test\"\n").expect("daemon config");
+    let token_path = temp.path().join("forgejo-token");
+    std::fs::write(&token_path, "test-token").expect("token file");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let forge = flotilla_resources::ForgeSpec::builder()
+        .forge_id("lab".to_string())
+        .kind(flotilla_resources::ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["forgejo.lab.flotilla.work".to_string()]))
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("forgejo.lab.flotilla.work".to_string())
+        .build();
+    backend.definitions::<flotilla_resources::Forge>("flotilla").create(&test_meta("lab"), &forge).await.expect("Forge");
+    let repository = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops")
+        .expect("repository")
+        .on_forge(&forge)
+        .expect("forge identity");
+    let repository_key = repository.key();
+    backend.clone().using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
+    let remote_repository = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops").expect("remote repository");
+    let remote_key = remote_repository.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&remote_key.to_string()), &remote_repository)
+        .await
+        .expect("repository awaiting forge identity migration");
+    backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(
+            &test_meta("lab-forgejo-crew-pr"),
+            &CredentialSpecSpec::builder()
+                .consumer(CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() })
+                .source(CredentialSource::File { path: token_path.to_string_lossy().into_owned() })
+                .lifecycle(CredentialLifecycle::Static)
+                .build(),
+        )
+        .await
+        .expect("credential");
+    let provider = Arc::new(FakeChangeRequest::new());
+    provider
+        .add_change_requests(vec![("17".to_string(), crate::providers::types::ChangeRequest {
+            title: "Fix ghostty".to_string(),
+            branch: "governor".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: None,
+            provider_name: "forgejo".to_string(),
+            provider_display_name: "Forgejo".to_string(),
+        })])
+        .await;
+    let mut discovery = fake_discovery(false);
+    discovery.factories.change_requests = vec![Box::new(ForgeAwareTestChangeRequestFactory(provider))];
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::new("test-host"),
+        backend,
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    let resolved =
+        daemon.resolve_convoy_change_request(std::slice::from_ref(&repository_key), "governor", None).await.expect("resolve Forgejo PR");
+    assert_eq!(
+        resolved,
+        Some(ConvoyChangeRequest { id: "17".to_string(), status: flotilla_protocol::ChangeRequestStatus::Open, repository_key })
+    );
+    let resolved =
+        daemon.resolve_convoy_change_request(std::slice::from_ref(&remote_key), "governor", None).await.expect("resolve remote by host");
+    assert_eq!(
+        resolved,
+        Some(ConvoyChangeRequest {
+            id: "17".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key: remote_key
+        })
+    );
+}
 
 #[test]
 fn missing_change_request_binding_explains_the_crew_role_without_a_placeholder() {

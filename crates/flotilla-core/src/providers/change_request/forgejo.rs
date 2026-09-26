@@ -246,6 +246,23 @@ mod tests {
         session.finish();
     }
 
+    #[tokio::test]
+    async fn record_replay_queries_ghostty_governor_pull_request() {
+        let auth = auth();
+        let mut masks = Masks::new();
+        masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
+        let fixture = crate::providers::testing::fixture_path("change_request", "forgejo_ghostty_governor.yaml");
+        let session = replay::test_session(&fixture, masks);
+        let provider = ForgejoChangeRequestProvider::new(
+            replay::test_http_client(&session),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.lab.flotilla.work".into(), None, auth),
+            "robert/ghostty-ops".into(),
+        );
+        provider.find_change_request_by_branch("governor").await.expect("query Forgejo pull requests");
+        session.finish();
+    }
+
     #[test]
     fn parses_forgejo_states_and_branch() {
         let config = ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth());
