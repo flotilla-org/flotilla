@@ -1831,7 +1831,8 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
             "sh",
             &[
                 "-c",
-                "for directory in \"$1\"/credentials/*; do \
+                "failed=0; \
+                for directory in \"$1\"/credentials/*; do \
                     [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
                     for file in \"$directory\"/token.tmp-*; do \
                         [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
@@ -1842,11 +1843,12 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
                                 case \"$hex\" in \
                                     ????????????????????????????????) \
                                         case \"$hex\" in *[!0123456789abcdefABCDEF]*) continue;; esac; \
-                                        rm -f -- \"$file\" || exit 1;; \
+                                        rm -f -- \"$file\" || failed=1;; \
                                 esac;; \
                         esac; \
                     done; \
-                done",
+                done; \
+                exit \"$failed\"",
                 "flotilla-github-app-token-cleanup",
                 &base.to_string_lossy(),
             ],
@@ -2228,6 +2230,41 @@ mod tests {
 
     struct FailedTokenWriteRunner;
 
+    struct PathCommandRunner {
+        bin_dir: PathBuf,
+    }
+
+    #[async_trait]
+    impl CommandRunner for PathCommandRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            let output = self.run_output(cmd, args, cwd, label).await?;
+            if output.success {
+                Ok(output.stdout)
+            } else {
+                Err(output.stderr)
+            }
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            let output = tokio::process::Command::new(cmd)
+                .args(args)
+                .current_dir(cwd)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.bin_dir.display()))
+                .output()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(CommandOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                success: output.status.success(),
+            })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
     #[async_trait]
     impl CommandRunner for FailedTokenWriteRunner {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
@@ -2347,6 +2384,30 @@ mod tests {
         assert!(!abandoned.exists());
         assert!(live.exists());
         assert!(malformed.exists());
+    }
+
+    #[tokio::test]
+    async fn delivered_cleanup_continues_after_one_removal_fails() {
+        let base = tempfile::tempdir().expect("create delivery base");
+        let bin_dir = tempfile::tempdir().expect("create command directory");
+        let fake_rm = bin_dir.path().join("rm");
+        tokio::fs::write(&fake_rm, "#!/bin/sh\ncase \"$3\" in */blocked/*) exit 1;; esac\nexec /bin/rm \"$@\"\n")
+            .await
+            .expect("write failing rm command");
+        tokio::fs::set_permissions(&fake_rm, std::fs::Permissions::from_mode(0o755)).await.expect("make rm command executable");
+        let blocked = base.path().join("credentials/blocked").join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let healthy = base.path().join("credentials/healthy").join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        for path in [&blocked, &healthy] {
+            tokio::fs::create_dir_all(path.parent().expect("credential directory")).await.expect("create credential directory");
+            tokio::fs::write(path, "abandoned material").await.expect("write staging file");
+        }
+
+        cleanup_stale_github_app_token_files_with_runner(&PathCommandRunner { bin_dir: bin_dir.path().to_path_buf() }, base.path())
+            .await
+            .expect_err("report failed removal after sweeping other directories");
+
+        assert!(blocked.exists());
+        assert!(!healthy.exists());
     }
 
     #[test]
