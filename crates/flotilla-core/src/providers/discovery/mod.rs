@@ -39,7 +39,7 @@ use crate::{
         registry::{ProviderRegistry, ProviderSet},
         scan_cache::{SharedPresentationManager, SharedTerminalPool},
         terminal::TerminalPool,
-        vcs::{CheckoutManager, Vcs},
+        vcs::CheckoutManager,
         CommandRunner,
     },
 };
@@ -418,7 +418,6 @@ pub trait Factory: Send + Sync {
 }
 
 pub type ProviderFactory<T> = dyn Factory<Descriptor = ProviderDescriptor, Output = T>;
-pub type VcsFactory = ProviderFactory<dyn Vcs>;
 pub type CheckoutManagerFactory = ProviderFactory<dyn CheckoutManager>;
 pub type ChangeRequestFactory = ProviderFactory<dyn ChangeRequestTracker>;
 pub type IssueProviderFactory = ProviderFactory<dyn IssueProvider>;
@@ -433,7 +432,6 @@ pub type EnvironmentProviderFactory = ProviderFactory<dyn crate::providers::envi
 // ---------------------------------------------------------------------------
 
 pub struct FactoryRegistry {
-    pub vcs: Vec<Box<VcsFactory>>,
     pub checkout_managers: Vec<Box<CheckoutManagerFactory>>,
     pub change_requests: Vec<Box<ChangeRequestFactory>>,
     pub issue_trackers: Vec<Box<IssueProviderFactory>>,
@@ -474,9 +472,6 @@ impl FactoryRegistry {
         let mut registry = ProviderRegistry::new();
         registry.agent_adapters = AgentAdapterRegistry::discover(env, Arc::clone(&runner));
 
-        for (desc, p) in probe_category(&self.vcs, env, config, repo_root, &runner).await {
-            registry.vcs.insert(desc.implementation.clone(), desc, p);
-        }
         for (desc, p) in probe_category(&self.checkout_managers, env, config, repo_root, &runner).await {
             registry.checkout_managers.insert(desc.implementation.clone(), desc, p);
         }
@@ -791,10 +786,6 @@ async fn discover_providers_inner(
         }
     }
 
-    probe_all(&factories.vcs, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.vcs.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
     probe_all(&factories.checkout_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.checkout_managers.insert(desc.implementation.clone(), desc, provider);
     })
@@ -903,13 +894,8 @@ async fn discover_providers_inner(
         &mut unmet,
     );
 
-    // Checkout strategy — resolved per-repo, nested under vcs.git
-    let checkout_config = config.resolve_checkout_config(repo_root);
-    if checkout_config.strategy != "auto" && !registry.checkout_managers.prefer_by_implementation(&checkout_config.strategy) {
-        unmet.push((ProviderCategory::CheckoutManager.slug().into(), UnmetRequirement::UnknownProviderPreference {
-            category: ProviderCategory::CheckoutManager,
-            key: checkout_config.strategy,
-        }));
+    if combined.find_vcs_checkout(VcsKind::Git).is_none() {
+        unmet.push(("git".to_string(), UnmetRequirement::NoVcsCheckout));
     }
 
     let repo_slug = combined.repo_slug();
@@ -982,7 +968,6 @@ mod orchestrator_tests {
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
         // VCS should be registered (git factory)
-        assert!(!result.registry.vcs.is_empty(), "expected at least one VCS provider");
 
         // The combined bag should have both host assertions (binary) and repo assertions (checkout)
         assert!(result.host_repo_bag.find_binary("git").is_some(), "host binary should be in combined bag");
@@ -1051,7 +1036,6 @@ mod orchestrator_tests {
         let repo_dets = detectors::default_repo_detectors();
         // Use empty factories — we only care about the bag/slug
         let fact_reg = FactoryRegistry {
-            vcs: vec![],
             checkout_managers: vec![],
             change_requests: vec![],
             issue_trackers: vec![],
@@ -1080,7 +1064,6 @@ mod orchestrator_tests {
         let host_bag = EnvironmentBag::new();
         let repo_dets: Vec<Box<dyn RepoDetector>> = vec![];
         let fact_reg = FactoryRegistry {
-            vcs: vec![],
             checkout_managers: vec![],
             change_requests: vec![],
             issue_trackers: vec![],
@@ -1093,7 +1076,6 @@ mod orchestrator_tests {
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
-        assert!(result.registry.vcs.is_empty());
         assert!(result.registry.checkout_managers.is_empty());
         assert!(result.registry.change_requests.is_empty());
         assert!(result.registry.issue_trackers.is_empty());

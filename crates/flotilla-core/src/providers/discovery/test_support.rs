@@ -32,7 +32,7 @@ use crate::{
         presentation::PresentationManager,
         terminal::TerminalPool,
         types::BranchInfo,
-        vcs::{CheckoutManager, Vcs},
+        vcs::{CheckoutManager, VcsInspection},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
 };
@@ -585,7 +585,7 @@ impl CheckoutBuilder {
 // FakeVcs
 // ---------------------------------------------------------------------------
 
-/// In-memory [`Vcs`] implementation backed by [`FakeVcsState`].
+/// In-memory [`VcsInspection`] implementation backed by [`FakeVcsState`].
 pub struct FakeVcs {
     state: Arc<RwLock<FakeVcsState>>,
 }
@@ -597,7 +597,7 @@ impl FakeVcs {
 }
 
 #[async_trait::async_trait]
-impl Vcs for FakeVcs {
+impl VcsInspection for FakeVcs {
     async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         let state = self.state.read().expect("FakeVcs state poisoned");
         if path.as_path().starts_with(&state.root) {
@@ -1031,54 +1031,6 @@ impl Factory for FakeIssueProviderFactory {
 }
 
 // ---------------------------------------------------------------------------
-// FakeVcsFactory
-// ---------------------------------------------------------------------------
-
-/// Factory that always returns a [`FakeVcs`] backed by a [`FakeVcsState`].
-///
-/// The `name` is derived from the state's root path to avoid registry
-/// conflicts when multiple factories are registered side-by-side.
-pub struct FakeVcsFactory {
-    state: Arc<RwLock<FakeVcsState>>,
-    name: String,
-}
-
-impl FakeVcsFactory {
-    pub fn new(state: Arc<RwLock<FakeVcsState>>) -> Self {
-        let name = {
-            let s = state.read().expect("FakeVcsFactory state poisoned");
-            format!("fake-vcs-{}", s.root.display())
-        };
-        Self { state, name }
-    }
-}
-
-#[async_trait::async_trait]
-impl Factory for FakeVcsFactory {
-    type Descriptor = ProviderDescriptor;
-    type Output = dyn Vcs;
-
-    fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor::labeled_simple(ProviderCategory::Vcs, &self.name, &self.name, "", "", "")
-    }
-
-    async fn probe(
-        &self,
-        _env: &EnvironmentBag,
-        _config: &ConfigStore,
-        repo_root: &ExecutionEnvironmentPath,
-        _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn Vcs>, Vec<UnmetRequirement>> {
-        let state = self.state.read().expect("FakeVcsFactory state poisoned");
-        if repo_root.as_path() == state.root {
-            Ok(Arc::new(FakeVcs::new(Arc::clone(&self.state))))
-        } else {
-            Err(vec![UnmetRequirement::NoVcsCheckout])
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // FakeCheckoutManagerFactory
 // ---------------------------------------------------------------------------
 
@@ -1313,7 +1265,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         host_detectors: vec![],
         repo_detectors: vec![],
         factories: FactoryRegistry {
-            vcs: vec![],
             checkout_managers,
             change_requests: change_request_factories,
             issue_trackers: issue_tracker_factories,
@@ -1340,14 +1291,13 @@ fn fixed_available_space_probe() -> Arc<dyn crate::admission::AvailableSpaceProb
     Arc::new(FixedAvailableSpaceProbe)
 }
 
-/// Build a [`DiscoveryRuntime`] with [`FakeVcs`] and [`FakeCheckoutManager`]
+/// Build a [`DiscoveryRuntime`] with [`FakeCheckoutManager`]
 /// both backed by the given [`FakeVcsState`].
 ///
 /// This is the preferred way to set up a minimal runtime for tests that need
 /// VCS and checkout data without running real git processes.
 pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
-    runtime.factories.vcs = vec![Box::new(FakeVcsFactory::new(Arc::clone(&state)))];
     runtime.factories.checkout_managers = vec![Box::new(FakeCheckoutManagerFactory::new(state))];
     runtime
 }

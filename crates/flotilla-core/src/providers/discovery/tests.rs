@@ -286,7 +286,6 @@ impl Factory for CountingPresentationFactory {
 
 fn factories_with_presentation(factory: CountingPresentationFactory) -> FactoryRegistry {
     FactoryRegistry {
-        vcs: vec![],
         checkout_managers: vec![],
         change_requests: vec![],
         issue_trackers: vec![],

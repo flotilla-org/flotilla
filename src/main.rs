@@ -14,7 +14,7 @@ use flotilla_core::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     path_policy::{daemon_socket_path, PathPolicy},
     providers::{
-        vcs::{git::GitVcs, Vcs},
+        vcs::{git::GitVcs, VcsInspection},
         ProcessCommandRunner,
     },
 };

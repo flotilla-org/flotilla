@@ -11,19 +11,14 @@ use flotilla_resources::{
 fn repository_provider_configuration_roundtrips_in_the_spec() {
     let spec = RepositorySpec::remote("https://github.com/acme/widgets")
         .expect("repository")
-        .with_vcs(RepositoryVcsSpec {
-            git: RepositoryGitSpec {
-                checkout_strategy: Some("wt".to_string()),
-                checkout_path: Some("{{ repo_path }}/../work/{{ branch }}".to_string()),
-            },
-        })
+        .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_path: Some("{{ repo_path }}/../work/{{ branch }}".to_string()) } })
         .with_change_request(RepositoryProviderPreference { backend: Some("github".to_string()) });
 
     let value = serde_json::to_value(&spec).expect("serialize repository spec");
     let decoded: RepositorySpec = serde_json::from_value(value).expect("deserialize repository spec");
 
     assert_eq!(decoded, spec);
-    assert_eq!(decoded.vcs().git.checkout_strategy.as_deref(), Some("wt"));
+    assert_eq!(decoded.vcs().git.checkout_path.as_deref(), Some("{{ repo_path }}/../work/{{ branch }}"));
     assert_eq!(decoded.change_request().backend.as_deref(), Some("github"));
 }
 

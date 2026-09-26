@@ -67,14 +67,12 @@ impl RepositoryVcsSpec {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryGitSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout_strategy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_path: Option<String>,
 }
 
 impl RepositoryGitSpec {
     fn is_empty(&self) -> bool {
-        self.checkout_strategy.is_none() && self.checkout_path.is_none()
+        self.checkout_path.is_none()
     }
 }
 
@@ -157,7 +155,6 @@ impl RepositorySpec {
             }
             Ok(())
         }
-        merge_option(&mut self.vcs.git.checkout_strategy, &other.vcs.git.checkout_strategy, "checkout strategy")?;
         merge_option(&mut self.vcs.git.checkout_path, &other.vcs.git.checkout_path, "checkout path")?;
         merge_option(&mut self.change_request.backend, &other.change_request.backend, "change request backend")?;
         Ok(self)

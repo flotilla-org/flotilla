@@ -111,20 +111,14 @@ pub struct VcsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitConfig {
-    #[serde(default = "default_checkout_strategy")]
-    pub checkout_strategy: String,
     #[serde(default = "default_checkout_path")]
     pub checkout_path: String,
 }
 
 impl Default for GitConfig {
     fn default() -> Self {
-        Self { checkout_strategy: default_checkout_strategy(), checkout_path: default_checkout_path() }
+        Self { checkout_path: default_checkout_path() }
     }
-}
-
-fn default_checkout_strategy() -> String {
-    "auto".to_string()
 }
 
 pub fn default_checkout_path() -> String {
@@ -203,7 +197,6 @@ pub enum RepoViewLayoutConfig {
 
 /// Resolved checkout configuration from host defaults.
 pub struct ResolvedCheckoutConfig {
-    pub strategy: String,
     pub path: String,
 }
 
@@ -637,7 +630,6 @@ impl ConfigStore {
         let specs = self.repository_specs.lock().expect("repository specs mutex poisoned");
         let git = specs.get(repo_root.as_path()).map(RepositorySpec::vcs).map(|vcs| &vcs.git);
         ResolvedCheckoutConfig {
-            strategy: git.and_then(|git| git.checkout_strategy.clone()).unwrap_or_else(|| global.vcs.git.checkout_strategy.clone()),
             path: git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
         }
     }

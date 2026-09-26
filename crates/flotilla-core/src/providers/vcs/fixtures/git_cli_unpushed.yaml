@@ -1,0 +1,93 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args:
+    - branch
+    - '--remotes'
+    - '--contains'
+    - HEAD
+    cwd: '{repo}'
+    stdout: |2
+        origin/main
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - branch
+    - '--remotes'
+    - '--contains'
+    - HEAD
+    cwd: '{repo}'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - merge-base
+    - '--is-ancestor'
+    - HEAD
+    - HEAD
+    cwd: '{repo}'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - rev-list
+    - '--count'
+    - HEAD
+    - '--not'
+    - '--remotes'
+    cwd: '{repo}'
+    stdout: |
+      1
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - rev-list
+    - '--count'
+    - origin/main..HEAD
+    cwd: '{repo}'
+    stdout: |
+      1
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - rev-parse
+    - '--abbrev-ref'
+    - '@{upstream}'
+    cwd: '{repo}'
+    stdout: ''
+    stderr: |
+      fatal: no upstream configured for branch 'main'
+    exit_code: 1
+  - channel: command
+    cmd: git
+    args:
+    - rev-parse
+    - '--abbrev-ref'
+    - '@{upstream}'
+    cwd: '{repo}'
+    stdout: ''
+    stderr: |
+      fatal: no upstream configured for branch 'main'
+    exit_code: 1
+  - channel: command
+    cmd: git
+    args:
+    - rev-parse
+    - '--abbrev-ref'
+    - '@{upstream}'
+    cwd: '{repo}'
+    stdout: |
+      origin/main
+    stderr: ''
+    exit_code: 0

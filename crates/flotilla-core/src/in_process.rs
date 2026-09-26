@@ -128,6 +128,7 @@ use crate::{
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
+    vcs::{CliGitVcs, Vcs},
 };
 
 fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
@@ -7374,7 +7375,7 @@ impl InProcessDaemon {
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
         use crate::{
             path_context::ExecutionEnvironmentPath,
-            providers::vcs::{git::GitVcs, Vcs},
+            providers::vcs::{git::GitVcs, VcsInspection},
         };
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
@@ -8554,7 +8555,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
+            let output = CliGitVcs::new(Path::new(path), &*runner).push_head("origin").await;
             let outcome = match output {
                 Ok(output) if output.success => {
                     CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()

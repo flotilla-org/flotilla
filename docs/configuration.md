@@ -219,16 +219,11 @@ Flotilla auto-detects available tools. Nothing is strictly required beyond git, 
 | [gh](https://cli.github.com/) | GitHub PRs and issues | No |
 | [claude](https://docs.anthropic.com/en/docs/claude-code) | Agent sessions, branch name generation | No |
 | [cmux](https://cmux.dev) | Terminal workspace manager | No |
-| [wt](https://github.com/max-sixty/worktrunk) | Git worktree manager (alternative to plain git worktrees) | No |
 
-## Checkout manager
+## Checkout paths
 
-The checkout manager provider can be configured fleet-wide in the Repository spec:
+The Repository spec can override the path template used when creating worktrees:
 
 ```json
-{ "vcs": { "git": { "checkout_strategy": "wt" } } }
+{ "vcs": { "git": { "checkout_path": "{{ repo_path }}/../work/{{ branch | sanitize }}" } } }
 ```
-
-- `auto`: uses `wt` if available, falls back to plain git worktrees
-- `wt`: requires the `wt` CLI
-- `git`: uses `git worktree` commands directly

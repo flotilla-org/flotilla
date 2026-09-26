@@ -46,13 +46,12 @@ fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
 }
 
 fn checkout_manager_factories() -> Vec<Box<super::CheckoutManagerFactory>> {
-    vec![Box::new(clone::CloneCheckoutManagerFactory), Box::new(git::WtCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
+    vec![Box::new(clone::CloneCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
 }
 
 impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
-            vcs: vec![Box::new(git::GitVcsFactory)],
             checkout_managers: checkout_manager_factories(),
             change_requests: vec![Box::new(github::GitHubChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
@@ -77,7 +76,6 @@ mod tests {
     #[test]
     fn default_all_has_all_categories() {
         let reg = FactoryRegistry::default_all();
-        assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
         assert!(!reg.change_requests.is_empty());
         assert!(!reg.issue_trackers.is_empty());
@@ -91,7 +89,6 @@ mod tests {
     fn process_runtime_constructs_external_providers() {
         let runtime = super::super::DiscoveryRuntime::for_process();
         let reg = &runtime.factories;
-        assert!(!reg.vcs.is_empty());
         assert!(!reg.checkout_managers.is_empty());
         assert!(!reg.change_requests.is_empty());
         assert!(!reg.issue_trackers.is_empty());

@@ -39,6 +39,7 @@ use crate::{
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
     terminal_manager::TerminalManager,
+    vcs::{CliGitVcs, Vcs, VcsQuery},
 };
 
 fn display_host_for_checkout_path(providers_data: &ProviderData, checkout_path: &Path, local_host: &HostName) -> Option<HostName> {
@@ -1260,10 +1261,7 @@ impl ExecutorStepResolver {
     // path to bind-mount). This should move into the EnvironmentProvider or CreateOpts
     // preparation rather than living on the executor.
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
-        let result = self
-            .runner
-            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Default)
-            .await;
+        let result = CliGitVcs::new(self.repo.root.as_path(), &*self.runner).query(VcsQuery::GitCommonDir).await;
         match result {
             Ok(path) => {
                 let git_dir = std::path::Path::new(path.trim());
