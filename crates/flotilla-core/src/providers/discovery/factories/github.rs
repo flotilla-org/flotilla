@@ -168,22 +168,22 @@ impl Factory for ForgejoChangeRequestFactory {
 fn forgejo_provider_config(env: &EnvironmentBag, config: &ConfigStore) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
     let forge = env.find_origin_forge().filter(|forge| forge.kind == ForgeKind::Forgejo);
     let forgejo = config.load_config().issue_tracker.forgejo.unwrap_or_default();
-    let service_url = forgejo
-        .service_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .or_else(|| forge.map(|forge| forge.https_url.as_str()))
+    let service_url = forge
+        .map(|forge| forge.https_url.as_str())
+        .or_else(|| forgejo.service_url.as_deref().map(str::trim).filter(|url| !url.is_empty()))
         .ok_or_else(|| vec![UnmetRequirement::MissingConfig("[issue_tracker.forgejo].service_url or Forge".into())])?;
-    let auth = resolve_forgejo_auth(config, &forgejo).map_err(|error| {
+    let auth = resolve_forgejo_auth(env, config, &forgejo).map_err(|error| {
         tracing::warn!(%error, "Forgejo authentication unavailable");
         vec![UnmetRequirement::MissingAuth("forgejo".into())]
     })?;
     Ok(ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth))
 }
 
-fn resolve_forgejo_auth(config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
-    let path = resolve_forgejo_token_path(config, forgejo)?;
+fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
+    let path = env
+        .find_auth_path("forgejo")
+        .map(|path| path.as_path().to_path_buf())
+        .map_or_else(|| resolve_forgejo_token_path(config, forgejo), Ok)?;
     let token =
         std::fs::read_to_string(&path).map_err(|error| format!("forgejo token file {}: {error}", path.display()))?.trim().to_string();
     if token.is_empty() {
@@ -249,10 +249,11 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec};
 
     use super::{
-        config_path, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory, GitHubChangeRequestFactory, GitHubIssueProviderFactory,
+        config_path, resolve_forgejo_auth, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory, GitHubChangeRequestFactory,
+        GitHubIssueProviderFactory,
     };
     use crate::{
-        config::ConfigStore,
+        config::{ConfigStore, ForgejoIssueTrackerConfig},
         path_context::ExecutionEnvironmentPath,
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
@@ -471,6 +472,19 @@ mod tests {
         let resolved = config_path(std::path::Path::new("/tmp/config-parent"), "~/lab-token");
 
         assert_eq!(resolved, home.join("lab-token"));
+    }
+
+    #[test]
+    fn forgejo_auth_uses_discovered_credential_before_config_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let selected = dir.path().join("selected-token");
+        std::fs::write(&selected, "selected\n").expect("selected token");
+        let config = ConfigStore::with_base(dir.path().join("flotilla"));
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::auth_file("forgejo", &selected));
+
+        let auth = resolve_forgejo_auth(&bag, &config, &ForgejoIssueTrackerConfig::default()).expect("discovered auth");
+        assert_eq!(auth.token_path, selected);
+        assert_eq!(auth.token, "selected");
     }
 
     #[tokio::test]

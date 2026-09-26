@@ -1897,6 +1897,9 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         HostName::local(),
     )
     .await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("gh available for discovery");
     let backend = daemon.resource_backend();
     backend
         .clone()

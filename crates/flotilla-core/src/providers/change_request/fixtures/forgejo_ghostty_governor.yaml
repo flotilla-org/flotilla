@@ -1,0 +1,22 @@
+rounds:
+- interactions:
+  - channel: http
+    method: GET
+    url: https://forgejo.lab.flotilla.work/api/v1/repos/robert/ghostty-ops/pulls?state=all&limit=50&page=1
+    request_headers:
+      accept: application/json
+      authorization: token <LAB_FORGEJO_TOKEN>
+    status: 200
+    response_body: |
+      []
+    response_headers:
+      x-content-type-options: nosniff
+      access-control-expose-headers: X-Total-Count
+      cache-control: max-age=0, private, must-revalidate
+      content-length: '3'
+      content-type: application/json;charset=utf-8
+      x-frame-options: SAMEORIGIN
+      via: '1.1 Caddy'
+      alt-svc: h3=":443"; ma=2592000
+      x-total-count: '0'
+      date: Sat, 26 Sep 2026 22:07:58 GMT
