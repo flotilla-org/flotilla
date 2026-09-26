@@ -6,13 +6,18 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
+use flotilla_protocol::CheckoutIntent;
 use flotilla_resources::CheckoutBranchProvenance;
 use tracing::warn;
 
-use crate::providers::{command_channel_label, CommandOutput, CommandRunner};
+use crate::{
+    path_context::ExecutionEnvironmentPath,
+    providers::{command_channel_label, types::Checkout, vcs::CheckoutManager, CommandOutput, CommandRunner},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VcsCheck {
@@ -96,6 +101,18 @@ impl VcsQuery<'_> {
 /// A VCS backend bound to one checkout path in its execution environment.
 #[async_trait]
 pub trait Vcs: Send + Sync {
+    async fn validate_target(&self, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
+        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
+    }
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
+    }
+    async fn create_checkout(&self, _branch: &str, _create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
+    }
+    async fn remove_checkout(&self, _branch: &str) -> Result<(), String> {
+        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
+    }
     /// Return porcelain status while preserving the command's exit status and stderr.
     async fn working_tree_status(&self, include_ignored: bool) -> Result<CommandOutput, String>;
     /// Resolve the commit checked out at HEAD.
@@ -131,6 +148,167 @@ pub trait Vcs: Send + Sync {
     async fn grep_operational_entries(&self, commit: &str) -> Result<CommandOutput, String>;
     async fn git_path(&self, name: &str) -> Result<CommandOutput, String>;
     async fn push_head(&self, remote: &str) -> Result<CommandOutput, String>;
+}
+
+/// Adapts the remaining Plane-A checkout implementation while callers move to
+/// the checkout-scoped operation contract.
+pub struct CheckoutManagerVcs {
+    checkout: ExecutionEnvironmentPath,
+    runner: Arc<dyn CommandRunner>,
+    manager: Arc<dyn CheckoutManager>,
+}
+
+impl CheckoutManagerVcs {
+    pub fn new(checkout: ExecutionEnvironmentPath, runner: Arc<dyn CommandRunner>, manager: Arc<dyn CheckoutManager>) -> Self {
+        Self { checkout, runner, manager }
+    }
+
+    fn cli(&self) -> CliGitVcs<'_> {
+        CliGitVcs::new(self.checkout.as_path(), &*self.runner)
+    }
+}
+
+#[async_trait]
+impl Vcs for CheckoutManagerVcs {
+    async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
+        self.manager.validate_target(&self.checkout, branch, intent).await
+    }
+
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        self.manager.list_checkouts(&self.checkout).await
+    }
+
+    async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        self.manager.create_checkout(&self.checkout, branch, create_branch).await
+    }
+
+    async fn remove_checkout(&self, branch: &str) -> Result<(), String> {
+        self.manager.remove_checkout(&self.checkout, branch).await
+    }
+
+    async fn working_tree_status(&self, include_ignored: bool) -> Result<CommandOutput, String> {
+        self.cli().working_tree_status(include_ignored).await
+    }
+
+    async fn head_commit(&self) -> Result<CommandOutput, String> {
+        self.cli().head_commit().await
+    }
+
+    async fn is_clean(&self) -> VcsCheck {
+        self.cli().is_clean().await
+    }
+
+    async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck {
+        self.cli().unpushed_commits(merged_head).await
+    }
+
+    async fn remote_url(&self, remote: &str) -> Result<String, String> {
+        self.cli().remote_url(remote).await
+    }
+
+    async fn remote_heads(&self, remote: &str, reference: &str) -> Result<String, String> {
+        self.cli().remote_heads(remote, reference).await
+    }
+
+    async fn remote_ref(&self, remote: &str, reference: &str) -> Result<CommandOutput, String> {
+        self.cli().remote_ref(remote, reference).await
+    }
+
+    async fn default_remote_branch(&self, remote: &str) -> Result<CommandOutput, String> {
+        self.cli().default_remote_branch(remote).await
+    }
+
+    async fn commit_count(&self, range: &str) -> Result<CommandOutput, String> {
+        self.cli().commit_count(range).await
+    }
+
+    async fn ref_exists(&self, reference: &str) -> bool {
+        self.cli().ref_exists(reference).await
+    }
+
+    async fn fetch(&self, remote: &str, refspec: &str) -> Result<(), String> {
+        self.cli().fetch(remote, refspec).await
+    }
+
+    async fn worktree_add(&self, add: WorktreeAdd<'_>) -> Result<(), String> {
+        self.cli().worktree_add(add).await
+    }
+
+    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<PreparedWorktree, String> {
+        self.cli().create_worktree(branch, base_ref, target).await
+    }
+
+    async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String> {
+        self.cli().worktree_remove(target).await
+    }
+
+    async fn remove_worktree(&self, branch: &str, target: &str) -> Result<WorktreeRemoval, String> {
+        self.cli().remove_worktree(branch, target).await
+    }
+
+    async fn worktree_prune(&self) -> Result<(), String> {
+        self.cli().worktree_prune().await
+    }
+
+    async fn worktree_list(&self) -> Result<String, String> {
+        self.cli().worktree_list().await
+    }
+
+    async fn read_ref(&self, reference: &str) -> Result<CommandOutput, String> {
+        self.cli().read_ref(reference).await
+    }
+
+    async fn resolve_ref(&self, reference: &str) -> Result<String, String> {
+        self.cli().resolve_ref(reference).await
+    }
+
+    async fn update_ref(&self, reference: &str, commit: &str) -> Result<(), String> {
+        self.cli().update_ref(reference, commit).await
+    }
+
+    async fn delete_ref(&self, reference: &str) -> Result<(), String> {
+        self.cli().delete_ref(reference).await
+    }
+
+    async fn delete_branch(&self, branch: &str) -> Result<(), String> {
+        self.cli().delete_branch(branch).await
+    }
+
+    async fn common_dir(&self) -> Result<String, String> {
+        self.cli().common_dir().await
+    }
+
+    async fn current_branch(&self) -> Result<String, String> {
+        self.cli().current_branch().await
+    }
+
+    async fn switch_create(&self, branch: &str, track: Option<&str>) -> Result<(), String> {
+        self.cli().switch_create(branch, track).await
+    }
+
+    async fn clone_repo(&self, url: &str, target: &str, branch: Option<&str>) -> Result<(), String> {
+        self.cli().clone_repo(url, target, branch).await
+    }
+
+    async fn head_commit_text(&self) -> Result<String, String> {
+        self.cli().head_commit_text().await
+    }
+
+    async fn query(&self, query: VcsQuery<'_>) -> Result<String, String> {
+        self.cli().query(query).await
+    }
+
+    async fn grep_operational_entries(&self, commit: &str) -> Result<CommandOutput, String> {
+        self.cli().grep_operational_entries(commit).await
+    }
+
+    async fn git_path(&self, name: &str) -> Result<CommandOutput, String> {
+        self.cli().git_path(name).await
+    }
+
+    async fn push_head(&self, remote: &str) -> Result<CommandOutput, String> {
+        self.cli().push_head(remote).await
+    }
 }
 
 /// Universal Git CLI implementation. The runner determines the command transport.
