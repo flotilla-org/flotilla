@@ -338,6 +338,7 @@ async fn create_runs_container_as_the_host_user() {
 
     let calls = runner.calls();
     let (_, args, _) = &calls[0];
+    assert!(args.contains(&"--init".to_string()), "docker should reap orphaned processes; args: {args:?}");
     // SAFETY: getuid and getgid are side-effect-free process identity queries.
     let host_user = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
     assert!(

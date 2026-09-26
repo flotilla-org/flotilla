@@ -9,8 +9,8 @@
 # prefix reaches the final image (consumed via CLEAT_GHOSTTY_PREFIX).
 FROM ubuntu:24.04 AS ghostty-builder
 ARG TARGETARCH
-ARG ZIG_VERSION=0.15.2
-ARG CLEAT_REF=2694b71c593868af3b289a04ed6e468979c236bc
+ARG ZIG_VERSION=0.16.0
+ARG CLEAT_REF=2f154566eb0e5ea3e70abbda2327f211ea183c2b
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils build-essential ncurses-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -25,10 +25,13 @@ RUN case "${TARGETARCH}" in \
     && ln -s "/opt/${zig_dir}/zig" /usr/local/bin/zig \
     && test "$(zig version)" = "${ZIG_VERSION}"
 COPY ci/crew-image/emit-ghostty-terminfo.zig /tmp/emit-ghostty-terminfo.zig
+# Cleat's preparation script reads the Ghostty revision from its own
+# tools/ghostty-toolchain.toml. Verify Zig matches that same pin.
 RUN git clone --filter=blob:none --no-checkout https://github.com/flotilla-org/cleat.git /src/cleat \
     && cd /src/cleat \
     && git fetch --depth 1 origin "${CLEAT_REF}" \
     && git checkout --detach FETCH_HEAD \
+    && test "$(sed -n '/^\[zig\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' tools/ghostty-toolchain.toml)" = "${ZIG_VERSION}" \
     && ./tools/prepare-ghostty-vt.sh \
     && cd /src/cleat/.tools/ghostty-src \
     && cp /tmp/emit-ghostty-terminfo.zig src/emit-ghostty-terminfo.zig \

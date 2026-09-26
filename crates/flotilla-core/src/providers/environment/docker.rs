@@ -136,6 +136,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         args.extend([
             "run",
             "-d",
+            "--init",
             "--pull",
             opts.image_pull_policy.docker_value(),
             "--name",
