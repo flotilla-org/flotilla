@@ -211,15 +211,11 @@ impl FlotillaVcs {
     }
 
     async fn remove_reference_clone(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
-        let target_path = Path::new(target);
-        if !self.runner.path_exists(target_path).await? {
+        if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(CheckoutRemoval::Removed);
         }
-        let backend = GitCliBackend::explicit_checkout(target_path, &*self.runner);
+        let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
         let preserve = |reason| CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason };
-        if backend.current_branch().await?.trim() != branch {
-            return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
-        }
         match backend.branch_ownership(branch, CheckoutSharing::Independent).await? {
             CheckoutOwnership::PreExisting => return Ok(preserve(CheckoutPreservationReason::NotCreatedForConvoy)),
             CheckoutOwnership::Advanced => return Ok(preserve(CheckoutPreservationReason::CommitsPastBase)),
@@ -227,12 +223,22 @@ impl FlotillaVcs {
             CheckoutOwnership::CheckedOutElsewhere => return Ok(preserve(CheckoutPreservationReason::CheckedOutElsewhere)),
             CheckoutOwnership::OwnedAtBase => {}
         }
+        remove_worktree_path(&*self.runner, target).await?;
+        Ok(CheckoutRemoval::Removed)
+    }
+
+    /// Apply the same checkout-preservation policy before either storage strategy removes a path.
+    async fn checkout_removal_guard(&self, branch: &str, target: &str) -> Result<Option<CheckoutRemoval>, String> {
+        let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
+        let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
+        if backend.current_branch().await?.trim() != branch {
+            return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+        }
         let status = backend.working_tree_status(false).await?;
         if !status.success || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
             return Ok(preserve(CheckoutPreservationReason::DirtyCheckout));
         }
-        remove_worktree_path(&*self.runner, target).await?;
-        Ok(CheckoutRemoval::Removed)
+        Ok(None)
     }
 
     fn cli(&self) -> GitCliBackend<'_> {
@@ -271,6 +277,11 @@ impl Vcs for FlotillaVcs {
     }
 
     async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        if self.runner.path_exists(Path::new(target)).await? {
+            if let Some(preserved) = self.checkout_removal_guard(branch, target).await? {
+                return Ok(preserved);
+            }
+        }
         if matches!(self.strategy, GitCheckoutStrategy::ReferenceClone(_)) {
             return self.remove_reference_clone(branch, target).await;
         }
@@ -1157,6 +1168,16 @@ mod tests {
         let prepared = vcs.materialise_checkout("convoy/new", Some("main"), target).await.expect("prepare worktree");
         assert_eq!(prepared.provenance, CheckoutBranchProvenance::CreatedForConvoy);
         assert_eq!(prepared.commit.as_deref().map(str::len), Some(40));
+        if replay::is_live() {
+            std::fs::write(Path::new(target).join("untracked.txt"), "keep me\n").expect("dirty file");
+        }
+        assert_eq!(
+            vcs.remove_materialised_checkout("convoy/new", target).await.expect("preserve dirty worktree"),
+            CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason: CheckoutPreservationReason::DirtyCheckout }
+        );
+        if replay::is_live() {
+            std::fs::remove_file(Path::new(target).join("untracked.txt")).expect("remove dirty file");
+        }
         assert_eq!(vcs.remove_materialised_checkout("convoy/new", target).await.expect("remove worktree"), CheckoutRemoval::Removed);
         session.finish();
     }

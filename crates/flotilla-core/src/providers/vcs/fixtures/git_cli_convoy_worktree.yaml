@@ -1,6 +1,24 @@
 rounds:
 - interactions:
   - channel: command
+    cmd: find
+    args:
+    - '.'
+    - '-path'
+    - './.git'
+    - '-prune'
+    - '-o'
+    - '-mindepth'
+    - '2'
+    - '-name'
+    - '.git'
+    - '-print'
+    - '-prune'
+    cwd: '{root}/convoy-new'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
     cmd: git
     args:
     - '-C'
@@ -85,7 +103,7 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 6e2c34d initial
+      HEAD is now at 21f659c initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -96,7 +114,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+      21f659c2825abce30753fba91302dc73cfcce647
     exit_code: 0
   - channel: command
     cmd: git
@@ -105,9 +123,58 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7'
+    - '21f659c2825abce30753fba91302dc73cfcce647'
     cwd: /
     stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - symbolic-ref
+    - '--quiet'
+    - '--short'
+    - HEAD
+    cwd: /
+    stdout: |
+      convoy/new
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - status
+    - '--porcelain'
+    cwd: /
+    stdout: |
+      ?? untracked.txt
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - symbolic-ref
+    - '--quiet'
+    - '--short'
+    - HEAD
+    cwd: /
+    stdout: |
+      convoy/new
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - status
+    - '--porcelain'
+    cwd: /
+    stdout: ''
+    stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
@@ -142,7 +209,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+      21f659c2825abce30753fba91302dc73cfcce647
     stderr: ''
     exit_code: 0
   - channel: command
@@ -155,7 +222,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+      21f659c2825abce30753fba91302dc73cfcce647
     stderr: ''
     exit_code: 0
   - channel: command
@@ -169,7 +236,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+      HEAD 21f659c2825abce30753fba91302dc73cfcce647
       branch refs/heads/main
 
     exit_code: 0
@@ -184,7 +251,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 6e2c34d).
+      Deleted branch convoy/new (was 21f659c).
     exit_code: 0
   - channel: command
     cmd: git
@@ -223,6 +290,24 @@ rounds:
     stdout: ''
     stderr: ''
     exit_code: 1
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
   - channel: command
     cmd: test
     args:
