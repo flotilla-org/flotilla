@@ -30,8 +30,10 @@ pub(crate) struct StubDaemon {
     #[builder(default = Mutex::new(None), with = |result: Result<CommandValue, String>| Mutex::new(Some(result)))]
     query_result: Mutex<Option<Result<CommandValue, String>>>,
     query_gate: Option<Arc<Semaphore>>,
-    #[builder(default = Ok(vec![]))]
-    subscribe_result: Result<Vec<DaemonEvent>, String>,
+    #[builder(default = Mutex::new(Ok(vec![])), with = |result: Result<Vec<DaemonEvent>, String>| Mutex::new(result))]
+    pub(crate) subscribe_result: Mutex<Result<Vec<DaemonEvent>, String>>,
+    #[builder(default = Arc::new(AtomicUsize::new(0)))]
+    pub(crate) subscribe_calls: Arc<AtomicUsize>,
     execute_gate: Option<Arc<Semaphore>>,
     #[builder(default = Ok(1))]
     execute_result: Result<u64, String>,
@@ -114,7 +116,8 @@ impl DaemonHandle for StubDaemon {
         _subscriber_id: uuid::Uuid,
         _queries: &[flotilla_protocol::QueryCursor],
     ) -> Result<Vec<DaemonEvent>, String> {
-        self.subscribe_result.clone()
+        self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
+        self.subscribe_result.lock().expect("subscribe result lock").clone()
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
