@@ -47,7 +47,7 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
     let query = parse_query(raw_query);
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
-    let all_provenances = query_flag(&query, &["allProvenances"]);
+    let all_provenances = query_flag(&query, &["allProvenances", "all-provenances", "all_provenances"]);
     let watch = query.get("watch").is_some_and(|value| value == "true");
 
     if let Some(name) = name {
