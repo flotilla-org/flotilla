@@ -2415,7 +2415,7 @@ fn resource_field_ownership_condition(diagnostics: Option<&flotilla_resources::R
 }
 
 fn host_capabilities(
-    _summary: &HostSummary,
+    summary: &HostSummary,
     profile: &LocalProvisioningProfile,
     held_credentials: &BTreeSet<String>,
     credential_expiry: &BTreeMap<String, CredentialExpiry>,
@@ -2425,6 +2425,7 @@ fn host_capabilities(
         (HELD_CREDENTIALS_CAPABILITY.to_string(), json!(held_credentials)),
         (CREDENTIAL_EXPIRY_CAPABILITY.to_string(), json!(credential_expiry)),
         ("docker".to_string(), json!(profile.docker_available)),
+        ("os".to_string(), json!(summary.system.os)),
         ("terminal_pools".to_string(), json!(profile.available_pools)),
     ])
 }

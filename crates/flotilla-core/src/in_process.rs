@@ -1367,6 +1367,32 @@ async fn policy_targets_agentless_ssh(backend: &ResourceBackend, namespace: &str
         .is_some_and(|host| matches!(host.spec.connection, flotilla_resources::HostConnection::AgentlessSsh { .. }))
 }
 
+async fn validate_docker_placement_host(
+    backend: &ResourceBackend,
+    namespace: &str,
+    policy: &ResourceObject<PlacementPolicy>,
+) -> Result<(), String> {
+    if policy.spec.docker_per_vessel.is_none() {
+        return Ok(());
+    }
+    let target = placement_target_host(backend, namespace, policy).await?;
+    let host = authoritative_placement_host(backend, namespace, &target, &policy.metadata.name).await?;
+    let capabilities = host.status.as_ref().map(|status| &status.capabilities);
+    if capabilities.and_then(|capabilities| capabilities.get("docker")) != Some(&serde_json::Value::Bool(true)) {
+        return Err(format!(
+            "placement `{}` host `{}` is missing docker capability required for contained vessels",
+            policy.metadata.name, target.display_name
+        ));
+    }
+    if capabilities.and_then(|capabilities| capabilities.get("os")).and_then(serde_json::Value::as_str) != Some("linux") {
+        return Err(format!(
+            "placement `{}` host `{}` is missing Linux host capability required for daemon-adjacent injection",
+            policy.metadata.name, target.display_name
+        ));
+    }
+    Ok(())
+}
+
 async fn placement_actuator_host_ref(
     backend: &ResourceBackend,
     namespace: &str,
@@ -1408,6 +1434,8 @@ async fn default_convoy_placement_policy(
             Some(format!("contained workflow requires a docker placement policy, but {} is not contained", policy.metadata.name))
         } else if contained && agentless_ssh {
             Some(format!("contained workflow cannot use agentless SSH host in placement {}", policy.metadata.name))
+        } else if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
+            Some(reason)
         } else if let Some(reason) = agentless_unready {
             Some(reason)
         } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await {
@@ -6109,6 +6137,7 @@ impl InProcessDaemon {
                 if contained && resolved.spec.docker_per_vessel.is_none() {
                     return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
                 }
+                validate_docker_placement_host(&self.resource_backend, namespace, &resolved).await?;
                 PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new(), viable_not_selected: Vec::new() }
             }
             None => {

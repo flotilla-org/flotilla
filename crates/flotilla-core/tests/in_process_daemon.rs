@@ -1669,6 +1669,8 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         Err(error) => panic!("get test placement host: {error}"),
     };
     let mut status = host.status.unwrap_or_default();
+    status.capabilities.insert("docker".to_string(), serde_json::json!(true));
+    status.capabilities.insert("os".to_string(), serde_json::json!("linux"));
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
     status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
     hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("publish test placement host capacity");
