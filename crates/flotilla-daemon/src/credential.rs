@@ -12,8 +12,9 @@ use flotilla_core::providers::{
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
 use flotilla_resources::{
-    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Project,
-    Repository, RepositoryKey, ResourceBackend, ResourceError, SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge,
+    ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError, SystemClock,
+    AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -599,7 +600,9 @@ impl CredentialStore {
         for (name, spec) in &specs {
             let git_http_host = match &spec.consumer {
                 CredentialConsumer::GitHttpToken { host, .. } => Some(canonical_git_http_host(host)),
-                CredentialConsumer::Forgejo { server_url, .. } => Some(forgejo_git_host(server_url)),
+                CredentialConsumer::Forgejo { forge_ref, .. } => {
+                    Some(self.forgejo_server_url(forge_ref).await.and_then(|url| forgejo_git_host(&url)))
+                }
                 CredentialConsumer::Gh | CredentialConsumer::GithubApp { .. } => Some(Ok("github.com".to_string())),
                 _ => None,
             };
@@ -1130,6 +1133,19 @@ impl CredentialStore {
         })
     }
 
+    async fn forgejo_server_url(&self, forge_ref: &str) -> Result<String, String> {
+        let forge = self
+            .backend
+            .definitions::<Forge>(&self.namespace)
+            .get(forge_ref)
+            .await
+            .map_err(|error| format!("Forge `{forge_ref}` unavailable: {error}"))?;
+        if forge.spec.kind != ForgeKind::Forgejo {
+            return Err(format!("Forge `{forge_ref}` is not a Forgejo forge"));
+        }
+        Ok(forge.spec.https_url)
+    }
+
     async fn source_is_available(&self, spec: &CredentialSpecSpec) -> bool {
         if spec.placement.binaries.iter().any(|binary| self.host_bag.find_binary(binary).is_none()) {
             return false;
@@ -1256,16 +1272,15 @@ impl CredentialStore {
     }
 
     async fn github_repository_names(&self, repository_scope: &BTreeSet<RepositoryKey>) -> Result<Vec<String>, String> {
-        if repository_scope.len() > 500 {
-            return Err("GitHub App repository scope exceeds the 500-repository API limit".to_string());
-        }
+        let forges =
+            self.backend.definitions::<Forge>(&self.namespace).list().await.map_err(|error| format!("list Forge definitions: {error}"))?;
         let repositories = self
             .backend
             .including_replicas::<Repository>(&self.namespace)
             .list()
             .await
             .map_err(|error| format!("list repository identities: {error}"))?;
-        let mut names = Vec::with_capacity(repository_scope.len());
+        let mut names = Vec::new();
         for key in repository_scope {
             let repository = repositories
                 .items
@@ -1274,14 +1289,41 @@ impl CredentialStore {
                 .ok_or_else(|| format!("repository scope references missing repository `{key}`"))?;
             let forge = repository.object.spec.forge().ok_or_else(|| format!("repository `{key}` has no forge identity"))?;
             let service = Url::parse(&forge.service_url).map_err(|error| format!("repository `{key}` has invalid forge URL: {error}"))?;
-            if service.host_str() != Some("github.com") {
-                return Err(format!("repository `{key}` is not hosted on github.com"));
+            let matching = match repository.object.spec.identity() {
+                RepositoryIdentity::Forge { forge_ref, .. } => {
+                    forges.iter().filter(|candidate| &candidate.spec.forge_id == forge_ref).collect::<Vec<_>>()
+                }
+                _ => {
+                    let remote = repository.object.spec.live_remote().ok_or_else(|| format!("repository `{key}` has no remote"))?;
+                    let mut matching = Vec::new();
+                    for candidate in &forges {
+                        if candidate.spec.repository_path(remote)?.is_some() {
+                            matching.push(candidate);
+                        }
+                    }
+                    matching
+                }
+            };
+            if matching.len() > 1 {
+                return Err(format!("repository `{key}` matches multiple Forge definitions"));
+            }
+            let is_github = matching
+                .first()
+                .map_or_else(|| service.host_str() == Some("github.com"), |candidate| candidate.spec.kind == ForgeKind::Github);
+            if !is_github {
+                continue;
             }
             let (_, name) = forge
                 .repository
                 .rsplit_once('/')
                 .ok_or_else(|| format!("repository `{key}` has invalid GitHub identity `{}`", forge.repository))?;
             names.push(name.to_string());
+        }
+        if names.is_empty() {
+            return Err("grant resolved to an empty GitHub repository scope".to_string());
+        }
+        if names.len() > 500 {
+            return Err("GitHub App repository scope exceeds the 500-repository API limit".to_string());
         }
         names.sort();
         names.dedup();
@@ -1402,9 +1444,10 @@ impl CredentialStore {
                     preflight: Some(GitCredentialPreflight::GithubApp { token_file }),
                 });
             }
-            CredentialConsumer::Forgejo { server_url, username } => {
+            CredentialConsumer::Forgejo { forge_ref, username } => {
                 let delivery_paths = delivery_paths.expect("Forgejo adapter resolves delivery paths");
-                let server_url = server_url.trim_end_matches('/');
+                let forgejo_url = self.forgejo_server_url(forge_ref).await?;
+                let server_url = forgejo_url.trim_end_matches('/');
                 let parsed_url = Url::parse(server_url).map_err(|error| format!("invalid Forgejo server URL: {error}"))?;
                 if parsed_url.scheme() != "https" {
                     return Err("Forgejo server URL must use HTTPS".to_string());
@@ -1835,7 +1878,8 @@ mod tests {
     };
     use flotilla_protocol::NodeId;
     use flotilla_resources::{
-        CredentialPlacementRequirements, InMemoryBackend, InputMeta, ProjectRepositorySpec, ProjectSpec, RepositorySpec, VirtualClock,
+        CredentialPlacementRequirements, ForgeSpec, InMemoryBackend, InputMeta, ProjectRepositorySpec, ProjectSpec, RepositorySpec,
+        VirtualClock,
     };
 
     use super::*;
@@ -2843,11 +2887,12 @@ interactions:
         let missing_key = RepositoryKey("missing-repository".to_string());
         let error = store.github_repository_names(&BTreeSet::from([missing_key])).await.expect_err("missing repository must fail");
         assert!(error.contains("missing repository"), "unexpected error: {error}");
-        let error = store.github_repository_names(&BTreeSet::from([non_github_key])).await.expect_err("non-GitHub repository must fail");
-        assert!(error.contains("not hosted on github.com"), "unexpected error: {error}");
+        let error =
+            store.github_repository_names(&BTreeSet::from([non_github_key])).await.expect_err("scope without GitHub repository must fail");
+        assert!(error.contains("empty GitHub repository scope"), "unexpected error: {error}");
         let oversized_scope = (0..501).map(|index| RepositoryKey(format!("repository-{index}"))).collect();
         let error = store.github_repository_names(&oversized_scope).await.expect_err("oversized repository scope must fail");
-        assert!(error.contains("500-repository API limit"), "unexpected error: {error}");
+        assert!(error.contains("missing repository"), "unexpected error: {error}");
         let mut static_spec = spec;
         static_spec.lifecycle = CredentialLifecycle::Static;
         let non_empty_scope = BTreeSet::from([RepositoryKey("not-resolved".to_string())]);
@@ -2856,6 +2901,57 @@ interactions:
             .await
             .expect_err("non-refreshable GitHub App credentials must fail");
         assert!(error.contains("must use the refreshable lifecycle"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn mixed_forge_scope_selects_only_github_repositories_for_app() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let github = ForgeSpec::builder()
+            .forge_id("github".to_string())
+            .kind(ForgeKind::Github)
+            .hosts(BTreeSet::from(["github.com".to_string()]))
+            .https_url("https://github.com".to_string())
+            .git_ssh_host("github.com".to_string())
+            .build();
+        let forgejo = ForgeSpec::builder()
+            .forge_id("lab".to_string())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["lab-alias".to_string(), "forgejo.lab".to_string()]))
+            .https_url("https://forgejo.lab".to_string())
+            .git_ssh_host("lab-alias".to_string())
+            .build();
+        for forge in [&github, &forgejo] {
+            backend
+                .definitions::<Forge>("flotilla")
+                .create(&InputMeta::builder().name(forge.forge_id.clone()).build(), forge)
+                .await
+                .expect("create Forge");
+        }
+        let github_repo = RepositorySpec::remote("https://github.com/rjwittams/ghostty")
+            .expect("GitHub repository")
+            .on_forge(&github)
+            .expect("resolve GitHub Forge");
+        let forgejo_repo = RepositorySpec::remote("https://forgejo.lab/ghostty-ops/work")
+            .expect("Forgejo repository")
+            .on_forge(&forgejo)
+            .expect("resolve Forgejo Forge");
+        for (name, repository) in [("github-repo", &github_repo), ("forgejo-repo", &forgejo_repo)] {
+            backend
+                .using::<Repository>("flotilla")
+                .create(&InputMeta::builder().name(name.to_string()).build(), repository)
+                .await
+                .expect("create repository");
+        }
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+        let scope = BTreeSet::from([github_repo.key(), forgejo_repo.key()]);
+        assert_eq!(store.github_repository_names(&scope).await.expect("partition mixed scope"), ["ghostty"]);
     }
 
     #[tokio::test]
@@ -3821,15 +3917,26 @@ interactions:
     #[tokio::test]
     async fn forgejo_and_git_http_token_credentials_for_the_same_host_fail_before_delivery() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .definitions::<Forge>("flotilla")
+            .create(
+                &InputMeta::builder().name("lab".to_string()).build(),
+                &ForgeSpec::builder()
+                    .forge_id("lab".to_string())
+                    .kind(ForgeKind::Forgejo)
+                    .hosts(BTreeSet::from(["forgejo.lab".to_string()]))
+                    .https_url("https://FORGEJO.LAB/".to_string())
+                    .git_ssh_host("forgejo.lab".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create Forge definition");
         create_git_http_token_spec(&backend, "git-only", "forgejo.lab", "TEST_GIT_TOKEN").await;
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo {
-                    server_url: "https://FORGEJO.LAB/".to_string(),
-                    username: "crew-reader".to_string(),
-                },
+                consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew-reader".to_string() },
                 source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
                 lifecycle: CredentialLifecycle::Static,
                 placement: CredentialPlacementRequirements::default(),
@@ -3856,6 +3963,50 @@ interactions:
 
         assert!(error.contains("multiple granted credentials target the same Git HTTPS host"), "unexpected error: {error}");
         assert!(runner.writes.lock().expect("writes lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn forgejo_delivery_derives_urls_from_referenced_forge() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".to_string())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo.lab".to_string()]))
+            .https_url("https://forgejo.lab".to_string())
+            .git_ssh_host("forgejo.lab".to_string())
+            .build();
+        backend
+            .definitions::<Forge>("flotilla")
+            .create(&InputMeta::builder().name("lab".to_string()).build(), &forge)
+            .await
+            .expect("create Forge definition");
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() },
+                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_FORGEJO_TOKEN".to_string(), "secret".to_string())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            PathBuf::from("/tmp/flotilla-test-state"),
+        );
+        let env: BTreeMap<_, _> = store
+            .prepare("env-a", &BTreeSet::from(["forgejo-api".to_string()]), runner)
+            .await
+            .expect("prepare Forgejo credential")
+            .into_iter()
+            .collect();
+        assert_eq!(env.get("FORGEJO_SERVER_URL").map(String::as_str), Some("https://forgejo.lab"));
+        assert_eq!(env.get("FORGEJO_API_URL").map(String::as_str), Some("https://forgejo.lab/api/v1"));
     }
 
     #[tokio::test]
