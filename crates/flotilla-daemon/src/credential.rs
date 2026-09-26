@@ -3,7 +3,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration as StdDuration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -230,6 +229,7 @@ pub(crate) struct CredentialStore {
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
+    cleaned_delivery_environments: Mutex<BTreeSet<String>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -391,11 +391,10 @@ impl CredentialStore {
     /// config base can differ from the previous one when XDG_RUNTIME_DIR
     /// becomes available, so inspect the state fallback as well.
     pub(crate) async fn cleanup_stale_github_app_token_files(&self) -> Result<(), String> {
-        let cutoff = SystemTime::now() - StdDuration::from_secs(2 * 60 * 60);
-        cleanup_stale_github_app_token_files_in(&self.state_dir, cutoff).await?;
+        cleanup_stale_github_app_token_files_in(&self.state_dir).await?;
         let base = self.delivery_paths(&*self.host_runner).await?.base;
         if base != self.state_dir {
-            cleanup_stale_github_app_token_files_in(&base, cutoff).await?;
+            cleanup_stale_github_app_token_files_in(&base).await?;
         }
         Ok(())
     }
@@ -459,6 +458,7 @@ impl CredentialStore {
             github_app_deliveries: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
+            cleaned_delivery_environments: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -660,6 +660,18 @@ impl CredentialStore {
         } else {
             None
         };
+        if specs.iter().any(|(_, spec)| matches!(spec.consumer, CredentialConsumer::GithubApp { .. })) {
+            let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
+            let mut cleaned = self.cleaned_delivery_environments.lock().await;
+            if !cleaned.contains(environment_ref) {
+                match cleanup_stale_github_app_token_files_with_runner(&*runner, &paths.base).await {
+                    Ok(()) => {
+                        cleaned.insert(environment_ref.to_string());
+                    }
+                    Err(error) => tracing::warn!(%environment_ref, %error, "failed to clean up delivered GitHub App token staging files"),
+                }
+            }
+        }
         let mut env = BTreeMap::new();
         let mut new_git_config_fragments = BTreeMap::new();
         let mut git_config_owner = None;
@@ -952,6 +964,7 @@ impl CredentialStore {
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
+        self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
@@ -1755,7 +1768,7 @@ fn github_app_token_file(paths: &CredentialDeliveryPaths, credential_name: &str)
     paths.credential_dir(credential_name).join("token")
 }
 
-async fn cleanup_stale_github_app_token_files_in(base: &Path, cutoff: SystemTime) -> Result<(), String> {
+async fn cleanup_stale_github_app_token_files_in(base: &Path) -> Result<(), String> {
     let credentials = base.join("credentials");
     let mut directories = match tokio::fs::read_dir(&credentials).await {
         Ok(directories) => directories,
@@ -1776,20 +1789,38 @@ async fn cleanup_stale_github_app_token_files_in(base: &Path, cutoff: SystemTime
                 continue;
             }
             let path = entry.path();
-            let modified = entry
-                .metadata()
-                .await
-                .and_then(|metadata| metadata.modified())
-                .map_err(|error| format!("inspect staging file: {error}"))?;
-            if modified > cutoff {
-                continue;
-            }
             tokio::fs::remove_file(&path)
                 .await
                 .map_err(|error| format!("remove stale GitHub App token staging file {}: {error}", path.display()))?;
         }
     }
     Ok(())
+}
+
+async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRunner, base: &Path) -> Result<(), String> {
+    runner
+        .run(
+            "sh",
+            &[
+                "-c",
+                "for directory in \"$1\"/credentials/*; do \
+                    [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
+                    for file in \"$directory\"/token.tmp-*; do \
+                        [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
+                        case \"${file##*/}\" in \
+                            token.tmp-????????-????-????-????-????????????) rm -f -- \"$file\" || exit 1;; \
+                        esac; \
+                    done; \
+                done",
+                "flotilla-github-app-token-cleanup",
+                &base.to_string_lossy(),
+            ],
+            Path::new("/"),
+            &ChannelLabel::Default,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("clean delivered GitHub App token staging files: {error}"))
 }
 
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
@@ -1925,7 +1956,7 @@ mod tests {
     use flotilla_core::providers::{
         discovery::EnvironmentAssertion,
         replay::{Masks, ReplayHttpClient, Session},
-        CommandOutput,
+        CommandOutput, ProcessCommandRunner,
     };
     use flotilla_protocol::NodeId;
     use flotilla_resources::{
@@ -2212,32 +2243,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_cleanup_removes_only_stale_github_app_staging_files() {
+    async fn startup_cleanup_removes_only_github_app_staging_files() {
         let state = tempfile::tempdir().expect("create state directory");
         let credential_dir = state.path().join("credentials/github-app");
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
-        let stale = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
-        let recent = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let unrelated = credential_dir.join("token.tmp-other");
-        for path in [&stale, &recent, &live, &unrelated] {
+        for path in [&abandoned, &live, &unrelated] {
             tokio::fs::write(path, "secret material").await.expect("write credential file");
         }
-        let cutoff = SystemTime::now() - StdDuration::from_secs(2 * 60 * 60);
-        for path in [&stale, &live] {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .expect("open old credential file")
-                .set_modified(cutoff - StdDuration::from_secs(1))
-                .expect("age credential file");
-        }
+        cleanup_stale_github_app_token_files_in(state.path()).await.expect("clean staging files");
 
-        cleanup_stale_github_app_token_files_in(state.path(), cutoff).await.expect("clean stale staging files");
-
-        assert!(!stale.exists());
-        assert!(recent.exists());
+        assert!(!abandoned.exists());
         assert!(unrelated.exists());
+        assert!(live.exists());
+    }
+
+    #[tokio::test]
+    async fn delivered_environment_cleanup_removes_staging_file_without_touching_live_token() {
+        let base = tempfile::tempdir().expect("create delivery base");
+        let credential_dir = base.path().join("credentials/github-app");
+        tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
+        let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let live = credential_dir.join("token");
+        tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
+        tokio::fs::write(&live, "live material").await.expect("write live token");
+
+        cleanup_stale_github_app_token_files_with_runner(&ProcessCommandRunner, base.path()).await.expect("clean delivered staging file");
+
+        assert!(!abandoned.exists());
         assert!(live.exists());
     }
 
