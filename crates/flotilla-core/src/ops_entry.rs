@@ -1,3 +1,4 @@
+use flotilla_protocol::AgentOverride;
 use flotilla_resources::{Stance, WorkflowTemplateSpec};
 use serde::Deserialize;
 
@@ -46,6 +47,7 @@ pub struct EnsureEntry {
     pub placement: Option<String>,
     pub stance: Option<Stance>,
     pub presents_as: Option<String>,
+    pub agent_overrides: Vec<AgentOverride>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +60,8 @@ struct EnsureBody {
     stance: Option<Stance>,
     #[serde(default, alias = "presents-as")]
     presents_as: Option<String>,
+    #[serde(default)]
+    agents: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +141,7 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
                 placement: body.placement,
                 stance: body.stance,
                 presents_as: body.presents_as,
+                agent_overrides: body.agents.into_iter().map(|token| token.parse()).collect::<Result<Vec<_>, _>>()?,
             };
             body.workflow = required(body.workflow, "workflow")?;
             body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
@@ -197,7 +202,8 @@ mod tests {
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),
                 presents_as: Some(presents_as),
-            }) if driver == "udder" && workflow == "quartermaster" && placement == "feta" && presents_as == "fleet"
+                agent_overrides,
+            }) if driver == "udder" && workflow == "quartermaster" && placement == "feta" && presents_as == "fleet" && agent_overrides.is_empty()
         ));
     }
 
@@ -233,10 +239,36 @@ mod tests {
                 placement: Some(placement),
                 stance: Some(flotilla_resources::Stance::Trusted),
                 presents_as: Some(presents_as),
+                agent_overrides,
             }) if workflow == "usage-observer"
                 && placement == "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
                 && presents_as == "fleet"
+                && agent_overrides.is_empty()
         ));
+    }
+
+    #[test]
+    fn ensure_agents_parse_with_cli_syntax_and_reject_invalid_tokens() {
+        let entry = parse_operational_entry(
+            "---\nkind: ensure\nrole: governor\n---\nworkflow: governor\nagents: [claude-code:claude-fable-5-1, review=codex]\n",
+        )
+        .expect("parse")
+        .expect("entry");
+        let OperationalEntryDefinition::Ensure(ensure) = entry.definition else {
+            panic!("ensure entry");
+        };
+        assert_eq!(ensure.agent_overrides, vec![
+            "claude-code:claude-fable-5-1".parse().expect("bare override"),
+            "review=codex".parse().expect("scoped override"),
+        ]);
+
+        for token in ["governor=", "governor=claude-code:", "governor role=claude-code", "governor=claude-code:bad model"] {
+            let contents = format!("---\nkind: ensure\nrole: governor\n---\nworkflow: governor\nagents: ['{token}']\n");
+            assert!(parse_operational_entry(&contents).expect_err("invalid agent override").contains("agent override must be"));
+        }
+        let error = parse_operational_entry("---\nkind: ensure\nrole: governor\n---\nworkflow: governor\nagent: claude-code\n")
+            .expect_err("unknown agent field");
+        assert!(error.contains("unknown field `agent`"));
     }
 
     #[test]
