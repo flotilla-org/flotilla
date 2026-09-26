@@ -293,6 +293,7 @@ async fn create_returns_handle() {
     assert_eq!(cmd, "docker");
     assert_eq!(args[0], "run");
     assert!(args.contains(&"-d".to_string()), "should detach");
+    assert!(args.contains(&"--init".to_string()), "docker should reap orphaned processes; args: {args:?}");
     assert!(args.contains(&"--name".to_string()), "should set name");
     assert!(args.contains(&"--label".to_string()), "should set label");
     assert!(args.contains(&"sleep".to_string()), "should run sleep infinity");
@@ -338,7 +339,6 @@ async fn create_runs_container_as_the_host_user() {
 
     let calls = runner.calls();
     let (_, args, _) = &calls[0];
-    assert!(args.contains(&"--init".to_string()), "docker should reap orphaned processes; args: {args:?}");
     // SAFETY: getuid and getgid are side-effect-free process identity queries.
     let host_user = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
     assert!(
