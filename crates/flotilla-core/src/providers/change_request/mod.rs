@@ -1,3 +1,4 @@
+pub mod forgejo;
 pub mod github;
 
 use async_trait::async_trait;

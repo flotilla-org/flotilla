@@ -3,13 +3,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use flotilla_resources::ForgeKind;
 
 use crate::{
     config::{ConfigStore, ForgejoIssueTrackerConfig},
     path_context::ExecutionEnvironmentPath,
     providers::{
-        change_request::{github::GitHubChangeRequest, ChangeRequestTracker},
-        discovery::{EnvironmentBag, Factory, HostPlatform, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        change_request::{forgejo::ForgejoChangeRequestProvider, github::GitHubChangeRequest, ChangeRequestTracker},
+        discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         github_api::GhApiClient,
         issue_tracker::{
             forgejo::{ForgejoAuth, ForgejoIssueProvider, ForgejoIssueProviderConfig},
@@ -25,14 +26,16 @@ pub(super) fn github_repo_slug(env: &EnvironmentBag) -> Result<String, Vec<Unmet
     if env.find_binary("gh").is_none() {
         unmet.push(UnmetRequirement::MissingBinary("gh".into()));
     }
-    let remote = env.find_remote_host(HostPlatform::GitHub);
+    let remote = env.find_origin_remote().filter(|(host, _, _)| {
+        env.find_origin_forge().map_or_else(|| host.eq_ignore_ascii_case("github.com"), |forge| forge.kind == ForgeKind::Github)
+    });
     if remote.is_none() {
-        unmet.push(UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub));
+        unmet.push(UnmetRequirement::MissingRemoteHost("github.com".into()));
     }
     if !unmet.is_empty() {
         return Err(unmet);
     }
-    let (owner, repo, _remote_name) = remote.expect("checked above");
+    let (_, owner, repo) = remote.expect("checked above");
     Ok(format!("{owner}/{repo}"))
 }
 
@@ -118,27 +121,65 @@ impl Factory for ForgejoIssueProviderFactory {
 
     async fn probe(
         &self,
-        _env: &EnvironmentBag,
+        env: &EnvironmentBag,
         config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
-        let Some(forgejo) = config.load_config().issue_tracker.forgejo else {
-            return Err(vec![UnmetRequirement::MissingConfig("[issue_tracker.forgejo]".into())]);
-        };
-        let service_url = forgejo
-            .service_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| vec![UnmetRequirement::MissingConfig("[issue_tracker.forgejo].service_url".into())])?;
-        let auth = resolve_forgejo_auth(config, &forgejo).map_err(|error| {
-            tracing::warn!(%error, "Forgejo authentication unavailable");
-            vec![UnmetRequirement::MissingAuth("forgejo".into())]
-        })?;
-        let provider_config = ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth);
+        let provider_config = forgejo_provider_config(env, config)?;
         Ok(Arc::new(ForgejoIssueProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config)))
     }
+}
+
+pub struct ForgejoChangeRequestFactory;
+
+#[async_trait]
+impl Factory for ForgejoChangeRequestFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn ChangeRequestTracker;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(
+            ProviderCategory::ChangeRequest,
+            "forgejo",
+            "Forgejo Pull Requests",
+            "PR",
+            "Pull Requests",
+            "pull request",
+        )
+    }
+
+    async fn probe(
+        &self,
+        env: &EnvironmentBag,
+        config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
+        if !env.find_origin_forge().is_some_and(|forge| forge.kind == ForgeKind::Forgejo) {
+            return Err(vec![UnmetRequirement::MissingRemoteHost("Forgejo origin".into())]);
+        }
+        let provider_config = forgejo_provider_config(env, config)?;
+        let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
+        Ok(Arc::new(ForgejoChangeRequestProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config, slug)))
+    }
+}
+
+fn forgejo_provider_config(env: &EnvironmentBag, config: &ConfigStore) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
+    let forge = env.find_origin_forge().filter(|forge| forge.kind == ForgeKind::Forgejo);
+    let forgejo = config.load_config().issue_tracker.forgejo.unwrap_or_default();
+    let service_url = forgejo
+        .service_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .or_else(|| forge.map(|forge| forge.https_url.as_str()))
+        .ok_or_else(|| vec![UnmetRequirement::MissingConfig("[issue_tracker.forgejo].service_url or Forge".into())])?;
+    let auth = resolve_forgejo_auth(config, &forgejo).map_err(|error| {
+        tracing::warn!(%error, "Forgejo authentication unavailable");
+        vec![UnmetRequirement::MissingAuth("forgejo".into())]
+    })?;
+    Ok(ForgejoIssueProviderConfig::new(service_url.into(), forgejo.api_base_url, auth))
 }
 
 fn resolve_forgejo_auth(config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
@@ -202,22 +243,23 @@ fn config_path(config_parent: &std::path::Path, path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use flotilla_protocol::{IssueRef, IssueSource};
+    use flotilla_resources::{ForgeKind, ForgeSpec};
 
-    use super::{config_path, ForgejoIssueProviderFactory, GitHubChangeRequestFactory, GitHubIssueProviderFactory};
+    use super::{
+        config_path, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory, GitHubChangeRequestFactory, GitHubIssueProviderFactory,
+    };
     use crate::{
         config::ConfigStore,
         path_context::ExecutionEnvironmentPath,
-        providers::discovery::{
-            test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, HostPlatform, UnmetRequirement,
-        },
+        providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
     fn bag_with_gh_and_github_remote() -> EnvironmentBag {
         EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")).with(EnvironmentAssertion::remote_host(
-            HostPlatform::GitHub,
+            "github.com",
             "acme",
             "widgets",
             "origin",
@@ -225,7 +267,7 @@ mod tests {
     }
 
     fn bag_with_github_remote_only() -> EnvironmentBag {
-        EnvironmentBag::new().with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "acme", "widgets", "origin"))
+        EnvironmentBag::new().with(EnvironmentAssertion::remote_host("github.com", "acme", "widgets", "origin"))
     }
 
     fn bag_with_gh_binary_only() -> EnvironmentBag {
@@ -253,7 +295,7 @@ mod tests {
         let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without gh binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
-        assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
+        assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost("github.com".into())));
     }
 
     #[tokio::test]
@@ -264,7 +306,7 @@ mod tests {
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without remote host");
-        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
+        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost("github.com".into())));
         assert!(!unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
     }
 
@@ -277,7 +319,7 @@ mod tests {
         let result = GitHubChangeRequestFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail with both missing");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
-        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
+        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost("github.com".into())));
         assert_eq!(unmet.len(), 2);
     }
 
@@ -313,7 +355,7 @@ mod tests {
         let result = GitHubIssueProviderFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without gh binary");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
-        assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
+        assert!(!unmet.contains(&UnmetRequirement::MissingRemoteHost("github.com".into())));
     }
 
     #[tokio::test]
@@ -397,6 +439,30 @@ mod tests {
         .expect("write config");
     }
 
+    #[tokio::test]
+    async fn forgejo_origin_binds_issue_and_change_request_without_config_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_token(dir.path(), "lab-forgejo-coder-token");
+        let config = ConfigStore::with_base(dir.path().join("flotilla"));
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo.lab.flotilla.work".into()]))
+            .https_url("https://forgejo.lab.flotilla.work".into())
+            .git_ssh_host("forgejo.lab.flotilla.work".into())
+            .build();
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::remote_host("forgejo.lab.flotilla.work", "lab", "flotilla", "origin"))
+            .with(EnvironmentAssertion::origin_forge(forge));
+        let root = ExecutionEnvironmentPath::new("/repo");
+        let runner = Arc::new(DiscoveryMockRunner::builder().build());
+        let issues = ForgejoIssueProviderFactory.probe(&bag, &config, &root, runner.clone()).await.expect("Forgejo issue source");
+        let changes = ForgejoChangeRequestFactory.probe(&bag, &config, &root, runner).await.expect("Forgejo CR source");
+        assert!(issues.supports(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() }));
+        assert_eq!(ForgejoChangeRequestFactory.descriptor().implementation, "forgejo");
+        let _ = changes;
+    }
+
     #[test]
     fn config_path_expands_home_relative_token_paths() {
         let Some(home) = dirs::home_dir() else {
@@ -441,7 +507,7 @@ mod tests {
             .await
             .expect("Forgejo issue provider should use configured token agent");
 
-        assert!(provider.supports(&IssueSource { service: "forgejo".into(), scope: "team/widgets".into() }));
+        assert!(provider.supports(&IssueSource { service: "https://forgejo.example.test".into(), scope: "team/widgets".into() }));
     }
 
     #[tokio::test]
@@ -458,7 +524,7 @@ mod tests {
 
         assert!(unmet
             .iter()
-            .any(|requirement| matches!(requirement, UnmetRequirement::MissingConfig(key) if key == "[issue_tracker.forgejo]")));
+            .any(|requirement| matches!(requirement, UnmetRequirement::MissingConfig(key) if key == "[issue_tracker.forgejo].service_url or Forge")));
     }
 
     #[tokio::test]
@@ -477,7 +543,7 @@ mod tests {
             .expect("should fail without Forgejo service URL");
 
         assert!(unmet.iter().any(
-            |requirement| matches!(requirement, UnmetRequirement::MissingConfig(key) if key == "[issue_tracker.forgejo].service_url")
+            |requirement| matches!(requirement, UnmetRequirement::MissingConfig(key) if key == "[issue_tracker.forgejo].service_url or Forge")
         ));
     }
 

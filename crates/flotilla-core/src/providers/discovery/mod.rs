@@ -21,6 +21,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::EnvironmentId;
+use flotilla_resources::ForgeSpec;
 use futures::stream;
 use tokio::sync::OnceCell as AsyncOnceCell;
 
@@ -34,7 +35,7 @@ use crate::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
-        issue_tracker::{provider_for_source, IssueProvider},
+        issue_tracker::IssueProvider,
         presentation::PresentationManager,
         registry::{ProviderRegistry, ProviderSet},
         scan_cache::{SharedPresentationManager, SharedTerminalPool},
@@ -54,18 +55,13 @@ pub enum VcsKind {
     Jujutsu,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HostPlatform {
-    GitHub,
-    GitLab,
-}
-
 #[derive(Debug, Clone)]
 pub enum EnvironmentAssertion {
     BinaryAvailable { name: String, path: ExecutionEnvironmentPath, version: Option<String> },
     EnvVarSet { key: String, value: String },
     VcsCheckoutDetected { root: ExecutionEnvironmentPath, kind: VcsKind, is_main_checkout: bool },
-    RemoteHost { platform: HostPlatform, owner: String, repo: String, remote_name: String },
+    RemoteHost { host: String, owner: String, repo: String, remote_name: String },
+    OriginForge { spec: ForgeSpec },
     AuthFileExists { provider: String, path: ExecutionEnvironmentPath },
     SocketAvailable { name: String, path: DaemonHostPath },
 }
@@ -87,8 +83,12 @@ impl EnvironmentAssertion {
         Self::VcsCheckoutDetected { root: ExecutionEnvironmentPath::new(root.into()), kind, is_main_checkout }
     }
 
-    pub fn remote_host(platform: HostPlatform, owner: impl Into<String>, repo: impl Into<String>, remote_name: impl Into<String>) -> Self {
-        Self::RemoteHost { platform, owner: owner.into(), repo: repo.into(), remote_name: remote_name.into() }
+    pub fn remote_host(host: impl Into<String>, owner: impl Into<String>, repo: impl Into<String>, remote_name: impl Into<String>) -> Self {
+        Self::RemoteHost { host: host.into(), owner: owner.into(), repo: repo.into(), remote_name: remote_name.into() }
+    }
+
+    pub fn origin_forge(spec: ForgeSpec) -> Self {
+        Self::OriginForge { spec }
     }
 
     pub fn auth_file(provider: impl Into<String>, path: impl Into<PathBuf>) -> Self {
@@ -143,13 +143,12 @@ impl EnvironmentBag {
         })
     }
 
-    /// Find a remote host matching the given platform.
-    /// Prefers `origin` over other remotes; falls back to the first match.
-    pub fn find_remote_host(&self, platform: HostPlatform) -> Option<(&str, &str, &str)> {
+    /// Find a remote matching a host, preferring origin.
+    pub fn find_remote_host(&self, host: &str) -> Option<(&str, &str, &str)> {
         let mut first_match = None;
         for a in &self.assertions {
-            if let EnvironmentAssertion::RemoteHost { platform: p, owner, repo, remote_name } = a {
-                if *p == platform {
+            if let EnvironmentAssertion::RemoteHost { host: candidate, owner, repo, remote_name } = a {
+                if candidate.eq_ignore_ascii_case(host) {
                     if remote_name == "origin" {
                         return Some((owner.as_str(), repo.as_str(), remote_name.as_str()));
                     }
@@ -160,6 +159,22 @@ impl EnvironmentBag {
             }
         }
         first_match
+    }
+
+    pub fn find_origin_remote(&self) -> Option<(&str, &str, &str)> {
+        self.assertions.iter().find_map(|a| match a {
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } if remote_name == "origin" => {
+                Some((host.as_str(), owner.as_str(), repo.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    pub fn find_origin_forge(&self) -> Option<&ForgeSpec> {
+        self.assertions.iter().find_map(|a| match a {
+            EnvironmentAssertion::OriginForge { spec } => Some(spec),
+            _ => None,
+        })
     }
 
     pub fn remote_hosts(&self) -> Vec<&EnvironmentAssertion> {
@@ -191,11 +206,9 @@ impl EnvironmentBag {
         })
     }
 
-    /// Return `owner/repo` from the first remote host found (GitHub preferred).
+    /// Return `owner/repo` from origin.
     pub fn repo_slug(&self) -> Option<String> {
-        self.find_remote_host(HostPlatform::GitHub)
-            .or_else(|| self.find_remote_host(HostPlatform::GitLab))
-            .map(|(owner, repo, _)| format!("{owner}/{repo}"))
+        self.find_origin_remote().map(|(_, owner, repo)| format!("{owner}/{repo}"))
     }
 
     /// Create a new bag containing assertions from both `self` and `other`.
@@ -207,20 +220,16 @@ impl EnvironmentBag {
 
     /// Derive a `RepoIdentity` from the environment bag.
     ///
-    /// Delegates to [`find_remote_host`] so the origin-preference logic is
-    /// shared with `repo_slug()`.
+    /// Uses the origin remote, whose authority is independent of the forge kind.
     pub fn repo_identity(&self) -> Option<flotilla_protocol::RepoIdentity> {
-        let platforms = [HostPlatform::GitHub, HostPlatform::GitLab];
-        for platform in platforms {
-            if let Some((owner, repo, _)) = self.find_remote_host(platform) {
-                let authority = match platform {
-                    HostPlatform::GitHub => "github.com",
-                    HostPlatform::GitLab => "gitlab.com",
-                };
-                return Some(flotilla_protocol::RepoIdentity { authority: authority.into(), path: format!("{owner}/{repo}") });
-            }
-        }
-        None
+        self.find_origin_remote().map(|(host, owner, repo)| {
+            let authority = self
+                .find_origin_forge()
+                .and_then(|forge| forge.https_url.strip_prefix("https://"))
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(host);
+            flotilla_protocol::RepoIdentity { authority: authority.into(), path: format!("{owner}/{repo}") }
+        })
     }
 }
 
@@ -246,7 +255,7 @@ pub enum UnmetRequirement {
     MissingEnvVar(String),
     MissingAuth(String),
     MissingConfig(String),
-    MissingRemoteHost(HostPlatform),
+    MissingRemoteHost(String),
     NoVcsCheckout,
     /// Config references a backend or implementation that no factory provides.
     UnknownProviderPreference {
@@ -529,20 +538,12 @@ pub(crate) struct HostRegistry {
 
 #[derive(Clone, Default)]
 pub(crate) struct HostScopedDiscovery {
-    issue_trackers: Vec<(ProviderDescriptor, Arc<dyn IssueProvider>)>,
     registry: HostRegistry,
     unmet: Vec<(String, UnmetRequirement)>,
 }
 
 impl HostScopedDiscovery {
-    pub(crate) fn issue_provider_for(&self, source: &flotilla_protocol::IssueSource) -> Option<Arc<dyn IssueProvider>> {
-        provider_for_source(self.issue_trackers.iter().map(|(_, provider)| provider), source)
-    }
-
     fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
-        for (descriptor, provider) in &self.issue_trackers {
-            registry.issue_trackers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
-        }
         registry.agent_adapters = self.registry.agent_adapters.clone();
         for (descriptor, provider) in &self.registry.cloud_agents {
             registry.cloud_agents.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
@@ -611,8 +612,7 @@ impl HostScopedProviderCache {
             .clone();
 
         cell.get_or_init(|| async {
-            let (issue_trackers, mut unmet) =
-                probe_host_category(&factories.issue_trackers, host_bag, config, probe_root, &runner, |provider| provider).await;
+            let mut unmet = Vec::new();
             let (cloud_agents, cloud_agent_unmet) =
                 probe_host_category(&factories.cloud_agents, host_bag, config, probe_root, &runner, |provider| provider).await;
             unmet.extend(cloud_agent_unmet);
@@ -636,7 +636,6 @@ impl HostScopedProviderCache {
             unmet.extend(environment_provider_unmet);
 
             HostScopedDiscovery {
-                issue_trackers,
                 registry: HostRegistry::builder()
                     .agent_adapters(AgentAdapterRegistry::discover(host_bag, Arc::clone(&runner)))
                     .cloud_agents(cloud_agents)
@@ -790,12 +789,10 @@ async fn discover_providers_inner(
         registry.change_requests.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    if host_scoped.is_none() {
-        probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-            registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
-        })
-        .await;
-    }
+    probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+        registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
+    })
+    .await;
     if host_scoped.is_none() {
         probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
             registry.cloud_agents.insert(desc.implementation.clone(), desc, provider);

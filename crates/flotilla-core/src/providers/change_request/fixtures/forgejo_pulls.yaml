@@ -1,0 +1,22 @@
+rounds:
+- interactions:
+  - channel: http
+    method: GET
+    url: https://forgejo.lab.flotilla.work/api/v1/repos/lab/flotilla/pulls?state=open&limit=10&page=1
+    request_headers:
+      authorization: token <LAB_FORGEJO_TOKEN>
+      accept: application/json
+    status: 200
+    response_body: |
+      []
+    response_headers:
+      cache-control: max-age=0, private, must-revalidate
+      x-frame-options: SAMEORIGIN
+      content-length: '3'
+      access-control-expose-headers: X-Total-Count
+      x-content-type-options: nosniff
+      alt-svc: h3=":443"; ma=2592000
+      via: '1.1 Caddy'
+      content-type: application/json;charset=utf-8
+      date: Sat, 26 Sep 2026 13:55:41 GMT
+      x-total-count: '0'
