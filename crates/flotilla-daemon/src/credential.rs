@@ -12,8 +12,8 @@ use flotilla_core::providers::{
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
 use flotilla_resources::{
-    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Repository,
-    RepositoryKey, ResourceBackend, ResourceError, SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Project,
+    Repository, RepositoryKey, ResourceBackend, ResourceError, SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -241,6 +241,13 @@ struct GithubAppDelivery {
     expires_at: DateTime<Utc>,
     refresh_failures: usize,
     installation_repository: Option<String>,
+    scope: Option<GithubAppScope>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GithubAppScope {
+    pub(crate) fixed_repositories: BTreeSet<RepositoryKey>,
+    pub(crate) projects: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -691,6 +698,7 @@ impl CredentialStore {
                             CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
                             _ => None,
                         },
+                        scope: None,
                     },
                 );
             }
@@ -1021,17 +1029,29 @@ impl CredentialStore {
     /// receive only the resulting file and never the App signing material.
     pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
         let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
-        let due = self
-            .github_app_deliveries
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, delivery)| delivery.expires_at <= refresh_before)
-            .map(|(key, delivery)| (key.clone(), delivery.clone()))
-            .collect::<Vec<_>>();
+        let deliveries =
+            self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
         let mut errors = Vec::new();
-        for (key, delivery) in due {
+        for (key, delivery) in deliveries {
             let mut request = delivery.request.clone();
+            if let Some(scope) = &delivery.scope {
+                let repositories = match self.resolve_github_app_scope(scope).await {
+                    Ok(repositories) => repositories,
+                    Err(error) => {
+                        let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                        errors.push(CredentialRefreshError {
+                            environment_ref: key.0.clone(),
+                            message: bounded_adapter_error(&key.1, "github-app", &error),
+                            should_surface,
+                        });
+                        continue;
+                    }
+                };
+                request.repositories = repositories;
+            }
+            if delivery.expires_at > refresh_before && request.repositories == delivery.request.repositories {
+                continue;
+            }
             let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                 Ok(token) => token,
                 Err(error) => {
@@ -1068,6 +1088,28 @@ impl CredentialStore {
             current.request = request;
         }
         errors
+    }
+
+    pub(crate) async fn set_github_app_scopes(&self, environment_ref: &str, scopes: &BTreeMap<String, GithubAppScope>) {
+        let mut deliveries = self.github_app_deliveries.lock().await;
+        for (name, scope) in scopes {
+            if let Some(delivery) = deliveries.get_mut(&(environment_ref.to_string(), name.clone())) {
+                delivery.scope = Some(scope.clone());
+            }
+        }
+    }
+
+    async fn resolve_github_app_scope(&self, scope: &GithubAppScope) -> Result<Vec<String>, String> {
+        let mut repositories = scope.fixed_repositories.clone();
+        let projects = self.backend.including_replicas::<Project>(&self.namespace);
+        for name in &scope.projects {
+            let project = projects.get(name).await.map_err(|error| format!("project `{name}` unavailable: {error}"))?;
+            repositories.extend(project.object.spec.repositories.iter().map(|repository| repository.repo.clone()));
+        }
+        if repositories.is_empty() {
+            return Err("grant resolved to an empty repository scope".to_string());
+        }
+        self.github_repository_names(&repositories).await
     }
 
     async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
@@ -1773,7 +1815,9 @@ mod tests {
         CommandOutput,
     };
     use flotilla_protocol::NodeId;
-    use flotilla_resources::{CredentialPlacementRequirements, InMemoryBackend, InputMeta, RepositorySpec, VirtualClock};
+    use flotilla_resources::{
+        CredentialPlacementRequirements, InMemoryBackend, InputMeta, ProjectRepositorySpec, ProjectSpec, RepositorySpec, VirtualClock,
+    };
 
     use super::*;
 
@@ -1841,6 +1885,101 @@ mod tests {
                 .unwrap_or_else(|| Err("no fake token available".to_string()))
                 .map_err(GithubAppMintError::Other)
         }
+    }
+
+    #[tokio::test]
+    async fn project_membership_remints_live_token_without_widening_fixed_scope() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { value: "project-initial".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "fixed-initial".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "project-expanded".to_string(), expires_at: now + Duration::hours(1) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let first = RepositorySpec::remote("https://github.com/flotilla-org/first").expect("first repository");
+        let second = RepositorySpec::remote("https://github.com/flotilla-org/second").expect("second repository");
+        for (name, spec) in [("first", &first), ("second", &second)] {
+            backend
+                .clone()
+                .using::<Repository>("flotilla")
+                .create(&InputMeta::builder().name(name.to_string()).build(), spec)
+                .await
+                .expect("create repository");
+        }
+        let project = |repositories: Vec<RepositoryKey>| {
+            ProjectSpec::builder()
+                .display_name("Island".to_string())
+                .default_workflow_ref("workflow".to_string())
+                .repositories(repositories.into_iter().map(|repo| ProjectRepositorySpec::builder().repo(repo).build()).collect())
+                .build()
+        };
+        let projects = backend.clone().using::<Project>("flotilla");
+        projects
+            .create(&InputMeta::builder().name("island".to_string()).build(), &project(vec![first.key()]))
+            .await
+            .expect("create project");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+                source: CredentialSource::GithubApp {
+                    app_id_path: "/host-only/github-app.id".to_string(),
+                    private_key_path: "/host-only/github-app.pem".to_string(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("create credential declaration");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock, minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let initial = BTreeMap::from([("github-app".to_string(), BTreeSet::from([first.key()]))]);
+        store.prepare_scoped("project-env", &refs, &initial, runner.clone()).await.expect("prepare project credential");
+        store.prepare_scoped("fixed-env", &refs, &initial, runner.clone()).await.expect("prepare fixed credential");
+        store
+            .set_github_app_scopes(
+                "project-env",
+                &BTreeMap::from([("github-app".to_string(), GithubAppScope {
+                    fixed_repositories: BTreeSet::new(),
+                    projects: BTreeSet::from(["island".to_string()]),
+                })]),
+            )
+            .await;
+        store
+            .set_github_app_scopes(
+                "fixed-env",
+                &BTreeMap::from([("github-app".to_string(), GithubAppScope {
+                    fixed_repositories: BTreeSet::from([first.key()]),
+                    projects: BTreeSet::new(),
+                })]),
+            )
+            .await;
+        projects.delete("island").await.expect("remove old project membership");
+        projects
+            .create(&InputMeta::builder().name("island".to_string()).build(), &project(vec![first.key(), second.key()]))
+            .await
+            .expect("expand project membership");
+
+        assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        let requests = minter.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 3, "membership change remints before expiry; explicit scope stays unchanged");
+        assert_eq!(requests[2].repositories, ["first", "second"]);
+        let token_writes = runner.writes.lock().expect("writes lock");
+        assert!(token_writes.iter().any(|(_, contents)| contents.contains("project-expanded")));
     }
 
     type RecordedCall = (String, Vec<String>, Vec<u8>);
