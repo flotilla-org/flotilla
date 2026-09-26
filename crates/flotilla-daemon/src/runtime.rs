@@ -44,9 +44,9 @@ use flotilla_resources::{
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
     HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass,
-    Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
+    HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
+    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy,
+    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
     AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
@@ -59,7 +59,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     agent_material::AgentMaterialRegistry,
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
-    credential::{CredentialRefreshError, CredentialStore},
+    credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
     resource_limits::file_descriptor_pressure_condition,
@@ -1290,8 +1290,24 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     let convoys =
         convoy_sources.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list credential vessels: {error}"))?;
-    type Delivery = (BTreeSet<String>, BTreeSet<String>, BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>);
+    let grants = backend
+        .including_replicas::<flotilla_resources::CredentialGrant>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list credential grants: {error}"))?
+        .items
+        .into_iter()
+        .map(|grant| grant.object.spec)
+        .collect::<Vec<_>>();
+    type Delivery = (
+        BTreeSet<String>,
+        BTreeSet<String>,
+        BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
+        BTreeMap<String, GithubAppScope>,
+    );
     let mut deliveries = BTreeMap::<String, Delivery>::new();
+    let mut placement_cache = BTreeMap::<String, Result<PlacementPolicySpec, String>>::new();
+    let mut scope_errors = BTreeMap::<String, String>::new();
     for vessel in vessels.items {
         let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
@@ -1314,12 +1330,53 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
         else {
             continue;
         };
-        let (granted, running, scopes) = deliveries.entry(environment_ref.clone()).or_default();
+        let (granted, running, scopes, live_scopes) = deliveries.entry(environment_ref.clone()).or_default();
         granted.extend(requirement.credential_refs.iter().cloned());
         if work.phase == flotilla_resources::WorkPhase::Running && !status.phase.is_terminal() {
             running.extend(requirement.credential_refs.iter().cloned());
             for (name, repositories) in &requirement.credential_scopes {
                 scopes.entry(name.clone()).or_default().extend(repositories.iter().cloned());
+            }
+            if requirement.credential_scopes.is_empty() {
+                continue;
+            }
+            let placement = if let Some(name) = flotilla_resources::pinned_placement_ref(convoy) {
+                if !placement_cache.contains_key(name) {
+                    let result = backend
+                        .including_replicas::<PlacementPolicy>(namespace)
+                        .get(name)
+                        .await
+                        .map(|placement| placement.object.spec)
+                        .map_err(|error| format!("credential placement `{name}` unavailable: {error}"));
+                    placement_cache.insert(name.to_string(), result);
+                }
+                match placement_cache.get(name).expect("placement was cached") {
+                    Ok(placement) => Some(placement),
+                    Err(error) => {
+                        scope_errors.insert(environment_ref.clone(), error.clone());
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let stance = match placement {
+                Some(spec) if spec.docker_per_vessel.is_some() => Stance::Contained,
+                Some(spec) if spec.host_direct.is_some() => Stance::Trusted,
+                _ => requirement.stance,
+            };
+            for (name, repositories) in &requirement.credential_scopes {
+                let scope = github_app_scope_from_grants(
+                    name,
+                    repositories,
+                    convoy.spec.project_ref.as_deref(),
+                    stance,
+                    requirement.repository_refs.is_some(),
+                    &grants,
+                );
+                let entry = live_scopes.entry(name.clone()).or_default();
+                entry.fixed_repositories.extend(scope.fixed_repositories);
+                entry.projects.extend(scope.projects);
             }
         }
     }
@@ -1328,7 +1385,11 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
         deliveries.entry(environment_ref).or_default().0.extend(previously_delivered);
     }
     let mut errors = Vec::new();
-    for (environment_ref, (granted, running, scopes)) in deliveries {
+    for (environment_ref, (granted, running, scopes, live_scopes)) in deliveries {
+        if let Some(error) = scope_errors.remove(&environment_ref) {
+            errors.push(format!("resolve credential scope for environment {environment_ref}: {error}"));
+            continue;
+        }
         if granted.is_empty() {
             continue;
         }
@@ -1352,6 +1413,7 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
                     .adopt_github_app_deliveries(&environment_ref, &running, &scopes, runner.clone())
                     .await
                     .map_err(|error| format!("mint work credentials for environment {environment_ref}: {}", error.message))?;
+                store.set_github_app_scopes(&environment_ref, &live_scopes).await;
             }
             store
                 .reconcile_work_delivery(&environment_ref, &granted, &running, &scopes, runner)
@@ -1368,6 +1430,37 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn github_app_scope_from_grants(
+    credential: &str,
+    repositories: &BTreeSet<flotilla_resources::RepositoryKey>,
+    project: Option<&str>,
+    stance: Stance,
+    vessel_repositories_pinned: bool,
+    grants: &[flotilla_resources::CredentialGrantSpec],
+) -> GithubAppScope {
+    let mut scope = GithubAppScope::default();
+    let mut matched = false;
+    for grant in grants {
+        if !grant.credentials.contains(credential) || !grant.selector.matches(stance, project, repositories) {
+            continue;
+        }
+        matched = true;
+        if !grant.selector.projects.is_empty() && grant.selector.repositories.is_empty() && !vessel_repositories_pinned {
+            if let Some(project) = project {
+                scope.projects.insert(project.to_string());
+            }
+        } else if grant.selector.repositories.is_empty() {
+            scope.fixed_repositories.extend(repositories.iter().cloned());
+        } else {
+            scope.fixed_repositories.extend(grant.selector.repositories.intersection(repositories).cloned());
+        }
+    }
+    if !matched {
+        scope.fixed_repositories.extend(repositories.iter().cloned());
+    }
+    scope
 }
 
 async fn fail_unavailable_environment(
@@ -4372,6 +4465,48 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[test]
+    fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {
+        let original = RepositoryKey("first".to_string());
+        let other = RepositoryKey("other".to_string());
+        let repositories = BTreeSet::from([original.clone()]);
+        let grant = |projects: BTreeSet<String>, repositories: BTreeSet<RepositoryKey>| {
+            flotilla_resources::CredentialGrantSpec::builder()
+                .selector(
+                    flotilla_resources::CredentialGrantSelector::builder()
+                        .stance(Stance::Contained)
+                        .projects(projects)
+                        .repositories(repositories)
+                        .build(),
+                )
+                .credentials(BTreeSet::from(["github-app".to_string()]))
+                .build()
+        };
+        let project_grant = grant(BTreeSet::from(["island".to_string()]), BTreeSet::new());
+        let explicit_grant = grant(BTreeSet::from(["island".to_string()]), BTreeSet::from([original.clone(), other]));
+        let non_project_grant = grant(BTreeSet::new(), BTreeSet::new());
+
+        let dynamic = github_app_scope_from_grants(
+            "github-app",
+            &repositories,
+            Some("island"),
+            Stance::Contained,
+            false,
+            std::slice::from_ref(&project_grant),
+        );
+        assert_eq!(dynamic.projects, BTreeSet::from(["island".to_string()]));
+        assert!(dynamic.fixed_repositories.is_empty());
+
+        for grant in [explicit_grant, non_project_grant] {
+            let scope = github_app_scope_from_grants("github-app", &repositories, Some("island"), Stance::Contained, false, &[grant]);
+            assert!(scope.projects.is_empty());
+            assert_eq!(scope.fixed_repositories, repositories);
+        }
+        let pinned = github_app_scope_from_grants("github-app", &repositories, Some("island"), Stance::Contained, true, &[project_grant]);
+        assert!(pinned.projects.is_empty());
+        assert_eq!(pinned.fixed_repositories, repositories);
+    }
 
     fn fixed_environment_tools(state_root: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
         EnvironmentToolProvisioner::fixed(
@@ -8127,20 +8262,37 @@ mod tests {
             }
         };
 
-        let current = convoys.get("credential-work").await.expect("read convoy");
-        let mut status = current.status.expect("convoy status");
-        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(
-            VesselRequirement::builder()
-                .name("unavailable".to_string())
-                .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                .crew(Vec::new())
-                .build(),
-        );
-        status.work.insert("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build());
-        convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("add unavailable work");
+        let unavailable_convoy = convoys
+            .create(
+                &empty_meta("unavailable-credential-work"),
+                &ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("missing-policy".to_string()).build(),
+            )
+            .await
+            .expect("create convoy with unavailable placement");
+        convoys
+            .update_status(&unavailable_convoy.metadata.name, &unavailable_convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("unavailable".to_string())
+                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                        .credential_scopes(BTreeMap::from([(
+                            "work-token".to_string(),
+                            BTreeSet::from([RepositoryKey("repo".to_string())]),
+                        )]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                work: BTreeMap::from([("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("mark unavailable work running");
         let unavailable_vessel = vessels
             .create(&empty_meta("unavailable-work-vessel"), &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
+                convoy_ref: "unavailable-credential-work".to_string(),
                 vessel_name: "unavailable".to_string(),
                 placement_policy_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
@@ -8156,7 +8308,7 @@ mod tests {
             .await
             .expect("place unavailable vessel");
         assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
-        assert!(can_fill_git_credential().await);
+        assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
 
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
