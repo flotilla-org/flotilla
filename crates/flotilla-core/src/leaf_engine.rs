@@ -2012,7 +2012,7 @@ mod tests {
             state: Duration::from_millis(20),
             checks_pending: Duration::from_millis(20),
             freshness_demanded: Duration::from_millis(20),
-            stale_after: Duration::from_secs(2),
+            stale_after: Duration::from_millis(80),
         };
         let owner_calls = Arc::new(AtomicUsize::new(0));
         let owner_refresher = ChangeRequestRefresher::new(
@@ -2052,8 +2052,22 @@ mod tests {
         );
         let reader_id = uuid::Uuid::new_v4();
         reader_refresher.demand(reader_id, subject.clone(), None).await.expect("reader demand");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let initial_observed_at =
+            records.get(&subject.record_name()).await.expect("owner record").status.expect("owner status").state.observed_at;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            reader
+                .replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("owner-root"), "flotilla")
+                .replace(&records.list().await.expect("owner records"), Utc::now())
+                .await
+                .expect("replicate owner heartbeat");
+        }
         assert_eq!(reader_calls.load(Ordering::SeqCst), 0, "reader must use replicated observation");
+        assert!(
+            records.get(&subject.record_name()).await.expect("owner record").status.expect("renewed status").state.observed_at
+                > initial_observed_at,
+            "healthy owner must renew unchanged observations before they become stale"
+        );
         assert!(reader.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.is_err());
         assert!(reader
             .including_replicas::<ChangeRequest>("flotilla")
@@ -2140,6 +2154,90 @@ mod tests {
             .await
             .expect("wait on takeover observation");
         assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
+    }
+
+    #[tokio::test]
+    async fn former_owner_can_reclaim_after_takeover_owner_goes_stale() {
+        let former = ResourceBackend::InMemory(InMemoryBackend::default());
+        let takeover = ResourceBackend::InMemory(InMemoryBackend::default());
+        let subject = crate::change_request_observer::ChangeRequestRef {
+            namespace: "flotilla".to_string(),
+            service: "github.com".to_string(),
+            scope: "flotilla-org/flotilla".to_string(),
+            number: 2053,
+        };
+        let status = |observed_at| flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
+            head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
+        };
+        for (backend, authority, age) in [(&former, "former", 10), (&takeover, "takeover", 6)] {
+            let records = backend.using::<ChangeRequest>("flotilla");
+            let created = records
+                .create(
+                    &InputMeta::builder().name(subject.record_name()).build(),
+                    &flotilla_resources::ChangeRequestSpec::builder()
+                        .service(subject.service.clone())
+                        .scope(subject.scope.clone())
+                        .number(subject.number)
+                        .observing_authority(authority.to_string())
+                        .build(),
+                )
+                .await
+                .expect("create authority record");
+            records
+                .update_status(
+                    &subject.record_name(),
+                    &created.metadata.resource_version,
+                    &status(Utc::now() - chrono::Duration::seconds(age)),
+                )
+                .await
+                .expect("publish old observation");
+        }
+        former
+            .replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("takeover-root"), "flotilla")
+            .replace(&takeover.using::<ChangeRequest>("flotilla").list().await.expect("takeover records"), Utc::now())
+            .await
+            .expect("replicate stale takeover");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            former.clone(),
+            "former".to_string(),
+            Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
+            crate::change_request_observer::ChangeRequestRefreshCadence {
+                state: Duration::from_millis(20),
+                checks_pending: Duration::from_millis(20),
+                freshness_demanded: Duration::from_millis(20),
+                stale_after: Duration::from_secs(2),
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        refresher.demand(id, subject.clone(), None).await.expect("former owner keeps demand");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("former owner reclaims stale takeover");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let reclaimed =
+                    former.using::<ChangeRequest>("flotilla").get(&subject.record_name()).await.expect("reclaimed local record");
+                assert_eq!(reclaimed.spec.observing_authority, "former");
+                if reclaimed.status.is_some_and(|status| status.state.observed_at > Utc::now() - chrono::Duration::seconds(2)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("former owner publishes a fresh status after reclaim");
+        refresher.release(id).await;
     }
 
     #[tokio::test]

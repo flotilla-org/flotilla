@@ -209,7 +209,7 @@ impl ChangeRequestRefresher {
             return Ok(());
         }
         let status = self.inner.source.observe_for_completion(subject).await?;
-        self.publish(subject, &subject.record_name(), status, true).await
+        self.publish(subject, &subject.record_name(), status, true, false).await
     }
 
     pub async fn demand(
@@ -321,7 +321,7 @@ impl ChangeRequestRefresher {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
-                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded).await {
+                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true).await {
                         self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
@@ -388,16 +388,17 @@ impl ChangeRequestRefresher {
         let local = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         let mut spec = record.object.spec.clone();
         spec.observing_authority = self.inner.authority.clone();
-        let result = match record.provenance {
-            ResourceProvenance::Local => {
-                local.update(&InputMeta::from(&record.object.metadata), &record.object.metadata.resource_version, &spec).await
+        // A former owner can keep its local record while another host owns a
+        // fresher replica. Reclaim through that local record when it exists.
+        let result = match local.get(&name).await {
+            Ok(existing) if existing.spec.observing_authority == self.inner.authority => Ok(existing),
+            Ok(existing) => local.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await,
+            Err(flotilla_resources::ResourceError::NotFound { .. }) => {
+                // A single conditional create claims a local copy, so an
+                // interruption cannot strand a foreign shadow.
+                local.create(&InputMeta::builder().name(name).build(), &spec).await
             }
-            ResourceProvenance::Replica { .. } => {
-                // Replicas are read-only. A single conditional create claims a
-                // local copy, so interruption cannot strand a foreign shadow.
-                let meta = InputMeta::builder().name(name).build();
-                local.create(&meta, &spec).await
-            }
+            Err(error) => Err(error),
         };
         match result {
             Ok(_) => Ok(true),
@@ -417,8 +418,15 @@ impl ChangeRequestRefresher {
         true
     }
 
-    async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus, heartbeat: bool) -> Result<(), String> {
-        if !self.owns_record(subject, false).await? {
+    async fn publish(
+        &self,
+        subject: &ChangeRequestRef,
+        name: &str,
+        status: ChangeRequestStatus,
+        heartbeat: bool,
+        allow_takeover: bool,
+    ) -> Result<(), String> {
+        if !self.owns_record(subject, allow_takeover).await? {
             return Ok(());
         }
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
@@ -426,7 +434,12 @@ impl ChangeRequestRefresher {
         if current.spec.observing_authority != self.inner.authority {
             return Ok(());
         }
-        if !heartbeat && current.status.as_ref().is_some_and(|current| observed_values_equal(current, &status)) {
+        let stale_after = chrono::Duration::from_std(self.inner.cadence.stale_after).map_err(|error| error.to_string())?;
+        if !heartbeat
+            && current.status.as_ref().is_some_and(|current| {
+                observed_values_equal(current, &status) && Utc::now().signed_duration_since(current.state.observed_at) < stale_after
+            })
+        {
             return Ok(());
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
