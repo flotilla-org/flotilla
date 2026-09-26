@@ -1053,6 +1053,16 @@ mod tests {
     }
 
     #[test]
+    fn default_brief_requires_authenticated_github_access() {
+        let brief = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+
+        assert!(brief.contains("use only the injected `gh` token-file wrapper with `$GITHUB_TOKEN_FILE` or an injected `GH_TOKEN`"));
+        assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
+        assert!(brief.contains("`$GITHUB_TOKEN_FILE` names a nonempty file or `GH_TOKEN` is set, and that `gh auth status` succeeds"));
+        assert!(brief.contains("fail the assignment with `flotilla crew fail --message '...'`"));
+    }
+
+    #[test]
     fn repo_level_override_can_replace_one_block() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -1101,6 +1111,7 @@ mod tests {
         .content;
 
         assert!(selected.contains("For interactive sessions, keep the user-facing loop tight"));
+        assert!(selected.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(selected.contains("## Assignment\n\nPair with the user."));
         assert!(!default.contains("For interactive sessions"));
     }
@@ -1133,6 +1144,7 @@ mod tests {
 
         assert!(brief.contains("flotilla crew coder handoff --message"));
         assert!(brief.contains("sign off on the fork PR"));
+        assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(brief.contains("Never add or repoint a git remote"));
         assert!(brief.contains("Never open issues, pull requests, or comments against the upstream repository"));
         assert!(brief.contains("exact repository URL and target ref named in `## Work context`"));
@@ -1173,6 +1185,7 @@ mod tests {
         assert!(brief.contains("park the verified commit"));
         assert!(brief.contains("redispatched under the owning project"));
         assert!(brief.contains("flotilla crew complete --message '<PR URL>'"));
+        assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));
     }
