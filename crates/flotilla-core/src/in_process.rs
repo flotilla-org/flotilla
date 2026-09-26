@@ -50,12 +50,12 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
     ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSpec,
-    CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
-    DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, HoldAct,
-    Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot,
-    IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource,
+    CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
+    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder,
+    EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
@@ -3886,7 +3886,7 @@ impl InProcessDaemon {
         let forge = match repository.identity() {
             RepositoryIdentity::Forge { forge_ref, .. } => Some(
                 self.resource_backend
-                    .definitions::<flotilla_resources::Forge>(namespace)
+                    .definitions::<Forge>(namespace)
                     .get(forge_ref)
                     .await
                     .map_err(|error| format!("Forge {forge_ref}: {error}"))?
@@ -3899,13 +3899,13 @@ impl InProcessDaemon {
         let mut bag = self.local_environment_bag().unwrap_or_default().with(remote_assertion);
         if let Some(forge) = &forge {
             bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
-            if forge.kind == flotilla_resources::ForgeKind::Forgejo {
+            if forge.kind == ForgeKind::Forgejo {
                 let credentials =
                     self.resource_backend.definitions::<CredentialSpec>(namespace).list().await.map_err(|error| error.to_string())?;
                 let paths = credentials
                     .into_iter()
                     .filter_map(|credential| match (&credential.spec.consumer, &credential.spec.source) {
-                        (CredentialConsumer::Forgejo { forge_ref, .. }, flotilla_resources::CredentialSource::File { path })
+                        (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path })
                             if forge_ref == &forge.forge_id =>
                         {
                             Some(path.clone())

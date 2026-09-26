@@ -249,8 +249,8 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec};
 
     use super::{
-        config_path, resolve_forgejo_auth, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory, GitHubChangeRequestFactory,
-        GitHubIssueProviderFactory,
+        config_path, forgejo_provider_config, resolve_forgejo_auth, ForgejoChangeRequestFactory, ForgejoIssueProviderFactory,
+        GitHubChangeRequestFactory, GitHubIssueProviderFactory,
     };
     use crate::{
         config::{ConfigStore, ForgejoIssueTrackerConfig},
@@ -462,6 +462,26 @@ mod tests {
         assert!(issues.supports(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() }));
         assert_eq!(ForgejoChangeRequestFactory.descriptor().implementation, "forgejo");
         let _ = changes;
+    }
+
+    #[test]
+    fn forgejo_origin_overrides_conflicting_configured_service_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_token(dir.path(), "lab-forgejo-coder-token");
+        let config_base = dir.path().join("flotilla");
+        write_forgejo_config(&config_base, "");
+        let config = ConfigStore::with_base(config_base);
+        let forge = ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo.lab.flotilla.work".into()]))
+            .https_url("https://forgejo.lab.flotilla.work".into())
+            .git_ssh_host("forgejo.lab.flotilla.work".into())
+            .build();
+        let bag = EnvironmentBag::new().with(EnvironmentAssertion::origin_forge(forge));
+
+        let resolved = forgejo_provider_config(&bag, &config).expect("Forgejo config");
+        assert_eq!(resolved.service_url, "https://forgejo.lab.flotilla.work");
     }
 
     #[test]
