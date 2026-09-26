@@ -980,6 +980,7 @@ impl Aggregator {
         }
         self.convoy_change_requests.retain(|reference, _| current.contains_key(reference));
         self.change_request_refresh_generations.retain(|reference, _| current.contains_key(reference));
+        self.change_request_refresh_started.retain(|reference, _| current.contains_key(reference));
         self.rebuild_local_projection().await;
         if let Err(error) = self.rebuild_checkout_rows().await {
             debug!(%error, "could not refresh checkout orphan attention after convoy event");
@@ -4211,6 +4212,29 @@ mod tests {
             })
             .await;
         assert!(!aggregator.convoy_change_requests.contains_key(&reference));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recreated_convoy_can_refresh_change_request_immediately() {
+        let (event_tx, _) = broadcast::channel(4);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        let convoy = convoy_with_branch("convoy-a").await;
+        let reference = aggregator.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy.clone())).await;
+        assert!(!aggregator.change_request_refresh_started.contains_key(&reference));
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
