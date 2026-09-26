@@ -145,7 +145,8 @@ that ground.
 - **TurnDelivery** — with the delivery-ladder work (ADR 0028's ladder); Bosun
   run 3 is its validation vehicle.
 - **Exit-table declaration syntax** — follow-on to ADR 0028, small grill.
-- **Webhook refreshers** — a transport upgrade inside the refresher.
+- **Webhook refreshers** — a transport upgrade inside the refresher. Resolved
+  by ADR 0041 (hints delivered through a dial-out relay).
 - **The evaluator-substrate ruling** (declared tables vs facet descriptor) —
   parked on PR #1372's contested record; #1368 sequences on it.
 - **Anchored's entry/exit wiring** — same table, pre-claim leaves; lands
