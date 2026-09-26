@@ -9,10 +9,7 @@ use flotilla_resources::{ForgeSpec, RepositoryKey, RepositorySpec};
 use crate::{
     ops_entry::OperationalEntryFile,
     path_context::ExecutionEnvironmentPath,
-    providers::{
-        vcs::{git_worktree::GitCheckoutManager, CheckoutManager},
-        ChannelLabel, CommandRunner,
-    },
+    providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandRunner},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -370,7 +367,7 @@ impl RepositoryInspector for GitRepositoryInspector {
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
         // The path template is used only when creating a worktree;
         // enumeration reads Git's existing worktree registry.
-        let manager = GitCheckoutManager::new(crate::config::default_checkout_path(), Arc::clone(&self.runner));
+        let manager = GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&self.runner));
         manager.list_checkouts(&ExecutionEnvironmentPath::new(&inspection.checkout.path)).await.map(|checkouts| {
             checkouts
                 .into_iter()

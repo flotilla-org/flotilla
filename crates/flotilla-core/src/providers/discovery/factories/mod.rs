@@ -1,6 +1,5 @@
 pub mod claude;
 pub mod cleat;
-pub mod clone;
 pub mod cmux;
 pub mod codex;
 pub mod cursor;
@@ -45,15 +44,14 @@ fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
     ]
 }
 
-fn checkout_manager_factories() -> Vec<Box<super::CheckoutManagerFactory>> {
-    vec![Box::new(clone::CloneCheckoutManagerFactory), Box::new(git::WtCheckoutManagerFactory), Box::new(git::GitCheckoutManagerFactory)]
+fn vcs_factories() -> Vec<Box<super::VcsFactory>> {
+    vec![Box::new(git::GitVcsFactory)]
 }
 
 impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
-            vcs: vec![Box::new(git::GitVcsFactory)],
-            checkout_managers: checkout_manager_factories(),
+            vcs: vcs_factories(),
             change_requests: vec![Box::new(github::GitHubChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
             cloud_agents: vec![
@@ -78,7 +76,6 @@ mod tests {
     fn default_all_has_all_categories() {
         let reg = FactoryRegistry::default_all();
         assert!(!reg.vcs.is_empty());
-        assert!(!reg.checkout_managers.is_empty());
         assert!(!reg.change_requests.is_empty());
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());
@@ -92,7 +89,6 @@ mod tests {
         let runtime = super::super::DiscoveryRuntime::for_process();
         let reg = &runtime.factories;
         assert!(!reg.vcs.is_empty());
-        assert!(!reg.checkout_managers.is_empty());
         assert!(!reg.change_requests.is_empty());
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());

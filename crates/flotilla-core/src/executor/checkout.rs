@@ -4,7 +4,7 @@ use tracing::warn;
 
 use crate::{
     path_context::ExecutionEnvironmentPath, provider_data::ProviderData, providers::registry::ProviderRegistry,
-    terminal_manager::TerminalManager,
+    terminal_manager::TerminalManager, vcs::Vcs,
 };
 
 pub(super) struct CheckoutService<'a> {
@@ -57,39 +57,37 @@ impl<'a> CheckoutService<'a> {
         Self { registry }
     }
 
+    fn vcs(&self) -> Result<&std::sync::Arc<dyn Vcs>, String> {
+        self.registry.vcs.preferred().ok_or_else(|| "No VCS provider available".to_string())
+    }
+
     pub(super) async fn validate_target(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         intent: CheckoutIntent,
     ) -> Result<(), String> {
-        let checkout_manager =
-            self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        checkout_manager.validate_target(repo_root, branch, intent).await
+        self.vcs()?.validate_target(branch, intent).await
     }
 
     pub(super) async fn create_checkout(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         create_branch: bool,
     ) -> Result<ExecutionEnvironmentPath, String> {
-        let checkout_manager =
-            self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        let (path, _checkout) = checkout_manager.create_checkout(repo_root, branch, create_branch).await?;
+        let (path, _checkout) = self.vcs()?.create_checkout(branch, create_branch).await?;
         Ok(path)
     }
 
     pub(super) async fn remove_checkout(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         deleted_checkout_paths: &[QualifiedPath],
         terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
-        let checkout_manager =
-            self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        checkout_manager.remove_checkout(repo_root, branch).await?;
+        self.vcs()?.remove_checkout(branch).await?;
 
         // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
         if let Some(tm) = terminal_manager {

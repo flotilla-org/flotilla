@@ -20,7 +20,7 @@ impl GitVcs {
 use super::TRUNK_NAMES;
 
 #[async_trait]
-impl super::Vcs for GitVcs {
+impl super::VcsInspection for GitVcs {
     async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
         let output = run!(self.runner, "git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], path.as_path()).ok()?;
         let git_dir = PathBuf::from(output.trim());
@@ -103,7 +103,7 @@ mod tests {
     use super::*;
     use crate::providers::{
         replay,
-        vcs::{checkout_test_support::git, Vcs},
+        vcs::{checkout_test_support::git, VcsInspection},
     };
 
     // ── Setup helpers (only called in record mode) ──

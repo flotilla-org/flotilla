@@ -1,0 +1,27 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args:
+    - rev-parse
+    - HEAD
+    cwd: '{repo}'
+    stdout: |
+      0d250b3c11a7eea039620df21d53ed9e1218b6e5
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - status
+    - '--porcelain'
+    - '--untracked-files=all'
+    - '--ignored=matching'
+    - '--'
+    - '.'
+    cwd: '{repo}'
+    stdout: |
+      ?? .gitignore
+      !! draft.ignored
+    stderr: ''
+    exit_code: 0

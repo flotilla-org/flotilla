@@ -63,7 +63,7 @@ interactions:
 
     use crate::{
         path_context::ExecutionEnvironmentPath,
-        providers::vcs::{git::GitVcs, Vcs},
+        providers::vcs::{git::GitVcs, VcsInspection},
     };
     let git = GitVcs::new(runner);
     let repo = ExecutionEnvironmentPath::new("/test/repo");

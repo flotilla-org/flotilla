@@ -2,7 +2,6 @@ pub mod clone;
 pub mod git;
 pub mod git_worktree;
 pub mod provisioning;
-pub mod wt;
 
 use std::path::Path;
 
@@ -20,7 +19,7 @@ pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
 #[allow(dead_code)]
 #[async_trait]
-pub trait Vcs: Send + Sync {
+pub trait VcsInspection: Send + Sync {
     /// Given any path (possibly inside a worktree/checkout), resolve to the
     /// main repository root. Returns None if the path is not inside a repo.
     async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath>;
@@ -35,36 +34,12 @@ pub trait Vcs: Send + Sync {
     ) -> Result<WorkingTreeStatus, String>;
 }
 
-#[async_trait]
-pub trait CheckoutManager: Send + Sync {
-    /// Validate whether this checkout manager can satisfy the requested branch intent.
-    ///
-    /// For ambient checkout flows the executor calls this before `create_checkout`.
-    /// Managers used in constructed environments may need to call it from
-    /// `create_checkout` themselves when bootstrap/discovery bypasses that outer preflight.
-    async fn validate_target(&self, repo_root: &ExecutionEnvironmentPath, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
-    async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
-    async fn create_checkout(
-        &self,
-        repo_root: &ExecutionEnvironmentPath,
-        branch: &str,
-        create_branch: bool,
-    ) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
-    async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String>;
-}
-
-#[allow(dead_code)]
-pub struct VcsBundle {
-    pub vcs: Box<dyn Vcs>,
-    pub checkout_manager: Box<dyn CheckoutManager>,
-}
-
 /// Parse `git status --porcelain` output into a `WorkingTreeStatus`.
 ///
 /// Each line has a two-character status prefix: X Y, where X is the index
 /// (staging area) status and Y is the working-tree status.  `??` means
 /// untracked.  This is the single canonical implementation used by both
-/// the `Vcs` and `CheckoutManager` providers.
+/// the legacy inspection and checkout implementations.
 pub(crate) fn parse_porcelain_status(output: &str) -> WorkingTreeStatus {
     let mut staged = 0usize;
     let mut modified = 0usize;
@@ -174,8 +149,8 @@ pub(crate) mod checkout_test_support {
     };
 
     use crate::{
-        path_context::ExecutionEnvironmentPath,
-        providers::{vcs::CheckoutManager, ChannelLabel, CommandRunner},
+        providers::{ChannelLabel, CommandRunner},
+        vcs::Vcs,
     };
 
     /// Run a git command, panicking on failure.
@@ -226,13 +201,8 @@ pub(crate) mod checkout_test_support {
     ///
     /// The worktree should end up on the remote branch's commit ("remote-only work"),
     /// not on main's HEAD ("Initial commit").
-    pub async fn assert_checkout_tracks_remote_branch(
-        mgr: &dyn CheckoutManager,
-        runner: &Arc<dyn CommandRunner>,
-        repo_path: &ExecutionEnvironmentPath,
-    ) {
-        let (wt_path, checkout) =
-            mgr.create_checkout(repo_path, "feature/remote-only", true).await.expect("create_checkout should succeed");
+    pub async fn assert_checkout_tracks_remote_branch(mgr: &dyn Vcs, runner: &Arc<dyn CommandRunner>) {
+        let (wt_path, checkout) = mgr.create_checkout("feature/remote-only", true).await.expect("create_checkout should succeed");
 
         assert_eq!(checkout.branch, "feature/remote-only");
         assert!(!checkout.is_main);

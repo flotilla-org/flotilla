@@ -3629,9 +3629,8 @@ impl InProcessDaemon {
         let mut matches = Vec::new();
         for state in repos.values() {
             let root = state.preferred_root();
-            let repo_root = ExecutionEnvironmentPath::new(&root.path);
-            let Some((_, manager)) = root.model.registry.checkout_managers.preferred_with_desc() else { continue };
-            let checkouts = manager.list_checkouts(&repo_root).await.map_err(|error| format!("checkout discovery failed: {error}"))?;
+            let Some((_, vcs)) = root.model.registry.vcs.preferred_with_desc() else { continue };
+            let checkouts = vcs.list_checkouts().await.map_err(|error| format!("checkout discovery failed: {error}"))?;
             for (checkout_path, checkout) in checkouts {
                 let host_path =
                     QualifiedPath::host(self.environment_manager.local_host_id().clone(), checkout_path.as_path().to_path_buf());
@@ -7374,7 +7373,7 @@ impl InProcessDaemon {
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
         use crate::{
             path_context::ExecutionEnvironmentPath,
-            providers::vcs::{git::GitVcs, Vcs},
+            providers::vcs::{git::GitVcs, VcsInspection},
         };
 
         let vcs = GitVcs::new(self.discovery.runner.clone());
@@ -9904,11 +9903,11 @@ impl InProcessDaemon {
         self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, caller).await
     }
 
-    async fn executor_provider_data(&self, repo_identity: &RepoIdentity, repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
+    async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
         let mut providers = ProviderData::default();
 
-        if let Some(checkout_manager) = registry.checkout_managers.preferred() {
-            match checkout_manager.list_checkouts(&ExecutionEnvironmentPath::new(repo_root)).await {
+        if let Some(vcs) = registry.vcs.preferred() {
+            match vcs.list_checkouts().await {
                 Ok(checkouts) => {
                     for (path, mut checkout) in checkouts {
                         checkout.host_name.get_or_insert_with(|| self.host_name.clone());

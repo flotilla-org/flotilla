@@ -92,7 +92,7 @@ struct CheckoutFlow<'a> {
     local_host: &'a HostName,
     new_checkout_qualifier: PathQualifier,
     /// When true, skip host-side validation and de-duplication.
-    /// Environment checkouts delegate validation to `CloneCheckoutManager`.
+    /// Environment checkouts delegate validation to `ReferenceCloneStrategy`.
     is_environment: bool,
 }
 
@@ -122,7 +122,7 @@ impl<'a> CheckoutFlow<'a> {
         }
 
         // In environment context, skip host-side branch validation — the
-        // CloneCheckoutManager validates during clone (git clone -b fails if
+        // ReferenceCloneStrategy validates during clone (git clone -b fails if
         // branch doesn't exist; --no-checkout handles fresh branches).
         if !self.is_environment {
             checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
