@@ -3,6 +3,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration as StdDuration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -386,6 +387,19 @@ impl GitCredentialPreflight {
 }
 
 impl CredentialStore {
+    /// Remove staging files left by a previous daemon process. The current
+    /// config base can differ from the previous one when XDG_RUNTIME_DIR
+    /// becomes available, so inspect the state fallback as well.
+    pub(crate) async fn cleanup_stale_github_app_token_files(&self) -> Result<(), String> {
+        let cutoff = SystemTime::now() - StdDuration::from_secs(2 * 60 * 60);
+        cleanup_stale_github_app_token_files_in(&self.state_dir, cutoff).await?;
+        let base = self.delivery_paths(&*self.host_runner).await?.base;
+        if base != self.state_dir {
+            cleanup_stale_github_app_token_files_in(&base, cutoff).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         backend: ResourceBackend,
         namespace: &str,
@@ -1741,6 +1755,43 @@ fn github_app_token_file(paths: &CredentialDeliveryPaths, credential_name: &str)
     paths.credential_dir(credential_name).join("token")
 }
 
+async fn cleanup_stale_github_app_token_files_in(base: &Path, cutoff: SystemTime) -> Result<(), String> {
+    let credentials = base.join("credentials");
+    let mut directories = match tokio::fs::read_dir(&credentials).await {
+        Ok(directories) => directories,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("list credential directories at {}: {error}", credentials.display())),
+    };
+    while let Some(directory) = directories.next_entry().await.map_err(|error| format!("list credential directories: {error}"))? {
+        if !directory.file_type().await.map_err(|error| format!("inspect credential directory: {error}"))?.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(directory.path()).await.map_err(|error| format!("list credential staging files: {error}"))?;
+        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
+            let name = entry.file_name();
+            let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
+            if uuid::Uuid::parse_str(suffix).is_err()
+                || !entry.file_type().await.map_err(|error| format!("inspect staging file: {error}"))?.is_file()
+            {
+                continue;
+            }
+            let path = entry.path();
+            let modified = entry
+                .metadata()
+                .await
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| format!("inspect staging file: {error}"))?;
+            if modified > cutoff {
+                continue;
+            }
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|error| format!("remove stale GitHub App token staging file {}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
@@ -2158,6 +2209,36 @@ mod tests {
         assert!(error.contains("simulated interrupted credential write"));
         assert_eq!(tokio::fs::read_to_string(&token_file).await.expect("read old token"), "still-valid-token");
         assert_eq!(std::fs::read_dir(directory.path()).expect("list credential directory").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_removes_only_stale_github_app_staging_files() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let credential_dir = state.path().join("credentials/github-app");
+        tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
+        let stale = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let recent = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let live = credential_dir.join("token");
+        let unrelated = credential_dir.join("token.tmp-other");
+        for path in [&stale, &recent, &live, &unrelated] {
+            tokio::fs::write(path, "secret material").await.expect("write credential file");
+        }
+        let cutoff = SystemTime::now() - StdDuration::from_secs(2 * 60 * 60);
+        for path in [&stale, &live] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open old credential file")
+                .set_modified(cutoff - StdDuration::from_secs(1))
+                .expect("age credential file");
+        }
+
+        cleanup_stale_github_app_token_files_in(state.path(), cutoff).await.expect("clean stale staging files");
+
+        assert!(!stale.exists());
+        assert!(recent.exists());
+        assert!(unrelated.exists());
+        assert!(live.exists());
     }
 
     #[test]
