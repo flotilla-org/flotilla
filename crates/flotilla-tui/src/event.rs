@@ -18,7 +18,7 @@ pub enum Event {
     Daemon(Box<DaemonEvent>),
     DaemonDisconnected,
     CommandDispatchCompleted { session_id: uuid::Uuid, result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
-    AttachDispatchCompleted(Result<CommandValue, String>),
+    AttachDispatchCompleted { session_id: uuid::Uuid, result: Result<CommandValue, String> },
     FleetHealthRefreshed(Result<CommandValue, String>),
 }
 
@@ -89,7 +89,10 @@ impl EventHandler {
         while let Ok(event) = self.rx.try_recv() {
             if matches!(
                 event,
-                Event::Daemon(_) | Event::DaemonDisconnected | Event::CommandDispatchCompleted { .. } | Event::AttachDispatchCompleted(_)
+                Event::Daemon(_)
+                    | Event::DaemonDisconnected
+                    | Event::CommandDispatchCompleted { .. }
+                    | Event::AttachDispatchCompleted { .. }
             ) {
                 self.retained.push_back(event);
             }
@@ -177,14 +180,18 @@ mod tests {
         sender
             .send(Event::CommandDispatchCompleted { session_id, result: Ok(42), pending_ctx: None })
             .expect("event handler should remain open");
-        sender.send(Event::AttachDispatchCompleted(Err("attach failed".into()))).expect("event handler should remain open");
+        sender
+            .send(Event::AttachDispatchCompleted { session_id, result: Err("attach failed".into()) })
+            .expect("event handler should remain open");
 
         handler.pause_terminal_input().await;
 
         assert!(
             matches!(handler.try_next(), Some(Event::CommandDispatchCompleted { session_id: id, result: Ok(42), pending_ctx: None }) if id == session_id)
         );
-        assert!(matches!(handler.try_next(), Some(Event::AttachDispatchCompleted(Err(message))) if message == "attach failed"));
+        assert!(
+            matches!(handler.try_next(), Some(Event::AttachDispatchCompleted { session_id: id, result: Err(message) }) if id == session_id && message == "attach failed")
+        );
         assert!(handler.try_next().is_none(), "ticks should not survive a terminal pause");
     }
 }

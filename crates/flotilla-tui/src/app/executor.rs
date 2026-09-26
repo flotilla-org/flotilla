@@ -27,7 +27,7 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
         let session_id = app.session_id;
         tokio::spawn(async move {
             let result = daemon.execute_query(cmd, session_id).await;
-            let _ = event_tx.send(Event::AttachDispatchCompleted(result));
+            let _ = event_tx.send(Event::AttachDispatchCompleted { session_id, result });
         });
         return;
     }
@@ -121,7 +121,10 @@ pub fn handle_dispatch_completion(
     }
 }
 
-pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, app: &mut App) {
+pub fn handle_attach_dispatch_completion(session_id: uuid::Uuid, result: Result<CommandValue, String>, app: &mut App) {
+    if session_id != app.session_id {
+        return;
+    }
     match result {
         Ok(CommandValue::AttachCommandResolved { plan, .. }) => {
             app.pending_attach_plan = Some(plan);
@@ -297,9 +300,38 @@ mod tests {
         dispatch(command.clone(), &mut app, None, event_tx);
 
         let event = event_rx.recv().await.expect("attach dispatch completion event");
-        assert!(matches!(event, Event::AttachDispatchCompleted(Ok(CommandValue::Ok))));
+        assert!(matches!(event, Event::AttachDispatchCompleted { session_id: id, result: Ok(CommandValue::Ok) } if id == session_id));
         assert!(execute_calls.lock().expect("execute calls lock").is_empty());
         assert_eq!(*query_calls.lock().expect("query calls lock"), vec![(command, session_id)]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_ignores_old_attach_query_completion() {
+        let gate = Arc::new(Semaphore::new(0));
+        let old_plan = flotilla_protocol::ResolvedAttachPlan::shell_command("old daemon attach");
+        let old_daemon = Arc::new(
+            StubDaemon::builder()
+                .query_gate(gate.clone())
+                .query_result(Ok(CommandValue::AttachCommandResolved { plan: old_plan, binding: None }))
+                .build(),
+        );
+        let mut app = stub_app_with_daemon(old_daemon, vec![]);
+        let old_session = app.session_id;
+        let command = app.command(CommandAction::Attach { reference: "session".into(), host: None, mode: AttachMode::default() });
+        let (event_tx, mut event_rx) = dispatch_channels();
+        dispatch(command, &mut app, None, event_tx);
+        app.reconnect_daemon(Arc::new(StubDaemon::new()), vec![]);
+
+        gate.add_permits(1);
+        let Event::AttachDispatchCompleted { session_id, result } = event_rx.recv().await.expect("old attach completion") else {
+            panic!("expected attach completion");
+        };
+        assert_eq!(session_id, old_session);
+        handle_attach_dispatch_completion(session_id, result, &mut app);
+        assert!(app.pending_attach_plan.is_none());
+
+        handle_attach_dispatch_completion(old_session, Err("old daemon failed".into()), &mut app);
+        assert!(app.model.status_message.is_none());
     }
 
     #[tokio::test]
