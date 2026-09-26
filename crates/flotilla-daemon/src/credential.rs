@@ -1053,7 +1053,7 @@ impl CredentialStore {
             let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) else {
                 continue;
             };
-            if let Err(error) = write_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
+            if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
                 current.refresh_failures += 1;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
@@ -1666,6 +1666,25 @@ async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, to
         .map_err(|error| format!("protect token file: {error}"))
 }
 
+async fn replace_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        write_github_app_token_file(runner, &temporary, token).await?;
+        runner
+            .run("mv", &["-f", "--", &temporary.to_string_lossy(), &path.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("replace token file: {error}"))
+    }
+    .await;
+    if result.is_err() {
+        if let Err(error) = runner.run("rm", &["-f", "--", &temporary.to_string_lossy()], Path::new("/"), &ChannelLabel::Default).await {
+            tracing::warn!(path = %temporary.display(), %error, "failed to remove incomplete GitHub App token file");
+        }
+    }
+    result
+}
+
 async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &str, context: &str) -> Result<(), String> {
     runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
     let path = path.to_string_lossy();
@@ -1905,6 +1924,57 @@ mod tests {
             self.writes.lock().expect("writes lock").push((path.to_path_buf(), content.to_string()));
             Ok(())
         }
+    }
+
+    struct FailedTokenWriteRunner;
+
+    #[async_trait]
+    impl CommandRunner for FailedTokenWriteRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "rm", "only cleanup may run after a failed write");
+            assert_eq!(&args[..2], &["-f", "--"]);
+            tokio::fs::remove_file(args[2]).await.map_err(|error| error.to_string())?;
+            Ok(String::new())
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err("unexpected command".to_string())
+        }
+
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            _input: &[u8],
+        ) -> Result<String, String> {
+            Err("unexpected command".to_string())
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+
+        async fn write_file(&self, path: &Path, _content: &str) -> Result<(), String> {
+            tokio::fs::write(path, "partial-new-token").await.map_err(|error| error.to_string())?;
+            Err("simulated interrupted credential write".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_github_app_refresh_preserves_live_token_and_removes_partial_file() {
+        let directory = tempfile::tempdir().expect("create credential directory");
+        let token_file = directory.path().join("token");
+        tokio::fs::write(&token_file, "still-valid-token").await.expect("stage old token");
+
+        let error = replace_github_app_token_file(&FailedTokenWriteRunner, &token_file, "new-token")
+            .await
+            .expect_err("interrupted refresh must fail");
+
+        assert!(error.contains("simulated interrupted credential write"));
+        assert_eq!(tokio::fs::read_to_string(&token_file).await.expect("read old token"), "still-valid-token");
+        assert_eq!(std::fs::read_dir(directory.path()).expect("list credential directory").count(), 1);
     }
 
     #[test]
@@ -2474,13 +2544,22 @@ interactions:
         assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
-        let token_writes =
-            runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
+        let token_writes = runner
+            .writes
+            .lock()
+            .expect("writes lock")
+            .iter()
+            .filter(|(path, _)| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("token")))
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(token_writes.len(), 3);
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
         assert!(token_writes[2].1.contains("installation-token-three"));
-        assert_eq!(token_writes[0].0, token_writes[2].0, "rotation replaces the file observed by the standing vessel");
+        assert_ne!(token_writes[0].0, token_writes[2].0, "rotation must stage at a separate path");
+        assert!(runner.calls.lock().expect("calls lock").iter().any(|(command, args, _)| {
+            command == "mv" && args == &["-f", "--", &token_writes[2].0.to_string_lossy(), &token_writes[0].0.to_string_lossy()]
+        }));
         {
             let writes = runner.writes.lock().expect("writes lock");
             let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
