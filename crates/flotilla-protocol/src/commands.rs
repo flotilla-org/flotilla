@@ -496,6 +496,25 @@ pub struct AgentOverride {
     pub model: Option<String>,
 }
 
+impl std::str::FromStr for AgentOverride {
+    type Err = String;
+
+    /// `[capability=]adapter[:model]`; a bare adapter selects `code`.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (capability, choice) = raw.split_once('=').unwrap_or(("code", raw));
+        let (adapter, model) = match choice.split_once(':') {
+            Some((adapter, model)) => (adapter, Some(model)),
+            None => (choice, None),
+        };
+        let valid_token =
+            |token: &str| !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+        if !valid_token(capability) || !valid_token(adapter) || model.is_some_and(|model| !valid_token(model)) {
+            return Err(format!("agent override must be [capability=]adapter[:model] using alphanumerics, `.`, `_`, and `-`: {raw}"));
+        }
+        Ok(Self { capability: capability.to_string(), adapter: adapter.to_string(), model: model.map(str::to_string) })
+    }
+}
+
 /// A convoy launch admitted by the presentation host and ready to be
 /// persisted by the selected execution host.
 ///

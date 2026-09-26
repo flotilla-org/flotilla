@@ -145,20 +145,7 @@ fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
 /// `[capability=]adapter[:model]` — bare adapter applies to the `code`
 /// capability, the one every stock coding workflow's crew selects on.
 fn parse_agent_override(raw: &str) -> Result<AgentOverride, String> {
-    let (capability, choice) = match raw.split_once('=') {
-        Some((capability, choice)) => (capability, choice),
-        None => ("code", raw),
-    };
-    let (adapter, model) = match choice.split_once(':') {
-        Some((adapter, model)) => (adapter, Some(model)),
-        None => (choice, None),
-    };
-    let valid_token =
-        |token: &str| !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
-    if capability.is_empty() || !valid_token(adapter) || model.is_some_and(|model| !valid_token(model)) {
-        return Err(format!("agent override must be [capability=]adapter[:model] using alphanumerics, `.`, `_`, and `-`: {raw}"));
-    }
-    Ok(AgentOverride { capability: capability.to_string(), adapter: adapter.to_string(), model: model.map(str::to_string) })
+    raw.parse()
 }
 
 fn parse_pr_number(raw: &str) -> Result<String, String> {

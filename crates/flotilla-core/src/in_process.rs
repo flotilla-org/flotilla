@@ -7051,7 +7051,7 @@ impl InProcessDaemon {
                         stance: ensure.stance,
                         repositories: targets,
                         presents_as: ensure.presents_as,
-                        agent_overrides: Vec::new(),
+                        agent_overrides: ensure.agent_overrides,
                     };
                     if ensures.insert(ensure_name, (meta, spec)).is_some() {
                         return Err(format!("duplicate standing convoy role `{role}` in project `{project_name}`"));

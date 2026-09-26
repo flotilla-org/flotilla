@@ -24,7 +24,7 @@ use flotilla_core::{
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
-    commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
+    commands::RepositoryIdentityChange, AgentOverride, Command, CommandAction, CommandValue, DaemonEvent, HostName, NodeId, RepoSelector,
 };
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
@@ -655,6 +655,12 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     assert_eq!(ensure.spec.workflow_ref, "all-code");
     assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
     assert_eq!(ensure.spec.stance, Some(Stance::Trusted));
+    let expected_override = AgentOverride {
+        capability: "quartermaster".to_string(),
+        adapter: "claude-code".to_string(),
+        model: Some("claude-fable-5-1".to_string()),
+    };
+    assert!(ensure.spec.agent_overrides.is_empty());
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
 
@@ -687,13 +693,18 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         )
         .await
         .expect("drift workflow");
+    std::fs::write(
+        &ensure_path,
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\nagents: [quartermaster=claude-code:claude-fable-5-1]\n",
+    )
+    .expect("declare agent override");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,
         CommandValue::ProjectRefreshed {
             name: "demo".to_string(),
             members: 3,
             converged: true,
-            changes: vec!["WorkflowTemplate/scoped".to_string()],
+            changes: vec![format!("ConvoyEnsure/{ensure_name}"), "WorkflowTemplate/scoped".to_string()],
             operational_entries: vec![
                 "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
                 format!("quartermaster.entry: ConvoyEnsure/{ensure_name} accepted"),
@@ -703,6 +714,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         }
     );
     assert_eq!(workflows.get(&scoped_name).await.expect("converged workflow").spec, scoped.spec);
+    assert_eq!(ensures.get(&ensure_name).await.expect("refreshed ensure").spec.agent_overrides, vec![expected_override]);
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(
