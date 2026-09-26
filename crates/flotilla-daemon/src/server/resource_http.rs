@@ -71,6 +71,10 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         };
     }
 
+    if all_provenances {
+        return write_error(&mut stream, 400, "allProvenances requires a resource name").await;
+    }
+
     if !watch {
         let listed = if replica_sources {
             list_resource_kind_replica_sources(&backend, namespace, kind).await

@@ -179,6 +179,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     /// Read every visible provenance for one name without listing the namespace.
     pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        // These classes have at most one visible copy for a name.
         if T::REPLICATION_CLASS == crate::ReplicationClass::None || T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
             return match self.get(name).await {
                 Ok(item) => Ok(ReadResourceList { items: vec![item] }),
