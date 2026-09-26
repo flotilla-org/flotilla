@@ -280,6 +280,46 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     assert_eq!(cursor.generation.as_deref(), Some("generation-2"));
 }
 
+pub async fn assert_get_all_provenances_contract(backend: ResourceBackend) {
+    let namespace = "point-copies";
+    let local = backend.using::<Convoy>(namespace);
+    local.create(&convoy_meta("shared"), &convoy_spec("local")).await.expect("create local copy");
+    let read = backend.including_replicas::<Convoy>(namespace);
+    assert!(read.get_all("missing").await.expect("missing name").items.is_empty());
+
+    for (origin, template) in [("peer-a", "first"), ("peer-b", "second")] {
+        let source = ResourceBackend::InMemory(InMemoryBackend::default());
+        source.using::<Convoy>(namespace).create(&convoy_meta("shared"), &convoy_spec(template)).await.expect("create source");
+        source.using::<Convoy>(namespace).create(&convoy_meta("unrelated"), &convoy_spec(template)).await.expect("create unrelated");
+        backend
+            .replica_writer::<Convoy>(flotilla_protocol::NodeId::new(origin), namespace)
+            .replace(&source.using::<Convoy>(namespace).list().await.expect("source list"), Utc::now())
+            .await
+            .expect("replicate source");
+    }
+    let copies = read.get_all("shared").await.expect("read all copies");
+    assert_eq!(copies.items.len(), 3);
+    assert_eq!(copies.items.iter().map(|item| item.object.spec.workflow_ref.as_str()).collect::<Vec<_>>(), ["local", "first", "second"]);
+    assert!(copies.items.iter().all(|item| item.object.metadata.name == "shared"));
+    let wire = flotilla_resources::get_resource_kind_all_provenances(&backend, namespace, "convoys", "shared")
+        .await
+        .expect("point read wire view");
+    assert_eq!(wire.value["items"].as_array().expect("wire items").len(), 3);
+
+    local.delete("shared").await.expect("delete local copy");
+    let copies = read.get_all("shared").await.expect("read replicas after local deletion");
+    assert_eq!(copies.items.len(), 2);
+    backend
+        .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("peer-a"), namespace)
+        .replace(
+            &flotilla_resources::ResourceList { items: vec![], resource_version: "0".to_string(), generation: Some("next".to_string()) },
+            Utc::now(),
+        )
+        .await
+        .expect("delete first replica");
+    assert_eq!(read.get_all("shared").await.expect("remaining copy").items.len(), 1);
+}
+
 pub async fn assert_replica_events_ignore_stale_writes_and_deletes_with_backend(backend: ResourceBackend) {
     let origin = flotilla_protocol::NodeId::new("feta-root");
     let source_backend = ResourceBackend::InMemory(InMemoryBackend::default());

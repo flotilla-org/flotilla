@@ -412,6 +412,15 @@ pub async fn get_resource_kind_including_replicas(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_typed_including_replicas(backend, namespace, name).await)
 }
 
+pub async fn get_resource_kind_all_provenances(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    name: &str,
+) -> Result<DynamicResourceList, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, get_all_typed(backend, namespace, name).await)
+}
+
 /// Collect only children authored here, never replica rows. A deleted owner
 /// filter makes the normal path precise; `None` is restart/backstop recovery.
 pub(crate) async fn collect_owned_resources(
@@ -782,6 +791,11 @@ async fn get_typed_including_replicas<T: Resource>(
         namespace: namespace.to_string(),
         value: read_object_value(&object)?,
     })
+}
+
+async fn get_all_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceList, ResourceError> {
+    let listed = backend.including_replicas::<T>(namespace).get_all(name).await?;
+    dynamic_read_list::<T>(namespace, listed)
 }
 
 async fn delete_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceDelete, ResourceError> {

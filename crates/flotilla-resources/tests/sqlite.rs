@@ -11,7 +11,7 @@ use chrono::Utc;
 use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
-        assert_delete_emits_event_with_backend, assert_identical_status_update_is_noop_with_backend,
+        assert_delete_emits_event_with_backend, assert_get_all_provenances_contract, assert_identical_status_update_is_noop_with_backend,
         assert_identical_update_is_noop_with_backend, assert_local_authority_shadows_self_origin_replica_with_backend,
         assert_metadata_roundtrip_with_backend, assert_missing_authority_delete_tombstones_replica_with_backend,
         assert_namespace_isolation_with_backend, assert_project_definition_causal_merge_with_backend,
@@ -312,6 +312,11 @@ resource_contract_tests!(demand_contract, DemandFixture);
 #[tokio::test]
 async fn replica_read_view_contract() {
     assert_replica_read_view_contract(backend()).await;
+}
+
+#[tokio::test]
+async fn get_all_provenances_contract() {
+    assert_get_all_provenances_contract(backend()).await;
 }
 
 #[tokio::test]
