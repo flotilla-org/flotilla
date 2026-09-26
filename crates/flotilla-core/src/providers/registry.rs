@@ -12,7 +12,7 @@ use crate::{
         issue_tracker::{provider_for_source, IssueProvider},
         presentation::PresentationManager,
         terminal::TerminalPool,
-        vcs::{CheckoutManager, CloneProvisioner, Vcs},
+        vcs::{CheckoutManager, CloneProvisioner},
     },
 };
 
@@ -141,7 +141,6 @@ impl<D, T: ?Sized> Default for TypedSet<D, T> {
 
 pub struct ProviderRegistry {
     pub agent_adapters: AgentAdapterRegistry,
-    pub vcs: ProviderSet<dyn Vcs>,
     pub clone_provisioners: ProviderSet<dyn CloneProvisioner>,
     pub checkout_managers: ProviderSet<dyn CheckoutManager>,
     pub change_requests: ProviderSet<dyn ChangeRequestTracker>,
@@ -157,7 +156,6 @@ impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
             agent_adapters: AgentAdapterRegistry::default(),
-            vcs: ProviderSet::new(),
             clone_provisioners: ProviderSet::new(),
             checkout_managers: ProviderSet::new(),
             change_requests: ProviderSet::new(),
@@ -191,7 +189,6 @@ impl ProviderRegistry {
                 infos.push((desc.category.slug().to_string(), desc.display_name.clone()));
             }
         }
-        collect(&mut infos, &self.vcs);
         collect(&mut infos, &self.clone_provisioners);
         collect(&mut infos, &self.checkout_managers);
         collect(&mut infos, &self.change_requests);

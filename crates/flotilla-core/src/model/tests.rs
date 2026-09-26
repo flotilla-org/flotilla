@@ -15,10 +15,9 @@ use crate::{
         issue_tracker::IssueProvider,
         presentation::PresentationManager,
         types::{
-            AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
-            WorkspaceAttachRequest,
+            ChangeRequest, Checkout, CloudAgentSession, Issue, Workspace, WorkspaceAttachRequest,
         },
-        vcs::{CheckoutManager, Vcs},
+        vcs::CheckoutManager,
     },
 };
 
@@ -38,29 +37,6 @@ fn labeled_desc(
 }
 
 // --- Stub providers for populating ProviderRegistry ---
-
-struct StubVcs;
-#[async_trait]
-impl Vcs for StubVcs {
-    async fn resolve_repo_root(&self, _path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath> {
-        None
-    }
-    async fn list_local_branches(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<BranchInfo>, String> {
-        Ok(vec![])
-    }
-    async fn list_remote_branches(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<String>, String> {
-        Ok(vec![])
-    }
-    async fn commit_log(&self, _: &ExecutionEnvironmentPath, _: &str, _: usize) -> Result<Vec<CommitInfo>, String> {
-        Ok(vec![])
-    }
-    async fn ahead_behind(&self, _: &ExecutionEnvironmentPath, _: &str, _: &str) -> Result<AheadBehind, String> {
-        Ok(AheadBehind { ahead: 0, behind: 0 })
-    }
-    async fn working_tree_status(&self, _: &ExecutionEnvironmentPath, _: &ExecutionEnvironmentPath) -> Result<WorkingTreeStatus, String> {
-        Ok(WorkingTreeStatus { staged: 0, modified: 0, untracked: 0 })
-    }
-}
 
 struct StubCheckoutManager;
 #[async_trait]
@@ -177,7 +153,6 @@ impl PresentationManager for StubPresentationManager {
 /// Build a ProviderRegistry with all provider slots populated.
 fn full_registry() -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
-    reg.vcs.insert("vcs", named_desc(ProviderCategory::Vcs, "StubVcs"), Arc::new(StubVcs));
     reg.checkout_managers.insert(
         "cm",
         labeled_desc(ProviderCategory::CheckoutManager, "cm", "StubCM", "WT", "Checkouts", "worktree"),
@@ -395,7 +370,6 @@ async fn repo_model_new_with_empty_registry_uses_default_labels() {
 #[tokio::test]
 async fn repo_model_new_virtual_has_empty_registry_and_default_labels() {
     let model = RepoModel::new_virtual();
-    assert!(model.registry.vcs.is_empty());
     assert!(model.registry.checkout_managers.is_empty());
     assert!(model.registry.change_requests.is_empty());
     assert!(model.registry.issue_trackers.is_empty());

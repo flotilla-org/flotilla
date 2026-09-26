@@ -108,27 +108,22 @@ fn load_config_missing_or_invalid_returns_defaults() {
     let root = tempdir().unwrap();
 
     let missing_store = ConfigStore::with_base(root.path().join("missing"));
-    assert_eq!(missing_store.load_config().vcs.git.checkout_strategy, "auto");
+    assert_eq!(missing_store.load_config().vcs.git.checkout_path, default_checkout_path());
 
     let invalid_base = root.path().join("invalid");
     std::fs::create_dir_all(&invalid_base).unwrap();
     std::fs::write(invalid_base.join("config.toml"), "this is not valid {{toml").unwrap();
     let invalid_store = ConfigStore::with_base(&invalid_base);
-    assert_eq!(invalid_store.load_config().vcs.git.checkout_strategy, "auto");
+    assert_eq!(invalid_store.load_config().vcs.git.checkout_path, default_checkout_path());
 }
 
 #[test]
 fn load_config_parses_full_overrides() {
     let dir = tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("config.toml"),
-        "[vcs.git]\ncheckout_path = \"/custom/{{ branch }}\"\ncheckout_strategy = \"worktree\"\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[vcs.git]\ncheckout_path = \"/custom/{{ branch }}\"\n").unwrap();
     let store = ConfigStore::with_base(dir.path());
     let cfg = store.load_config();
     assert_eq!(cfg.vcs.git.checkout_path, "/custom/{{ branch }}");
-    assert_eq!(cfg.vcs.git.checkout_strategy, "worktree");
 }
 
 #[test]
@@ -136,7 +131,7 @@ fn repository_provider_overrides_merge_with_global_defaults() {
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.toml"),
-        "[vcs.git]\ncheckout_path = \"/global/{{ branch }}\"\ncheckout_strategy = \"clone\"\n[change_request]\nbackend = \"github\"\n",
+        "[vcs.git]\ncheckout_path = \"/global/{{ branch }}\"\n[change_request]\nbackend = \"github\"\n",
     )
     .unwrap();
     let store = ConfigStore::with_base(dir.path());
@@ -144,17 +139,15 @@ fn repository_provider_overrides_merge_with_global_defaults() {
     let fallback = ee(dir.path().join("fallback"));
     let spec = RepositorySpec::remote("https://git.example/acme/widgets")
         .expect("repository spec")
-        .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_strategy: Some("worktree".into()), checkout_path: None } })
+        .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_path: Some("/repo/{{ branch }}".into()) } })
         .with_change_request(RepositoryProviderPreference { backend: Some("forgejo".into()) });
     store.set_repository_spec(&overridden, spec);
 
     let resolved = store.resolve_checkout_config(&overridden);
-    assert_eq!(resolved.strategy, "worktree");
-    assert_eq!(resolved.path, "/global/{{ branch }}");
+    assert_eq!(resolved.path, "/repo/{{ branch }}");
     assert_eq!(store.resolve_change_request_backend(&overridden).as_deref(), Some("forgejo"));
 
     let fallback_checkout = store.resolve_checkout_config(&fallback);
-    assert_eq!(fallback_checkout.strategy, "clone");
     assert_eq!(fallback_checkout.path, "/global/{{ branch }}");
     assert_eq!(store.resolve_change_request_backend(&fallback).as_deref(), Some("github"));
 }
@@ -172,10 +165,9 @@ fn load_config_parses_convoy_auto_attach_override() {
 #[test]
 fn load_config_partial_override_keeps_defaults() {
     let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[vcs.git]\ncheckout_strategy = \"worktree\"\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[vcs.git]\n").unwrap();
     let store = ConfigStore::with_base(dir.path());
     let cfg = store.load_config();
-    assert_eq!(cfg.vcs.git.checkout_strategy, "worktree");
     assert_eq!(cfg.vcs.git.checkout_path, default_checkout_path());
 }
 
@@ -192,14 +184,14 @@ fn load_config_parses_layout() {
 #[test]
 fn save_layout_writes_global_config() {
     let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[vcs.git]\ncheckout_strategy = \"worktree\"\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[vcs.git]\ncheckout_path = \"/custom/{{ branch }}\"\n").unwrap();
 
     let store = ConfigStore::with_base(dir.path());
     store.save_layout(RepoViewLayoutConfig::Right);
 
     let reloaded = ConfigStore::with_base(dir.path());
     let cfg = reloaded.load_config();
-    assert_eq!(cfg.vcs.git.checkout_strategy, "worktree");
+    assert_eq!(cfg.vcs.git.checkout_path, "/custom/{{ branch }}");
     assert_eq!(cfg.ui.preview.layout, RepoViewLayoutConfig::Right);
 }
 
@@ -220,20 +212,19 @@ fn save_layout_updates_same_store_cache() {
 fn load_config_is_cached() {
     let dir = tempdir().unwrap();
     let base = dir.path();
-    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_strategy = \"first\"\n").unwrap();
+    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"first\"\n").unwrap();
 
     let store = ConfigStore::with_base(base);
-    assert_eq!(store.load_config().vcs.git.checkout_strategy, "first");
+    assert_eq!(store.load_config().vcs.git.checkout_path, "first");
 
-    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_strategy = \"second\"\n").unwrap();
-    assert_eq!(store.load_config().vcs.git.checkout_strategy, "first");
+    std::fs::write(base.join("config.toml"), "[vcs.git]\ncheckout_path = \"second\"\n").unwrap();
+    assert_eq!(store.load_config().vcs.git.checkout_path, "first");
 }
 
 #[test]
 fn defaults_have_expected_values_and_base_path_roundtrips() {
     let git_config = GitConfig::default();
     assert_eq!(git_config.checkout_path, "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}");
-    assert_eq!(git_config.checkout_strategy, "auto");
 
     let dir = tempdir().unwrap();
     let store = ConfigStore::with_base(dir.path());
@@ -515,13 +506,11 @@ implementation = "api"
 backend = "zellij"
 
 [vcs.git]
-checkout_strategy = "wt"
 checkout_path = "/tmp/{{ branch }}"
 "#;
     let config: FlotillaConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.ai_utility.preference.backend.as_deref(), Some("claude"));
     assert_eq!(config.ai_utility.claude.unwrap().implementation.as_deref(), Some("api"));
     assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some("zellij"));
-    assert_eq!(config.vcs.git.checkout_strategy, "wt");
     assert_eq!(config.vcs.git.checkout_path, "/tmp/{{ branch }}");
 }

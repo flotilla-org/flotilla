@@ -35,6 +35,7 @@ use flotilla_core::{
         vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
+    vcs::{CliGitVcs, Vcs, WorktreePreservationReason, WorktreeRemoval},
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
@@ -133,7 +134,10 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 }
                 let mut reconciler =
                     ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
-                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
+                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
+                        .with_runner(
+                            self.state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
+                        );
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
@@ -617,6 +621,7 @@ impl DaemonRuntime {
                     daemon.resource_backend(),
                     options.namespace.clone(),
                     manifests,
+                    daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
                     MANIFEST_RECONCILE_INTERVAL,
                     options.controller_supervision.clone(),
                     runtime_health.clone(),
@@ -703,6 +708,7 @@ fn spawn_manifest_reconciler_task(
     backend: ResourceBackend,
     namespace: String,
     manifests: flotilla_core::config::ResourceManifestsConfig,
+    runner: Arc<dyn CommandRunner>,
     interval: Duration,
     supervision: ControllerSupervision,
     runtime_health: RuntimeHealth,
@@ -710,7 +716,8 @@ fn spawn_manifest_reconciler_task(
     tokio::spawn(async move {
         supervise_controller("manifest", supervision, runtime_health, move || {
             let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), manifests.dir.clone())
-                .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
+                .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
+                .with_runner(Arc::clone(&runner));
             async move { reconciler.run(interval).await }
         })
         .await;
@@ -3300,8 +3307,8 @@ async fn recover_existing_clone(
 }
 
 async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
-    let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default)
+    let origin = CliGitVcs::explicit_checkout(Path::new(target_path), runner)
+        .remote_url("origin")
         .await
         .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
     let origin = origin.trim();
@@ -3458,117 +3465,8 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
-        if let Some(prepared) = recover_existing_worktree(&*runner, clone_path, branch, target_path).await? {
-            return Ok(prepared);
-        }
-
-        let local_ref = format!("refs/heads/{branch}");
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        let local_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .is_ok();
-        let has_origin = !local_exists
-            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok();
-        if has_origin {
-            let remote_head = format!("refs/heads/{branch}");
-            let advertised = runner
-                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
-            if !advertised.trim().is_empty() {
-                let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
-                runner
-                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
-            }
-        }
-        let remote_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .is_ok();
-        let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
-            CheckoutBranchProvenance::CreatedForConvoy
-        } else {
-            CheckoutBranchProvenance::PreExisting
-        };
-
-        if local_exists {
-            // Multiple vessels can intentionally share the convoy branch. `--force`
-            // overrides Git's protection against attaching it to another worktree.
-            runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-        } else if remote_exists {
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        } else if let Some(base_ref) = base_ref {
-            let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
-            if has_origin {
-                // Force-update the tracking ref: a plain (non-force) fetch would fail on a
-                // rebased/force-pushed base branch and silently fall through to whatever
-                // origin/{base_ref} was last cached, reproducing a narrower version of the
-                // staleness bug this arm exists to fix.
-                let refspec = format!("+{base_ref}:refs/remotes/origin/{base_ref}");
-                if let Err(error) =
-                    runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default).await
-                {
-                    warn!(%base_ref, %error, "fetch convoy base ref failed; falling back to local ref for branch-off");
-                }
-            }
-            // A shared clone always has a local base_ref from its initial clone, but
-            // nothing keeps it advancing — prefer the freshly fetched remote tip and
-            // only fall back to the local ref when origin has no such branch.
-            let resolved_base_ref = if runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await
-                .is_ok()
-            {
-                format!("origin/{base_ref}")
-            } else {
-                base_ref.to_string()
-            };
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        } else {
-            runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-        }
-
-        let commit = resolve_head_commit(&*runner, target_path).await?;
-        if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
-            // Ownership belongs to the branch, not one checkout: sibling vessels
-            // can share it and may finalize in either order.
-            let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        }
-        Ok(PreparedCheckout { commit, branch_provenance })
+        let prepared = CliGitVcs::explicit_checkout(Path::new(clone_path), &*runner).create_worktree(branch, base_ref, target_path).await?;
+        Ok(PreparedCheckout { commit: prepared.commit, branch_provenance: prepared.branch_provenance })
     }
 
     async fn create_fresh_clone(
@@ -3586,36 +3484,17 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let staging_path = clone_staging_path(target_path);
         remove_checkout_path(&*runner, &staging_path).await?;
         let clone_ref = base_ref.unwrap_or(branch);
+        let clone_vcs = CliGitVcs::new(Path::new("/"), &*runner);
         let prepare = async {
-            if clone_ref == "HEAD" {
-                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default).await?;
-            } else {
-                runner
-                    .run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-            }
+            clone_vcs.clone_repo(repo_url, &staging_path, (clone_ref != "HEAD").then_some(clone_ref)).await?;
             if clone_ref != branch {
                 let remote_ref = format!("refs/remotes/origin/{branch}");
-                let remote_exists = runner
-                    .run(
-                        "git",
-                        &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                    )
-                    .await
-                    .is_ok();
+                let staging_vcs = CliGitVcs::explicit_checkout(Path::new(&staging_path), &*runner);
+                let remote_exists = staging_vcs.ref_exists(&remote_ref).await;
                 if remote_exists {
-                    runner
-                        .run(
-                            "git",
-                            &["-C", &staging_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                        )
-                        .await?;
+                    staging_vcs.switch_create(branch, Some(&format!("origin/{branch}"))).await?;
                 } else {
-                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Default).await?;
+                    staging_vcs.switch_create(branch, None).await?;
                 }
             }
             resolve_head_commit(&*runner, &staging_path).await
@@ -3681,119 +3560,21 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
-                let target_exists = runner.path_exists(Path::new(target_path)).await?;
-                if !target_exists && !runner.path_exists(Path::new(clone_path)).await? {
-                    return Ok(CheckoutRemovalOutcome::Removed);
-                }
-                if target_exists {
-                    let remove = runner
-                        .run_output(
-                            "git",
-                            &["-C", clone_path, "worktree", "remove", "--force", target_path],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                        )
-                        .await?;
-                    if !remove.success && !remove.stderr.contains("is not a working tree") {
-                        return Err(remove.stderr);
+                let vcs = CliGitVcs::explicit_checkout(Path::new(clone_path), &*runner);
+                match vcs.remove_worktree(branch, target_path).await? {
+                    WorktreeRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
+                    WorktreeRemoval::PreservedBranch { branch, reason } => {
+                        let reason = match reason {
+                            WorktreePreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
+                            WorktreePreservationReason::CheckedOutElsewhere => BranchPreservationReason::CheckedOutElsewhere,
+                            WorktreePreservationReason::NotCreatedForConvoy => BranchPreservationReason::NotCreatedForConvoy,
+                        };
+                        Ok(CheckoutRemovalOutcome::PreservedBranch { branch, reason })
                     }
                 }
-                remove_checkout_path(&*runner, target_path).await?;
-                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
-                remove_empty_checkout_parents(&*runner, clone_path, target_path).await?;
-
-                let branch_ref = format!("refs/heads/{branch}");
-                let bootstrap_ref = bootstrap_branch_ref(branch);
-                let head = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if !head.success {
-                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                    return Ok(CheckoutRemovalOutcome::Removed);
-                }
-                let bootstrap = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if !bootstrap.success {
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::NotCreatedForConvoy,
-                    });
-                }
-                if head.stdout.trim() != bootstrap.stdout.trim() {
-                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::CommitsPastBase,
-                    });
-                }
-
-                let worktrees = runner
-                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::CheckedOutElsewhere,
-                    });
-                }
-
-                runner
-                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                Ok(CheckoutRemovalOutcome::Removed)
             }
         }
     }
-}
-
-async fn recover_existing_worktree(
-    runner: &dyn CommandRunner,
-    clone_path: &str,
-    branch: &str,
-    target_path: &str,
-) -> Result<Option<PreparedCheckout>, String> {
-    if !runner.path_exists(Path::new(target_path)).await? {
-        return Ok(None);
-    }
-
-    let target_common_dir = runner
-        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable git worktree: {error}"))?;
-    let clone_common_dir = runner
-        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
-        .await?;
-    if target_common_dir.trim() != clone_common_dir.trim() {
-        return Err(format!("checkout target {target_path} already exists but belongs to a different git repository"));
-    }
-
-    let current_branch =
-        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default).await;
-    if current_branch.as_deref().map(str::trim) != Ok(branch) {
-        let target_commit = resolve_head_commit(runner, target_path).await?;
-        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Default).await?;
-        if target_commit.as_deref() != Some(expected_commit.trim()) {
-            return Err(format!("checkout target {target_path} already exists at a different ref than {branch}"));
-        }
-    }
-
-    let branch_provenance = if runner
-        .run(
-            "git",
-            &["-C", clone_path, "show-ref", "--verify", "--quiet", &bootstrap_branch_ref(branch)],
-            Path::new("/"),
-            &ChannelLabel::Default,
-        )
-        .await
-        .is_ok()
-    {
-        CheckoutBranchProvenance::CreatedForConvoy
-    } else {
-        CheckoutBranchProvenance::PreExisting
-    };
-    Ok(Some(PreparedCheckout { commit: resolve_head_commit(runner, target_path).await?, branch_provenance }))
 }
 
 async fn recover_existing_fresh_clone(
@@ -3809,8 +3590,8 @@ async fn recover_existing_fresh_clone(
     verify_clone_origin(runner, repo_url, target_path, "checkout target").await?;
 
     if branch != "HEAD" {
-        let current_branch = runner
-            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default)
+        let current_branch = CliGitVcs::explicit_checkout(Path::new(target_path), runner)
+            .current_branch()
             .await
             .map_err(|error| format!("checkout target {target_path} already exists but its branch cannot be resolved: {error}"))?;
         if current_branch.trim() != branch {
@@ -3824,13 +3605,9 @@ async fn recover_existing_fresh_clone(
     }))
 }
 
+#[cfg(test)]
 fn bootstrap_branch_ref(branch: &str) -> String {
     format!("refs/flotilla/bootstrap/{branch}")
-}
-
-async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
-    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Default).await?;
-    Ok(())
 }
 
 async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
@@ -3855,35 +3632,8 @@ fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 
-async fn remove_empty_checkout_parents(runner: &dyn CommandRunner, clone_path: &str, target_path: &str) -> Result<(), String> {
-    let Some(checkout_root) = Path::new(clone_path).parent() else {
-        return Ok(());
-    };
-    let Some(mut parent) = Path::new(target_path).parent() else {
-        return Ok(());
-    };
-    while parent != checkout_root && parent.starts_with(checkout_root) {
-        let path = parent.to_string_lossy();
-        match runner.run_output("rmdir", &[&path], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(output) if output.success => {}
-            Ok(_) => {
-                let exists = runner.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Default).await?;
-                if exists.success {
-                    break;
-                }
-            }
-            Err(error) => return Err(format!("remove empty checkout parent {}: {error}", parent.display())),
-        }
-        let Some(next) = parent.parent() else {
-            break;
-        };
-        parent = next;
-    }
-    Ok(())
-}
-
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
-    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Default).await?;
+    let commit = CliGitVcs::explicit_checkout(Path::new(path), runner).head_commit_text().await?;
     Ok(Some(commit.trim().to_string()))
 }
 

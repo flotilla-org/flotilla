@@ -13,6 +13,7 @@ use crate::{
         vcs::{git_worktree::GitCheckoutManager, CheckoutManager},
         ChannelLabel, CommandRunner,
     },
+    vcs::{CliGitVcs, Vcs, VcsQuery},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -130,17 +131,18 @@ impl GitRepositoryInspector {
         self
     }
 
-    async fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
-        self.runner
-            .run("git", args, cwd, &ChannelLabel::Default)
+    async fn git_query(&self, cwd: &Path, query: VcsQuery<'_>) -> Result<String, String> {
+        let description = query.description();
+        CliGitVcs::new(cwd, &*self.runner)
+            .query(query)
             .await
             .map(|output| output.trim().to_string())
-            .map_err(|error| format!("git {} in {}: {error}", args.join(" "), cwd.display()))
+            .map_err(|error| format!("git {description} in {}: {error}", cwd.display()))
     }
 
     async fn configured_remote_url(&self, cwd: &Path, remote: &str) -> Result<String, String> {
         let key = format!("remote.{remote}.url");
-        self.git(cwd, &["config", "--get-all", &key])
+        self.git_query(cwd, VcsQuery::ConfigGetAll(&key))
             .await?
             .lines()
             .map(str::trim)
@@ -151,7 +153,7 @@ impl GitRepositoryInspector {
 
     async fn remote_urls(&self, cwd: &Path, remote: &str) -> Result<(String, String), String> {
         let configured = self.configured_remote_url(cwd, remote).await?;
-        let effective = self.git(cwd, &["remote", "get-url", remote]).await?;
+        let effective = self.git_query(cwd, VcsQuery::RemoteUrl(remote)).await?;
         Ok((configured, effective))
     }
 
@@ -168,7 +170,7 @@ impl GitRepositoryInspector {
         }
 
         let remotes = self
-            .git(cwd, &["remote"])
+            .git_query(cwd, VcsQuery::ListRemotes)
             .await?
             .lines()
             .map(str::trim)
@@ -180,7 +182,7 @@ impl GitRepositoryInspector {
             [remote] => self.remote_urls(cwd, remote).await.map(Some),
             _ => {
                 let branch_key = format!("branch.{branch}.remote");
-                let tracked = self.git(cwd, &["config", "--get", &branch_key]).await.ok();
+                let tracked = self.git_query(cwd, VcsQuery::ConfigGet(&branch_key)).await.ok();
                 match tracked.filter(|tracked| remotes.contains(tracked)) {
                     Some(remote) => self.remote_urls(cwd, &remote).await.map(Some),
                     None => {
@@ -203,7 +205,7 @@ impl GitRepositoryInspector {
                         }
                         if identities.len() == 1 {
                             let (remote, configured) = identities.into_values().next().expect("one identity has one remote");
-                            let effective = self.git(cwd, &["remote", "get-url", &remote]).await?;
+                            let effective = self.git_query(cwd, VcsQuery::RemoteUrl(&remote)).await?;
                             Ok(Some((configured, effective)))
                         } else {
                             Err(format!(
@@ -254,16 +256,16 @@ impl RepositoryInspector for GitRepositoryInspector {
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let path =
             std::fs::canonicalize(path).map_err(|error| format!("repository path {} cannot be resolved: {error}", path.display()))?;
-        let top_level = PathBuf::from(self.git(&path, &["rev-parse", "--show-toplevel"]).await?);
+        let top_level = PathBuf::from(self.git_query(&path, VcsQuery::TopLevel).await?);
         let top_level = std::fs::canonicalize(&top_level)
             .map_err(|error| format!("repository root {} cannot be resolved: {error}", top_level.display()))?;
         // `rev-parse HEAD` can fail before the first commit, while the symbolic
         // ref still exposes the initial branch name.
-        let branch = match self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+        let branch = match self.git_query(&top_level, VcsQuery::AbbrevHead).await {
             Ok(branch) => branch,
-            Err(_) => self.git(&top_level, &["symbolic-ref", "--short", "HEAD"]).await?,
+            Err(_) => self.git_query(&top_level, VcsQuery::SymbolicHead).await?,
         };
-        let git_ref = if branch == "HEAD" { self.git(&top_level, &["rev-parse", "HEAD"]).await? } else { branch.clone() };
+        let git_ref = if branch == "HEAD" { self.git_query(&top_level, VcsQuery::Head).await? } else { branch.clone() };
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
         let (spec, transport_url) = match selected_remote {
             Some((configured, effective)) => {
@@ -273,7 +275,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 (RepositorySpec::remote(identity_remote)?.update_remotes(live_remote)?, Some(effective))
             }
             None => {
-                let common_dir = PathBuf::from(self.git(&top_level, &["rev-parse", "--git-common-dir"]).await?);
+                let common_dir = PathBuf::from(self.git_query(&top_level, VcsQuery::GitCommonDir).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
                 let common_dir = std::fs::canonicalize(&common_dir)
                     .map_err(|error| format!("git common directory {} cannot be resolved: {error}", common_dir.display()))?;
@@ -295,9 +297,9 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
         let repository = self.inspect_path(path, None).await?;
-        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let commit = self.git_query(&repository.checkout.path, VcsQuery::Head).await?;
         let declaration_ref = format!("{commit}:{}", crate::project_declaration::DECLARATION_FILE);
-        let yaml = self.git(&repository.checkout.path, &["show", &declaration_ref]).await.map_err(|error| {
+        let yaml = self.git_query(&repository.checkout.path, VcsQuery::Show(&declaration_ref)).await.map_err(|error| {
             format!(
                 "read {} from bootstrap commit {commit}: {error}",
                 repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE).display()
@@ -308,19 +310,13 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
         let repository = self.inspect_path(path, None).await?;
-        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let commit = self.git_query(&repository.checkout.path, VcsQuery::Head).await?;
         // Use one tree-wide grep to find content candidates. Operational entry
         // kind and scope remain content-authoritative; this only avoids one
         // `git show` subprocess for every unrelated file in a large ops+code
         // repository.
-        let grep = self
-            .runner
-            .run_output(
-                "git",
-                &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"],
-                &repository.checkout.path,
-                &ChannelLabel::Default,
-            )
+        let grep = CliGitVcs::new(&repository.checkout.path, &*self.runner)
+            .grep_operational_entries(&commit)
             .await
             .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
         let paths = if grep.success || grep.stderr.trim().is_empty() {
@@ -332,7 +328,7 @@ impl RepositoryInspector for GitRepositoryInspector {
         let mut files = Vec::new();
         for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
             let object_ref = format!("{commit}:{entry_path}");
-            let Ok(contents) = self.git(&repository.checkout.path, &["show", &object_ref]).await else {
+            let Ok(contents) = self.git_query(&repository.checkout.path, VcsQuery::Show(&object_ref)).await else {
                 continue;
             };
             files.push(OperationalEntryFile { path: entry_path.to_string(), contents });
@@ -348,7 +344,7 @@ impl RepositoryInspector for GitRepositoryInspector {
         let Some(previous_remote) = previous.live_remote() else {
             return RepositoryContinuity::Unproven { evidence: "previous Repository has no transport remote".to_string() };
         };
-        let advertised = match self.git(path, &["ls-remote", "--refs", previous_remote]).await {
+        let advertised = match self.git_query(path, VcsQuery::RemoteRefs(previous_remote)).await {
             Ok(advertised) => advertised,
             Err(error) => return RepositoryContinuity::Unproven { evidence: format!("old remote refs unavailable: {error}") },
         };
@@ -358,7 +354,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 continue;
             };
             refs += 1;
-            if self.git(path, &["merge-base", "--is-ancestor", commit, "HEAD"]).await.is_ok() {
+            if self.git_query(path, VcsQuery::IsAncestor { ancestor: commit, descendant: "HEAD" }).await.is_ok() {
                 return RepositoryContinuity::Continuous {
                     evidence: format!("old remote ref {reference} ({commit}) is reachable from HEAD"),
                 };

@@ -2,7 +2,10 @@ use std::path::Path;
 
 use flotilla_protocol::CheckoutStatus;
 
-use crate::providers::run;
+use crate::{
+    providers::run,
+    vcs::{CliGitVcs, Vcs, VcsQuery},
+};
 
 pub async fn fetch_checkout_status(
     branch: &str,
@@ -22,15 +25,16 @@ pub async fn fetch_checkout_status(
     let (unpushed_result, uncommitted, pr_info) = tokio::join!(
         async {
             let base = async {
-                let upstream =
-                    run!(runner, "git", &["rev-parse", "--abbrev-ref", &format!("{branch_for_base}@{{upstream}}")], &repo_for_base);
+                let vcs = CliGitVcs::new(&repo_for_base, runner);
+                let upstream_ref = format!("{branch_for_base}@{{upstream}}");
+                let upstream = vcs.query(VcsQuery::UpstreamOf(&upstream_ref)).await;
                 if let Ok(ref upstream) = upstream {
                     let upstream = upstream.trim();
                     if !upstream.is_empty() {
                         return Ok(upstream.to_string());
                     }
                 }
-                let remote_head = run!(runner, "git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], &repo_for_base);
+                let remote_head = vcs.query(VcsQuery::DefaultRemoteBranch).await;
                 if let Ok(ref remote_head) = remote_head {
                     let remote_head = remote_head.trim();
                     if !remote_head.is_empty() {
@@ -42,14 +46,16 @@ pub async fn fetch_checkout_status(
             .await;
 
             match base {
-                Ok(base_ref) => Ok(run!(runner, "git", &["log", &format!("{base_ref}..{branch_for_base}"), "--oneline"], &repo_for_base)
-                    .unwrap_or_default()),
+                Ok(base_ref) => {
+                    let range = format!("{base_ref}..{branch_for_base}");
+                    Ok(CliGitVcs::new(&repo_for_base, runner).query(VcsQuery::LogOneline(&range)).await.unwrap_or_default())
+                }
                 Err(warning) => Err(warning),
             }
         },
         async {
             if let Some(path) = &checkout_path {
-                run!(runner, "git", &["status", "--porcelain"], path).unwrap_or_default()
+                CliGitVcs::new(path, runner).query(VcsQuery::StatusPorcelain).await.unwrap_or_default()
             } else {
                 String::new()
             }

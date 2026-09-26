@@ -40,7 +40,6 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
             }
         }
     }
-    collect(&mut names, &registry.vcs);
     collect(&mut names, &registry.checkout_managers);
     collect(&mut names, &registry.change_requests);
     collect(&mut names, &registry.issue_trackers);

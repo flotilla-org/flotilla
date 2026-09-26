@@ -267,7 +267,8 @@ pub trait CommandRunner: Send + Sync {
     /// remote-host path semantics.
     async fn path_exists(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_string_lossy();
-        self.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Default).await.map(|output| output.success)
+        let args = ["-e", &*path];
+        self.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await.map(|output| output.success)
     }
 
     /// Choose a Flotilla-owned writable scratch base in this runner's

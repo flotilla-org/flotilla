@@ -2,7 +2,6 @@ pub mod clone;
 pub mod git;
 pub mod git_worktree;
 pub mod provisioning;
-pub mod wt;
 
 use std::path::Path;
 
@@ -20,7 +19,7 @@ pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
 
 #[allow(dead_code)]
 #[async_trait]
-pub trait Vcs: Send + Sync {
+pub trait VcsInspection: Send + Sync {
     /// Given any path (possibly inside a worktree/checkout), resolve to the
     /// main repository root. Returns None if the path is not inside a repo.
     async fn resolve_repo_root(&self, path: &ExecutionEnvironmentPath) -> Option<ExecutionEnvironmentPath>;
@@ -53,18 +52,12 @@ pub trait CheckoutManager: Send + Sync {
     async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String>;
 }
 
-#[allow(dead_code)]
-pub struct VcsBundle {
-    pub vcs: Box<dyn Vcs>,
-    pub checkout_manager: Box<dyn CheckoutManager>,
-}
-
 /// Parse `git status --porcelain` output into a `WorkingTreeStatus`.
 ///
 /// Each line has a two-character status prefix: X Y, where X is the index
 /// (staging area) status and Y is the working-tree status.  `??` means
 /// untracked.  This is the single canonical implementation used by both
-/// the `Vcs` and `CheckoutManager` providers.
+/// the legacy inspection and checkout implementations.
 pub(crate) fn parse_porcelain_status(output: &str) -> WorkingTreeStatus {
     let mut staged = 0usize;
     let mut modified = 0usize;

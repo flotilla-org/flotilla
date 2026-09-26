@@ -1,0 +1,197 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - show-ref
+    - '--verify'
+    - '--quiet'
+    - refs/heads/main
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - remote
+    - get-url
+    - origin
+    cwd: /
+    stdout: |
+      {root}/remote.git
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - ls-remote
+    - '--heads'
+    - origin
+    - refs/heads/feature/remote
+    cwd: /
+    stdout: "e5566a5d525712e19b232849c4353a3df599ddc1\trefs/heads/feature/remote\n"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - fetch
+    - origin
+    - '+main:refs/remotes/origin/main'
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - add
+    - '-b'
+    - convoy/new
+    - '{root}/new-worktree'
+    - origin/main
+    cwd: /
+    stdout: |
+      branch 'convoy/new' set up to track 'origin/main'.
+      HEAD is now at f66de93 initial
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/new-worktree'
+    - rev-parse
+    - HEAD
+    cwd: /
+    stdout: |
+      f66de93fc1be4d90cc56409dbd0b239078715610
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - update-ref
+    - refs/flotilla/bootstrap/convoy/new
+    - f66de93fc1be4d90cc56409dbd0b239078715610
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - rev-parse
+    - '--verify'
+    - refs/flotilla/bootstrap/convoy/new
+    cwd: /
+    stdout: |
+      f66de93fc1be4d90cc56409dbd0b239078715610
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - list
+    - '--porcelain'
+    cwd: /
+    stdout: |+
+      worktree {root}/repo
+      HEAD f66de93fc1be4d90cc56409dbd0b239078715610
+      branch refs/heads/main
+
+      worktree {root}/new-worktree
+      HEAD f66de93fc1be4d90cc56409dbd0b239078715610
+      branch refs/heads/convoy/new
+
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - remove
+    - '--force'
+    - '{root}/new-worktree'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - prune
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - branch
+    - '--delete'
+    - '--force'
+    - convoy/new
+    cwd: /
+    stdout: |
+      Deleted branch convoy/new (was f66de93).
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - update-ref
+    - '-d'
+    - refs/flotilla/bootstrap/convoy/new
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - add
+    - '-b'
+    - feature/remote
+    - '--track'
+    - '{root}/tracked-worktree'
+    - origin/feature/remote
+    cwd: /
+    stdout: |
+      branch 'feature/remote' set up to track 'origin/feature/remote'.
+      HEAD is now at e5566a5 remote feature
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - add
+    - '--detach'
+    - '{root}/detached-worktree'
+    - main
+    cwd: /
+    stdout: |
+      HEAD is now at f66de93 initial
+    exit_code: 0

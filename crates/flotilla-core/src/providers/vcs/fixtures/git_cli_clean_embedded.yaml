@@ -1,0 +1,111 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: find
+    args:
+    - '.'
+    - '-path'
+    - './.git'
+    - '-prune'
+    - '-o'
+    - '-mindepth'
+    - '2'
+    - '-name'
+    - '.git'
+    - '-print'
+    - '-prune'
+    cwd: '{repo}'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: find
+    args:
+    - '.'
+    - '-path'
+    - './.git'
+    - '-prune'
+    - '-o'
+    - '-mindepth'
+    - '2'
+    - '-name'
+    - '.git'
+    - '-print'
+    - '-prune'
+    cwd: '{repo}'
+    stdout: |
+      ./embedded/.git
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - embedded
+    - symbolic-ref
+    - '--short'
+    - '-q'
+    - HEAD
+    cwd: '{repo}'
+    stdout: |
+      main
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - embedded
+    - rev-list
+    - '--count'
+    - HEAD
+    - '--all'
+    - '--not'
+    - '--remotes'
+    cwd: '{repo}'
+    stdout: |
+      1
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - embedded
+    - status
+    - '--porcelain'
+    cwd: '{repo}'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - check-ignore
+    - '--quiet'
+    - '--'
+    - embedded
+    cwd: '{repo}'
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - status
+    - '--porcelain'
+    cwd: '{repo}'
+    stdout: |
+      ?? .flotilla/briefs/
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - status
+    - '--porcelain'
+    cwd: '{repo}'
+    stdout: |
+      ?? .flotilla/briefs/
+    stderr: ''
+    exit_code: 0

@@ -1,0 +1,243 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - show-ref
+    - '--verify'
+    - '--quiet'
+    - refs/heads/convoy/new
+    cwd: /
+    stderr: ''
+    exit_code: 1
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - remote
+    - get-url
+    - origin
+    cwd: /
+    stdout: |
+      {root}/remote.git
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - ls-remote
+    - '--heads'
+    - origin
+    - refs/heads/convoy/new
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - show-ref
+    - '--verify'
+    - '--quiet'
+    - refs/remotes/origin/convoy/new
+    cwd: /
+    stderr: ''
+    exit_code: 1
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - fetch
+    - origin
+    - '+main:refs/remotes/origin/main'
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - show-ref
+    - '--verify'
+    - '--quiet'
+    - refs/remotes/origin/main
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - add
+    - '-b'
+    - convoy/new
+    - '{root}/convoy-new'
+    - origin/main
+    cwd: /
+    stdout: |
+      branch 'convoy/new' set up to track 'origin/main'.
+      HEAD is now at 6e2c34d initial
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - rev-parse
+    - HEAD
+    cwd: /
+    stdout: |
+      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - update-ref
+    - refs/flotilla/bootstrap/convoy/new
+    - '6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7'
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - remove
+    - '--force'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - prune
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - rev-parse
+    - '--verify'
+    - refs/heads/convoy/new
+    cwd: /
+    stdout: |
+      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - rev-parse
+    - '--verify'
+    - refs/flotilla/bootstrap/convoy/new
+    cwd: /
+    stdout: |
+      6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - list
+    - '--porcelain'
+    cwd: /
+    stdout: |+
+      worktree {root}/repo
+      HEAD 6e2c34d7d3d9cd0a005cae6fcea61e60c1b5eac7
+      branch refs/heads/main
+
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - branch
+    - '--delete'
+    - '--force'
+    - convoy/new
+    cwd: /
+    stdout: |
+      Deleted branch convoy/new (was 6e2c34d).
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - update-ref
+    - '-d'
+    - refs/flotilla/bootstrap/convoy/new
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: rm
+    args:
+    - '-rf'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: test
+    args:
+    - '-L'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 1
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 1
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 1
