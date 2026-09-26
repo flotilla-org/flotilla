@@ -37,7 +37,7 @@ pub enum CredentialConsumer {
         permissions: Option<BTreeMap<String, String>>,
     },
     Forgejo {
-        server_url: String,
+        forge_ref: String,
         username: String,
     },
     GitHttpToken {
