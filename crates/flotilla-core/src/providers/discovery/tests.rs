@@ -1,3 +1,5 @@
+use flotilla_resources::{ForgeKind, ForgeSpec};
+
 use super::*;
 use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 
@@ -204,6 +206,21 @@ fn repo_identity_from_gitlab_remote() {
     let identity = bag.repo_identity().expect("should have identity");
     assert_eq!(identity.authority, "gitlab.com");
     assert_eq!(identity.path, "gl-org/project");
+}
+
+#[test]
+fn repo_identity_uses_canonical_forge_host_without_trailing_slash() {
+    let forge = ForgeSpec::builder()
+        .forge_id("lab".into())
+        .kind(ForgeKind::Forgejo)
+        .hosts(std::collections::BTreeSet::from(["ssh-lab".into()]))
+        .https_url("https://forgejo.example.test/".into())
+        .git_ssh_host("ssh-lab".into())
+        .build();
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::remote_host("ssh-lab", "team", "repo", "origin"))
+        .with(EnvironmentAssertion::origin_forge(forge));
+    assert_eq!(bag.repo_identity().expect("repo identity").authority, "forgejo.example.test");
 }
 
 #[test]

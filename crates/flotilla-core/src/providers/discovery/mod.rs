@@ -223,7 +223,11 @@ impl EnvironmentBag {
     /// Uses the origin remote, whose authority is independent of the forge kind.
     pub fn repo_identity(&self) -> Option<flotilla_protocol::RepoIdentity> {
         self.find_origin_remote().map(|(host, owner, repo)| {
-            let authority = self.find_origin_forge().and_then(|forge| forge.https_url.strip_prefix("https://")).unwrap_or(host);
+            let authority = self
+                .find_origin_forge()
+                .and_then(|forge| forge.https_url.strip_prefix("https://"))
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or(host);
             flotilla_protocol::RepoIdentity { authority: authority.into(), path: format!("{owner}/{repo}") }
         })
     }

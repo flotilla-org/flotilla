@@ -96,9 +96,9 @@ impl ForgejoChangeRequestProvider {
 
     async fn list(&self, state: &str, limit: usize) -> Result<Vec<serde_json::Value>, String> {
         let mut items = Vec::new();
+        let page_size = limit.min(50);
         while items.len() < limit {
-            let page_size = (limit - items.len()).min(50);
-            let page = items.len() / 50 + 1;
+            let page = items.len() / page_size + 1;
             let value = self
                 .execute(
                     reqwest::Method::GET,
@@ -114,6 +114,7 @@ impl ForgejoChangeRequestProvider {
                 break;
             }
         }
+        items.truncate(limit);
         Ok(items)
     }
 }
@@ -174,13 +175,45 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
     use crate::providers::{
         replay::{self, Masks},
         testing::MockRunner,
+        ChannelLabel,
     };
+
+    struct MockHttp {
+        responses: Mutex<VecDeque<http::Response<bytes::Bytes>>>,
+        urls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HttpClient for MockHttp {
+        async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            self.urls.lock().expect("request URLs").push(request.url().to_string());
+            self.responses.lock().expect("responses").pop_front().ok_or_else(|| "unexpected HTTP request".into())
+        }
+    }
+
+    fn response(items: &[serde_json::Value]) -> http::Response<bytes::Bytes> {
+        http::Response::builder()
+            .status(200)
+            .body(bytes::Bytes::from(serde_json::to_vec(items).expect("serialize items")))
+            .expect("response")
+    }
+
+    fn json_response(value: &serde_json::Value) -> http::Response<bytes::Bytes> {
+        http::Response::builder()
+            .status(200)
+            .body(bytes::Bytes::from(serde_json::to_vec(value).expect("serialize value")))
+            .expect("response")
+    }
 
     fn auth() -> crate::providers::issue_tracker::forgejo::ForgejoAuth {
         if !replay::is_live() {
@@ -231,5 +264,77 @@ mod tests {
         merged["state"] = "closed".into();
         merged["merged"] = true.into();
         assert_eq!(provider.parse(&merged).expect("parse merged request").1.status, ChangeRequestStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn pagination_keeps_page_size_constant_and_truncates_to_requested_limit() {
+        let values = (1..=100)
+            .map(|number| serde_json::json!({"number": number, "title": format!("Change {number}"), "head": {"ref": format!("branch-{number}")}, "state": "open"}))
+            .collect::<Vec<_>>();
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([response(&values[..50]), response(&values[50..])])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth()),
+            "team/repo".into(),
+        );
+        let requests = provider.list_change_requests(70).await.expect("list change requests");
+        assert_eq!(requests.len(), 70);
+        assert_eq!(requests.first().expect("first").0, "1");
+        assert_eq!(requests.last().expect("last").0, "70");
+        let urls = http.urls.lock().expect("request URLs");
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].ends_with("pulls?state=open&limit=50&page=1"));
+        assert!(urls[1].ends_with("pulls?state=open&limit=50&page=2"));
+    }
+
+    #[tokio::test]
+    async fn admission_close_and_merge_use_forgejo_pull_endpoints() {
+        let value =
+            serde_json::json!({"number": 7, "title": "Change", "head": {"ref": "feature"}, "base": {"ref": "main"}, "state": "open"});
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([
+                json_response(&value),
+                json_response(&value),
+                http::Response::builder().status(200).body(bytes::Bytes::new()).expect("response"),
+            ])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth()),
+            "team/repo".into(),
+        );
+        let admission = provider.get_change_request_for_admission("7").await.expect("admission");
+        assert_eq!(admission.base_ref.as_deref(), Some("main"));
+        provider.close_change_request("7").await.expect("close");
+        provider.merge_change_request("7").await.expect("merge");
+        let urls = http.urls.lock().expect("request URLs");
+        assert!(urls[0].ends_with("/repos/team/repo/pulls/7"));
+        assert!(urls[1].ends_with("/repos/team/repo/pulls/7"));
+        assert!(urls[2].ends_with("/repos/team/repo/pulls/7/merge"));
+    }
+
+    #[tokio::test]
+    async fn reports_forgejo_http_errors() {
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([http::Response::builder()
+                .status(401)
+                .body(bytes::Bytes::from_static(b"unauthorized"))
+                .expect("response")])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider = ForgejoChangeRequestProvider::new(
+            http,
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth()),
+            "team/repo".into(),
+        );
+        let error = provider.list_change_requests(1).await.expect_err("HTTP error");
+        assert!(error.contains("401"));
     }
 }
