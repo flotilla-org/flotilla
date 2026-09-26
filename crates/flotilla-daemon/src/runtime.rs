@@ -1306,6 +1306,8 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
         BTreeMap<String, GithubAppScope>,
     );
     let mut deliveries = BTreeMap::<String, Delivery>::new();
+    let mut placement_cache = BTreeMap::<String, Result<PlacementPolicySpec, String>>::new();
+    let mut scope_errors = BTreeMap::<String, String>::new();
     for vessel in vessels.items {
         let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
@@ -1335,17 +1337,30 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
             for (name, repositories) in &requirement.credential_scopes {
                 scopes.entry(name.clone()).or_default().extend(repositories.iter().cloned());
             }
-            let placement = match flotilla_resources::pinned_placement_ref(convoy) {
-                Some(name) => Some(
-                    backend
+            if requirement.credential_scopes.is_empty() {
+                continue;
+            }
+            let placement = if let Some(name) = flotilla_resources::pinned_placement_ref(convoy) {
+                if !placement_cache.contains_key(name) {
+                    let result = backend
                         .including_replicas::<PlacementPolicy>(namespace)
                         .get(name)
                         .await
-                        .map_err(|error| format!("credential placement `{name}` unavailable: {error}"))?,
-                ),
-                None => None,
+                        .map(|placement| placement.object.spec)
+                        .map_err(|error| format!("credential placement `{name}` unavailable: {error}"));
+                    placement_cache.insert(name.to_string(), result);
+                }
+                match placement_cache.get(name).expect("placement was cached") {
+                    Ok(placement) => Some(placement),
+                    Err(error) => {
+                        scope_errors.insert(environment_ref.clone(), error.clone());
+                        continue;
+                    }
+                }
+            } else {
+                None
             };
-            let stance = match placement.as_ref().map(|placement| &placement.object.spec) {
+            let stance = match placement {
                 Some(spec) if spec.docker_per_vessel.is_some() => Stance::Contained,
                 Some(spec) if spec.host_direct.is_some() => Stance::Trusted,
                 _ => requirement.stance,
@@ -1371,6 +1386,10 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     }
     let mut errors = Vec::new();
     for (environment_ref, (granted, running, scopes, live_scopes)) in deliveries {
+        if let Some(error) = scope_errors.remove(&environment_ref) {
+            errors.push(format!("resolve credential scope for environment {environment_ref}: {error}"));
+            continue;
+        }
         if granted.is_empty() {
             continue;
         }
@@ -8242,20 +8261,37 @@ mod tests {
             }
         };
 
-        let current = convoys.get("credential-work").await.expect("read convoy");
-        let mut status = current.status.expect("convoy status");
-        status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(
-            VesselRequirement::builder()
-                .name("unavailable".to_string())
-                .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                .crew(Vec::new())
-                .build(),
-        );
-        status.work.insert("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build());
-        convoys.update_status("credential-work", &current.metadata.resource_version, &status).await.expect("add unavailable work");
+        let unavailable_convoy = convoys
+            .create(
+                &empty_meta("unavailable-credential-work"),
+                &ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("missing-policy".to_string()).build(),
+            )
+            .await
+            .expect("create convoy with unavailable placement");
+        convoys
+            .update_status(&unavailable_convoy.metadata.name, &unavailable_convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("unavailable".to_string())
+                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                        .credential_scopes(BTreeMap::from([(
+                            "work-token".to_string(),
+                            BTreeSet::from([RepositoryKey("repo".to_string())]),
+                        )]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                work: BTreeMap::from([("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("mark unavailable work running");
         let unavailable_vessel = vessels
             .create(&empty_meta("unavailable-work-vessel"), &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
+                convoy_ref: "unavailable-credential-work".to_string(),
                 vessel_name: "unavailable".to_string(),
                 placement_policy_ref: "test".to_string(),
                 adopted_checkout_refs: BTreeMap::new(),
@@ -8271,7 +8307,7 @@ mod tests {
             .await
             .expect("place unavailable vessel");
         assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
-        assert!(can_fill_git_credential().await);
+        assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
 
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
