@@ -196,9 +196,7 @@ impl<'a> TeleportSessionActionService<'a> {
 
         match branch {
             Some(branch_name) => {
-                let checkout_manager =
-                    self.read_only.registry.vcs.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-                let vcs = checkout_manager;
+                let vcs = self.read_only.registry.vcs.preferred().cloned().ok_or_else(|| "No VCS provider available".to_string())?;
                 let (path, _checkout) = vcs.create_checkout(branch_name, false).await?;
                 Ok(Some(path))
             }

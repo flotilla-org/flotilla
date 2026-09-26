@@ -5598,7 +5598,7 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
         "should expose structured valued unmet requirements"
     );
     assert!(
-        providers.unmet_requirements.iter().any(|req| req.factory == "git" && req.kind == "no_vcs_checkout" && req.value.is_none()),
+        providers.unmet_requirements.iter().any(|req| req.factory == "git-cli" && req.kind == "no_vcs_checkout" && req.value.is_none()),
         "should expose valueless unmet requirements without forcing a placeholder string"
     );
 }

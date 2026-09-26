@@ -890,8 +890,10 @@ async fn discover_providers_inner(
         &mut unmet,
     );
 
-    if !factories.vcs.is_empty() && combined.find_vcs_checkout(VcsKind::Git).is_none() {
-        unmet.push(("git".to_string(), UnmetRequirement::NoVcsCheckout));
+    if combined.find_vcs_checkout(VcsKind::Git).is_none() {
+        if let Some(descriptor) = factories.vcs.iter().map(|factory| factory.descriptor()).find(|descriptor| descriptor.backend == "git") {
+            unmet.push((descriptor.implementation, UnmetRequirement::NoVcsCheckout));
+        }
     }
 
     let repo_slug = combined.repo_slug();
@@ -963,7 +965,7 @@ mod orchestrator_tests {
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
-        // VCS should be registered (git factory)
+        assert!(!result.registry.vcs.is_empty(), "expected a discovered Git VCS provider");
 
         // The combined bag should have both host assertions (binary) and repo assertions (checkout)
         assert!(result.host_repo_bag.find_binary("git").is_some(), "host binary should be in combined bag");
