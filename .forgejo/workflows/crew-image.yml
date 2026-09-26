@@ -22,12 +22,12 @@ on:
         description: Exact 40-character commit from flotilla-org/cleat
         required: true
         type: string
-        default: '2694b71c593868af3b289a04ed6e468979c236bc'
+        default: '2f154566eb0e5ea3e70abbda2327f211ea183c2b'
       zig_version:
         description: "Zig version matching cleat_ref's ghostty-vt toolchain pin (see issue 1881)"
         required: true
         type: string
-        default: '0.15.2'
+        default: '0.16.0'
 
 permissions:
   contents: read

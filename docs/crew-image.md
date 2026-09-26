@@ -36,8 +36,8 @@ readable by the host-mapped crew user without a home-directory or host mount.
 The entry is generated from Ghostty's `src/terminfo/ghostty.zig` at the commit
 pinned by `tools/ghostty-toolchain.toml` in the Dockerfile's `CLEAT_REF`
 checkout, using `ci/crew-image/emit-ghostty-terminfo.zig` as a small encoder
-entry point. With the current `CLEAT_REF` (`2694b71c593868af3b289a04ed6e468979c236bc`),
-that Ghostty commit is `64daa599c531e6938bc4c52d9198a91f1e6ce8cf`
+entry point. With the current `CLEAT_REF` (`2f154566eb0e5ea3e70abbda2327f211ea183c2b`),
+that Ghostty commit is `c3dbb925e6cbcfceafba5749f81a486dd2275099`
 from `rjwittams/ghostty`. Ghostty is MIT licensed; its `LICENSE` is copied
 to `/usr/share/doc/ghostty-terminfo/copyright`. The image does not set `TERM`:
 Cleat chooses the identity for each new session, and environments without this
@@ -193,6 +193,9 @@ override. Inspect the child with `printf '%s\n' "$TERM"` and
 Also run `TERM=xterm-ghostty python3 -c 'import curses; curses.setupterm()'`
 and a noninteractive `sh -c 'true'`. Existing crews retain their pinned image
 and are not restarted by the image build or baseline update.
+
+Flotilla launches managed Docker environments with `--init`, so PID 1 reaps
+orphaned processes created by crew commands and process-lifecycle tests.
 
 The build-time smoke check also compiles and links a small C program with
 Clang and LLD, exercising the common C and Linux headers. To verify the
