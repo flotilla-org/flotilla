@@ -26,8 +26,8 @@ use flotilla_core::{
             test_support::{
                 fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_discovery_with_runner,
                 fake_vcs_discovery, git_process_discovery, init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner,
-                FakeChangeRequest, FakeCheckoutManager, FakeCheckoutManagerFactory, FakeDiscoveryProviders, FakeIssueProvider,
-                FakePresentationManager, FakeTerminalPool, FakeVcsState, TestEnvVars,
+                FakeChangeRequest, FakeCheckoutManager, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager,
+                FakeTerminalPool, FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
             ProviderDescriptor, RepoDetector, UnmetRequirement,
@@ -4244,8 +4244,7 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
     let state_b = FakeVcsState::builder(repo_b.clone()).branch("main", true).checkout("main").is_main(true).build().build();
 
     let mut discovery = fake_discovery(false);
-    discovery.factories.checkout_managers =
-        vec![Box::new(FakeCheckoutManagerFactory::new(state_a)), Box::new(FakeCheckoutManagerFactory::new(state_b))];
+    discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(state_a)), Box::new(FakeVcsFactory::new(state_b))];
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
     let config = test_config_store(temp.path().join("config"));

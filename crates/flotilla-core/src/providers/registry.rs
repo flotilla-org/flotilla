@@ -12,8 +12,9 @@ use crate::{
         issue_tracker::{provider_for_source, IssueProvider},
         presentation::PresentationManager,
         terminal::TerminalPool,
-        vcs::{CheckoutManager, CloneProvisioner},
+        vcs::CloneProvisioner,
     },
+    vcs::Vcs,
 };
 
 /// Common accessors shared by all descriptor types.
@@ -142,7 +143,7 @@ impl<D, T: ?Sized> Default for TypedSet<D, T> {
 pub struct ProviderRegistry {
     pub agent_adapters: AgentAdapterRegistry,
     pub clone_provisioners: ProviderSet<dyn CloneProvisioner>,
-    pub checkout_managers: ProviderSet<dyn CheckoutManager>,
+    pub vcs: ProviderSet<dyn Vcs>,
     pub change_requests: ProviderSet<dyn ChangeRequestTracker>,
     pub issue_trackers: ProviderSet<dyn IssueProvider>,
     pub cloud_agents: ProviderSet<dyn CloudAgentService>,
@@ -157,7 +158,7 @@ impl ProviderRegistry {
         Self {
             agent_adapters: AgentAdapterRegistry::default(),
             clone_provisioners: ProviderSet::new(),
-            checkout_managers: ProviderSet::new(),
+            vcs: ProviderSet::new(),
             change_requests: ProviderSet::new(),
             issue_trackers: ProviderSet::new(),
             cloud_agents: ProviderSet::new(),
@@ -190,7 +191,7 @@ impl ProviderRegistry {
             }
         }
         collect(&mut infos, &self.clone_provisioners);
-        collect(&mut infos, &self.checkout_managers);
+        collect(&mut infos, &self.vcs);
         collect(&mut infos, &self.change_requests);
         collect(&mut infos, &self.issue_trackers);
         collect(&mut infos, &self.cloud_agents);

@@ -8,14 +8,9 @@ use std::{
     fmt,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
-use flotilla_core::{
-    providers::{CommandRunner, ProcessCommandRunner},
-    vcs::{CliGitVcs, Vcs},
-};
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, patch_resource_annotations, resource_document_spec_hash, EventRecorder,
     EventRegarding, ObjectEvent, ResourceBackend, ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
@@ -86,14 +81,12 @@ pub struct ResourceManifestReconciler {
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
     events: EventRecorder,
-    runner: Arc<dyn CommandRunner>,
 }
 
 impl ResourceManifestReconciler {
     pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
             events: EventRecorder::new(backend.clone()),
-            runner: Arc::new(ProcessCommandRunner),
             backend,
             default_namespace: default_namespace.into(),
             root: root.into(),
@@ -109,11 +102,6 @@ impl ResourceManifestReconciler {
         self.source = source.into();
         self.reconciler_root = reconciler_root.into();
         self.fixed_revision = None;
-        self
-    }
-
-    pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
-        self.runner = runner;
         self
     }
 
@@ -164,7 +152,12 @@ impl ResourceManifestReconciler {
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
         let revision = match &self.fixed_revision {
             Some(revision) => revision.clone(),
-            None => resolve_clean_git_revision(&*self.runner, &self.root).await?,
+            None => {
+                let root = self.root.clone();
+                tokio::task::spawn_blocking(move || resolve_clean_git_revision(&root))
+                    .await
+                    .map_err(|error| format!("manifest revision task failed: {error}"))??
+            }
         };
         let root = self.root.clone();
         let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
@@ -472,20 +465,28 @@ impl ResourceManifestReconciler {
     }
 }
 
-async fn resolve_clean_git_revision(runner: &dyn CommandRunner, root: &Path) -> Result<String, String> {
-    let vcs = CliGitVcs::new(root, runner);
-    let status = vcs.working_tree_status(true).await.map_err(|error| format!("run git status in {}: {error}", root.display()))?;
-    if !status.success {
-        return Err(format!("git status in {} failed: {}", root.display(), status.stderr.trim()));
+fn resolve_clean_git_revision(root: &Path) -> Result<String, String> {
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", "."])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("run git status in {}: {error}", root.display()))?;
+    if !status.status.success() {
+        return Err(format!("git status in {} failed: {}", root.display(), String::from_utf8_lossy(&status.stderr).trim()));
     }
     if !status.stdout.is_empty() {
         return Err(format!("manifest directory {} has changes not represented by a Git revision", root.display()));
     }
-    let output = vcs.head_commit().await.map_err(|error| format!("resolve manifest revision in {}: {error}", root.display()))?;
-    if !output.success {
-        return Err(format!("resolve manifest revision in {}: {}", root.display(), output.stderr.trim()));
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("resolve manifest revision in {}: {error}", root.display()))?;
+    if !output.status.success() {
+        return Err(format!("resolve manifest revision in {}: {}", root.display(), String::from_utf8_lossy(&output.stderr).trim()));
     }
-    Ok(output.stdout.trim().to_string())
+    let revision = String::from_utf8(output.stdout).map_err(|error| format!("manifest Git revision is not UTF-8: {error}"))?;
+    Ok(revision.trim().to_string())
 }
 
 fn manifest_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -729,44 +730,41 @@ mod tests {
         assert_eq!(object.metadata.annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str), Some("current-revision"));
     }
 
-    #[tokio::test]
-    async fn clean_manifest_tree_resolves_head_revision() {
+    #[test]
+    fn clean_manifest_tree_resolves_head_revision() {
         let dir = committed_manifest_repo();
 
-        assert_eq!(
-            resolve_clean_git_revision(&ProcessCommandRunner, dir.path()).await.expect("clean revision"),
-            git(dir.path(), &["rev-parse", "HEAD"])
-        );
+        assert_eq!(resolve_clean_git_revision(dir.path()).expect("clean revision"), git(dir.path(), &["rev-parse", "HEAD"]));
     }
 
-    #[tokio::test]
-    async fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
+    #[test]
+    fn dirty_manifest_tree_is_rejected_as_unversioned_input() {
         let dir = committed_manifest_repo();
         write(&dir.path().join("untracked.yaml"), &manifest("draft", "uncommitted"));
 
-        let error = resolve_clean_git_revision(&ProcessCommandRunner, dir.path()).await.expect_err("dirty tree must be rejected");
+        let error = resolve_clean_git_revision(dir.path()).expect_err("dirty tree must be rejected");
 
         assert!(error.contains("changes not represented by a Git revision"), "{error}");
     }
 
-    #[tokio::test]
-    async fn ignored_manifest_is_rejected_as_unversioned_input() {
+    #[test]
+    fn ignored_manifest_is_rejected_as_unversioned_input() {
         let dir = committed_manifest_repo();
         write(&dir.path().join(".gitignore"), "*.local.yaml\n");
         git(dir.path(), &["add", ".gitignore"]);
         git(dir.path(), &["commit", "-m", "ignore local manifests"]);
         write(&dir.path().join("draft.local.yaml"), &manifest("draft", "ignored"));
 
-        let error = resolve_clean_git_revision(&ProcessCommandRunner, dir.path()).await.expect_err("ignored manifest must be rejected");
+        let error = resolve_clean_git_revision(dir.path()).expect_err("ignored manifest must be rejected");
 
         assert!(error.contains("changes not represented by a Git revision"), "{error}");
     }
 
-    #[tokio::test]
-    async fn manifest_tree_outside_git_is_rejected() {
+    #[test]
+    fn manifest_tree_outside_git_is_rejected() {
         let dir = tempfile::tempdir_in("/tmp").expect("non-git tempdir");
 
-        let error = resolve_clean_git_revision(&ProcessCommandRunner, dir.path()).await.expect_err("non-repository must be rejected");
+        let error = resolve_clean_git_revision(dir.path()).expect_err("non-repository must be rejected");
 
         assert!(error.contains("git status"), "{error}");
     }

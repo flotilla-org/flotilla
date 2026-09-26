@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use async_trait::async_trait;
 use tracing::info;
 
 use crate::{
@@ -26,13 +25,13 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-pub struct GitCheckoutManager {
+pub struct GitWorktreeStrategy {
     checkout_path: String,
     env: minijinja::Environment<'static>,
     runner: Arc<dyn CommandRunner>,
 }
 
-impl GitCheckoutManager {
+impl GitWorktreeStrategy {
     pub fn new(checkout_path: String, runner: Arc<dyn CommandRunner>) -> Self {
         let mut env = minijinja::Environment::new();
         env.add_filter("sanitize", |value: String| -> String { value.replace(['/', '\\'], "-") });
@@ -169,9 +168,8 @@ impl GitCheckoutManager {
     }
 }
 
-#[async_trait]
-impl super::CheckoutManager for GitCheckoutManager {
-    async fn validate_target(
+impl GitWorktreeStrategy {
+    pub(crate) async fn validate_target(
         &self,
         repo_root: &ExecutionEnvironmentPath,
         branch: &str,
@@ -180,7 +178,10 @@ impl super::CheckoutManager for GitCheckoutManager {
         super::validate_checkout_target_in_repo(repo_root.as_path(), branch, intent, &*self.runner).await
     }
 
-    async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+    pub(crate) async fn list_checkouts(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+    ) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         let root = repo_root.as_path();
         let output = run!(self.runner, "git", &["worktree", "list", "--porcelain"], root)?;
         let entries = Self::parse_porcelain(&output);
@@ -198,7 +199,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         Ok(futures::future::join_all(futures).await)
     }
 
-    async fn create_checkout(
+    pub(crate) async fn create_checkout(
         &self,
         repo_root: &ExecutionEnvironmentPath,
         branch: &str,
@@ -255,7 +256,7 @@ impl super::CheckoutManager for GitCheckoutManager {
         Ok(self.enrich_checkout(&wt_path, branch, false, &default_branch).await)
     }
 
-    async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
+    pub(crate) async fn remove_checkout(&self, repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
         let root = repo_root.as_path();
         info!(%branch, "git: removing worktree");
 
@@ -302,7 +303,7 @@ worktree /home/user/repo.feature-x
 HEAD def4567890123
 branch refs/heads/feature/x
 ";
-        let entries = GitCheckoutManager::parse_porcelain(output);
+        let entries = GitWorktreeStrategy::parse_porcelain(output);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, PathBuf::from("/home/user/repo"));
         assert_eq!(entries[0].1, "main");
@@ -321,7 +322,7 @@ worktree /home/user/repo.detached
 HEAD def4567890123
 detached
 ";
-        let entries = GitCheckoutManager::parse_porcelain(output);
+        let entries = GitWorktreeStrategy::parse_porcelain(output);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, "main");
         assert_eq!(entries[1].1, "(detached: def4567)");
@@ -338,7 +339,7 @@ worktree /home/user/repo.feature
 HEAD def4567890123
 branch refs/heads/feature
 ";
-        let entries = GitCheckoutManager::parse_porcelain(output);
+        let entries = GitWorktreeStrategy::parse_porcelain(output);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, "feature");
     }
@@ -364,7 +365,7 @@ branch refs/heads/feature
     fn render_worktree_path_default_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
         let checkout_path = crate::config::default_checkout_path();
-        let mgr = GitCheckoutManager::new(checkout_path, runner);
+        let mgr = GitWorktreeStrategy::new(checkout_path, runner);
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "feature/my-branch").unwrap();
@@ -374,7 +375,7 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_absolute_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let mgr = GitCheckoutManager::new("/tmp/worktrees/{{ repo }}.{{ branch | sanitize }}".to_string(), runner);
+        let mgr = GitWorktreeStrategy::new("/tmp/worktrees/{{ repo }}.{{ branch | sanitize }}".to_string(), runner);
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "fix\\backslash").unwrap();
@@ -384,7 +385,7 @@ branch refs/heads/feature
     #[test]
     fn render_worktree_path_relative_template() {
         let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![]));
-        let mgr = GitCheckoutManager::new("worktrees/{{ branch | sanitize }}".to_string(), runner);
+        let mgr = GitWorktreeStrategy::new("worktrees/{{ branch | sanitize }}".to_string(), runner);
         let repo = ExecutionEnvironmentPath::new("/home/user/myrepo");
 
         let path = mgr.render_worktree_path(&repo, "dev/thing").unwrap();
@@ -412,9 +413,10 @@ branch refs/heads/feature
         let runner = replay::test_runner(&session);
 
         let checkout_path = crate::config::default_checkout_path();
-        let mgr = GitCheckoutManager::new(checkout_path, runner.clone());
+        let strategy = GitWorktreeStrategy::new(checkout_path, runner.clone());
+        let vcs = crate::vcs::FlotillaVcs::new(repo_path, runner.clone(), crate::vcs::GitCheckoutStrategy::Worktree(Box::new(strategy)));
 
-        checkout_test_support::assert_checkout_tracks_remote_branch(&mgr, &runner, &repo_path).await;
+        checkout_test_support::assert_checkout_tracks_remote_branch(&vcs, &runner).await;
 
         session.finish();
     }

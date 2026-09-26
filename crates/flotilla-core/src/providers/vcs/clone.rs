@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
+use flotilla_resources::CheckoutBranchProvenance;
 use tracing::info;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
+    vcs::{CheckoutMaterialisation, VcsBackend},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -15,14 +18,14 @@ use crate::{
 /// Instead of git worktrees (which require a shared `.git` directory),
 /// this creates independent clones under `/workspace/<branch>` that
 /// share objects with the reference repo for fast, space-efficient setup.
-pub struct CloneCheckoutManager {
+pub struct ReferenceCloneStrategy {
     runner: Arc<dyn CommandRunner>,
     reference_dir: ExecutionEnvironmentPath,
 }
 
 const WORKSPACE_ROOT: &str = "/workspace";
 
-impl CloneCheckoutManager {
+impl ReferenceCloneStrategy {
     pub fn new(runner: Arc<dyn CommandRunner>, reference_dir: ExecutionEnvironmentPath) -> Self {
         Self { runner, reference_dir }
     }
@@ -59,9 +62,97 @@ impl CloneCheckoutManager {
     }
 }
 
-#[async_trait]
-impl super::CheckoutManager for CloneCheckoutManager {
-    async fn validate_target(
+impl ReferenceCloneStrategy {
+    pub(crate) async fn materialise_checkout(
+        &self,
+        branch: &str,
+        base_ref: Option<&str>,
+        target: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
+        let reference_dir = self.ref_dir_str()?;
+        let target_path = std::path::Path::new(target);
+        if self.runner.path_exists(target_path).await? {
+            let backend = crate::vcs::GitCliBackend::explicit_checkout(target_path, &*self.runner);
+            if backend.current_branch().await?.trim() != branch {
+                return Err(format!("checkout target {target} already exists on a different branch"));
+            }
+            let provenance = if backend.ref_exists(&format!("refs/flotilla/bootstrap/{branch}")).await {
+                CheckoutBranchProvenance::CreatedForConvoy
+            } else {
+                CheckoutBranchProvenance::PreExisting
+            };
+            return Ok(CheckoutMaterialisation { commit: Some(backend.head_commit_text().await?.trim().to_string()), provenance });
+        }
+
+        let remote_url = self.remote_url().await?;
+        let local_ref = format!("refs/heads/{branch}");
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        let local_exists = self
+            .runner
+            .run(
+                "git",
+                &["--git-dir", reference_dir, "show-ref", "--verify", "--quiet", &local_ref],
+                std::path::Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await
+            .is_ok();
+        let remote_exists = self
+            .runner
+            .run(
+                "git",
+                &["--git-dir", reference_dir, "show-ref", "--verify", "--quiet", &remote_ref],
+                std::path::Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await
+            .is_ok();
+        let provenance = if local_exists || remote_exists {
+            self.runner
+                .run(
+                    "git",
+                    &["clone", "--reference", reference_dir, "--branch", branch, &remote_url, target],
+                    std::path::Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await?;
+            CheckoutBranchProvenance::PreExisting
+        } else {
+            let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
+            self.runner
+                .run(
+                    "git",
+                    &["clone", "--reference", reference_dir, "--no-checkout", &remote_url, target],
+                    std::path::Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await?;
+            self.runner
+                .run(
+                    "git",
+                    &["-C", target, "checkout", "-b", branch, &format!("origin/{base}")],
+                    std::path::Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await?;
+            CheckoutBranchProvenance::CreatedForConvoy
+        };
+        let backend = crate::vcs::GitCliBackend::explicit_checkout(target_path, &*self.runner);
+        let commit = backend.head_commit_text().await?.trim().to_string();
+        if provenance == CheckoutBranchProvenance::CreatedForConvoy {
+            self.runner
+                .run(
+                    "git",
+                    &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
+                    std::path::Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await?;
+        }
+        Ok(CheckoutMaterialisation { commit: Some(commit), provenance })
+    }
+
+    pub(crate) async fn validate_target(
         &self,
         _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
@@ -71,7 +162,10 @@ impl super::CheckoutManager for CloneCheckoutManager {
             .await
     }
 
-    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+    pub(crate) async fn list_checkouts(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+    ) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         // List directories under /workspace/
         let output = self
             .runner
@@ -121,7 +215,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         Ok(checkouts)
     }
 
-    async fn create_checkout(
+    pub(crate) async fn create_checkout(
         &self,
         _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
@@ -184,7 +278,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         Ok((ExecutionEnvironmentPath::new(checkout_dir), checkout))
     }
 
-    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
+    pub(crate) async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, branch: &str) -> Result<(), String> {
         let sanitized = Self::sanitize_branch(branch);
         let checkout_dir = format!("{WORKSPACE_ROOT}/{sanitized}");
         info!(%branch, %checkout_dir, "clone: removing checkout");
@@ -204,14 +298,10 @@ mod tests {
         sync::Mutex,
     };
 
-    use async_trait::async_trait;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::providers::{
-        vcs::{checkout_test_support::git, CheckoutManager},
-        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
-    };
+    use crate::providers::{vcs::checkout_test_support::git, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
 
     /// A test runner that records all (cmd, args) calls and returns queued responses.
     struct RecordingRunner {
@@ -249,7 +339,7 @@ mod tests {
     }
 
     /// Executes real git commands while remapping the logical `/workspace` paths
-    /// used by `CloneCheckoutManager` into a writable temp directory for tests.
+    /// used by `ReferenceCloneStrategy` into a writable temp directory for tests.
     struct WorkspaceMappingRunner {
         inner: ProcessCommandRunner,
         workspace_root: PathBuf,
@@ -336,7 +426,7 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
         let (path, checkout) =
             mgr.create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "feat", false).await.expect("create_checkout should succeed");
 
@@ -377,7 +467,7 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
         let (path, checkout) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "my-feature", true)
             .await
@@ -422,7 +512,7 @@ mod tests {
     async fn create_checkout_fresh_branch_populates_working_tree() {
         let (_dir, reference_git_dir, workspace_root) = setup_real_clone_repo();
         let runner = Arc::new(WorkspaceMappingRunner::new(workspace_root.clone()));
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new(reference_git_dir.clone()));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new(reference_git_dir.clone()));
 
         let (_path, checkout) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new(reference_git_dir), "my-feature", true)
@@ -446,7 +536,7 @@ mod tests {
             Err("".to_string()),                                 // show-ref local — not found
             Ok("".to_string()),                                  // show-ref remote — found!
         ]));
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
 
         let result = mgr.create_checkout(&ExecutionEnvironmentPath::new("/workspace"), "existing-branch", true).await;
 
@@ -458,7 +548,7 @@ mod tests {
     async fn create_checkout_sanitizes_slashes() {
         let runner = Arc::new(RecordingRunner::new(vec![Ok("https://github.com/org/repo.git\n".into()), Ok(String::new())]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
         let (path, _) = mgr
             .create_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "feature/deep/branch", false)
             .await
@@ -474,7 +564,7 @@ mod tests {
             Ok(String::new()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
         mgr.remove_checkout(&ExecutionEnvironmentPath::new("/ref/repo"), "my-feature").await.expect("remove_checkout should succeed");
 
         let calls = runner.calls();
@@ -500,7 +590,7 @@ mod tests {
             Err("fatal: not a git repository".into()),
         ]));
 
-        let mgr = CloneCheckoutManager::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
         let checkouts = mgr.list_checkouts(&ExecutionEnvironmentPath::new("/ref/repo")).await.expect("list should succeed");
 
         assert_eq!(checkouts.len(), 2);

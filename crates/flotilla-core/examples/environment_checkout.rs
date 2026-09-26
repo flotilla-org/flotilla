@@ -93,17 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let factory_registry = FactoryRegistry::default_all();
     let provider_registry = factory_registry.probe_all(&bag, &config, &env_repo_root, env_runner.clone()).await;
 
-    let checkout_mgr = provider_registry.checkout_managers.preferred();
+    let checkout_mgr = provider_registry.vcs.preferred();
     println!("Checkout manager: {}", checkout_mgr.map(|_| "found").unwrap_or("NONE"));
 
-    if let Some((desc, _)) = provider_registry.checkout_managers.preferred_with_desc() {
+    if let Some((desc, _)) = provider_registry.vcs.preferred_with_desc() {
         println!("  backend: {}, impl: {}", desc.backend, desc.implementation);
     }
 
     // 5. Create checkout
     println!("\n--- Creating checkout for '{branch}' ---");
     match &checkout_mgr {
-        Some(mgr) => match mgr.create_checkout(&env_repo_root, &branch, false).await {
+        Some(mgr) => match mgr.create_checkout(&branch, false).await {
             Ok((path, checkout)) => {
                 println!("Checkout path:   {path}");
                 println!("Checkout branch: {}", checkout.branch);

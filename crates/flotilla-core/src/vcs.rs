@@ -16,7 +16,12 @@ use tracing::warn;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{command_channel_label, types::Checkout, vcs::CheckoutManager, CommandOutput, CommandRunner},
+    providers::{
+        command_channel_label,
+        types::Checkout,
+        vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy},
+        CommandOutput, CommandRunner,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,22 +38,25 @@ pub enum WorktreeAdd<'a> {
     Detached { target: &'a str, branch: &'a str },
 }
 
-pub struct PreparedWorktree {
+pub struct CheckoutMaterialisation {
     pub commit: Option<String>,
-    pub branch_provenance: CheckoutBranchProvenance,
+    pub provenance: CheckoutBranchProvenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorktreePreservationReason {
+pub enum CheckoutPreservationReason {
     CommitsPastBase,
     CheckedOutElsewhere,
+    DifferentBranch,
     NotCreatedForConvoy,
+    DirtyCheckout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorktreeRemoval {
+pub enum CheckoutRemoval {
     Removed,
-    PreservedBranch { branch: String, reason: WorktreePreservationReason },
+    PreservedBranch { branch: String, reason: CheckoutPreservationReason },
+    PreservedCheckout { path: String, reason: CheckoutPreservationReason },
 }
 
 /// Read operations needed while discovering and inspecting a checkout.
@@ -98,29 +106,40 @@ impl VcsQuery<'_> {
     }
 }
 
+/// Git backend's report of checkout branch ownership, without exposing its ref layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutOwnership {
+    Missing,
+    PreExisting,
+    Advanced,
+    CheckedOutElsewhere,
+    OwnedAtBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutSharing {
+    Shared,
+    Independent,
+}
+
 /// A VCS backend bound to one checkout path in its execution environment.
 #[async_trait]
-pub trait Vcs: Send + Sync {
-    async fn validate_target(&self, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
-        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
-    }
-    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
-        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
-    }
-    async fn create_checkout(&self, _branch: &str, _create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
-        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
-    }
-    async fn remove_checkout(&self, _branch: &str) -> Result<(), String> {
-        Err("checkout lifecycle is unavailable for this VCS backend".to_string())
-    }
+pub trait VcsBackend: Send + Sync {
+    async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
+    async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
+    async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
+    async fn branch_ownership(&self, branch: &str, sharing: CheckoutSharing) -> Result<CheckoutOwnership, String>;
+    async fn delete_owned_branch(&self, branch: &str) -> Result<(), String>;
+    async fn embedded_repositories(&self) -> Result<Vec<EmbeddedRepository>, String>;
+    async fn head_is_ancestor_of(&self, descendant: &str) -> Result<CommandOutput, String>;
+    async fn head_upstream(&self) -> Result<CommandOutput, String>;
+    async fn remote_branches_containing_head(&self) -> Result<CommandOutput, String>;
+    async fn unpushed_count(&self, upstream: Option<&str>) -> Result<CommandOutput, String>;
     /// Return porcelain status while preserving the command's exit status and stderr.
     async fn working_tree_status(&self, include_ignored: bool) -> Result<CommandOutput, String>;
     /// Resolve the commit checked out at HEAD.
     async fn head_commit(&self) -> Result<CommandOutput, String>;
-    /// Check the checkout and embedded repositories, excluding generated crew briefs.
-    async fn is_clean(&self) -> VcsCheck;
-    /// Check whether HEAD is represented on a remote, including merge and no-upstream cases.
-    async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck;
     async fn remote_url(&self, remote: &str) -> Result<String, String>;
     async fn remote_heads(&self, remote: &str, reference: &str) -> Result<String, String>;
     async fn remote_ref(&self, remote: &str, reference: &str) -> Result<CommandOutput, String>;
@@ -129,9 +148,8 @@ pub trait Vcs: Send + Sync {
     async fn ref_exists(&self, reference: &str) -> bool;
     async fn fetch(&self, remote: &str, refspec: &str) -> Result<(), String>;
     async fn worktree_add(&self, add: WorktreeAdd<'_>) -> Result<(), String>;
-    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<PreparedWorktree, String>;
+    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String>;
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String>;
-    async fn remove_worktree(&self, branch: &str, target: &str) -> Result<WorktreeRemoval, String>;
     async fn worktree_prune(&self) -> Result<(), String>;
     async fn worktree_list(&self) -> Result<String, String>;
     async fn read_ref(&self, reference: &str) -> Result<CommandOutput, String>;
@@ -150,182 +168,217 @@ pub trait Vcs: Send + Sync {
     async fn push_head(&self, remote: &str) -> Result<CommandOutput, String>;
 }
 
-/// Adapts the remaining Plane-A checkout implementation while callers move to
-/// the checkout-scoped operation contract.
-pub struct CheckoutManagerVcs {
-    checkout: ExecutionEnvironmentPath,
-    runner: Arc<dyn CommandRunner>,
-    manager: Arc<dyn CheckoutManager>,
+/// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
+#[async_trait]
+pub trait Vcs: Send + Sync {
+    async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
+    async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
+    async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
+    async fn materialise_checkout(&self, _branch: &str, _base_ref: Option<&str>, _target: &str) -> Result<CheckoutMaterialisation, String> {
+        Err("checkout materialisation is unavailable".into())
+    }
+    async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
+        Err("checkout removal is unavailable".into())
+    }
+    async fn is_clean(&self) -> VcsCheck {
+        VcsCheck::Unknown(vec!["checkout cleanliness is unavailable".into()])
+    }
+    async fn unpushed_commits(&self, _merged_head: Option<&str>) -> VcsCheck {
+        VcsCheck::Unknown(vec!["unpushed commit inspection is unavailable".into()])
+    }
+    async fn current_branch(&self) -> Result<String, String> {
+        Err("current branch inspection is unavailable".into())
+    }
 }
 
-impl CheckoutManagerVcs {
-    pub fn new(checkout: ExecutionEnvironmentPath, runner: Arc<dyn CommandRunner>, manager: Arc<dyn CheckoutManager>) -> Self {
-        Self { checkout, runner, manager }
+/// Git CLI backend with a checkout strategy selected by discovery.
+pub enum GitCheckoutStrategy {
+    Worktree(Box<GitWorktreeStrategy>),
+    ReferenceClone(ReferenceCloneStrategy),
+}
+
+pub struct FlotillaVcs {
+    checkout: ExecutionEnvironmentPath,
+    runner: Arc<dyn CommandRunner>,
+    strategy: GitCheckoutStrategy,
+    explicit_checkout: bool,
+}
+
+impl FlotillaVcs {
+    pub fn new(checkout: ExecutionEnvironmentPath, runner: Arc<dyn CommandRunner>, strategy: GitCheckoutStrategy) -> Self {
+        Self { checkout, runner, strategy, explicit_checkout: false }
     }
 
-    fn cli(&self) -> CliGitVcs<'_> {
-        CliGitVcs::new(self.checkout.as_path(), &*self.runner)
+    async fn remove_reference_clone(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        let target_path = Path::new(target);
+        if !self.runner.path_exists(target_path).await? {
+            return Ok(CheckoutRemoval::Removed);
+        }
+        let backend = GitCliBackend::explicit_checkout(target_path, &*self.runner);
+        let preserve = |reason| CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason };
+        if backend.current_branch().await?.trim() != branch {
+            return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+        }
+        match backend.branch_ownership(branch, CheckoutSharing::Independent).await? {
+            CheckoutOwnership::PreExisting => return Ok(preserve(CheckoutPreservationReason::NotCreatedForConvoy)),
+            CheckoutOwnership::Advanced => return Ok(preserve(CheckoutPreservationReason::CommitsPastBase)),
+            CheckoutOwnership::Missing => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+            CheckoutOwnership::CheckedOutElsewhere => return Ok(preserve(CheckoutPreservationReason::CheckedOutElsewhere)),
+            CheckoutOwnership::OwnedAtBase => {}
+        }
+        let status = backend.working_tree_status(false).await?;
+        if !status.success || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
+            return Ok(preserve(CheckoutPreservationReason::DirtyCheckout));
+        }
+        remove_worktree_path(&*self.runner, target).await?;
+        Ok(CheckoutRemoval::Removed)
+    }
+
+    fn cli(&self) -> GitCliBackend<'_> {
+        let backend = if self.explicit_checkout {
+            GitCliBackend::explicit_checkout(self.checkout.as_path(), &*self.runner)
+        } else {
+            GitCliBackend::new(self.checkout.as_path(), &*self.runner)
+        };
+        backend.with_strategy(&self.strategy)
     }
 }
 
 #[async_trait]
-impl Vcs for CheckoutManagerVcs {
+impl Vcs for FlotillaVcs {
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
-        self.manager.validate_target(&self.checkout, branch, intent).await
+        self.cli().validate_target(branch, intent).await
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
-        self.manager.list_checkouts(&self.checkout).await
+        self.cli().list_checkouts().await
     }
 
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
-        self.manager.create_checkout(&self.checkout, branch, create_branch).await
+        self.cli().create_checkout(branch, create_branch).await
     }
 
     async fn remove_checkout(&self, branch: &str) -> Result<(), String> {
-        self.manager.remove_checkout(&self.checkout, branch).await
+        self.cli().remove_checkout(branch).await
     }
 
-    async fn working_tree_status(&self, include_ignored: bool) -> Result<CommandOutput, String> {
-        self.cli().working_tree_status(include_ignored).await
+    async fn materialise_checkout(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
+        match &self.strategy {
+            GitCheckoutStrategy::Worktree(_) => self.cli().create_worktree(branch, base_ref, target).await,
+            GitCheckoutStrategy::ReferenceClone(strategy) => strategy.materialise_checkout(branch, base_ref, target).await,
+        }
     }
 
-    async fn head_commit(&self) -> Result<CommandOutput, String> {
-        self.cli().head_commit().await
+    async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        if matches!(self.strategy, GitCheckoutStrategy::ReferenceClone(_)) {
+            return self.remove_reference_clone(branch, target).await;
+        }
+        let clone_path = self.checkout.as_path().to_str().ok_or_else(|| "clone path is not valid UTF-8".to_string())?;
+        let target_exists = self.runner.path_exists(Path::new(target)).await?;
+        if !target_exists && !self.runner.path_exists(self.checkout.as_path()).await? {
+            return Ok(CheckoutRemoval::Removed);
+        }
+        if target_exists {
+            let remove = self.cli().worktree_remove(target).await?;
+            if !remove.success && !remove.stderr.contains("is not a working tree") {
+                return Err(remove.stderr);
+            }
+        }
+        remove_worktree_path(&*self.runner, target).await?;
+        self.cli().worktree_prune().await?;
+        remove_empty_worktree_parents(&*self.runner, clone_path, target).await?;
+
+        match self.cli().branch_ownership(branch, CheckoutSharing::Shared).await? {
+            CheckoutOwnership::Missing => Ok(CheckoutRemoval::Removed),
+            CheckoutOwnership::PreExisting => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::NotCreatedForConvoy })
+            }
+            CheckoutOwnership::Advanced => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CommitsPastBase })
+            }
+            CheckoutOwnership::CheckedOutElsewhere => {
+                Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CheckedOutElsewhere })
+            }
+            CheckoutOwnership::OwnedAtBase => {
+                self.cli().delete_owned_branch(branch).await?;
+                Ok(CheckoutRemoval::Removed)
+            }
+        }
     }
 
     async fn is_clean(&self) -> VcsCheck {
-        self.cli().is_clean().await
+        match self.cli().working_tree_status(false).await {
+            Ok(output) if output.success => {
+                let mut details = output
+                    .stdout
+                    .lines()
+                    .filter(|line| {
+                        let trimmed = line.trim_start();
+                        !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                match self.cli().embedded_repositories().await {
+                    Ok(repositories) => details.extend(repositories.into_iter().map(|repository| repository.to_string())),
+                    Err(error) => {
+                        details.push(error);
+                        return VcsCheck::Unknown(details);
+                    }
+                }
+                if details.is_empty() {
+                    VcsCheck::True(Vec::new())
+                } else {
+                    VcsCheck::False(details)
+                }
+            }
+            Ok(output) => VcsCheck::Unknown(vec![non_empty_output_or("git status failed", &output.stderr)]),
+            Err(error) => VcsCheck::Unknown(vec![format!("git status could not run: {error}")]),
+        }
     }
 
     async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck {
-        self.cli().unpushed_commits(merged_head).await
-    }
+        if let Some(head_sha) = merged_head {
+            let ancestor = self.cli().head_is_ancestor_of(head_sha).await;
+            if ancestor.is_ok_and(|output| output.success) {
+                return VcsCheck::True(vec![format!("HEAD is preserved by merged change request head {head_sha}")]);
+            }
+        }
 
-    async fn remote_url(&self, remote: &str) -> Result<String, String> {
-        self.cli().remote_url(remote).await
-    }
-
-    async fn remote_heads(&self, remote: &str, reference: &str) -> Result<String, String> {
-        self.cli().remote_heads(remote, reference).await
-    }
-
-    async fn remote_ref(&self, remote: &str, reference: &str) -> Result<CommandOutput, String> {
-        self.cli().remote_ref(remote, reference).await
-    }
-
-    async fn default_remote_branch(&self, remote: &str) -> Result<CommandOutput, String> {
-        self.cli().default_remote_branch(remote).await
-    }
-
-    async fn commit_count(&self, range: &str) -> Result<CommandOutput, String> {
-        self.cli().commit_count(range).await
-    }
-
-    async fn ref_exists(&self, reference: &str) -> bool {
-        self.cli().ref_exists(reference).await
-    }
-
-    async fn fetch(&self, remote: &str, refspec: &str) -> Result<(), String> {
-        self.cli().fetch(remote, refspec).await
-    }
-
-    async fn worktree_add(&self, add: WorktreeAdd<'_>) -> Result<(), String> {
-        self.cli().worktree_add(add).await
-    }
-
-    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<PreparedWorktree, String> {
-        self.cli().create_worktree(branch, base_ref, target).await
-    }
-
-    async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String> {
-        self.cli().worktree_remove(target).await
-    }
-
-    async fn remove_worktree(&self, branch: &str, target: &str) -> Result<WorktreeRemoval, String> {
-        self.cli().remove_worktree(branch, target).await
-    }
-
-    async fn worktree_prune(&self) -> Result<(), String> {
-        self.cli().worktree_prune().await
-    }
-
-    async fn worktree_list(&self) -> Result<String, String> {
-        self.cli().worktree_list().await
-    }
-
-    async fn read_ref(&self, reference: &str) -> Result<CommandOutput, String> {
-        self.cli().read_ref(reference).await
-    }
-
-    async fn resolve_ref(&self, reference: &str) -> Result<String, String> {
-        self.cli().resolve_ref(reference).await
-    }
-
-    async fn update_ref(&self, reference: &str, commit: &str) -> Result<(), String> {
-        self.cli().update_ref(reference, commit).await
-    }
-
-    async fn delete_ref(&self, reference: &str) -> Result<(), String> {
-        self.cli().delete_ref(reference).await
-    }
-
-    async fn delete_branch(&self, branch: &str) -> Result<(), String> {
-        self.cli().delete_branch(branch).await
-    }
-
-    async fn common_dir(&self) -> Result<String, String> {
-        self.cli().common_dir().await
+        let upstream = self.cli().head_upstream().await;
+        let upstream = match upstream {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            _ => return self.unpushed_without_upstream().await,
+        };
+        self.parse_unpushed_count(self.cli().unpushed_count(Some(&upstream)).await)
     }
 
     async fn current_branch(&self) -> Result<String, String> {
         self.cli().current_branch().await
     }
-
-    async fn switch_create(&self, branch: &str, track: Option<&str>) -> Result<(), String> {
-        self.cli().switch_create(branch, track).await
-    }
-
-    async fn clone_repo(&self, url: &str, target: &str, branch: Option<&str>) -> Result<(), String> {
-        self.cli().clone_repo(url, target, branch).await
-    }
-
-    async fn head_commit_text(&self) -> Result<String, String> {
-        self.cli().head_commit_text().await
-    }
-
-    async fn query(&self, query: VcsQuery<'_>) -> Result<String, String> {
-        self.cli().query(query).await
-    }
-
-    async fn grep_operational_entries(&self, commit: &str) -> Result<CommandOutput, String> {
-        self.cli().grep_operational_entries(commit).await
-    }
-
-    async fn git_path(&self, name: &str) -> Result<CommandOutput, String> {
-        self.cli().git_path(name).await
-    }
-
-    async fn push_head(&self, remote: &str) -> Result<CommandOutput, String> {
-        self.cli().push_head(remote).await
-    }
 }
 
 /// Universal Git CLI implementation. The runner determines the command transport.
-pub struct CliGitVcs<'a> {
+pub struct GitCliBackend<'a> {
     checkout: &'a Path,
     runner: &'a dyn CommandRunner,
+    strategy: Option<&'a GitCheckoutStrategy>,
     explicit_checkout: bool,
 }
 
-impl<'a> CliGitVcs<'a> {
+impl<'a> GitCliBackend<'a> {
     pub fn new(checkout: &'a Path, runner: &'a dyn CommandRunner) -> Self {
-        Self { checkout, runner, explicit_checkout: false }
+        Self { checkout, runner, strategy: None, explicit_checkout: false }
     }
 
     /// Preserve `git -C <checkout>` command addressing for existing remote runners.
     pub fn explicit_checkout(checkout: &'a Path, runner: &'a dyn CommandRunner) -> Self {
-        Self { checkout, runner, explicit_checkout: true }
+        Self { checkout, runner, strategy: None, explicit_checkout: true }
+    }
+
+    fn with_strategy(mut self, strategy: &'a GitCheckoutStrategy) -> Self {
+        self.strategy = Some(strategy);
+        self
     }
 
     async fn run(&self, args: &[&str]) -> Result<String, String> {
@@ -352,7 +405,97 @@ impl<'a> CliGitVcs<'a> {
 }
 
 #[async_trait]
-impl Vcs for CliGitVcs<'_> {
+impl VcsBackend for GitCliBackend<'_> {
+    async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
+        match self.strategy.ok_or("checkout strategy unavailable")? {
+            GitCheckoutStrategy::Worktree(strategy) => {
+                strategy.validate_target(&ExecutionEnvironmentPath::new(self.checkout), branch, intent).await
+            }
+            GitCheckoutStrategy::ReferenceClone(strategy) => {
+                strategy.validate_target(&ExecutionEnvironmentPath::new(self.checkout), branch, intent).await
+            }
+        }
+    }
+
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        match self.strategy.ok_or("checkout strategy unavailable")? {
+            GitCheckoutStrategy::Worktree(strategy) => strategy.list_checkouts(&ExecutionEnvironmentPath::new(self.checkout)).await,
+            GitCheckoutStrategy::ReferenceClone(strategy) => strategy.list_checkouts(&ExecutionEnvironmentPath::new(self.checkout)).await,
+        }
+    }
+
+    async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        match self.strategy.ok_or("checkout strategy unavailable")? {
+            GitCheckoutStrategy::Worktree(strategy) => {
+                strategy.create_checkout(&ExecutionEnvironmentPath::new(self.checkout), branch, create_branch).await
+            }
+            GitCheckoutStrategy::ReferenceClone(strategy) => {
+                strategy.create_checkout(&ExecutionEnvironmentPath::new(self.checkout), branch, create_branch).await
+            }
+        }
+    }
+
+    async fn remove_checkout(&self, branch: &str) -> Result<(), String> {
+        match self.strategy.ok_or("checkout strategy unavailable")? {
+            GitCheckoutStrategy::Worktree(strategy) => {
+                strategy.remove_checkout(&ExecutionEnvironmentPath::new(self.checkout), branch).await
+            }
+            GitCheckoutStrategy::ReferenceClone(strategy) => {
+                strategy.remove_checkout(&ExecutionEnvironmentPath::new(self.checkout), branch).await
+            }
+        }
+    }
+
+    async fn branch_ownership(&self, branch: &str, sharing: CheckoutSharing) -> Result<CheckoutOwnership, String> {
+        let branch_ref = format!("refs/heads/{branch}");
+        let bootstrap_ref = bootstrap_branch_ref(branch);
+        let head = self.read_ref(&branch_ref).await?;
+        if !head.success {
+            self.delete_ref(&bootstrap_ref).await?;
+            return Ok(CheckoutOwnership::Missing);
+        }
+        let bootstrap = self.read_ref(&bootstrap_ref).await?;
+        if !bootstrap.success {
+            return Ok(CheckoutOwnership::PreExisting);
+        }
+        if head.stdout.trim() != bootstrap.stdout.trim() {
+            self.delete_ref(&bootstrap_ref).await?;
+            return Ok(CheckoutOwnership::Advanced);
+        }
+        if sharing == CheckoutSharing::Shared && self.worktree_list().await?.lines().any(|line| line == format!("branch {branch_ref}")) {
+            return Ok(CheckoutOwnership::CheckedOutElsewhere);
+        }
+        Ok(CheckoutOwnership::OwnedAtBase)
+    }
+
+    async fn delete_owned_branch(&self, branch: &str) -> Result<(), String> {
+        self.delete_branch(branch).await?;
+        self.delete_ref(&bootstrap_branch_ref(branch)).await
+    }
+
+    async fn embedded_repositories(&self) -> Result<Vec<EmbeddedRepository>, String> {
+        inspect_embedded_repositories(self.runner, self.checkout).await
+    }
+
+    async fn head_is_ancestor_of(&self, descendant: &str) -> Result<CommandOutput, String> {
+        self.output(&["merge-base", "--is-ancestor", "HEAD", descendant]).await
+    }
+
+    async fn head_upstream(&self) -> Result<CommandOutput, String> {
+        self.output(&["rev-parse", "--abbrev-ref", "@{upstream}"]).await
+    }
+
+    async fn remote_branches_containing_head(&self) -> Result<CommandOutput, String> {
+        self.output(&["branch", "--remotes", "--contains", "HEAD"]).await
+    }
+
+    async fn unpushed_count(&self, upstream: Option<&str>) -> Result<CommandOutput, String> {
+        match upstream {
+            Some(upstream) => self.output(&["rev-list", "--count", &format!("{upstream}..HEAD")]).await,
+            None => self.output(&["rev-list", "--count", "HEAD", "--not", "--remotes"]).await,
+        }
+    }
+
     async fn working_tree_status(&self, include_ignored: bool) -> Result<CommandOutput, String> {
         let args: &[&str] = if include_ignored {
             &["status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", "."]
@@ -364,53 +507,6 @@ impl Vcs for CliGitVcs<'_> {
 
     async fn head_commit(&self) -> Result<CommandOutput, String> {
         self.output(&["rev-parse", "HEAD"]).await
-    }
-
-    async fn is_clean(&self) -> VcsCheck {
-        match self.working_tree_status(false).await {
-            Ok(output) if output.success => {
-                let mut details = output
-                    .stdout
-                    .lines()
-                    .filter(|line| {
-                        let trimmed = line.trim_start();
-                        !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
-                    })
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                match inspect_embedded_repositories(self.runner, self.checkout).await {
-                    Ok(repositories) => details.extend(repositories.into_iter().map(|repository| repository.to_string())),
-                    Err(error) => {
-                        details.push(error);
-                        return VcsCheck::Unknown(details);
-                    }
-                }
-                if details.is_empty() {
-                    VcsCheck::True(Vec::new())
-                } else {
-                    VcsCheck::False(details)
-                }
-            }
-            Ok(output) => VcsCheck::Unknown(vec![non_empty_output_or("git status failed", &output.stderr)]),
-            Err(error) => VcsCheck::Unknown(vec![format!("git status could not run: {error}")]),
-        }
-    }
-
-    async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck {
-        if let Some(head_sha) = merged_head {
-            let ancestor = self.output(&["merge-base", "--is-ancestor", "HEAD", head_sha]).await;
-            if ancestor.is_ok_and(|output| output.success) {
-                return VcsCheck::True(vec![format!("HEAD is preserved by merged change request head {head_sha}")]);
-            }
-        }
-
-        let upstream = self.output(&["rev-parse", "--abbrev-ref", "@{upstream}"]).await;
-        let upstream = match upstream {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            _ => return self.unpushed_without_upstream().await,
-        };
-        let range = format!("{upstream}..HEAD");
-        self.parse_unpushed_count(self.output(&["rev-list", "--count", &range]).await)
     }
 
     async fn remote_url(&self, remote: &str) -> Result<String, String> {
@@ -455,9 +551,9 @@ impl Vcs for CliGitVcs<'_> {
         self.run(&args).await.map(|_| ())
     }
 
-    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<PreparedWorktree, String> {
+    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
         if self.runner.path_exists(Path::new(target)).await? {
-            let target_vcs = CliGitVcs::explicit_checkout(Path::new(target), self.runner);
+            let target_vcs = GitCliBackend::explicit_checkout(Path::new(target), self.runner);
             let target_common_dir = target_vcs
                 .common_dir()
                 .await
@@ -474,12 +570,12 @@ impl Vcs for CliGitVcs<'_> {
                     return Err(format!("checkout target {target} already exists at a different ref than {branch}"));
                 }
             }
-            let branch_provenance = if self.ref_exists(&bootstrap_branch_ref(branch)).await {
+            let provenance = if self.ref_exists(&bootstrap_branch_ref(branch)).await {
                 CheckoutBranchProvenance::CreatedForConvoy
             } else {
                 CheckoutBranchProvenance::PreExisting
             };
-            return Ok(PreparedWorktree { commit: Some(target_vcs.head_commit_text().await?.trim().to_string()), branch_provenance });
+            return Ok(CheckoutMaterialisation { commit: Some(target_vcs.head_commit_text().await?.trim().to_string()), provenance });
         }
 
         let local_ref = format!("refs/heads/{branch}");
@@ -498,7 +594,7 @@ impl Vcs for CliGitVcs<'_> {
             }
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
-        let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
+        let provenance = if !local_exists && !remote_exists && base_ref.is_some() {
             CheckoutBranchProvenance::CreatedForConvoy
         } else {
             CheckoutBranchProvenance::PreExisting
@@ -525,64 +621,16 @@ impl Vcs for CliGitVcs<'_> {
             self.worktree_add(WorktreeAdd::Detached { target, branch }).await?;
         }
 
-        let commit = Some(CliGitVcs::explicit_checkout(Path::new(target), self.runner).head_commit_text().await?.trim().to_string());
-        if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
+        let commit = Some(GitCliBackend::explicit_checkout(Path::new(target), self.runner).head_commit_text().await?.trim().to_string());
+        if provenance == CheckoutBranchProvenance::CreatedForConvoy {
             let bootstrap_commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
             self.update_ref(&bootstrap_branch_ref(branch), bootstrap_commit).await?;
         }
-        Ok(PreparedWorktree { commit, branch_provenance })
+        Ok(CheckoutMaterialisation { commit, provenance })
     }
 
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String> {
         self.output(&["worktree", "remove", "--force", target]).await
-    }
-
-    async fn remove_worktree(&self, branch: &str, target: &str) -> Result<WorktreeRemoval, String> {
-        let clone_path = self.checkout.to_str().ok_or_else(|| "clone path is not valid UTF-8".to_string())?;
-        let target_exists = self.runner.path_exists(Path::new(target)).await?;
-        if !target_exists && !self.runner.path_exists(self.checkout).await? {
-            return Ok(WorktreeRemoval::Removed);
-        }
-        if target_exists {
-            let remove = self.worktree_remove(target).await?;
-            if !remove.success && !remove.stderr.contains("is not a working tree") {
-                return Err(remove.stderr);
-            }
-        }
-        remove_worktree_path(self.runner, target).await?;
-        self.worktree_prune().await?;
-        remove_empty_worktree_parents(self.runner, clone_path, target).await?;
-
-        let branch_ref = format!("refs/heads/{branch}");
-        let bootstrap_ref = bootstrap_branch_ref(branch);
-        let head = self.read_ref(&branch_ref).await?;
-        if !head.success {
-            self.delete_ref(&bootstrap_ref).await?;
-            return Ok(WorktreeRemoval::Removed);
-        }
-        let bootstrap = self.read_ref(&bootstrap_ref).await?;
-        if !bootstrap.success {
-            return Ok(WorktreeRemoval::PreservedBranch {
-                branch: branch.to_string(),
-                reason: WorktreePreservationReason::NotCreatedForConvoy,
-            });
-        }
-        if head.stdout.trim() != bootstrap.stdout.trim() {
-            self.delete_ref(&bootstrap_ref).await?;
-            return Ok(WorktreeRemoval::PreservedBranch {
-                branch: branch.to_string(),
-                reason: WorktreePreservationReason::CommitsPastBase,
-            });
-        }
-        if self.worktree_list().await?.lines().any(|line| line == format!("branch {branch_ref}")) {
-            return Ok(WorktreeRemoval::PreservedBranch {
-                branch: branch.to_string(),
-                reason: WorktreePreservationReason::CheckedOutElsewhere,
-            });
-        }
-        self.delete_branch(branch).await?;
-        self.delete_ref(&bootstrap_ref).await?;
-        Ok(WorktreeRemoval::Removed)
     }
 
     async fn worktree_prune(&self) -> Result<(), String> {
@@ -656,13 +704,11 @@ impl Vcs for CliGitVcs<'_> {
     }
 }
 
-impl CliGitVcs<'_> {
+impl FlotillaVcs {
     async fn unpushed_without_upstream(&self) -> VcsCheck {
-        match self.output(&["branch", "--remotes", "--contains", "HEAD"]).await {
+        match self.cli().remote_branches_containing_head().await {
             Ok(output) if output.success && !output.stdout.trim().is_empty() => VcsCheck::True(Vec::new()),
-            Ok(output) if output.success => {
-                self.parse_unpushed_count(self.output(&["rev-list", "--count", "HEAD", "--not", "--remotes"]).await)
-            }
+            Ok(output) if output.success => self.parse_unpushed_count(self.cli().unpushed_count(None).await),
             Ok(output) => {
                 VcsCheck::Unknown(vec![non_empty_output_or("could not inspect remote branches for pushed check", &output.stderr)])
             }
@@ -684,7 +730,7 @@ impl CliGitVcs<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-pub(crate) struct EmbeddedRepository {
+pub struct EmbeddedRepository {
     path: PathBuf,
     branch: String,
     local_commits: Option<usize>,
@@ -839,6 +885,14 @@ mod tests {
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     }
 
+    fn test_fl(cwd: &Path, runner: Arc<dyn CommandRunner>, explicit: bool) -> FlotillaVcs {
+        let strategy =
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&runner))));
+        let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
+        vcs.explicit_checkout = explicit;
+        vcs
+    }
+
     #[tokio::test]
     async fn checkout_scoped_status_and_head_contract() {
         let live = if replay::is_live() {
@@ -861,7 +915,7 @@ mod tests {
         masks.add(repo.to_str().expect("utf8 repo path"), "{repo}");
         let session = replay::test_session(&fixture_path("vcs", "git_cli_status_head.yaml"), masks);
         let runner = replay::test_runner(&session);
-        let vcs = CliGitVcs::new(&repo, &*runner);
+        let vcs = GitCliBackend::new(&repo, &*runner);
 
         let status = vcs.working_tree_status(true).await.expect("status");
         assert!(status.success);
@@ -895,7 +949,7 @@ mod tests {
         masks.add(repo.to_str().expect("utf8 repo path"), "{repo}");
         let session = replay::test_session(&fixture_path("vcs", "git_cli_clean_embedded.yaml"), masks);
         let runner = replay::test_runner(&session);
-        let vcs = CliGitVcs::new(&repo, &*runner);
+        let vcs = test_fl(&repo, runner.clone(), false);
 
         assert_eq!(vcs.is_clean().await, VcsCheck::True(Vec::new()));
         if live.is_some() {
@@ -942,7 +996,7 @@ mod tests {
         masks.add(repo.to_str().expect("utf8 repo path"), "{repo}");
         let session = replay::test_session(&fixture_path("vcs", "git_cli_unpushed.yaml"), masks);
         let runner = replay::test_runner(&session);
-        let vcs = CliGitVcs::new(&repo, &*runner);
+        let vcs = test_fl(&repo, runner.clone(), false);
 
         assert_eq!(vcs.unpushed_commits(None).await, VcsCheck::True(Vec::new()));
         if live.is_some() {
@@ -999,7 +1053,7 @@ mod tests {
         masks.add(root.to_str().expect("utf8 root"), "{root}");
         let session = replay::test_session(&fixture_path("vcs", "git_cli_worktree_ref.yaml"), masks);
         let runner = replay::test_runner(&session);
-        let vcs = CliGitVcs::explicit_checkout(&repo, &*runner);
+        let vcs = GitCliBackend::explicit_checkout(&repo, &*runner);
 
         assert!(vcs.ref_exists("refs/heads/main").await);
         assert!(!vcs.remote_url("origin").await.expect("origin URL").trim().is_empty());
@@ -1012,7 +1066,7 @@ mod tests {
         })
         .await
         .expect("add convoy worktree");
-        let commit = CliGitVcs::explicit_checkout(&new_worktree, &*runner).head_commit_text().await.expect("worktree HEAD");
+        let commit = GitCliBackend::explicit_checkout(&new_worktree, &*runner).head_commit_text().await.expect("worktree HEAD");
         vcs.update_ref("refs/flotilla/bootstrap/convoy/new", commit.trim()).await.expect("bootstrap ref");
         assert!(vcs.read_ref("refs/flotilla/bootstrap/convoy/new").await.expect("read bootstrap ref").success);
         assert!(vcs.worktree_list().await.expect("worktree list").contains("convoy/new"));
@@ -1030,6 +1084,43 @@ mod tests {
             .await
             .expect("detached worktree");
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn reference_clone_materialisation_preserves_dirty_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("clone");
+        git(root, &["init", "--bare", remote.to_str().expect("remote path")]);
+        std::fs::create_dir(&source).expect("source directory");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        std::fs::write(source.join("README.md"), "initial\n").expect("initial file");
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "-m", "initial"]);
+        git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
+        git(&source, &["push", "origin", "main"]);
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let strategy = GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
+            Arc::clone(&runner),
+            ExecutionEnvironmentPath::new(source.join(".git")),
+        ));
+        let vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(&source), runner, strategy);
+        let target = target.to_str().expect("target path");
+        let materialised = vcs.materialise_checkout("feature/new", Some("main"), target).await.expect("reference clone materialised");
+        assert_eq!(materialised.provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        let dirty_file = Path::new(target).join("untracked.txt");
+        std::fs::write(&dirty_file, "keep me\n").expect("dirty file");
+        assert_eq!(
+            vcs.remove_materialised_checkout("feature/new", target).await.expect("preserve dirty clone"),
+            CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason: CheckoutPreservationReason::DirtyCheckout }
+        );
+        std::fs::remove_file(dirty_file).expect("remove dirty file");
+        assert_eq!(vcs.remove_materialised_checkout("feature/new", target).await.expect("remove clean clone"), CheckoutRemoval::Removed);
     }
 
     #[tokio::test]
@@ -1061,12 +1152,12 @@ mod tests {
         masks.add(root.to_str().expect("root path"), "{root}");
         let session = replay::test_session(&fixture_path("vcs", "git_cli_convoy_worktree.yaml"), masks);
         let runner = replay::test_runner(&session);
-        let vcs = CliGitVcs::explicit_checkout(&repo, &*runner);
+        let vcs = test_fl(&repo, runner.clone(), true);
 
-        let prepared = vcs.create_worktree("convoy/new", Some("main"), target).await.expect("prepare worktree");
-        assert_eq!(prepared.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        let prepared = vcs.materialise_checkout("convoy/new", Some("main"), target).await.expect("prepare worktree");
+        assert_eq!(prepared.provenance, CheckoutBranchProvenance::CreatedForConvoy);
         assert_eq!(prepared.commit.as_deref().map(str::len), Some(40));
-        assert_eq!(vcs.remove_worktree("convoy/new", target).await.expect("remove worktree"), WorktreeRemoval::Removed);
+        assert_eq!(vcs.remove_materialised_checkout("convoy/new", target).await.expect("remove worktree"), CheckoutRemoval::Removed);
         session.finish();
     }
 }

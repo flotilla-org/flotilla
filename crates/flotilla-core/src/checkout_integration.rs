@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use chrono::Utc;
 use flotilla_resources::{
@@ -7,10 +12,7 @@ use flotilla_resources::{
     RemoteRefObservation, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
-use crate::{
-    providers::{ChannelLabel, CommandRunner},
-    vcs::{CliGitVcs, Vcs, VcsCheck},
-};
+use crate::providers::{ChannelLabel, CommandRunner};
 
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
@@ -18,6 +20,28 @@ const CONVOY_ASSOCIATION_UNAVAILABLE: &str = "no change request exists for the c
 
 pub fn checkout_observation_lacks_convoy_association(status: &CheckoutIntegrationStatus) -> bool {
     status.landed.details.iter().any(|detail| detail == CONVOY_ASSOCIATION_UNAVAILABLE)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+struct EmbeddedRepository {
+    path: PathBuf,
+    branch: String,
+    local_commits: Option<usize>,
+    uncommitted_entries: Option<usize>,
+}
+
+impl fmt::Display for EmbeddedRepository {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let local_commits = self.local_commits.map_or_else(
+            || "local commits unknown".to_string(),
+            |count| format!("{count} local commit{}", if count == 1 { "" } else { "s" }),
+        );
+        write!(formatter, "embedded repository {}/ (branch {}, {local_commits}", self.path.display(), self.branch)?;
+        if let Some(count) = self.uncommitted_entries.filter(|count| *count > 0) {
+            write!(formatter, ", {count} uncommitted entr{}", if count == 1 { "y" } else { "ies" })?;
+        }
+        write!(formatter, ")")
+    }
 }
 
 fn checkout_branch_from_spec(spec: &CheckoutSpec) -> &str {
@@ -160,7 +184,8 @@ async fn inspect_remote_ref(
     observed_at: &str,
 ) -> BTreeMap<String, RemoteRefObservation> {
     let remote_ref = if branch.starts_with("refs/") { branch.to_string() } else { format!("refs/heads/{branch}") };
-    let Ok(output) = CliGitVcs::new(checkout_path, runner).remote_ref("origin", &remote_ref).await else {
+    let Ok(output) = runner.run_output("git", &["ls-remote", "--refs", "origin", &remote_ref], checkout_path, &ChannelLabel::Default).await
+    else {
         return BTreeMap::new();
     };
     if !output.success {
@@ -184,21 +209,125 @@ async fn inspect_remote_ref(
 }
 
 async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
-    condition_from_vcs_check(CliGitVcs::new(checkout_path, runner).is_clean().await, observed_at)
+    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Default).await {
+        Ok(output) if output.success => {
+            let mut details = output
+                .stdout
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            match inspect_embedded_repositories(runner, checkout_path).await {
+                Ok(repositories) => details.extend(repositories.into_iter().map(|repository| repository.to_string())),
+                Err(error) => {
+                    details.push(error);
+                    return IntegrationCondition::builder()
+                        .value(ConditionValue::Unknown)
+                        .details(details)
+                        .observed_at(observed_at.to_string())
+                        .build();
+                }
+            }
+            if details.is_empty() {
+                IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
+            } else {
+                IntegrationCondition::builder().value(ConditionValue::False).details(details).observed_at(observed_at.to_string()).build()
+            }
+        }
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git status failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git status could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
 }
 
-fn condition_from_vcs_check(check: VcsCheck, observed_at: &str) -> IntegrationCondition {
-    match check {
-        VcsCheck::True(details) => {
-            IntegrationCondition::builder().value(ConditionValue::True).details(details).observed_at(observed_at.to_string()).build()
-        }
-        VcsCheck::False(details) => {
-            IntegrationCondition::builder().value(ConditionValue::False).details(details).observed_at(observed_at.to_string()).build()
-        }
-        VcsCheck::Unknown(details) => {
-            IntegrationCondition::builder().value(ConditionValue::Unknown).details(details).observed_at(observed_at.to_string()).build()
+async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<Vec<EmbeddedRepository>, String> {
+    let output = runner
+        .run_output(
+            "find",
+            &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"],
+            checkout_path,
+            &ChannelLabel::Default,
+        )
+        .await
+        .map_err(|error| format!("embedded repository scan could not run: {error}"))?;
+    if !output.success {
+        return Err(non_empty_output_or("embedded repository scan failed", &output.stderr));
+    }
+
+    let mut paths = output
+        .stdout
+        .lines()
+        .filter_map(|git_path| Path::new(git_path).parent())
+        .filter_map(|repository_path| repository_path.strip_prefix(".").ok())
+        .filter(|repository_path| !repository_path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+
+    let mut repositories = Vec::new();
+    for path in paths {
+        let path_arg = path.to_string_lossy();
+        let ignored = runner
+            .run_output("git", &["check-ignore", "--quiet", "--", &path_arg], checkout_path, &ChannelLabel::Default)
+            .await
+            .is_ok_and(|output| output.success);
+        let repository = inspect_embedded_repository(runner, checkout_path, path).await;
+        if !ignored || repository.local_commits != Some(0) {
+            repositories.push(repository);
         }
     }
+    Ok(repositories)
+}
+
+async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
+    let path_arg = path.to_string_lossy();
+    let branch = match runner
+        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Default)
+        .await
+    {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        _ => {
+            match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Default).await
+            {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
+                _ => "unknown".to_string(),
+            }
+        }
+    };
+    let local_commits = runner
+        .run_output(
+            "git",
+            &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"],
+            checkout_path,
+            &ChannelLabel::Default,
+        )
+        .await
+        .ok()
+        .filter(|output| output.success)
+        .and_then(|output| output.stdout.trim().parse().ok());
+    let uncommitted_entries = runner
+        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Default)
+        .await
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout.lines().count());
+    EmbeddedRepository::builder()
+        .path(path)
+        .branch(branch)
+        .maybe_local_commits(local_commits)
+        .maybe_uncommitted_entries(uncommitted_entries)
+        .build()
 }
 
 async fn inspect_pushed(
@@ -207,10 +336,100 @@ async fn inspect_pushed(
     observed_change_request: Option<&ChangeRequestStatus>,
     observed_at: &str,
 ) -> IntegrationCondition {
-    let merged_head = observed_change_request
+    if let Some(head_sha) = observed_change_request
         .filter(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
-        .and_then(|status| status.head_sha.value.as_deref());
-    condition_from_vcs_check(CliGitVcs::new(checkout_path, runner).unpushed_commits(merged_head).await, observed_at)
+        .and_then(|status| status.head_sha.value.as_deref())
+    {
+        let ancestor =
+            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Default).await;
+        if ancestor.is_ok_and(|output| output.success) {
+            return IntegrationCondition::builder()
+                .value(ConditionValue::True)
+                .details(vec![format!("HEAD is preserved by merged change request head {head_sha}")])
+                .observed_at(observed_at.to_string())
+                .build();
+        }
+    }
+
+    let upstream = runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Default).await;
+    let upstream = match upstream {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        _ => return inspect_pushed_without_upstream(runner, checkout_path, observed_at).await,
+    };
+    let range = format!("{upstream}..HEAD");
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
+        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+            Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
+            Ok(count) => IntegrationCondition::builder()
+                .value(ConditionValue::False)
+                .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
+                .observed_at(observed_at.to_string())
+                .build(),
+            Err(_) => IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
+                .observed_at(observed_at.to_string())
+                .build(),
+        },
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git rev-list could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
+async fn inspect_pushed_without_upstream(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    match runner.run_output("git", &["branch", "--remotes", "--contains", "HEAD"], checkout_path, &ChannelLabel::Default).await {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => {
+            IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
+        }
+        Ok(output) if output.success => {
+            match runner
+                .run_output("git", &["rev-list", "--count", "HEAD", "--not", "--remotes"], checkout_path, &ChannelLabel::Default)
+                .await
+            {
+                Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+                    Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
+                    Ok(count) => IntegrationCondition::builder()
+                        .value(ConditionValue::False)
+                        .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                    Err(_) => IntegrationCondition::builder()
+                        .value(ConditionValue::Unknown)
+                        .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                },
+                Ok(output) => IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+                Err(error) => IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![format!("git rev-list could not run: {error}")])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+            }
+        }
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("could not inspect remote branches for pushed check", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("could not inspect remote branches for pushed check: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
 }
 
 async fn inspect_landed(
@@ -340,18 +559,20 @@ enum BaseComparison {
 async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path, base_ref: Option<&str>) -> BaseComparison {
     let base_ref = match base_ref {
         Some(base_ref) => base_ref.to_string(),
-        None => match CliGitVcs::new(checkout_path, runner).default_remote_branch("origin").await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            Ok(output) => {
-                return BaseComparison::Indeterminate {
-                    detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
-                };
+        None => {
+            match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Default).await {
+                Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+                Ok(output) => {
+                    return BaseComparison::Indeterminate {
+                        detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
+                    };
+                }
+                Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
             }
-            Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
-        },
+        }
     };
     let range = format!("{base_ref}..HEAD");
-    match CliGitVcs::new(checkout_path, runner).commit_count(&range).await {
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
             Ok(count) => BaseComparison::Counted { base_ref, count },
             Err(_) => BaseComparison::Indeterminate {

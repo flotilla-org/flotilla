@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path};
 
 use flotilla_protocol::{provider_data::Issue, qualified_path::QualifiedPath, CommandValue, HostName, IssueSource};
 use tracing::{info, warn};
@@ -8,9 +8,8 @@ use crate::{
     attachable::SharedAttachableStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, types::CloudAgentSession, CommandRunner},
+    providers::{registry::ProviderRegistry, types::CloudAgentSession},
     terminal_manager::TerminalManager,
-    vcs::{CheckoutManagerVcs, Vcs},
 };
 
 pub(super) struct ReadOnlySessionActionService<'a> {
@@ -27,7 +26,6 @@ pub(super) struct TeleportSessionActionService<'a> {
     daemon_socket_path: Option<&'a Path>,
     local_host: &'a HostName,
     terminal_manager: Option<&'a TerminalManager>,
-    runner: Option<Arc<dyn CommandRunner>>,
 }
 
 pub(super) struct TeleportFlow<'a> {
@@ -175,7 +173,6 @@ impl<'a> TeleportSessionActionService<'a> {
         daemon_socket_path: Option<&'a Path>,
         local_host: &'a HostName,
         terminal_manager: Option<&'a TerminalManager>,
-        runner: Option<Arc<dyn CommandRunner>>,
     ) -> Self {
         Self {
             read_only: ReadOnlySessionActionService::new(issue_source, registry, providers_data),
@@ -185,7 +182,6 @@ impl<'a> TeleportSessionActionService<'a> {
             daemon_socket_path,
             local_host,
             terminal_manager,
-            runner,
         }
     }
 
@@ -200,15 +196,9 @@ impl<'a> TeleportSessionActionService<'a> {
 
         match branch {
             Some(branch_name) => {
-                let checkout_manager = self
-                    .read_only
-                    .registry
-                    .checkout_managers
-                    .preferred()
-                    .cloned()
-                    .ok_or_else(|| "No checkout manager available".to_string())?;
-                let runner = self.runner.as_ref().ok_or_else(|| "No command runner available".to_string())?;
-                let vcs = CheckoutManagerVcs::new(self.repo_root.clone(), Arc::clone(runner), checkout_manager);
+                let checkout_manager =
+                    self.read_only.registry.vcs.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
+                let vcs = checkout_manager;
                 let (path, _checkout) = vcs.create_checkout(branch_name, false).await?;
                 Ok(Some(path))
             }
@@ -267,7 +257,6 @@ impl<'a> TeleportFlow<'a> {
                 attachable_store,
                 daemon_socket_path,
                 local_host,
-                None,
                 None,
             ),
             checkout_key,

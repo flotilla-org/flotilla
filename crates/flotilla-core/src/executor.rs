@@ -39,7 +39,6 @@ use crate::{
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
     terminal_manager::TerminalManager,
-    vcs::{CliGitVcs, Vcs, VcsQuery},
 };
 
 fn display_host_for_checkout_path(providers_data: &ProviderData, checkout_path: &Path, local_host: &HostName) -> Option<HostName> {
@@ -89,12 +88,11 @@ struct CheckoutFlow<'a> {
     intent: CheckoutIntent,
     repo_root: &'a ExecutionEnvironmentPath,
     registry: &'a ProviderRegistry,
-    runner: &'a Arc<dyn CommandRunner>,
     providers_data: &'a ProviderData,
     local_host: &'a HostName,
     new_checkout_qualifier: PathQualifier,
     /// When true, skip host-side validation and de-duplication.
-    /// Environment checkouts delegate validation to `CloneCheckoutManager`.
+    /// Environment checkouts delegate validation to `ReferenceCloneStrategy`.
     is_environment: bool,
 }
 
@@ -114,7 +112,7 @@ impl<'a> CheckoutFlow<'a> {
     }
 
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
-        let checkout_service = CheckoutService::new(self.registry, Arc::clone(self.runner));
+        let checkout_service = CheckoutService::new(self.registry);
 
         if let Some(path) = self.existing_checkout_path() {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
@@ -124,7 +122,7 @@ impl<'a> CheckoutFlow<'a> {
         }
 
         // In environment context, skip host-side branch validation — the
-        // CloneCheckoutManager validates during clone (git clone -b fails if
+        // ReferenceCloneStrategy validates during clone (git clone -b fails if
         // branch doesn't exist; --no-checkout handles fresh branches).
         if !self.is_environment {
             checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
@@ -754,7 +752,6 @@ impl StepResolver for ExecutorStepResolver {
                     intent,
                     repo_root: &effective_repo_root,
                     registry: effective_registry.as_ref(),
-                    runner: &effective_runner,
                     providers_data: effective_providers_data.as_ref(),
                     local_host: &self.local_host,
                     new_checkout_qualifier: context_environment_id.as_ref().map_or_else(
@@ -774,7 +771,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(effective_registry.as_ref(), Arc::clone(&effective_runner));
+                let checkout_service = CheckoutService::new(effective_registry.as_ref());
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
@@ -802,7 +799,6 @@ impl StepResolver for ExecutorStepResolver {
                     self.daemon_socket_path.as_ref().map(|p| p.as_path()),
                     &self.local_host,
                     tm.as_ref(),
-                    Some(Arc::clone(&effective_runner)),
                 );
                 match service.resolve_teleport_checkout_path(checkout_key.as_ref(), branch.as_deref()).await? {
                     Some(path) => Ok(StepOutcome::Produced(CommandValue::CheckoutPathResolved { path: path.into_path_buf() })),
@@ -841,7 +837,6 @@ impl StepResolver for ExecutorStepResolver {
                     self.daemon_socket_path.as_ref().map(|p| p.as_path()),
                     &self.local_host,
                     tm.as_ref(),
-                    Some(Arc::clone(&effective_runner)),
                 );
                 let checkout_key = known_local_checkout_key(self.providers_data.as_ref(), &path, &self.local_host)
                     .cloned()
@@ -1265,7 +1260,10 @@ impl ExecutorStepResolver {
     // path to bind-mount). This should move into the EnvironmentProvider or CreateOpts
     // preparation rather than living on the executor.
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
-        let result = CliGitVcs::new(self.repo.root.as_path(), &*self.runner).query(VcsQuery::GitCommonDir).await;
+        let result = self
+            .runner
+            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Default)
+            .await;
         match result {
             Ok(path) => {
                 let git_dir = std::path::Path::new(path.trim());

@@ -17,7 +17,7 @@ use crate::{
         types::{
             ChangeRequest, Checkout, CloudAgentSession, Issue, Workspace, WorkspaceAttachRequest,
         },
-        vcs::CheckoutManager,
+        vcs::Vcs,
     },
 };
 
@@ -40,23 +40,22 @@ fn labeled_desc(
 
 struct StubCheckoutManager;
 #[async_trait]
-impl CheckoutManager for StubCheckoutManager {
-    async fn validate_target(&self, _: &ExecutionEnvironmentPath, _: &str, _: flotilla_protocol::CheckoutIntent) -> Result<(), String> {
+impl Vcs for StubCheckoutManager {
+    async fn validate_target(&self, _: &str, _: flotilla_protocol::CheckoutIntent) -> Result<(), String> {
         Ok(())
     }
 
-    async fn list_checkouts(&self, _: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
     async fn create_checkout(
         &self,
-        _: &ExecutionEnvironmentPath,
         _: &str,
         _: bool,
     ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
         Err("stub".into())
     }
-    async fn remove_checkout(&self, _: &ExecutionEnvironmentPath, _: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -153,9 +152,9 @@ impl PresentationManager for StubPresentationManager {
 /// Build a ProviderRegistry with all provider slots populated.
 fn full_registry() -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
-    reg.checkout_managers.insert(
+    reg.vcs.insert(
         "cm",
-        labeled_desc(ProviderCategory::CheckoutManager, "cm", "StubCM", "WT", "Checkouts", "worktree"),
+        labeled_desc(ProviderCategory::Vcs, "cm", "StubCM", "WT", "Checkouts", "worktree"),
         Arc::new(StubCheckoutManager),
     );
     reg.change_requests.insert(
@@ -219,11 +218,11 @@ fn labels_from_full_registry_uses_provider_values() {
 
 #[test]
 fn labels_with_partial_registry() {
-    // Only checkout_managers and coding_agents registered.
+    // Only vcs and coding_agents registered.
     let mut reg = ProviderRegistry::new();
-    reg.checkout_managers.insert(
+    reg.vcs.insert(
         "cm",
-        labeled_desc(ProviderCategory::CheckoutManager, "cm", "StubCM", "WT", "Checkouts", "worktree"),
+        labeled_desc(ProviderCategory::Vcs, "cm", "StubCM", "WT", "Checkouts", "worktree"),
         Arc::new(StubCheckoutManager),
     );
     reg.cloud_agents.insert(
@@ -344,7 +343,7 @@ async fn repo_model_new_initializes_state_and_uses_registry_data() {
     assert!(model.data.provider_health.is_empty());
     assert!(model.data.correlation_groups.is_empty());
 
-    assert!(model.registry.checkout_managers.contains_key("cm"));
+    assert!(model.registry.vcs.contains_key("cm"));
     assert!(model.registry.cloud_agents.contains_key("ca"));
     assert!(!model.registry.presentation_managers.is_empty());
     model.refresh_handle.trigger_refresh();
@@ -370,7 +369,7 @@ async fn repo_model_new_with_empty_registry_uses_default_labels() {
 #[tokio::test]
 async fn repo_model_new_virtual_has_empty_registry_and_default_labels() {
     let model = RepoModel::new_virtual();
-    assert!(model.registry.checkout_managers.is_empty());
+    assert!(model.registry.vcs.is_empty());
     assert!(model.registry.change_requests.is_empty());
     assert!(model.registry.issue_trackers.is_empty());
     assert!(model.registry.cloud_agents.is_empty());

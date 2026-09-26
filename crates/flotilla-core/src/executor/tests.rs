@@ -28,10 +28,11 @@ use crate::{
         terminal::TerminalPool,
         testing::MockRunner,
         types::*,
-        vcs::{write_branch_issue_links, CheckoutManager},
+        vcs::write_branch_issue_links,
         CommandRunner,
     },
     step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
+    vcs::Vcs,
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
@@ -90,20 +91,15 @@ impl MockCheckoutManager {
 }
 
 #[async_trait]
-impl CheckoutManager for MockCheckoutManager {
-    async fn validate_target(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
+impl Vcs for MockCheckoutManager {
+    async fn validate_target(&self, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
         self.validate_result.lock().await.take().expect("validate_target called more than expected")
     }
 
-    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+    async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
-    async fn create_checkout(
-        &self,
-        _repo_root: &ExecutionEnvironmentPath,
-        _branch: &str,
-        _create_branch: bool,
-    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+    async fn create_checkout(&self, _branch: &str, _create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
         self.create_result
             .lock()
             .await
@@ -111,7 +107,7 @@ impl CheckoutManager for MockCheckoutManager {
             .expect("create_checkout called more than expected")
             .map(|(p, co)| (ExecutionEnvironmentPath::new(p), co))
     }
-    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
+    async fn remove_checkout(&self, _branch: &str) -> Result<(), String> {
         self.remove_result.lock().await.take().expect("remove_checkout called more than expected")
     }
 }
@@ -952,7 +948,7 @@ async fn checkout_action_creates_workspace_after_checkout() {
     })]));
 
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), ws_mgr.clone());
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
     let attachable_store = crate::attachable::shared_in_memory_attachable_store();
@@ -1140,13 +1136,13 @@ async fn create_checkout_no_manager() {
 
     let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
 
-    assert_error_contains(result, "No checkout manager available");
+    assert_error_contains(result, "No VCS provider available");
 }
 
 #[tokio::test]
 async fn create_checkout_success() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
@@ -1158,7 +1154,7 @@ async fn create_checkout_success() {
 #[tokio::test]
 async fn create_checkout_with_issue_ids_writes_git_config() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     // Two validation probes (branch absent locally/remotely), then the git config write.
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string()), Ok(String::new())]);
@@ -1181,7 +1177,7 @@ async fn create_checkout_with_issue_ids_writes_git_config() {
 #[tokio::test]
 async fn create_checkout_failure() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("branch already exists")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("branch already exists")));
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
     let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
@@ -1192,7 +1188,7 @@ async fn create_checkout_failure() {
 #[tokio::test]
 async fn create_checkout_success_ws_manager_fails_still_returns_created() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("ws failed")));
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
@@ -1215,13 +1211,13 @@ async fn remove_checkout_no_manager() {
 
     let result = run_build_plan_to_completion(remove_checkout_action("old"), registry, data, runner).await;
 
-    assert_error_contains(result, "No checkout manager available");
+    assert_error_contains(result, "No VCS provider available");
 }
 
 #[tokio::test]
 async fn remove_checkout_success() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-old").into(), TestCheckout::new("old").build());
     let runner = runner_ok();
@@ -1234,7 +1230,7 @@ async fn remove_checkout_success() {
 #[tokio::test]
 async fn remove_checkout_failure() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::failing("cannot remove trunk")));
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-main").into(), TestCheckout::new("main").build());
     let runner = runner_ok();
@@ -1453,7 +1449,7 @@ async fn remove_checkout_succeeds_with_terminal_pool() {
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
 
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
@@ -1995,7 +1991,7 @@ async fn teleport_session_with_branch_creates_checkout() {
     let terminal_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     registry.terminal_pools.insert("shpool", desc("shpool"), terminal_pool);
     let mut data = empty_data();
@@ -2242,7 +2238,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
 
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
@@ -2281,7 +2277,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
 #[tokio::test]
 async fn build_plan_create_checkout_returns_steps() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let data = empty_data();
     let runner = runner_ok();
@@ -2302,7 +2298,7 @@ async fn build_plan_create_checkout_returns_steps() {
 #[tokio::test]
 async fn checkout_command_fails_loudly_without_workspace_manager() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
 
     let result = run_build_plan_to_completion(existing_branch_checkout_action("feat-x"), registry, empty_data(), runner_ok()).await;
 
@@ -2312,7 +2308,7 @@ async fn checkout_command_fails_loudly_without_workspace_manager() {
 #[tokio::test]
 async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let data = empty_data();
 
@@ -2339,7 +2335,7 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
 #[tokio::test]
 async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_and_attaches_locally() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let local = node_id("laptop-node");
 
@@ -2386,7 +2382,7 @@ async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_an
 #[tokio::test]
 async fn build_plan_create_checkout_treats_local_host_as_local() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let data = empty_data();
     let local = local_node_id();
@@ -2423,7 +2419,7 @@ async fn workspace_label_for_host_suffixes_only_for_remote_hosts() {
 #[tokio::test]
 async fn build_plan_create_checkout_skips_existing() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let mut data = empty_data();
     // Pre-populate with an existing checkout for the branch
@@ -2446,7 +2442,7 @@ async fn build_plan_create_checkout_skips_existing() {
 #[tokio::test]
 async fn checkout_plan_includes_workspace_step() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
 
     let plan = run_build_plan(fresh_checkout_action("feat-x"), registry, empty_data(), runner_ok()).await;
@@ -2561,7 +2557,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
 
     let ws_mgr = Arc::new(MockWorkspaceManager::succeeding());
     let mut registry = ProviderRegistry::new();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) }));
     let registry = Arc::new(registry);
@@ -2704,7 +2700,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
 
     let ws_mgr = Arc::new(MockWorkspaceManager::failing("ws failed"));
     let mut registry = ProviderRegistry::new();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
     let registry = Arc::new(registry);
     let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
@@ -2785,7 +2781,7 @@ async fn build_plan_teleport_session_returns_steps() {
 #[tokio::test]
 async fn build_plan_remove_checkout_returns_steps() {
     let mut registry = empty_registry();
-    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
+    registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("old", "/repo/wt-old")));
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-old").into(), TestCheckout::new("old").build());
     let runner = runner_ok();
@@ -3424,8 +3420,8 @@ async fn write_branch_issue_links_empty_is_noop() {
 #[tokio::test]
 async fn checkout_service_validate_target_uses_checkout_manager() {
     let mut registry = ProviderRegistry::new();
-    registry.checkout_managers.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/tmp/feat-x")));
-    let service = CheckoutService::new(&registry, Arc::new(MockRunner::new(vec![])));
+    registry.vcs.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/tmp/feat-x")));
+    let service = CheckoutService::new(&registry);
 
     let result = service.validate_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch).await;
 
@@ -3435,12 +3431,8 @@ async fn checkout_service_validate_target_uses_checkout_manager() {
 #[tokio::test]
 async fn checkout_service_validate_target_propagates_checkout_manager_error() {
     let mut registry = ProviderRegistry::new();
-    registry.checkout_managers.insert(
-        "checkout",
-        desc("checkout"),
-        Arc::new(MockCheckoutManager::failing("branch already exists: existing")),
-    );
-    let service = CheckoutService::new(&registry, Arc::new(MockRunner::new(vec![])));
+    registry.vcs.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::failing("branch already exists: existing")));
+    let service = CheckoutService::new(&registry);
 
     let result = service.validate_target(&repo_root(), "existing", CheckoutIntent::FreshBranch).await;
 

@@ -128,7 +128,6 @@ use crate::{
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
-    vcs::{CheckoutManagerVcs, CliGitVcs, Vcs},
 };
 
 fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
@@ -3630,9 +3629,7 @@ impl InProcessDaemon {
         let mut matches = Vec::new();
         for state in repos.values() {
             let root = state.preferred_root();
-            let repo_root = ExecutionEnvironmentPath::new(&root.path);
-            let Some((_, manager)) = root.model.registry.checkout_managers.preferred_with_desc() else { continue };
-            let vcs = CheckoutManagerVcs::new(repo_root, Arc::clone(&self.discovery.runner), Arc::clone(manager));
+            let Some((_, vcs)) = root.model.registry.vcs.preferred_with_desc() else { continue };
             let checkouts = vcs.list_checkouts().await.map_err(|error| format!("checkout discovery failed: {error}"))?;
             for (checkout_path, checkout) in checkouts {
                 let host_path =
@@ -8556,7 +8553,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let output = CliGitVcs::new(Path::new(path), &*runner).push_head("origin").await;
+            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
             let outcome = match output {
                 Ok(output) if output.success => {
                     CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()
@@ -9906,15 +9903,10 @@ impl InProcessDaemon {
         self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, caller).await
     }
 
-    async fn executor_provider_data(&self, repo_identity: &RepoIdentity, repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
+    async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
         let mut providers = ProviderData::default();
 
-        if let Some(checkout_manager) = registry.checkout_managers.preferred() {
-            let vcs = CheckoutManagerVcs::new(
-                ExecutionEnvironmentPath::new(repo_root),
-                Arc::clone(&self.discovery.runner),
-                Arc::clone(checkout_manager),
-            );
+        if let Some(vcs) = registry.vcs.preferred() {
             match vcs.list_checkouts().await {
                 Ok(checkouts) => {
                     for (path, mut checkout) in checkouts {

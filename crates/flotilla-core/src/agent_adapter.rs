@@ -14,7 +14,6 @@ use toml_edit::{value, DocumentMut, Item, Table};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
-    vcs::{CliGitVcs, Vcs},
 };
 
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
@@ -803,7 +802,7 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
-    let Ok(output) = CliGitVcs::new(cwd, runner).git_path("info/exclude").await else {
+    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Default).await else {
         return Ok(());
     };
     if !output.success {

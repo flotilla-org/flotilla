@@ -15,7 +15,7 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
             .unwrap_or_default()
     }
     RepoLabels {
-        checkouts: labels(&registry.checkout_managers),
+        checkouts: labels(&registry.vcs),
         change_requests: labels(&registry.change_requests),
         issues: labels(&registry.issue_trackers),
         cloud_agents: labels(&registry.cloud_agents),
@@ -40,7 +40,7 @@ pub fn provider_names_from_registry(registry: &ProviderRegistry) -> HashMap<Stri
             }
         }
     }
-    collect(&mut names, &registry.checkout_managers);
+    collect(&mut names, &registry.vcs);
     collect(&mut names, &registry.change_requests);
     collect(&mut names, &registry.issue_trackers);
     collect(&mut names, &registry.cloud_agents);

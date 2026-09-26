@@ -1,20 +1,14 @@
-use std::sync::Arc;
-
 pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{provider_data::Checkout, qualified_path::QualifiedPath, CheckoutSelector, HostName};
 use tracing::warn;
 
 use crate::{
-    path_context::ExecutionEnvironmentPath,
-    provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, CommandRunner},
-    terminal_manager::TerminalManager,
-    vcs::{CheckoutManagerVcs, Vcs},
+    path_context::ExecutionEnvironmentPath, provider_data::ProviderData, providers::registry::ProviderRegistry,
+    terminal_manager::TerminalManager, vcs::Vcs,
 };
 
 pub(super) struct CheckoutService<'a> {
     registry: &'a ProviderRegistry,
-    runner: Arc<dyn CommandRunner>,
 }
 
 /// Returns whether a checkout key belongs to the executor's local provider snapshot.
@@ -59,42 +53,41 @@ pub(crate) fn checkout_matches_scope(
 }
 
 impl<'a> CheckoutService<'a> {
-    pub(super) fn new(registry: &'a ProviderRegistry, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { registry, runner }
+    pub(super) fn new(registry: &'a ProviderRegistry) -> Self {
+        Self { registry }
     }
 
-    fn vcs(&self, repo_root: &ExecutionEnvironmentPath) -> Result<CheckoutManagerVcs, String> {
-        let manager = self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
-        Ok(CheckoutManagerVcs::new(repo_root.clone(), Arc::clone(&self.runner), manager))
+    fn vcs(&self) -> Result<&std::sync::Arc<dyn Vcs>, String> {
+        self.registry.vcs.preferred().ok_or_else(|| "No VCS provider available".to_string())
     }
 
     pub(super) async fn validate_target(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         intent: CheckoutIntent,
     ) -> Result<(), String> {
-        self.vcs(repo_root)?.validate_target(branch, intent).await
+        self.vcs()?.validate_target(branch, intent).await
     }
 
     pub(super) async fn create_checkout(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         create_branch: bool,
     ) -> Result<ExecutionEnvironmentPath, String> {
-        let (path, _checkout) = self.vcs(repo_root)?.create_checkout(branch, create_branch).await?;
+        let (path, _checkout) = self.vcs()?.create_checkout(branch, create_branch).await?;
         Ok(path)
     }
 
     pub(super) async fn remove_checkout(
         &self,
-        repo_root: &ExecutionEnvironmentPath,
+        _repo_root: &ExecutionEnvironmentPath,
         branch: &str,
         deleted_checkout_paths: &[QualifiedPath],
         terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
-        self.vcs(repo_root)?.remove_checkout(branch).await?;
+        self.vcs()?.remove_checkout(branch).await?;
 
         // Cascade: remove attachable sets and kill terminal sessions for deleted checkouts
         if let Some(tm) = terminal_manager {

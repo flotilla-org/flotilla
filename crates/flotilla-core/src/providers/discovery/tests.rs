@@ -179,7 +179,6 @@ fn provider_descriptor_labeled_simple() {
 fn provider_category_slug_round_trip() {
     let expected = [
         "vcs",
-        "checkout_manager",
         "change_request",
         "issue_tracker",
         "cloud_agent",
@@ -286,7 +285,7 @@ impl Factory for CountingPresentationFactory {
 
 fn factories_with_presentation(factory: CountingPresentationFactory) -> FactoryRegistry {
     FactoryRegistry {
-        checkout_managers: vec![],
+        vcs: vec![],
         change_requests: vec![],
         issue_trackers: vec![],
         cloud_agents: vec![],
