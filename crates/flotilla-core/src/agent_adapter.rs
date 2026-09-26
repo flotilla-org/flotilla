@@ -1053,6 +1053,16 @@ mod tests {
     }
 
     #[test]
+    fn default_brief_requires_authenticated_github_access() {
+        let brief = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+
+        assert!(brief.contains("use only the injected `gh` token-file wrapper or `$GITHUB_TOKEN_FILE`"));
+        assert!(brief.contains("never use unauthenticated or anonymous GitHub API requests"));
+        assert!(brief.contains("`$GITHUB_TOKEN_FILE` names a nonempty file and `gh auth status` succeeds"));
+        assert!(brief.contains("fail the assignment with `flotilla crew fail --message '...'`"));
+    }
+
+    #[test]
     fn repo_level_override_can_replace_one_block() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
