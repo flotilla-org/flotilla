@@ -205,8 +205,11 @@ impl ChangeRequestRefresher {
     /// Refresh a claim-time observation even before Landing has armed its
     /// standing leaf subscriptions.
     pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+        if !self.owns_record(subject, false).await? {
+            return Ok(());
+        }
         let status = self.inner.source.observe_for_completion(subject).await?;
-        self.publish(subject, &subject.record_name(), status, true).await
+        self.publish(subject, &subject.record_name(), status, true, false).await
     }
 
     pub async fn demand(
@@ -215,17 +218,12 @@ impl ChangeRequestRefresher {
         subject: ChangeRequestRef,
         freshness: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
-        let records =
-            self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
         let name = subject.record_name();
-        if records
-            .items
-            .iter()
-            .any(|item| item.object.metadata.name == name && matches!(item.provenance, ResourceProvenance::Replica { .. }))
-        {
-            return Ok(());
+        match self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).get(&name).await {
+            Ok(_) => {}
+            Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
+            Err(error) => return Err(error.to_string()),
         }
-        self.ensure_record(&subject, &name).await?;
 
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
@@ -267,7 +265,12 @@ impl ChangeRequestRefresher {
                 continue;
             }
             self.inner.observation_errors.lock().await.remove(&subject);
-            let result = self.inner.backend.using::<ChangeRequest>(&subject.namespace).delete(&subject.record_name()).await;
+            let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+            let result = match records.get(&subject.record_name()).await {
+                Ok(record) if record.spec.observing_authority == self.inner.authority => records.delete(&subject.record_name()).await,
+                Ok(_) | Err(flotilla_resources::ResourceError::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 if !matches!(error, flotilla_resources::ResourceError::NotFound { .. }) {
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "garbage collect undemanded change request failed");
@@ -298,11 +301,27 @@ impl ChangeRequestRefresher {
     async fn refresh_loop(&self, subject: ChangeRequestRef) {
         let record_name = subject.record_name();
         loop {
+            match self.owns_record(&subject, true).await {
+                Ok(false) => {
+                    if !self.wait_for_next(&subject, self.inner.cadence.state).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), error);
+                    if !self.wait_for_next(&subject, self.inner.cadence.checks_pending).await {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(true) => {}
+            }
             match self.inner.source.observe(&subject).await {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
-                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded).await {
+                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true).await {
                         self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
@@ -330,6 +349,64 @@ impl ChangeRequestRefresher {
         }
     }
 
+    async fn owns_record(&self, subject: &ChangeRequestRef, allow_takeover: bool) -> Result<bool, String> {
+        let name = subject.record_name();
+        let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
+        // A former owner can still hold its local copy after another host has
+        // claimed the subject. Prefer the freshest observation across copies;
+        // an exact tie is resolved deterministically by authority name.
+        let record = records
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|item| item.object.metadata.name == name)
+            .max_by_key(|item| {
+                (
+                    item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
+                    item.object.spec.observing_authority.clone(),
+                )
+            });
+        let Some(record) = record else {
+            let created = self.get_or_create_record(subject, &name).await?;
+            return Ok(created.spec.observing_authority == self.inner.authority);
+        };
+        if record.object.spec.observing_authority == self.inner.authority {
+            return Ok(matches!(record.provenance, ResourceProvenance::Local));
+        }
+        if !allow_takeover {
+            return Ok(false);
+        }
+        let observed_at =
+            record.object.status.as_ref().map_or(record.object.metadata.creation_timestamp, |status| status.state.observed_at);
+        let takeover_after =
+            chrono::Duration::from_std(self.inner.cadence.stale_after.saturating_mul(2)).map_err(|error| error.to_string())?;
+        if Utc::now().signed_duration_since(observed_at) <= takeover_after {
+            return Ok(false);
+        }
+        let local = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        let mut spec = record.object.spec.clone();
+        spec.observing_authority = self.inner.authority.clone();
+        // A former owner can keep its local record while another host owns a
+        // fresher replica. Reclaim through that local record when it exists.
+        let result = match local.get(&name).await {
+            Ok(existing) if existing.spec.observing_authority == self.inner.authority => Ok(existing),
+            Ok(existing) => local.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await,
+            Err(flotilla_resources::ResourceError::NotFound { .. }) => {
+                // A single conditional create claims a local copy, so an
+                // interruption cannot strand a foreign shadow.
+                local.create(&InputMeta::builder().name(name).build(), &spec).await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(_) => Ok(true),
+            Err(flotilla_resources::ResourceError::Conflict { .. }) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     async fn wait_for_next(&self, subject: &ChangeRequestRef, delay: Duration) -> bool {
         let Some(wake) = self.inner.active.lock().await.get(subject).map(|refresh| Arc::clone(&refresh.wake)) else {
             return false;
@@ -341,10 +418,28 @@ impl ChangeRequestRefresher {
         true
     }
 
-    async fn publish(&self, subject: &ChangeRequestRef, name: &str, status: ChangeRequestStatus, heartbeat: bool) -> Result<(), String> {
+    async fn publish(
+        &self,
+        subject: &ChangeRequestRef,
+        name: &str,
+        status: ChangeRequestStatus,
+        heartbeat: bool,
+        allow_takeover: bool,
+    ) -> Result<(), String> {
+        if !self.owns_record(subject, allow_takeover).await? {
+            return Ok(());
+        }
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
-        let current = self.get_or_create_record(subject, name).await?;
-        if !heartbeat && current.status.as_ref().is_some_and(|current| observed_values_equal(current, &status)) {
+        let current = records.get(name).await.map_err(|error| error.to_string())?;
+        if current.spec.observing_authority != self.inner.authority {
+            return Ok(());
+        }
+        let stale_after = chrono::Duration::from_std(self.inner.cadence.stale_after).map_err(|error| error.to_string())?;
+        if !heartbeat
+            && current.status.as_ref().is_some_and(|current| {
+                observed_values_equal(current, &status) && Utc::now().signed_duration_since(current.state.observed_at) < stale_after
+            })
+        {
             return Ok(());
         }
         records.update_status(name, &current.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;

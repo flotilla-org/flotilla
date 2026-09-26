@@ -15,10 +15,10 @@ impl Resource for ChangeRequest {
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
 
     fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {
-        if current == requested {
+        if current.service == requested.service && current.scope == requested.scope && current.number == requested.number {
             Ok(())
         } else {
-            Err(ResourceError::invalid("ChangeRequest subject and observing authority are immutable"))
+            Err(ResourceError::invalid("ChangeRequest subject is immutable"))
         }
     }
 }
