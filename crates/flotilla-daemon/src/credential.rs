@@ -18,7 +18,7 @@ use flotilla_resources::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use url::Url;
 
 use crate::vessel_config::{
@@ -229,7 +229,7 @@ pub(crate) struct CredentialStore {
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
-    cleaned_delivery_environments: Mutex<BTreeSet<String>>,
+    cleaned_delivery_environments: Mutex<BTreeMap<String, Arc<OnceCell<()>>>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -469,7 +469,7 @@ impl CredentialStore {
             github_app_deliveries: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
-            cleaned_delivery_environments: Mutex::new(BTreeSet::new()),
+            cleaned_delivery_environments: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -673,14 +673,12 @@ impl CredentialStore {
         };
         if specs.iter().any(|(_, spec)| matches!(spec.consumer, CredentialConsumer::GithubApp { .. })) {
             let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-            let mut cleaned = self.cleaned_delivery_environments.lock().await;
-            if !cleaned.contains(environment_ref) {
-                match cleanup_stale_github_app_token_files_with_runner(&*runner, &paths.base).await {
-                    Ok(()) => {
-                        cleaned.insert(environment_ref.to_string());
-                    }
-                    Err(error) => tracing::warn!(%environment_ref, %error, "failed to clean up delivered GitHub App token staging files"),
-                }
+            let cleanup = {
+                let mut cleanups = self.cleaned_delivery_environments.lock().await;
+                Arc::clone(cleanups.entry(environment_ref.to_string()).or_insert_with(|| Arc::new(OnceCell::new())))
+            };
+            if let Err(error) = cleanup.get_or_try_init(|| cleanup_stale_github_app_token_files_with_runner(&*runner, &paths.base)).await {
+                tracing::warn!(%environment_ref, %error, "failed to clean up delivered GitHub App token staging files");
             }
         }
         let mut env = BTreeMap::new();
