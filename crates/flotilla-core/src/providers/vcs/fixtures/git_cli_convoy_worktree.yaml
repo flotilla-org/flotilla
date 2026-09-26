@@ -103,7 +103,7 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 21f659c initial
+      HEAD is now at 49a25e9 initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -114,7 +114,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      21f659c2825abce30753fba91302dc73cfcce647
+      49a25e971d19c18e1d676b4fc832eafa1e0e9635
     exit_code: 0
   - channel: command
     cmd: git
@@ -123,7 +123,7 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '21f659c2825abce30753fba91302dc73cfcce647'
+    - '49a25e971d19c18e1d676b4fc832eafa1e0e9635'
     cwd: /
     stdout: ''
     exit_code: 0
@@ -152,6 +152,18 @@ rounds:
       ?? untracked.txt
     stderr: ''
     exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/convoy-new'
+    - symbolic-ref
+    - '--quiet'
+    - '--short'
+    - HEAD
+    cwd: /
+    stderr: ''
+    exit_code: 1
   - channel: command
     cmd: git
     args:
@@ -209,7 +221,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      21f659c2825abce30753fba91302dc73cfcce647
+      49a25e971d19c18e1d676b4fc832eafa1e0e9635
     stderr: ''
     exit_code: 0
   - channel: command
@@ -222,7 +234,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      21f659c2825abce30753fba91302dc73cfcce647
+      49a25e971d19c18e1d676b4fc832eafa1e0e9635
     stderr: ''
     exit_code: 0
   - channel: command
@@ -236,7 +248,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 21f659c2825abce30753fba91302dc73cfcce647
+      HEAD 49a25e971d19c18e1d676b4fc832eafa1e0e9635
       branch refs/heads/main
 
     exit_code: 0
@@ -251,7 +263,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 21f659c).
+      Deleted branch convoy/new (was 49a25e9).
     exit_code: 0
   - channel: command
     cmd: git
@@ -290,6 +302,15 @@ rounds:
     stdout: ''
     stderr: ''
     exit_code: 1
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
   - channel: command
     cmd: test
     args:

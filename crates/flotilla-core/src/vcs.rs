@@ -231,7 +231,7 @@ impl FlotillaVcs {
     async fn checkout_removal_guard(&self, branch: &str, target: &str) -> Result<Option<CheckoutRemoval>, String> {
         let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
-        if backend.current_branch().await?.trim() != branch {
+        if backend.current_branch().await.ok().as_deref().map(str::trim) != Some(branch) {
             return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
         }
         let status = backend.working_tree_status(false).await?;
@@ -1177,6 +1177,14 @@ mod tests {
         );
         if replay::is_live() {
             std::fs::remove_file(Path::new(target).join("untracked.txt")).expect("remove dirty file");
+            git(Path::new(target), &["checkout", "--detach"]);
+        }
+        assert_eq!(
+            vcs.remove_materialised_checkout("convoy/new", target).await.expect("preserve detached worktree"),
+            CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason: CheckoutPreservationReason::DifferentBranch }
+        );
+        if replay::is_live() {
+            git(Path::new(target), &["checkout", "convoy/new"]);
         }
         assert_eq!(vcs.remove_materialised_checkout("convoy/new", target).await.expect("remove worktree"), CheckoutRemoval::Removed);
         session.finish();
