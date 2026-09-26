@@ -52,7 +52,7 @@ impl FactoryRegistry {
     pub fn default_all() -> Self {
         Self {
             vcs: vcs_factories(),
-            change_requests: vec![Box::new(github::GitHubChangeRequestFactory)],
+            change_requests: vec![Box::new(github::GitHubChangeRequestFactory), Box::new(github::ForgejoChangeRequestFactory)],
             issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
             cloud_agents: vec![
                 Box::new(claude::ClaudeCodingAgentFactory),

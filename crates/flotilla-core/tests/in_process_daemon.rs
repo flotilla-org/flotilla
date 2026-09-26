@@ -29,8 +29,8 @@ use flotilla_core::{
                 FakeChangeRequest, FakeCheckoutManager, FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager,
                 FakeTerminalPool, FakeVcsFactory, FakeVcsState, TestEnvVars,
             },
-            DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
-            ProviderDescriptor, RepoDetector, UnmetRequirement,
+            DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, ProviderCategory, ProviderDescriptor,
+            RepoDetector, UnmetRequirement,
         },
         environment::{EnvironmentHandle, ProvisionedEnvironment},
         terminal::TerminalPool,
@@ -150,7 +150,7 @@ impl RepoDetector for FixedRemoteHostDetector {
         _runner: &dyn flotilla_core::providers::CommandRunner,
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
-        vec![EnvironmentAssertion::remote_host(HostPlatform::GitHub, self.owner, self.repo, "origin")]
+        vec![EnvironmentAssertion::remote_host("github.com", self.owner, self.repo, "origin")]
     }
 }
 
@@ -163,7 +163,7 @@ impl RepoDetector for MutableRemoteHostDetector {
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         let repo = self.repo.read().expect("mutable remote detector should not be poisoned").clone();
-        vec![EnvironmentAssertion::remote_host(HostPlatform::GitHub, self.owner, repo, "origin")]
+        vec![EnvironmentAssertion::remote_host("github.com", self.owner, repo, "origin")]
     }
 }
 
@@ -4756,6 +4756,36 @@ fn lab_forge_spec() -> flotilla_resources::ForgeSpec {
         .build()
 }
 
+#[tokio::test]
+async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
+    use flotilla_resources::Forge;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    init_git_repo_with_remote(&repo, "git@forgejo.lab.flotilla.work:lab/flotilla.git");
+    std::fs::write(temp.path().join("lab-forgejo-coder-token"), "test-token\n").expect("write test token");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), git_process_discovery(false), HostName::local())
+            .await;
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &lab_forge_spec())
+        .await
+        .expect("declare Forge");
+
+    let result = daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.expect("discover providers");
+    assert_eq!(result.host_repo_bag.find_origin_forge().expect("origin Forge").forge_id, "flotilla-lab");
+    assert_eq!(result.host_repo_bag.repo_identity().expect("repo identity").authority, "forgejo.lab.flotilla.work");
+    assert!(result.registry.issue_trackers.get("forgejo").is_some(), "{:?}", result.unmet);
+    assert!(result.registry.change_requests.get("forgejo").is_some());
+    assert!(result.registry.change_requests.get("github").is_none());
+    daemon
+        .issue_provider_for_source(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() })
+        .await
+        .expect("source-addressed Forgejo provider");
+}
+
 #[async_trait]
 impl RepositoryInspector for ForgeAliasInspector {
     async fn inspect_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
@@ -5617,7 +5647,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
 
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
-            HostPlatform::GitHub,
+            "github.com",
             "owner",
             "manager-backed-repo",
             "origin",

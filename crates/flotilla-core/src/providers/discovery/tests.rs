@@ -7,8 +7,8 @@ fn sample_bag() -> EnvironmentBag {
         .with(EnvironmentAssertion::binary("gh", "/usr/bin/gh"))
         .with(EnvironmentAssertion::env_var("GITHUB_TOKEN", "ghp_abc123"))
         .with(EnvironmentAssertion::vcs_checkout("/home/user/project", VcsKind::Git, true))
-        .with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "acme", "widgets", "upstream"))
-        .with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "fork-owner", "widgets", "origin"))
+        .with(EnvironmentAssertion::remote_host("github.com", "acme", "widgets", "upstream"))
+        .with(EnvironmentAssertion::remote_host("github.com", "fork-owner", "widgets", "origin"))
         .with(EnvironmentAssertion::auth_file("github", "/home/user/.config/gh/hosts.yml"))
         .with(EnvironmentAssertion::socket("cmux", "/tmp/cmux.sock"))
 }
@@ -31,7 +31,7 @@ fn find_env_var_returns_value() {
 #[test]
 fn find_remote_host_prefers_origin() {
     let bag = sample_bag();
-    let result = bag.find_remote_host(HostPlatform::GitHub);
+    let result = bag.find_remote_host("github.com");
     // Should prefer origin over upstream
     assert_eq!(result, Some(("fork-owner", "widgets", "origin")));
 }
@@ -39,16 +39,16 @@ fn find_remote_host_prefers_origin() {
 #[test]
 fn find_remote_host_falls_back_to_first() {
     let bag = EnvironmentBag::new()
-        .with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "acme", "widgets", "upstream"))
-        .with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "other", "widgets", "fork"));
-    let result = bag.find_remote_host(HostPlatform::GitHub);
+        .with(EnvironmentAssertion::remote_host("github.com", "acme", "widgets", "upstream"))
+        .with(EnvironmentAssertion::remote_host("github.com", "other", "widgets", "fork"));
+    let result = bag.find_remote_host("github.com");
     assert_eq!(result, Some(("acme", "widgets", "upstream")));
 }
 
 #[test]
 fn find_remote_host_filters_by_platform() {
     let bag = sample_bag();
-    assert_eq!(bag.find_remote_host(HostPlatform::GitLab), None);
+    assert_eq!(bag.find_remote_host("gitlab.com"), None);
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn repo_slug_from_github() {
 
 #[test]
 fn repo_slug_falls_back_to_gitlab() {
-    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(HostPlatform::GitLab, "gl-org", "project", "origin"));
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host("gitlab.com", "gl-org", "project", "origin"));
     assert_eq!(bag.repo_slug(), Some("gl-org/project".into()));
 }
 
@@ -126,7 +126,7 @@ fn unmet_requirement_variants() {
         UnmetRequirement::MissingEnvVar("TOKEN".into()),
         UnmetRequirement::MissingAuth("github".into()),
         UnmetRequirement::MissingConfig("[provider]".into()),
-        UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub),
+        UnmetRequirement::MissingRemoteHost("github.com".into()),
         UnmetRequirement::NoVcsCheckout,
         UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::AiUtility, key: "nonexistent".into() },
     ];
@@ -192,7 +192,7 @@ fn provider_category_slug_round_trip() {
 
 #[test]
 fn repo_identity_from_github_remote() {
-    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "rjwittams", "flotilla", "origin"));
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host("github.com", "rjwittams", "flotilla", "origin"));
     let identity = bag.repo_identity().expect("should have identity");
     assert_eq!(identity.authority, "github.com");
     assert_eq!(identity.path, "rjwittams/flotilla");
@@ -200,7 +200,7 @@ fn repo_identity_from_github_remote() {
 
 #[test]
 fn repo_identity_from_gitlab_remote() {
-    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(HostPlatform::GitLab, "gl-org", "project", "origin"));
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host("gitlab.com", "gl-org", "project", "origin"));
     let identity = bag.repo_identity().expect("should have identity");
     assert_eq!(identity.authority, "gitlab.com");
     assert_eq!(identity.path, "gl-org/project");

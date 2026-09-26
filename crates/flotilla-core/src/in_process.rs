@@ -1546,17 +1546,53 @@ fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
 }
 
+/// Resolve one remote independently; callers choose which remote's forge to carry.
+async fn forge_for_remote(
+    resource_backend: &ResourceBackend,
+    namespace: &str,
+    remote: &str,
+) -> Result<Option<flotilla_resources::ForgeSpec>, String> {
+    let forges = resource_backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|error| error.to_string())?;
+    let mut matching = Vec::new();
+    for forge in forges {
+        if forge.spec.repository_path(remote)?.is_some() {
+            if forge.metadata.name != forge.spec.forge_id {
+                return Err(format!("Forge {} must use its forge_id as its resource name", forge.metadata.name));
+            }
+            matching.push(forge.spec);
+        }
+    }
+    if matching.len() > 1 {
+        return Err("repository remote matches multiple Forge definitions".into());
+    }
+    Ok(matching.into_iter().next())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
     discovery: &DiscoveryRuntime,
     config: &ConfigStore,
+    resource_backend: &ResourceBackend,
+    namespace: &str,
     local_environment_id: &EnvironmentId,
     environment_id: &EnvironmentId,
     repo_path: &Path,
 ) -> Result<DiscoveryResult, String> {
-    let host_bag = environment_manager.environment_bag(environment_id).ok_or_else(|| format!("environment not found: {environment_id}"))?;
+    let mut host_bag =
+        environment_manager.environment_bag(environment_id).ok_or_else(|| format!("environment not found: {environment_id}"))?;
     let runner =
         environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
+    // Resolve the forge while the resource backend is available. Factories only
+    // receive assertions, so their probe interface remains independent of storage.
+    if let Ok(origin_url) = crate::providers::run!(runner, "git", &["remote", "get-url", "origin"], repo_path) {
+        if let Some(remote) = crate::providers::discovery::detectors::git::remote_assertion(origin_url.trim(), "origin") {
+            host_bag = host_bag.with(remote);
+        }
+        if let Some(spec) = forge_for_remote(resource_backend, namespace, origin_url.trim()).await? {
+            host_bag = host_bag.with(crate::providers::discovery::EnvironmentAssertion::origin_forge(spec));
+        }
+    }
     let ee_path = ExecutionEnvironmentPath::new(repo_path);
     let remote_env = StaticEnvVars::from_bag(&host_bag);
     let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
@@ -2440,6 +2476,8 @@ impl InProcessDaemon {
                 &environment_manager,
                 &discovery,
                 &config,
+                &resource_backend,
+                DEFAULT_PROVISIONING_NAMESPACE,
                 &local_environment_id,
                 &local_environment_id,
                 &path,
@@ -2707,27 +2745,13 @@ impl InProcessDaemon {
     }
 
     async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
-        if spec.live_remote().is_none() {
+        let Some(remote) = spec.live_remote() else {
             return Ok(spec);
-        }
+        };
         let namespace = self.provisioning_namespace().await;
-        let forges =
-            self.resource_backend.definitions::<flotilla_resources::Forge>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let mut matching = Vec::new();
-        for forge in forges {
-            if forge.spec.repository_path(spec.live_remote().expect("remote Repository has a live remote"))?.is_some() {
-                if forge.metadata.name != forge.spec.forge_id {
-                    return Err(format!("Forge {} must use its forge_id as its resource name", forge.metadata.name));
-                }
-                matching.push(forge);
-            }
-        }
-        let Some(forge) = matching.first() else { return Ok(spec) };
-        if matching.len() > 1 {
-            return Err("repository remote matches multiple Forge definitions".to_string());
-        }
-        let resolved = spec.on_forge(&forge.spec)?;
-        self.sweep_split_forge_repositories(&resolved, &forge.spec).await
+        let Some(forge) = forge_for_remote(&self.resource_backend, &namespace, remote).await? else { return Ok(spec) };
+        let resolved = spec.on_forge(&forge)?;
+        self.sweep_split_forge_repositories(&resolved, &forge).await
     }
 
     async fn sweep_split_forge_repositories(
@@ -2968,6 +2992,11 @@ impl InProcessDaemon {
     /// Resolve a portable issue source to a provider capability installed on
     /// this host. Provider names and credentials remain local.
     pub async fn issue_provider_for_source(&self, source: &flotilla_protocol::IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
+        for repo in self.repos.read().await.values() {
+            if let Some(provider) = repo.registry().issue_provider_for(source) {
+                return Ok(provider);
+            }
+        }
         let host_bag = self
             .environment_manager
             .environment_bag(&self.local_environment_id)
@@ -2976,16 +3005,20 @@ impl InProcessDaemon {
             .environment_manager
             .environment_runner(&self.local_environment_id)
             .ok_or_else(|| format!("environment runner not found: {}", self.local_environment_id))?;
+        let mut bag = host_bag;
+        let namespace = self.provisioning_namespace().await;
+        if let Some(forge) = forge_for_remote(&self.resource_backend, &namespace, &format!("{}/{}", source.service, source.scope)).await? {
+            bag = bag.with(EnvironmentAssertion::origin_forge(forge));
+        }
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
-        let host_scoped = self
-            .discovery
-            .host_scoped_providers
-            .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
-            .await;
-        let provider = host_scoped
-            .issue_provider_for(source)
-            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
-        Ok(provider)
+        for factory in &self.discovery.factories.issue_trackers {
+            if let Ok(provider) = factory.probe(&bag, &self.config, &probe_root, Arc::clone(&runner)).await {
+                if provider.supports(source) {
+                    return Ok(provider);
+                }
+            }
+        }
+        Err(format!("no issue provider available for {} {}", source.service, source.scope))
     }
 
     /// Resolve a curated query scope to external issue sources. Repository
@@ -3330,6 +3363,8 @@ impl InProcessDaemon {
             &self.environment_manager,
             &self.discovery,
             &self.config,
+            &self.resource_backend,
+            &self.provisioning_namespace().await,
             &self.local_environment_id,
             environment_id,
             repo_path,
@@ -3592,6 +3627,8 @@ impl InProcessDaemon {
             &self.environment_manager,
             &self.discovery,
             &self.config,
+            &self.resource_backend,
+            &self.provisioning_namespace().await,
             &self.local_environment_id,
             &self.local_environment_id,
             repo_path,
@@ -7466,6 +7503,8 @@ impl InProcessDaemon {
             &self.environment_manager,
             &self.discovery,
             &self.config,
+            &self.resource_backend,
+            &self.provisioning_namespace().await,
             &self.local_environment_id,
             &self.local_environment_id,
             &path,
@@ -9658,6 +9697,8 @@ impl InProcessDaemon {
             &self.environment_manager,
             &self.discovery,
             &self.config,
+            &self.resource_backend,
+            &self.provisioning_namespace().await,
             &self.local_environment_id,
             &self.local_environment_id,
             cwd.as_path(),
@@ -9869,6 +9910,8 @@ impl InProcessDaemon {
             &self.environment_manager,
             &self.discovery,
             &self.config,
+            &self.resource_backend,
+            &self.provisioning_namespace().await,
             &self.local_environment_id,
             &environment_id,
             cwd,

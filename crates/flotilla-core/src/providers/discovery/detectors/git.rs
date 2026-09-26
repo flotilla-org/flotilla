@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
-        discovery::{EnvVars, EnvironmentAssertion, HostPlatform, RepoDetector, VcsKind},
+        discovery::{EnvVars, EnvironmentAssertion, RepoDetector, VcsKind},
         run, CommandRunner,
     },
 };
@@ -44,11 +44,11 @@ impl RepoDetector for VcsRepoDetector {
 // RemoteHostDetector (RepoDetector)
 // ---------------------------------------------------------------------------
 
-/// Detects the remote host platform by parsing git remote URLs.
+/// Detects the origin remote without assuming a hosting platform.
 ///
 /// Preference order for selecting the remote:
-/// 1. The remote tracked by the current branch
-/// 2. `origin` if it exists
+/// 1. `origin` if it exists
+/// 2. The remote tracked by the current branch
 /// 3. First remote with a valid URL
 pub struct RemoteHostDetector;
 
@@ -78,16 +78,11 @@ async fn tracking_remote_url(repo_root: &Path, runner: &dyn CommandRunner) -> Op
 
 /// Find the preferred remote URL and its name.
 async fn preferred_remote(repo_root: &Path, runner: &dyn CommandRunner) -> Option<(String, String)> {
-    // 1. Try the tracking remote for the current branch
-    if let Some(result) = tracking_remote_url(repo_root, runner).await {
-        return Some(result);
-    }
-
-    // Get the list of remotes for steps 2 and 3
+    // Origin is the remote used for issues, change requests, and pushes.
     let remotes_output = run!(runner, "git", &["remote"], repo_root).ok()?;
     let remotes: Vec<&str> = remotes_output.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
-    // 2. Prefer "origin" if it exists
+    // 1. Prefer "origin" if it exists
     if remotes.contains(&"origin") {
         if let Ok(url) = run!(runner, "git", &["remote", "get-url", "origin"], repo_root) {
             let url = url.trim().to_string();
@@ -97,7 +92,12 @@ async fn preferred_remote(repo_root: &Path, runner: &dyn CommandRunner) -> Optio
         }
     }
 
-    // 3. Fall back to first remote with a valid URL
+    // 2. Try the tracking remote if origin is unavailable.
+    if let Some(result) = tracking_remote_url(repo_root, runner).await {
+        return Some(result);
+    }
+
+    // 3. Fall back to first remote with a valid URL.
     for remote in &remotes {
         if let Ok(url) = run!(runner, "git", &["remote", "get-url", remote], repo_root) {
             let url = url.trim().to_string();
@@ -109,16 +109,11 @@ async fn preferred_remote(repo_root: &Path, runner: &dyn CommandRunner) -> Optio
     None
 }
 
-/// Detect the host platform from a remote URL.
-fn detect_host_from_url(url: &str) -> Option<HostPlatform> {
-    let url_lower = url.to_lowercase();
-    if url_lower.contains("github.com") {
-        Some(HostPlatform::GitHub)
-    } else if url_lower.contains("gitlab") {
-        Some(HostPlatform::GitLab)
-    } else {
-        None
-    }
+/// Extract the remote host, including SSH aliases.
+fn detect_host_from_url(url: &str) -> Option<String> {
+    let canonical = flotilla_resources::canonicalize_repo_url(url).ok()?;
+    let (_, rest) = canonical.split_once("://")?;
+    Some(rest.split_once('/')?.0.to_ascii_lowercase())
 }
 
 /// Extract "owner" and "repo" from a git remote URL.
@@ -126,21 +121,20 @@ fn detect_host_from_url(url: &str) -> Option<HostPlatform> {
 /// Handles SSH (`git@github.com:owner/repo.git`) and
 /// HTTPS (`https://github.com/owner/repo.git`).
 fn extract_owner_repo(url: &str) -> Option<(String, String)> {
-    let path = if let Some(rest) = url.strip_prefix("git@") {
-        // git@github.com:owner/repo.git
-        rest.split_once(':').map(|(_, p)| p)
-    } else {
-        // https://github.com/owner/repo.git or similar
-        url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).and_then(|u| u.split_once('/').map(|(_, p)| p))
-    }?;
-    let slug = path.trim_end_matches(".git").trim_matches('/');
-    let (owner, repo) = slug.split_once('/')?;
+    let canonical = flotilla_resources::canonicalize_repo_url(url).ok()?;
+    let (_, rest) = canonical.split_once("://")?;
+    let (_, path) = rest.split_once('/')?;
+    let (owner, repo) = path.rsplit_once('/')?;
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    // Take only the first segment after owner as repo (ignore deeper paths)
-    let repo = repo.split('/').next().unwrap_or(repo);
     Some((owner.to_string(), repo.to_string()))
+}
+
+pub(crate) fn remote_assertion(url: &str, remote_name: &str) -> Option<EnvironmentAssertion> {
+    let host = detect_host_from_url(url)?;
+    let (owner, repo) = extract_owner_repo(url)?;
+    Some(EnvironmentAssertion::remote_host(host, owner, repo, remote_name))
 }
 
 #[async_trait]
@@ -155,15 +149,7 @@ impl RepoDetector for RemoteHostDetector {
             Some(r) => r,
             None => return vec![],
         };
-        let platform = match detect_host_from_url(&url) {
-            Some(p) => p,
-            None => return vec![],
-        };
-        let (owner, repo) = match extract_owner_repo(&url) {
-            Some(r) => r,
-            None => return vec![],
-        };
-        vec![EnvironmentAssertion::remote_host(platform, owner, repo, remote_name)]
+        remote_assertion(&url, &remote_name).into_iter().collect()
     }
 }
 
@@ -244,8 +230,8 @@ mod tests {
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
-                assert_eq!(*platform, HostPlatform::GitHub);
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } => {
+                assert_eq!(host, "github.com");
                 assert_eq!(owner, "owner");
                 assert_eq!(repo, "repo");
                 assert_eq!(remote_name, "origin");
@@ -265,14 +251,29 @@ mod tests {
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
-                assert_eq!(*platform, HostPlatform::GitHub);
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } => {
+                assert_eq!(host, "github.com");
                 assert_eq!(owner, "upstream-owner");
                 assert_eq!(repo, "repo");
                 assert_eq!(remote_name, "upstream");
             }
             other => panic!("expected RemoteHost, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn remote_host_detector_uses_origin_with_cross_forge_upstream() {
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["remote"], Ok("origin\nupstream\n".into()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("git@forgejo.lab.flotilla.work:lab/flotilla.git\n".into()))
+            .build();
+        let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
+        assert!(matches!(
+            &assertions[0],
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name }
+                if host == "forgejo.lab.flotilla.work" && owner == "lab" && repo == "flotilla" && remote_name == "origin"
+        ));
     }
 
     #[tokio::test]
@@ -286,8 +287,8 @@ mod tests {
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
-                assert_eq!(*platform, HostPlatform::GitHub);
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } => {
+                assert_eq!(host, "github.com");
                 assert_eq!(owner, "owner");
                 assert_eq!(repo, "repo");
                 assert_eq!(remote_name, "origin");
@@ -318,8 +319,8 @@ mod tests {
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
-            EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
-                assert_eq!(*platform, HostPlatform::GitLab);
+            EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } => {
+                assert_eq!(host, "gitlab.example.com");
                 assert_eq!(owner, "org");
                 assert_eq!(repo, "project");
                 assert_eq!(remote_name, "origin");
@@ -329,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_host_detector_unknown_host_returns_empty() {
+    async fn remote_host_detector_accepts_any_host() {
         let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let runner = DiscoveryMockRunner::builder()
             .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Err("fatal: no upstream".into()))
@@ -337,25 +338,25 @@ mod tests {
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://bitbucket.org/owner/repo.git\n".into()))
             .build();
         let assertions = RemoteHostDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
-        assert!(assertions.is_empty());
+        assert!(matches!(&assertions[0], EnvironmentAssertion::RemoteHost { host, .. } if host == "bitbucket.org"));
     }
 
     // -- URL parsing unit tests --
 
     #[test]
     fn detect_host_from_url_github() {
-        assert_eq!(detect_host_from_url("git@github.com:owner/repo.git"), Some(HostPlatform::GitHub));
-        assert_eq!(detect_host_from_url("https://GitHub.com/owner/repo"), Some(HostPlatform::GitHub));
+        assert_eq!(detect_host_from_url("git@github.com:owner/repo.git"), Some("github.com".into()));
+        assert_eq!(detect_host_from_url("https://GitHub.com/owner/repo"), Some("github.com".into()));
     }
 
     #[test]
     fn detect_host_from_url_gitlab() {
-        assert_eq!(detect_host_from_url("https://gitlab.mycompany.com/org/project"), Some(HostPlatform::GitLab));
+        assert_eq!(detect_host_from_url("https://gitlab.mycompany.com/org/project"), Some("gitlab.mycompany.com".into()));
     }
 
     #[test]
     fn detect_host_from_url_unknown() {
-        assert_eq!(detect_host_from_url("https://bitbucket.org/owner/repo"), None);
+        assert_eq!(detect_host_from_url("https://bitbucket.org/owner/repo"), Some("bitbucket.org".into()));
         assert_eq!(detect_host_from_url(""), None);
     }
 
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn extract_owner_repo_deep_path() {
-        // For deep paths like org/sub/repo, we take owner=org, repo=sub
-        assert_eq!(extract_owner_repo("https://github.com/org/sub/repo.git"), Some(("org".into(), "sub".into())));
+        // Keep nested owner paths intact.
+        assert_eq!(extract_owner_repo("https://github.com/org/sub/repo.git"), Some(("org/sub".into(), "repo".into())));
     }
 }

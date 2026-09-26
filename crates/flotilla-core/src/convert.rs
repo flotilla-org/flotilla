@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use flotilla_protocol::{DiscoveryEntry, DiscoveryFact, HostProviderStatus, ToolInventory, UnmetRequirementInfo};
 
-use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag, HostPlatform, UnmetRequirement};
+use crate::providers::discovery::{EnvironmentAssertion, EnvironmentBag, UnmetRequirement};
 
 pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> DiscoveryEntry {
     let mut detail = HashMap::new();
@@ -31,12 +31,19 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
             detail.insert("is_main_checkout".into(), is_main_checkout.to_string());
             "vcs_checkout_detected"
         }
-        EnvironmentAssertion::RemoteHost { platform, owner, repo, remote_name } => {
-            detail.insert("platform".into(), format!("{platform:?}"));
+        EnvironmentAssertion::RemoteHost { host, owner, repo, remote_name } => {
+            detail.insert("host".into(), host.clone());
             detail.insert("owner".into(), owner.clone());
             detail.insert("repo".into(), repo.clone());
             detail.insert("remote_name".into(), remote_name.clone());
             "remote_host"
+        }
+        EnvironmentAssertion::OriginForge { spec } => {
+            detail.insert("forge_id".into(), spec.forge_id.clone());
+            detail.insert("kind".into(), format!("{:?}", spec.kind));
+            detail.insert("https_url".into(), spec.https_url.clone());
+            detail.insert("git_ssh_host".into(), spec.git_ssh_host.clone());
+            "origin_forge"
         }
         EnvironmentAssertion::AuthFileExists { provider, path } => {
             detail.insert("provider".into(), provider.clone());
@@ -84,7 +91,9 @@ pub fn inventory_from_bag(bag: &EnvironmentBag) -> ToolInventory {
                 let detail = vec![("value".into(), "<set>".into())];
                 inventory.env_vars.push(DiscoveryFact { name: key.clone(), detail });
             }
-            EnvironmentAssertion::VcsCheckoutDetected { .. } | EnvironmentAssertion::RemoteHost { .. } => {}
+            EnvironmentAssertion::VcsCheckoutDetected { .. }
+            | EnvironmentAssertion::RemoteHost { .. }
+            | EnvironmentAssertion::OriginForge { .. } => {}
         }
     }
 
@@ -102,19 +111,12 @@ pub fn unmet_requirement_to_proto(factory: &str, requirement: &UnmetRequirement)
         UnmetRequirement::MissingEnvVar(key) => ("missing_env_var", Some(key.clone())),
         UnmetRequirement::MissingAuth(provider) => ("missing_auth", Some(provider.clone())),
         UnmetRequirement::MissingConfig(key) => ("missing_config", Some(key.clone())),
-        UnmetRequirement::MissingRemoteHost(platform) => ("missing_remote_host", Some(host_platform_name(*platform).to_string())),
+        UnmetRequirement::MissingRemoteHost(host) => ("missing_remote_host", Some(host.clone())),
         UnmetRequirement::NoVcsCheckout => ("no_vcs_checkout", None),
         UnmetRequirement::UnknownProviderPreference { key, .. } => ("unknown_provider_preference", Some(key.clone())),
     };
 
     UnmetRequirementInfo { factory: factory.to_string(), kind: kind.to_string(), value }
-}
-
-fn host_platform_name(platform: HostPlatform) -> &'static str {
-    match platform {
-        HostPlatform::GitHub => "github",
-        HostPlatform::GitLab => "gitlab",
-    }
 }
 
 pub fn provider_health_to_host_statuses(health: &HashMap<(&'static str, String), bool>) -> Vec<HostProviderStatus> {

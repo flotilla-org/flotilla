@@ -98,7 +98,7 @@ fn normalized_service(value: &str) -> &str {
 
 pub fn is_forgejo_source(source: &IssueSource, service_url: &str) -> bool {
     let service = normalized_service(&source.service);
-    service == "forgejo" || service == normalized_service(service_url)
+    service == normalized_service(service_url)
 }
 
 fn clamp_limit(count: usize) -> usize {
@@ -410,7 +410,7 @@ mod tests {
     fn supports_configured_forgejo_service_and_generic_alias() {
         let provider = provider(Arc::new(MockHttp::new(vec![])));
 
-        assert!(provider.supports(&IssueSource { service: "forgejo".into(), scope: "fork-issues/zellij".into() }));
+        assert!(provider.supports(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() }));
         assert!(provider.supports(&IssueSource { service: LAB_SERVICE_URL.into(), scope: "fork-issues/zellij".into() }));
         assert!(
             !provider.supports(&IssueSource { service: "https://other-forgejo.example.test".into(), scope: "fork-issues/zellij".into() })
