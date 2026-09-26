@@ -1817,7 +1817,14 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
                     for file in \"$directory\"/token.tmp-*; do \
                         [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
                         case \"${file##*/}\" in \
-                            token.tmp-????????-????-????-????-????????????) rm -f -- \"$file\" || exit 1;; \
+                            token.tmp-????????-????-????-????-????????????) \
+                                name=${file##*/}; \
+                                hex=$(printf '%s' \"${name#token.tmp-}\" | tr -d '-'); \
+                                case \"$hex\" in \
+                                    ????????????????????????????????) \
+                                        case \"$hex\" in *[!0123456789abcdefABCDEF]*) continue;; esac; \
+                                        rm -f -- \"$file\" || exit 1;; \
+                                esac;; \
                         esac; \
                     done; \
                 done",
@@ -2311,13 +2318,16 @@ mod tests {
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
+        let malformed = credential_dir.join("token.tmp-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
         tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
         tokio::fs::write(&live, "live material").await.expect("write live token");
+        tokio::fs::write(&malformed, "unrelated material").await.expect("write unrelated file");
 
         cleanup_stale_github_app_token_files_with_runner(&ProcessCommandRunner, base.path()).await.expect("clean delivered staging file");
 
         assert!(!abandoned.exists());
         assert!(live.exists());
+        assert!(malformed.exists());
     }
 
     #[test]
