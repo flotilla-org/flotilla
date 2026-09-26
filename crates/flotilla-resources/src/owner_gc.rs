@@ -47,18 +47,32 @@ impl ControlledChildren {
         if object["metadata"]["annotations"].get(ORIGIN_ROOT_ANNOTATION).is_some() {
             return Ok(Vec::new());
         }
+        let owners: Vec<OwnerReference> = match &object["metadata"]["ownerReferences"] {
+            serde_json::Value::Null => Vec::new(),
+            value => serde_json::from_value(value.clone())
+                .map_err(|error| ResourceError::decode(format!("invalid owner references in watch object: {error}")))?,
+        };
+        // The index only needs references that the collector can act on.
+        let owners: Vec<_> = owners
+            .into_iter()
+            .filter(|owner| {
+                owner.controller
+                    && owner.api_version == "flotilla.work/v1"
+                    && REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind)
+            })
+            .collect();
+        let previous = self.by_child.get(&child).cloned().unwrap_or_default();
+        if previous == owners {
+            return Ok(Vec::new());
+        }
         self.remove(&child);
-        let owners: Vec<OwnerReference> = serde_json::from_value(object["metadata"]["ownerReferences"].clone())
-            .or_else(|error| object["metadata"]["ownerReferences"].is_null().then(Vec::new).ok_or(error))
-            .map_err(|error| ResourceError::decode(format!("invalid owner references in watch object: {error}")))?;
-        let owners: Vec<_> = owners.into_iter().filter(|owner| owner.controller).collect();
         for owner in &owners {
             self.by_owner.entry(owner.clone()).or_default().insert(child.clone());
         }
         if !owners.is_empty() {
             self.by_child.insert(child, owners.clone());
         }
-        Ok(owners)
+        Ok(owners.into_iter().filter(|owner| !previous.contains(owner)).collect())
     }
 }
 
@@ -146,9 +160,29 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use futures::StreamExt;
+    use serde_json::json;
 
     use super::*;
     use crate::{registry::GC_FULL_KIND_LISTS, Host, HostSpec, InMemoryBackend, InputMeta, WatchEvent, WatchStart};
+
+    #[test]
+    fn unchanged_owners_do_not_trigger_repeat_lookups() {
+        let mut index = ControlledChildren::default();
+        let object = |owner: &str, api_version: &str| {
+            json!({
+                "kind": "Host",
+                "metadata": {
+                    "name": "child",
+                    "ownerReferences": [{"apiVersion": api_version, "kind": "Host", "name": owner, "controller": true}]
+                }
+            })
+        };
+        assert_eq!(index.record(&object("first", "flotilla.work/v1")).expect("index child").len(), 1);
+        assert!(index.record(&object("first", "flotilla.work/v1")).expect("unchanged child").is_empty());
+        assert_eq!(index.record(&object("second", "flotilla.work/v1")).expect("reparent child").len(), 1);
+        assert!(index.record(&object("foreign", "foreign/v1")).expect("ignore foreign owner").is_empty());
+        assert!(index.by_owner.is_empty());
+    }
 
     #[tokio::test]
     async fn deleting_a_leaf_does_not_list_resource_kinds() {
