@@ -199,6 +199,12 @@ impl OpenViews {
         }
     }
 
+    pub fn clear_pending_rows(&mut self) {
+        for view in &mut self.views {
+            view.visit_table_states_mut(&mut TableState::clear_pending_rows);
+        }
+    }
+
     pub fn reconcile_authoritative_rows(&mut self, query: &QueryId, update: &AuthoritativeRowUpdate) {
         for view in &mut self.views {
             view.visit_table_states_mut(&mut |state| state.reconcile_authoritative(query, update));

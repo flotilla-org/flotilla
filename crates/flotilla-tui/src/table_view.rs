@@ -124,6 +124,10 @@ impl TableState {
         self.row_states.values().any(RowState::is_pending)
     }
 
+    pub fn clear_pending_rows(&mut self) {
+        self.row_states.retain(|_, state| !state.is_pending());
+    }
+
     pub fn reconcile_authoritative(&mut self, query: &QueryId, update: &AuthoritativeRowUpdate) {
         self.row_states.retain(|row_id, state| {
             state.query() != query

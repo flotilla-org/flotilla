@@ -119,8 +119,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::CommandDispatchCompleted { session_id, result, pending_ctx } => {
                     app::executor::handle_dispatch_completion(session_id, result, pending_ctx, &mut app);
                 }
-                Event::AttachDispatchCompleted(result) => {
-                    app::executor::handle_attach_dispatch_completion(result, &mut app);
+                Event::AttachDispatchCompleted { session_id, result } => {
+                    app::executor::handle_attach_dispatch_completion(session_id, result, &mut app);
                 }
                 Event::FleetHealthRefreshed(result) => {
                     fleet_health_refresh_in_flight = false;
@@ -249,7 +249,10 @@ async fn resync_subscriptions(app: &mut App) {
                 app.handle_daemon_event(event);
             }
         }
-        Err(e) => tracing::warn!(%e, "query subscription re-sync failed"),
+        Err(e) => {
+            app.subscriptions_dirty = true;
+            tracing::warn!(%e, "query subscription re-sync failed");
+        }
     }
 }
 
@@ -307,4 +310,43 @@ pub fn render_reconnect_frame(
         );
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use std::sync::Arc;
+
+    use flotilla_protocol::{QueryId, ViewAddress};
+
+    use super::resync_subscriptions;
+    use crate::{
+        app::test_support::{stub_app_with_daemon, StubDaemon},
+        table_view::{PendingRowContext, RowId, RowState},
+    };
+
+    #[tokio::test]
+    async fn reconnect_clears_pending_rows_in_inactive_views_when_resubscription_fails() {
+        let mut app = stub_app_with_daemon(Arc::new(StubDaemon::new()), vec![]);
+        let address = ViewAddress::Convoys { namespace: "default".into(), scope: None };
+        app.views.open_or_focus(address.clone());
+        let row = PendingRowContext {
+            address: address.clone(),
+            panel: None,
+            query: QueryId::Convoys { scope: None },
+            row_id: RowId::new("convoy"),
+        };
+        app.views.begin_pending_row(&row, "old action".into()).expect("row should begin submitting");
+        app.views.open_or_focus(ViewAddress::Overview);
+
+        let daemon = Arc::new(StubDaemon::builder().subscribe_result(Err("subscription unavailable".into())).build());
+        app.reconnect_daemon(daemon, vec![]);
+        resync_subscriptions(&mut app).await;
+
+        assert!(app.subscriptions_dirty, "failed subscription should be retried");
+        let view = app.views.iter().find(|view| view.address() == Some(&address)).expect("inactive view should remain open");
+        assert!(view.table_state.row_state(&row.row_id).is_none());
+        app.views.begin_pending_row(&row, "new action".into()).expect("stale pending row should no longer block actions");
+        let view = app.views.iter().find(|view| view.address() == Some(&address)).expect("inactive view should remain open");
+        assert!(matches!(view.table_state.row_state(&row.row_id), Some(RowState::Submitting { .. })));
+    }
 }

@@ -29,6 +29,9 @@ pub(crate) struct StubDaemon {
     tx: broadcast::Sender<DaemonEvent>,
     #[builder(default = Mutex::new(None), with = |result: Result<CommandValue, String>| Mutex::new(Some(result)))]
     query_result: Mutex<Option<Result<CommandValue, String>>>,
+    query_gate: Option<Arc<Semaphore>>,
+    #[builder(default = Ok(vec![]))]
+    subscribe_result: Result<Vec<DaemonEvent>, String>,
     execute_gate: Option<Arc<Semaphore>>,
     #[builder(default = Ok(1))]
     execute_result: Result<u64, String>,
@@ -92,6 +95,9 @@ impl DaemonHandle for StubDaemon {
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         self.query_calls.lock().expect("query calls lock").push((command, session_id));
+        if let Some(gate) = &self.query_gate {
+            gate.acquire().await.expect("query gate should remain open").forget();
+        }
         self.query_result.lock().expect("query result lock").take().unwrap_or_else(|| Err("stub".into()))
     }
 
@@ -108,7 +114,7 @@ impl DaemonHandle for StubDaemon {
         _subscriber_id: uuid::Uuid,
         _queries: &[flotilla_protocol::QueryCursor],
     ) -> Result<Vec<DaemonEvent>, String> {
-        Ok(vec![])
+        self.subscribe_result.clone()
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {

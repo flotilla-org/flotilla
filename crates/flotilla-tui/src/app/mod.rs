@@ -730,6 +730,7 @@ impl App {
         self.in_flight.clear();
         self.acknowledged_dispatches.clear();
         self.pending_dispatch_acks = 0;
+        self.views.clear_pending_rows();
         self.recent_command_finishes.clear();
         self.local_attach_effects = LocalAttachEffects::default();
         self.project_issue_start_batches.clear();
