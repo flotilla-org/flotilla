@@ -54,8 +54,9 @@ use flotilla_resources::{
     CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
     DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder,
     EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObjectEvent,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
+    LifecycleAuthority, ObjectEvent, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief,
+    PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
@@ -2361,6 +2362,46 @@ impl StandingConvoyBackingInspector for InProcessDaemon {
     }
 }
 
+fn rewrite_repository_annotations(meta: &mut InputMeta, replacements: &BTreeSet<RepositoryKey>, target_name: &str) -> bool {
+    let mut changed = false;
+    for value in meta.annotations.values_mut() {
+        if replacements.contains(&RepositoryKey(value.clone())) {
+            *value = target_name.to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn rewrite_repository_keys(keys: &mut Vec<RepositoryKey>, replacements: &BTreeSet<RepositoryKey>, target: &RepositoryKey) -> bool {
+    if !keys.iter().any(|key| replacements.contains(key)) {
+        return false;
+    }
+    let mut changed = false;
+    let mut seen = BTreeSet::new();
+    keys.retain_mut(|key| {
+        if replacements.contains(key) {
+            *key = target.clone();
+            changed = true;
+        }
+        if !seen.insert(key.clone()) {
+            changed = true;
+            return false;
+        }
+        true
+    });
+    changed
+}
+
+fn rewrite_repository_set(keys: &mut BTreeSet<RepositoryKey>, replacements: &BTreeSet<RepositoryKey>, target: &RepositoryKey) -> bool {
+    if !keys.iter().any(|key| replacements.contains(key)) {
+        return false;
+    }
+    keys.retain(|key| !replacements.contains(key));
+    keys.insert(target.clone());
+    true
+}
+
 impl InProcessDaemon {
     async fn resolve_convoy_issue_snapshot(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
         let issue = self.fetch_issue_by_ref(reference).await?;
@@ -2865,6 +2906,54 @@ impl InProcessDaemon {
                 project_updates.push((meta, spec));
             }
         }
+        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
+        let mut ensure_updates = Vec::new();
+        for ensure in ensures.list().await.map_err(|error| error.to_string())? {
+            let mut spec = ensure.spec.clone();
+            let mut meta = InputMeta::from(&ensure.metadata);
+            let mut changed = rewrite_repository_keys(&mut spec.repositories, &replacements, &target_key);
+            changed |= rewrite_repository_annotations(&mut meta, &replacements, &target_name);
+            if changed {
+                ensure_updates.push((meta, spec));
+            }
+        }
+        let templates = self.resource_backend.clone().definitions::<WorkflowTemplate>(&namespace);
+        let mut template_updates = Vec::new();
+        for template in templates.list().await.map_err(|error| error.to_string())? {
+            let mut spec = template.spec.clone();
+            let mut meta = InputMeta::from(&template.metadata);
+            let mut changed = rewrite_repository_annotations(&mut meta, &replacements, &target_name);
+            for vessel in &mut spec.vessels {
+                if let Some(refs) = &mut vessel.repository_refs {
+                    changed |= rewrite_repository_keys(refs, &replacements, &target_key);
+                }
+                for refs in vessel.credential_scopes.values_mut() {
+                    changed |= rewrite_repository_set(refs, &replacements, &target_key);
+                }
+            }
+            if changed {
+                template_updates.push((meta, spec));
+            }
+        }
+        let grants = self.resource_backend.clone().definitions::<CredentialGrant>(&namespace);
+        let mut grant_updates = Vec::new();
+        for grant in grants.list().await.map_err(|error| error.to_string())? {
+            let mut spec = grant.spec.clone();
+            let mut meta = InputMeta::from(&grant.metadata);
+            let mut changed = rewrite_repository_annotations(&mut meta, &replacements, &target_name);
+            changed |= rewrite_repository_set(&mut spec.selector.repositories, &replacements, &target_key);
+            for scope in spec.landing_credentials.values_mut() {
+                if let LandingCredentialScope::Branch { repository, .. } = scope {
+                    if replacements.contains(repository) {
+                        *repository = target_key.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                grant_updates.push((meta, spec));
+            }
+        }
         match existing {
             Some(existing) if existing.spec != merged || InputMeta::from(&existing.metadata) != target_meta => {
                 repositories.update(&target_meta, &existing.metadata.resource_version, &merged).await.map_err(|error| error.to_string())?;
@@ -2881,6 +2970,15 @@ impl InProcessDaemon {
         }
         for (meta, spec) in project_updates {
             projects.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        }
+        for (meta, spec) in ensure_updates {
+            ensures.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        }
+        for (meta, spec) in template_updates {
+            templates.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
+        }
+        for (meta, spec) in grant_updates {
+            grants.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
         }
         let durable_checkouts =
             self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
