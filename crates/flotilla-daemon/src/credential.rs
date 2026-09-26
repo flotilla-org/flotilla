@@ -391,10 +391,21 @@ impl CredentialStore {
     /// config base can differ from the previous one when XDG_RUNTIME_DIR
     /// becomes available, so inspect the state fallback as well.
     pub(crate) async fn cleanup_stale_github_app_token_files(&self) -> Result<(), String> {
-        cleanup_stale_github_app_token_files_in(&self.state_dir).await?;
-        let base = self.delivery_paths(&*self.host_runner).await?.base;
-        if base != self.state_dir {
-            cleanup_stale_github_app_token_files_in(&base).await?;
+        let mut errors = Vec::new();
+        if let Err(error) = cleanup_stale_github_app_token_files_in(&self.state_dir).await {
+            errors.push(error);
+        }
+        match self.delivery_paths(&*self.host_runner).await {
+            Ok(paths) if paths.base != self.state_dir => {
+                if let Err(error) = cleanup_stale_github_app_token_files_in(&paths.base).await {
+                    errors.push(error);
+                }
+            }
+            Err(error) => errors.push(error),
+            Ok(_) => {}
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
         }
         Ok(())
     }
@@ -2258,6 +2269,41 @@ mod tests {
         assert!(!abandoned.exists());
         assert!(unrelated.exists());
         assert!(live.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_sweeps_both_bases_even_if_one_fails() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let runtime = tempfile::tempdir().expect("create runtime directory");
+        let runtime_base = runtime.path().join("flotilla");
+        let state_credentials = state.path().join("credentials/github-app");
+        let runtime_credentials = runtime_base.join("credentials/github-app");
+        for directory in [&state_credentials, &runtime_credentials] {
+            tokio::fs::create_dir_all(directory).await.expect("create credential directory");
+        }
+        let state_staging = state_credentials.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let runtime_staging = runtime_credentials.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        for path in [&state_staging, &runtime_staging] {
+            tokio::fs::write(path, "abandoned material").await.expect("write staging file");
+        }
+        let store = CredentialStore::new(
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("XDG_RUNTIME_DIR".to_string(), runtime.path().to_string_lossy().into_owned())]))),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            state.path().to_path_buf(),
+        );
+
+        store.cleanup_stale_github_app_token_files().await.expect("sweep both credential bases");
+        assert!(!state_staging.exists());
+        assert!(!runtime_staging.exists());
+
+        tokio::fs::remove_dir_all(state.path().join("credentials")).await.expect("remove state credentials directory");
+        tokio::fs::write(state.path().join("credentials"), "block directory listing").await.expect("block state credentials directory");
+        tokio::fs::write(&runtime_staging, "abandoned material").await.expect("write another staging file");
+        store.cleanup_stale_github_app_token_files().await.expect_err("report state directory error");
+        assert!(!runtime_staging.exists(), "a bad state base must not prevent sweeping the runtime base");
     }
 
     #[tokio::test]
