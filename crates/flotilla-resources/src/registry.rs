@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
+pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
@@ -425,35 +428,76 @@ pub(crate) async fn collect_owned_resources(
     Ok(())
 }
 
+/// Recheck an indexed child against current local state before requesting its
+/// deletion. Watch events are hints: the child may have been reparented since
+/// the event, or a replica may now satisfy the owner reference.
+pub(crate) async fn collect_indexed_child(
+    backend: &ResourceBackend,
+    namespace: &str,
+    kind: &str,
+    name: &str,
+    deleted_owner: &OwnerReference,
+) -> Result<(), ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, collect_indexed_typed(backend, namespace, name, deleted_owner).await)
+}
+
+async fn collect_indexed_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    name: &str,
+    deleted_owner: &OwnerReference,
+) -> Result<(), ResourceError> {
+    let resolver = backend.using::<T>(namespace);
+    let child = match resolver.get(name).await {
+        Ok(child) => child,
+        Err(ResourceError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    collect_owned_child(backend, namespace, &resolver, &child, Some(deleted_owner)).await
+}
+
 async fn collect_owned_typed<T: Resource>(
     backend: &ResourceBackend,
     namespace: &str,
     deleted_owner: Option<&OwnerReference>,
 ) -> Result<(), ResourceError> {
+    #[cfg(test)]
+    GC_FULL_KIND_LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resolver = backend.using::<T>(namespace);
     for child in resolver.list().await?.items {
-        if matches!(child.metadata.lifecycle_authority()?, Some(crate::LifecycleAuthority::Observed | crate::LifecycleAuthority::Adopted)) {
+        collect_owned_child(backend, namespace, &resolver, &child, deleted_owner).await?;
+    }
+    Ok(())
+}
+
+async fn collect_owned_child<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    resolver: &crate::TypedResolver<T>,
+    child: &ResourceObject<T>,
+    deleted_owner: Option<&OwnerReference>,
+) -> Result<(), ResourceError> {
+    if matches!(child.metadata.lifecycle_authority()?, Some(crate::LifecycleAuthority::Observed | crate::LifecycleAuthority::Adopted)) {
+        return Ok(());
+    }
+    for owner in &child.metadata.owner_references {
+        if !owner.controller || deleted_owner.is_some_and(|deleted| deleted != owner) {
             continue;
         }
-        for owner in &child.metadata.owner_references {
-            if !owner.controller || deleted_owner.is_some_and(|deleted| deleted != owner) {
-                continue;
-            }
-            // Unknown groups/kinds are not evidence of an absent owner.
-            if owner.api_version != "flotilla.work/v1" || !REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind) {
-                continue;
-            }
-            match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {
-                Ok(_) => continue, // Also protects a replacement or another surviving authority.
-                Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
-            match resolver.delete(&child.metadata.name).await {
-                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
-            }
-            break;
+        // Unknown groups/kinds are not evidence of an absent owner.
+        if owner.api_version != "flotilla.work/v1" || !REGISTERED_RESOURCE_KINDS.iter().any(|kind| kind.kind == owner.kind) {
+            continue;
         }
+        match get_resource_kind_including_replicas(backend, namespace, &owner.kind, &owner.name).await {
+            Ok(_) => continue, // Also protects a replacement or another surviving authority.
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        match resolver.delete(&child.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        break;
     }
     Ok(())
 }
