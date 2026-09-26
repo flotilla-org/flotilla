@@ -1784,24 +1784,43 @@ async fn cleanup_stale_github_app_token_files_in(base: &Path) -> Result<(), Stri
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("list credential directories at {}: {error}", credentials.display())),
     };
+    let mut errors = Vec::new();
     while let Some(directory) = directories.next_entry().await.map_err(|error| format!("list credential directories: {error}"))? {
-        if !directory.file_type().await.map_err(|error| format!("inspect credential directory: {error}"))?.is_dir() {
-            continue;
-        }
-        let mut entries = tokio::fs::read_dir(directory.path()).await.map_err(|error| format!("list credential staging files: {error}"))?;
-        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
-            let name = entry.file_name();
-            let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
-            if uuid::Uuid::parse_str(suffix).is_err()
-                || !entry.file_type().await.map_err(|error| format!("inspect staging file: {error}"))?.is_file()
-            {
+        match directory.file_type().await {
+            Ok(file_type) if !file_type.is_dir() => continue,
+            Err(error) => {
+                errors.push(format!("inspect credential directory {}: {error}", directory.path().display()));
                 continue;
             }
-            let path = entry.path();
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|error| format!("remove stale GitHub App token staging file {}: {error}", path.display()))?;
+            Ok(_) => {}
         }
+        if let Err(error) = cleanup_stale_github_app_token_files_in_directory(&directory.path()).await {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(directory)
+        .await
+        .map_err(|error| format!("list credential staging files in {}: {error}", directory.display()))?;
+    while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
+        if uuid::Uuid::parse_str(suffix).is_err()
+            || !entry.file_type().await.map_err(|error| format!("inspect staging file: {error}"))?.is_file()
+        {
+            continue;
+        }
+        let path = entry.path();
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|error| format!("remove stale GitHub App token staging file {}: {error}", path.display()))?;
     }
     Ok(())
 }
