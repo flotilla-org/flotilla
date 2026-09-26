@@ -894,7 +894,7 @@ async fn discover_providers_inner(
         &mut unmet,
     );
 
-    if combined.find_vcs_checkout(VcsKind::Git).is_none() {
+    if !factories.checkout_managers.is_empty() && combined.find_vcs_checkout(VcsKind::Git).is_none() {
         unmet.push(("git".to_string(), UnmetRequirement::NoVcsCheckout));
     }
 

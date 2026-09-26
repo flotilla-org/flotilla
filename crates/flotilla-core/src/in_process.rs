@@ -128,7 +128,7 @@ use crate::{
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
-    vcs::{CliGitVcs, Vcs},
+    vcs::{CheckoutManagerVcs, CliGitVcs, Vcs},
 };
 
 fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
@@ -3632,7 +3632,8 @@ impl InProcessDaemon {
             let root = state.preferred_root();
             let repo_root = ExecutionEnvironmentPath::new(&root.path);
             let Some((_, manager)) = root.model.registry.checkout_managers.preferred_with_desc() else { continue };
-            let checkouts = manager.list_checkouts(&repo_root).await.map_err(|error| format!("checkout discovery failed: {error}"))?;
+            let vcs = CheckoutManagerVcs::new(repo_root, Arc::clone(&self.discovery.runner), Arc::clone(manager));
+            let checkouts = vcs.list_checkouts().await.map_err(|error| format!("checkout discovery failed: {error}"))?;
             for (checkout_path, checkout) in checkouts {
                 let host_path =
                     QualifiedPath::host(self.environment_manager.local_host_id().clone(), checkout_path.as_path().to_path_buf());
@@ -9909,7 +9910,12 @@ impl InProcessDaemon {
         let mut providers = ProviderData::default();
 
         if let Some(checkout_manager) = registry.checkout_managers.preferred() {
-            match checkout_manager.list_checkouts(&ExecutionEnvironmentPath::new(repo_root)).await {
+            let vcs = CheckoutManagerVcs::new(
+                ExecutionEnvironmentPath::new(repo_root),
+                Arc::clone(&self.discovery.runner),
+                Arc::clone(checkout_manager),
+            );
+            match vcs.list_checkouts().await {
                 Ok(checkouts) => {
                     for (path, mut checkout) in checkouts {
                         checkout.host_name.get_or_insert_with(|| self.host_name.clone());

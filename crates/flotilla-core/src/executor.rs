@@ -89,6 +89,7 @@ struct CheckoutFlow<'a> {
     intent: CheckoutIntent,
     repo_root: &'a ExecutionEnvironmentPath,
     registry: &'a ProviderRegistry,
+    runner: &'a Arc<dyn CommandRunner>,
     providers_data: &'a ProviderData,
     local_host: &'a HostName,
     new_checkout_qualifier: PathQualifier,
@@ -113,7 +114,7 @@ impl<'a> CheckoutFlow<'a> {
     }
 
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
-        let checkout_service = CheckoutService::new(self.registry);
+        let checkout_service = CheckoutService::new(self.registry, Arc::clone(self.runner));
 
         if let Some(path) = self.existing_checkout_path() {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
@@ -753,6 +754,7 @@ impl StepResolver for ExecutorStepResolver {
                     intent,
                     repo_root: &effective_repo_root,
                     registry: effective_registry.as_ref(),
+                    runner: &effective_runner,
                     providers_data: effective_providers_data.as_ref(),
                     local_host: &self.local_host,
                     new_checkout_qualifier: context_environment_id.as_ref().map_or_else(
@@ -772,7 +774,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(effective_registry.as_ref());
+                let checkout_service = CheckoutService::new(effective_registry.as_ref(), Arc::clone(&effective_runner));
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
@@ -800,6 +802,7 @@ impl StepResolver for ExecutorStepResolver {
                     self.daemon_socket_path.as_ref().map(|p| p.as_path()),
                     &self.local_host,
                     tm.as_ref(),
+                    Some(Arc::clone(&effective_runner)),
                 );
                 match service.resolve_teleport_checkout_path(checkout_key.as_ref(), branch.as_deref()).await? {
                     Some(path) => Ok(StepOutcome::Produced(CommandValue::CheckoutPathResolved { path: path.into_path_buf() })),
@@ -838,6 +841,7 @@ impl StepResolver for ExecutorStepResolver {
                     self.daemon_socket_path.as_ref().map(|p| p.as_path()),
                     &self.local_host,
                     tm.as_ref(),
+                    Some(Arc::clone(&effective_runner)),
                 );
                 let checkout_key = known_local_checkout_key(self.providers_data.as_ref(), &path, &self.local_host)
                     .cloned()

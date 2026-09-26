@@ -3425,7 +3425,7 @@ async fn write_branch_issue_links_empty_is_noop() {
 async fn checkout_service_validate_target_uses_checkout_manager() {
     let mut registry = ProviderRegistry::new();
     registry.checkout_managers.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/tmp/feat-x")));
-    let service = CheckoutService::new(&registry);
+    let service = CheckoutService::new(&registry, Arc::new(MockRunner::new(vec![])));
 
     let result = service.validate_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch).await;
 
@@ -3440,7 +3440,7 @@ async fn checkout_service_validate_target_propagates_checkout_manager_error() {
         desc("checkout"),
         Arc::new(MockCheckoutManager::failing("branch already exists: existing")),
     );
-    let service = CheckoutService::new(&registry);
+    let service = CheckoutService::new(&registry, Arc::new(MockRunner::new(vec![])));
 
     let result = service.validate_target(&repo_root(), "existing", CheckoutIntent::FreshBranch).await;
 
