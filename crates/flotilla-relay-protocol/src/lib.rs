@@ -26,11 +26,23 @@ pub struct Delivery {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamFrame {
-    Hint { delivery: Delivery },
-    Gap { oldest_cursor: u64, latest_cursor: u64 },
-    Acked { cursor: u64 },
-    Ready { cursor: u64 },
-    Error { message: String },
+    Hint {
+        delivery: Delivery,
+    },
+    /// `oldest_cursor` is absent when every retained hint has expired.
+    Gap {
+        oldest_cursor: Option<u64>,
+        latest_cursor: u64,
+    },
+    Acked {
+        cursor: u64,
+    },
+    Ready {
+        cursor: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +84,8 @@ impl Mailbox {
         if cursor > self.latest_cursor() {
             return vec![StreamFrame::Error { message: "cursor is ahead of mailbox".into() }];
         }
-        let oldest = self.entries.front().map_or(self.next_cursor, |entry| entry.delivery.cursor);
-        if cursor < oldest.saturating_sub(1) {
+        let oldest = self.entries.front().map(|entry| entry.delivery.cursor);
+        if cursor < oldest.unwrap_or(self.next_cursor).saturating_sub(1) {
             return vec![StreamFrame::Gap { oldest_cursor: oldest, latest_cursor: self.next_cursor - 1 }];
         }
         self.entries
@@ -85,6 +97,10 @@ impl Mailbox {
 
     pub fn latest_cursor(&self) -> u64 {
         self.next_cursor - 1
+    }
+
+    pub fn retained_count(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn ack(&self, cursor: u64) -> Result<StreamFrame, &'static str> {
@@ -212,11 +228,19 @@ mod tests {
         assert!(mailbox.read(1, 0).is_empty());
         assert!(matches!(mailbox.read(3, 0).as_slice(), [StreamFrame::Error { .. }]));
         mailbox.append(hint(2), RETENTION_MS + 1);
-        assert_eq!(mailbox.read(0, RETENTION_MS + 1), vec![StreamFrame::Gap { oldest_cursor: 2, latest_cursor: 2 }]);
+        assert_eq!(mailbox.read(0, RETENTION_MS + 1), vec![StreamFrame::Gap { oldest_cursor: Some(2), latest_cursor: 2 }]);
         assert_eq!(mailbox.read(1, RETENTION_MS + 1).len(), 1);
         for n in 3..=MAX_HINTS + 3 {
             mailbox.append(hint(n), RETENTION_MS + 1);
         }
         assert!(matches!(mailbox.read(1, RETENTION_MS + 1).as_slice(), [StreamFrame::Gap { .. }]));
+    }
+
+    #[test]
+    fn expired_last_hint_reports_empty_gap_and_resume_cursor() {
+        let mut mailbox = Mailbox::default();
+        mailbox.append(hint(1), 0);
+        assert_eq!(mailbox.read(0, RETENTION_MS + 1), vec![StreamFrame::Gap { oldest_cursor: None, latest_cursor: 1 }]);
+        assert!(mailbox.read(1, RETENTION_MS + 1).is_empty());
     }
 }

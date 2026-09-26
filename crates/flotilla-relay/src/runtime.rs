@@ -5,6 +5,8 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use worker::*;
 
+use crate::route::{self, Method as RouteMethod, Route, RouteError};
+
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -14,9 +16,9 @@ struct InstallConfig {
 }
 
 fn install_config(env: &Env, install: &str) -> Result<Option<InstallConfig>> {
-    let configs: HashMap<String, InstallConfig> = serde_json::from_str(&env.secret("RELAY_INSTALLS")?.to_string())
+    let mut configs: HashMap<String, InstallConfig> = serde_json::from_str(&env.secret("RELAY_INSTALLS")?.to_string())
         .map_err(|error| Error::RustError(format!("invalid RELAY_INSTALLS: {error}")))?;
-    Ok(configs.into_iter().find_map(|(id, config)| (id == install).then_some(config)))
+    Ok(configs.remove(install))
 }
 
 fn bearer_token(req: &Request) -> Result<Option<String>> {
@@ -46,18 +48,24 @@ fn internal_request(method: Method, path: &str, body: Option<String>, cursor: Op
 #[event(fetch)]
 async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-    let ["i", install, tail @ ..] = segments.as_slice() else { return Response::error("not found", 404) };
-    if install.is_empty() || !install.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
-        return Response::error("invalid install", 400);
-    }
+    let method = match req.method() {
+        Method::Get => RouteMethod::Get,
+        Method::Post => RouteMethod::Post,
+        _ => RouteMethod::Other,
+    };
+    let route = match route::parse(method, &path) {
+        Ok(route) => route,
+        Err(RouteError::InvalidInstall) => return Response::error("invalid install", 400),
+        Err(RouteError::NotFound) => return Response::error("not found", 404),
+    };
+    let install = route.install();
     let Some(config) = install_config(&env, install)? else { return Response::error("unknown install", 404) };
     let namespace = env.durable_object("MAILBOX")?;
     let stub = namespace.id_from_name(install)?.get_stub()?;
-    match (req.method(), tail) {
-        (Method::Post, [source]) => {
-            let Some(secret) = config.sources.get(*source) else { return Response::error("unknown source", 404) };
-            if *source != "github" {
+    match route {
+        Route::Ingress { source, .. } => {
+            let Some(secret) = config.sources.get(source) else { return Response::error("unknown source", 404) };
+            if source != "github" {
                 return Response::error("unsupported source", 400);
             }
             let Some(signature) = req.headers().get("X-Hub-Signature-256")? else { return Response::error("missing signature", 401) };
@@ -80,7 +88,7 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let request = internal_request(Method::Post, "append", Some(body), None, false)?;
             stub.fetch_with_request(request).await
         }
-        (Method::Get, ["stream"]) | (Method::Post, ["stream", "ack"]) => {
+        Route::Stream { .. } | Route::Ack { .. } => {
             if !authorized(&req, &config.consumer_token)? {
                 return Response::error("unauthorized", 401);
             }
@@ -94,7 +102,6 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let internal = internal_request(method, if body.is_some() { "ack" } else { "stream" }, body, cursor, websocket)?;
             stub.fetch_with_request(internal).await
         }
-        _ => Response::error("not found", 404),
     }
 }
 
@@ -197,8 +204,11 @@ impl MailboxObject {
     }
     async fn read(&self, cursor: u64) -> Result<Vec<StreamFrame>> {
         let mut mailbox = self.load().await?;
+        let before = mailbox.retained_count();
         let frames = mailbox.read(cursor, Date::now().as_millis());
-        self.save(&mailbox).await?;
+        if mailbox.retained_count() != before {
+            self.save(&mailbox).await?;
+        }
         Ok(frames)
     }
 }
