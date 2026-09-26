@@ -353,7 +353,8 @@ impl ChangeRequestRefresher {
         let name = subject.record_name();
         let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
         // A former owner can still hold its local copy after another host has
-        // claimed the subject. Prefer the freshest observation across copies.
+        // claimed the subject. Prefer the freshest observation across copies;
+        // an exact tie is resolved deterministically by authority name.
         let record = records
             .list()
             .await
@@ -392,13 +393,10 @@ impl ChangeRequestRefresher {
                 local.update(&InputMeta::from(&record.object.metadata), &record.object.metadata.resource_version, &spec).await
             }
             ResourceProvenance::Replica { .. } => {
-                // Replicas are read-only. Shadow the stale copy locally, then
-                // use the ordinary resource-version write to claim authority.
+                // Replicas are read-only. A single conditional create claims a
+                // local copy, so interruption cannot strand a foreign shadow.
                 let meta = InputMeta::builder().name(name).build();
-                match local.create(&meta, &record.object.spec).await {
-                    Ok(created) => local.update(&meta, &created.metadata.resource_version, &spec).await,
-                    Err(error) => Err(error),
-                }
+                local.create(&meta, &spec).await
             }
         };
         match result {
