@@ -1169,7 +1169,13 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
         .expect("create remote Docker host");
     hosts
         .update_status("remote-docker-host", &host.metadata.resource_version, &HostStatus {
-            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            capabilities: [
+                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                ("docker".to_string(), serde_json::json!(true)),
+                ("os".to_string(), serde_json::json!("linux")),
+            ]
+            .into_iter()
+            .collect(),
             heartbeat_at: Some(Utc::now()),
             ready: true,
             ..HostStatus::default()

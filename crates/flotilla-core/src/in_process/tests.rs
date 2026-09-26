@@ -2669,6 +2669,8 @@ async fn default_remote_placement_routes_before_admission() {
             capabilities: [
                 (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
                 (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+                ("docker".to_string(), serde_json::json!(true)),
+                ("os".to_string(), serde_json::json!("linux")),
             ]
             .into_iter()
             .collect(),
@@ -3187,9 +3189,13 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
         .expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
-            capabilities: [(flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials))]
-                .into_iter()
-                .collect(),
+            capabilities: [
+                (flotilla_resources::HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(held_credentials)),
+                ("docker".to_string(), serde_json::json!(true)),
+                ("os".to_string(), serde_json::json!("linux")),
+            ]
+            .into_iter()
+            .collect(),
             heartbeat_at: Some(Utc::now()),
             ready: true,
             resource_store: None,
@@ -3217,6 +3223,43 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
         )
         .await
         .expect("placement create");
+}
+
+#[tokio::test]
+async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selection() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    create_docker_placement(&backend, "docker-kiwi", "kiwi", BTreeSet::new()).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .build();
+
+    for (docker, os, missing) in [(false, "macos", "docker capability"), (true, "macos", "Linux host capability")] {
+        let host = hosts.get("kiwi").await.expect("host");
+        let mut status = host.status.expect("status");
+        status.capabilities.insert("docker".to_string(), serde_json::json!(docker));
+        status.capabilities.insert("os".to_string(), serde_json::json!(os));
+        hosts.update_status("kiwi", &host.metadata.resource_version, &status).await.expect("update capability");
+
+        for policy in [Some("docker-kiwi"), None] {
+            let error = daemon
+                .resolve_convoy_placement("flotilla", None, &[], &workflow, policy)
+                .await
+                .expect_err("ineligible host must refuse admission");
+            assert!(error.contains("host `kiwi`"), "{error}");
+            assert!(error.contains(missing), "{error}");
+        }
+    }
 }
 
 #[tokio::test]
