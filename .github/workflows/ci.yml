@@ -74,6 +74,19 @@ jobs:
           shared-key: "clippy"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  relay-wasm:
+    name: Relay Workers target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "relay-wasm"
+      - run: cargo build -p flotilla-relay --target wasm32-unknown-unknown --locked
+
   test:
     name: Test
     runs-on: ubuntu-latest

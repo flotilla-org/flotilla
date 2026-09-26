@@ -12,6 +12,8 @@ members = [
     "crates/flotilla-tui",
     "crates/flotilla-test-support",
     "crates/tender",
+    "crates/flotilla-relay-protocol",
+    "crates/flotilla-relay",
 ]
 exclude = ["lints/long_inline_paths", "crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
