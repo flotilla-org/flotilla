@@ -47,10 +47,8 @@ impl HarnessHookParser for CodexParser {
         }
         let parsed: CodexNotifyPayload =
             serde_json::from_slice(payload).map_err(|error| format!("failed to parse Codex notify payload: {error}"))?;
-        if parsed.kind != "agent-turn-complete" {
-            return Err(format!("unsupported Codex notification: {}", parsed.kind));
-        }
-        Ok(ParsedHookEvent { event_type: AgentEventType::Idle, session_id: parsed.thread_id, model: None, cwd: parsed.cwd })
+        let event_type = if parsed.kind == "agent-turn-complete" { AgentEventType::Idle } else { AgentEventType::NoChange };
+        Ok(ParsedHookEvent { event_type, session_id: parsed.thread_id, model: None, cwd: parsed.cwd })
     }
 }
 
@@ -334,7 +332,10 @@ mod tests {
         assert_eq!(parsed.event_type, AgentEventType::Idle);
         assert_eq!(parsed.session_id.as_deref(), Some("thread-1"));
         assert_eq!(parsed.cwd.as_deref(), Some("/repo"));
-        assert!(CodexParser.parse_event("notify", br#"{"type":"other"}"#).is_err());
+        assert_eq!(
+            CodexParser.parse_event("notify", br#"{"type":"other"}"#).expect("unknown notification").event_type,
+            AgentEventType::NoChange
+        );
     }
 
     #[test]
