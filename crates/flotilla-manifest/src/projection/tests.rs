@@ -1009,6 +1009,15 @@ fn live_role_carries_its_attempts_vessel_attention() {
     let quiet = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     assert!(!find_entity(&quiet, &role_entity_for("p", "governor")).set.contains_key(KEY_STATUS_ATTENTION));
 
+    live.phase = ConvoyPhase::Interrupted;
+    let interrupted = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
+    let interrupted_role = find_entity(&interrupted, &role_entity_for("p", "governor"));
+    let interrupted_convoy = find_entity(&interrupted, &entity::convoy("dev", "convoy-a", "kiwi"));
+    assert!(!interrupted_role.set.contains_key(KEY_STATUS_ATTENTION));
+    assert!(!interrupted_convoy.set.contains_key(KEY_STATUS_ATTENTION));
+    assert_eq!(text(interrupted_role, KEY_STATUS_STATE), "waiting");
+    live.phase = ConvoyPhase::Active;
+
     live.vessels[0].surface_state =
         flotilla_protocol::result_set::SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge };
     live.surface_state = live.vessels[0].surface_state;
