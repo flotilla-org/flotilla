@@ -347,6 +347,8 @@ pub struct BlobStoreConfig {
     #[serde(default)]
     pub prefix: String,
     pub credential_file: PathBuf,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 fn default_blob_store_region() -> String {

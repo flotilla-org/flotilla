@@ -199,6 +199,7 @@ pub struct S3BlobStore {
 
 impl S3BlobStore {
     pub fn from_config(config: &BlobStoreConfig) -> Result<Self, String> {
+        validate_config_transport(config)?;
         let credentials: S3Credentials = serde_json::from_slice(
             &std::fs::read(&config.credential_file)
                 .map_err(|error| format!("read S3 credential reference {}: {error}", config.credential_file.display()))?,
@@ -326,6 +327,27 @@ impl S3BlobStore {
     }
 }
 
+fn validate_config_transport(config: &BlobStoreConfig) -> Result<(), String> {
+    let endpoint = Url::parse(&config.endpoint).map_err(|error| format!("invalid S3 endpoint for store {}: {error}", config.bucket))?;
+    if endpoint.scheme() != "http" {
+        return Ok(());
+    }
+    let loopback = match endpoint.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if !loopback && !config.allow_insecure_http {
+        return Err(format!(
+            "blob store {} uses non-loopback HTTP endpoint {}; set allow_insecure_http = true to opt in",
+            config.bucket, config.endpoint
+        ));
+    }
+    tracing::warn!(store = %config.bucket, endpoint = %config.endpoint, "blob store uses insecure HTTP transport");
+    Ok(())
+}
+
 fn sign(key: &[u8], message: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|error| error.to_string())?;
     mac.update(message);
@@ -374,7 +396,22 @@ pub struct TieredBlobStore {
     fleet: Vec<FleetTarget>,
     markers: PathBuf,
     wake: Notify,
-    status: Mutex<BlobSyncStatus>,
+    inventory: Mutex<SyncInventory>,
+    sync_lock: Mutex<()>,
+}
+
+#[derive(Default)]
+struct SyncInventory {
+    initialized: bool,
+    known: HashSet<BlobDigest>,
+    pending: HashMap<BlobDigest, HashSet<String>>,
+    last_error: Option<String>,
+}
+
+impl SyncInventory {
+    fn status(&self) -> BlobSyncStatus {
+        BlobSyncStatus { pending_count: self.pending.values().map(HashSet::len).sum(), last_error: self.last_error.clone() }
+    }
 }
 
 struct FleetTarget {
@@ -393,7 +430,8 @@ impl TieredBlobStore {
             fleet,
             markers: state_dir.join("blob-sync"),
             wake: Notify::new(),
-            status: Mutex::new(BlobSyncStatus::default()),
+            inventory: Mutex::new(SyncInventory::default()),
+            sync_lock: Mutex::new(()),
         }
     }
     pub fn from_config(state_dir: &Path, fleet: &[BlobStoreConfig]) -> Result<Self, String> {
@@ -411,20 +449,59 @@ impl TieredBlobStore {
         self.markers.join(id).join(digest.as_str())
     }
     pub async fn status(&self) -> BlobSyncStatus {
-        self.status.lock().await.clone()
+        self.inventory.lock().await.status()
+    }
+    async fn recover_inventory(&self) -> Result<(), String> {
+        let mut inventory = self.inventory.lock().await;
+        if inventory.initialized {
+            return Ok(());
+        }
+        for digest in self.local.digests().await? {
+            let mut missing = HashSet::new();
+            for target in &self.fleet {
+                if !tokio::fs::try_exists(self.marker(&target.id, &digest)).await.map_err(|error| error.to_string())? {
+                    missing.insert(target.id.clone());
+                }
+            }
+            inventory.known.insert(digest.clone());
+            if missing.is_empty() {
+                inventory.pending.remove(&digest);
+            } else {
+                inventory.pending.insert(digest, missing);
+            }
+        }
+        inventory.initialized = true;
+        Ok(())
+    }
+    async fn queue_new(&self, digest: &BlobDigest, was_present: bool, completed_target: Option<&str>) {
+        let mut inventory = self.inventory.lock().await;
+        if !was_present && inventory.known.insert(digest.clone()) {
+            let missing: HashSet<_> =
+                self.fleet.iter().filter(|target| Some(target.id.as_str()) != completed_target).map(|target| target.id.clone()).collect();
+            if !missing.is_empty() {
+                inventory.pending.insert(digest.clone(), missing);
+                self.wake.notify_one();
+            }
+        }
     }
     pub async fn sync_once(&self) -> Result<BlobSyncStatus, String> {
-        let mut pending = 0;
+        let _sync = self.sync_lock.lock().await;
+        self.recover_inventory().await?;
+        let mut digests: Vec<_> = self.inventory.lock().await.pending.keys().cloned().collect();
+        digests.sort_by(|a, b| a.0.cmp(&b.0));
         let mut last_error = None;
         let mut unavailable = HashSet::new();
-        for digest in self.local.digests().await? {
+        for digest in digests {
             for target in &self.fleet {
-                let marker = self.marker(&target.id, &digest);
-                if tokio::fs::try_exists(&marker).await.map_err(|error| error.to_string())? {
+                if !self.inventory.lock().await.pending.get(&digest).is_some_and(|ids| ids.contains(&target.id)) {
                     continue;
                 }
                 if unavailable.contains(&target.id) {
-                    pending += 1;
+                    continue;
+                }
+                let marker = self.marker(&target.id, &digest);
+                if tokio::fs::try_exists(&marker).await.map_err(|error| error.to_string())? {
+                    self.mark_synced(&digest, &target.id).await;
                     continue;
                 }
                 let result = async {
@@ -440,15 +517,25 @@ impl TieredBlobStore {
                 }
                 .await;
                 if let Err(error) = result {
-                    pending += 1;
                     last_error = Some(error);
                     unavailable.insert(&target.id);
+                } else {
+                    self.mark_synced(&digest, &target.id).await;
                 }
             }
         }
-        let status = BlobSyncStatus { pending_count: pending, last_error };
-        *self.status.lock().await = status.clone();
-        Ok(status)
+        let mut inventory = self.inventory.lock().await;
+        inventory.last_error = last_error;
+        Ok(inventory.status())
+    }
+    async fn mark_synced(&self, digest: &BlobDigest, target: &str) {
+        let mut inventory = self.inventory.lock().await;
+        if let Some(missing) = inventory.pending.get_mut(digest) {
+            missing.remove(target);
+            if missing.is_empty() {
+                inventory.pending.remove(digest);
+            }
+        }
     }
     pub async fn run_sync(self: Arc<Self>) {
         let mut delay = Duration::from_secs(1);
@@ -457,7 +544,7 @@ impl TieredBlobStore {
                 Ok(status) if status.last_error.is_none() => false,
                 Ok(_) => true,
                 Err(error) => {
-                    self.status.lock().await.last_error = Some(error);
+                    self.inventory.lock().await.last_error = Some(error);
                     true
                 }
             };
@@ -478,10 +565,7 @@ impl BlobStore for TieredBlobStore {
         let digest = BlobDigest::of(bytes);
         let was_present = self.local.has(&digest).await?;
         self.local.write_digest(&digest, bytes).await?;
-        if !was_present && !self.fleet.is_empty() {
-            self.status.lock().await.pending_count += self.fleet.len();
-            self.wake.notify_one();
-        }
+        self.queue_new(&digest, was_present, None).await;
         Ok(digest)
     }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
@@ -497,11 +581,12 @@ impl BlobStore for TieredBlobStore {
                         error = Some(failure);
                         continue;
                     }
+                    let was_present = self.local.has(digest).await?;
                     self.local.write_digest(digest, &bytes).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
                     tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
-                    self.wake.notify_one();
+                    self.queue_new(digest, was_present, Some(&target.id)).await;
                     return Ok(Some(bytes));
                 }
                 Ok(None) => {}
@@ -526,6 +611,11 @@ impl BlobStore for TieredBlobStore {
     }
     async fn delete(&self, digest: &BlobDigest) -> Result<(), String> {
         self.local.delete(digest).await?;
+        {
+            let mut inventory = self.inventory.lock().await;
+            inventory.known.remove(digest);
+            inventory.pending.remove(digest);
+        }
         for target in &self.fleet {
             target.store.delete(digest).await?;
             let _ = tokio::fs::remove_file(self.marker(&target.id, digest)).await;
@@ -541,6 +631,73 @@ mod tests {
     use flotilla_core::providers::replay::{self, Masks};
 
     use super::*;
+
+    #[test]
+    fn configured_http_requires_loopback_or_explicit_opt_in() {
+        let config = |endpoint: &str, allow_insecure_http| BlobStoreConfig {
+            endpoint: endpoint.into(),
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            credential_file: PathBuf::from("missing-credentials.json"),
+            allow_insecure_http,
+        };
+        for endpoint in ["http://localhost:9000", "http://127.25.1.2:9000", "http://[::1]:9000"] {
+            assert!(validate_config_transport(&config(endpoint, false)).is_ok(), "{endpoint}");
+        }
+        assert!(validate_config_transport(&config("https://storage.example.com", false)).is_ok());
+        assert!(validate_config_transport(&config("http://storage.example.com", true)).is_ok());
+        for endpoint in ["http://storage.example.com", "http://192.168.1.2", "http://[::2]"] {
+            assert!(validate_config_transport(&config(endpoint, false)).expect_err(endpoint).contains("allow_insecure_http"));
+            assert!(S3BlobStore::from_config(&config(endpoint, false)).err().expect(endpoint).contains("allow_insecure_http"));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_puts_count_one_pending_copy() {
+        let state = tempfile::tempdir().expect("state dir");
+        let tiered = Arc::new(TieredBlobStore::new(state.path(), vec![("fleet".into(), Arc::new(MemoryBlobStore::default()))]));
+        let puts: Vec<_> = (0..32)
+            .map(|_| {
+                let tiered = Arc::clone(&tiered);
+                tokio::spawn(async move { tiered.put(b"concurrent duplicate").await.expect("put") })
+            })
+            .collect();
+        for put in puts {
+            put.await.expect("join put");
+        }
+        assert_eq!(tiered.status().await.pending_count, 1);
+        assert_eq!(tiered.sync_once().await.expect("sync").pending_count, 0);
+        tiered.put(b"concurrent duplicate").await.expect("repeat put");
+        assert_eq!(tiered.status().await.pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_unsynced_blobs_and_later_passes_use_pending_inventory() {
+        let state = tempfile::tempdir().expect("state dir");
+        let fleet = Arc::new(MemoryBlobStore::default());
+        let first = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        let digest = first.put(b"restart recovery").await.expect("put");
+        drop(first);
+        let restarted = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        assert_eq!(restarted.sync_once().await.expect("recover and sync").pending_count, 0);
+        assert!(fleet.has(&digest).await.expect("fleet copy"));
+        tokio::fs::rename(&restarted.local.root, state.path().join("hidden-blobs")).await.expect("hide local directory");
+        assert_eq!(restarted.sync_once().await.expect("empty pending pass needs no directory scan").pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn fleet_cache_fill_queues_other_targets() {
+        let state = tempfile::tempdir().expect("state dir");
+        let source = Arc::new(MemoryBlobStore::default());
+        let mirror = Arc::new(MemoryBlobStore::default());
+        let digest = source.put(b"cached from source").await.expect("source put");
+        let tiered = TieredBlobStore::new(state.path(), vec![("source".into(), source), ("mirror".into(), mirror.clone())]);
+        assert_eq!(tiered.get(&digest).await.expect("fleet read"), Some(b"cached from source".to_vec()));
+        assert_eq!(tiered.status().await.pending_count, 1);
+        assert_eq!(tiered.sync_once().await.expect("sync mirror").pending_count, 0);
+        assert!(mirror.has(&digest).await.expect("mirror copy"));
+    }
 
     async fn contract(store: &dyn BlobStore) {
         let missing = BlobDigest::of(b"missing blob");
