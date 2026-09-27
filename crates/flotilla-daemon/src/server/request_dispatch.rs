@@ -66,7 +66,7 @@ impl<'a> RequestDispatcher<'a> {
                 Err(e) => Message::error_response(id, e),
             },
             Request::ArtifactPut { kind, subject, summary, media_type, source_path } => {
-                let result = async {
+                let result = Box::pin(async {
                     let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
                     let config = self.daemon.config_store();
                     let settings = config.load_daemon_config()?;
@@ -152,7 +152,7 @@ impl<'a> RequestDispatcher<'a> {
                             Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
                         }
                     }
-                }
+                })
                 .await;
                 match result {
                     Ok(response) => Message::ok_response(id, response),
@@ -160,7 +160,7 @@ impl<'a> RequestDispatcher<'a> {
                 }
             }
             Request::ArtifactGet { reference, destination_path } => {
-                let result = async {
+                let result = Box::pin(async {
                     let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
                     let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
@@ -176,7 +176,7 @@ impl<'a> RequestDispatcher<'a> {
                     let size = service.get_to_file(&reference, temporary.path()).await?;
                     runner.write_file_from(temporary.path(), &destination_path).await?;
                     Ok::<_, String>(Response::ArtifactGet { size })
-                }
+                })
                 .await;
                 match result {
                     Ok(response) => Message::ok_response(id, response),
@@ -184,7 +184,7 @@ impl<'a> RequestDispatcher<'a> {
                 }
             }
             Request::ArtifactList { convoy, kind, subject } => {
-                let result = async {
+                let result = Box::pin(async {
                     let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
@@ -195,7 +195,7 @@ impl<'a> RequestDispatcher<'a> {
                         .map(|item| serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string()))
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok::<_, String>(Response::ArtifactList { items })
-                }
+                })
                 .await;
                 match result {
                     Ok(response) => Message::ok_response(id, response),
