@@ -184,6 +184,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             "Crew",
             "Convoys",
             "Disk Free",
+            "Blob Sync",
             "Sleep Inhibition",
             "Staleness",
             "Diagnosis",
@@ -229,6 +230,13 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
                 Cell::new(host.crew_count),
                 Cell::new(host.convoy_count),
                 Cell::new(format_disk_free(host.disk_free_bytes)),
+                Cell::new(host.blob_sync.as_ref().map_or_else(
+                    || "-".to_string(),
+                    |sync| match &sync.last_error {
+                        Some(error) => format!("{} pending; {error}", sync.pending_count),
+                        None => format!("{} pending", sync.pending_count),
+                    },
+                )),
                 Cell::new(format_sleep_inhibition(&host.sleep_inhibition)),
                 Cell::new(row),
                 Cell::new(diagnosis),
@@ -305,6 +313,12 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
+    if let Some(sync) = &response.blob_sync {
+        out.push_str(&format!("Blob sync: {} pending\n", sync.pending_count));
+        if let Some(error) = &sync.last_error {
+            out.push_str(&format!("Blob sync error: {error}\n"));
+        }
+    }
 
     if let Some(summary) = &response.summary {
         out.push_str("\nSystem:\n");

@@ -323,6 +323,8 @@ pub struct DaemonConfig {
     pub manifests: Option<ResourceManifestsConfig>,
     #[serde(default)]
     pub relay: Option<RelayConfig>,
+    #[serde(default)]
+    pub blob_stores: Vec<BlobStoreConfig>,
 }
 
 /// Host-local event relay settings. The token is read from a daemon-owned file;
@@ -332,6 +334,23 @@ pub struct RelayConfig {
     pub endpoint: String,
     pub install_id: String,
     pub consumer_token_file: PathBuf,
+}
+
+/// Fleet blob storage is configured only on the daemon. The referenced file
+/// contains S3 credentials and is never copied into a crew environment.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BlobStoreConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    #[serde(default = "default_blob_store_region")]
+    pub region: String,
+    #[serde(default)]
+    pub prefix: String,
+    pub credential_file: PathBuf,
+}
+
+fn default_blob_store_region() -> String {
+    "us-east-1".into()
 }
 
 /// Host-local directory whose resource documents are continuously applied as

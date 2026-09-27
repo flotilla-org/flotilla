@@ -174,6 +174,30 @@ and the TUI fleet health pane. Override the near-expiry warning window
 warning_window_days = 14
 ```
 
+## Blob stores
+
+Every daemon stores blobs by SHA-256 beneath its state directory in
+`blobs/sha256/`. A fleet store is optional. To replicate local blobs to one or
+more S3-compatible stores, add an entry per store to the daemon's
+`~/.config/flotilla/daemon.toml`:
+
+```toml
+[[blob_stores]]
+endpoint = "https://storage.example.com"
+bucket = "flotilla-artifacts"
+region = "us-east-1"
+prefix = "installation-a"
+credential_file = "/etc/flotilla/blob-store-credentials.json"
+```
+
+The daemon reads the credential file at startup. Its JSON object has
+`access_key_id` and `secret_access_key` fields, and optionally `session_token`.
+Keep the file readable only by the daemon account. It is never staged into
+crew vessels. Writes complete in the local store even when S3 is unavailable;
+background sync retries with backoff. `flotilla host list` and
+`flotilla host status` show the pending count and last sync error. A blob outlives a failed
+host only after sync reaches a fleet store.
+
 ## Daemon logging
 
 Each daemon writes structured JSON-lines to

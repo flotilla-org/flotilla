@@ -175,9 +175,9 @@ pub use provider_data::{
     SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
-    CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry,
-    DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
-    FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse,
+    BlobSyncStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse,
+    DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
+    FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse,
     HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse,
     ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse, TopologyResponse,
     TopologyRoute, UnmetRequirementInfo,

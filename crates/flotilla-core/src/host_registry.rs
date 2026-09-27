@@ -734,6 +734,7 @@ fn build_host_status(
         summary,
         visible_environments: vec![],
         repo_count: counts.repo_count,
+        blob_sync: None,
     }
 }
 

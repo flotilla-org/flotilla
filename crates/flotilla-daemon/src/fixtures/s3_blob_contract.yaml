@@ -1,0 +1,283 @@
+rounds:
+- interactions:
+  - channel: http
+    label: blob-store
+    method: HEAD
+    url: '{s3_endpoint}/{s3_bucket}/contracts/851b21b83e2c90c27db346fdee839912a4a238457b280a68784c147cde11b7bb'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=7ef15f5b6e07309dd0fef45b4134d94f37d32c1b447f39ead4a553779e513451
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      x-amz-date: '20260927T123917Z'
+    status: 404
+    response_body: ''
+    response_headers:
+      x-request-id: '4652b7d2-bebc-48b3-a106-122f4bba82b3'
+      x-amz-request-id: '4652b7d2-bebc-48b3-a106-122f4bba82b3'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      content-type: application/xml
+  - channel: http
+    label: blob-store
+    method: GET
+    url: '{s3_endpoint}/{s3_bucket}/contracts/851b21b83e2c90c27db346fdee839912a4a238457b280a68784c147cde11b7bb'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=105d9ff4209c5973734174783298711f97bc4716f532d5fd137b616b13bd4784
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    status: 404
+    response_body: <?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>
+    response_headers:
+      content-length: '127'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-amz-request-id: ed11cb69-e44e-4346-a19b-7cb2b46eaf5d
+      x-request-id: ed11cb69-e44e-4346-a19b-7cb2b46eaf5d
+      content-type: application/xml
+  - channel: http
+    label: blob-store
+    method: DELETE
+    url: '{s3_endpoint}/{s3_bucket}/contracts/851b21b83e2c90c27db346fdee839912a4a238457b280a68784c147cde11b7bb'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b74d94ae071955a0e8b1b98bcbd5d12986821aa33483386c360541eeecb7b146
+    status: 204
+    response_body: ''
+    response_headers:
+      x-request-id: '7e2b25c6-e450-4577-bd2f-42ebbce6fe05'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-amz-request-id: '7e2b25c6-e450-4577-bd2f-42ebbce6fe05'
+  - channel: http
+    label: blob-store
+    method: PUT
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=1d9e964e3f9d7718b0c72d80151ce2c44f75f53ec459d59c0edf7d519c93cbdd
+    request_body: ''
+    status: 200
+    response_body: ''
+    response_headers:
+      x-amz-request-id: a0e1a596-fbfc-402e-91c7-eba72b16f59f
+      etag: '"d41d8cd98f00b204e9800998ecf8427e"'
+      x-request-id: a0e1a596-fbfc-402e-91c7-eba72b16f59f
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      content-length: '0'
+  - channel: http
+    label: blob-store
+    method: PUT
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=1d9e964e3f9d7718b0c72d80151ce2c44f75f53ec459d59c0edf7d519c93cbdd
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      x-amz-date: '20260927T123917Z'
+    request_body: ''
+    status: 200
+    response_body: ''
+    response_headers:
+      content-length: '0'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      etag: '"d41d8cd98f00b204e9800998ecf8427e"'
+      x-amz-request-id: '472e18de-0b75-4290-b41a-4c82a821deb0'
+      x-request-id: '472e18de-0b75-4290-b41a-4c82a821deb0'
+  - channel: http
+    label: blob-store
+    method: HEAD
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=043902b736db431748497763bc1ef7972151e9936ddd062a3844bd9b06b274b9
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    status: 200
+    response_body: ''
+    response_headers:
+      etag: '"d41d8cd98f00b204e9800998ecf8427e"'
+      x-request-id: '7cc55f19-15fb-4ffd-8207-8e9011975f74'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      accept-ranges: bytes
+      x-amz-request-id: '7cc55f19-15fb-4ffd-8207-8e9011975f74'
+      content-length: '0'
+      content-type: application/octet-stream
+      last-modified: Sun, 27 Sep 2026 12:39:18 GMT
+  - channel: http
+    label: blob-store
+    method: GET
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      x-amz-date: '20260927T123917Z'
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=5694a3d1f87e2da9b8d850f6b282f7dd9801d041aaca73eaa67cacb8c7d700d3
+    status: 200
+    response_body: ''
+    response_headers:
+      last-modified: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: '8d735ac7-a43d-428e-b530-352fdc5f6066'
+      etag: '"d41d8cd98f00b204e9800998ecf8427e"'
+      content-length: '0'
+      accept-ranges: bytes
+      content-type: application/octet-stream
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-amz-request-id: '8d735ac7-a43d-428e-b530-352fdc5f6066'
+  - channel: http
+    label: blob-store
+    method: DELETE
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ab96240f1c6b0cd71fb662e9e8de5b3698a8b274e1ea473cc1d422b158bdae5c
+    status: 204
+    response_body: ''
+    response_headers:
+      x-amz-delete-marker: 'false'
+      x-amz-request-id: ccf39ee8-464d-4f9b-9243-f77d9e182339
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: ccf39ee8-464d-4f9b-9243-f77d9e182339
+  - channel: http
+    label: blob-store
+    method: HEAD
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      x-amz-date: '20260927T123917Z'
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=043902b736db431748497763bc1ef7972151e9936ddd062a3844bd9b06b274b9
+    status: 404
+    response_body: ''
+    response_headers:
+      x-amz-request-id: e11956b8-2942-497a-8bb3-c2831c5a3b26
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: e11956b8-2942-497a-8bb3-c2831c5a3b26
+      content-type: application/xml
+  - channel: http
+    label: blob-store
+    method: GET
+    url: '{s3_endpoint}/{s3_bucket}/contracts/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=5694a3d1f87e2da9b8d850f6b282f7dd9801d041aaca73eaa67cacb8c7d700d3
+    status: 404
+    response_body: <?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>
+    response_headers:
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      content-length: '127'
+      x-amz-request-id: '227d64a7-5c59-4bc6-aa27-932cf098e9ec'
+      x-request-id: '227d64a7-5c59-4bc6-aa27-932cf098e9ec'
+      content-type: application/xml
+  - channel: http
+    label: blob-store
+    method: PUT
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      x-amz-content-sha256: a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=571e9e85b8092de2a3448ae0c57065f6b54498700abade340d28e4c4dcbdb98b
+      x-amz-date: '20260927T123917Z'
+    request_body: blob contract payload
+    status: 200
+    response_body: ''
+    response_headers:
+      etag: '"99ef3e108a89c48eb62b6e671f3594c4"'
+      x-amz-request-id: '713d2b73-41f1-44e5-84b2-19a0777bb442'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: '713d2b73-41f1-44e5-84b2-19a0777bb442'
+      content-length: '0'
+  - channel: http
+    label: blob-store
+    method: PUT
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=571e9e85b8092de2a3448ae0c57065f6b54498700abade340d28e4c4dcbdb98b
+      x-amz-content-sha256: a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275
+      x-amz-date: '20260927T123917Z'
+    request_body: blob contract payload
+    status: 200
+    response_body: ''
+    response_headers:
+      etag: '"99ef3e108a89c48eb62b6e671f3594c4"'
+      x-amz-request-id: '29ffd815-bc2e-41ef-956a-175684e2f001'
+      content-length: '0'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: '29ffd815-bc2e-41ef-956a-175684e2f001'
+  - channel: http
+    label: blob-store
+    method: HEAD
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a0e9438b46b49220ce53180ac1fca9cc24c2a1252a479372173171bff5c5b0f8
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    status: 200
+    response_body: ''
+    response_headers:
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      content-type: application/octet-stream
+      accept-ranges: bytes
+      content-length: '21'
+      last-modified: Sun, 27 Sep 2026 12:39:18 GMT
+      x-amz-request-id: df340b1b-cb48-444a-9826-2622ab248a3d
+      etag: '"99ef3e108a89c48eb62b6e671f3594c4"'
+      x-request-id: df340b1b-cb48-444a-9826-2622ab248a3d
+  - channel: http
+    label: blob-store
+    method: GET
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=17c5804c87a3c17737355adc43f6dbface4da20a2ad45e4f521c872b440f2c02
+    status: 200
+    response_body: blob contract payload
+    response_headers:
+      etag: '"99ef3e108a89c48eb62b6e671f3594c4"'
+      x-amz-request-id: '92af0c3c-538a-47d4-9206-5ec6b3f572ea'
+      content-length: '21'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      accept-ranges: bytes
+      x-request-id: '92af0c3c-538a-47d4-9206-5ec6b3f572ea'
+      last-modified: Sun, 27 Sep 2026 12:39:18 GMT
+      content-type: application/octet-stream
+  - channel: http
+    label: blob-store
+    method: DELETE
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      x-amz-date: '20260927T123917Z'
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=3424cbd2dcaf5efbe5bca2175a6844a4a9d281445d12296e910675be865c1c05
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    status: 204
+    response_body: ''
+    response_headers:
+      x-amz-request-id: e4f23f75-8207-49b1-b00d-4f494f02f0e1
+      x-amz-delete-marker: 'false'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: e4f23f75-8207-49b1-b00d-4f494f02f0e1
+  - channel: http
+    label: blob-store
+    method: HEAD
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a0e9438b46b49220ce53180ac1fca9cc24c2a1252a479372173171bff5c5b0f8
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      x-amz-date: '20260927T123917Z'
+    status: 404
+    response_body: ''
+    response_headers:
+      content-type: application/xml
+      x-amz-request-id: '6c1a59e0-76b5-40e5-8098-d21344aa017a'
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      x-request-id: '6c1a59e0-76b5-40e5-8098-d21344aa017a'
+  - channel: http
+    label: blob-store
+    method: GET
+    url: '{s3_endpoint}/{s3_bucket}/contracts/a0dbee970d658e924c142dbefaf1ab730bf15cfd006f6d8d88e0c6b4e18cb275'
+    request_headers:
+      authorization: AWS4-HMAC-SHA256 Credential={s3_access_key}/20260927/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=17c5804c87a3c17737355adc43f6dbface4da20a2ad45e4f521c872b440f2c02
+      x-amz-date: '20260927T123917Z'
+      x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    status: 404
+    response_body: <?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>
+    response_headers:
+      content-type: application/xml
+      date: Sun, 27 Sep 2026 12:39:18 GMT
+      content-length: '127'
+      x-amz-request-id: ec74b2a6-54cd-4970-82ad-8f6a4dbc8e03
+      x-request-id: ec74b2a6-54cd-4970-82ad-8f6a4dbc8e03

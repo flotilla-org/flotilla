@@ -37,6 +37,10 @@ futures = "0.3"
 tokio-tungstenite = { version = "0.28", features = ["connect", "rustls-tls-webpki-roots"] }
 visibility = "0.1.1"
 tempfile = "3"
+sha2 = "0.10"
+hmac = "0.12"
+bytes = "1"
+http = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

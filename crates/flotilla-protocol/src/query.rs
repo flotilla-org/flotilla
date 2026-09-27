@@ -262,6 +262,8 @@ pub struct FleetHostRow {
     pub convoy_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_sync: Option<crate::BlobSyncStatus>,
     #[serde(default)]
     #[builder(default)]
     pub sleep_inhibition: SleepInhibitionHealth,
@@ -275,6 +277,13 @@ pub struct FleetHostRow {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_attention: Vec<CredentialAttention>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSyncStatus {
+    pub pending_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +452,8 @@ pub struct HostStatusResponse {
     #[serde(default)]
     pub visible_environments: Vec<EnvironmentInfo>,
     pub repo_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_sync: Option<BlobSyncStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,6 +603,7 @@ mod tests {
             summary: Some(sample_host_summary()),
             visible_environments: sample_visible_environments(),
             repo_count: 2,
+            blob_sync: None,
         };
 
         let json = serde_json::to_value(&response).expect("serialize host status");
@@ -631,6 +643,7 @@ mod tests {
             summary: Some(sample_host_summary()),
             visible_environments: vec![],
             repo_count: 2,
+            blob_sync: None,
         })
         .expect("serialize host status");
         value.as_object_mut().expect("object").remove("visible_environments");

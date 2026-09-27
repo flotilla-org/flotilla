@@ -42,7 +42,7 @@ use flotilla_resources::{
     CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource,
     CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
     EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta,
     PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource,
     ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
@@ -57,6 +57,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     agent_material::AgentMaterialRegistry,
+    blob_store::TieredBlobStore,
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
@@ -324,6 +325,7 @@ impl Default for RuntimeOptions {
 
 pub struct DaemonRuntime {
     tasks: Vec<JoinHandle<()>>,
+    pub blob_store: Arc<TieredBlobStore>,
     /// Set by `shutdown` so `Drop` can tell an intended stop from a runtime
     /// that vanished while the daemon was meant to keep working.
     stop_expected: bool,
@@ -519,6 +521,7 @@ impl DaemonRuntime {
         let daemon_config = config.load_daemon_config()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
+        let blob_store = Arc::new(TieredBlobStore::from_config(config.state_dir().as_path(), &daemon_config.blob_stores)?);
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -574,6 +577,13 @@ impl DaemonRuntime {
         }
 
         let mut tasks = vec![
+            tokio::spawn(Arc::clone(&blob_store).run_sync()),
+            spawn_blob_sync_status_task(
+                Arc::clone(&blob_store),
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                profile.host_id.clone(),
+            ),
             spawn_heartbeat_task_with_credentials(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -712,12 +722,33 @@ impl DaemonRuntime {
         let supervisory_tasks = tasks.len() + 1;
         tasks.push(spawn_liveness_watchdog_task(supervisory_tasks, LIVENESS_WATCHDOG_INTERVAL));
 
-        Ok(Self { tasks, stop_expected: false })
+        Ok(Self { tasks, blob_store, stop_expected: false })
     }
 }
 
 pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str) -> bool {
     declared_root == local_root
+}
+
+fn spawn_blob_sync_status_task(
+    store: Arc<TieredBlobStore>,
+    backend: ResourceBackend,
+    namespace: String,
+    host_id: String,
+) -> JoinHandle<()> {
+    spawn_periodic_task(Duration::from_secs(5), PeriodicTaskStart::Immediate, move || {
+        let store = Arc::clone(&store);
+        let backend = backend.clone();
+        let namespace = namespace.clone();
+        let host_id = host_id.clone();
+        async move {
+            let status = store.status().await;
+            let hosts = backend.using::<Host>(&namespace);
+            if let Err(error) = flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::BlobSync { status }).await {
+                warn!(%error, "failed to publish blob sync status");
+            }
+        }
+    })
 }
 
 fn spawn_manifest_reconciler_task(
@@ -2365,6 +2396,7 @@ async fn apply_host_heartbeat_with_credentials(
         heartbeat_at: Some(Utc::now()),
         ready: !conditions.iter().any(HostCondition::blocks_readiness),
         resource_store,
+        blob_sync: host.status.as_ref().and_then(|status| status.blob_sync.clone()),
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
@@ -4279,6 +4311,7 @@ mod tests {
     use super::{test_git_repo::TestGitRepo, *};
     use crate::{
         agent_material::{CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV},
+        blob_store::{BlobStore, MemoryBlobStore},
         environment_tools::{
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
@@ -10203,6 +10236,11 @@ mod tests {
         .expect("seed sleep inhibition health");
         let heartbeat =
             spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
+        let blob_store =
+            Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
+        blob_store.put(b"pending host status blob").await.expect("local blob put");
+        let blob_status_task =
+            spawn_blob_sync_status_task(Arc::clone(&blob_store), daemon.resource_backend(), NAMESPACE.to_string(), host_id.clone());
 
         wait_until_with_timeout(Duration::from_secs(30), || {
             let hosts = hosts.clone();
@@ -10210,7 +10248,25 @@ mod tests {
             async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.heartbeat_at.is_some()) }
         })
         .await;
+        wait_until_with_timeout(Duration::from_secs(30), || {
+            let hosts = hosts.clone();
+            let host_id = host_id.clone();
+            async move {
+                hosts
+                    .get(&host_id)
+                    .await
+                    .ok()
+                    .and_then(|host| host.status)
+                    .and_then(|status| status.blob_sync)
+                    .is_some_and(|sync| sync.pending_count == 1)
+            }
+        })
+        .await;
         let status = hosts.get(&host_id).await.expect("get host").status.expect("host status");
+        assert_eq!(status.blob_sync.as_ref().expect("blob sync status").pending_count, 1);
+        let local_environment_id = daemon.local_host_summary().await.environment_id;
+        let host_status = daemon.get_host_status_internal(&local_environment_id).await.expect("query host status");
+        assert_eq!(host_status.blob_sync.as_ref().expect("host query blob sync").pending_count, 1);
         assert!(!status.ready, "sleep inhibition failure should keep the host degraded");
         assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
@@ -10229,6 +10285,7 @@ mod tests {
         );
         let fleet = daemon.fleet_health_internal().await.expect("query fleet health");
         let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet-health row");
+        assert_eq!(local.blob_sync.as_ref().expect("fleet list blob sync").pending_count, 1);
         assert!(
             local.degraded_conditions.iter().any(|condition| condition.contains("SleepInhibition") && condition.contains("polkit denied")),
             "fleet health should expose the sleep-inhibition condition: {:?}",
@@ -10237,6 +10294,8 @@ mod tests {
 
         heartbeat.abort();
         let _ = heartbeat.await;
+        blob_status_task.abort();
+        let _ = blob_status_task.await;
     }
 
     #[tokio::test]
