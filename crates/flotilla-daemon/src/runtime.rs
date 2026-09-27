@@ -24,7 +24,7 @@ use flotilla_core::{
     },
     config::ConfigStore,
     demand_lifecycle::DemandLifecycle,
-    in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector},
+    in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     placement_policy::reconcile_registered_policy,
     providers::{
@@ -114,6 +114,18 @@ struct RuntimeOperatorReconciler {
     state: Arc<ControllerRuntimeState>,
     manifests: Option<flotilla_core::config::ResourceManifestsConfig>,
     local_root: String,
+}
+
+struct RuntimeWorkCredentialReconciler {
+    state: std::sync::Weak<ControllerRuntimeState>,
+}
+
+#[async_trait]
+impl WorkCredentialReconciler for RuntimeWorkCredentialReconciler {
+    async fn reconcile(&self, namespace: &str) -> Result<(), String> {
+        let state = self.state.upgrade().ok_or_else(|| "credential controller is unavailable".to_string())?;
+        reconcile_work_credentials(&state, namespace).await
+    }
 }
 
 #[async_trait]
@@ -663,6 +675,7 @@ impl DaemonRuntime {
                     local_root: profile.host_id.clone(),
                 }))
                 .await;
+            daemon.set_work_credential_reconciler(Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&state) })).await;
             if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
                 warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
             }
