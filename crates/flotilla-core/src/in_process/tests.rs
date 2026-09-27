@@ -27,6 +27,7 @@ use crate::providers::{
 struct RecordingWorkCredentials {
     backend: ResourceBackend,
     delivered: tokio::sync::Mutex<BTreeSet<String>>,
+    fail_next: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -49,6 +50,9 @@ impl WorkCredentialReconciler for RecordingWorkCredentials {
             .find(|vessel| vessel.name == "work")
             .ok_or_else(|| "missing work vessel".to_string())?
             .credential_refs;
+        if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("credential staging failed".to_string());
+        }
         self.delivered.lock().await.extend(refs);
         Ok(())
     }
@@ -68,8 +72,11 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             backend.clone(),
         )
         .await;
-        let credentials =
-            Arc::new(RecordingWorkCredentials { backend: backend.clone(), delivered: tokio::sync::Mutex::new(BTreeSet::new()) });
+        let credentials = Arc::new(RecordingWorkCredentials {
+            backend: backend.clone(),
+            delivered: tokio::sync::Mutex::new(BTreeSet::new()),
+            fail_next: std::sync::atomic::AtomicBool::new(true),
+        });
         daemon.set_work_credential_reconciler(credentials.clone()).await;
         let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
         let convoy = convoys
@@ -141,20 +148,25 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             })
             .await
             .expect("session phase");
-        daemon
-            .deliver_standing_turn(
-                &crate::leaf_engine::TurnDeliveryRequest::builder()
-                    .namespace("flotilla".to_string())
-                    .convoy("turn-credential-work".to_string())
-                    .source("conflicting".to_string())
-                    .vessel("work".to_string())
-                    .role("coder".to_string())
-                    .brief("rebase the PR".to_string())
-                    .head_sha("new-head".to_string())
-                    .build(),
-            )
-            .await
-            .expect("deliver conflicting turn");
+        let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+            .namespace("flotilla".to_string())
+            .convoy("turn-credential-work".to_string())
+            .source("conflicting".to_string())
+            .vessel("work".to_string())
+            .role("coder".to_string())
+            .brief("rebase the PR".to_string())
+            .head_sha("new-head".to_string())
+            .build();
+        assert!(daemon.deliver_standing_turn(&request).await.is_err(), "failed staging must prevent delivery");
+        let after_failure = convoys.get("turn-credential-work").await.expect("convoy after failed staging").status.expect("status");
+        assert_eq!(after_failure.phase, flotilla_resources::ConvoyPhase::Landing);
+        assert_eq!(after_failure.work["work"].phase, flotilla_resources::WorkPhase::Complete);
+        assert_eq!(after_failure.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+        assert!(credentials.delivered.lock().await.is_empty());
+        let undelivered = sessions.get("turn-credential-session").await.expect("undelivered session");
+        let TerminalSessionSource::Agent { message, .. } = undelivered.spec.source else { panic!("agent session expected") };
+        assert!(message.is_none());
+        daemon.deliver_standing_turn(&request).await.expect("retry conflicting turn");
         let delivered = sessions.get("turn-credential-session").await.expect("delivered session");
         assert_eq!(*credentials.delivered.lock().await, BTreeSet::from(["github-crew-pr".to_string()]));
         let TerminalSessionSource::Agent { brief, message, .. } = delivered.spec.source else { panic!("agent session expected") };

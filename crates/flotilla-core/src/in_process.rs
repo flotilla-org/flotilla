@@ -2789,6 +2789,23 @@ impl InProcessDaemon {
         Ok(())
     }
 
+    async fn reconcile_or_restore_crew_work(
+        &self,
+        namespace: &str,
+        convoys: &flotilla_resources::TypedResolver<ResourceConvoy>,
+        name: &str,
+        previous_status: flotilla_resources::ConvoyStatus,
+        reopened: &ResourceObject<ResourceConvoy>,
+    ) -> Result<(), String> {
+        if let Err(error) = self.reconcile_resumed_work_credentials(namespace).await {
+            return match convoys.update_status(name, &reopened.metadata.resource_version, &previous_status).await {
+                Ok(_) => Err(error),
+                Err(restore_error) => Err(format!("{error}; could not restore crew work after credential failure: {restore_error}")),
+            };
+        }
+        Ok(())
+    }
+
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
         if let Some(inspector) = self.repository_inspector.read().await.clone() {
             return Ok(inspector);
@@ -9094,7 +9111,8 @@ impl InProcessDaemon {
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
-        apply_resource_status_patch(
+        let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
+        let reopened = apply_resource_status_patch(
             &convoys,
             &context.convoy,
             &convoy_external_patches::handoff_crew_work(
@@ -9107,7 +9125,7 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|err| err.to_string())?;
-        self.reconcile_resumed_work_credentials(&context.namespace).await?;
+        self.reconcile_or_restore_crew_work(&context.namespace, &convoys, &context.convoy, previous_status, &reopened).await?;
         let handoff_result = match sessions.get(&terminal_name).await {
             Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
                 Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &existing, &delivered_message).await,
@@ -9275,14 +9293,14 @@ impl InProcessDaemon {
         if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
         }
-        apply_resource_status_patch(
+        let reopened = apply_resource_status_patch(
             &convoys,
             name,
             &convoy_external_patches::resume_crew_work(vessel.clone(), role.clone(), chrono::Utc::now(), prompt.to_string()),
         )
         .await
         .map_err(|err| err.to_string())?;
-        self.reconcile_resumed_work_credentials(namespace).await?;
+        self.reconcile_or_restore_crew_work(namespace, &convoys, name, status.clone(), &reopened).await?;
         match session.status.as_ref().map(|status| status.phase) {
             Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &session, prompt).await?,
             Some(ResourceTerminalSessionPhase::Stopped) => {
@@ -9291,10 +9309,7 @@ impl InProcessDaemon {
                     .await
                     .map_err(|err| err.to_string())?;
             }
-            Some(ResourceTerminalSessionPhase::Starting) | None => queue_pending_crew_message(&sessions, &session, prompt).await?,
-            Some(ResourceTerminalSessionPhase::Failed) => {
-                return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
-            }
+            _ => queue_pending_crew_message(&sessions, &session, prompt).await?,
         }
         Ok(ConvoyResumeOutcome::Delivered { displaced })
     }
@@ -9353,7 +9368,13 @@ impl InProcessDaemon {
             TerminalCrewMessage { id: format!("turn-delivery:{}:{}", request.source, request.head_sha), text: request.brief.clone() };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
-        apply_resource_status_patch(
+        let previous_status = convoys
+            .get(&request.convoy)
+            .await
+            .map_err(|error| error.to_string())?
+            .status
+            .ok_or_else(|| format!("convoy `{}` has no status", request.convoy))?;
+        let reopened = apply_resource_status_patch(
             &convoys,
             &request.convoy,
             &convoy_external_patches::resume_crew_work(
@@ -9365,7 +9386,7 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|error| error.to_string())?;
-        self.reconcile_resumed_work_credentials(&request.namespace).await?;
+        self.reconcile_or_restore_crew_work(&request.namespace, &convoys, &request.convoy, previous_status, &reopened).await?;
         match plan {
             TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
                 *message = Some(delivery_message);
