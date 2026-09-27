@@ -2593,7 +2593,7 @@ mod tests {
             source: flotilla_resources::StallEvidenceSource::Hook,
             began_at: Utc::now(),
             rung: StallRung::Supervisor,
-            nudge_history: vec!["nudged once".into()],
+            nudge_history: Vec::new(),
         };
         let supervisor_state = stalled_surface_state(&supervised);
         assert_eq!(supervisor_state, SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Supervisor });
