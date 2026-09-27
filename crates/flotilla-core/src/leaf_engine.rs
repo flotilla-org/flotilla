@@ -115,6 +115,7 @@ struct LeafSubscriptionTableInner {
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
     unable_since: Mutex<HashMap<uuid::Uuid, (UnableEvidenceKey, DateTime<Utc>)>>,
+    stale_attention_reported: Mutex<HashSet<uuid::Uuid>>,
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
     change_requests: ChangeRequestRefresher,
     issues: IssueRefresher,
@@ -176,6 +177,7 @@ impl LeafSubscriptionTable {
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),
                 unable_since: Mutex::new(HashMap::new()),
+                stale_attention_reported: Mutex::new(HashSet::new()),
                 tasks: Mutex::new(HashMap::new()),
                 change_requests,
                 issues,
@@ -727,6 +729,12 @@ impl SecondaryWatch for ReconcilerWake {
 }
 
 impl ReconcilerWake {
+    async fn report_stale_attention(&self, row: &LeafSubscriptionRow, source: TerminalAttentionSource) {
+        if self.subscriptions.inner.stale_attention_reported.lock().await.insert(row.id) {
+            tracing::warn!(subscription_id = %row.id, ?source, maker = ?row.maker, "terminal attention evidence stale");
+        }
+    }
+
     async fn maker_debouncing(
         &self,
         row_id: uuid::Uuid,
@@ -786,13 +794,25 @@ impl ReconcilerWake {
                 row.namespace == namespace
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
-            if convoy_rows.is_empty() && status.stalled.is_some() && holding {
-                continue;
-            }
             let mut unable = None;
             let mut able = false;
-            let mut pending_debounce = false;
+            let mut unknown = false;
+            let mut actionable_rows = 0;
             for row in convoy_rows {
+                if row.leaves.iter().any(|leaf| {
+                    let LeafAddress::Work { work, .. } = &leaf.address else { return false };
+                    let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|field| field.strip_suffix(".phase")) else {
+                        return false;
+                    };
+                    status.crew_work.get(work).and_then(|crew| crew.get(role)).is_some_and(|state| {
+                        state.phase == flotilla_resources::CrewWorkPhase::Done
+                            && leaf.operator == LeafOperator::Equal
+                            && leaf.literal == "Done"
+                    })
+                }) {
+                    continue;
+                }
+                actionable_rows += 1;
                 let judgement = match &row.maker {
                     LeafMaker::Actor { vessel, role } => {
                         let session = selected_sessions.values().find(|session| {
@@ -818,9 +838,22 @@ impl ReconcilerWake {
                             match attention {
                                 Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
                                     self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                    self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                                     Ok(())
                                 }
+                                Some(attention) if attention.is_stale_at(now) => {
+                                    self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                    self.report_stale_attention(row, attention.source).await;
+                                    unknown = true;
+                                    continue;
+                                }
+                                Some(attention) if attention.state == TerminalAttentionState::Unobservable => {
+                                    self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                    unknown = true;
+                                    continue;
+                                }
                                 Some(attention) => {
+                                    self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                                     let source = match attention.source {
                                         TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
                                         TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
@@ -839,27 +872,30 @@ impl ReconcilerWake {
                                         )
                                         .await
                                     {
-                                        pending_debounce = true;
+                                        unknown = true;
                                         continue;
                                     }
-                                    let evidence = if attention.is_stale_at(now) {
-                                        "attention stale".into()
-                                    } else {
-                                        match attention.state {
-                                            TerminalAttentionState::Idle => "idle".into(),
-                                            TerminalAttentionState::NeedsInput => "NeedsInput".into(),
-                                            TerminalAttentionState::Unobservable => "unobservable".into(),
-                                            TerminalAttentionState::Working => "working".into(),
-                                        }
+                                    let evidence = match attention.state {
+                                        TerminalAttentionState::Idle => "idle".into(),
+                                        TerminalAttentionState::NeedsInput => "NeedsInput".into(),
+                                        TerminalAttentionState::Unobservable => unreachable!("handled as unknown"),
+                                        TerminalAttentionState::Working => "working".into(),
                                     };
                                     Err((evidence, source))
                                 }
                                 None => {
+                                    if session.is_some_and(|session| {
+                                        session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
+                                    }) {
+                                        self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                        unknown = true;
+                                        continue;
+                                    }
                                     if self
                                         .maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now)
                                         .await
                                     {
-                                        pending_debounce = true;
+                                        unknown = true;
                                         continue;
                                     }
                                     Err(("session dead or absent".into(), StallEvidenceSource::Session))
@@ -880,8 +916,12 @@ impl ReconcilerWake {
                             .filter(|status| status.phase == TerminalSessionPhase::Running)
                             .and_then(|status| status.attention.as_ref());
                         match attention {
-                            Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => Ok(()),
+                            Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
+                                self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
+                                Ok(())
+                            }
                             Some(attention) if attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now) => {
+                                self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                                 if self
                                     .maker_debouncing(
                                         row.id,
@@ -892,15 +932,25 @@ impl ReconcilerWake {
                                     )
                                     .await
                                 {
-                                    pending_debounce = true;
+                                    unknown = true;
                                     continue;
                                 }
                                 Err(("supervisor idle".into(), StallEvidenceSource::Session))
                             }
                             Some(attention) if attention.state == TerminalAttentionState::NeedsInput && !attention.is_stale_at(now) => {
+                                self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
                                 Err(("supervisor needs input".into(), StallEvidenceSource::Hook))
                             }
-                            _ => Err(("supervisor unavailable".into(), StallEvidenceSource::Session)),
+                            Some(attention) if attention.is_stale_at(now) => {
+                                self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                self.report_stale_attention(row, attention.source).await;
+                                unknown = true;
+                                continue;
+                            }
+                            _ => {
+                                unknown = true;
+                                continue;
+                            }
                         }
                     }
                     LeafMaker::Observed { .. } => {
@@ -974,10 +1024,14 @@ impl ReconcilerWake {
                     }
                 };
             }
-            if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted) && !able && holding {
+            if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted)
+                && !able
+                && status.phase == ConvoyPhase::Active
+                && actionable_rows > 0
+            {
                 continue;
             }
-            let next = if holding && !able && !pending_debounce {
+            let next = if holding && !able && !unknown && (status.phase != ConvoyPhase::Active || actionable_rows > 0) {
                 let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable.as_ref() {
                     (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
                 } else {
@@ -1192,7 +1246,10 @@ impl ReconcilerWake {
                     .stalled
                     .as_ref()
                     .filter(|stalled| {
-                        stalled.supervisor.is_some() || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew)
+                        status.phase == ConvoyPhase::Active
+                            && actionable_rows > 0
+                            && (stalled.supervisor.is_some()
+                                || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew))
                     })
                     .cloned()
             };
@@ -1367,6 +1424,18 @@ impl ReconcilerWake {
                 }
                 for (vessel, crew) in &status.crew_work {
                     for (role, work) in crew {
+                        let owes_claim = status.workflow_snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.vessels.iter().any(|requirement| {
+                                requirement.name == *vessel
+                                    && requirement
+                                        .crew
+                                        .iter()
+                                        .any(|member| member.role == *role && !member.completion_expectations.is_empty())
+                            })
+                        });
+                        if !owes_claim {
+                            continue;
+                        }
                         if status.stalled.as_ref().is_some_and(|stalled| {
                             stalled.supervisor.is_some()
                                 && stalled.leaves.iter().any(|leaf| {
@@ -1488,6 +1557,7 @@ impl ReconcilerWake {
             }
             self.subscriptions.inner.rows.lock().await.remove(&row.id);
             self.subscriptions.forget_firings(row.id).await;
+            self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
             if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(&row.id) {
                 task.abort();
             }
