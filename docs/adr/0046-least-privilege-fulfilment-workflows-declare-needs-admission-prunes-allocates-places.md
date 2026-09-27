@@ -6,7 +6,7 @@ Date: 2026-09-27
 
 Accepted
 
-Grilled 2026-09-27 on #2075 (rulings recorded there). Amends ADR 0007 and ADR 0010. Builds on ADR 0044 (grants select on the work; delivery follows fulfilment).
+Grilled 2026-09-27 on #2075 (rulings recorded there). Amends ADR 0007, ADR 0010 and one clause of ADR 0044 §2. Builds on ADR 0044 (grants select on the work; delivery follows fulfilment).
 
 ## Context
 
@@ -110,6 +110,10 @@ ADR 0007 already makes placement requirements-first, with `VesselRequirement` as
   - Stance stops being declared by workflows. The *effective confinement* of a vessel is the grant set of its fulfilment, recorded on status.
   - The AgentAdapter derives harness permission flags from that grant set (walls-first still holds: realise confinement in the environment, with harness flags as fallback).
   - Under-realisation still fails loudly.
+- **ADR 0044.**
+  - Its §2 clause that "a workflow may still *require* containment" no longer holds, because workflows do not declare stance (§1).
+  - Containment is what least privilege yields when no need forces more. A host-direct placement comes only from a capability need or a recorded escalation.
+  - Its grant selection and delivery rules are unchanged.
 
 ## Consequences
 
