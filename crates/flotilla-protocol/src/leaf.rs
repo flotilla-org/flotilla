@@ -49,6 +49,7 @@ pub enum LeafAddress {
     Vessel { name: String },
     Work { convoy: String, work: String },
     ChangeRequest { service: String, scope: String, number: u64 },
+    Issue { service: String, scope: String, number: u64 },
     Usage { provider: String, account: String },
 }
 
@@ -59,6 +60,7 @@ impl LeafAddress {
             Self::Vessel { .. } => LeafKind::Vessel,
             Self::Work { .. } => LeafKind::Work,
             Self::ChangeRequest { .. } => LeafKind::ChangeRequest,
+            Self::Issue { .. } => LeafKind::Issue,
             Self::Usage { .. } => LeafKind::Usage,
         }
     }
@@ -79,6 +81,10 @@ impl FromStr for LeafAddress {
                 let number = number.parse().map_err(|_| format!("invalid change request number `{number}` in leaf address `{value}`"))?;
                 Ok(Self::ChangeRequest { service: (*service).to_string(), scope: scope.join("/"), number })
             }
+            ["issue", service, scope @ .., number] if !service.is_empty() && !scope.is_empty() => {
+                let number = number.parse().map_err(|_| format!("invalid issue number `{number}` in leaf address `{value}`"))?;
+                Ok(Self::Issue { service: (*service).to_string(), scope: scope.join("/"), number })
+            }
             ["usage", provider, account] if !provider.is_empty() && !account.is_empty() => {
                 Ok(Self::Usage { provider: (*provider).to_string(), account: (*account).to_string() })
             }
@@ -96,6 +102,7 @@ impl fmt::Display for LeafAddress {
             Self::Vessel { name } => write!(f, "vessel/{name}"),
             Self::Work { convoy, work } => write!(f, "work/{convoy}/{work}"),
             Self::ChangeRequest { service, scope, number } => write!(f, "cr/{service}/{scope}/{number}"),
+            Self::Issue { service, scope, number } => write!(f, "issue/{service}/{scope}/{number}"),
             Self::Usage { provider, account } => write!(f, "usage/{provider}/{account}"),
         }
     }
@@ -108,6 +115,7 @@ pub enum LeafKind {
     Vessel,
     Work,
     ChangeRequest,
+    Issue,
     Usage,
 }
 
@@ -118,6 +126,7 @@ impl fmt::Display for LeafKind {
             Self::Vessel => "vessel",
             Self::Work => "work",
             Self::ChangeRequest => "cr",
+            Self::Issue => "issue",
             Self::Usage => "usage",
         })
     }

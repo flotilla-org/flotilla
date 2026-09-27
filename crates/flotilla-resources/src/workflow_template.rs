@@ -114,6 +114,7 @@ pub struct LeafTemplate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectVariable {
     ChangeRequest,
+    Issue,
 }
 
 impl FromStr for LeafTemplate {
@@ -133,7 +134,8 @@ impl FromStr for LeafTemplate {
             .ok_or_else(|| leaf_template_syntax_error(input))?;
         let subject = match subject {
             "$cr" => SubjectVariable::ChangeRequest,
-            unknown => return Err(format!("unknown exit leaf subject variable `{unknown}`; admitted variables: $cr")),
+            "$issue" => SubjectVariable::Issue,
+            unknown => return Err(format!("unknown exit leaf subject variable `{unknown}`; admitted variables: $cr, $issue")),
         };
         if field_path == "." {
             return Err(leaf_template_syntax_error(input));
@@ -156,6 +158,7 @@ impl fmt::Display for LeafTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let subject = match self.subject {
             SubjectVariable::ChangeRequest => "$cr",
+            SubjectVariable::Issue => "$issue",
         };
         write!(f, "{subject}{} {} {}", self.field_path, self.operator, self.literal)
     }
@@ -598,9 +601,11 @@ fn validate_turn_delivery(
     errors: &mut Vec<ValidationError>,
 ) {
     for (source, rule) in &spec.turn_delivery {
-        let admitted = rule.on.subject == SubjectVariable::ChangeRequest
+        let admitted = (rule.on.subject == SubjectVariable::ChangeRequest
             && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable")
-            && matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual);
+            || rule.on.subject == SubjectVariable::Issue
+                && (matches!(rule.on.field_path.as_str(), ".state" | ".updated-at") || rule.on.field_path.starts_with(".labels.")))
+            && (rule.on.field_path == ".updated-at" || matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual));
         if !admitted {
             push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
         }

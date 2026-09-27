@@ -3,7 +3,7 @@ use std::{cmp::Ordering, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafKind, LeafOperator};
 
-use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, ResourceObject, Usage, Vessel, WorkState};
+use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, Issue, ResourceObject, Usage, Vessel, WorkState};
 
 pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("convoy", ".status.phase"),
@@ -17,6 +17,8 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("cr", ".checks"),
     ("cr", ".review.actionable-at-head"),
     ("cr", ".mergeable"),
+    ("issue", ".state"),
+    ("issue", ".updated-at"),
 ];
 
 /// Phrasing is part of the closed actor-leaf vocabulary. An actor row without
@@ -76,13 +78,16 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let kind = leaf.address.kind();
     let usage_field = kind == LeafKind::Usage && admitted_usage_field(&leaf.field_path);
     let crew_field = kind == LeafKind::Work && crew_role_path(&leaf.field_path).is_some();
+    let issue_label = kind == LeafKind::Issue && issue_label_path(&leaf.field_path).is_some();
     let admitted = usage_field
         || crew_field
+        || issue_label
         || ADMITTED_LEAF_VOCABULARY.iter().any(|(candidate_kind, path)| *candidate_kind == kind.to_string() && *path == leaf.field_path);
     if !admitted {
         let mut vocabulary = ADMITTED_LEAF_VOCABULARY.iter().map(|(kind, path)| format!("{kind}{path}")).collect::<Vec<_>>();
         vocabulary.extend([
             "work.crew.<role>.phase".to_string(),
+            "issue.labels.<label>".to_string(),
             "usage.provider".to_string(),
             "usage.plan".to_string(),
             "usage.organization".to_string(),
@@ -94,12 +99,14 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let ordered_usage_field = kind == LeafKind::Usage
         && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes" | "resets-at"));
     if leaf.field_path != ".latest-claim.claimed-at"
+        && leaf.field_path != ".updated-at"
         && !ordered_usage_field
         && !matches!(leaf.operator, LeafOperator::Equal | LeafOperator::NotEqual)
     {
         return Err(format!("operator `{}` is not admitted for text leaf `{kind}{}`; use `==` or `!=`", leaf.operator, leaf.field_path));
     }
     if leaf.field_path == ".latest-claim.claimed-at"
+        || leaf.field_path == ".updated-at"
         || (kind == LeafKind::Usage && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| field == "resets-at"))
     {
         leaf.literal
@@ -119,6 +126,10 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
 fn crew_role_path(path: &str) -> Option<&str> {
     let role = path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
     (!role.is_empty() && role.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))).then_some(role)
+}
+
+fn issue_label_path(path: &str) -> Option<&str> {
+    path.strip_prefix(".labels.").filter(|label| !label.is_empty())
 }
 
 pub fn evaluate_leaf(
@@ -153,7 +164,8 @@ pub fn evaluate_leaf(
 }
 
 fn bind_literal(path: &str, literal: &str) -> Result<LeafValue, String> {
-    if path == ".latest-claim.claimed-at" || usage_window_path(path).is_some_and(|(_, field)| field == "resets-at") {
+    if matches!(path, ".latest-claim.claimed-at" | ".updated-at") || usage_window_path(path).is_some_and(|(_, field)| field == "resets-at")
+    {
         return literal
             .parse::<DateTime<Utc>>()
             .map(LeafValue::Timestamp)
@@ -249,6 +261,56 @@ pub struct ChangeRequestLeafSubject<'a> {
     pub change_request: &'a ResourceObject<ChangeRequest>,
     pub now: DateTime<Utc>,
     pub stale_after: Duration,
+}
+
+pub struct IssueLeafSubject<'a> {
+    pub issue: &'a ResourceObject<Issue>,
+    pub now: DateTime<Utc>,
+    pub stale_after: Duration,
+}
+
+impl IssueLeafSubject<'_> {
+    fn field_observed_at(&self, field_path: &str) -> Option<DateTime<Utc>> {
+        let status = self.issue.status.as_ref()?;
+        match field_path {
+            ".state" => Some(status.state.observed_at),
+            ".updated-at" => Some(status.updated_at.observed_at),
+            path if issue_label_path(path).is_some() => Some(status.labels.observed_at),
+            _ => None,
+        }
+    }
+}
+
+impl LeafSubject for IssueLeafSubject<'_> {
+    fn kind(&self) -> LeafKind {
+        LeafKind::Issue
+    }
+
+    fn value(&self, field_path: &str) -> Option<LeafValue> {
+        let observed_at = self.field_observed_at(field_path)?;
+        if self.now.signed_duration_since(observed_at).to_std().ok().is_none_or(|age| age > self.stale_after) {
+            return None;
+        }
+        let status = self.issue.status.as_ref()?;
+        match field_path {
+            ".state" => Some(LeafValue::Text(
+                match status.state.value? {
+                    crate::ObservedIssueState::Open => "open",
+                    crate::ObservedIssueState::Closed => "closed",
+                }
+                .to_string(),
+            )),
+            ".updated-at" => status.updated_at.value.map(LeafValue::Timestamp),
+            path => {
+                let label = issue_label_path(path)?;
+                Some(LeafValue::Text(status.labels.value.as_ref()?.iter().any(|value| value == label).to_string()))
+            }
+        }
+    }
+
+    fn observed_at(&self, field_path: &str) -> Option<DateTime<Utc>> {
+        self.field_observed_at(field_path)
+    }
 }
 
 pub struct UsageLeafSubject<'a>(pub &'a ResourceObject<Usage>);

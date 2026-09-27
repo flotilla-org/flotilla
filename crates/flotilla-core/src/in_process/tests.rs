@@ -229,7 +229,7 @@ async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() 
         .vessel("work".to_string())
         .role("coder".to_string())
         .brief("continue".to_string())
-        .head_sha("new-head".to_string())
+        .subject_revision("new-head".to_string())
         .build();
     daemon.deliver_standing_turn(&request).await.expect_err("stale session write");
     let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
@@ -335,7 +335,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .vessel("work".to_string())
             .role("coder".to_string())
             .brief("rebase the PR".to_string())
-            .head_sha("new-head".to_string())
+            .subject_revision("new-head".to_string())
             .build();
         assert!(daemon.deliver_standing_turn(&request).await.is_err(), "failed staging must prevent delivery");
         let after_failure = convoys.get("turn-credential-work").await.expect("convoy after failed staging").status.expect("status");

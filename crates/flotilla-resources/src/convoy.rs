@@ -247,15 +247,24 @@ pub fn instantiate_turn_delivery(
     let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
         return Ok(Vec::new());
     };
-    let subjects = bound_change_request_addresses(convoy, checkouts)?;
+    let change_requests = bound_change_request_addresses(convoy, checkouts)?;
+    let issues = if snapshot.turn_delivery.values().any(|rule| rule.on.subject == SubjectVariable::Issue) {
+        convoy.spec.issues.iter().map(|issue| issue_address(&issue.reference)).collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     Ok(snapshot
         .turn_delivery
         .iter()
         .flat_map(|(source, rule)| {
-            subjects.iter().map(move |address| InstantiatedTurnDelivery {
+            let subjects = match rule.on.subject {
+                SubjectVariable::ChangeRequest => change_requests.clone(),
+                SubjectVariable::Issue => issues.clone(),
+            };
+            subjects.into_iter().map(move |address| InstantiatedTurnDelivery {
                 source: source.clone(),
                 leaf: Leaf {
-                    address: address.clone(),
+                    address,
                     field_path: rule.on.field_path.clone(),
                     operator: rule.on.operator,
                     literal: rule.on.literal.clone(),
@@ -264,6 +273,25 @@ pub fn instantiate_turn_delivery(
             })
         })
         .collect())
+}
+
+pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
+    let service = reference
+        .source
+        .service
+        .strip_prefix("https://")
+        .or_else(|| reference.source.service.strip_prefix("http://"))
+        .unwrap_or(&reference.source.service)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let (service, scope) = if service.eq_ignore_ascii_case("github.com") {
+        (service.to_ascii_lowercase(), reference.source.scope.to_ascii_lowercase())
+    } else {
+        (service.to_string(), reference.source.scope.clone())
+    };
+    let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
+    Ok(LeafAddress::Issue { service, scope, number })
 }
 
 /// Instantiate the convoy's pinned exit declaration over every bound subject.
@@ -301,6 +329,7 @@ pub fn instantiate_exit(
                     .map(|address| {
                         let address = match template.subject {
                             SubjectVariable::ChangeRequest => address.clone(),
+                            SubjectVariable::Issue => address.clone(),
                         };
                         Leaf {
                             address,
@@ -577,7 +606,7 @@ fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryEpisode {
-    pub head_sha: String,
+    pub subject_revision: String,
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
@@ -1248,7 +1277,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
-                if !delivery.episodes.iter().any(|existing| existing.head_sha == episode.head_sha) {
+                if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
                 status.attention = None;
@@ -1267,7 +1296,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RefuseTurnDelivery { source, episode, attention } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
-                if !delivery.episodes.iter().any(|existing| existing.head_sha == episode.head_sha) {
+                if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
                 status.attention = Some(attention.clone());
