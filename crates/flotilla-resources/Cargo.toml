@@ -32,6 +32,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 tokio-rusqlite = "0.7"
 uuid = { version = "1", features = ["v4"] }
 object_store = { version = "0.12", features = ["aws"] }
+serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
 flotilla-controllers = { path = "../flotilla-controllers" }

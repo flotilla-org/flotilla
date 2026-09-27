@@ -169,6 +169,10 @@ Provider refreshes publish discovered checkout facts into the daemon's ephemeral
 
 ## Conventions
 
+### Resource schema changes
+
+Every PR that changes a resource kind's serialized shape must name the out-of-repo sources that author that kind. Update those sources in a companion change, or explicitly state that none exist. Reviewers should verify the statement and the companion change before approval.
+
 - **Commits**: `type: lowercase description` — types: feat, fix, refactor, chore, docs. Present tense, no period.
 - **Errors**: Provider methods return `Result<T, String>`. App-level uses `color_eyre::Result`.
 - **Async**: `async-trait` for provider traits, `tokio::join!` for parallel refresh.

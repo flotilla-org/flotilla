@@ -25,6 +25,8 @@ use flotilla_protocol::{
 use flotilla_tui::{app, event_log, theme};
 use tracing::info;
 
+mod resource_validate;
+
 /// Flotilla: TUI dashboard for managing development workspaces
 #[derive(Parser)]
 #[command(version, long_version = binary_version())]
@@ -339,6 +341,11 @@ enum ResourceSubCommand {
     List(ResourceListArgs),
     /// Create or update a raw resource document
     Apply(ResourceApplyArgs),
+    /// Validate resource documents offline against this binary's schema
+    Validate {
+        /// Resource document or directory containing JSON/YAML manifests
+        path: PathBuf,
+    },
     /// Make the manifest overwrite a drifted live spec
     Sync(ResourceManifestResolutionArgs),
     /// Write the live spec back to its manifest
@@ -1452,6 +1459,7 @@ async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     match command {
+        ResourceSubCommand::Validate { path } => resource_validate::validate_path(&path),
         ResourceSubCommand::List(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;
