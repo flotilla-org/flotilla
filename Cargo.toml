@@ -15,14 +15,14 @@ members = [
     "crates/flotilla-relay-protocol",
     "crates/flotilla-relay",
 ]
-exclude = ["lints/long_inline_paths", "crates/flotilla-manifest/fixtures/generator"]
+exclude = ["lints/long_inline_paths", "lints/raw_git_outside_vcs", "crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
 
 [workspace.package]
 license = "Apache-2.0 OR MIT"
 
 [workspace.metadata.dylint]
-libraries = [{ path = "lints/long_inline_paths" }]
+libraries = [{ path = "lints/long_inline_paths" }, { path = "lints/raw_git_outside_vcs" }]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

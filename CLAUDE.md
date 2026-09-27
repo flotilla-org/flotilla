@@ -157,6 +157,12 @@ Providers are constructed via **factories** (`discovery/factories/`) that receiv
 
 **Why injected collaborators?** The daemon may run discovery for remote hosts or container environments where the host process's own env vars and binaries are wrong. The `EnvVars` trait and `CommandRunner` trait abstract this so tests can inject values and environments can provide their own. Never use `std::env` or `std::process::Command` directly in providers — always go through the injected `EnvVars` and `CommandRunner`.
 
+### VCS operation boundary
+
+Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. CLI via the checkout's environment runner is the universal implementation. A library backend may be used as a host-local fast path behind the same trait; it must not replace the CLI path for remote or provisioned environments.
+
+Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The Dylint gate enforces this for production code. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
+
 ### Observed resources and aggregation
 
 Provider refreshes publish discovered checkout facts into the daemon's ephemeral observed-resource backend. Durable resources remain authoritative for desired and adopted state. The Aggregator watches both stores, applies durable-over-observed precedence where a resource is present in both, and emits named-query result sets and deltas for surfaces.
