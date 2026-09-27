@@ -318,6 +318,7 @@ async fn reconcile_with_observed_change_request(
             .expect("checkout create");
         checkouts
             .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/tmp/checkout-a".to_string()),
                 commit: None,
@@ -605,6 +606,8 @@ fn vessel_object_with_image_digest(
             requested_stance: None,
             effective_stance: None,
             held_credentials: Default::default(),
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
         }),
     }
 }
@@ -1173,6 +1176,7 @@ async fn reconcile_terminal_bound_change_request(
             .expect("checkout create");
         checkouts
             .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/tmp/checkout-a".to_string()),
                 commit: None,
@@ -1206,6 +1210,7 @@ async fn reconcile_terminal_bound_change_request(
             .expect("context checkout create");
         checkouts
             .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some("/tmp/checkout-context".to_string()),
                 commit: None,
@@ -1361,6 +1366,7 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .expect("create remote checkout");
     remote_checkouts
         .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some("/remote/worktree".to_string()),
             commit: None,

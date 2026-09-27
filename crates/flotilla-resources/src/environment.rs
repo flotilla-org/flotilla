@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch};
+use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry};
 
 define_resource!(Environment, "environments", EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch);
 
@@ -74,6 +74,10 @@ pub struct EnvironmentStatus {
     pub image_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_delivery_retry: Option<ControllerRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_refresh_retry: Option<ControllerRetry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +85,15 @@ pub enum EnvironmentStatusPatch {
     MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
     MarkFailed { message: String },
     MarkTerminating,
+    CredentialDelivery { retry: Option<ControllerRetry> },
+    CredentialRefresh { retry: Option<ControllerRetry> },
 }
 
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     fn apply(&self, status: &mut EnvironmentStatus) {
         match self {
+            Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
+            Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::MarkReady { docker_container_id, image_ref, image_digest } => {
                 status.phase = EnvironmentPhase::Ready;
                 status.ready = true;

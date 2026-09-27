@@ -6,7 +6,8 @@ use flotilla_resources::{
     Clone, ClonePhase, CloneStatusPatch, ObjectEvent, Repository, ResourceError, ResourceObject, TypedResolver,
 };
 
-const CLONE_RETRY_AFTER: Duration = Duration::from_secs(30);
+const CLONE_BACKOFF: flotilla_resources::RetryBackoff =
+    flotilla_resources::RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) };
 
 #[async_trait]
 pub trait CloneRuntime: Send + Sync {
@@ -100,7 +101,9 @@ where
             outcome.events.push(ObjectEvent::for_object(obj, "CloneFailed", message.clone()));
         }
         if matches!(prepared, ClonePrepared::Retrying(_)) {
-            outcome.requeue_after = Some(CLONE_RETRY_AFTER);
+            let next_attempt =
+                obj.status.as_ref().and_then(|status| status.retry.as_ref()).map_or(1, |retry| retry.attempts.saturating_add(1));
+            outcome.requeue_after = Some(CLONE_BACKOFF.delay(next_attempt));
         }
         outcome
     }
@@ -111,5 +114,9 @@ where
 
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/clone-cleanup")
+    }
+
+    fn retry_disposition(&self, obj: &ResourceObject<Self::Resource>) -> Option<flotilla_resources::ControllerRetryDisposition> {
+        obj.status.as_ref()?.retry.as_ref().map(|retry| retry.disposition.clone())
     }
 }

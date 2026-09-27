@@ -39,16 +39,17 @@ use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, No
 use flotilla_resources::{
     canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, watch_resource_kind,
     watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase,
-    CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource,
-    CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
-    EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta,
-    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource,
-    ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
-    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
+    CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler,
+    ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
+    HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, HostStatusPatch, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
+    ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance,
+    SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -171,9 +172,14 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                     .map_err(|error| error.to_string())?;
                 Ok(format!("Clone/{name} retry requested"))
             }
+            "credentialdelivery" | "workcredential" | "workcredentials" => {
+                record_credential_delivery_retry(&self.state.daemon.resource_backend(), namespace, name, None, false).await?;
+                reconcile_work_credentials_for_environment(&self.state, namespace, name).await?;
+                Ok(format!("CredentialDelivery/{name} reconciled"))
+            }
             "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
             _ => Err(format!(
-                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, manifest-root, or Repository"
+                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, manifest-root, or Repository"
             )),
         }
     }
@@ -1513,11 +1519,30 @@ async fn reconcile_work_credentials_filtered(
     let mut errors = Vec::new();
     for (environment_ref, (granted, running, scopes, live_scopes, permissions)) in deliveries {
         if let Some(error) = permission_conflicts.remove(&environment_ref) {
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, Some(error.clone()), false).await?;
             errors.push(error);
             continue;
         }
         let permissions = permissions.into_iter().filter_map(|(name, value)| value.map(|value| (name, value))).collect();
         if granted.is_empty() {
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, None, false).await?;
+            continue;
+        }
+        if let Ok(environment) = backend.clone().using::<Environment>(namespace).get(&environment_ref).await {
+            if let Some(retry) = environment.status.as_ref().and_then(|status| status.credential_delivery_retry.as_ref()) {
+                match retry.disposition {
+                    ControllerRetryDisposition::Terminal { .. } => {
+                        mirror_credential_retry_to_vessels(&backend, namespace, &environment_ref, Some(retry.clone()), false).await?;
+                        continue;
+                    }
+                    ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => continue,
+                    _ => {}
+                }
+            }
+        }
+        if let Some(error) = credential_quarantine_need(&backend, namespace, &granted).await? {
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, Some(error.clone()), true).await?;
+            errors.push(error);
             continue;
         }
         let result = async {
@@ -1549,7 +1574,10 @@ async fn reconcile_work_credentials_filtered(
         }
         .await;
         if let Err(error) = result {
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, Some(error.clone()), false).await?;
             errors.push(error);
+        } else {
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, None, false).await?;
         }
     }
     if errors.is_empty() {
@@ -1557,6 +1585,98 @@ async fn reconcile_work_credentials_filtered(
     } else {
         Err(errors.join("; "))
     }
+}
+
+async fn credential_quarantine_need(
+    backend: &ResourceBackend,
+    namespace: &str,
+    granted: &BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    Ok(backend.diagnostics().await.map_err(|error| format!("inspect credential declaration quarantine: {error}"))?.and_then(
+        |diagnostics| {
+            diagnostics
+                .decode_quarantines
+                .iter()
+                .find(|quarantine| {
+                    quarantine.kind == "CredentialSpec" && quarantine.namespace == namespace && granted.contains(&quarantine.name)
+                })
+                .map(|quarantine| format!("credential spec `{}` does not decode: {}", quarantine.name, quarantine.error))
+        },
+    ))
+}
+
+async fn record_credential_delivery_retry(
+    backend: &ResourceBackend,
+    namespace: &str,
+    environment_ref: &str,
+    error: Option<String>,
+    terminal: bool,
+) -> Result<(), String> {
+    let environments = backend.clone().using::<Environment>(namespace);
+    let environment = match environments.get(environment_ref).await {
+        Ok(environment) => environment,
+        Err(ResourceError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(format!("read credential delivery environment: {error}")),
+    };
+    let previous = environment.status.as_ref().and_then(|status| status.credential_delivery_retry.as_ref());
+    if !terminal
+        && error.is_some()
+        && previous.is_some_and(
+            |retry| matches!(retry.disposition, ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at),
+        )
+    {
+        mirror_credential_retry_to_vessels(backend, namespace, environment_ref, previous.cloned(), false).await?;
+        return Ok(());
+    }
+    let retry = error.map(|error| {
+        if terminal {
+            ControllerRetry::terminal(previous, Utc::now(), error)
+        } else {
+            ControllerRetry::retryable(previous, Utc::now(), RetryBackoff {
+                initial: Duration::from_secs(30),
+                maximum: Duration::from_secs(120),
+            })
+        }
+    });
+    if previous == retry.as_ref() {
+        mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
+        return Ok(());
+    }
+    flotilla_resources::apply_status_patch(&environments, environment_ref, &EnvironmentStatusPatch::CredentialDelivery {
+        retry: retry.clone(),
+    })
+    .await
+    .map_err(|error| format!("record credential delivery disposition: {error}"))?;
+    mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
+    Ok(())
+}
+
+async fn mirror_credential_retry_to_vessels(
+    backend: &ResourceBackend,
+    namespace: &str,
+    environment_ref: &str,
+    retry: Option<ControllerRetry>,
+    refresh: bool,
+) -> Result<(), String> {
+    let vessels = backend.clone().using::<Vessel>(namespace);
+    for vessel in vessels.list().await.map_err(|error| format!("list credential delivery vessels: {error}"))?.items {
+        let Some(status) = vessel.status.as_ref().filter(|status| status.environment_ref.as_deref() == Some(environment_ref)) else {
+            continue;
+        };
+        let current = if refresh { &status.credential_refresh_retry } else { &status.credential_delivery_retry };
+        if current == &retry {
+            continue;
+        }
+        let patch = if refresh {
+            VesselStatusPatch::CredentialRefresh { retry: retry.clone() }
+        } else {
+            VesselStatusPatch::CredentialDelivery { retry: retry.clone() }
+        };
+        flotilla_resources::apply_status_patch(&vessels, &vessel.metadata.name, &patch)
+            .await
+            .map_err(|error| format!("record vessel credential disposition: {error}"))?;
+    }
+    Ok(())
 }
 
 fn github_app_scope_from_grants(
@@ -2064,6 +2184,7 @@ async fn reconcile_credential_refresh_attention(
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
+    record_credential_refresh_dispositions(&backend, namespace, errors).await?;
     let demands = backend.using::<Demand>(namespace);
     let existing = demands.list().await.map_err(|error| error.to_string())?;
     if errors.is_empty()
@@ -2134,6 +2255,42 @@ async fn reconcile_credential_refresh_attention(
     }
     for (_, (meta, spec)) in desired {
         demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+async fn record_credential_refresh_dispositions(
+    backend: &ResourceBackend,
+    namespace: &str,
+    errors: &[CredentialRefreshError],
+) -> Result<(), String> {
+    let environments = backend.clone().using::<Environment>(namespace);
+    let listed = environments.list().await.map_err(|error| format!("list credential refresh environments: {error}"))?;
+    for environment in listed.items {
+        let previous = environment.status.as_ref().and_then(|status| status.credential_refresh_retry.as_ref());
+        let error = errors.iter().find(|error| error.environment_ref == environment.metadata.name);
+        if error.is_some()
+            && previous.is_some_and(|retry| {
+                matches!(retry.disposition, ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at)
+            })
+        {
+            continue;
+        }
+        let retry = error.map(|_| {
+            ControllerRetry::retryable(previous, Utc::now(), RetryBackoff {
+                initial: Duration::from_secs(30),
+                maximum: Duration::from_secs(120),
+            })
+        });
+        if previous == retry.as_ref() {
+            continue;
+        }
+        flotilla_resources::apply_status_patch(&environments, &environment.metadata.name, &EnvironmentStatusPatch::CredentialRefresh {
+            retry: retry.clone(),
+        })
+        .await
+        .map_err(|error| format!("record credential refresh disposition: {error}"))?;
+        mirror_credential_retry_to_vessels(backend, namespace, &environment.metadata.name, retry, true).await?;
     }
     Ok(())
 }
@@ -4726,6 +4883,44 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta("refresh-work"), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            })
+            .await
+            .expect("create environment");
+        let failure = CredentialRefreshError {
+            environment_ref: "refresh-work".into(),
+            credential_name: Some("github-app".into()),
+            message: "provider unavailable".into(),
+            should_surface: true,
+        };
+        record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure)).await.expect("record first failure");
+        let first = environments.get("refresh-work").await.expect("environment after first failure");
+        let retry = first.status.expect("status").credential_refresh_retry.expect("retry record");
+        assert_eq!(retry.attempts, 1);
+        record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure))
+            .await
+            .expect("observe failure again before deadline");
+        let second = environments.get("refresh-work").await.expect("environment after repeated failure");
+        assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+        assert_eq!(second.status.expect("status").credential_refresh_retry, Some(retry));
+        record_credential_refresh_dispositions(&backend, NAMESPACE, &[]).await.expect("clear on recovery");
+        assert!(environments
+            .get("refresh-work")
+            .await
+            .expect("environment after recovery")
+            .status
+            .expect("status")
+            .credential_refresh_retry
+            .is_none());
     }
 
     #[tokio::test]
@@ -8467,6 +8662,15 @@ mod tests {
         assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
 
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            })
+            .await
+            .expect("create durable shared environment");
+
         let conflicting_convoy = convoys
             .create(
                 &empty_meta("conflicting-credential-work"),
@@ -8516,9 +8720,50 @@ mod tests {
             .expect("place second vessel in shared environment");
         let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
         assert!(error.contains("different minted permissions for `work-token`"), "{error}");
+        let conflict_retry = environments
+            .get(env_id.as_str())
+            .await
+            .expect("shared environment")
+            .status
+            .expect("status")
+            .credential_delivery_retry
+            .expect("durable conflict retry");
+        assert!(matches!(conflict_retry.disposition, ControllerRetryDisposition::Retryable { .. }));
+        let conflict_environment_version = environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version;
+        let conflict_vessel_version = vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version;
+        let repeated_error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("persistent conflict remains retryable");
+        assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
+        assert_eq!(
+            environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version,
+            conflict_environment_version
+        );
+        assert_eq!(vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version, conflict_vessel_version);
         vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
 
+        // Simulate the retry deadline elapsing while preserving the persisted
+        // episode, then verify the normal pass can recover without an operator.
+        let due_retry = ControllerRetry {
+            disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
+            ..conflict_retry
+        };
+        flotilla_resources::apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::CredentialDelivery {
+            retry: Some(due_retry),
+        })
+        .await
+        .expect("advance retry deadline");
+
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
+        assert!(
+            environments
+                .get(env_id.as_str())
+                .await
+                .expect("shared environment")
+                .status
+                .expect("status")
+                .credential_delivery_retry
+                .is_none(),
+            "resolved conflict should clear durable retry"
+        );
         assert!(can_fill_git_credential().await);
         let current = convoys.get("credential-work").await.expect("read running work");
         let mut stalled = current.status.expect("work status");
@@ -9540,6 +9785,75 @@ mod tests {
                 rusqlite::params![T::API_PATHS.group, T::API_PATHS.version, T::API_PATHS.kind, NAMESPACE, name],
             )
             .expect("insert undecodable resource");
+    }
+
+    #[tokio::test]
+    async fn undecodable_credential_spec_parks_delivery_as_a_terminal_controller_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let sqlite_path = temp.path().join("resources.sqlite");
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta("credential-work"), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            })
+            .await
+            .expect("work environment");
+        let connection = rusqlite::Connection::open(&sqlite_path).expect("raw sqlite store");
+        insert_undecodable_resource::<CredentialSpec>(&connection, "broken-spec");
+        drop(connection);
+        flotilla_resources::quarantine_undecodable_stored_objects(&backend, NAMESPACE).await.expect("quarantine undecodable spec");
+        let granted = BTreeSet::from(["broken-spec".to_string()]);
+        let need = credential_quarantine_need(&backend, NAMESPACE, &granted)
+            .await
+            .expect("inspect quarantine")
+            .expect("undecodable spec needs operator");
+        assert!(need.contains("broken-spec") && need.contains("does not decode"), "{need}");
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need.clone()), true)
+            .await
+            .expect("persist terminal delivery disposition");
+        let retry = environments
+            .get("credential-work")
+            .await
+            .expect("environment")
+            .status
+            .expect("status")
+            .credential_delivery_retry
+            .expect("delivery retry");
+        assert_eq!(retry.stall_reason(Utc::now(), flotilla_resources::RetryCeiling::default()), Some(need.clone()));
+        assert!(matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }));
+        let resource_version = environments.get("credential-work").await.expect("environment").metadata.resource_version;
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need), true)
+            .await
+            .expect("repeat terminal disposition");
+        // A repeated terminal failure does not churn durable status.
+        let after_repeat = environments.get("credential-work").await.expect("environment");
+        assert_eq!(after_repeat.metadata.resource_version, resource_version);
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", None, false).await.expect("operator retry reset");
+        assert!(environments
+            .get("credential-work")
+            .await
+            .expect("environment")
+            .status
+            .expect("status")
+            .credential_delivery_retry
+            .is_none());
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some("provider unavailable".into()), false)
+            .await
+            .expect("retry after operator reset");
+        assert_eq!(
+            environments
+                .get("credential-work")
+                .await
+                .expect("environment")
+                .status
+                .expect("status")
+                .credential_delivery_retry
+                .expect("new episode")
+                .attempts,
+            1
+        );
     }
 
     #[tokio::test]

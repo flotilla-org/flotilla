@@ -289,6 +289,8 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             requested_stance: None,
             effective_stance: None,
             held_credentials: Default::default(),
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
         })
         .await
         .expect("workspace status update should succeed");

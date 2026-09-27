@@ -227,6 +227,8 @@ pub async fn create_ready_host_direct_environment(
             image_ref: None,
             image_digest: None,
             message: None,
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
         })
         .await
         .expect("environment status update should succeed");
@@ -253,6 +255,8 @@ pub async fn create_ready_docker_environment(
             image_ref: Some(image_ref),
             image_digest: Some("sha256:test-image".to_string()),
             message: None,
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
         })
         .await
         .expect("docker env status update should succeed");
@@ -284,6 +288,7 @@ pub async fn create_ready_clone(
             message: None,
             failed_at: None,
             failure_policy: None,
+            retry: None,
         })
         .await
         .expect("clone status update should succeed");
@@ -315,6 +320,7 @@ pub async fn create_ready_checkout(
     let created = checkouts.create(&meta(&fixture.name), &spec).await.expect("checkout create should succeed");
     checkouts
         .update_status(&fixture.name, &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some(fixture.path.clone()),
             commit: Some("44982740".to_string()),

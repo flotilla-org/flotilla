@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::PlacementDecision;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, LandingCredentialScope, ReplicationClass, RepositoryKey, Stance};
+use crate::{
+    resource::define_resource, status_patch::StatusPatch, ControllerRetry, LandingCredentialScope, ReplicationClass, RepositoryKey, Stance,
+};
 
 define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
@@ -67,10 +69,20 @@ pub struct VesselStatus {
     /// status, not desired spec: absence is the pre-approval invariant.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub held_credentials: BTreeMap<String, LandingCredentialScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_delivery_retry: Option<ControllerRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_refresh_retry: Option<ControllerRetry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesselStatusPatch {
+    CredentialDelivery {
+        retry: Option<ControllerRetry>,
+    },
+    CredentialRefresh {
+        retry: Option<ControllerRetry>,
+    },
     MarkProvisioning {
         observed_policy_ref: String,
         observed_policy_version: String,
@@ -105,6 +117,8 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
+            Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
+            Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());

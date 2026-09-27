@@ -49,17 +49,17 @@ use flotilla_resources::{
     watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
     ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
-    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
-    CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
-    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
+    ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
+    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind,
+    DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind,
+    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ObjectEvent,
+    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
+    ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
     TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
     TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
@@ -2563,19 +2563,31 @@ const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-r
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
     config_hash: String,
-    consecutive_refusals: u32,
-    retry_at: DateTime<Utc>,
     dependency_hash: String,
+    retry: ControllerRetry,
 }
 
 fn ensure_retry_delay(restart_count: u32) -> ChronoDuration {
-    let exponent = restart_count.min(5);
-    ChronoDuration::seconds((30_i64.saturating_mul(1_i64 << exponent)).min(15 * 60))
+    ChronoDuration::from_std(
+        RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(15 * 60) }.delay(restart_count.saturating_add(1)),
+    )
+    .expect("ensure retry delay fits chrono")
 }
 
-fn ensure_admission_retry_delay(refusal_count: u32) -> ChronoDuration {
-    let exponent = refusal_count.saturating_sub(1).min(2);
-    ChronoDuration::seconds(30_i64.saturating_mul(1_i64 << exponent))
+fn record_ensure_admission_retry(
+    retries: &mut HashMap<(String, String), EnsureAdmissionRetry>,
+    key: (String, String),
+    config_hash: String,
+    dependency_hash: String,
+    now: DateTime<Utc>,
+    persisted: Option<&ControllerRetry>,
+) -> (u32, DateTime<Utc>) {
+    let previous = retries.get(&key).map(|entry| &entry.retry).or(persisted);
+    let retry =
+        ControllerRetry::retryable(previous, now, RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) });
+    let result = (retry.attempts, retry.next_attempt_at().expect("new admission retry is retryable"));
+    retries.insert(key, EnsureAdmissionRetry { config_hash, dependency_hash, retry });
+    result
 }
 
 fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
@@ -6087,7 +6099,7 @@ impl InProcessDaemon {
             }
             if !resolved_escalation && !force_now {
                 if let Some(retry) = retries.get(&retry_key) {
-                    if retry.retry_at > self.clock.now() {
+                    if retry.retry.next_attempt_at().is_some_and(|retry_at| retry_at > self.clock.now()) {
                         return Ok(None);
                     }
                 }
@@ -6131,15 +6143,14 @@ impl InProcessDaemon {
                 let now = self.clock.now();
                 let (refusals, retry_at) = {
                     let mut retries = self.ensure_admission_retries.lock().await;
-                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
-                    let retry_at = now + ensure_admission_retry_delay(refusals);
-                    retries.insert(retry_key, EnsureAdmissionRetry {
+                    record_ensure_admission_retry(
+                        &mut retries,
+                        retry_key,
                         config_hash,
-                        consecutive_refusals: refusals,
-                        retry_at,
                         dependency_hash,
-                    });
-                    (refusals, retry_at)
+                        now,
+                        ensure.status.as_ref().and_then(|status| status.retry.as_ref()),
+                    )
                 };
                 self.patch_driver_ensure_status_if_local(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::BackoffState {
                     strikes: consecutive_failures,
@@ -6216,6 +6227,7 @@ impl InProcessDaemon {
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+                status.retry = None;
             }
         }
         let convoy = match status.convoy_ref.as_deref() {
@@ -6284,6 +6296,7 @@ impl InProcessDaemon {
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+                status.retry = None;
             }
             return self.restart_absent_ensured_convoy(namespace, ensure, &status, now).await;
         }
@@ -6302,6 +6315,7 @@ impl InProcessDaemon {
             status.retry_at = None;
             status.last_failure = None;
             status.hold_reason = None;
+            status.retry = None;
         }
         let operator_forced = convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned);
         // A forced pass is the recovery boundary for recordless teardown: the
@@ -6377,15 +6391,7 @@ impl InProcessDaemon {
                     .map_err(|record_error| format!("record ensure admission event: {record_error}"))?;
                 let (refusals, retry_at) = {
                     let mut retries = self.ensure_admission_retries.lock().await;
-                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
-                    let retry_at = now + ensure_admission_retry_delay(refusals);
-                    retries.insert(retry_key, EnsureAdmissionRetry {
-                        config_hash,
-                        consecutive_refusals: refusals,
-                        retry_at,
-                        dependency_hash,
-                    });
-                    (refusals, retry_at)
+                    record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
                 };
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,
@@ -6401,7 +6407,7 @@ impl InProcessDaemon {
         &self,
         namespace: &str,
         ensure: &ResourceObject<ConvoyEnsure>,
-        _status: &flotilla_resources::ConvoyEnsureStatus,
+        status: &flotilla_resources::ConvoyEnsureStatus,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
         self.clear_ensure_attention(namespace, &ensure.metadata.name).await?;
@@ -6425,15 +6431,7 @@ impl InProcessDaemon {
                 let dependency_hash = self.ensure_admission_dependency_hash(namespace, ensure).await?;
                 let (refusals, retry_at) = {
                     let mut retries = self.ensure_admission_retries.lock().await;
-                    let refusals = retries.get(&retry_key).map_or(1, |retry| retry.consecutive_refusals.saturating_add(1));
-                    let retry_at = now + ensure_admission_retry_delay(refusals);
-                    retries.insert(retry_key, EnsureAdmissionRetry {
-                        config_hash,
-                        consecutive_refusals: refusals,
-                        retry_at,
-                        dependency_hash,
-                    });
-                    (refusals, retry_at)
+                    record_ensure_admission_retry(&mut retries, retry_key, config_hash, dependency_hash, now, status.retry.as_ref())
                 };
                 self.patch_convoy_ensure(namespace, &ensure.metadata.name, ConvoyEnsureStatusPatch::Retrying {
                     retry_at,

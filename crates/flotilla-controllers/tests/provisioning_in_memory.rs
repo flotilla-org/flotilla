@@ -523,6 +523,7 @@ async fn new_convoy_checkout_demand_redrives_a_clone_failed_on_old_auth() {
             message: Some("authentication failed: repository access denied".to_string()),
             failed_at: Some(Utc::now() - chrono::Duration::hours(15)),
             failure_policy: None,
+            retry: None,
         })
         .await
         .expect("legacy clone failure should apply");

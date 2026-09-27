@@ -128,6 +128,8 @@ pub struct CheckoutStatus {
     pub integration: CheckoutIntegrationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_retry: Option<crate::ControllerRetry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -220,6 +222,7 @@ pub enum ChangeRequestMergeability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
+    ObserveCloneRetry { retry: Option<crate::ControllerRetry> },
     MarkPreparing,
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
@@ -246,6 +249,7 @@ pub fn latch_evidence_backed_integration(existing: &CheckoutIntegrationStatus, o
 impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
     fn apply(&self, status: &mut CheckoutStatus) {
         match self {
+            Self::ObserveCloneRetry { retry } => status.clone_retry = retry.clone(),
             Self::MarkPreparing => {
                 status.phase = CheckoutPhase::Preparing;
                 status.message = None;
@@ -256,6 +260,7 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.commit = commit.clone();
                 status.branch_provenance = *branch_provenance;
                 status.message = None;
+                status.clone_retry = None;
             }
             Self::MarkTerminating => {
                 status.phase = CheckoutPhase::Terminating;

@@ -472,17 +472,28 @@ pub struct ConvoyStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LeafMaker {
-    Observed { refresher: String, external_party: String },
-    Actor { vessel: String, role: String },
-    Supervisor { convoy: String, vessel: String, role: String },
-    Controller { resource_kind: String, name: String, disposition: ControllerRetryDisposition },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ControllerRetryDisposition {
-    Retryable { next_attempt_at: DateTime<Utc> },
-    Terminal { needs: String },
+    Observed {
+        refresher: String,
+        external_party: String,
+    },
+    Actor {
+        vessel: String,
+        role: String,
+    },
+    Supervisor {
+        convoy: String,
+        vessel: String,
+        role: String,
+    },
+    /// An absent name identifies the resource carrying this condition.
+    Controller {
+        resource_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        retry: crate::ControllerRetry,
+        #[serde(default)]
+        ceiling: crate::RetryCeiling,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

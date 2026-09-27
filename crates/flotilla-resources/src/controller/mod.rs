@@ -58,6 +58,12 @@ pub trait Reconciler: Send + Sync + 'static {
         None
     }
 
+    /// A durable retry wake can suppress watch/resync attempts until its due
+    /// time. Explicit reconcile-now clears the resource's retry record.
+    fn retry_disposition(&self, _obj: &ResourceObject<Self::Resource>) -> Option<crate::ControllerRetryDisposition> {
+        None
+    }
+
     /// Persist a resource-specific degraded condition once the reconcile
     /// error threshold is reached.
     fn reconcile_degraded_patch(
@@ -741,6 +747,15 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                     if object_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
                         object_failures.remove(&name);
+                    }
+                    if let Some(disposition) = reconciler.retry_disposition(&object) {
+                        match disposition {
+                            crate::ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at => {
+                                return Ok(());
+                            }
+                            crate::ControllerRetryDisposition::Terminal { .. } => return Ok(()),
+                            _ => {}
+                        }
                     }
                     if let Some(failure) = object_failures.get(&name) {
                         if !degraded_needs_reconcile && (failure.terminal || Instant::now() < failure.retry_at) {
