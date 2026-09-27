@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::AgentOverride;
 use serde::{Deserialize, Serialize};
 
-use crate::{checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
+use crate::{
+    checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ControllerRetry, LeafMaker, ReplicationClass,
+    RepositoryKey, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition, Stance,
+};
 
 pub const DRIVER_ADMISSION_CONDITION_TYPE: &str = "DriverAdmission";
 
@@ -59,6 +62,10 @@ pub struct ConvoyEnsureStatus {
     pub observed_config_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<ConvoyEnsureCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ControllerRetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<StalledCondition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +108,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+                status.retry = None;
             }
             Self::BackingOff { retry_at, failure } => {
                 status.convoy_ref = None;
@@ -109,12 +117,14 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = Some(*retry_at);
                 status.last_failure = Some(failure.clone());
                 status.hold_reason = None;
+                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
             }
             Self::Retrying { retry_at, failure } => {
                 status.running_since = None;
                 status.retry_at = Some(*retry_at);
                 status.last_failure = Some(failure.clone());
                 status.hold_reason = None;
+                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
             }
             Self::Holding { convoy_ref, failure } => {
                 status.convoy_ref = Some(convoy_ref.clone());
@@ -122,6 +132,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = None;
                 status.last_failure = Some(failure.clone());
                 status.hold_reason = Some(ConvoyEnsureHoldReason::BackingUnverified);
+                status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), Utc::now(), failure.clone()));
             }
             Self::RestartLimitReached { convoy_ref, failure } => {
                 status.convoy_ref = Some(convoy_ref.clone());
@@ -130,6 +141,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = None;
                 status.last_failure = Some(failure.clone());
                 status.hold_reason = Some(ConvoyEnsureHoldReason::RestartLimit);
+                status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), Utc::now(), failure.clone()));
             }
             Self::ObserveConfig { config_hash, changed } => {
                 status.observed_config_hash = Some(config_hash.clone());
@@ -138,6 +150,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                     status.retry_at = None;
                     status.last_failure = None;
                     status.hold_reason = None;
+                    status.retry = None;
                 }
             }
             Self::BackoffState { strikes, retry_at, failure } => {
@@ -145,17 +158,20 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 status.retry_at = Some(*retry_at);
                 status.last_failure = Some(failure.clone());
                 status.hold_reason = None;
+                status.retry = Some(ControllerRetry::retryable_at(status.retry.as_ref(), Utc::now(), *retry_at));
             }
             Self::ResetBackoff => {
                 status.restart_count = 0;
                 status.retry_at = None;
                 status.last_failure = None;
                 status.hold_reason = None;
+                status.retry = None;
             }
             Self::DriverManaged => {
                 status.convoy_ref = None;
                 status.running_since = None;
                 status.observed_config_hash = None;
+                status.retry = None;
             }
             Self::DriverAdmission { condition } => {
                 status.conditions.retain(|existing| existing.condition_type != DRIVER_ADMISSION_CONDITION_TYPE);
@@ -164,6 +180,22 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
                 }
             }
         }
+        let now = Utc::now();
+        let reason = status.retry.as_ref().and_then(|retry| retry.stall_reason(now, RetryCeiling::default()));
+        status.stalled = reason.map(|evidence| StalledCondition {
+            leaves: Vec::new(),
+            maker: status.retry.clone().map(|retry| LeafMaker::Controller {
+                resource_kind: "ConvoyEnsure".into(),
+                name: None,
+                retry,
+                ceiling: RetryCeiling::default(),
+            }),
+            evidence,
+            source: StallEvidenceSource::LeafEngine,
+            began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
+            rung: StallRung::Operator,
+            nudge_history: Vec::new(),
+        });
     }
 }
 
@@ -172,7 +204,35 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
-    use super::{ConvoyEnsureSpec, ConvoyEnsureStatus};
+    use super::*;
+
+    #[test]
+    fn operator_ensure_retry_rows_stall_on_terminal_failure_or_ceiling() {
+        let now = Utc::now();
+        let mut status = ConvoyEnsureStatus::default();
+        ConvoyEnsureStatusPatch::Retrying { retry_at: now + chrono::Duration::seconds(30), failure: "provider unavailable".into() }
+            .apply(&mut status);
+        assert!(status.retry.is_some());
+        assert!(status.stalled.is_none(), "a transient controller failure keeps an able maker");
+
+        ConvoyEnsureStatusPatch::Holding { convoy_ref: "convoy-a".into(), failure: "operator must verify backing".into() }
+            .apply(&mut status);
+        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.evidence.as_str()), Some("operator must verify backing"));
+        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.rung), Some(StallRung::Operator));
+
+        ConvoyEnsureStatusPatch::ResetBackoff.apply(&mut status);
+        assert!(status.stalled.is_none());
+        for attempt in 0..RetryCeiling::default().attempts {
+            ConvoyEnsureStatusPatch::Retrying {
+                retry_at: now + chrono::Duration::seconds(30 + attempt as i64),
+                failure: "provider unavailable".into(),
+            }
+            .apply(&mut status);
+        }
+        assert_eq!(status.stalled.as_ref().map(|stalled| stalled.evidence.as_str()), Some("retrying without progress"));
+        ConvoyEnsureStatusPatch::ResetBackoff.apply(&mut status);
+        assert!(status.retry.is_none() && status.stalled.is_none(), "explicit reconcile-now clears the retry episode");
+    }
 
     #[test]
     fn serialized_backoff_uses_operator_vocabulary() {

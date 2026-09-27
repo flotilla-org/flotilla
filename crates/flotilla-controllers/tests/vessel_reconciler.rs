@@ -300,6 +300,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let checkout = checkouts.create(&checkout_meta, &checkout_spec).await.expect("shared checkout create");
     checkouts
         .update_status(&checkout_meta.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: checkout_spec.target_path().map(str::to_string),
             commit: None,
@@ -580,6 +581,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         let created = checkouts.create(&meta, &spec).await.expect("checkout should create");
         checkouts
             .update_status(&meta.name, &created.metadata.resource_version, &CheckoutStatus {
+                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: spec.target_path().map(str::to_string),
                 commit: Some("44982740".to_string()),
@@ -757,6 +759,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             .expect("checkout should create");
         checkouts
             .update_status(&name, &created.metadata.resource_version, &CheckoutStatus {
+                clone_retry: None,
                 phase: CheckoutPhase::Ready,
                 path: Some(path),
                 commit: Some("44982740".to_string()),
@@ -1077,6 +1080,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .expect("adopted checkout should create");
     checkouts
         .update_status("adopted-cleat-scoped", &adopted.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some(adopted_path.to_string()),
             commit: Some("abc123".to_string()),
@@ -2541,6 +2545,7 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
         .expect("adopted checkout create should succeed");
     checkouts
         .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some(path.to_string()),
             commit: Some("abc123".to_string()),
@@ -2569,6 +2574,7 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
         .expect("checkout create should succeed");
     checkouts
         .update_status(name, &checkout.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: None,
             commit: Some("abc123".to_string()),

@@ -3383,6 +3383,8 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
             hold_reason: None,
             observed_config_hash: None,
             conditions: Vec::new(),
+            retry: None,
+            stalled: None,
         })
         .await
         .expect("seed crash budget");

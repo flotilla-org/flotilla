@@ -160,6 +160,7 @@ async fn clone_failure_from_the_current_checkout_attempt_requests_another_clone_
             message: Some("authentication failed".to_string()),
             failed_at: Some(failed_at),
             failure_policy: None,
+            retry: None,
         })
         .await
         .expect("legacy clone failure should apply");
@@ -247,6 +248,7 @@ async fn create_deleting_checkout(backend: &ResourceBackend, name: &str, target_
         .expect("deleting checkout create should succeed");
     checkouts
         .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some(target_path.to_string()),
             commit: Some("base-commit".to_string()),
@@ -322,6 +324,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
         .expect("checkout create should succeed");
     checkouts
         .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
             commit: Some("base-commit".to_string()),
@@ -393,6 +396,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
         .expect("checkout create should succeed");
     checkouts
         .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
             commit: Some("base-commit".to_string()),
@@ -441,6 +445,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
     let observed_at = chrono::Utc::now().to_rfc3339();
     checkouts
         .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
+            clone_retry: None,
             phase: CheckoutPhase::Ready,
             path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
             commit: Some("base-commit".to_string()),

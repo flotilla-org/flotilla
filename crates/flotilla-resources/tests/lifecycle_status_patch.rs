@@ -173,6 +173,9 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
 
 fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
     match patch {
+        VesselStatusPatch::CredentialDelivery { .. } | VesselStatusPatch::CredentialRefresh { .. } => {
+            panic!("credential status patches are outside this lifecycle contract")
+        }
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,

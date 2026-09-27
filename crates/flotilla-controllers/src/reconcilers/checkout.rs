@@ -6,6 +6,7 @@ use flotilla_core::checkout_integration::{
     checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL,
 };
 use flotilla_resources::{
+    apply_status_patch,
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition,
@@ -100,6 +101,7 @@ pub trait CheckoutRuntime: Send + Sync {
 
 pub struct CheckoutReconciler<R> {
     runtime: Arc<R>,
+    checkouts: TypedResolver<Checkout>,
     clones: TypedResolver<Clone>,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
@@ -114,11 +116,24 @@ impl<R> CheckoutReconciler<R> {
     pub fn with_clock(runtime: Arc<R>, backend: ResourceBackend, namespace: &str, clock: Arc<dyn Clock>) -> Self {
         Self {
             runtime,
+            checkouts: backend.clone().using::<Checkout>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             convoys: backend.using::<Convoy>(namespace),
             federated_convoys: None,
             clock,
         }
+    }
+
+    async fn observe_clone_retry(
+        &self,
+        checkout: &ResourceObject<Checkout>,
+        retry: Option<flotilla_resources::ControllerRetry>,
+    ) -> Result<(), ResourceError> {
+        if checkout.status.as_ref().and_then(|status| status.clone_retry.as_ref()) == retry.as_ref() {
+            return Ok(());
+        }
+        apply_status_patch(&self.checkouts, &checkout.metadata.name, &CheckoutStatusPatch::ObserveCloneRetry { retry }).await?;
+        Ok(())
     }
 
     pub fn with_federated_convoys(mut self, backend: &ResourceBackend, namespace: &str) -> Self {
@@ -255,9 +270,13 @@ where
             CheckoutSpec::Worktree(spec) => {
                 let clone = match self.clones.get(&spec.clone_ref).await {
                     Ok(clone) => clone,
-                    Err(ResourceError::NotFound { .. }) => return Ok(CheckoutPrepared::Waiting),
+                    Err(ResourceError::NotFound { .. }) => {
+                        self.observe_clone_retry(obj, None).await?;
+                        return Ok(CheckoutPrepared::Waiting);
+                    }
                     Err(err) => return Err(err),
                 };
+                self.observe_clone_retry(obj, clone.status.as_ref().and_then(|status| status.retry.clone())).await?;
                 if clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
                     if clone.status.as_ref().and_then(|status| status.failure_policy) == Some(CloneFailurePolicy::Terminal) {
                         let message = clone

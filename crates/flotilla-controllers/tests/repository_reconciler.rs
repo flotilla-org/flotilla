@@ -107,6 +107,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
             message: None,
             failed_at: None,
             failure_policy: None,
+            retry: None,
         })
         .await
         .expect("clone status");

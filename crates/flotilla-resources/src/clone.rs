@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey};
+use crate::{resource::define_resource, status_patch::StatusPatch, ControllerRetry, RepositoryKey, RetryBackoff};
 
 define_resource!(Clone, "clones", CloneSpec, CloneStatus, CloneStatusPatch);
 
@@ -39,7 +41,11 @@ pub struct CloneStatus {
     /// Absent on legacy failures, which remain eligible for renewed-demand retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<CloneFailurePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ControllerRetry>,
 }
+
+const CLONE_BACKOFF: RetryBackoff = RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloneStatusPatch {
@@ -57,12 +63,14 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
                 status.message = None;
                 status.failed_at = None;
                 status.failure_policy = None;
+                status.retry = None;
             }
             Self::MarkRetrying { message } => {
                 status.phase = ClonePhase::Cloning;
                 status.message = Some(message.clone());
                 status.failed_at = None;
                 status.failure_policy = None;
+                status.retry = Some(ControllerRetry::retryable(status.retry.as_ref(), Utc::now(), CLONE_BACKOFF));
             }
             Self::MarkReady { default_branch } => {
                 status.phase = ClonePhase::Ready;
@@ -70,12 +78,14 @@ impl StatusPatch<CloneStatus> for CloneStatusPatch {
                 status.message = None;
                 status.failed_at = None;
                 status.failure_policy = None;
+                status.retry = None;
             }
             Self::MarkFailed { message, failed_at } => {
                 status.phase = ClonePhase::Failed;
                 status.message = Some(message.clone());
                 status.failed_at = Some(*failed_at);
                 status.failure_policy = Some(CloneFailurePolicy::Terminal);
+                status.retry = Some(ControllerRetry::terminal(status.retry.as_ref(), *failed_at, message.clone()));
             }
         }
     }

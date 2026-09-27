@@ -11,13 +11,13 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
-    select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
-    HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
-    StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
-    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, Convoy, ConvoyAttention, ConvoyLeafSubject,
+    ConvoyPhase, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung,
+    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -941,19 +941,23 @@ impl ReconcilerWake {
                         }
                         reason.map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::Observation)))
                     }
-                    LeafMaker::Controller { disposition, .. } => match disposition {
-                        flotilla_resources::ControllerRetryDisposition::Retryable { .. } => Ok(()),
-                        flotilla_resources::ControllerRetryDisposition::Terminal { needs } => {
-                            Err((needs.clone(), StallEvidenceSource::LeafEngine))
-                        }
-                    },
+                    LeafMaker::Controller { retry, ceiling, .. } => {
+                        retry.stall_reason(now, *ceiling).map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::LeafEngine)))
+                    }
                 };
                 match judgement {
                     Ok(()) => {
                         able = true;
-                        break;
+                        continue;
                     }
-                    Err((evidence, source)) => unable.get_or_insert((row, evidence, source)),
+                    Err((evidence, source)) => {
+                        if matches!(row.maker, LeafMaker::Controller { .. }) {
+                            unable = Some((row, evidence, source));
+                            able = false;
+                            break;
+                        }
+                        unable.get_or_insert((row, evidence, source))
+                    }
                 };
             }
             if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted) && !able && holding {
@@ -1199,6 +1203,8 @@ impl ReconcilerWake {
         let listed_convoys = convoys.list().await.map_err(|error| error.to_string())?;
         let mut convoy_watch = convoys.watch(WatchStart::resuming_from(&listed_convoys)).await.map_err(|error| error.to_string())?;
         let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
+        let mut vessel_watch =
+            self.subscriptions.inner.backend.including_replicas::<Vessel>(&namespace).watch().await.map_err(|error| error.to_string())?;
         let mut convoy_objects =
             listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
@@ -1229,6 +1235,10 @@ impl ReconcilerWake {
                     event.ok_or_else(|| "reconciler wake checkout watch closed".to_string())?.map_err(|error| error.to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
+                event = vessel_watch.next() => {
+                    event.ok_or_else(|| "reconciler wake vessel watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    self.sync_rows(&namespace, &convoy_objects).await?;
+                }
                 wake = wake_rx.recv() => match wake {
                     Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1254,6 +1264,8 @@ impl ReconcilerWake {
             .await
             .map_err(|error| error.to_string())?
             .items;
+        let vessel_sources =
+            self.subscriptions.inner.backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().filter(|convoy| {
             convoy
@@ -1262,6 +1274,61 @@ impl ReconcilerWake {
                 .is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
+            let checkouts = select_convoy_children(convoy, &checkout_sources);
+            for checkout in checkouts.values() {
+                let CheckoutSpec::Worktree(spec) = &checkout.spec else { continue };
+                let Some(retry) = checkout.status.as_ref().and_then(|status| status.clone_retry.clone()) else { continue };
+                desired.push(LeafSubscriptionRow {
+                    id: uuid::Uuid::nil(),
+                    namespace: namespace.to_string(),
+                    leaves: vec![Leaf {
+                        address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
+                        field_path: ".status.phase".into(),
+                        operator: LeafOperator::Equal,
+                        literal: "Landed".into(),
+                    }],
+                    watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                    maker: LeafMaker::Controller {
+                        resource_kind: "Clone".into(),
+                        name: Some(spec.clone_ref.clone()),
+                        retry,
+                        ceiling: RetryCeiling::default(),
+                    },
+                    freshness_demand: None,
+                    created_at: Utc::now(),
+                    episode_key: EpisodeKeyFields::default(),
+                });
+            }
+            for vessel in select_convoy_children(convoy, &vessel_sources).values() {
+                let Some(vessel_status) = vessel.status.as_ref() else { continue };
+                let Some(environment_ref) = vessel_status.environment_ref.as_ref() else { continue };
+                for (kind, retry) in [
+                    ("CredentialDelivery", vessel_status.credential_delivery_retry.as_ref()),
+                    ("CredentialRefresh", vessel_status.credential_refresh_retry.as_ref()),
+                ] {
+                    let Some(retry) = retry else { continue };
+                    desired.push(LeafSubscriptionRow {
+                        id: uuid::Uuid::nil(),
+                        namespace: namespace.to_string(),
+                        leaves: vec![Leaf {
+                            address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
+                            field_path: ".status.phase".into(),
+                            operator: LeafOperator::Equal,
+                            literal: "Landed".into(),
+                        }],
+                        watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                        maker: LeafMaker::Controller {
+                            resource_kind: kind.into(),
+                            name: Some(environment_ref.clone()),
+                            retry: retry.clone(),
+                            ceiling: RetryCeiling::default(),
+                        },
+                        freshness_demand: None,
+                        created_at: Utc::now(),
+                        episode_key: EpisodeKeyFields::default(),
+                    });
+                }
+            }
             if status.phase == ConvoyPhase::Active {
                 if let Some(stalled) = status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some()) {
                     if let Some(maker @ LeafMaker::Supervisor { .. }) = &stalled.maker {
@@ -1322,7 +1389,6 @@ impl ReconcilerWake {
                 }
                 continue;
             }
-            let checkouts = select_convoy_children(convoy, &checkout_sources);
             let exit = match instantiate_exit(convoy, &checkouts) {
                 Ok(exit) => exit,
                 Err(error) => {
@@ -1642,10 +1708,10 @@ mod tests {
     use flotilla_protocol::{LeafAddress, LeafOperator};
     use flotilla_resources::{
         controller::ControllerLoop, BoundChangeRequest, ChangeRequestObservation, ChangeRequestState, CheckoutIntegrationStatus,
-        CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
-        ConvoyStatus, CrewWorkPhase, CrewWorkState, ExitDeclaration, InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority,
-        ObservedCheckoutSpec, PlacementStatus, RepositoryKey, SqliteBackend, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-        CONVOY_LABEL,
+        CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, ControllerRetry, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec,
+        ConvoySpec, ConvoyStatus, CrewWorkPhase, CrewWorkState, ExitDeclaration, InMemoryBackend, InputMeta, IntegrationCondition,
+        LifecycleAuthority, ObservedCheckoutSpec, PlacementStatus, RepositoryKey, SqliteBackend, WorkPhase, WorkState, WorkflowSnapshot,
+        WorkflowTemplate, CONVOY_LABEL,
     };
 
     use super::*;
@@ -1766,6 +1832,119 @@ mod tests {
         let convoys = backend.using::<Convoy>("flotilla");
         let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &convoy_spec()).await.expect("create convoy");
         convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("write convoy status");
+    }
+
+    #[tokio::test]
+    async fn credential_delivery_and_clone_controller_rows_judge_transient_terminal_and_exhausted_failures() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "test-host".to_string(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let wake = ReconcilerWake { subscriptions: LeafSubscriptionTable::new(backend.clone(), event_tx, refresher), _marker: PhantomData };
+        create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let vessels = backend.using::<Vessel>("flotilla");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder()
+                    .name("delivery-work".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "delivery".to_string())]))
+                    .build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "delivery".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "test".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessels
+            .update_status("delivery-work", &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
+                environment_ref: Some("delivery-env".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("place vessel");
+        let now = Utc::now();
+        let backoff = flotilla_resources::RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) };
+        let scenarios = [
+            (ControllerRetry::retryable(None, now, backoff), None),
+            (ControllerRetry::terminal(None, now, "credential spec does not decode"), Some("credential spec does not decode")),
+            (
+                ControllerRetry {
+                    attempts: RetryCeiling::default().attempts,
+                    first_failure_at: now,
+                    disposition: flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at: now },
+                },
+                Some("retrying without progress"),
+            ),
+        ];
+        for (retry, expected) in scenarios {
+            flotilla_resources::apply_status_patch(&vessels, "delivery-work", &flotilla_resources::VesselStatusPatch::CredentialDelivery {
+                retry: Some(retry),
+            })
+            .await
+            .expect("record delivery retry");
+            let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
+            let objects = HashMap::from([("delivery".to_string(), convoy)]);
+            wake.sync_rows("flotilla", &objects).await.expect("arm controller row");
+            wake.judge_stalls("flotilla", &objects).await.expect("judge controller row");
+            let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
+            assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
+        }
+        flotilla_resources::apply_status_patch(&vessels, "delivery-work", &flotilla_resources::VesselStatusPatch::CredentialDelivery {
+            retry: None,
+        })
+        .await
+        .expect("clear credential retry");
+        let checkouts = backend.using::<Checkout>("flotilla");
+        checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("delivery-checkout".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "delivery".to_string())]))
+                    .build(),
+                &CheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                    repo_ref: RepositoryKey("repo".into()),
+                    env_ref: "delivery-env".into(),
+                    r#ref: "main".into(),
+                    base_ref: None,
+                    target_path: "/tmp/checkout".into(),
+                    clone_ref: "delivery-clone".into(),
+                }),
+            )
+            .await
+            .expect("worktree checkout");
+        for (retry, expected) in [
+            (ControllerRetry::retryable(None, now, backoff), None),
+            (ControllerRetry::terminal(None, now, "repository not found"), Some("repository not found")),
+            (
+                ControllerRetry {
+                    attempts: RetryCeiling::default().attempts,
+                    first_failure_at: now,
+                    disposition: flotilla_resources::ControllerRetryDisposition::Retryable { next_attempt_at: now },
+                },
+                Some("retrying without progress"),
+            ),
+        ] {
+            flotilla_resources::apply_status_patch(
+                &checkouts,
+                "delivery-checkout",
+                &flotilla_resources::CheckoutStatusPatch::ObserveCloneRetry { retry: Some(retry) },
+            )
+            .await
+            .expect("project clone retry");
+            let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
+            let objects = HashMap::from([("delivery".to_string(), convoy)]);
+            wake.sync_rows("flotilla", &objects).await.expect("arm clone controller row");
+            wake.judge_stalls("flotilla", &objects).await.expect("judge clone controller row");
+            let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
+            assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);
+        }
     }
 
     async fn update_convoy(backend: &ResourceBackend, name: &str, update: impl FnOnce(&mut ConvoyStatus)) {

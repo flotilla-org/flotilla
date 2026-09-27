@@ -90,6 +90,8 @@ async fn vessel_metadata_and_status_roundtrip() {
             requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
             effective_stance: Some(flotilla_resources::Stance::Contained),
             held_credentials: Default::default(),
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
         })
         .await
         .expect("status update should succeed");
