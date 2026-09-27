@@ -3403,6 +3403,18 @@ impl InProcessDaemon {
         self.leaf_subscriptions.change_request_stale_after()
     }
 
+    pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+        self.leaf_subscriptions.refresh_change_request_hint(hint).await
+    }
+
+    pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
+        self.leaf_subscriptions.refresh_demanded_owned_change_requests().await
+    }
+
+    pub fn set_change_request_relay_healthy(&self, healthy: bool) {
+        self.leaf_subscriptions.set_change_request_relay_healthy(healthy);
+    }
+
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
         self.regard_lifecycle.connect_surface(surface_id, declaration);
     }

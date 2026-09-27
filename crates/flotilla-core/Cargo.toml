@@ -13,6 +13,7 @@ test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-suppo
 [dependencies]
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -139,6 +139,26 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+## Event relay
+
+To receive change-request hints, configure each daemon separately in its
+`~/.config/flotilla/daemon.toml`:
+
+```toml
+[relay]
+endpoint = "https://relay.example.org"
+install_id = "my-install"
+consumer_token_file = "/home/user/.config/flotilla/relay-consumer-token"
+```
+
+The token file contains only the install's consumer token. Keep it readable
+only by the daemon's account. Flotilla reads it on each connection, so rotation
+takes effect on reconnect. This daemon-owned file is never staged to crews.
+The daemon stores its mailbox cursor under its state directory. It tries a
+WebSocket first and uses long polling if the upgrade is unavailable. A healthy
+connection slows change-request polling to a 15-minute backstop; disconnects
+and retention gaps trigger a full refresh of locally owned demanded subjects.
+
 ## Credential health
 
 Each daemon's heartbeat probes expiry metadata for held credential material

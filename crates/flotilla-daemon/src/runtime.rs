@@ -504,7 +504,9 @@ impl DaemonRuntime {
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
         let aggregator_projection_state = daemon.aggregator_projection_state().await;
-        let manifests = config.load_daemon_config()?.manifests;
+        let daemon_config = config.load_daemon_config()?;
+        let manifests = daemon_config.manifests;
+        let relay = daemon_config.relay;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -597,6 +599,9 @@ impl DaemonRuntime {
                 runtime_health.clone(),
             ),
         ];
+        if let Some(relay) = relay {
+            tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
+        }
         for ssh in &ssh_profiles {
             let daemon = Arc::clone(&daemon);
             let namespace = options.namespace.clone();
