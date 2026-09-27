@@ -103,6 +103,8 @@ pub async fn create_convoy_with_single_task(
     convoys
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                // This generic fixture has no exit. Tests that expect a dispatched
+                // agent brief must declare one on their pinned workflow snapshot.
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
