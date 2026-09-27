@@ -206,6 +206,41 @@ vessels:
 }
 
 #[test]
+fn turn_delivery_rejects_invalid_typed_literals_before_leaf_admission() {
+    for (condition, expected_reason) in [
+        ("$issue.updated-at > not-a-date", "invalid timestamp literal `not-a-date`"),
+        ("$issue.labels.ready == yes", "issue label leaf literal must be `true` or `false`"),
+    ] {
+        let yaml = format!(
+            r#"
+turn_delivery:
+  issue-change:
+    on: {condition}
+    to:
+      vessel: implement
+      role: coder
+    brief: Respond to the issue.
+    hold:
+      kind: change-request-comment
+      body: Automatic delivery paused.
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#
+        );
+        let errors = validate(&parse_spec(&yaml)).expect_err("invalid typed literal should reject the template");
+        assert!(
+            errors.iter().any(|error| matches!(error, ValidationError::InvalidTurnDeliveryLiteral { source, template, reason }
+            if source == "issue-change" && template == condition && reason.contains(expected_reason))),
+            "unexpected errors: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn issue_exit_is_rejected_and_issue_subjects_follow_relay_casing() {
     let spec = parse_spec(
         r#"
