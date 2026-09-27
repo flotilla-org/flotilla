@@ -15,9 +15,9 @@ use flotilla_resources::{
     HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend,
     ResourceError, ResourceObject, ResourceProvenance, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
     StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
+    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -1141,7 +1141,7 @@ impl ReconcilerWake {
                                     .vessel(target_vessel.clone())
                                     .role(target_role.clone())
                                     .brief(brief)
-                                    .head_sha(condition.began_at.timestamp_micros().to_string())
+                                    .subject_revision(condition.began_at.timestamp_micros().to_string())
                                     .build();
                                 if convoys.contains_key(&target_convoy) {
                                     if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await
