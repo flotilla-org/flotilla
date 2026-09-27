@@ -2113,7 +2113,7 @@ impl Aggregator {
                     .collect()
             })
             .unwrap_or_default();
-        let reclaim_refusal = self.demands.values().find(|demand| {
+        let attention_demand = self.demands.values().find(|demand| {
             let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
             let target = &demand.spec.originating_work_ref;
             matches!(state, DemandState::Raised | DemandState::Escalated)
@@ -2121,9 +2121,10 @@ impl Aggregator {
                 && target.kind == resource.kind
                 && target.namespace == resource.namespace
                 && target.name == resource.name
-                && demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                    || demand.metadata.annotations.contains_key("flotilla.work/credential-refresh-reason"))
         });
-        let needs_attention = reclaim_refusal.is_some() || vessels.iter().any(|vessel| vessel.needs_attention);
+        let needs_attention = attention_demand.is_some() || vessels.iter().any(|vessel| vessel.needs_attention);
         ConvoyRow::builder()
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
@@ -2136,8 +2137,15 @@ impl Aggregator {
             .maybe_placement_decision(status.and_then(|status| status.placement_decision.clone()))
             .initializing(convoy_is_initializing(status))
             .maybe_message(
-                reclaim_refusal
-                    .and_then(|demand| demand.metadata.annotations.get(RECLAIM_REFUSAL_REASON_ANNOTATION).cloned())
+                attention_demand
+                    .and_then(|demand| {
+                        demand
+                            .metadata
+                            .annotations
+                            .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                            .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
+                            .cloned()
+                    })
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
             .maybe_disposition(status.and_then(|status| status.disposition.clone()))
@@ -2222,7 +2230,17 @@ impl Aggregator {
             .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
             .min_by_key(|pending| pending.attempted_at)
             .cloned();
-        let needs_attention = completion_pending.is_some()
+        let credential_attention = self.demands.values().find(|demand| {
+            demand.spec.originating_work_ref.namespace == convoy_ref.namespace
+                && demand.spec.originating_work_ref.name == convoy_ref.name
+                && demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel") == Some(&definition.name)
+                && matches!(
+                    demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
+                    DemandState::Raised | DemandState::Escalated
+                )
+        });
+        let needs_attention = credential_attention.is_some()
+            || completion_pending.is_some()
             || matching_sessions().any(|session| {
                 session.object.status.as_ref().is_some_and(|status| {
                     status.phase == TerminalSessionPhase::Running
@@ -2243,9 +2261,13 @@ impl Aggregator {
             .maybe_started_at(state.and_then(|state| state.started_at))
             .maybe_finished_at(state.and_then(|state| state.finished_at))
             .maybe_message(
-                completion_pending
-                    .map(|pending| format!("completion pending: {}", pending.last_error))
-                    .or_else(|| state.and_then(|state| state.message.clone())),
+                credential_attention
+                    .and_then(|demand| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned())
+                    .or_else(|| {
+                        completion_pending
+                            .map(|pending| format!("completion pending: {}", pending.last_error))
+                            .or_else(|| state.and_then(|state| state.message.clone()))
+                    }),
             )
             .requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
@@ -2505,6 +2527,41 @@ mod tests {
         aggregator.prune_expired_regards(now + chrono::Duration::seconds(5));
         assert_eq!(aggregator.regards.len(), 1);
         assert_eq!(aggregator.next_regard_expiry_delay_at(now + chrono::Duration::seconds(5)), None);
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_demand_marks_convoy_and_vessel_until_deleted() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let query = QueryId::Convoys { scope: None };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query, since: None }]);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+        let mut demand = ResourceObject {
+            metadata: attention_meta("credential-refresh-vessel-github-app", Utc::now()),
+            spec: DemandSpec::for_dispatching_principal(
+                ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a"),
+                DemandKind::HumanGate,
+                AttentionPrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+            status: None,
+        };
+        demand.metadata.annotations = BTreeMap::from([
+            ("flotilla.work/credential-refresh-reason".to_string(), "credential `github-app` failed; expires in 120 seconds".to_string()),
+            ("flotilla.work/credential-refresh-vessel".to_string(), "implement".to_string()),
+        ]);
+        aggregator.apply_demand_event(WatchEvent::Added(demand.clone())).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert!(convoy.needs_attention);
+        assert!(convoy.vessels[0].needs_attention);
+        assert!(convoy.vessels[0].message.as_deref().is_some_and(|message| message.contains("github-app")));
+
+        aggregator.apply_demand_event(WatchEvent::Deleted(demand)).await;
+        let result_set = state.result_set().await;
+        let convoy = &result_set.rows.as_convoys().expect("convoy rows")[0];
+        assert!(!convoy.needs_attention);
+        assert!(!convoy.vessels[0].needs_attention);
     }
 
     #[tokio::test]

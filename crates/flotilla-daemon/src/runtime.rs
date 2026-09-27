@@ -1948,11 +1948,12 @@ fn spawn_heartbeat_task_with_credentials(
         let runtime_health = runtime_health.clone();
         async move {
             if let Some(store) = credential_store.as_ref().as_ref() {
-                for error in store.refresh_due_github_app_tokens().await {
+                let errors = store.refresh_due_github_app_tokens().await;
+                for error in &errors {
                     warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
-                    if let Err(status_error) = surface_credential_refresh_error(&daemon, &namespace, &error).await {
-                        warn!(%status_error, environment = %error.environment_ref, "failed to surface credential refresh failure");
-                    }
+                }
+                if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors).await {
+                    warn!(%status_error, "failed to reconcile credential refresh attention");
                 }
             }
             if let Err(err) =
@@ -1993,18 +1994,82 @@ fn spawn_codex_central_refresh_task(env: Arc<dyn EnvVars>, interval: Duration) -
     })
 }
 
-async fn surface_credential_refresh_error(daemon: &InProcessDaemon, namespace: &str, error: &CredentialRefreshError) -> Result<(), String> {
-    if !error.should_surface {
-        return Ok(());
+const CREDENTIAL_REFRESH_REASON_ANNOTATION: &str = "flotilla.work/credential-refresh-reason";
+const CREDENTIAL_REFRESH_VESSEL_ANNOTATION: &str = "flotilla.work/credential-refresh-vessel";
+
+async fn reconcile_credential_refresh_attention(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    errors: &[CredentialRefreshError],
+) -> Result<(), String> {
+    let backend = daemon.resource_backend();
+    let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
+    let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
+    let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
+    let demands = backend.using::<Demand>(namespace);
+    let existing = demands.list().await.map_err(|error| error.to_string())?;
+    let mut desired = BTreeMap::new();
+    let mut still_failing = BTreeSet::new();
+    for error in errors {
+        let Some(credential) = error.credential_name.as_ref() else { continue };
+        for vessel in &vessels.items {
+            if vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) != Some(&error.environment_ref) {
+                continue;
+            }
+            let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
+            let holds_credential = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| {
+                snapshot
+                    .vessels
+                    .iter()
+                    .any(|requirement| requirement.name == vessel.spec.vessel_name && requirement.credential_refs.contains(credential))
+            });
+            if !holds_credential {
+                continue;
+            }
+            let name = format!("credential-refresh-{}-{credential}", vessel.metadata.name);
+            still_failing.insert(name.clone());
+            if !error.should_surface {
+                continue;
+            }
+            let target = flotilla_protocol::ResourceRef::new(
+                flotilla_resources::api_version(Convoy::API_PATHS),
+                Convoy::API_PATHS.kind,
+                namespace,
+                &convoy.metadata.name,
+            );
+            let spec = DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, convoy.spec.dispatching_principal_ref.clone());
+            let meta = InputMeta::builder()
+                .name(name.clone())
+                .annotations(BTreeMap::from([
+                    (CREDENTIAL_REFRESH_REASON_ANNOTATION.to_string(), error.message.clone()),
+                    (CREDENTIAL_REFRESH_VESSEL_ANNOTATION.to_string(), vessel.spec.vessel_name.clone()),
+                ]))
+                .build();
+            desired.insert(name, (meta, spec));
+        }
     }
-    flotilla_resources::apply_status_patch(
-        &daemon.resource_backend().using::<Environment>(namespace),
-        &error.environment_ref,
-        &EnvironmentStatusPatch::MarkFailed { message: format!("Credential delivery recovery failed: {}", error.message) },
-    )
-    .await
-    .map(|_| ())
-    .map_err(|status_error| status_error.to_string())
+    for demand in existing.items {
+        if !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION) {
+            continue;
+        }
+        if let Some((meta, spec)) = desired.remove(&demand.metadata.name) {
+            if !matches!(
+                demand.status.as_ref().map_or(flotilla_resources::DemandState::Raised, |status| status.state),
+                flotilla_resources::DemandState::Raised | flotilla_resources::DemandState::Escalated
+            ) {
+                demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
+                demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
+            } else if demand.metadata.annotations != meta.annotations || demand.spec != spec {
+                demands.update(&meta, &demand.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+            }
+        } else if !still_failing.contains(&demand.metadata.name) {
+            demands.delete(&demand.metadata.name).await.map_err(|error| error.to_string())?;
+        }
+    }
+    for (_, (meta, spec)) in desired {
+        demands.create(&meta, &spec).await.map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4598,54 +4663,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_credential_refresh_failure_is_surfaced_but_a_transient_failure_is_not() {
+    async fn credential_refresh_attention_appears_and_clears_on_recovery() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"credential-refresh-test\"\n").expect("daemon config");
-        let config = Arc::new(ConfigStore::with_base(temp.path()));
-        let daemon = in_memory_daemon(Vec::new(), config).await;
-        let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
-        environments
-            .create(&InputMeta::builder().name("standing-vessel".to_string()).build(), &EnvironmentSpec {
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    host_ref: "host-test".to_string(),
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let backend = daemon.resource_backend();
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("credential-convoy"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+            .await
+            .expect("create convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .credential_refs(BTreeSet::from(["github-app".to_string()]))
+                        .crew(Vec::new())
+                        .build()],
                 }),
+                ..ConvoyStatus::default()
             })
             .await
-            .expect("create environment");
-        flotilla_resources::apply_status_patch(&environments, "standing-vessel", &EnvironmentStatusPatch::MarkReady {
-            docker_container_id: Some("container".to_string()),
-            image_ref: None,
-            image_digest: None,
-        })
-        .await
-        .expect("mark environment ready");
-
-        surface_credential_refresh_error(&daemon, NAMESPACE, &CredentialRefreshError {
+            .expect("set convoy status");
+        let vessels = backend.using::<Vessel>(NAMESPACE);
+        let vessel = vessels
+            .create(&empty_meta("credential-vessel"), &VesselSpec {
+                convoy_ref: "credential-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("create vessel");
+        vessels
+            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some("standing-vessel".to_string()),
+                ..VesselStatus::default()
+            })
+            .await
+            .expect("place vessel");
+        let transient = CredentialRefreshError {
             environment_ref: "standing-vessel".to_string(),
-            message: "temporary outage".to_string(),
+            credential_name: Some("github-app".to_string()),
+            message: "credential `github-app`: outage; expires in 180 seconds".to_string(),
             should_surface: false,
-        })
-        .await
-        .expect("ignore transient failure");
-        assert_eq!(environments.get("standing-vessel").await.expect("environment").status.expect("status").phase, EnvironmentPhase::Ready);
+        };
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[transient]).await.expect("ignore transient failure");
+        let demands = backend.using::<Demand>(NAMESPACE);
+        assert!(demands.list().await.expect("list demands").items.is_empty());
 
-        surface_credential_refresh_error(&daemon, NAMESPACE, &CredentialRefreshError {
+        let persistent = CredentialRefreshError {
             environment_ref: "standing-vessel".to_string(),
-            message: "repeated outage".to_string(),
+            credential_name: Some("github-app".to_string()),
+            message: "credential `github-app`: outage; expires in 120 seconds".to_string(),
             should_surface: true,
+        };
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[persistent]).await.expect("raise attention");
+        let raised = demands.list().await.expect("list demands").items;
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0].metadata.annotations[CREDENTIAL_REFRESH_REASON_ANNOTATION].contains("expires in 120 seconds"));
+        assert_eq!(raised[0].spec.originating_work_ref.name, "credential-convoy");
+        flotilla_resources::apply_status_patch(&demands, &raised[0].metadata.name, &flotilla_resources::DemandStatusPatch::Acknowledge {
+            as_of: chrono::Utc::now(),
+            authority: "operator".to_string(),
         })
         .await
-        .expect("surface repeated failure");
-        let status = environments.get("standing-vessel").await.expect("environment").status.expect("status");
-        assert_eq!(status.phase, EnvironmentPhase::Failed);
-        assert!(status.message.is_some_and(|message| message.contains("repeated outage")));
+        .expect("acknowledge demand");
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[CredentialRefreshError {
+            environment_ref: "standing-vessel".to_string(),
+            credential_name: Some("github-app".to_string()),
+            message: "credential `github-app`: outage; expires in 60 seconds".to_string(),
+            should_surface: true,
+        }])
+        .await
+        .expect("keep persistent failure raised");
+        assert_eq!(
+            demands.list().await.expect("list demands").items[0]
+                .status
+                .as_ref()
+                .map_or(flotilla_resources::DemandState::Raised, |status| status.state),
+            flotilla_resources::DemandState::Raised
+        );
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[CredentialRefreshError {
+            environment_ref: "standing-vessel".to_string(),
+            credential_name: Some("github-app".to_string()),
+            message: "credential `github-app`: outage; expired 5 seconds ago".to_string(),
+            should_surface: false,
+        }])
+        .await
+        .expect("retain alert during retry after restart");
+        assert_eq!(demands.list().await.expect("list demands").items.len(), 1);
+        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[]).await.expect("clear on recovery");
+        assert!(demands.list().await.expect("list demands").items.is_empty());
     }
 
     /// #1413 leg 1: once the convoy is Landed, the checkout authority's

@@ -1560,6 +1560,7 @@ mod tests {
                     model: None,
                     stance: Some("trusted-implicit".into()),
                 }],
+                credential_alerts: Vec::new(),
             })),
             CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
                 host: crate::HostName::new("desktop"),

@@ -8664,6 +8664,24 @@ impl InProcessDaemon {
             .into_iter()
             .map(|session| (session.spec.role.clone(), session))
             .collect();
+        let credential_alerts = self
+            .resource_backend
+            .clone()
+            .using::<ResourceDemand>(&context.namespace)
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .filter(|demand| demand.metadata.name.starts_with(&format!("credential-refresh-{}-", context.vessel_ref)))
+            .filter(|demand| {
+                matches!(
+                    demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
+                    DemandState::Raised | DemandState::Escalated
+                )
+            })
+            .filter_map(|demand| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned())
+            .collect::<Vec<_>>();
         let members = task
             .crew
             .iter()
@@ -8700,6 +8718,7 @@ impl InProcessDaemon {
             .vessel_ref(context.vessel_ref)
             .vessel(context.vessel)
             .members(members)
+            .credential_alerts(credential_alerts)
             .build())
     }
 

@@ -661,7 +661,8 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
             Cell::new(member.stance.as_deref().unwrap_or("-")),
         ]);
     }
-    format!("Convoy: {}  Vessel: {} ({})\n{}\n", response.convoy, response.vessel, response.vessel_ref, table)
+    let alerts = response.credential_alerts.iter().map(|alert| format!("Credential attention: {alert}\n")).collect::<String>();
+    format!("Convoy: {}  Vessel: {} ({})\n{}\n{alerts}", response.convoy, response.vessel, response.vessel_ref, table)
 }
 
 fn explained_condition_label(condition: Option<&flotilla_protocol::ExplainedCondition>) -> String {
