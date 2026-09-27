@@ -11,7 +11,7 @@ use flotilla_core::providers::{
         runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
         ProvisionedMount, ProvisionedMountMode,
     },
-    vcs::skill_source::stage_git_skill_sources,
+    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX},
     ChannelLabel, CommandRunner,
 };
 use tokio::{fs, io::AsyncWriteExt};
@@ -472,12 +472,7 @@ impl SkillBundle {
         let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
             .await
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
-        let mut args = vec![
-            "flotilla-stage-skills".to_string(),
-            format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
-            String::new(),
-            String::new(),
-        ];
+        let mut args = vec![format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"), String::new(), String::new()];
         for source in &inspection.sources {
             let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
             args.extend([
@@ -492,8 +487,8 @@ impl SkillBundle {
         }
         let destination_count = destinations.len();
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
-            args[2] = destination.to_string_lossy().into_owned();
-            args[3] = (index + 1 == destination_count).to_string();
+            args[1] = destination.to_string_lossy().into_owned();
+            args[2] = (index + 1 == destination_count).to_string();
             let result = stage_git_skill_sources(runner, &args).await;
             result.map_err(|error| skill_stage_error(environment_ref, &error))?;
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
@@ -503,13 +498,12 @@ impl SkillBundle {
 }
 
 fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
-    const DIAGNOSTIC_PREFIX: &str = "flotilla-stage-skills: ";
     // A git child can write to the shared stderr pipe after the script reports
     // its failure, so prefer the script's marked diagnostic regardless of order.
     let reason = stderr
         .lines()
         .rev()
-        .find_map(|line| line.strip_prefix(DIAGNOSTIC_PREFIX))
+        .find_map(|line| line.strip_prefix(STAGE_DIAGNOSTIC_PREFIX))
         .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("skill staging command failed");
     format!("stage generation-pinned skills for {environment_ref}: {reason}")
