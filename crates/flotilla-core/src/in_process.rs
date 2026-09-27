@@ -164,7 +164,12 @@ fn issue_source_for_subject(
         if !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") && subject.service != "localhost" {
             return Err(format!("issue service `{}` has no Forge declaration or host-derived address", subject.service));
         }
-        format!("https://{}", subject.service.replace("%2f", "/").replace("%25", "%"))
+        let location = subject.service.replace("%2f", "/").replace("%3a", ":").replace("%25", "%");
+        if location.contains("://") {
+            location
+        } else {
+            format!("https://{location}")
+        }
     };
     Ok(flotilla_protocol::IssueSource { service, scope: subject.scope.clone() })
 }

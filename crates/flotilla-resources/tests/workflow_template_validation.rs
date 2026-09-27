@@ -315,6 +315,16 @@ fn issue_subjects_distinguish_installations_on_one_host() {
 }
 
 #[test]
+fn undeclared_issue_subjects_keep_non_https_schemes_distinct() {
+    let reference = |scheme: &str| IssueRef {
+        source: IssueSource { service: format!("{scheme}://tracker.example/root"), scope: "Team/Repo".into() },
+        id: "12".into(),
+    };
+    assert_eq!(issue_address(&reference("https")).expect("https").to_string(), "issue/tracker.example%2froot/Team/Repo/12");
+    assert_eq!(issue_address(&reference("http")).expect("http").to_string(), "issue/http%3a%2f%2ftracker.example%2froot/Team/Repo/12");
+}
+
+#[test]
 fn stock_workflows_transcribe_the_standard_exit_table() {
     let expected = Some(ExitDeclaration::standard_table());
     for spec in [
