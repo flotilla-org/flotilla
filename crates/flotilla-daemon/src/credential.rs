@@ -1210,9 +1210,9 @@ impl CredentialStore {
     fn refresh_failure_message(&self, name: &str, expires_at: DateTime<Utc>, error: &str) -> String {
         let remaining = expires_at - self.clock.now();
         let expiry = if remaining <= Duration::zero() {
-            format!("expired {} seconds ago", -remaining.num_seconds())
+            format!("expired {} minutes ago", (-remaining.num_seconds()).saturating_add(59) / 60)
         } else {
-            format!("expires in {} seconds", remaining.num_seconds())
+            format!("expires in {} minutes", remaining.num_seconds().saturating_add(59) / 60)
         };
         format!("{}; {expiry}", bounded_adapter_error(name, "github-app", error))
     }
