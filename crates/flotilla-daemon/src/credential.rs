@@ -1809,20 +1809,31 @@ async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> 
     let mut entries = tokio::fs::read_dir(directory)
         .await
         .map_err(|error| format!("list credential staging files in {}: {error}", directory.display()))?;
+    let mut errors = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
         let name = entry.file_name();
         let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
-        if uuid::Uuid::parse_str(suffix).is_err()
-            || !entry.file_type().await.map_err(|error| format!("inspect staging file: {error}"))?.is_file()
-        {
+        if uuid::Uuid::parse_str(suffix).is_err() {
             continue;
         }
+        match entry.file_type().await {
+            Ok(file_type) if !file_type.is_file() => continue,
+            Err(error) => {
+                errors.push(format!("inspect staging file {}: {error}", entry.path().display()));
+                continue;
+            }
+            Ok(_) => {}
+        }
         let path = entry.path();
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| format!("remove stale GitHub App token staging file {}: {error}", path.display()))?;
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            errors.push(format!("remove stale GitHub App token staging file {}: {error}", path.display()));
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRunner, base: &Path) -> Result<(), String> {
