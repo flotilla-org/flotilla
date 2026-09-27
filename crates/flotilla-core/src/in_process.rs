@@ -134,6 +134,11 @@ use crate::{
 };
 
 type ObservationScope = (String, String, String);
+
+fn forge_service_matches(service_url: &str, service: &str) -> bool {
+    service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
+}
+
 struct CachedObservation {
     expires_at: tokio::time::Instant,
     queried: BTreeSet<u64>,
@@ -169,15 +174,16 @@ impl ProviderChangeRequestObservationSource {
         let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("change request observation daemon unavailable")?;
         let repositories =
             daemon.resource_backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
-        let repository = repositories
-            .items
-            .into_iter()
-            .find(|repository| {
-                repository.object.spec.forge().is_some_and(|forge| {
-                    forge.repository == subject.scope && forge.service_url.trim_end_matches('/') == format!("https://{}", subject.service)
+        let repository =
+            repositories
+                .items
+                .into_iter()
+                .find(|repository| {
+                    repository.object.spec.forge().is_some_and(|forge| {
+                        forge.repository == subject.scope && forge_service_matches(&forge.service_url, &subject.service)
+                    })
                 })
-            })
-            .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
+                .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
         for convoy in daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)

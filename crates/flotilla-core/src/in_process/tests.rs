@@ -597,7 +597,8 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         .expect("gh discovery");
     let mut subjects = Vec::new();
     for (scope, ids) in [("team/one", vec![1, 2, 3]), ("team/two", vec![4, 5])] {
-        let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
+        let scheme = if scope == "team/one" { "http" } else { "https" };
+        let repository = RepositorySpec::remote(format!("{scheme}://github.com/{scope}")).expect("repository");
         let repository_key = repository.key();
         backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
         for id in ids {
@@ -651,6 +652,13 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         .expect_err("second repository remains rate limited");
     runner.release_one.notify_one();
     blocked.await.expect("first observation task").expect("first repository resumes");
+}
+
+#[test]
+fn observation_service_matching_preserves_http_and_authority_port() {
+    assert!(forge_service_matches("http://forgejo.local:3000", "forgejo.local:3000"));
+    assert!(forge_service_matches("https://github.com/", "github.com"));
+    assert!(!forge_service_matches("http://forgejo.local:3000", "forgejo.local:3001"));
 }
 
 #[tokio::test]
