@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
-use flotilla_resources::{TerminalAttentionState, TerminalBrief};
+use flotilla_resources::{Convoy, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -129,7 +129,7 @@ pub struct CrewBriefRenderOptions {
 impl CrewBriefRenderOptions {
     /// The pinned exit declaration is the same signal used by convoy exit
     /// instantiation: an absent declaration keeps the convoy standing.
-    pub fn for_convoy(mut self, convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>) -> Self {
+    fn for_convoy(mut self, convoy: &ResourceObject<Convoy>) -> Self {
         self.is_standing = convoy.metadata.annotations.contains_key(crate::ops_entry::ENSURED_FROM_ANNOTATION)
             || convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| snapshot.exit.is_none());
         self
@@ -168,7 +168,8 @@ struct CrewBriefTemplateContext<'a> {
     is_standing: bool,
 }
 
-pub fn build_crew_brief(
+#[cfg(test)]
+fn build_crew_brief(
     context: &flotilla_resources::TerminalCrewContext,
     vessel: &str,
     role: &str,
@@ -179,7 +180,7 @@ pub fn build_crew_brief(
         .expect("built-in crew brief template should render")
 }
 
-pub fn build_crew_brief_with_options(
+fn build_crew_brief_with_options(
     context: &flotilla_resources::TerminalCrewContext,
     vessel: &str,
     role: &str,
@@ -214,6 +215,20 @@ pub fn build_crew_brief_with_options(
         content.push('\n');
     }
     Ok(flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() })
+}
+
+/// Production entry point: deriving the standing variant from the convoy here
+/// keeps call sites from accidentally rendering a dispatched brief for one.
+pub fn build_convoy_crew_brief_with_options(
+    convoy: &ResourceObject<Convoy>,
+    context: &flotilla_resources::TerminalCrewContext,
+    vessel: &str,
+    role: &str,
+    assignment: CrewAssignment<'_>,
+    members: &[CrewBriefMember],
+    options: &CrewBriefRenderOptions,
+) -> Result<flotilla_resources::TerminalBrief, String> {
+    build_crew_brief_with_options(context, vessel, role, assignment, members, &options.clone().for_convoy(convoy))
 }
 
 fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBriefTemplateContext<'_>) -> Result<String, String> {
@@ -942,9 +957,9 @@ mod tests {
 
     use crate::{
         agent_adapter::{
-            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
-            CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
-            CLAUDE_MANAGED_SETTINGS_PATH,
+            append_convoy_work_context, build_convoy_crew_brief_with_options, build_crew_brief, build_crew_brief_with_options,
+            AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions,
+            CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -1054,7 +1069,10 @@ mod tests {
 
     #[test]
     fn standing_brief_keeps_the_convoy_active_across_tasks() {
-        let content = build_crew_brief_with_options(
+        let (mut convoy, _) = convoy_brief_fixture();
+        convoy.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        let content = build_convoy_crew_brief_with_options(
+            &convoy,
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
                 convoy: "standing-ops".to_string(),
@@ -1064,7 +1082,7 @@ mod tests {
             "steward",
             CrewAssignment::Unassigned,
             &[CrewBriefMember { role: "steward".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { has_credential_scope: true, is_standing: true, ..CrewBriefRenderOptions::default() },
+            &CrewBriefRenderOptions { has_credential_scope: true, ..CrewBriefRenderOptions::default() },
         )
         .expect("render standing brief")
         .content;
@@ -1345,8 +1363,7 @@ mod tests {
         assert!(!content.contains("No assignment was provided"));
     }
 
-    #[test]
-    fn convoy_work_context_separates_multiple_issue_snapshots() {
+    fn convoy_brief_fixture() -> (ResourceObject<Convoy>, RepositoryKey) {
         let repo_ref = RepositoryKey("repo_widgets".to_string());
         let source = IssueSource { service: "https://github.com".to_string(), scope: "flotilla-org/flotilla".to_string() };
         let issue = |id: &str, title: &str, body: &str| ConvoyIssue {
@@ -1401,6 +1418,12 @@ mod tests {
             },
             status: None,
         };
+        (convoy, repo_ref)
+    }
+
+    #[test]
+    fn convoy_work_context_separates_multiple_issue_snapshots() {
+        let (convoy, repo_ref) = convoy_brief_fixture();
         let mut content = String::new();
         append_convoy_work_context(
             &mut content,
@@ -1414,7 +1437,11 @@ mod tests {
         assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
+    }
 
+    #[test]
+    fn standing_brief_selection_follows_the_pinned_exit_or_ensure() {
+        let (convoy, _) = convoy_brief_fixture();
         let options = CrewBriefRenderOptions::default();
         assert!(!options.clone().for_convoy(&convoy).is_standing);
         let mut declared_exit = convoy.clone();
