@@ -230,6 +230,16 @@ pub enum TerminalAttentionSource {
     Screen,
 }
 
+impl TerminalAttentionSource {
+    /// Delay before a stall judge trusts an idle observation from this source.
+    pub const fn idle_debounce(self) -> chrono::Duration {
+        match self {
+            Self::Hook => chrono::Duration::zero(),
+            Self::Screen => chrono::Duration::seconds(5),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalOccupancy {
@@ -276,6 +286,7 @@ impl TerminalAttention {
         }
         if self.source == TerminalAttentionSource::Hook
             && incoming.source == TerminalAttentionSource::Screen
+            && !(self.state == TerminalAttentionState::Idle && incoming.state == TerminalAttentionState::Working)
             && self.state != TerminalAttentionState::Unobservable
             && !self.is_stale_at(incoming.as_of)
         {
@@ -482,6 +493,19 @@ mod tests {
         let screen = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 10);
 
         assert!(!hook.should_replace_with(&screen));
+    }
+
+    #[test]
+    fn screen_activity_resumes_a_hook_idle_session() {
+        let hook = attention(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, 0);
+        let screen = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 1);
+        assert!(hook.should_replace_with(&screen));
+        assert_eq!(hook.source.idle_debounce(), chrono::Duration::zero());
+    }
+
+    #[test]
+    fn screen_idle_needs_short_debounce() {
+        assert_eq!(TerminalAttentionSource::Screen.idle_debounce(), chrono::Duration::seconds(5));
     }
 
     #[test]

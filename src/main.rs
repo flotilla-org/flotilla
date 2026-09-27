@@ -175,6 +175,8 @@ enum SubCommand {
         harness: String,
         /// Event type (e.g. session-start, stop, notification)
         event_type: String,
+        /// Codex notify supplies its JSON payload as one command argument.
+        payload: Option<String>,
     },
     /// Install or uninstall agent hook configuration
     Hooks {
@@ -678,7 +680,7 @@ async fn main() -> Result<()> {
             run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
-        Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
+        Some(SubCommand::Hook { harness, event_type, payload }) => run_hook(&cli, &harness, &event_type, payload.as_deref()).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
@@ -2089,7 +2091,7 @@ async fn run_logs(cli: &Cli, host: Option<&str>, since: Option<Duration>, level:
     }
 }
 
-async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
+async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: Option<&str>) -> Result<()> {
     use std::io::Read;
 
     // 1. Resolve harness parser
@@ -2097,7 +2099,11 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
 
     // 2. Read native payload from stdin
     let mut payload = Vec::new();
-    std::io::stdin().read_to_end(&mut payload).map_err(|e| color_eyre::eyre::eyre!("failed to read stdin: {e}"))?;
+    if harness == "codex" && event_type == "notify" {
+        payload = argument_payload.ok_or_else(|| color_eyre::eyre::eyre!("Codex notify requires a JSON argument"))?.as_bytes().to_vec();
+    } else {
+        std::io::stdin().read_to_end(&mut payload).map_err(|e| color_eyre::eyre::eyre!("failed to read stdin: {e}"))?;
+    }
 
     // 3. Parse the event
     let parsed = parser.parse_event(event_type, &payload).map_err(|e| color_eyre::eyre::eyre!("parse error: {e}"))?;
@@ -2142,8 +2148,17 @@ async fn send_hook_event(socket_path: &std::path::Path, event: AgentHookEvent) -
 async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
     match command {
         HooksSubCommand::Install { harness, user, project, local, plugin } => {
+            if harness == "codex" {
+                if *plugin || *project || *local {
+                    return Err(color_eyre::eyre::eyre!("Codex notify can only be installed in user config"));
+                }
+                let path = codex_config_path();
+                install_codex_hook(&path)?;
+                println!("Installed flotilla hooks for codex in {}", path.display());
+                return Ok(());
+            }
             if harness != "claude-code" {
-                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code"));
+                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code, codex"));
             }
 
             if *plugin {
@@ -2165,8 +2180,17 @@ async fn run_hooks_command(command: &HooksSubCommand) -> Result<()> {
             Ok(())
         }
         HooksSubCommand::Uninstall { harness, user, project, local } => {
+            if harness == "codex" {
+                if *project || *local {
+                    return Err(color_eyre::eyre::eyre!("Codex notify can only be uninstalled from user config"));
+                }
+                let path = codex_config_path();
+                uninstall_codex_hook(&path)?;
+                println!("Removed flotilla hooks for codex from {}", path.display());
+                return Ok(());
+            }
             if harness != "claude-code" {
-                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code"));
+                return Err(color_eyre::eyre::eyre!("unknown harness: {harness}. Supported: claude-code, codex"));
             }
 
             let scope = resolve_settings_scope(*user, *project, *local)?;
@@ -2276,6 +2300,53 @@ fn resolve_settings_scope(user: bool, project: bool, local: bool) -> Result<Sett
     }
 }
 
+fn codex_config_path() -> PathBuf {
+    let home = std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("~")).join(".codex"));
+    home.join("config.toml")
+}
+
+fn update_codex_hook(path: &std::path::Path, install: bool) -> Result<()> {
+    let content = if path.exists() {
+        std::fs::read_to_string(path).map_err(|error| color_eyre::eyre::eyre!("failed to read {}: {error}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut doc: toml_edit::DocumentMut =
+        content.parse().map_err(|error| color_eyre::eyre::eyre!("failed to parse {}: {error}", path.display()))?;
+    let expected = agents::CODEX_NOTIFY_COMMAND.iter().map(|part| toml_edit::Value::from(*part)).collect::<toml_edit::Array>();
+    let matches_installed =
+        doc.get("notify").and_then(toml_edit::Item::as_value).and_then(toml_edit::Value::as_array).is_some_and(|array| {
+            array.len() == agents::CODEX_NOTIFY_COMMAND.len()
+                && array.iter().zip(agents::CODEX_NOTIFY_COMMAND).all(|(value, expected)| value.as_str() == Some(*expected))
+        });
+    if install {
+        if doc.get("notify").is_some() && !matches_installed {
+            return Err(color_eyre::eyre::eyre!("{} already has a different notify command", path.display()));
+        }
+        doc["notify"] = toml_edit::value(expected);
+    } else if matches_installed {
+        doc.remove("notify");
+    } else {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| color_eyre::eyre::eyre!("failed to create {}: {error}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string()).map_err(|error| color_eyre::eyre::eyre!("failed to write {}: {error}", path.display()))
+}
+
+fn install_codex_hook(path: &std::path::Path) -> Result<()> {
+    update_codex_hook(path, true)
+}
+
+fn uninstall_codex_hook(path: &std::path::Path) -> Result<()> {
+    update_codex_hook(path, false)
+}
+
 fn install_claude_code_hooks(path: &std::path::Path) -> Result<()> {
     let mut settings: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("failed to read {}: {e}", path.display()))?;
@@ -2288,13 +2359,11 @@ fn install_claude_code_hooks(path: &std::path::Path) -> Result<()> {
     let new_entries = agents::claude_code_hook_entries();
     for (event, matchers) in new_entries.as_object().expect("entries is object") {
         let event_hooks = hooks.as_object_mut().expect("hooks is object").entry(event).or_insert_with(|| serde_json::json!([]));
-        let existing_arr = event_hooks.as_array().expect("event hooks is array");
-        // Check if flotilla hooks are already present
-        let already_installed = existing_arr.iter().any(|m| m.to_string().contains(agents::CLAUDE_CODE_HOOK_COMMAND_PREFIX));
-        if !already_installed {
-            let arr = event_hooks.as_array_mut().expect("array");
-            for entry in matchers.as_array().expect("matchers array") {
-                arr.push(entry.clone());
+        for entry in matchers.as_array().expect("matchers array") {
+            if !event_hooks.as_array().expect("event hooks is array").iter().any(|current| {
+                current["matcher"] == entry["matcher"] && current["hooks"].to_string().contains(agents::CLAUDE_CODE_HOOK_COMMAND_PREFIX)
+            }) {
+                event_hooks.as_array_mut().expect("array").push(entry.clone());
             }
         }
     }
@@ -2343,12 +2412,12 @@ mod tests {
 
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
-        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, provisioning_target_for_environment,
-        replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format,
-        Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs,
-        ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs,
-        ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
+        provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target,
+        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
+        topology_output_format, uninstall_codex_hook, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand,
+        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -3371,5 +3440,23 @@ mod tests {
 
         let target = provisioning_target_for_environment(&host, &environment_id);
         assert_eq!(target, ProvisioningTarget::ExistingEnvironment { host, env_id: environment_id });
+    }
+
+    #[test]
+    fn codex_hook_install_preserves_other_config_and_uninstalls_only_its_command() {
+        let dir = std::env::temp_dir().join(format!("flotilla-codex-hook-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).expect("create config directory");
+        std::fs::write(&path, "model = \"gpt-6-sol\"\n[projects.\"/repo\"]\ntrust_level = \"trusted\"\n").expect("seed config");
+        install_codex_hook(&path).expect("install hook");
+        install_codex_hook(&path).expect("idempotent install");
+        let installed = std::fs::read_to_string(&path).expect("read installed config");
+        assert!(installed.contains("notify = [\"flotilla\", \"hook\", \"codex\", \"notify\"]"), "{installed}");
+        assert!(installed.contains("trust_level = \"trusted\""));
+        uninstall_codex_hook(&path).expect("uninstall hook");
+        let uninstalled = std::fs::read_to_string(&path).expect("read uninstalled config");
+        assert!(!uninstalled.contains("notify"));
+        assert!(uninstalled.contains("trust_level = \"trusted\""));
+        std::fs::remove_dir_all(dir).expect("remove test config");
     }
 }

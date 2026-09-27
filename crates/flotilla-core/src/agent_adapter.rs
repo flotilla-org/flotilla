@@ -622,6 +622,10 @@ impl CliAgentAdapter {
         if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
+        if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
+            let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
+            args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
+        }
         if let Some(model) = &request.model {
             args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
         }
@@ -1570,7 +1574,7 @@ mod tests {
             .expect("codex launch plan");
         assert_eq!(
             plan.command,
-            "/tools/codex --dangerously-bypass-approvals-and-sandbox 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/codex --dangerously-bypass-approvals-and-sandbox -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
         assert_eq!(plan.stance, "trusted-implicit");

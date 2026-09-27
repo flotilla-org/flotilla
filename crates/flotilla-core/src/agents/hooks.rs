@@ -29,6 +29,31 @@ pub struct ParsedHookEvent {
 
 pub struct ClaudeCodeParser;
 
+pub struct CodexParser;
+
+#[derive(Deserialize)]
+struct CodexNotifyPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "thread-id")]
+    thread_id: Option<String>,
+    cwd: Option<String>,
+}
+
+impl HarnessHookParser for CodexParser {
+    fn parse_event(&self, event_type: &str, payload: &[u8]) -> Result<ParsedHookEvent, String> {
+        if event_type != "notify" {
+            return Err(format!("unknown Codex event type: {event_type}"));
+        }
+        let parsed: CodexNotifyPayload =
+            serde_json::from_slice(payload).map_err(|error| format!("failed to parse Codex notify payload: {error}"))?;
+        if parsed.kind != "agent-turn-complete" {
+            return Err(format!("unsupported Codex notification: {}", parsed.kind));
+        }
+        Ok(ParsedHookEvent { event_type: AgentEventType::Idle, session_id: parsed.thread_id, model: None, cwd: parsed.cwd })
+    }
+}
+
 /// Common fields present in every Claude Code hook stdin payload.
 #[derive(Deserialize)]
 struct ClaudeCommonPayload {
@@ -87,7 +112,10 @@ impl HarnessHookParser for ClaudeCodeParser {
             "notification" => {
                 let parsed: ClaudeNotificationPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse Notification payload: {e}"))?;
-                let event_type = if parsed.notification_type.as_deref() == Some("permission_prompt") {
+                let event_type = if matches!(
+                    parsed.notification_type.as_deref(),
+                    Some("permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input")
+                ) {
                     AgentEventType::WaitingForPermission
                 } else {
                     AgentEventType::NoChange
@@ -114,6 +142,9 @@ const CLAUDE_CODE_HOOK_SUBSCRIPTIONS: &[ClaudeCodeHookSubscription] = &[
     ClaudeCodeHookSubscription { hook: "UserPromptSubmit", matcher: "", event: "user-prompt-submit" },
     ClaudeCodeHookSubscription { hook: "Stop", matcher: "", event: "stop" },
     ClaudeCodeHookSubscription { hook: "Notification", matcher: "permission_prompt", event: "notification" },
+    ClaudeCodeHookSubscription { hook: "Notification", matcher: "elicitation_dialog", event: "notification" },
+    ClaudeCodeHookSubscription { hook: "Notification", matcher: "elicitation_url_dialog", event: "notification" },
+    ClaudeCodeHookSubscription { hook: "Notification", matcher: "agent_needs_input", event: "notification" },
 ];
 
 struct ClaudeCodeHookSubscription {
@@ -125,18 +156,21 @@ struct ClaudeCodeHookSubscription {
 /// Marks a hook command as Flotilla's, so installers can recognise entries they
 /// own without re-parsing the command line.
 pub const CLAUDE_CODE_HOOK_COMMAND_PREFIX: &str = "flotilla hook claude-code";
+pub const CODEX_NOTIFY_COMMAND: &[&str] = &["flotilla", "hook", "codex", "notify"];
 
 /// The `hooks` object Flotilla installs into Claude Code settings.
 pub fn claude_code_hook_entries() -> serde_json::Value {
     let mut entries = serde_json::Map::new();
     for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
-        entries.insert(
-            subscription.hook.to_string(),
-            serde_json::json!([{
+        entries
+            .entry(subscription.hook.to_string())
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .expect("hook entries are arrays")
+            .push(serde_json::json!({
                 "matcher": subscription.matcher,
                 "hooks": [{ "type": "command", "command": format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {}", subscription.event) }],
-            }]),
-        );
+            }));
     }
     serde_json::Value::Object(entries)
 }
@@ -154,6 +188,7 @@ pub fn claude_code_hook_settings() -> serde_json::Value {
 pub fn parser_for_harness(harness: &str) -> Result<(AgentHarness, Box<dyn HarnessHookParser>), String> {
     match harness {
         "claude-code" => Ok((AgentHarness::ClaudeCode, Box::new(ClaudeCodeParser))),
+        "codex" => Ok((AgentHarness::Codex, Box::new(CodexParser))),
         other => Err(format!("unknown harness: {other}")),
     }
 }
@@ -224,6 +259,13 @@ mod tests {
     }
 
     #[test]
+    fn claude_question_prompt_maps_to_waiting() {
+        let payload = serde_json::json!({ "notification_type": "elicitation_dialog", "session_id": "sess-abc" });
+        let parsed = ClaudeCodeParser.parse_event("notification", payload.to_string().as_bytes()).expect("question notification");
+        assert_eq!(parsed.event_type, AgentEventType::WaitingForPermission);
+    }
+
+    #[test]
     fn claude_notification_non_permission_maps_to_no_change() {
         let payload = serde_json::json!({
             "session_id": "sess-abc",
@@ -267,9 +309,14 @@ mod tests {
         let settings = claude_code_hook_settings();
         let hooks = settings["hooks"].as_object().expect("hooks object");
 
-        assert_eq!(hooks.len(), CLAUDE_CODE_HOOK_SUBSCRIPTIONS.len());
+        assert_eq!(hooks.len(), 5);
         for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
-            let entry = &hooks[subscription.hook][0];
+            let entry = hooks[subscription.hook]
+                .as_array()
+                .expect("hook entries")
+                .iter()
+                .find(|entry| entry["matcher"] == subscription.matcher)
+                .expect("subscription entry");
             assert_eq!(entry["matcher"], subscription.matcher);
             assert_eq!(entry["hooks"][0]["type"], "command");
             assert_eq!(entry["hooks"][0]["command"], format!("flotilla hook claude-code {}", subscription.event));
@@ -277,6 +324,17 @@ mod tests {
         // The permission prompt is what turns a stalled crew into visible
         // attention rather than a healthy-looking phase.
         assert_eq!(hooks["Notification"][0]["matcher"], "permission_prompt");
+        assert_eq!(hooks["Notification"][1]["matcher"], "elicitation_dialog");
+    }
+
+    #[test]
+    fn codex_turn_completion_maps_to_idle() {
+        let payload = br#"{"type":"agent-turn-complete","thread-id":"thread-1","cwd":"/repo"}"#;
+        let parsed = CodexParser.parse_event("notify", payload).expect("Codex notify");
+        assert_eq!(parsed.event_type, AgentEventType::Idle);
+        assert_eq!(parsed.session_id.as_deref(), Some("thread-1"));
+        assert_eq!(parsed.cwd.as_deref(), Some("/repo"));
+        assert!(CodexParser.parse_event("notify", br#"{"type":"other"}"#).is_err());
     }
 
     #[test]
