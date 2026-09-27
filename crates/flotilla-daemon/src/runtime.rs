@@ -5170,6 +5170,73 @@ mod tests {
         commands: Arc<StdMutex<Vec<String>>>,
     }
 
+    #[tokio::test]
+    async fn bad_agentless_ssh_host_does_not_block_daemon_startup_or_other_hosts() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"ssh-resilience-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let good_home = temp.path().join("good-home");
+        let good_repo_dir = good_home.join(DEFAULT_REPO_DIR_SUFFIX);
+        let good_repo_dir = good_repo_dir.to_str().expect("UTF-8 test path");
+
+        for (host_id, runner, env_bag) in [
+            (
+                "bad-ssh-host",
+                Arc::new(DiscoveryMockRunner::builder().build()) as Arc<dyn CommandRunner>,
+                EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", "/unreachable")),
+            ),
+            (
+                "good-ssh-host",
+                Arc::new(
+                    DiscoveryMockRunner::builder()
+                        .on_run("mkdir", &["-p", good_repo_dir], Ok(String::new()))
+                        .on_run(
+                            "df",
+                            &["-Pk", good_repo_dir],
+                            Ok("Filesystem 1024-blocks Used Available Capacity Mounted on\nremote 1000 100 900 10% /\n".into()),
+                        )
+                        .build(),
+                ) as Arc<dyn CommandRunner>,
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", good_home.display().to_string()))
+                    .with(EnvironmentAssertion::binary("cleat", "/usr/bin/cleat")),
+            ),
+        ] {
+            let environment_id = EnvironmentId::new(format!("host-direct-{host_id}"));
+            daemon
+                .register_direct_environment_for_test(
+                    environment_id.clone(),
+                    runner,
+                    env_bag,
+                    Some(flotilla_protocol::qualified_path::HostId::new(host_id)),
+                )
+                .expect("register direct environment");
+            daemon
+                .set_direct_environment_ssh_destination_for_test(&environment_id, format!("crew@{host_id}"))
+                .expect("set SSH destination");
+        }
+
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
+            heartbeat_interval: Duration::from_secs(300),
+            controller_resync_interval: Duration::from_secs(300),
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("bad SSH preflight must not abort daemon startup");
+
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let local_id = daemon.local_host_id().expect("local host identity");
+        assert!(hosts.get(local_id.as_str()).await.expect("local host remains registered").status.expect("local heartbeat").ready);
+        assert!(hosts.get("bad-ssh-host").await.is_err(), "host without a persistent terminal pool must be skipped");
+        let good = hosts.get("good-ssh-host").await.expect("other SSH host remains registered");
+        assert!(good.status.expect("other SSH observation").ready);
+        assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-good-ssh-host").await.is_ok());
+
+        runtime.shutdown();
+    }
+
     #[async_trait]
     impl CommandRunner for SshProvisioningRecordingRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
