@@ -98,7 +98,7 @@ Step, pod.
 
 **VesselRequirement**:
 A declaration that a **Vessel** matching some abstract requirements (platform,
-capabilities, sandbox quality, affinity) must exist — the runtime primitive
+**Capability Needs**, affinity) must exist — the runtime primitive
 placement resolution works on. **One requirement ↔ one Vessel (at a time) is
 an invariant**: the requirement is *not* the fan-out unit; fan-out is
 *authored* — an orchestrating agent or embedded script emits several concrete
