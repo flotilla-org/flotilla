@@ -105,7 +105,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false, is_standing: false }
     }
 }
 
@@ -123,11 +123,28 @@ pub struct CrewBriefRenderOptions {
     pub overrides: Vec<CrewBriefTemplateOverride>,
     pub fork_stance: bool,
     pub has_credential_scope: bool,
+    pub is_standing: bool,
+}
+
+impl CrewBriefRenderOptions {
+    /// The pinned exit declaration is the same signal used by convoy exit
+    /// instantiation: an absent declaration keeps the convoy standing.
+    pub fn for_convoy(mut self, convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>) -> Self {
+        self.is_standing = convoy.metadata.annotations.contains_key(crate::ops_entry::ENSURED_FROM_ANNOTATION)
+            || convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some_and(|snapshot| snapshot.exit.is_none());
+        self
+    }
 }
 
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
-        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false, has_credential_scope: false }
+        Self {
+            template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(),
+            overrides: Vec::new(),
+            fork_stance: false,
+            has_credential_scope: false,
+            is_standing: false,
+        }
     }
 }
 
@@ -148,6 +165,7 @@ struct CrewBriefTemplateContext<'a> {
     handoff_members: Vec<&'a CrewBriefMember>,
     has_credential_scope: bool,
     has_in_crew_reviewer: bool,
+    is_standing: bool,
 }
 
 pub fn build_crew_brief(
@@ -175,6 +193,8 @@ pub fn build_crew_brief_with_options(
             "Your assignment is the issue snapshot section below. Its body is the contract: work it to completion and deliver as described above.",
         CrewAssignment::CarriedChangeRequest =>
             "Your assignment is the bound pull request in the work context below. Work that pull request to the completion standard described above.",
+        CrewAssignment::Unassigned if options.is_standing =>
+            "No task was provided for this turn. Check `## Human instruction` below if present; otherwise yield at the turn boundary and wait for work.",
         CrewAssignment::Unassigned =>
             "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
     };
@@ -188,6 +208,7 @@ pub fn build_crew_brief_with_options(
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
         has_credential_scope: options.has_credential_scope,
         has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
+        is_standing: options.is_standing,
     })?;
     if !content.ends_with('\n') {
         content.push('\n');
@@ -913,8 +934,9 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
     use flotilla_resources::{
-        single_agent_contained_workflow_spec, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, CrewSource, IssueSnapshot, ObjectMeta,
-        RepositoryKey, ResourceObject, TerminalAttentionState, TerminalCrewContext,
+        single_agent_contained_workflow_spec, ClaimExit, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource,
+        ExitDeclaration, IssueSnapshot, ObjectMeta, RepositoryKey, ResourceObject, TerminalAttentionState, TerminalCrewContext,
+        WorkflowSnapshot,
     };
     use toml_edit::DocumentMut;
 
@@ -1027,6 +1049,32 @@ mod tests {
         assert!(content.contains("A completion without this pointer is refused"));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
+        insta::assert_snapshot!("dispatched_crew_brief", content);
+    }
+
+    #[test]
+    fn standing_brief_keeps_the_convoy_active_across_tasks() {
+        let content = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "standing-ops".to_string(),
+                vessel_ref: "standing-ops-work".to_string(),
+            },
+            "work",
+            "steward",
+            CrewAssignment::Unassigned,
+            &[CrewBriefMember { role: "steward".to_string(), state: "active".to_string(), is_agent: true }],
+            &CrewBriefRenderOptions { has_credential_scope: true, is_standing: true, ..CrewBriefRenderOptions::default() },
+        )
+        .expect("render standing brief")
+        .content;
+
+        assert!(!content.contains("flotilla crew complete"));
+        assert!(!content.contains("flotilla crew fail"));
+        assert!(content.contains("Open a pull request that closes the issue"));
+        assert!(content.contains("ADR carry:"));
+        assert!(content.contains("yield at the turn boundary"));
+        insta::assert_snapshot!("standing_crew_brief", content);
     }
 
     #[test]
@@ -1105,6 +1153,7 @@ mod tests {
                 overrides: Vec::new(),
                 fork_stance: false,
                 has_credential_scope: false,
+                is_standing: false,
             },
         )
         .expect("render selected template")
@@ -1137,6 +1186,7 @@ mod tests {
                 overrides: Vec::new(),
                 fork_stance: true,
                 has_credential_scope: false,
+                is_standing: false,
             },
         )
         .expect("render fork review brief")
@@ -1168,6 +1218,7 @@ mod tests {
                 overrides: Vec::new(),
                 fork_stance: false,
                 has_credential_scope: true,
+                is_standing: false,
             },
         )
         .expect("render shepherd brief")
@@ -1241,6 +1292,7 @@ mod tests {
                 }],
                 fork_stance: false,
                 has_credential_scope: false,
+                is_standing: false,
             },
         )
         .expect("render custom block-only template");
@@ -1362,6 +1414,24 @@ mod tests {
         assert!(content.contains("  - `github-app`:\n    - `repo_widgets` — https://github.com/flotilla-org/flotilla"));
         assert!(content.contains("- Bound pull request: `#1071` — Existing pull request (`repo_widgets`)"));
         assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
+
+        let options = CrewBriefRenderOptions::default();
+        assert!(!options.clone().for_convoy(&convoy).is_standing);
+        let mut declared_exit = convoy.clone();
+        declared_exit.status = Some(ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                exit: Some(ExitDeclaration::Claim(ClaimExit)),
+                turn_delivery: Default::default(),
+                vessels: Vec::new(),
+            }),
+            ..ConvoyStatus::default()
+        });
+        assert!(!options.clone().for_convoy(&declared_exit).is_standing);
+        declared_exit.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot").exit = None;
+        assert!(options.clone().for_convoy(&declared_exit).is_standing);
+        declared_exit.metadata.annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "ensure".to_string());
+        declared_exit.status = None;
+        assert!(options.for_convoy(&declared_exit).is_standing);
     }
 
     #[test]
