@@ -13,6 +13,13 @@ spec:
     - name: v1
       served: true
       storage: true
+      additionalPrinterColumns:
+        - name: Host
+          type: string
+          jsonPath: .spec.host_ref
+        - name: Pool
+          type: string
+          jsonPath: .spec.pool
       schema:
         openAPIV3Schema:
           type: object

@@ -26,7 +26,9 @@ probes). A one-turn, tool-free invocation records model
 acceptance as `probe` evidence. A failed launch leaves the model unknown;
 explicit CLI rejection records it unusable. Probes run on daemon start and
 again when a Docker kind's resolved image changes. A missing or conflicted image
-baseline leaves that kind without current facts. Current terminal pools have no
+baseline leaves that kind without current facts. Each command has a 15-second
+deadline, and each kind has a 45-second total deadline; a timed-out kind is
+retried on the next observation. Current terminal pools have no
 configured vessel-slot ceiling, so an available pool reports unbounded capacity;
 an unavailable pool reports zero free slots.
 

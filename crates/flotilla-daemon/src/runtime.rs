@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, Weak,
+    },
     time::Duration,
 };
 
@@ -855,6 +858,7 @@ struct AgentlessSshProfile {
     destination: String,
     env_bag: EnvironmentBag,
     runner: Arc<dyn CommandRunner>,
+    facts_probed_this_process: Arc<AtomicBool>,
 }
 
 struct BagEnvVars<'a>(&'a EnvironmentBag);
@@ -910,7 +914,14 @@ async fn discover_agentless_ssh_profile(
     };
     daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
     let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
-    Ok(AgentlessSshProfile { provisioning, environment_id, destination, env_bag: direct.env_bag, runner: direct.runner })
+    Ok(AgentlessSshProfile {
+        provisioning,
+        environment_id,
+        destination,
+        env_bag: direct.env_bag,
+        runner: direct.runner,
+        facts_probed_this_process: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 async fn register_agentless_ssh_resources(
@@ -1012,16 +1023,22 @@ async fn apply_agentless_ssh_observation(
                 .build(),
         );
     }
+    let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
+        host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     let fulfilment_facts = observe_fulfilment_facts(
         &daemon.resource_backend(),
         namespace,
         &profile.host_id,
         &profile.available_pools,
-        &host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default(),
+        &previous_facts,
         ssh.runner.as_ref(),
         &BagEnvVars(&ssh.env_bag),
     )
     .await?;
+    ssh.facts_probed_this_process.store(true, Ordering::Release);
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
@@ -2167,7 +2184,18 @@ async fn observe_fulfilment_facts(
             .filter(|prior| prior.image == image && prior.free_vessel_slots == (!pool_available).then_some(0));
         let observed = match current {
             Some(current) => current.clone(),
-            None => crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env).await,
+            None => match tokio::time::timeout(
+                Duration::from_secs(45),
+                crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env),
+            )
+            .await
+            {
+                Ok(observed) => observed,
+                Err(_) => {
+                    warn!(kind = %kind.metadata.name, "fulfilment fact probe exceeded total deadline");
+                    continue;
+                }
+            },
         };
         facts.insert(kind.metadata.name, observed);
     }
@@ -2799,12 +2827,18 @@ async fn apply_host_heartbeat_with_credentials(
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
     let discovery = daemon.discovery_runtime();
+    let previous_facts = host
+        .status
+        .as_ref()
+        .filter(|status| status.daemon_started_at == Some(health.started_at))
+        .map(|status| status.fulfilment_facts.clone())
+        .unwrap_or_default();
     let fulfilment_facts = observe_fulfilment_facts(
         &backend,
         namespace,
         &profile.host_id,
         &profile.available_pools,
-        &host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default(),
+        &previous_facts,
         discovery.runner.as_ref(),
         discovery.env.as_ref(),
     )
@@ -5715,8 +5749,10 @@ mod tests {
             destination: "crew@beaufort.example".to_string(),
             env_bag: EnvironmentBag::new()
                 .with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string()))
+                .with(EnvironmentAssertion::env_var("FLOTILLA_PROBE_MODELS", ""))
                 .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
             runner,
+            facts_probed_this_process: Arc::new(AtomicBool::new(false)),
         };
         register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
             .await
