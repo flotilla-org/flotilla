@@ -457,9 +457,41 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
         } else {
             "expiring"
         };
+        let fulfilments = host
+            .fulfilments
+            .iter()
+            .map(|kind| {
+                let harnesses = kind
+                    .harnesses
+                    .iter()
+                    .map(|(name, fact)| {
+                        let models = fact
+                            .models
+                            .iter()
+                            .map(|(model, model_fact)| {
+                                format!("{model} {} ({})", if model_fact.usable { "yes" } else { "no" }, model_fact.source)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{name} {} [{models}]", fact.version)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tools = kind.toolchains.iter().map(|(name, version)| format!("{name} {version}")).collect::<Vec<_>>().join(", ");
+                format!(
+                    "{}: {} | {harnesses} | {tools} | GUI {} | slots {}",
+                    kind.name,
+                    kind.grants.join(", "),
+                    kind.gui_session_logged_in.map_or("?", |yes| if yes { "yes" } else { "no" }),
+                    kind.free_vessel_slots.map_or_else(|| "unbounded".to_string(), |slots| slots.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         Row::new(vec![
             Cell::from(Span::styled(icon, style)),
             Cell::from(name),
+            Cell::from(fulfilments),
             Cell::from(daemon),
             Cell::from(link),
             Cell::from(fleet_age(host.heartbeat_at, now)),
@@ -474,6 +506,7 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
     let widths = [
         Constraint::Length(2),
         Constraint::Min(12),
+        Constraint::Min(35),
         Constraint::Length(22),
         Constraint::Length(12),
         Constraint::Length(10),
@@ -487,6 +520,7 @@ fn render_fleet_health(hosts: &[FleetHostRow], theme: &Theme, frame: &mut Frame,
     let header = Row::new([
         "",
         "Host",
+        "Fulfilments",
         "Daemon v/gen/up",
         "Link",
         "Heartbeat",

@@ -235,6 +235,8 @@ enum SubCommand {
     Workspace(flotilla_commands::commands::workspace::WorkspaceNoun),
     /// Manage and route to hosts
     Host(flotilla_commands::commands::host::HostNounPartial),
+    /// Inspect fulfilment kinds and live facts
+    Fulfilment(flotilla_commands::commands::fulfilment::FulfilmentNoun),
     /// Manage workflow templates
     WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
     /// Manage projects
@@ -767,6 +769,7 @@ async fn main() -> Result<()> {
             use flotilla_commands::Refinable;
             dispatch(partial.refine().and_then(|n| n.resolve()).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
         }
+        Some(SubCommand::Fulfilment(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::WorkflowTemplate(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Project(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
 

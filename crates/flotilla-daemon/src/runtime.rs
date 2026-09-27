@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, Weak,
+    },
     time::Duration,
 };
 
@@ -41,12 +44,13 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase,
     CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
-    HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, HostStatusPatch, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
-    ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance,
-    SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity,
+    FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
+    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
+    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance, SystemClock, TerminalOccupancy,
+    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
@@ -854,6 +858,15 @@ struct AgentlessSshProfile {
     destination: String,
     env_bag: EnvironmentBag,
     runner: Arc<dyn CommandRunner>,
+    facts_probed_this_process: Arc<AtomicBool>,
+}
+
+struct BagEnvVars<'a>(&'a EnvironmentBag);
+
+impl EnvVars for BagEnvVars<'_> {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.find_env_var(key).map(ToString::to_string)
+    }
 }
 
 async fn discover_agentless_ssh_profiles(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Vec<AgentlessSshProfile> {
@@ -901,7 +914,14 @@ async fn discover_agentless_ssh_profile(
     };
     daemon.set_direct_environment_registry(&environment_id, Arc::clone(&registry))?;
     let destination = direct.ssh_destination.ok_or_else(|| format!("SSH host {} has no destination", provisioning.host_id))?;
-    Ok(AgentlessSshProfile { provisioning, environment_id, destination, env_bag: direct.env_bag, runner: direct.runner })
+    Ok(AgentlessSshProfile {
+        provisioning,
+        environment_id,
+        destination,
+        env_bag: direct.env_bag,
+        runner: direct.runner,
+        facts_probed_this_process: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 async fn register_agentless_ssh_resources(
@@ -933,7 +953,26 @@ async fn register_agentless_ssh_resources(
         Err(error) => return Err(error.to_string()),
     }
     ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
-    ensure_default_policies(backend, namespace, provisioning).await
+    ensure_default_policies(backend, namespace, provisioning).await?;
+    let platform = agentless_platform(profile.runner.as_ref()).await;
+    migrate_live_placement_policies(backend, namespace, &provisioning.host_id, &platform).await
+}
+
+async fn agentless_platform(runner: &dyn CommandRunner) -> String {
+    let uname = tokio::time::timeout(Duration::from_secs(15), runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default)).await;
+    match uname {
+        Ok(Ok(output)) => match output.trim() {
+            "Darwin" => "macos".to_string(),
+            "Linux" => "linux".to_string(),
+            other => other.to_ascii_lowercase(),
+        },
+        _ => match tokio::time::timeout(Duration::from_secs(15), runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default))
+            .await
+        {
+            Ok(Ok(output)) if output.contains("Windows") => "windows".to_string(),
+            _ => "unknown".to_string(),
+        },
+    }
 }
 
 async fn apply_agentless_ssh_observation(
@@ -991,6 +1030,31 @@ async fn apply_agentless_ssh_observation(
                 .build(),
         );
     }
+    if probe_succeeded {
+        let platform = agentless_platform(ssh.runner.as_ref()).await;
+        migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
+    }
+    let fulfilment_facts = if probe_succeeded {
+        let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
+            host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let facts = observe_fulfilment_facts(
+            &daemon.resource_backend(),
+            namespace,
+            &profile.host_id,
+            &profile.available_pools,
+            &previous_facts,
+            ssh.runner.as_ref(),
+            &BagEnvVars(&ssh.env_bag),
+        )
+        .await?;
+        ssh.facts_probed_this_process.store(true, Ordering::Release);
+        facts
+    } else {
+        BTreeMap::new()
+    };
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
@@ -1002,6 +1066,7 @@ async fn apply_agentless_ssh_observation(
             (PLACEMENT_CAPABILITY.to_string(), json!("host_direct_only")),
             (OWNING_DAEMON_CAPABILITY.to_string(), json!(daemon.local_host_id().map(|id| id.to_string()))),
         ]),
+        fulfilment_facts,
         // This timestamp is the owning daemon's last successful SSH probe,
         // never a heartbeat emitted by a daemon on the target host.
         heartbeat_at: probe_succeeded.then(Utc::now),
@@ -2049,7 +2114,114 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
         .await?;
     }
 
+    migrate_live_placement_policies(backend, namespace, &profile.host_id, std::env::consts::OS).await
+}
+
+/// A1 runs beside the policy-based admission path. Existing policy names are
+/// retained so operators can inspect the corresponding kind during rollout.
+async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &str, host_ref: &str, platform: &str) -> Result<(), String> {
+    let policies =
+        backend.clone().using::<flotilla_resources::PlacementPolicy>(namespace).list().await.map_err(|error| error.to_string())?;
+    let kinds = backend.clone().using::<FulfilmentKind>(namespace);
+    for policy in policies.items {
+        if policy.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        if policy.metadata.annotations.contains_key(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION) {
+            continue;
+        }
+        let policy_host = policy
+            .spec
+            .host_direct
+            .as_ref()
+            .map(|strategy| strategy.host_ref.as_str())
+            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
+        if policy_host != Some(host_ref) {
+            continue;
+        }
+        let name = &policy.metadata.name;
+        let spec = match FulfilmentKindSpec::from_policy(&policy.spec, platform) {
+            Ok(spec) => spec,
+            Err(error) => {
+                warn!(policy = %name, %error, "skipping invalid placement policy during fulfilment migration");
+                continue;
+            }
+        };
+        match kinds.get(name).await {
+            Ok(existing) if existing.metadata.deletion_timestamp.is_some() => {}
+            Ok(existing) => {
+                let mut updated = spec.clone();
+                updated.grants = existing.spec.grants.clone();
+                // Platform is a host fact. Correct an initial local-OS
+                // registration when an agentless SSH host reports its own OS.
+                updated.grants.retain(|grant| !matches!(grant, flotilla_resources::FulfilmentGrant::Platform(_)));
+                updated
+                    .grants
+                    .extend(spec.grants.iter().filter(|grant| matches!(grant, flotilla_resources::FulfilmentGrant::Platform(_))).cloned());
+                if updated != existing.spec {
+                    kinds
+                        .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &updated)
+                        .await
+                        .map_err(|error| format!("update fulfilment kind {name}: {error}"))?;
+                }
+            }
+            Err(ResourceError::NotFound { .. }) => {
+                kinds.create(&empty_meta(name), &spec).await.map_err(|error| format!("create fulfilment kind {name}: {error}"))?;
+            }
+            Err(error) => return Err(format!("inspect fulfilment kind {name}: {error}")),
+        }
+    }
     Ok(())
+}
+
+async fn observe_fulfilment_facts(
+    backend: &ResourceBackend,
+    namespace: &str,
+    host_ref: &str,
+    available_pools: &[String],
+    previous: &BTreeMap<String, FulfilmentFacts>,
+    runner: &dyn CommandRunner,
+    env: &dyn EnvVars,
+) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
+    let kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?;
+    let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
+    let mut facts = BTreeMap::new();
+    for kind in kinds.items {
+        if kind.spec.host_ref != host_ref || kind.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let image = match &kind.spec.realisation {
+            FulfilmentRealisation::DockerPerVessel { image } => match image.resolve(&baselines).await {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    warn!(kind = %kind.metadata.name, %error, "cannot probe unresolved fulfilment image");
+                    continue;
+                }
+            },
+            FulfilmentRealisation::HostDirect => None,
+        };
+        let pool_available = available_pools.contains(&kind.spec.pool);
+        let current = previous
+            .get(&kind.metadata.name)
+            .filter(|prior| prior.image == image && prior.free_vessel_slots == (!pool_available).then_some(0));
+        let observed = match current {
+            Some(current) => current.clone(),
+            None => match tokio::time::timeout(
+                Duration::from_secs(45),
+                crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env),
+            )
+            .await
+            {
+                Ok(observed) => observed,
+                Err(_) => {
+                    warn!(kind = %kind.metadata.name, "fulfilment fact probe exceeded total deadline");
+                    continue;
+                }
+            },
+        };
+        facts.insert(kind.metadata.name, observed);
+    }
+    Ok(facts)
 }
 
 async fn supervise_controller<F, Fut>(name: &'static str, supervision: ControllerSupervision, runtime_health: RuntimeHealth, make_run: F)
@@ -2675,6 +2847,24 @@ async fn apply_host_heartbeat_with_credentials(
     };
     let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
+    migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
+    let discovery = daemon.discovery_runtime();
+    let previous_facts = host
+        .status
+        .as_ref()
+        .filter(|status| status.daemon_started_at == Some(health.started_at))
+        .map(|status| status.fulfilment_facts.clone())
+        .unwrap_or_default();
+    let fulfilment_facts = observe_fulfilment_facts(
+        &backend,
+        namespace,
+        &profile.host_id,
+        &profile.available_pools,
+        &previous_facts,
+        discovery.runner.as_ref(),
+        discovery.env.as_ref(),
+    )
+    .await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
@@ -2698,6 +2888,7 @@ async fn apply_host_heartbeat_with_credentials(
     }
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
+        fulfilment_facts,
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: !conditions.iter().any(HostCondition::blocks_readiness),
@@ -5580,8 +5771,10 @@ mod tests {
             destination: "crew@beaufort.example".to_string(),
             env_bag: EnvironmentBag::new()
                 .with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string()))
+                .with(EnvironmentAssertion::env_var("FLOTILLA_PROBE_MODELS", ""))
                 .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
             runner,
+            facts_probed_this_process: Arc::new(AtomicBool::new(false)),
         };
         register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
             .await
@@ -5599,6 +5792,36 @@ mod tests {
             .expect("SSH credential expiry")
             .contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
         assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
+        let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
+        let policy = policies.get("host-direct-ssh-test-host").await.expect("SSH policy");
+        let mut changed = policy.spec.clone();
+        changed.pool = "alternate-pool".to_string();
+        policies
+            .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &changed)
+            .await
+            .expect("edit SSH policy while the daemon runs");
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("refresh SSH observation");
+        let kind = daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .get("host-direct-ssh-test-host")
+            .await
+            .expect("refreshed SSH kind");
+        assert_eq!(kind.spec.pool, "alternate-pool");
+        let mut unreachable = profile.clone();
+        unreachable.runner = Arc::new(DiscoveryMockRunner::builder().on_run("rustc", &["--version"], Ok("rustc 9".into())).build());
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &unreachable, None).await.expect("publish unreachable SSH observation");
+        let unreachable_status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(host_id)
+            .await
+            .expect("SSH Host")
+            .status
+            .expect("unreachable SSH status");
+        assert!(!unreachable_status.ready);
+        assert!(unreachable_status.fulfilment_facts.is_empty(), "unreachable SSH host must not retain or probe facts");
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("restore SSH observation");
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),
@@ -10944,6 +11167,86 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn migrates_live_policy_names_to_fulfilment_kinds() {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        for host in ["feta", "kiwi", "udder"] {
+            let name = format!("docker-crew-image-{host}");
+            let spec = PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: host.to_string(),
+                    image: "crew:test".into(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                })
+                .build();
+            policies.create(&empty_meta(&name), &spec).await.expect("seed crew image policy");
+        }
+        for (name, host, docker) in [("docker-on-kiwi", "kiwi", true), ("host-direct-kiwi", "kiwi", false)] {
+            let mut spec = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
+            if docker {
+                spec.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+                    host_ref: host.to_string(),
+                    image: "ubuntu:24.04".into(),
+                    pull_policy: Default::default(),
+                    agent_adapters: BTreeSet::new(),
+                    default_cwd: None,
+                    env: BTreeMap::new(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                });
+            } else {
+                spec.host_direct = Some(HostDirectPlacementPolicySpec {
+                    host_ref: host.to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                });
+            }
+            policies.create(&empty_meta(name), &spec).await.expect("seed local policy");
+        }
+        policies
+            .create(
+                &InputMeta::builder()
+                    .name("prepared-placement-snapshot".to_string())
+                    .annotations(BTreeMap::from([(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), "true".to_string())]))
+                    .build(),
+                &PlacementPolicySpec::builder().pool("cleat".to_string()).build(),
+            )
+            .await
+            .expect("seed frozen placement snapshot");
+        let mut invalid = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
+        invalid.host_direct =
+            Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
+        invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+            host_ref: "kiwi".to_string(),
+            image: "crew:test".into(),
+            pull_policy: Default::default(),
+            agent_adapters: BTreeSet::new(),
+            default_cwd: None,
+            env: BTreeMap::new(),
+            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+        });
+        policies.create(&empty_meta("invalid-both-realisations"), &invalid).await.expect("seed invalid policy");
+        for host in ["feta", "kiwi", "udder"] {
+            migrate_live_placement_policies(&backend, NAMESPACE, host, "linux").await.expect("migrate host policies");
+        }
+        let kinds = backend.using::<FulfilmentKind>(NAMESPACE).list().await.expect("list kinds").items;
+        assert_eq!(kinds.len(), 5);
+        for kind in kinds {
+            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string())));
+            if kind.metadata.name.starts_with("docker-") {
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::Network("scoped".to_string())));
+            } else {
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::HostAccountReach));
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::GuiSession));
+            }
+        }
+        assert_eq!(policies.list().await.expect("policies stay for A1 admission").items.len(), 7);
     }
 
     #[tokio::test]

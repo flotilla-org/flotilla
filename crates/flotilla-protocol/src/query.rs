@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -225,6 +228,39 @@ pub struct FleetHealthResponse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentListResponse {
+    pub kinds: Vec<FulfilmentRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentRow {
+    pub name: String,
+    pub host_ref: String,
+    pub pool: String,
+    pub realisation: String,
+    pub grants: Vec<String>,
+    #[serde(default)]
+    pub harnesses: BTreeMap<String, FulfilmentHarness>,
+    #[serde(default)]
+    pub toolchains: BTreeMap<String, String>,
+    pub gui_session_logged_in: Option<bool>,
+    pub free_vessel_slots: Option<u32>,
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentHarness {
+    pub version: String,
+    pub models: BTreeMap<String, FulfilmentModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentModel {
+    pub usable: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SleepInhibitionHealth {
     #[default]
@@ -244,6 +280,9 @@ pub enum SleepInhibitionHealth {
 #[builder(on(String, into))]
 pub struct FleetHostRow {
     pub host: HostName,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fulfilments: Vec<FulfilmentRow>,
     pub is_local: bool,
     pub configured: bool,
     pub link: PeerConnectionState,

@@ -7,6 +7,7 @@ mod credential;
 mod dispatch_reconciler;
 mod environment_tools;
 mod event_relay;
+mod fulfilment_probe;
 mod issue_materializer;
 mod resource_limits;
 pub mod resource_manifest;

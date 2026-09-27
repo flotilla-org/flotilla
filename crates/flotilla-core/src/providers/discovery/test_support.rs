@@ -330,7 +330,8 @@ pub fn git_process_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
 fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> super::DiscoveryRuntime {
     super::DiscoveryRuntime {
         runner,
-        env: std::sync::Arc::new(TestEnvVars::default()),
+        // Runtime tests use real Git but must never make model API calls.
+        env: std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])),
         available_space_probe: fixed_available_space_probe(),
         host_detectors: vec![Box::new(super::detectors::generic::CommandDetector::new(
             "git",

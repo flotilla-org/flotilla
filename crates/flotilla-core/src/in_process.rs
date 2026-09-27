@@ -30,13 +30,14 @@ use flotilla_protocol::{
     ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
-    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
-    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
-    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
-    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
+    HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal,
+    NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate,
+    PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
+    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -54,9 +55,10 @@ use flotilla_resources::{
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
     CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind,
     DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind,
-    HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ObjectEvent,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
+    LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
     ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
@@ -8416,6 +8418,98 @@ impl InProcessDaemon {
         Ok(DispatchQueueResponse { observed_at, entries })
     }
 
+    pub async fn fulfilment_list_internal(&self) -> Result<FulfilmentListResponse, String> {
+        let namespace = self.provisioning_namespace().await;
+        let hosts =
+            self.resource_backend.clone().including_replicas::<ResourceHost>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut facts_by_host = BTreeMap::<String, ResourceHostStatus>::new();
+        for host in hosts.items {
+            if let Some(status) = host.object.status {
+                facts_by_host
+                    .entry(host.object.metadata.name)
+                    .and_modify(|current| {
+                        if current.heartbeat_at < status.heartbeat_at {
+                            *current = status.clone();
+                        }
+                    })
+                    .or_insert(status);
+            }
+        }
+        let kinds = self
+            .resource_backend
+            .clone()
+            .including_replicas::<FulfilmentKind>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut rows = BTreeMap::new();
+        for kind in kinds.items {
+            let kind = kind.object;
+            if kind.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            let facts = facts_by_host.get(&kind.spec.host_ref).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            let grants = kind
+                .spec
+                .grants
+                .iter()
+                .map(|grant| match grant {
+                    FulfilmentGrant::Platform(value) => format!("platform:{value}"),
+                    FulfilmentGrant::GuiSession => "gui_session".to_string(),
+                    FulfilmentGrant::Gpu => "gpu".to_string(),
+                    FulfilmentGrant::HostDevices => "host_devices".to_string(),
+                    FulfilmentGrant::Network(value) => format!("network:{value}"),
+                    FulfilmentGrant::HostAccountReach => "host_account_reach".to_string(),
+                    FulfilmentGrant::ContainerRuntime => "container_runtime".to_string(),
+                    FulfilmentGrant::Toolchain(value) => format!("toolchain:{value}"),
+                })
+                .collect();
+            let harnesses = facts
+                .map(|facts| {
+                    facts
+                        .harnesses
+                        .iter()
+                        .map(|(name, harness)| {
+                            let models = harness
+                                .models
+                                .iter()
+                                .map(|(name, model)| {
+                                    (name.clone(), FulfilmentModel {
+                                        usable: model.usable,
+                                        source: match model.source {
+                                            flotilla_resources::ModelFactSource::Probe => "probe",
+                                            flotilla_resources::ModelFactSource::Declaration => "declaration",
+                                        }
+                                        .to_string(),
+                                    })
+                                })
+                                .collect();
+                            (name.clone(), FulfilmentHarness { version: harness.version.clone(), models })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let row = FulfilmentRow {
+                name: kind.metadata.name.clone(),
+                host_ref: kind.spec.host_ref.clone(),
+                pool: kind.spec.pool,
+                realisation: match kind.spec.realisation {
+                    FulfilmentRealisation::DockerPerVessel { .. } => "docker_per_vessel",
+                    FulfilmentRealisation::HostDirect => "host_direct",
+                }
+                .to_string(),
+                grants,
+                harnesses,
+                toolchains: facts.map(|facts| facts.toolchains.clone()).unwrap_or_default(),
+                gui_session_logged_in: facts.map(|facts| facts.gui_session_logged_in),
+                free_vessel_slots: facts.and_then(|facts| facts.free_vessel_slots),
+                image: facts.and_then(|facts| facts.image.clone()),
+            };
+            rows.insert((row.host_ref.clone(), row.name.clone()), row);
+        }
+        Ok(FulfilmentListResponse { kinds: rows.into_values().collect() })
+    }
+
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
@@ -8453,6 +8547,7 @@ impl InProcessDaemon {
 
         let local_host_id = self.local_host_id().map(|host_id| host_id.to_string());
         let mut statuses = HashMap::<HostName, ResourceHostStatus>::new();
+        let mut host_refs = HashMap::<String, HostName>::new();
         let resource_hosts =
             self.resource_backend.clone().including_replicas::<ResourceHost>(&namespace).list().await.map_err(|error| error.to_string())?;
         for resource_host in resource_hosts.items {
@@ -8480,12 +8575,19 @@ impl InProcessDaemon {
             let (Some(host), Some(status)) = (host, resource_host.object.status) else {
                 continue;
             };
+            host_refs.insert(resource_host.object.metadata.name, host.clone());
             let replace = statuses.get(&host).is_none_or(|current| current.heartbeat_at < status.heartbeat_at);
             if replace {
                 statuses.insert(host, status);
             }
         }
 
+        let mut fulfilments_by_host = HashMap::<HostName, Vec<FulfilmentRow>>::new();
+        for kind in self.fulfilment_list_internal().await?.kinds {
+            if let Some(host_name) = host_refs.get(&kind.host_ref) {
+                fulfilments_by_host.entry(host_name.clone()).or_default().push(kind);
+            }
+        }
         let (local_rows, _) = self.local_fleet_rows(&namespace).await?;
         let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
         accumulate_fleet_health_counts(&mut counts, &local_rows);
@@ -8565,6 +8667,7 @@ impl InProcessDaemon {
 
             rows.push(
                 FleetHostRow::builder()
+                    .fulfilments(fulfilments_by_host.remove(&host).unwrap_or_default())
                     .host(host)
                     .is_local(is_local)
                     .configured(configured)
@@ -12809,6 +12912,10 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::QueryFleetHealth {} => match self.fleet_health_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetHealth(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryFulfilmentList {} => match self.fulfilment_list_internal().await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::FulfilmentList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryFleetList { project, crew_id, convoy } => {
