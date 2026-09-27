@@ -1469,33 +1469,37 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 if !matches!(kind, "convoys" | "vessels" | "terminalsessions" | "environments" | "checkouts") {
                     return Err(color_eyre::eyre::eyre!("--project is unsupported for resource kind `{kind}`"));
                 }
-                let convoys = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
-                    .list(
-                        flotilla_client::resource::ResourceListRequest::builder()
-                            .kind("convoys".to_string())
-                            .namespace(args.namespace.clone())
-                            .maybe_node_id(node_id.clone())
-                            .include_replicas(args.include_replicas || !args.local_only)
-                            .build(),
-                    )
-                    .await
-                    .map_err(|e| color_eyre::eyre::eyre!(e))?;
-                let names: std::collections::HashSet<_> = convoys
-                    .records
-                    .iter()
-                    .filter_map(|record| record.object.as_ref())
-                    .filter(|object| object["spec"]["project_ref"].as_str() == Some(project))
-                    .filter_map(|object| object["metadata"]["name"].as_str().map(ToOwned::to_owned))
-                    .collect();
+                let names: std::collections::HashSet<_> = if kind == "convoys" {
+                    Default::default()
+                } else {
+                    flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+                        .list(
+                            flotilla_client::resource::ResourceListRequest::builder()
+                                .kind("convoys".to_string())
+                                .namespace(args.namespace.clone())
+                                .maybe_node_id(node_id.clone())
+                                .include_replicas(args.include_replicas || !args.local_only)
+                                .build(),
+                        )
+                        .await
+                        .map_err(|e| color_eyre::eyre::eyre!(e))?
+                        .records
+                        .into_iter()
+                        .filter_map(|record| record.object)
+                        .filter(|object| object["spec"]["project_ref"].as_str() == Some(project))
+                        .filter_map(|object| object["metadata"]["name"].as_str().map(ToOwned::to_owned))
+                        .collect()
+                };
                 response.records.retain(|record| {
                     record.object.as_ref().is_some_and(|object| {
                         if kind == "convoys" {
                             return object["spec"]["project_ref"].as_str() == Some(project);
                         }
-                        let convoy =
-                            object["spec"]["convoy_ref"].as_str().or_else(|| object["metadata"]["labels"]["flotilla.work/convoy"].as_str());
+                        let convoy = object["spec"]["convoy_ref"]
+                            .as_str()
+                            .or_else(|| object["metadata"]["labels"][flotilla_resources::CONVOY_LABEL].as_str());
                         convoy.is_some_and(|name| names.contains(name))
-                            || object["metadata"]["labels"]["flotilla.work/project"].as_str() == Some(project)
+                            || object["metadata"]["labels"][flotilla_resources::PROJECT_LABEL].as_str() == Some(project)
                     })
                 });
             }
