@@ -521,6 +521,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     let follower = empty_daemon_named("artifact-home").await;
     let namespace = "flotilla";
     let convoy = "artifact-demo";
+    let workspace = tempfile::tempdir().expect("crew workspace");
     follower
         .resource_backend()
         .using::<Convoy>(namespace)
@@ -532,7 +533,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .create(
             &InputMeta::builder().name("terminal-artifact-coder".to_string()).build(),
             &TerminalSessionSpec::builder()
-                .env_ref("env".to_string())
+                .env_ref(leader.local_environment_id().to_string())
                 .role("coder".to_string())
                 .source(TerminalSessionSource::Agent {
                     selector: Selector::for_capability("coding"),
@@ -544,7 +545,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
                     }),
                     message: None,
                 })
-                .cwd("/work".to_string())
+                .cwd(workspace.path().to_string_lossy().into_owned())
                 .pool("cleat".to_string())
                 .build(),
         )
@@ -590,6 +591,9 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     apply_convoy_replica_feed(&leader, namespace, convoy, topology.follower_host.clone()).await;
 
     let bytes = vec![0, 1, 2, 127, 255];
+    let source = workspace.path().join("source.bin");
+    let destination = workspace.path().join("result.bin");
+    tokio::fs::write(&source, &bytes).await.expect("write crew source");
     let (address, digest) = topology
         .client
         .artifact_put(
@@ -597,11 +601,12 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
             "head-1".into(),
             BTreeMap::from([("approved".into(), serde_json::json!(true))]),
             "application/octet-stream".into(),
-            bytes.clone(),
+            source.clone(),
         )
         .await
         .expect("put through dispatcher and remote home");
-    assert_eq!(topology.client.artifact_get(digest.clone()).await.expect("get local body"), bytes);
+    assert_eq!(topology.client.artifact_get(digest.clone(), destination.clone()).await.expect("get local body"), bytes.len() as u64);
+    assert_eq!(tokio::fs::read(&destination).await.expect("read crew destination"), bytes);
     assert!(leader.resource_backend().using::<Artifact>(namespace).list().await.expect("leader artifacts").items.is_empty());
     let home_artifacts = follower.resource_backend().using::<Artifact>(namespace).list().await.expect("home artifacts");
     assert_eq!(home_artifacts.items.len(), 1);
@@ -612,7 +617,8 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .replace(&home_artifacts, Utc::now())
         .await
         .expect("deliver envelope replica");
-    assert_eq!(topology.client.artifact_get(address.clone()).await.expect("get by address"), bytes);
+    assert_eq!(topology.client.artifact_get(address.clone(), destination.clone()).await.expect("get by address"), bytes.len() as u64);
+    assert_eq!(tokio::fs::read(&destination).await.expect("read crew destination"), bytes);
     assert_eq!(
         topology.client.artifact_list(Some(convoy.into()), Some("review-round".into()), None).await.expect("list artifacts").len(),
         1
@@ -626,7 +632,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     home_resolver.create(&InputMeta::from(&current.metadata), &conflicting).await.expect("create conflicting home address");
     let error = topology
         .client
-        .artifact_put("review-round".into(), "head-1".into(), BTreeMap::new(), "text/plain".into(), b"new".to_vec())
+        .artifact_put("review-round".into(), "head-1".into(), BTreeMap::new(), "text/plain".into(), source)
         .await
         .expect_err("remote apply must report address conflict");
     assert!(error.contains("artifact address cannot change"), "unexpected routed error: {error}");

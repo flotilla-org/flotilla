@@ -51,6 +51,18 @@ pub trait BlobStore: Send + Sync {
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String>;
     async fn has(&self, digest: &BlobDigest) -> Result<bool, String>;
     async fn delete(&self, digest: &BlobDigest) -> Result<(), String>;
+
+    async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
+        let bytes = tokio::fs::read(path).await.map_err(|error| error.to_string())?;
+        let digest = self.put(&bytes).await?;
+        Ok((digest, bytes.len() as u64))
+    }
+
+    async fn get_file(&self, digest: &BlobDigest, path: &Path) -> Result<Option<u64>, String> {
+        let Some(bytes) = self.get(digest).await? else { return Ok(None) };
+        tokio::fs::write(path, &bytes).await.map_err(|error| error.to_string())?;
+        Ok(Some(bytes.len() as u64))
+    }
 }
 
 #[derive(Default)]
@@ -110,6 +122,51 @@ impl LocalBlobStore {
             file.sync_all().await.map_err(|error| error.to_string())?;
             tokio::fs::rename(&temp, &path).await.map_err(|error| error.to_string())?;
             Ok::<(), String>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        result
+    }
+
+    async fn verified_file_size(&self, digest: &BlobDigest) -> Result<Option<u64>, String> {
+        use tokio::io::AsyncReadExt;
+        let mut file = match tokio::fs::File::open(self.path(digest)).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut hash = Sha256::new();
+        let mut size = 0_u64;
+        let mut chunk = [0_u8; 65536];
+        loop {
+            let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&chunk[..read]);
+            size += read as u64;
+        }
+        if format!("{:x}", hash.finalize()) == digest.as_str() {
+            Ok(Some(size))
+        } else {
+            Err(format!("blob digest mismatch for {}", digest.as_str()))
+        }
+    }
+
+    async fn write_file(&self, digest: &BlobDigest, source: &Path) -> Result<(), String> {
+        let path = self.path(digest);
+        let parent = path.parent().expect("blob path has parent");
+        tokio::fs::create_dir_all(parent).await.map_err(|error| error.to_string())?;
+        if self.verified_file_size(digest).await.ok().flatten().is_some() {
+            return Ok(());
+        }
+        let temp = parent.join(format!(".{}-{}.tmp", digest.as_str(), uuid::Uuid::new_v4()));
+        let result = async {
+            tokio::fs::copy(source, &temp).await.map_err(|error| error.to_string())?;
+            tokio::fs::File::open(&temp).await.map_err(|error| error.to_string())?.sync_all().await.map_err(|error| error.to_string())?;
+            tokio::fs::rename(&temp, &path).await.map_err(|error| error.to_string())
         }
         .await;
         if result.is_err() {
@@ -613,6 +670,40 @@ impl BlobStore for TieredBlobStore {
         self.local.write_digest(&digest, bytes).await?;
         self.queue_new(&digest, was_present, None).await;
         Ok(digest)
+    }
+
+    async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(path).await.map_err(|error| error.to_string())?;
+        let mut hash = Sha256::new();
+        let mut size = 0_u64;
+        let mut chunk = [0_u8; 65536];
+        loop {
+            let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&chunk[..read]);
+            size += read as u64;
+        }
+        let digest = BlobDigest(format!("{:x}", hash.finalize()));
+        let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
+        self.local.write_file(&digest, path).await?;
+        if !was_present && !self.fleet.is_empty() {
+            self.status.lock().await.pending_count += self.fleet.len();
+            self.wake.notify_one();
+        }
+        Ok((digest, size))
+    }
+
+    async fn get_file(&self, digest: &BlobDigest, path: &Path) -> Result<Option<u64>, String> {
+        if let Ok(Some(size)) = self.local.verified_file_size(digest).await {
+            tokio::fs::copy(self.local.path(digest), path).await.map_err(|error| error.to_string())?;
+            return Ok(Some(size));
+        }
+        let Some(bytes) = self.get(digest).await? else { return Ok(None) };
+        tokio::fs::write(path, &bytes).await.map_err(|error| error.to_string())?;
+        Ok(Some(bytes.len() as u64))
     }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
         let mut error = match self.local.get(digest).await {

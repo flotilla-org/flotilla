@@ -9,27 +9,25 @@ fn list_repos_request_roundtrips() {
 }
 
 #[test]
-fn artifact_bodies_are_base64_strings_on_the_wire() {
-    let body = vec![0, 1, 127, 255];
+fn artifact_requests_carry_paths_without_body_bytes() {
     let request = Request::ArtifactPut {
         kind: "recording".into(),
         subject: "head".into(),
         summary: Default::default(),
         media_type: "application/octet-stream".into(),
-        body: body.clone(),
+        source_path: "/crew/report.bin".into(),
     };
     let encoded = serde_json::to_value(&request).expect("serialize request");
-    assert_eq!(encoded["params"]["body"], "AAF//w==");
+    assert_eq!(encoded["params"]["source_path"], "/crew/report.bin");
+    assert!(encoded["params"].get("body").is_none());
     assert!(
-        matches!(serde_json::from_value::<Request>(encoded).expect("decode request"), Request::ArtifactPut { body: decoded, .. } if decoded == body)
+        matches!(serde_json::from_value::<Request>(encoded).expect("decode request"), Request::ArtifactPut { source_path, .. } if source_path == std::path::Path::new("/crew/report.bin"))
     );
 
-    let response = Response::ArtifactGet { body: body.clone() };
+    let response = Response::ArtifactGet { size: 4 };
     let encoded = serde_json::to_value(&response).expect("serialize response");
-    assert_eq!(encoded["data"]["body"], "AAF//w==");
-    assert!(
-        matches!(serde_json::from_value::<Response>(encoded).expect("decode response"), Response::ArtifactGet { body: decoded } if decoded == body)
-    );
+    assert!(encoded["data"].get("body").is_none());
+    assert!(matches!(serde_json::from_value::<Response>(encoded).expect("decode response"), Response::ArtifactGet { size: 4 }));
 }
 
 #[test]

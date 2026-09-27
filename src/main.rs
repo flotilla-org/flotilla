@@ -1325,7 +1325,7 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
     .map_err(|error| color_eyre::eyre::eyre!(error))?;
     match command {
         ArtifactSubCommand::Put { kind, about, summary, file } => {
-            let body = tokio::fs::read(&file).await?;
+            let source_path = tokio::fs::canonicalize(&file).await?;
             let media_type = match file.extension().and_then(|value| value.to_str()).unwrap_or("") {
                 "json" => "application/json",
                 "md" => "text/markdown",
@@ -1335,7 +1335,7 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
             };
             let summary = summary.into_iter().collect();
             let (address, digest) = daemon
-                .artifact_put(kind, about, summary, media_type.to_string(), body)
+                .artifact_put(kind, about, summary, media_type.to_string(), source_path)
                 .await
                 .map_err(|error| color_eyre::eyre::eyre!(error))?;
             match format {
@@ -1344,11 +1344,11 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
             }
         }
         ArtifactSubCommand::Get { reference, output } => {
-            let body = daemon.artifact_get(reference.clone()).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
             let path = output.unwrap_or_else(|| PathBuf::from(reference.rsplit('/').next().unwrap_or(&reference)));
-            tokio::fs::write(&path, &body).await?;
+            let destination = if path.is_absolute() { path.clone() } else { std::env::current_dir()?.join(&path) };
+            let size = daemon.artifact_get(reference.clone(), destination).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
             match format {
-                OutputFormat::Json => println!("{}", serde_json::json!({"path": path, "size": body.len()})),
+                OutputFormat::Json => println!("{}", serde_json::json!({"path": path, "size": size})),
                 OutputFormat::Human => println!("{}", path.display()),
             }
         }

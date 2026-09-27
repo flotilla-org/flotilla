@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -6,12 +6,21 @@ use flotilla_core::{
     in_process::InProcessDaemon,
 };
 use flotilla_protocol::{
-    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, Message, RepoSelector, Request, Response,
+    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, EnvironmentId, Message, RepoSelector, Request,
+    Response,
 };
 use tracing::warn;
 
 use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
-use crate::artifact::{ArtifactPutInput, ArtifactService};
+use crate::artifact::{ArtifactBody, ArtifactPutInput, ArtifactService};
+
+fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(cwd).join(path)
+    }
+}
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
@@ -56,7 +65,7 @@ impl<'a> RequestDispatcher<'a> {
                 Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
                 Err(e) => Message::error_response(id, e),
             },
-            Request::ArtifactPut { kind, subject, summary, media_type, body } => {
+            Request::ArtifactPut { kind, subject, summary, media_type, source_path } => {
                 let result = async {
                     let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
                     let config = self.daemon.config_store();
@@ -65,8 +74,21 @@ impl<'a> RequestDispatcher<'a> {
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
                     let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-                    let input =
-                        ArtifactPutInput::builder().kind(kind).subject(subject).summary(summary).media_type(media_type).body(body).build();
+                    let session = service.caller_session(caller).await?;
+                    let runner = self
+                        .daemon
+                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                    let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
+                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+                    runner.read_file_to(&source_path, temporary.path()).await?;
+                    let input = ArtifactPutInput::builder()
+                        .kind(kind)
+                        .subject(subject)
+                        .summary(summary)
+                        .media_type(media_type)
+                        .body(ArtifactBody::File(temporary.path().to_path_buf()))
+                        .build();
                     let target = self
                         .daemon
                         .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
@@ -137,13 +159,23 @@ impl<'a> RequestDispatcher<'a> {
                     Err(error) => Message::error_response(id, error),
                 }
             }
-            Request::ArtifactGet { reference } => {
+            Request::ArtifactGet { reference, destination_path } => {
                 let result = async {
+                    let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
                     let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
                     let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-                    Ok::<_, String>(Response::ArtifactGet { body: service.get(&reference).await? })
+                    let session = service.caller_session(caller).await?;
+                    let runner = self
+                        .daemon
+                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                    let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
+                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+                    let size = service.get_to_file(&reference, temporary.path()).await?;
+                    runner.write_file_from(temporary.path(), &destination_path).await?;
+                    Ok::<_, String>(Response::ArtifactGet { size })
                 }
                 .await;
                 match result {

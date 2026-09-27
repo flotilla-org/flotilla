@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::{Path, PathBuf},
+};
 
 use chrono::{Duration, Utc};
 use flotilla_protocol::CallerCrew;
@@ -19,7 +22,13 @@ pub struct ArtifactPutInput {
     #[builder(default)]
     pub summary: BTreeMap<String, serde_json::Value>,
     pub media_type: String,
-    pub body: Vec<u8>,
+    pub body: ArtifactBody,
+}
+
+#[derive(Debug)]
+pub enum ArtifactBody {
+    Bytes(Vec<u8>),
+    File(PathBuf),
 }
 
 /// The daemon owns both the envelope write and every blob-store operation.
@@ -66,7 +75,10 @@ impl ArtifactService<'_> {
         if serde_json::to_vec(&input.summary).map_err(|error| error.to_string())?.len() > MAX_SUMMARY_BYTES {
             return Err("artifact summary exceeds 4096 bytes".into());
         }
-        let digest = self.blobs.put(&input.body).await?;
+        let (digest, size) = match &input.body {
+            ArtifactBody::Bytes(bytes) => (self.blobs.put(bytes).await?, bytes.len() as u64),
+            ArtifactBody::File(path) => self.blobs.put_file(path).await?,
+        };
         let name = artifact_record_name(&caller.convoy, &producer, &input.kind, &input.subject);
         let prior = match self.backend.including_replicas::<Artifact>(self.namespace).get(&name).await {
             Ok(prior) => Some(prior.object),
@@ -86,7 +98,7 @@ impl ArtifactService<'_> {
             .subject(input.subject)
             .summary(input.summary)
             .digest(digest.as_str().to_string())
-            .size(input.body.len() as u64)
+            .size(size)
             .media_type(input.media_type)
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|object| object.spec.pinned))
@@ -101,6 +113,10 @@ impl ArtifactService<'_> {
     }
 
     async fn stamped_role(&self, caller: &CallerCrew) -> Result<String, String> {
+        Ok(self.caller_session(caller).await?.spec.role)
+    }
+
+    pub async fn caller_session(&self, caller: &CallerCrew) -> Result<ResourceObject<TerminalSession>, String> {
         if caller.namespace != self.namespace {
             return Err("crew namespace does not match daemon namespace".into());
         }
@@ -116,7 +132,7 @@ impl ArtifactService<'_> {
         {
             return Err("calling crew identity does not match daemon session".into());
         }
-        Ok(session.spec.role.clone())
+        Ok(session.clone())
     }
 
     pub async fn list(
@@ -143,6 +159,16 @@ impl ArtifactService<'_> {
     }
 
     pub async fn get(&self, reference: &str) -> Result<Vec<u8>, String> {
+        let digest = self.resolve_digest(reference).await?;
+        self.blobs.get(&digest).await?.ok_or_else(|| format!("artifact blob {} is unavailable", digest.as_str()))
+    }
+
+    pub async fn get_to_file(&self, reference: &str, path: &Path) -> Result<u64, String> {
+        let digest = self.resolve_digest(reference).await?;
+        self.blobs.get_file(&digest, path).await?.ok_or_else(|| format!("artifact blob {} is unavailable", digest.as_str()))
+    }
+
+    async fn resolve_digest(&self, reference: &str) -> Result<BlobDigest, String> {
         let digest = if let Ok(digest) = BlobDigest::parse(reference) {
             digest
         } else {
@@ -150,7 +176,7 @@ impl ArtifactService<'_> {
             let object = self.backend.including_replicas::<Artifact>(self.namespace).get(name).await.map_err(|error| error.to_string())?;
             BlobDigest::parse(&object.object.spec.digest)?
         };
-        self.blobs.get(&digest).await?.ok_or_else(|| format!("artifact blob {} is unavailable", digest.as_str()))
+        Ok(digest)
     }
 
     pub async fn reap_expired(&self) -> Result<HashSet<BlobDigest>, String> {
@@ -174,7 +200,7 @@ mod tests {
         TerminalSessionStatus,
     };
 
-    use super::*;
+    use super::{ArtifactBody, *};
     use crate::blob_store::MemoryBlobStore;
 
     fn input(subject: &str, summary: BTreeMap<String, serde_json::Value>, body: &[u8]) -> ArtifactPutInput {
@@ -183,7 +209,7 @@ mod tests {
             .subject(subject.to_string())
             .summary(summary)
             .media_type("text/plain".to_string())
-            .body(body.to_vec())
+            .body(ArtifactBody::Bytes(body.to_vec()))
             .build()
     }
 
