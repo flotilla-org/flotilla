@@ -1519,7 +1519,7 @@ async fn reconcile_work_credentials_filtered(
     let mut errors = Vec::new();
     for (environment_ref, (granted, running, scopes, live_scopes, permissions)) in deliveries {
         if let Some(error) = permission_conflicts.remove(&environment_ref) {
-            record_credential_delivery_retry(&backend, namespace, &environment_ref, Some(error.clone()), true).await?;
+            record_credential_delivery_retry(&backend, namespace, &environment_ref, Some(error.clone()), false).await?;
             errors.push(error);
             continue;
         }
@@ -8653,6 +8653,15 @@ mod tests {
         assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
 
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            })
+            .await
+            .expect("create durable shared environment");
+
         let conflicting_convoy = convoys
             .create(
                 &empty_meta("conflicting-credential-work"),
@@ -8702,9 +8711,41 @@ mod tests {
             .expect("place second vessel in shared environment");
         let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
         assert!(error.contains("different minted permissions for `work-token`"), "{error}");
+        let conflict_retry = environments
+            .get(env_id.as_str())
+            .await
+            .expect("shared environment")
+            .status
+            .expect("status")
+            .credential_delivery_retry
+            .expect("durable conflict retry");
+        assert!(matches!(conflict_retry.disposition, ControllerRetryDisposition::Retryable { .. }));
         vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
 
+        // Simulate the retry deadline elapsing while preserving the persisted
+        // episode, then verify the normal pass can recover without an operator.
+        let due_retry = ControllerRetry {
+            disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
+            ..conflict_retry
+        };
+        flotilla_resources::apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::CredentialDelivery {
+            retry: Some(due_retry),
+        })
+        .await
+        .expect("advance retry deadline");
+
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
+        assert!(
+            environments
+                .get(env_id.as_str())
+                .await
+                .expect("shared environment")
+                .status
+                .expect("status")
+                .credential_delivery_retry
+                .is_none(),
+            "resolved conflict should clear durable retry"
+        );
         assert!(can_fill_git_credential().await);
         let current = convoys.get("credential-work").await.expect("read running work");
         let mut stalled = current.status.expect("work status");
