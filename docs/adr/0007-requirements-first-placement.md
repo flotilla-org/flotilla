@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-07-07
+**Amended by:** ADR 0046 (allocation authors VesselRequirements from role needs; `sandbox-quality` gives way to the need/grant vocabulary; PlacementPolicy preferences become fulfilment kinds plus a tie-breaking decider; a pin above least privilege is a recorded escalation)
 
 Vessel allocation is **requirements-first, not recipe-first**. A
 **VesselRequirement** declares what a Vessel must provide — platform
