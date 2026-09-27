@@ -194,6 +194,10 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             source: StallEvidenceSource::LeafEngine,
             began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
             rung: StallRung::Operator,
+            supervisor: None,
+            supervision_index: None,
+            supervision_exhausted: false,
+            reason: None,
             nudge_history: Vec::new(),
         });
     }
