@@ -306,7 +306,7 @@ impl HostsConfig {
 /// `daemon.toml` is the source of truth for execution environments.
 /// Peer-daemon mesh config stays in `hosts.toml`.
 /// Loaded from `~/.config/flotilla/daemon.toml`.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -328,6 +328,23 @@ pub struct DaemonConfig {
     /// Retention in days by artifact kind. Unknown kinds use 30 days.
     #[serde(default = "default_artifact_retention_days")]
     pub artifact_retention_days: BTreeMap<String, u64>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            machine_id: None,
+            host_name: None,
+            admission: AdmissionConfig::default(),
+            credentials: CredentialHealthConfig::default(),
+            logging: DaemonLoggingConfig::default(),
+            environments: BTreeMap::new(),
+            manifests: None,
+            relay: None,
+            blob_stores: Vec::new(),
+            artifact_retention_days: default_artifact_retention_days(),
+        }
+    }
 }
 
 fn default_artifact_retention_days() -> BTreeMap<String, u64> {
