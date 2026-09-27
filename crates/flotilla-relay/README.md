@@ -53,6 +53,5 @@ A subject is pruned once its latest hint is older than the retention window, or 
 
 ## Development
 
-- Host tests: `cargo test -p flotilla-relay -p flotilla-relay-protocol --locked`. The store and request logic run against in-process SQLite through the same `Sql` seam the Durable Object uses.
-- Workers target: `cargo build -p flotilla-relay --target wasm32-unknown-unknown --locked`.
-- Runtime integration tests build the Worker and run it under `wrangler dev`: `cargo test -p flotilla-relay --test runtime --locked -- --ignored`. They need `wrangler` and a `worker-build` matching the `worker` crate (`cargo install worker-build --version 0.8.7 --locked`) on `PATH`. Set `WRANGLER` to use a different wrangler binary.
+- Host tests: `cargo test -p flotilla-relay -p flotilla-relay-protocol --locked`. They cover authentication, webhook limits and delivery handling, replay, acknowledgements, and gaps against in-process SQLite through the same `Sql` seam the Durable Object uses.
+- Workers target: `cargo build -p flotilla-relay --target wasm32-unknown-unknown --locked`. This checks the runtime glue.

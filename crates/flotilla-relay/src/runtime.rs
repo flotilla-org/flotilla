@@ -2,7 +2,7 @@
 //! that install's credentials and mailbox in its own SQLite storage.
 use std::{cell::RefCell, time::Duration};
 
-use flotilla_relay_protocol::{github, ConsumerFrame, Source, StreamFrame};
+use flotilla_relay_protocol::{github, StreamFrame};
 use futures::{
     channel::oneshot,
     future::{select, Either},
@@ -15,13 +15,6 @@ use crate::{
     service::{self, AdminOutcome, Disconnect, Ingress, IngressHeaders, Reply},
     store::{RetentionPolicy, Sql, SqlValue, Store, StoreError, StoreResult},
 };
-
-/// Longest a long-poll holds an empty response.
-const MAX_WAIT_SECS: u64 = 20;
-
-/// Largest admin or ack body the relay reads. Those bodies are at most a small JSON object
-/// (a supplied secret, or an ack frame); every body read is bounded, not only webhook payloads.
-const MAX_CONTROL_BODY_BYTES: usize = 4 * 1024;
 
 fn route_method(method: Method) -> RouteMethod {
     match method {
@@ -40,10 +33,6 @@ fn optional_setting(env: &Env, name: &str) -> Option<String> {
     env.var(name).ok().map(|value| value.to_string())
 }
 
-fn content_length(req: &Request) -> Result<Option<usize>> {
-    Ok(req.headers().get("Content-Length")?.and_then(|value| value.trim().parse().ok()))
-}
-
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
@@ -58,25 +47,16 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if !service::operator_authorized(expected.as_deref(), req.headers().get("Authorization")?.as_deref()) {
                 return unauthorized();
             }
-            if content_length(&req)?.is_some_and(|length| length > MAX_CONTROL_BODY_BYTES) {
-                return Response::error("payload too large", 413);
-            }
         }
         Route::Ingress { source, .. } => {
-            // A source without an adapter is a fact about the relay, not about the install.
-            if Source::parse(source).is_none() {
-                return Response::error("unknown source", 404);
-            }
-            if content_length(&req)?.is_some_and(|length| length > github::MAX_PAYLOAD_BYTES) {
-                return Response::error("payload too large", 413);
+            if let Err(outcome) = service::source(source) {
+                return reply(outcome);
             }
         }
-        Route::Ack { .. } => {
-            if content_length(&req)?.is_some_and(|length| length > MAX_CONTROL_BODY_BYTES) {
-                return Response::error("payload too large", 413);
-            }
-        }
-        Route::Stream { .. } => {}
+        Route::Ack { .. } | Route::Stream { .. } => {}
+    }
+    if service::body_too_large(route, req.headers().get("Content-Length")?.as_deref()) {
+        return Response::error("payload too large", 413);
     }
     let stub = env.durable_object("MAILBOX")?.id_from_name(route.install())?.get_stub()?;
     stub.fetch_with_request(req).await
@@ -132,19 +112,18 @@ fn query_u64(req: &Request, name: &str) -> Result<Option<u64>> {
 
 /// Reads at most `limit` bytes of body, or `None` when the body is larger.
 async fn read_limited(req: &mut Request, limit: usize) -> Result<Option<Vec<u8>>> {
-    let mut body = Vec::new();
+    let mut body = service::LimitedBody::new(limit);
     // A bodyless request (an admin POST without a supplied secret) has no stream to read.
     if req.inner().body().is_none() {
-        return Ok(Some(body));
+        return Ok(Some(body.into_bytes()));
     }
     let mut stream = req.stream()?;
     while let Some(chunk) = stream.next().await {
-        body.extend_from_slice(&chunk?);
-        if body.len() > limit {
+        if !body.push(&chunk?) {
             return Ok(None);
         }
     }
-    Ok(Some(body))
+    Ok(Some(body.into_bytes()))
 }
 
 fn frame_text(frame: &StreamFrame) -> Result<String> {
@@ -195,7 +174,7 @@ impl DurableObject for MailboxObject {
         let authorization = req.headers().get("Authorization")?;
         match route {
             Route::Admin { install, op } => {
-                let Some(body) = read_limited(&mut req, MAX_CONTROL_BODY_BYTES).await? else {
+                let Some(body) = read_limited(&mut req, service::body_limit(route).expect("admin body limit")).await? else {
                     return Response::error("payload too large", 413);
                 };
                 let AdminOutcome { reply: outcome, disconnect } =
@@ -211,11 +190,11 @@ impl DurableObject for MailboxObject {
                 reply(outcome)
             }
             Route::Ingress { source, .. } => {
-                let Some(source) = Source::parse(source) else { return Response::error("unknown source", 404) };
+                let Ok(source) = service::source(source) else { return Response::error("unknown source", 404) };
                 let header = |name| req.headers().get(name);
                 let (signature, event, delivery_id) =
                     (header(github::SIGNATURE_HEADER)?, header(github::EVENT_HEADER)?, header(github::DELIVERY_HEADER)?);
-                let Some(payload) = read_limited(&mut req, github::MAX_PAYLOAD_BYTES).await? else {
+                let Some(payload) = read_limited(&mut req, service::body_limit(route).expect("ingress body limit")).await? else {
                     return Response::error("payload too large", 413);
                 };
                 let headers =
@@ -241,16 +220,13 @@ impl DurableObject for MailboxObject {
                     let pair = WebSocketPair::new()?;
                     // Tagged with the token id so revoking the token closes the connection.
                     self.state.accept_websocket_with_tags(&pair.server, &[&token_id]);
-                    let frames = store.read(cursor, now_ms()).map_err(store_error)?;
-                    if frames.is_empty() {
-                        send_frame(&pair.server, &StreamFrame::Ready { cursor })?;
-                    }
+                    let frames = service::websocket_replay(store, cursor, now_ms()).map_err(store_error)?;
                     for frame in &frames {
                         send_frame(&pair.server, frame)?;
                     }
                     Response::from_websocket(pair.client)
                 } else {
-                    let wait = Duration::from_secs(query_u64(&req, "wait")?.unwrap_or(MAX_WAIT_SECS).min(MAX_WAIT_SECS));
+                    let wait = Duration::from_secs(service::wait_secs(query_u64(&req, "wait")?));
                     let frames = store.read(cursor, now_ms()).map_err(store_error)?;
                     if !frames.is_empty() || wait.is_zero() {
                         return Response::from_json(&frames);
@@ -277,13 +253,10 @@ impl DurableObject for MailboxObject {
                 if service::consumer_token_id(store, authorization.as_deref()).map_err(store_error)?.is_none() {
                     return unauthorized();
                 }
-                let Some(body) = read_limited(&mut req, MAX_CONTROL_BODY_BYTES).await? else {
+                let Some(body) = read_limited(&mut req, service::body_limit(route).expect("ack body limit")).await? else {
                     return Response::error("payload too large", 413);
                 };
-                let Ok(ConsumerFrame::Ack { cursor }) = serde_json::from_slice(&body) else {
-                    return Response::error("invalid frame", 400);
-                };
-                match store.ack(cursor).map_err(store_error)? {
+                match service::ack(store, &body).map_err(store_error)? {
                     Ok(frame) => Response::from_json(&frame),
                     Err(message) => Response::error(message, 400),
                 }
@@ -294,12 +267,7 @@ impl DurableObject for MailboxObject {
     async fn websocket_message(&self, ws: WebSocket, message: WebSocketIncomingMessage) -> Result<()> {
         let Ok(store) = &self.store else { return Ok(()) };
         let WebSocketIncomingMessage::String(text) = message else { return Ok(()) };
-        let reply = match serde_json::from_str::<ConsumerFrame>(&text) {
-            Ok(ConsumerFrame::Ack { cursor }) => {
-                store.ack(cursor).map_err(store_error)?.unwrap_or_else(|message| StreamFrame::Error { message: message.into() })
-            }
-            Err(error) => StreamFrame::Error { message: format!("invalid frame: {error}") },
-        };
+        let reply = service::websocket_ack(store, &text).map_err(store_error)?;
         send_frame(&ws, &reply)
     }
 
@@ -315,8 +283,7 @@ impl DurableObject for MailboxObject {
 impl MailboxObject {
     /// Pushes new deliveries to connected websockets and wakes pending long-polls.
     fn broadcast(&self, deliveries: &[flotilla_relay_protocol::Delivery]) -> Result<()> {
-        let messages =
-            deliveries.iter().map(|delivery| frame_text(&StreamFrame::Hint { delivery: delivery.clone() })).collect::<Result<Vec<_>>>()?;
+        let messages = service::live_frames(deliveries).iter().map(frame_text).collect::<Result<Vec<_>>>()?;
         for socket in self.state.get_websockets() {
             for message in &messages {
                 let _ = socket.send_with_str(message);
