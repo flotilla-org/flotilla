@@ -3565,6 +3565,69 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
 }
 
 #[tokio::test]
+async fn host_direct_placement_selects_only_the_matching_trusted_credential_grant() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&test_meta("github-crew-pr"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Gh,
+            source: CredentialSource::Env { name: "GITHUB_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("create GitHub credential declaration");
+    create_host_direct_placement(&backend, "host-direct-kiwi", "kiwi", BTreeSet::new()).await;
+    let placement = backend.using::<PlacementPolicy>("flotilla").get("host-direct-kiwi").await.expect("get host-direct placement");
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .build();
+
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &test_meta("github-contained"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create non-matching contained grant");
+
+    let mut without_grant = workflow.clone();
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut without_grant)
+        .await
+        .expect("resolve default-deny grants");
+    assert!(without_grant.vessels[0].credential_refs.is_empty(), "host-direct must not fall back to ambient GitHub credentials");
+
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &test_meta("github-trusted"),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder().stance(Stance::Trusted).projects(BTreeSet::from(["flotilla".to_string()])).build(),
+                )
+                .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("create trusted GitHub grant");
+    let mut with_grant = workflow;
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut with_grant)
+        .await
+        .expect("resolve matching trusted grant");
+    assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["github-crew-pr".to_string()]));
+    assert_eq!(with_grant.vessels[0].stance, Stance::Contained, "requested stance remains part of the workflow contract");
+}
+
+#[tokio::test]
 async fn remote_placement_uses_replicated_host_capabilities() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("kiwi-root"));
     let now = Utc::now();

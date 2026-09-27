@@ -10849,7 +10849,7 @@ mod tests {
         };
         let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
 
-        TerminalControllerRuntime { state }
+        let launched = TerminalControllerRuntime { state }
             .ensure_session("terminal-demo-work-coder", &spec, &tags)
             .await
             .expect("launch contained Claude with its granted credential");
@@ -10870,6 +10870,17 @@ mod tests {
             "the contained Claude process must receive the config directory owned by its adapter"
         );
         assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
+        let crew_id = &launched.crew.expect("contained crew identity").id;
+        for (name, expected) in [
+            ("FLOTILLA_CREW_ID", crew_id.as_str()),
+            ("FLOTILLA_CONVOY", "demo"),
+            ("FLOTILLA_VESSEL", "demo-work"),
+            ("FLOTILLA_CREW_ROLE", "coder"),
+            ("FLOTILLA_NAMESPACE", NAMESPACE),
+            ("FLOTILLA_TERMINAL_SESSION", "terminal-demo-work-coder"),
+        ] {
+            assert!(launch.env_vars.iter().any(|(key, value)| key == name && value == expected), "contained launch missing {name}");
+        }
     }
 
     #[tokio::test]
@@ -11244,6 +11255,7 @@ mod tests {
             .into_iter()
             .find(|session| session.spec.role == "coder")
             .expect("coder session");
+        let TerminalSessionSource::Agent { context, .. } = &coder.spec.source else { panic!("coder must be an agent") };
         let coder_id = coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("coder identity").id.clone();
         assert_eq!(coder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
         assert!(terminals.list().await.expect("terminal list").items.iter().any(|session| session.spec.role == "watcher"));
@@ -11252,7 +11264,20 @@ mod tests {
         let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
         assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(!coder_launch.command.contains("without leaking this full brief"));
-        assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "FLOTILLA_CREW_ID" && value == &coder_id));
+        for (name, expected) in [
+            ("FLOTILLA_CREW_ID", coder_id.as_str()),
+            ("FLOTILLA_CONVOY", context.convoy.as_str()),
+            ("FLOTILLA_VESSEL", context.vessel_ref.as_str()),
+            ("FLOTILLA_CREW_ROLE", "coder"),
+            ("FLOTILLA_NAMESPACE", NAMESPACE),
+            ("FLOTILLA_TERMINAL_SESSION", coder_launch.session_name.as_str()),
+        ] {
+            assert!(coder_launch.env_vars.iter().any(|(key, value)| key == name && value == expected), "host-direct launch missing {name}");
+        }
+        assert!(
+            !coder_launch.env_vars.iter().any(|(key, _)| matches!(key.as_str(), "GH_TOKEN" | "GITHUB_TOKEN_FILE" | "GIT_CONFIG_GLOBAL")),
+            "ungranted host-direct crew must remain credential-less"
+        );
         assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
         let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
         assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));

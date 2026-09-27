@@ -79,21 +79,15 @@ impl CleatTerminalPool {
             return Ok(());
         }
 
-        let effective_cmd = if env_vars.is_empty() {
-            command.to_string()
-        } else {
-            let mut parts = vec!["env".to_string()];
-            for (key, value) in env_vars {
-                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
-            }
-            parts.push(command.to_string());
-            parts.join(" ")
-        };
         let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
+        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", command];
         let encoded_size = initial_size.map(|size| size.to_string());
         if let Some(size) = &encoded_size {
             args.extend(["--size", size]);
+        }
+        let encoded_env = env_vars.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>();
+        for variable in &encoded_env {
+            args.extend(["--env", variable]);
         }
         let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
         for tag in &encoded_tags {
@@ -317,14 +311,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_includes_env_vars_in_cmd() {
-        let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"env FOO='bar' claude","status":"Detached"}"#;
+    async fn ensure_session_passes_env_vars_to_launch() {
+        let create_json = r#"{"id":"my-session","cwd":"/repo","cmd":"claude","status":"Detached"}"#;
         let runner = Arc::new(MockRunner::new(vec![
             Ok("[]".into()),        // list_sessions: empty
             Ok(create_json.into()), // launch response
         ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
-        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let env = vec![
+            ("FOO".to_string(), "bar baz".to_string()),
+            ("FLOTILLA_CREW_ID".to_string(), "crew-123".to_string()),
+            ("GITHUB_TOKEN_FILE".to_string(), "/run/credentials/github-app/token".to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), "/run/credentials/gitconfig".to_string()),
+        ];
 
         pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
 
@@ -332,10 +331,11 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
-        let cmd_val = &calls[1].1[cmd_idx + 1];
-        assert!(cmd_val.starts_with("env "), "should prefix with env: {cmd_val}");
-        assert!(cmd_val.contains("FOO='bar'"), "should contain quoted env var: {cmd_val}");
-        assert!(cmd_val.ends_with("claude"), "should end with command: {cmd_val}");
+        assert_eq!(calls[1].1[cmd_idx + 1], "claude");
+        assert!(calls[1].1.windows(2).any(|args| args == ["--env", "FOO=bar baz"]));
+        assert!(calls[1].1.windows(2).any(|args| args == ["--env", "FLOTILLA_CREW_ID=crew-123"]));
+        assert!(calls[1].1.windows(2).any(|args| args == ["--env", "GITHUB_TOKEN_FILE=/run/credentials/github-app/token"]));
+        assert!(calls[1].1.windows(2).any(|args| args == ["--env", "GIT_CONFIG_GLOBAL=/run/credentials/gitconfig"]));
     }
 
     #[tokio::test]
@@ -588,10 +588,9 @@ mod tests {
 
         let calls = runner.calls();
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
-        assert_eq!(
-            calls[1].1[cmd_idx + 1],
-            "env TERM='screen-256color' TERM_PROGRAM='my-terminal' TERM_PROGRAM_VERSION='2.0' COLORTERM='truecolor' FOO='bar' claude"
-        );
+        assert_eq!(calls[1].1[cmd_idx + 1], "claude");
+        let launch_env = calls[1].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].clone()).collect::<Vec<_>>();
+        assert_eq!(launch_env, caller_env.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>());
     }
 
     #[tokio::test]

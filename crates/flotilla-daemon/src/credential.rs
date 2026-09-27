@@ -2648,7 +2648,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn github_app_mints_only_project_repositories_on_every_prepare() {
+    async fn github_app_host_direct_and_contained_delivery_match_and_no_grant_stays_empty() {
         let state = tempfile::tempdir().expect("create state directory");
         let app_id_path = state.path().join("github-app.id");
         let private_key_path = state.path().join("github-app.pem");
@@ -2714,17 +2714,33 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-        let first = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
-        let second = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("second preparation");
+        let first = store.prepare_scoped("host-direct-kiwi", &refs, &scopes, runner.clone()).await.expect("host-direct preparation");
+        let second = store.prepare_scoped("contained-crew", &refs, &scopes, runner.clone()).await.expect("contained preparation");
+        let no_grant = store
+            .prepare_scoped("host-direct-without-grant", &BTreeSet::new(), &BTreeMap::new(), runner.clone())
+            .await
+            .expect("ungranted crew preparation");
 
         let first = first.into_iter().collect::<BTreeMap<_, _>>();
         let second = second.into_iter().collect::<BTreeMap<_, _>>();
         assert!(!first.contains_key("GH_TOKEN") && !second.contains_key("GH_TOKEN"));
-        assert_eq!(first.get("GITHUB_TOKEN_FILE"), second.get("GITHUB_TOKEN_FILE"));
-        assert_eq!(first.get("PATH"), second.get("PATH"));
+        assert_eq!(first, second, "both placements must use the same credential adapter output");
+        assert!(no_grant.is_empty(), "an ungranted host-direct crew must receive no credential environment");
+        assert!(first["GITHUB_TOKEN_FILE"].ends_with("/credentials/github-app/token"));
+        assert!(first["PATH"].contains("/credentials/github-app:"), "gh wrapper directory must be on PATH");
+        assert!(first["GIT_CONFIG_GLOBAL"].ends_with("/credentials/gitconfig"));
+        assert_eq!(first["GIT_TERMINAL_PROMPT"], "0");
         let writes = runner.writes.lock().expect("writes lock");
         assert!(writes.iter().any(|(_, contents)| contents.contains("installation-token-one")));
         assert!(writes.iter().any(|(_, contents)| contents.contains("installation-token-two")));
+        assert!(writes
+            .iter()
+            .any(|(path, contents)| path.ends_with("credentials/github-app/gh") && contents.contains("GITHUB_TOKEN_FILE")));
+        assert!(writes
+            .iter()
+            .any(|(path, contents)| path.ends_with("credentials/github-app/git-credential-github-app")
+                && contents.contains("GITHUB_TOKEN_FILE")));
+        assert!(writes.iter().any(|(path, contents)| path.ends_with("credentials/gitconfig") && contents.contains("flotilla-crew")));
         drop(writes);
         let calls = runner.calls.lock().expect("calls lock");
         assert_eq!(
