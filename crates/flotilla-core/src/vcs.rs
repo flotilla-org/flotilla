@@ -314,7 +314,7 @@ impl FlotillaVcs {
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
         match backend.current_branch().await {
             Ok(current) if current.trim() != branch => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
-            Err(error) if error.contains("not a git repository") || error.contains("cannot change to") => return Ok(None),
+            Err(error) if error.contains("not a git repository") => return Ok(None),
             Err(_) => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
             _ => {}
         }

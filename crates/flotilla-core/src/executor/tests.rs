@@ -19,7 +19,7 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{
-            test_support::{fake_discovery, DiscoveryMockRunner},
+            test_support::{fake_discovery, test_vcs_resolver, DiscoveryMockRunner},
             ProviderCategory, ProviderDescriptor,
         },
         issue_tracker::IssueProvider,
@@ -32,28 +32,8 @@ use crate::{
         CommandRunner,
     },
     step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
-    vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
+    vcs::Vcs,
 };
-
-struct TestVcsResolver(Arc<dyn CommandRunner>);
-
-#[async_trait]
-impl CheckoutVcsResolver for TestVcsResolver {
-    async fn vcs_for(&self, _environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String> {
-        Ok(Arc::new(FlotillaVcs::new(
-            ExecutionEnvironmentPath::new(path),
-            Arc::clone(&self.0),
-            GitCheckoutStrategy::Worktree(Box::new(crate::providers::vcs::git_worktree::GitWorktreeStrategy::new(
-                crate::config::default_checkout_path(),
-                Arc::clone(&self.0),
-            ))),
-        )))
-    }
-}
-
-fn test_vcs_resolver(runner: Arc<dyn CommandRunner>) -> Arc<dyn CheckoutVcsResolver> {
-    Arc::new(TestVcsResolver(runner))
-}
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)

@@ -406,33 +406,13 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use crate::{
-        providers::{discovery::test_support::DiscoveryMockRunner, vcs::git_worktree::GitWorktreeStrategy, CommandRunner},
-        vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
+    use crate::providers::{
+        discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
+        CommandRunner,
     };
 
-    struct TestVcsResolver(Arc<dyn CommandRunner>);
-
-    #[async_trait::async_trait]
-    impl CheckoutVcsResolver for TestVcsResolver {
-        async fn vcs_for(
-            &self,
-            _environment: Option<&flotilla_protocol::EnvironmentId>,
-            path: &std::path::Path,
-        ) -> Result<Arc<dyn Vcs>, String> {
-            Ok(Arc::new(FlotillaVcs::new(
-                crate::path_context::ExecutionEnvironmentPath::new(path),
-                Arc::clone(&self.0),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
-                    crate::config::default_checkout_path(),
-                    Arc::clone(&self.0),
-                ))),
-            )))
-        }
-    }
-
     fn test_inspector(runner: Arc<dyn CommandRunner>, host_ref: &str) -> GitRepositoryInspector {
-        GitRepositoryInspector::new(Arc::clone(&runner), Arc::new(TestVcsResolver(runner)), host_ref)
+        GitRepositoryInspector::new(Arc::clone(&runner), test_vcs_resolver(runner), host_ref)
     }
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
