@@ -1,14 +1,26 @@
-use std::sync::Arc;
+use std::{future::Future, path::Path, sync::Arc};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
 };
-use flotilla_protocol::{AgentHookEvent, Command, CommandAction, CommandCaller, Message, RepoSelector, Request, Response};
+use flotilla_protocol::{
+    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, EnvironmentId, Message, RepoSelector, Request,
+    Response,
+};
 use tracing::warn;
 
 use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
+use crate::artifact::{ArtifactBody, ArtifactPutInput, ArtifactService};
+
+fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(cwd).join(path)
+    }
+}
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
@@ -46,13 +58,154 @@ impl<'a> RequestDispatcher<'a> {
         Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, caller }
     }
 
-    pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
+    pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
+        Box::pin(self.dispatch_inner(id, request))
+    }
+
+    async fn dispatch_inner(&self, id: u64, request: Request) -> Message {
         match request {
             Request::Shutdown => Message::ok_response(id, Response::Shutdown),
             Request::ListRepos => match self.daemon.list_repos().await {
                 Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
                 Err(e) => Message::error_response(id, e),
             },
+            Request::ArtifactPut { kind, subject, summary, media_type, source_path } => {
+                let result = Box::pin(async {
+                    let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
+                    let config = self.daemon.config_store();
+                    let settings = config.load_daemon_config()?;
+                    let blobs = self.remote_command_router.blob_store()?;
+                    let backend = self.daemon.resource_backend();
+                    let namespace = self.daemon.provisioning_namespace().await;
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+                    let session = service.caller_session(caller).await?;
+                    let runner = self
+                        .daemon
+                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                    let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
+                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+                    runner.read_file_to(&source_path, temporary.path()).await?;
+                    let input = ArtifactPutInput::builder()
+                        .kind(kind)
+                        .subject(subject)
+                        .summary(summary)
+                        .media_type(media_type)
+                        .body(ArtifactBody::File(temporary.path().to_path_buf()))
+                        .build();
+                    let target = self
+                        .daemon
+                        .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
+                            namespace: Some(namespace.clone()),
+                            name: caller.convoy.clone(),
+                        })
+                        .await?;
+                    match target {
+                        Some(target) if target.node_id != *self.daemon.node_id() => {
+                            let (name, spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
+                            let digest = spec.digest.clone();
+                            let document = serde_json::json!({
+                                "apiVersion": "flotilla.work/v1",
+                                "kind": "Artifact",
+                                "metadata": { "name": name, "ownerReferences": [owner] },
+                                "spec": spec,
+                            });
+                            let mut events = self.daemon.subscribe();
+                            let command_id = self
+                                .remote_command_router
+                                .dispatch_execute_for_caller(
+                                    Command {
+                                        node_id: Some(target.node_id),
+                                        provisioning_target: None,
+                                        context_repo: None,
+                                        action: CommandAction::ResourceApply { namespace, document },
+                                    },
+                                    Some(self.caller.clone()),
+                                )
+                                .await?;
+                            let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                                loop {
+                                    match events.recv().await {
+                                        Ok(DaemonEvent::CommandFinished { command_id: finished, result, .. }) if finished == command_id => {
+                                            break Ok(result);
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => break Err(format!("artifact home command event unavailable: {error}")),
+                                    }
+                                }
+                            })
+                            .await
+                            .map_err(|_| "artifact home command timed out".to_string())??;
+                            match result {
+                                CommandValue::ResourceObject(_) => {
+                                    Ok(Response::ArtifactPut { address: format!("artifact/{name}"), digest })
+                                }
+                                CommandValue::Error { message } => Err(message),
+                                other => Err(format!("unexpected artifact home result: {other:?}")),
+                            }
+                        }
+                        Some(_) => {
+                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
+                            Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
+                        }
+                        None => {
+                            if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
+                                return Err("convoy home is unavailable for artifact put".to_string());
+                            }
+                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
+                            Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
+                        }
+                    }
+                })
+                .await;
+                match result {
+                    Ok(response) => Message::ok_response(id, response),
+                    Err(error) => Message::error_response(id, error),
+                }
+            }
+            Request::ArtifactGet { reference, destination_path } => {
+                let result = Box::pin(async {
+                    let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
+                    let blobs = self.remote_command_router.blob_store()?;
+                    let backend = self.daemon.resource_backend();
+                    let namespace = self.daemon.provisioning_namespace().await;
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+                    let session = service.caller_session(caller).await?;
+                    let runner = self
+                        .daemon
+                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                    let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
+                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+                    let size = service.get_to_file(&reference, temporary.path()).await?;
+                    runner.write_file_from(temporary.path(), &destination_path).await?;
+                    Ok::<_, String>(Response::ArtifactGet { size })
+                })
+                .await;
+                match result {
+                    Ok(response) => Message::ok_response(id, response),
+                    Err(error) => Message::error_response(id, error),
+                }
+            }
+            Request::ArtifactList { convoy, kind, subject } => {
+                let result = Box::pin(async {
+                    let blobs = self.remote_command_router.blob_store()?;
+                    let backend = self.daemon.resource_backend();
+                    let namespace = self.daemon.provisioning_namespace().await;
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+                    let items = service.list(convoy.as_deref(), kind.as_deref(), subject.as_deref()).await?;
+                    let items = items
+                        .into_iter()
+                        .map(|item| serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, String>(Response::ArtifactList { items })
+                })
+                .await;
+                match result {
+                    Ok(response) => Message::ok_response(id, response),
+                    Err(error) => Message::error_response(id, error),
+                }
+            }
 
             Request::Execute { command } => {
                 if command.action.is_query() {

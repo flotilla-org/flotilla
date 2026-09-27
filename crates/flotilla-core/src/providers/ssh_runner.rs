@@ -146,6 +146,19 @@ impl CommandRunner for SshCommandRunner {
         let ssh_args = self.ssh_shell_args(&script);
         self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
+
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let source = source.to_string_lossy();
+        let script = self.remote_exec_script("cat", &[&source], Path::new("/"));
+        let args = self.ssh_shell_args(&script);
+        self.runner.run_to_file("ssh", &args, Path::new("/"), destination).await
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let script = atomic_write_script(destination, &Uuid::new_v4().to_string())?;
+        let args = self.ssh_shell_args(&script);
+        self.runner.run_from_file("ssh", &args, Path::new("/"), source).await
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +248,24 @@ mod tests {
             ));
             self.inputs.lock().expect("inputs mutex").push(input.to_vec());
             self.run_results.lock().expect("run_results mutex").pop_front().expect("run result not configured")
+        }
+
+        async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, _destination: &Path) -> Result<(), String> {
+            self.calls.lock().expect("calls mutex").push((
+                cmd.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd.to_path_buf(),
+            ));
+            Ok(())
+        }
+
+        async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, _source: &Path) -> Result<(), String> {
+            self.calls.lock().expect("calls mutex").push((
+                cmd.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd.to_path_buf(),
+            ));
+            Ok(())
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -453,5 +484,23 @@ mod tests {
         assert!(args.iter().all(|arg| !arg.contains("secret assignment")));
         assert_eq!(inner.inputs(), vec![b"secret assignment".to_vec()]);
         assert!(args.last().expect("remote script").contains("cat > \"$tmp\""));
+    }
+
+    #[tokio::test]
+    async fn binary_file_transfer_uses_ssh_streams() {
+        let inner = std::sync::Arc::new(RecordingRunner::with_run_results(vec![]));
+        let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
+        let host_path = Path::new("/tmp/daemon-body");
+        let crew_path = Path::new("/work/body.bin");
+
+        runner.read_file_to(crew_path, host_path).await.expect("read binary file");
+        runner.write_file_from(host_path, crew_path).await.expect("write binary file");
+
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "ssh");
+        assert!(calls[0].1.last().expect("read script").contains("'cat' '/work/body.bin'"));
+        assert_eq!(calls[1].0, "ssh");
+        assert!(calls[1].1.last().expect("write script").contains("cat > \"$tmp\""));
     }
 }

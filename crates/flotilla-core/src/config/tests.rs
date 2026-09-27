@@ -377,6 +377,9 @@ fn load_daemon_config_missing_file_returns_default() {
     let config = store.load_daemon_config().unwrap();
     assert_eq!(config.host_name, None);
     assert_eq!(config.manifests, None);
+    assert_eq!(config.artifact_retention_days.get("brief"), Some(&3650));
+    assert_eq!(config.artifact_retention_days.get("recording"), Some(&14));
+    assert_eq!(config.artifact_retention_days.get("raw-test-output"), Some(&7));
 }
 
 #[test]

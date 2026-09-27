@@ -334,6 +334,9 @@ pub struct DaemonServer {
 }
 
 impl DaemonServer {
+    pub fn install_blob_store(&self, store: Arc<crate::blob_store::TieredBlobStore>) -> Result<(), String> {
+        self.remote_command_router.install_blob_store(store)
+    }
     /// Create a new daemon server.
     ///
     /// `repo_paths` — initial repos to track.

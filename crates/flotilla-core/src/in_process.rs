@@ -3663,6 +3663,10 @@ impl InProcessDaemon {
         self.resource_backend.clone()
     }
 
+    pub fn config_store(&self) -> Arc<ConfigStore> {
+        Arc::clone(&self.config)
+    }
+
     pub async fn subscribe_wait(
         &self,
         connection_id: uuid::Uuid,

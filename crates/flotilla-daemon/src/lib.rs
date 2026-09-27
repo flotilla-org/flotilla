@@ -1,5 +1,6 @@
 mod agent_material;
 mod aggregator;
+pub mod artifact;
 pub mod blob_store;
 mod codex_central;
 mod credential;

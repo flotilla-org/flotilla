@@ -258,6 +258,26 @@ pub trait CommandRunner: Send + Sync {
         Err("command runner does not support stdin input".to_string())
     }
 
+    /// Stream a command's binary stdout into a daemon-host file.
+    async fn run_to_file(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file reads".to_string())
+    }
+
+    /// Stream a daemon-host file into a command's binary stdin.
+    async fn run_from_file(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _source: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file writes".to_string())
+    }
+
+    /// Copy a file from this runner's environment to the daemon host.
+    async fn read_file_to(&self, _source: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file reads".to_string())
+    }
+
+    /// Copy a daemon-host file into this runner's environment.
+    async fn write_file_from(&self, _source: &Path, _destination: &Path) -> Result<(), String> {
+        Err("command runner does not support binary file writes".to_string())
+    }
+
     /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
 
@@ -420,6 +440,60 @@ impl CommandRunner for ProcessCommandRunner {
         }
     }
 
+    async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
+        let mut child = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut output = tokio::fs::File::create(destination).await.map_err(|error| error.to_string())?;
+        tokio::io::copy(&mut child.stdout.take().expect("piped stdout"), &mut output).await.map_err(|error| error.to_string())?;
+        let status = child.wait().await.map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited with {status}"))
+        }
+    }
+
+    async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, source: &Path) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let mut input = tokio::fs::File::open(source).await.map_err(|error| error.to_string())?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        tokio::io::copy(&mut input, &mut stdin).await.map_err(|error| error.to_string())?;
+        stdin.shutdown().await.map_err(|error| error.to_string())?;
+        drop(stdin);
+        let status = child.wait().await.map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{cmd} exited with {status}"))
+        }
+    }
+
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        tokio::fs::copy(source, destination).await.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let temporary = destination.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::copy(source, &temporary).await.map_err(|error| error.to_string())?;
+        tokio::fs::rename(&temporary, destination).await.map_err(|error| error.to_string())
+    }
+
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         tokio::process::Command::new(cmd)
             .args(args)
@@ -555,6 +629,17 @@ pub(crate) use http_execute;
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String>;
+
+    /// Stream a response body to a file. Test clients may use the buffered
+    /// `execute` implementation; production overrides this to bound memory.
+    async fn execute_to_file(&self, request: reqwest::Request, label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        let response = self.execute(request, label).await?;
+        let status = response.status();
+        if status.is_success() {
+            tokio::fs::write(path, response.body()).await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
+    }
 }
 
 /// Production implementation that delegates to `reqwest::Client`.
@@ -588,6 +673,20 @@ impl HttpClient for ReqwestHttpClient {
             builder = builder.header(name, value);
         }
         builder.body(body).map_err(|e| e.to_string())
+    }
+
+    async fn execute_to_file(&self, request: reqwest::Request, _label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        use tokio::io::AsyncWriteExt;
+        let mut response = self.client.execute(request).await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            let mut file = tokio::fs::File::create(path).await.map_err(|error| error.to_string())?;
+            while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+                file.write_all(&chunk).await.map_err(|error| error.to_string())?;
+            }
+            file.flush().await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
     }
 }
 
@@ -648,6 +747,16 @@ pub(crate) mod testing {
             _input: &[u8],
         ) -> Result<String, String> {
             self.run(cmd, args, cwd, label).await
+        }
+
+        async fn run_to_file(&self, cmd: &str, args: &[&str], _cwd: &Path, _destination: &Path) -> Result<(), String> {
+            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|arg| (*arg).into()).collect()));
+            Ok(())
+        }
+
+        async fn run_from_file(&self, cmd: &str, args: &[&str], _cwd: &Path, _source: &Path) -> Result<(), String> {
+            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|arg| (*arg).into()).collect()));
+            Ok(())
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -837,6 +946,29 @@ mod tests {
     async fn process_runner_exists_false() {
         let runner = ProcessCommandRunner;
         assert!(!runner.exists("nonexistent-binary-xyz", &[]).await);
+    }
+
+    #[tokio::test]
+    async fn process_runner_transfers_binary_files_without_text_conversion() {
+        let directory = tempfile::tempdir().expect("transfer directory");
+        let source = directory.path().join("source");
+        let copied = directory.path().join("copied");
+        let streamed = directory.path().join("streamed");
+        let returned = directory.path().join("returned");
+        let bytes = [0_u8, 1, 127, 128, 255];
+        tokio::fs::write(&source, bytes).await.expect("source bytes");
+        let runner = ProcessCommandRunner;
+        runner.read_file_to(&source, &copied).await.expect("read host file");
+        runner.write_file_from(&copied, &returned).await.expect("write host file");
+        runner.run_to_file("cat", &[source.to_str().expect("utf8 path")], Path::new("/"), &streamed).await.expect("stream stdout");
+        assert_eq!(tokio::fs::read(&streamed).await.expect("streamed bytes"), bytes);
+        assert_eq!(tokio::fs::read(&returned).await.expect("returned bytes"), bytes);
+        let piped = directory.path().join("piped");
+        runner
+            .run_from_file("sh", &["-c", "cat > \"$1\"", "flotilla-test", piped.to_str().expect("utf8 path")], Path::new("/"), &source)
+            .await
+            .expect("stream stdin");
+        assert_eq!(tokio::fs::read(piped).await.expect("piped bytes"), bytes);
     }
 
     #[test]

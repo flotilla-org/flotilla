@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use super::{build_remote_command_router, spawn_peer_networking_runtime};
 use crate::{
+    blob_store::TieredBlobStore,
     peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
     server::PeerConnectionEvent,
 };
@@ -73,7 +74,7 @@ pub async fn spawn_in_memory_request_topology_stateful(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, None, None, None).await
 }
 
 /// Stateful in-memory topology whose client declares an explicit attention
@@ -83,7 +84,7 @@ pub async fn spawn_in_memory_request_topology_stateful_with_surface(
     follower: Arc<InProcessDaemon>,
     surface: SurfaceDeclaration,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), None, None).await
 }
 
 pub async fn spawn_in_memory_request_topology_stateful_with_caller(
@@ -92,7 +93,17 @@ pub async fn spawn_in_memory_request_topology_stateful_with_caller(
     surface: SurfaceDeclaration,
     caller: CommandCaller,
 ) -> Result<InMemoryRequestTopology, String> {
-    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller)).await
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), None).await
+}
+
+pub async fn spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
+    leader: Arc<InProcessDaemon>,
+    follower: Arc<InProcessDaemon>,
+    surface: SurfaceDeclaration,
+    caller: CommandCaller,
+    blob_store: Arc<TieredBlobStore>,
+) -> Result<InMemoryRequestTopology, String> {
+    spawn_in_memory_request_topology_stateful_with_options(leader, follower, Some(surface), Some(caller), Some(blob_store)).await
 }
 
 async fn spawn_in_memory_request_topology_stateful_with_options(
@@ -100,6 +111,7 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     follower: Arc<InProcessDaemon>,
     surface: Option<SurfaceDeclaration>,
     caller: Option<CommandCaller>,
+    blob_store: Option<Arc<TieredBlobStore>>,
 ) -> Result<InMemoryRequestTopology, String> {
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
@@ -128,6 +140,9 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
     let (leader_inbound_peer_tx, leader_inbound_peer_rx) = mpsc::channel(256);
     let (follower_inbound_peer_tx, follower_inbound_peer_rx) = mpsc::channel(256);
     let leader_remote_router = build_remote_command_router(&leader, &leader_peer_manager);
+    if let Some(blob_store) = blob_store {
+        leader_remote_router.install_blob_store(blob_store)?;
+    }
     let follower_remote_router = build_remote_command_router(&follower, &follower_peer_manager);
 
     let (leader_runtime_handle, _leader_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) =

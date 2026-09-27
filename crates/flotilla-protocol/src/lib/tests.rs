@@ -9,6 +9,28 @@ fn list_repos_request_roundtrips() {
 }
 
 #[test]
+fn artifact_requests_carry_paths_without_body_bytes() {
+    let request = Request::ArtifactPut {
+        kind: "recording".into(),
+        subject: "head".into(),
+        summary: Default::default(),
+        media_type: "application/octet-stream".into(),
+        source_path: "/crew/report.bin".into(),
+    };
+    let encoded = serde_json::to_value(&request).expect("serialize request");
+    assert_eq!(encoded["params"]["source_path"], "/crew/report.bin");
+    assert!(encoded["params"].get("body").is_none());
+    assert!(
+        matches!(serde_json::from_value::<Request>(encoded).expect("decode request"), Request::ArtifactPut { source_path, .. } if source_path == std::path::Path::new("/crew/report.bin"))
+    );
+
+    let response = Response::ArtifactGet { size: 4 };
+    let encoded = serde_json::to_value(&response).expect("serialize response");
+    assert!(encoded["data"].get("body").is_none());
+    assert!(matches!(serde_json::from_value::<Response>(encoded).expect("decode response"), Response::ArtifactGet { size: 4 }));
+}
+
+#[test]
 fn host_replay_cursor_roundtrips() {
     let cursor = ReplayCursor { stream: StreamKey::Host { environment_id: EnvironmentId::new("env-1") }, seq: 7 };
     let json = serde_json::to_string(&cursor).expect("serialize");

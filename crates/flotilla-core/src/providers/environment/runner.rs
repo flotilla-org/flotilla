@@ -129,6 +129,16 @@ impl CommandRunner for DockerEnvironmentRunner {
         let args = ["exec", "-i", &self.container_name, "sh", "-c", script.as_str()];
         self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
+
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let source = source.to_string_lossy();
+        self.inner.run_to_file("docker", &["exec", &self.container_name, "cat", &source], Path::new("/"), destination).await
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let script = atomic_write_script(destination, &Uuid::new_v4().to_string())?;
+        self.inner.run_from_file("docker", &["exec", "-i", &self.container_name, "sh", "-c", &script], Path::new("/"), source).await
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +361,22 @@ mod tests {
         assert!(calls[0].1.iter().all(|arg| !arg.contains("secret assignment")));
         assert!(calls[0].1.contains(&"-i".to_string()));
         assert!(calls[0].1.last().expect("write script").contains("cat > \"$tmp\""));
+    }
+
+    #[tokio::test]
+    async fn binary_file_transfer_uses_docker_exec_streams() {
+        let inner = Arc::new(MockRunner::new(vec![]));
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
+        let host_path = Path::new("/tmp/daemon-body");
+        let crew_path = Path::new("/work/body.bin");
+
+        runner.read_file_to(crew_path, host_path).await.expect("read binary file");
+        runner.write_file_from(host_path, crew_path).await.expect("write binary file");
+
+        let calls = inner.calls();
+        assert_eq!(calls[0], ("docker".into(), vec!["exec".into(), "my-container".into(), "cat".into(), "/work/body.bin".into()]));
+        assert_eq!(calls[1].0, "docker");
+        assert_eq!(&calls[1].1[..5], ["exec", "-i", "my-container", "sh", "-c"]);
+        assert!(calls[1].1[5].contains("cat > \"$tmp\""));
     }
 }

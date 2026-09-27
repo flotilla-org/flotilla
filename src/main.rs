@@ -195,6 +195,11 @@ enum SubCommand {
         #[command(subcommand)]
         command: ResourceSubCommand,
     },
+    /// Store and retrieve crew artifacts
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactSubCommand,
+    },
     /// List recent object-scoped events fleet-wide
     Events {
         /// Resource namespace
@@ -250,6 +255,44 @@ enum SubCommand {
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+}
+
+#[derive(clap::Subcommand)]
+enum ArtifactSubCommand {
+    Put {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        about: String,
+        #[arg(long = "summary", value_parser = parse_artifact_summary)]
+        summary: Vec<(String, serde_json::Value)>,
+        file: PathBuf,
+    },
+    Get {
+        reference: String,
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+    List {
+        #[arg(long)]
+        convoy: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        about: Option<String>,
+    },
+}
+
+fn parse_artifact_summary(value: &str) -> Result<(String, serde_json::Value), String> {
+    let (key, value) = value.split_once('=').ok_or_else(|| "summary must be key=value".to_string())?;
+    if key.is_empty() {
+        return Err("summary key must be nonempty".into());
+    }
+    let parsed = serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    if !parsed.is_string() && !parsed.is_number() && !parsed.is_boolean() {
+        return Err("summary value must be a string, number, or boolean".into());
+    }
+    Ok((key.to_string(), parsed))
 }
 
 #[derive(clap::Subcommand)]
@@ -691,6 +734,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
+        Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
         Some(SubCommand::Events { namespace, host, local_only }) => {
             run_resource_command(
                 &cli,
@@ -1267,6 +1311,68 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     .await
     .map_err(|e| color_eyre::eyre::eyre!(e))?;
     Ok(daemon as Arc<dyn DaemonHandle>)
+}
+
+async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: OutputFormat) -> Result<()> {
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let daemon = connect_cli_socket(
+        &socket_path,
+        &config_dir,
+        &state_dir,
+        host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref()),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    match command {
+        ArtifactSubCommand::Put { kind, about, summary, file } => {
+            let source_path = tokio::fs::canonicalize(&file).await?;
+            let media_type = match file.extension().and_then(|value| value.to_str()).unwrap_or("") {
+                "json" => "application/json",
+                "md" => "text/markdown",
+                "txt" | "log" => "text/plain",
+                "yaml" | "yml" => "application/yaml",
+                _ => "application/octet-stream",
+            };
+            let summary = summary.into_iter().collect();
+            let (address, digest) = daemon
+                .artifact_put(kind, about, summary, media_type.to_string(), source_path)
+                .await
+                .map_err(|error| color_eyre::eyre::eyre!(error))?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::json!({"address": address, "digest": digest})),
+                OutputFormat::Human => println!("{address}\n{digest}"),
+            }
+        }
+        ArtifactSubCommand::Get { reference, output } => {
+            let path = output.unwrap_or_else(|| PathBuf::from(reference.rsplit('/').next().unwrap_or(&reference)));
+            let destination = if path.is_absolute() { path.clone() } else { std::env::current_dir()?.join(&path) };
+            let size = daemon.artifact_get(reference.clone(), destination).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::json!({"path": path, "size": size})),
+                OutputFormat::Human => println!("{}", path.display()),
+            }
+        }
+        ArtifactSubCommand::List { convoy, kind, about } => {
+            let items = daemon.artifact_list(convoy, kind, about).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&items)?),
+                OutputFormat::Human => {
+                    for item in items {
+                        println!(
+                            "artifact/{}\t{}\t{}\t{}\t{}\t{}",
+                            item["metadata"]["name"].as_str().unwrap_or("?"),
+                            item["spec"]["convoy"].as_str().unwrap_or("?"),
+                            item["spec"]["producer"].as_str().unwrap_or("?"),
+                            item["spec"]["kind"].as_str().unwrap_or("?"),
+                            item["spec"]["subject"].as_str().unwrap_or("?"),
+                            item["spec"]["digest"].as_str().unwrap_or("?"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) -> Result<()> {
@@ -2423,9 +2529,9 @@ mod tests {
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
         provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target,
         select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
-        topology_output_format, uninstall_codex_hook, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
-        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        topology_output_format, uninstall_codex_hook, ArtifactSubCommand, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand,
+        PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
+        ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[test]
@@ -3218,6 +3324,41 @@ mod tests {
         let literal = Cli::try_parse_from(["flotilla", "crew", "--subject", "@reviewer", "handoff", "--message", "Review commit abc123"])
             .expect("literal crew role should parse");
         assert!(matches!(literal.command, Some(SubCommand::Crew(_))));
+    }
+
+    #[test]
+    fn artifact_cli_parses_typed_summary_without_a_producer_option() {
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "artifact",
+            "put",
+            "--kind",
+            "review-round",
+            "--about",
+            "head-1",
+            "--summary",
+            "approved=true",
+            "round.md",
+        ])
+        .expect("artifact put parses");
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Artifact { command: ArtifactSubCommand::Put { summary, .. } })
+                if summary == vec![("approved".to_string(), serde_json::json!(true))]
+        ));
+        assert!(Cli::try_parse_from([
+            "flotilla",
+            "artifact",
+            "put",
+            "--kind",
+            "brief",
+            "--about",
+            "convoy",
+            "--producer",
+            "reviewer",
+            "brief.md"
+        ])
+        .is_err());
     }
 
     #[test]

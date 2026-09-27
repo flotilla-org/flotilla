@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
     },
     time::Duration,
 };
@@ -23,7 +23,10 @@ use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::peer::{PeerManager, PeerSender};
+use crate::{
+    blob_store::TieredBlobStore,
+    peer::{PeerManager, PeerSender},
+};
 
 fn command_action_name(command: &Command) -> &'static str {
     match &command.action {
@@ -179,6 +182,7 @@ pub(super) struct RemoteCommandRouter {
     next_remote_command_id: Arc<AtomicU64>,
     /// Session name -> latest completion intent and its update generation.
     retrying_crew_completions: Arc<StdMutex<HashMap<String, CrewCompletionRetryState>>>,
+    blob_store: Arc<OnceLock<Arc<TieredBlobStore>>>,
 }
 
 impl RemoteCommandRouter {
@@ -202,7 +206,16 @@ impl RemoteCommandRouter {
             forwarded_remote_step_batches: Arc::new(Mutex::new(HashMap::new())),
             next_remote_command_id,
             retrying_crew_completions: Arc::new(StdMutex::new(HashMap::new())),
+            blob_store: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(super) fn install_blob_store(&self, store: Arc<TieredBlobStore>) -> Result<(), String> {
+        self.blob_store.set(store).map_err(|_| "blob store already installed".to_string())
+    }
+
+    pub(super) fn blob_store(&self) -> Result<Arc<TieredBlobStore>, String> {
+        self.blob_store.get().cloned().ok_or_else(|| "blob store is not running".to_string())
     }
 
     #[cfg(test)]

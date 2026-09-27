@@ -298,6 +298,14 @@ impl CommandRunner for DiscoveryMockRunner {
         self.files.lock().expect("lock poisoned").insert(path.to_path_buf(), content.to_owned());
         Ok(())
     }
+
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        tokio::fs::copy(source, destination).await.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        tokio::fs::copy(source, destination).await.map(|_| ()).map_err(|error| error.to_string())
+    }
 }
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
