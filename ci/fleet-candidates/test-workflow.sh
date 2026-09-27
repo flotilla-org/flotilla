@@ -135,6 +135,27 @@ if grep -Fq 'remote: Enumerating objects' "$skill_test_root/stderr"; then
   exit 1
 fi
 
+# A valid SHA absent from a local repository must fail at git fetch, before
+# path validation. Keep the repository local so this never needs the network.
+missing_pin=0000000000000000000000000000000000000000
+python3 - "$skill_manifest" "$skill_repo" "$missing_pin" <<'PY'
+import json
+import sys
+
+manifest, repository, missing_revision = sys.argv[1:]
+sources = [{"name": name, "repository": repository, "revision": missing_revision}
+           for name in ("mattpocock-skills", "rjw-skills", "cleat", "flotilla")]
+with open(manifest, "w") as output:
+    json.dump({"schema_version": 5, "sources": sources}, output)
+PY
+if python3 "$repo_root/ci/fleet-candidates/generation_validation.py" \
+    skill-sources "$skill_manifest" >"$skill_test_root/stdout" 2>"$skill_test_root/stderr"; then
+  echo 'accepted an absent skill source revision' >&2
+  exit 1
+fi
+test -s "$skill_test_root/stderr"
+grep -Fq "skill source mattpocock-skills at pinned revision $missing_pin could not be fetched" "$skill_test_root/stderr"
+
 fake_flotilla="$(mktemp "${TMPDIR:-/tmp}/fake-flotilla.XXXXXX")"
 printf '#!/bin/sh\nprintf "flotilla 0.1.0 (wire=test, proto=20)\\n"\n' >"$fake_flotilla"
 chmod 0755 "$fake_flotilla"
