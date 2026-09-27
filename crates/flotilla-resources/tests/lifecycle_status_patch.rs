@@ -239,6 +239,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         message: None,
         disposition: None,
         decision_ledger_ref: None,
+        superseded_claims: Vec::new(),
         completion_override: None,
         completed_while_crew_active: false,
         claim_evidence: None,

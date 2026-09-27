@@ -638,6 +638,10 @@ pub struct CrewWorkState {
     /// A claim without this pointer is refused unless an operator uses `--force`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
+    /// Completion claims displaced by a brief delivered at the turn boundary.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_claims: Vec<SupersededCrewClaim>,
     /// Operator authority that admitted this claim without a decision ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_override: Option<CrewCompletionOverride>,
@@ -650,6 +654,16 @@ pub struct CrewWorkState {
     /// producers migrate onto the evidence-backed protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_evidence: Option<SettlementClaimEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededCrewClaim {
+    pub claimed_at: DateTime<Utc>,
+    pub message: Option<String>,
+    pub disposition: Option<String>,
+    pub decision_ledger_ref: Option<String>,
+    pub completion_override: Option<CrewCompletionOverride>,
+    pub completed_while_crew_active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1142,22 +1156,16 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     return;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                    state.phase = CrewWorkPhase::Done;
-                    state.finished_at = Some(*delivered_at);
-                    state.message = completion_message.clone();
-                    if disposition.is_some() {
-                        state.disposition = disposition.clone();
-                    }
-                    if decision_ledger_ref.is_some() {
-                        state.decision_ledger_ref = decision_ledger_ref.clone();
-                    }
-                    if let Some(principal) = forced_by {
-                        if state.decision_ledger_ref.is_none() {
-                            state.completion_override =
-                                Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at });
-                        }
-                    }
-                    state.completed_while_crew_active |= *completed_while_crew_active;
+                    state.superseded_claims.push(SupersededCrewClaim {
+                        claimed_at: *delivered_at,
+                        message: completion_message.clone(),
+                        disposition: disposition.clone(),
+                        decision_ledger_ref: decision_ledger_ref.clone(),
+                        completion_override: forced_by
+                            .as_ref()
+                            .map(|principal| CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at }),
+                        completed_while_crew_active: *completed_while_crew_active,
+                    });
                 }
                 clear_operator_pending_brief(status);
                 status.phase = ConvoyPhase::Active;
@@ -1172,6 +1180,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.started_at.get_or_insert(*delivered_at);
                     state.finished_at = None;
                     state.message = Some(content.clone());
+                    state.disposition = None;
+                    state.decision_ledger_ref = None;
+                    state.completion_override = None;
+                    state.completed_while_crew_active = false;
                 }
             }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {

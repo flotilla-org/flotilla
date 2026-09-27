@@ -6357,6 +6357,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     convoys
         .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
             phase: ConvoyPhase::Active,
+            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
             crew_work: BTreeMap::from([(
                 "work".to_string(),
                 BTreeMap::from([(
@@ -6411,31 +6412,78 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
         .await
         .expect("queue pending brief");
 
-    daemon
-        .crew_complete_with_disposition_internal(
-            &flotilla_protocol::CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("turn-boundary".to_string()),
-                vessel_ref: Some("work-vessel".to_string()),
-                role: Some("coder".to_string()),
-            },
-            Some("first turn complete".to_string()),
-            Some("satisfied".to_string()),
-            Some("https://example.test/pull/1#decision-ledger".to_string()),
+    let context = flotilla_protocol::CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some("turn-boundary".to_string()),
+        vessel_ref: Some("work-vessel".to_string()),
+        role: Some("coder".to_string()),
+    };
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: context.clone(),
+                    message: Some("first turn complete".to_string()),
+                    disposition: Some("satisfied".to_string()),
+                    decision_ledger_ref: Some("https://example.test/pull/1#decision-ledger".to_string()),
+                    force: false,
+                })
+                .build(),
         )
         .await
-        .expect("complete first turn");
+        .expect("dispatch first completion");
+    assert_eq!(recv_command_finished(&mut events, command_id).await, CommandValue::CrewFollowUpDelivered);
 
     let convoy = convoys.get("turn-boundary").await.expect("read convoy");
     let status = convoy.status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].disposition.as_deref(), Some("satisfied"));
+    assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
-    assert_eq!(message.expect("next turn message").text, "Begin the follow-up turn");
+    let message = message.expect("next turn message").text;
+    assert!(message.contains("run `flotilla crew complete` again"), "{message}");
+    assert!(message.ends_with("Begin the follow-up turn"), "{message}");
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Begin the follow-up turn"));
+    assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].message.as_deref(), Some("first turn complete"));
+    assert_eq!(
+        status.crew_work["work"]["coder"].superseded_claims[0].decision_ledger_ref.as_deref(),
+        Some("https://example.test/pull/1#decision-ledger")
+    );
+    let explanation = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "turn-boundary".to_string() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain convoy");
+    let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
+    assert!(explanation.decision_ledgers.iter().any(|ledger| ledger.superseded
+        && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#decision-ledger")
+        && ledger.message.as_deref() == Some("first turn complete")));
+    let second_id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context,
+                    message: Some("second turn complete".to_string()),
+                    disposition: None,
+                    decision_ledger_ref: Some("https://example.test/pull/1#second-ledger".to_string()),
+                    force: false,
+                })
+                .build(),
+        )
+        .await
+        .expect("dispatch second completion");
+    assert_eq!(recv_command_finished(&mut events, second_id).await, CommandValue::Ok);
+    let status = convoys.get("turn-boundary").await.expect("read settled convoy").status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
 }
 
 #[tokio::test]

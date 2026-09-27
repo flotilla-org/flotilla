@@ -148,6 +148,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::ConvoyBriefDelivered { .. }
         | CommandValue::ConvoyBriefQueued { .. }
         | CommandValue::ConvoyBriefWithdrawn { .. } => {}
+        CommandValue::CrewFollowUpDelivered => {
+            app.set_status_message(Some(flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string()));
+        }
         CommandValue::RepoTracked { path, .. } => {
             info!(path = %path.display(), "tracked repo");
         }

@@ -8,6 +8,14 @@ use flotilla_protocol::{
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
 
 #[test]
+fn crew_follow_up_result_tells_the_crew_to_complete_again() {
+    let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
+    assert!(output.contains("Completion received"));
+    assert!(output.contains("follow-up brief was delivered"));
+    assert!(output.contains("run `flotilla crew complete` again"));
+}
+
+#[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
         recent_events: Vec::new(),
@@ -27,11 +35,24 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
             ExplainedDecisionLedger {
                 vessel: "work".into(),
                 role: "coder".into(),
+                claimed_at: Some("2026-08-21T11:59:00Z".into()),
+                comment_url: Some("https://example.test/pull/1#prior".into()),
+                missing: false,
+                override_principal: None,
+                completed_while_crew_active: false,
+                message: Some("first turn complete".into()),
+                superseded: true,
+            },
+            ExplainedDecisionLedger {
+                vessel: "work".into(),
+                role: "coder".into(),
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
                 comment_url: Some("https://example.test/pull/1#comment-2".into()),
                 missing: false,
                 override_principal: None,
                 completed_while_crew_active: false,
+                message: None,
+                superseded: false,
             },
             ExplainedDecisionLedger {
                 vessel: "review".into(),
@@ -41,6 +62,8 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 missing: true,
                 override_principal: None,
                 completed_while_crew_active: false,
+                message: None,
+                superseded: false,
             },
             ExplainedDecisionLedger {
                 vessel: "research".into(),
@@ -50,12 +73,17 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 missing: true,
                 override_principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
                 completed_while_crew_active: true,
+                message: None,
+                superseded: false,
             },
         ],
         settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    assert!(
+        output.contains("superseded claim at=2026-08-21T11:59:00Z comment=https://example.test/pull/1#prior message=first turn complete")
+    );
     assert!(output.contains("Message: waiting for review evidence"));
     assert!(output.contains("Crew work needing a settlement claim:\n  - work/coder (turn idle)"));
     assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));

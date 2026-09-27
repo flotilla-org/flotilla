@@ -17,6 +17,9 @@ use crate::{
 fn is_false(value: &bool) -> bool {
     !*value
 }
+
+pub const CREW_FOLLOW_UP_INSTRUCTION: &str =
+    "Completion received, but a follow-up brief was delivered. Address it and run `flotilla crew complete` again when done.";
 #[cfg(test)]
 use crate::{qualified_path::HostId, EnvironmentId};
 
@@ -273,6 +276,10 @@ pub struct ExplainedDecisionLedger {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub completed_while_crew_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub superseded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -957,6 +964,7 @@ impl AttachBinding {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
     Ok,
+    CrewFollowUpDelivered,
     ResourceReconciled {
         resource_kind: String,
         name: String,
@@ -1401,6 +1409,7 @@ mod tests {
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandValue::Ok,
+            CommandValue::CrewFollowUpDelivered,
             CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },
