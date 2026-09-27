@@ -1,14 +1,20 @@
-use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, WaitSubscriptionRequest};
+use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
     select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
-    HoldAct, InstantiatedExit, ResourceBackend, ResourceError, ResourceObject, StatusPatch, ThreeValue, TurnDeliveryEpisode,
-    TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart,
-    WorkLeafSubject,
+    HoldAct, InstantiatedExit, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    StatusPatch, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel,
+    VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
 };
 use futures::StreamExt;
 use tokio::{
@@ -262,7 +268,8 @@ impl LeafSubscriptionTable {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
         });
-        let mut change_request_objects = freshest_change_requests(change_request_list);
+        let mut change_request_sources = change_request_sources(change_request_list);
+        let mut change_request_objects = freshest_change_requests(&change_request_sources);
         let mut usage_objects = usage_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -293,8 +300,25 @@ impl LeafSubscriptionTable {
                     apply_read_event(event, &mut vessel_objects);
                 }
                 event = change_request_watch.next() => {
-                    event.ok_or_else(|| "change request resource watch closed".to_string())?.map_err(|error| error.to_string())?;
-                    change_request_objects = freshest_change_requests(change_requests.list().await.map_err(|error| error.to_string())?);
+                    let event = event.ok_or_else(|| "change request resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let name = match event {
+                        ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name,
+                        ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
+                    };
+                    // A buffered event may precede the initial list snapshot, and a
+                    // deletion may expose a suppressed self-origin copy. Refresh
+                    // only this name from the current store on either transition.
+                    let copies = change_requests.get_all(&name).await.map_err(|error| error.to_string())?;
+                    let mut by_source = BTreeMap::new();
+                    for item in copies.items {
+                        by_source.insert(change_request_source(&item.provenance), item.object);
+                    }
+                    if by_source.is_empty() {
+                        change_request_sources.remove(&name);
+                    } else {
+                        change_request_sources.insert(name.clone(), by_source);
+                    }
+                    update_freshest_change_request(&name, &change_request_sources, &mut change_request_objects);
                 }
                 event = usage_watch.next() => {
                     let event = event.ok_or_else(|| "usage resource watch closed".to_string())?.map_err(|error| error.to_string())?;
@@ -717,21 +741,51 @@ fn apply_read_event<T: flotilla_resources::Resource>(
     }
 }
 
-fn freshest_change_requests(list: flotilla_resources::ReadResourceList<ChangeRequest>) -> HashMap<String, ResourceObject<ChangeRequest>> {
-    let mut objects: HashMap<String, ResourceObject<ChangeRequest>> = HashMap::new();
-    for item in list.items {
-        let name = item.object.metadata.name.clone();
-        let replace = objects.get(&name).is_none_or(|current| {
-            let observed_at =
-                item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at);
-            let current_at = current.status.as_ref().map_or(current.metadata.creation_timestamp, |status| status.state.observed_at);
-            (observed_at, item.object.spec.observing_authority.as_str()) > (current_at, current.spec.observing_authority.as_str())
-        });
-        if replace {
-            objects.insert(name, item.object);
-        }
+type ChangeRequestSources = HashMap<String, BTreeMap<Option<NodeId>, ResourceObject<ChangeRequest>>>;
+
+fn change_request_source(provenance: &ResourceProvenance) -> Option<NodeId> {
+    match provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
     }
-    objects
+}
+
+fn change_request_sources(list: flotilla_resources::ReadResourceList<ChangeRequest>) -> ChangeRequestSources {
+    let mut sources = ChangeRequestSources::new();
+    for ReadResourceObject { object, provenance } in list.items {
+        sources.entry(object.metadata.name.clone()).or_default().insert(change_request_source(&provenance), object);
+    }
+    sources
+}
+
+fn update_freshest_change_request(
+    name: &str,
+    sources: &ChangeRequestSources,
+    selected: &mut HashMap<String, ResourceObject<ChangeRequest>>,
+) {
+    let freshest = sources.get(name).and_then(|copies| {
+        copies.iter().max_by_key(|(source, object)| {
+            (
+                object.status.as_ref().map_or(object.metadata.creation_timestamp, |status| status.state.observed_at),
+                object.spec.observing_authority.as_str(),
+                // Local wins an otherwise exact tie, matching the initial list order.
+                source.is_none(),
+            )
+        })
+    });
+    if let Some((_, object)) = freshest {
+        selected.insert(name.to_string(), object.clone());
+    } else {
+        selected.remove(name);
+    }
+}
+
+fn freshest_change_requests(sources: &ChangeRequestSources) -> HashMap<String, ResourceObject<ChangeRequest>> {
+    let mut selected = HashMap::new();
+    for name in sources.keys() {
+        update_freshest_change_request(name, sources, &mut selected);
+    }
+    selected
 }
 
 fn evaluate_row(
@@ -2135,7 +2189,21 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(former_owner, event_tx.clone(), refresher);
+        let keeper_id = uuid::Uuid::new_v4();
+        refresher
+            .demand(
+                keeper_id,
+                crate::change_request_observer::ChangeRequestRef {
+                    namespace: "flotilla".to_string(),
+                    service: "github.com".to_string(),
+                    scope: "flotilla-org/flotilla".to_string(),
+                    number: 2052,
+                },
+                None,
+            )
+            .await
+            .expect("keep local observation while waits finish");
+        let table = LeafSubscriptionTable::new(former_owner.clone(), event_tx.clone(), refresher.clone());
         let mut events = event_tx.subscribe();
         let subscription_id = table
             .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
@@ -2154,6 +2222,38 @@ mod tests {
             .await
             .expect("wait on takeover observation");
         assert_eq!(receive_fire(&mut events, subscription_id).await.value, "merged");
+
+        let fallback_id = table
+            .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
+                namespace: "flotilla".to_string(),
+                leaves: vec![leaf(
+                    LeafAddress::ChangeRequest {
+                        service: "github.com".to_string(),
+                        scope: "flotilla-org/flotilla".to_string(),
+                        number: 2052,
+                    },
+                    ".state",
+                    "open",
+                )],
+                freshness_demand: None,
+            })
+            .await
+            .expect("wait for local fallback");
+        assert!(tokio::time::timeout(Duration::from_millis(100), events.recv()).await.is_err(), "stale local state must not fire");
+        former_owner
+            .replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("new-root"), "flotilla")
+            .replace(
+                &flotilla_resources::ResourceList {
+                    items: vec![],
+                    resource_version: "0".to_string(),
+                    generation: Some("next".to_string()),
+                },
+                Utc::now(),
+            )
+            .await
+            .expect("remove takeover replica");
+        assert_eq!(receive_fire(&mut events, fallback_id).await.value, "open");
+        refresher.release(keeper_id).await;
     }
 
     #[tokio::test]

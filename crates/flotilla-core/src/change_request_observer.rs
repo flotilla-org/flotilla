@@ -355,19 +355,13 @@ impl ChangeRequestRefresher {
         // A former owner can still hold its local copy after another host has
         // claimed the subject. Prefer the freshest observation across copies;
         // an exact tie is resolved deterministically by authority name.
-        let record = records
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .filter(|item| item.object.metadata.name == name)
-            .max_by_key(|item| {
-                (
-                    item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
-                    item.object.spec.observing_authority.clone(),
-                )
-            });
+        let record = records.get_all(&name).await.map_err(|error| error.to_string())?.items.into_iter().max_by_key(|item| {
+            (
+                item.object.status.as_ref().map_or(item.object.metadata.creation_timestamp, |status| status.state.observed_at),
+                item.object.spec.observing_authority.clone(),
+                matches!(item.provenance, ResourceProvenance::Local),
+            )
+        });
         let Some(record) = record else {
             let created = self.get_or_create_record(subject, &name).await?;
             return Ok(created.spec.observing_authority == self.inner.authority);

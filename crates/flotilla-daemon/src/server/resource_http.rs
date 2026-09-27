@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use flotilla_resources::{
-    get_resource_kind, get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas,
-    list_resource_kind_replica_sources, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, DynamicResourceWatch, ResourceBackend, ResourceError, WatchStart,
+    get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
+    list_resource_kind_including_replicas, list_resource_kind_replica_sources, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch, ResourceBackend, ResourceError,
+    WatchStart,
 };
 use futures::StreamExt;
 use tokio::{
@@ -46,11 +47,18 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
     let query = parse_query(raw_query);
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
+    let all_provenances = query_flag(&query, &["allProvenances", "all-provenances", "all_provenances"]);
     let watch = query.get("watch").is_some_and(|value| value == "true");
 
     if let Some(name) = name {
-        if watch || replica_sources {
-            return write_error(&mut stream, 400, "resource point reads do not support watch or replicaSources").await;
+        if watch || replica_sources || (all_provenances && include_replicas) {
+            return write_error(&mut stream, 400, "unsupported resource point read options").await;
+        }
+        if all_provenances {
+            return match get_resource_kind_all_provenances(&backend, namespace, kind, name).await {
+                Ok(listed) => write_json(&mut stream, 200, &listed.value).await,
+                Err(error) => write_resource_error(&mut stream, error).await,
+            };
         }
         let object = if include_replicas {
             get_resource_kind_including_replicas(&backend, namespace, kind, name).await
@@ -61,6 +69,10 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
             Ok(object) => write_json(&mut stream, 200, &object.value).await,
             Err(error) => write_resource_error(&mut stream, error).await,
         };
+    }
+
+    if all_provenances {
+        return write_error(&mut stream, 400, "allProvenances requires a resource name").await;
     }
 
     if !watch {

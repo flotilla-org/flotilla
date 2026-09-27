@@ -177,6 +177,39 @@ impl<T: Resource> ReplicaReadResolver<T> {
         }
     }
 
+    /// Read every visible provenance for one name without listing the namespace.
+    pub async fn get_all(&self, name: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        // These classes have at most one visible copy for a name.
+        if T::REPLICATION_CLASS == crate::ReplicationClass::None || T::REPLICATION_CLASS == crate::ReplicationClass::Definitions {
+            return match self.get(name).await {
+                Ok(item) => Ok(ReadResourceList { items: vec![item] }),
+                Err(ResourceError::NotFound { .. }) => Ok(ReadResourceList { items: Vec::new() }),
+                Err(error) => Err(error),
+            };
+        }
+        ensure_replication_enabled::<T>()?;
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.get_all_including_replicas_typed::<T>(&self.namespace, name).await;
+        }
+        let mut items = match self.backend.using::<T>(&self.namespace).get(name).await {
+            Ok(object) => vec![ReadResourceObject { object, provenance: ResourceProvenance::Local }],
+            Err(ResourceError::NotFound { .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let replicas = match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Sqlite(backend) => backend.get_replicas_typed::<T>(&self.namespace, name).await?,
+            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
+        };
+        items.extend(replicas);
+        let listed = ReadResourceList { items };
+        if self.suppress_self_origin {
+            self.suppress_shadowed_self_origin_sources(listed)
+        } else {
+            Ok(listed)
+        }
+    }
+
     pub async fn list(&self) -> Result<ReadResourceList<T>, ResourceError> {
         if T::REPLICATION_CLASS == crate::ReplicationClass::None {
             let items = self

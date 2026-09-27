@@ -141,6 +141,29 @@ impl HttpBackend {
         read_resource_object(ResourceObject::from_k8s_object(object)?)
     }
 
+    pub(crate) async fn get_all_including_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ReadResourceList<T>, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), false);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("allProvenances", "true")])
+            .send()
+            .await
+            .map_err(|err| ResourceError::other(format!("GET resource provenances: {err}")))?;
+        let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
+        let items = list
+            .items
+            .into_iter()
+            .map(ResourceObject::from_k8s_object)
+            .map(|object| object.and_then(read_resource_object))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReadResourceList { items })
+    }
+
     pub async fn list_replica_sources_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
         self.list_read_view_typed::<T>(namespace, "replicaSources").await
     }

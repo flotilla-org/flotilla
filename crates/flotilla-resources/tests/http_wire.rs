@@ -135,6 +135,45 @@ async fn replica_point_get_requests_read_view_and_decodes_provenance() {
 
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn provenance_point_get_requests_only_one_name() {
+    let body = serde_json::json!({
+        "apiVersion": "flotilla.work/v1",
+        "kind": "ConvoyList",
+        "metadata": { "resourceVersion": "overlay" },
+        "items": [{
+            "apiVersion": "flotilla.work/v1",
+            "kind": "Convoy",
+            "metadata": {
+                "name": "alpha",
+                "namespace": "flotilla",
+                "resourceVersion": "7",
+                "labels": {},
+                "annotations": {
+                    "flotilla.work/origin-root": "remote-root",
+                    "flotilla.work/last-synced-at": "2026-04-13T12:00:00Z"
+                },
+                "creationTimestamp": "2026-04-13T12:00:00Z"
+            },
+            "spec": {
+                "workflow_ref": "review",
+                "inputs": {},
+                "placement_policy": "laptop-docker"
+            },
+            "status": { "phase": "Active" }
+        }]
+    })
+    .to_string();
+    let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), base_url));
+    let copies = backend.including_replicas::<Convoy>("flotilla").get_all("alpha").await.expect("read named provenances");
+    assert_eq!(copies.items.len(), 1);
+    assert!(matches!(copies.items[0].provenance, flotilla_resources::ResourceProvenance::Replica { .. }));
+    let request = request_rx.await.expect("captured request");
+    assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/convoys/alpha?allProvenances=true HTTP/1.1"));
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn update_status_uses_status_subresource_path_and_body() {
     let body = serde_json::json!({
         "apiVersion": "flotilla.work/v1",
