@@ -3303,7 +3303,55 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     let env = create_test_environment(&daemon, "local-env", &host).await;
     for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
         create_identity_convoy(&daemon.resource_backend(), convoy, convoy, Some(project)).await;
-        create_running_session(&daemon, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+        if convoy == "convoy-one" {
+            let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+            let name = "terminal-convoy-one";
+            let created = terminals
+                .create(
+                    &InputMeta::builder()
+                        .name(name.to_string())
+                        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())]))
+                        .build(),
+                    &ResourceTerminalSessionSpec {
+                        env_ref: env.clone(),
+                        role: "coder".to_string(),
+                        source: TerminalSessionSource::Agent {
+                            selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
+                            brief: flotilla_resources::TerminalBrief {
+                                path: "brief.md".to_string(),
+                                content: "Work".to_string(),
+                                copies: vec![],
+                            },
+                            context: Box::new(flotilla_resources::TerminalCrewContext {
+                                namespace: "flotilla".to_string(),
+                                convoy: convoy.to_string(),
+                                vessel_ref: "vessel-one".to_string(),
+                            }),
+                            message: None,
+                        },
+                        cwd: "/repo".to_string(),
+                        pool: "passthrough".to_string(),
+                    },
+                )
+                .await
+                .expect("agent session");
+            terminals
+                .update_status(name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
+                    phase: ResourceTerminalSessionPhase::Running,
+                    session_id: Some("session-one".to_string()),
+                    crew: Some(flotilla_resources::CrewSessionStatus {
+                        id: "crew-one".to_string(),
+                        adapter: "codex".to_string(),
+                        model: None,
+                        stance: "coder".to_string(),
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .expect("agent status");
+        } else {
+            create_running_session(&daemon, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+        }
     }
 
     let fleet = daemon.scoped_fleet_list(None, None, None).await.expect("fleet");
@@ -3311,9 +3359,15 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
     let scoped = daemon.scoped_fleet_list(None, None, Some("convoy-one")).await.expect("crew convoy scope");
     assert_eq!(scoped.rows.len(), 1);
     assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    let by_crew = daemon.scoped_fleet_list(None, Some("crew-one"), None).await.expect("crew identity scope");
+    assert_eq!(by_crew.rows.len(), 1);
+    assert_eq!(by_crew.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    assert!(daemon.scoped_fleet_list(None, Some("missing"), None).await.is_err());
     let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some("convoy-one")).await.expect("explicit scope");
     assert_eq!(explicit.rows.len(), 1);
     assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some("convoy-two"));
+    let explicit_with_stale_crew = daemon.scoped_fleet_list(Some("island-two"), Some("missing"), None).await.expect("explicit scope wins");
+    assert_eq!(explicit_with_stale_crew.rows.len(), 1);
 }
 
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {

@@ -56,6 +56,7 @@ flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
+flotilla-resources = { path = "crates/flotilla-resources" }
 flotilla-tui = { path = "crates/flotilla-tui" }
 ratatui = "0.30"
 tokio = { workspace = true }
