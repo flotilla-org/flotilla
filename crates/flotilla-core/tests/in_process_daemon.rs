@@ -4809,7 +4809,10 @@ impl RepositoryInspector for ForgeAliasInspector {
 
 #[tokio::test]
 async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
-    use flotilla_resources::{Forge, ProjectRepositoryRole, RepositoryIdentity};
+    use flotilla_resources::{
+        ConvoyEnsure, ConvoyEnsureSpec, CrewSource, CrewSpec, Forge, LandingCredentialScope, ProjectRepositoryRole, RepositoryIdentity,
+        Selector, VesselRequirement, WorkflowTemplateSpec,
+    };
 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("ghostty-ops");
@@ -4853,12 +4856,88 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                     alias: None,
                     roles: [ProjectRepositoryRole::Ops].into(),
                     subpath: None,
-                    default_branch: None,
+                    default_branch: Some("main".to_string()),
                 },
             ],
         })
         .await
         .expect("legacy project");
+
+    let overrides = vec![flotilla_protocol::AgentOverride {
+        capability: "governor".to_string(),
+        adapter: "codex".to_string(),
+        model: Some("fable".to_string()),
+    }];
+    let ensures = daemon.resource_backend().definitions::<ConvoyEnsure>("flotilla");
+    ensures
+        .create(
+            &InputMeta::builder()
+                .name("governor".to_string())
+                .annotations(BTreeMap::from([
+                    ("flotilla.work/source-repository".to_string(), front.key().to_string()),
+                    ("flotilla.work/source-commit".to_string(), "abc123".to_string()),
+                ]))
+                .build(),
+            &ConvoyEnsureSpec::builder()
+                .project_ref("ghostty".to_string())
+                .role("governor".to_string())
+                .workflow_ref("governor".to_string())
+                .repositories(vec![front.key(), ssh.key()])
+                .agent_overrides(overrides.clone())
+                .build(),
+        )
+        .await
+        .expect("legacy ensure");
+    let templates = daemon.resource_backend().definitions::<WorkflowTemplate>("flotilla");
+    templates
+        .create(
+            &InputMeta::builder().name("governor".to_string()).build(),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .repository_refs(vec![front.key(), ssh.key()])
+                    .crew(vec![CrewSpec::builder()
+                        .role("governor".to_string())
+                        .source(CrewSource::Agent { selector: Selector::for_capability("governor"), prompt: None, brief_template: None })
+                        .build()])
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("legacy workflow");
+    templates
+        .create(
+            &InputMeta::builder().name("scoped-workflow".to_string()).build(),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .credential_scopes(BTreeMap::from([("landing".to_string(), BTreeSet::from([front.key(), ssh.key()]))]))
+                    .crew(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("legacy scoped workflow");
+    let grants = daemon.resource_backend().definitions::<CredentialGrant>("flotilla");
+    grants
+        .create(
+            &InputMeta::builder().name("legacy-grant".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder()
+                        .stance(Stance::Contained)
+                        .repositories(BTreeSet::from([front.key(), ssh.key()]))
+                        .build(),
+                )
+                .credentials(BTreeSet::new())
+                .landing_credentials(BTreeMap::from([("landing".to_string(), LandingCredentialScope::Branch {
+                    repository: front.key(),
+                    branch: "main".to_string(),
+                })]))
+                .build(),
+        )
+        .await
+        .expect("legacy grant");
 
     let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve and sweep identities");
     assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
@@ -4870,7 +4949,28 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let project = projects.get("ghostty").await.expect("migrated project");
     assert_eq!(project.spec.repositories.len(), 1);
     assert_eq!(project.spec.repositories[0].repo, inspected.key());
+    assert_eq!(project.spec.repositories[0].default_branch.as_deref(), Some("main"));
     assert_eq!(project.spec.repositories[0].roles, [ProjectRepositoryRole::Code, ProjectRepositoryRole::Ops].into());
+    let ensure = ensures.get("governor").await.expect("migrated ensure");
+    assert_eq!(ensure.spec.repositories, vec![inspected.key()]);
+    assert_eq!(ensure.spec.agent_overrides, overrides);
+    assert_eq!(ensure.metadata.annotations["flotilla.work/source-repository"], inspected.key().to_string());
+    let template = templates.get("governor").await.expect("migrated workflow");
+    assert_eq!(template.spec.vessels[0].repository_refs, Some(vec![inspected.key()]));
+    let scoped = templates.get("scoped-workflow").await.expect("migrated scoped workflow");
+    assert_eq!(scoped.spec.vessels[0].credential_scopes["landing"], BTreeSet::from([inspected.key()]));
+    let grant = grants.get("legacy-grant").await.expect("migrated grant");
+    assert_eq!(grant.spec.selector.repositories, BTreeSet::from([inspected.key()]));
+    assert_eq!(grant.spec.landing_credentials["landing"], LandingCredentialScope::Branch {
+        repository: inspected.key(),
+        branch: "main".to_string()
+    });
+    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("migrated ensure admits");
+    let admitted = admitted_convoy(&daemon.resource_backend(), "governor").await;
+    assert_eq!(admitted.spec.repositories.len(), 1);
+    assert_eq!(admitted.spec.repositories[0].repo_ref, inspected.key());
 
     let mut overlap = lab_forge_spec();
     overlap.forge_id = "other-lab".to_string();
