@@ -44,13 +44,13 @@ use flotilla_resources::{
     watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase,
     CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler,
     ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host,
-    HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, HostStatusPatch, InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
-    ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance,
-    SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
-
-    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity,
+    FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
+    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
+    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance, SystemClock, TerminalOccupancy,
+    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
@@ -2123,8 +2123,14 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
         if policy_host != Some(host_ref) {
             continue;
         }
-        let spec = FulfilmentKindSpec::from_policy(&policy.spec, platform)?;
         let name = &policy.metadata.name;
+        let spec = match FulfilmentKindSpec::from_policy(&policy.spec, platform) {
+            Ok(spec) => spec,
+            Err(error) => {
+                warn!(policy = %name, %error, "skipping invalid placement policy during fulfilment migration");
+                continue;
+            }
+        };
         match kinds.get(name).await {
             Ok(existing) if existing.metadata.deletion_timestamp.is_some() => {}
             Ok(existing) => {
@@ -11167,6 +11173,19 @@ mod tests {
             )
             .await
             .expect("seed frozen placement snapshot");
+        let mut invalid = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
+        invalid.host_direct =
+            Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
+        invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+            host_ref: "kiwi".to_string(),
+            image: "crew:test".into(),
+            pull_policy: Default::default(),
+            agent_adapters: BTreeSet::new(),
+            default_cwd: None,
+            env: BTreeMap::new(),
+            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+        });
+        policies.create(&empty_meta("invalid-both-realisations"), &invalid).await.expect("seed invalid policy");
         for host in ["feta", "kiwi", "udder"] {
             migrate_live_placement_policies(&backend, NAMESPACE, host, "linux").await.expect("migrate host policies");
         }
@@ -11181,7 +11200,7 @@ mod tests {
                 assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::GuiSession));
             }
         }
-        assert_eq!(policies.list().await.expect("policies stay for A1 admission").items.len(), 6);
+        assert_eq!(policies.list().await.expect("policies stay for A1 admission").items.len(), 7);
     }
 
     #[tokio::test]

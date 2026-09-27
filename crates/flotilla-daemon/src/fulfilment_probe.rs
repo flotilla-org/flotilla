@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
 use flotilla_core::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
-use flotilla_resources::{FulfilmentFacts, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact, ModelFactSource};
+use flotilla_resources::{
+    FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact, ModelFactSource,
+};
 
 // These are the fleet's candidate lists, not claims that every host can run
 // them. Operators may extend the model list through the injected environment.
@@ -52,8 +54,22 @@ pub(crate) async fn probe_kind(
     env: &dyn EnvVars,
 ) -> FulfilmentFacts {
     let mut facts = FulfilmentFacts { image: image.map(ToString::to_string), observed_at: Utc::now(), ..FulfilmentFacts::default() };
-    facts.gui_session_logged_in = matches!(spec.realisation, FulfilmentRealisation::HostDirect)
-        && (env.get("DISPLAY").is_some() || env.get("WAYLAND_DISPLAY").is_some() || env.get("AQUA_SESSION").is_some());
+    if matches!(spec.realisation, FulfilmentRealisation::HostDirect) {
+        facts.gui_session_logged_in = env.get("DISPLAY").is_some() || env.get("WAYLAND_DISPLAY").is_some();
+        if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::Platform("macos".to_string())) {
+            // Aqua does not advertise a display variable. A logged-in user's
+            // launchd GUI domain is the host-native signal for that session.
+            if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, "id", &["-u"]).await {
+                let uid = output.stdout.trim();
+                if output.success && uid.parse::<u32>().is_ok() {
+                    facts.gui_session_logged_in =
+                        run_in_realisation(runner, &spec.realisation, image, "launchctl", &["print", &format!("gui/{uid}")])
+                            .await
+                            .is_ok_and(|session| session.success);
+                }
+            }
+        }
+    }
     // Terminal pools in the current fleet have no configured slot ceiling.
     // None means unbounded; an unavailable pool has zero usable slots.
     facts.free_vessel_slots = (!pool_available).then_some(0);
@@ -174,5 +190,26 @@ mod tests {
         assert_eq!(host_facts.harnesses["claude-code"].models[model].source, ModelFactSource::Probe);
         assert_eq!(host_facts.toolchains["rustc"], "rustc 1.94.1");
         assert!(host_facts.gui_session_logged_in);
+    }
+
+    #[tokio::test]
+    async fn macos_gui_session_uses_launchd_domain_through_the_runner() {
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref("kiwi".to_string())
+            .pool("cleat".to_string())
+            .grants(BTreeSet::from([FulfilmentGrant::Platform("macos".to_string())]))
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
+        let logged_in = DiscoveryMockRunner::builder()
+            .on_run("id", &["-u"], Ok("501".into()))
+            .on_run("launchctl", &["print", "gui/501"], Ok("gui/501 = { ... }".into()))
+            .build();
+        let logged_out = DiscoveryMockRunner::builder()
+            .on_run("id", &["-u"], Ok("501".into()))
+            .on_run("launchctl", &["print", "gui/501"], Err("domain absent".into()))
+            .build();
+        assert!(probe_kind(&spec, None, true, &logged_in, &env).await.gui_session_logged_in);
+        assert!(!probe_kind(&spec, None, true, &logged_out, &env).await.gui_session_logged_in);
     }
 }

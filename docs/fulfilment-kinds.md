@@ -16,6 +16,10 @@ grants persist when a policy's image or pool changes. Prepared placement policy
 snapshots remain frozen and are skipped by migration. Admission continues to
 read policies until A2.
 
+Malformed policies with both realisations are skipped during kind migration so
+they cannot interrupt host heartbeats. Host-direct GUI observation reads display
+variables on X11 and Wayland, and checks the user's launchd GUI domain on macOS.
+
 Each Host status carries observations keyed by kind name. Host-direct probes
 run through its injected command runner; Docker probes execute the binary in
 the resolved image with `docker run --rm --pull=never`. Harness versions and
