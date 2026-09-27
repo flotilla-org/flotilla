@@ -40,31 +40,33 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
-    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, change_request_address,
-    change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository, evaluate_crew_completion,
-    evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches as convoy_external_patches,
-    get_resource_kind_including_replicas, list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source,
-    normalize_project_spec, patch_resource_annotation, repository_display_labels, resolve_project_issue_sources,
-    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, BoundChangeRequest, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition,
-    ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource,
-    CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
-    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder,
-    EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    LifecycleAuthority, ObjectEvent, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief,
-    PlacementPolicy, PlacementPolicySpec, Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec,
-    ProjectSpec, ProjectStatusPatch, ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
+    apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, capped_github_app_permissions,
+    change_request_address, change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository,
+    evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
+    external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
+    list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec, patch_resource_annotation,
+    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    ConditionValue, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec,
+    ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
+    CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState,
+    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, HoldAct, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
     TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
     TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
+    GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1852,6 +1854,12 @@ fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flot
         meta.annotations.insert(
             CREDENTIAL_SCOPES_ANNOTATION.to_string(),
             serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
+        );
+    }
+    if !requirement.credential_permissions.is_empty() {
+        meta.annotations.insert(
+            CREDENTIAL_PERMISSIONS_ANNOTATION.to_string(),
+            serde_json::to_string(&requirement.credential_permissions).expect("credential permissions serialize"),
         );
     }
     meta
@@ -4656,7 +4664,7 @@ async fn resolve_workflow_credentials(
     namespace: &str,
     project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
-    placement: Option<&ResourceObject<PlacementPolicy>>,
+    _placement: Option<&ResourceObject<PlacementPolicy>>,
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     let grants = backend
@@ -4672,31 +4680,81 @@ async fn resolve_workflow_credentials(
         .map_err(|error| format!("list credential specs: {error}"))?
         .items
         .into_iter()
-        .map(|source| source.object.metadata.name)
-        .collect::<BTreeSet<_>>();
+        .map(|source| (source.object.metadata.name, source.object.spec.consumer))
+        .collect::<BTreeMap<_, _>>();
     let all_repositories = repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<BTreeSet<_>>();
+    let repository_definitions = backend
+        .including_replicas::<Repository>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list repositories for credential grants: {error}"))?
+        .items
+        .into_iter()
+        .map(|source| {
+            (
+                RepositoryKey(source.object.metadata.name),
+                if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for vessel in &mut workflow.vessels {
-        let effective_stance = match placement.map(|placement| &placement.spec) {
-            Some(spec) if spec.docker_per_vessel.is_some() => flotilla_resources::Stance::Contained,
-            Some(spec) if spec.host_direct.is_some() => flotilla_resources::Stance::Trusted,
-            _ => vessel.stance,
-        };
         let vessel_repositories = vessel
             .repository_refs
             .as_ref()
             .map(|repositories| repositories.iter().cloned().collect())
             .unwrap_or_else(|| all_repositories.clone());
+        let repository_trust = vessel_repositories
+            .iter()
+            .map(|key| {
+                repository_definitions
+                    .get(key)
+                    .copied()
+                    .map(|trust| (key.clone(), trust))
+                    .ok_or_else(|| format!("repository `{key}` unavailable for credential grant selection"))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        if vessel.crew.len() > 1 {
+            let grant_sets = vessel
+                .crew
+                .iter()
+                .map(|crew| {
+                    grants
+                        .iter()
+                        .filter(|source| source.object.spec.selector.matches(project_ref, &repository_trust, &crew.role))
+                        .map(|source| source.object.metadata.name.clone())
+                        .collect::<BTreeSet<_>>()
+                })
+                .collect::<BTreeSet<_>>();
+            if grant_sets.len() > 1 {
+                return Err(format!(
+                    "vessel `{}` has crew roles with different credential grants; place those roles in separate vessels",
+                    vessel.name
+                ));
+            }
+        }
         let matching_grants = grants
             .iter()
-            .filter(|source| source.object.spec.selector.matches(effective_stance, project_ref, &vessel_repositories))
+            .filter(|source| {
+                (vessel.crew.is_empty() && source.object.spec.selector.matches(project_ref, &repository_trust, ""))
+                    || vessel.crew.iter().any(|crew| source.object.spec.selector.matches(project_ref, &repository_trust, &crew.role))
+            })
             .collect::<Vec<_>>();
         let granted = matching_grants.iter().flat_map(|grant| grant.object.spec.credentials.iter().cloned()).collect::<BTreeSet<_>>();
-        if let Some(missing) = granted.iter().find(|name| !specs.contains(*name)) {
+        if let Some(missing) = granted.iter().find(|name| !specs.contains_key(*name)) {
             return Err(format!("credential grant references missing credential `{missing}`"));
         }
         let mut credential_scopes = BTreeMap::<String, BTreeSet<_>>::new();
+        let mut credential_permissions = BTreeMap::<String, BTreeMap<String, String>>::new();
         for grant in matching_grants {
+            for name in grant.object.spec.permissions.keys() {
+                if !grant.object.spec.credentials.contains(name) {
+                    return Err(format!("grant permissions reference ungranted credential `{name}`"));
+                }
+                if !matches!(specs.get(name), Some(CredentialConsumer::GithubApp { .. })) {
+                    return Err(format!("grant permissions require GitHub App credential `{name}`"));
+                }
+            }
             let covered_repositories = if grant.object.spec.selector.repositories.is_empty() {
                 vessel_repositories.clone()
             } else {
@@ -4704,10 +4762,28 @@ async fn resolve_workflow_credentials(
             };
             for credential in &grant.object.spec.credentials {
                 credential_scopes.entry(credential.clone()).or_default().extend(covered_repositories.iter().cloned());
+                if let Some(permissions) = grant.object.spec.permissions.get(credential) {
+                    let resolved = credential_permissions.entry(credential.clone()).or_default();
+                    for (name, level) in permissions {
+                        let current = resolved.entry(name.clone()).or_insert_with(|| level.clone());
+                        if flotilla_resources::permission_level_rank(level)? > flotilla_resources::permission_level_rank(current)? {
+                            *current = level.clone();
+                        }
+                    }
+                }
+            }
+        }
+        for name in &granted {
+            if let Some(CredentialConsumer::GithubApp { permissions: declaration, .. }) = specs.get(name) {
+                let resolved = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
+                if let Some(resolved) = resolved {
+                    credential_permissions.insert(name.clone(), resolved);
+                }
             }
         }
         vessel.credential_refs = granted;
         vessel.credential_scopes = credential_scopes;
+        vessel.credential_permissions = credential_permissions;
     }
     Ok(())
 }

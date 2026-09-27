@@ -121,6 +121,12 @@ spec:
                           items:
                             type: string
                             minLength: 1
+                      credential_permissions:
+                        type: object
+                        additionalProperties:
+                          type: object
+                          additionalProperties:
+                            type: string
                       depends_on:
                         type: array
                         items:

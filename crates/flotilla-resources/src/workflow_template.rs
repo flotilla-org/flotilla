@@ -194,6 +194,9 @@ pub struct VesselRequirement {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credential_scopes: BTreeMap<String, BTreeSet<RepositoryKey>>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credential_permissions: BTreeMap<String, BTreeMap<String, String>>,
     pub crew: Vec<CrewSpec>,
 }
 
