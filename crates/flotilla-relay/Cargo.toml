@@ -1,0 +1,18 @@
+[package]
+name = "flotilla-relay"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8.6"
+js-sys = "0.3"
+subtle = "2"

@@ -1,0 +1,14 @@
+name = "flotilla-relay"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-26"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "MailboxObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MailboxObject"]
