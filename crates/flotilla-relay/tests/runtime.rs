@@ -55,8 +55,13 @@ impl Drop for Relay {
             eprintln!("--- wrangler dev log ---\n{}", self.log());
         }
         // wrangler runs workerd and esbuild as children; stop the whole process group.
-        if let Some(pid) = self.child.id() {
-            let _ = std::process::Command::new("kill").args(["-KILL", &format!("-{pid}")]).status();
+        // Signal the group directly. procps `kill -KILL -<pgid>` on Linux signals every process the
+        // user owns, which killed GitHub's runner agent and crew containers (#2087); BSD `kill`
+        // on macOS parses the same arguments as a process group, which hid the difference.
+        if let Some(pid) = self.child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            // SAFETY: killpg only sends a signal; `pid` is the group this Relay created with
+            // `process_group(0)`, so it cannot address anything outside the spawned wrangler tree.
+            let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
         }
     }
 }
