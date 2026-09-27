@@ -4342,7 +4342,13 @@ impl InProcessDaemon {
                     }
                 };
                 let Some(remote) = repository.object.spec.live_remote() else { continue };
-                let address = change_request_address(remote, id)?;
+                let address = match change_request_address(remote, id) {
+                    Ok(address) => address,
+                    Err(error) => {
+                        failures.push(error);
+                        continue;
+                    }
+                };
                 let Some(subject) = ChangeRequestRef::from_address(&namespace, &address) else { continue };
                 match self.change_request_observation_source.observe(&subject).await {
                     Ok(observation) => {
