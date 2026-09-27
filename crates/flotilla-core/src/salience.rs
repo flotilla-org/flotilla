@@ -31,7 +31,6 @@ pub struct RegardFact {
 pub struct AttentionFact {
     pub target: ResourceRef,
     pub state: TerminalAttentionState,
-    pub work_unsettled: bool,
     pub as_of: DateTime<Utc>,
 }
 
@@ -48,14 +47,9 @@ pub struct SalienceEvaluation {
 }
 
 /// Compute the surface-independent salience judgment for one projection
-/// entry. Idle evidence alone is availability; the authority's `Stalled`
-/// condition decides whether owed work needs an operator.
-pub fn compute_salience(
-    demand: Option<DemandState>,
-    regard_covers: bool,
-    attention: Option<TerminalAttentionState>,
-    _work_unsettled: bool,
-) -> Salience {
+/// entry. Idle evidence alone contributes information; stall routing is
+/// projected separately from the authority's condition.
+pub fn compute_salience(demand: Option<DemandState>, regard_covers: bool, attention: Option<TerminalAttentionState>) -> Salience {
     let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput));
     let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied | DemandState::Escalated));
     if demand_is_unacknowledged && regard_covers && attention_needs_human {
@@ -138,12 +132,7 @@ fn evaluate_combination(
         regard_covers = true;
         result.as_of = result.as_of.max(regard.as_of);
     }
-    let candidate = compute_salience(
-        demand.map(|demand| demand.state),
-        regard_covers,
-        attention.map(|attention| attention.state),
-        attention.is_some_and(|attention| attention.work_unsettled),
-    );
+    let candidate = compute_salience(demand.map(|demand| demand.state), regard_covers, attention.map(|attention| attention.state));
     result.salience = result.salience.max(candidate);
     if let Some(demand) = demand {
         result.as_of = result.as_of.max(demand.as_of);
@@ -185,47 +174,30 @@ mod tests {
     #[test]
     fn demand_regard_attention_join_has_one_central_precedence_table() {
         let cases = [
-            (None, false, None, true, Salience::None, "no facts"),
-            (None, true, None, true, Salience::Info, "regarded work"),
-            (None, false, Some(TerminalAttentionState::Working), true, Salience::Info, "working observation"),
-            (None, false, Some(TerminalAttentionState::Idle), false, Salience::Info, "settled idle observation"),
-            (None, false, Some(TerminalAttentionState::Idle), true, Salience::Info, "idle unsettled work without a stall"),
-            (None, false, Some(TerminalAttentionState::NeedsInput), true, Salience::Attention, "unrouted input need"),
-            (Some(DemandState::Raised), false, Some(TerminalAttentionState::Working), true, Salience::Attention, "raised demand"),
-            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Working), true, Salience::Attention, "regarded raised demand"),
-            (
-                Some(DemandState::Raised),
-                true,
-                Some(TerminalAttentionState::NeedsInput),
-                true,
-                Salience::Urgent,
-                "in-searchlight input demand",
-            ),
-            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Idle), true, Salience::Attention, "in-searchlight idle demand"),
-            (
-                Some(DemandState::Raised),
-                false,
-                Some(TerminalAttentionState::NeedsInput),
-                true,
-                Salience::Attention,
-                "out-of-searchlight demand",
-            ),
-            (Some(DemandState::Satisfied), false, None, true, Salience::Info, "satisfied demand awaiting acknowledgement"),
-            (Some(DemandState::Escalated), false, None, true, Salience::Urgent, "expired demand escalated"),
+            (None, false, None, Salience::None, "no facts"),
+            (None, true, None, Salience::Info, "regarded work"),
+            (None, false, Some(TerminalAttentionState::Working), Salience::Info, "working observation"),
+            (None, false, Some(TerminalAttentionState::Idle), Salience::Info, "idle observation"),
+            (None, false, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "unrouted input need"),
+            (Some(DemandState::Raised), false, Some(TerminalAttentionState::Working), Salience::Attention, "raised demand"),
+            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Working), Salience::Attention, "regarded raised demand"),
+            (Some(DemandState::Raised), true, Some(TerminalAttentionState::NeedsInput), Salience::Urgent, "in-searchlight input demand"),
+            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Idle), Salience::Attention, "in-searchlight idle demand"),
+            (Some(DemandState::Raised), false, Some(TerminalAttentionState::NeedsInput), Salience::Attention, "out-of-searchlight demand"),
+            (Some(DemandState::Satisfied), false, None, Salience::Info, "satisfied demand awaiting acknowledgement"),
+            (Some(DemandState::Escalated), false, None, Salience::Urgent, "expired demand escalated"),
             (
                 Some(DemandState::Satisfied),
                 true,
                 Some(TerminalAttentionState::NeedsInput),
-                true,
                 Salience::Urgent,
                 "satisfied demand remains unacknowledged",
             ),
-            (Some(DemandState::Acknowledged), false, None, true, Salience::None, "acknowledged demand"),
+            (Some(DemandState::Acknowledged), false, None, Salience::None, "acknowledged demand"),
             (
                 Some(DemandState::Acknowledged),
                 true,
                 Some(TerminalAttentionState::NeedsInput),
-                true,
                 Salience::Attention,
                 "live input remains visible after acknowledgement",
             ),
@@ -233,14 +205,13 @@ mod tests {
                 Some(DemandState::Raised),
                 true,
                 Some(TerminalAttentionState::Unobservable),
-                true,
                 Salience::Attention,
                 "unobservable raised demand",
             ),
         ];
 
-        for (demand, regard_covers, attention, work_unsettled, expected, description) in cases {
-            assert_eq!(compute_salience(demand, regard_covers, attention, work_unsettled), expected, "{description}");
+        for (demand, regard_covers, attention, expected, description) in cases {
+            assert_eq!(compute_salience(demand, regard_covers, attention), expected, "{description}");
         }
     }
 }

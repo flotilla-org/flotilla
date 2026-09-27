@@ -743,12 +743,7 @@ mod tests {
                     as_of: demand_at,
                 }],
                 regards: vec![RegardFact { principal, target: project_resource_ref("flotilla", "flotilla/platform"), as_of: base }],
-                attention: vec![AttentionFact {
-                    target: vessel,
-                    state: TerminalAttentionState::NeedsInput,
-                    work_unsettled: true,
-                    as_of: attention_at,
-                }],
+                attention: vec![AttentionFact { target: vessel, state: TerminalAttentionState::NeedsInput, as_of: attention_at }],
                 pane_exits: Vec::new(),
             },
             state: ResultSetState {

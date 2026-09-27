@@ -1848,7 +1848,6 @@ impl Aggregator {
                         (self.vessel_host(reference, work) == session_host).then(|| AttentionFact {
                             target: reference.subresource(format!("vessels/{vessel}")),
                             state: observation.state,
-                            work_unsettled: work.is_none_or(|work| !work.phase.is_terminal()),
                             as_of: observation.as_of,
                         })
                     })
@@ -2136,12 +2135,10 @@ impl Aggregator {
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
-        let surface_state = if attention_demand.is_some() {
+        let surface_state = if attention_demand.is_some() || vessels.iter().any(|vessel| vessel.surface_state.needs_attention()) {
             SurfaceState::NeedsYou
         } else if let Some(stalled) = status.and_then(|status| status.stalled.as_ref()) {
             stalled_surface_state(stalled)
-        } else if vessels.iter().any(|vessel| vessel.surface_state.needs_attention()) {
-            SurfaceState::NeedsYou
         } else if vessels.iter().all(|vessel| vessel.surface_state == SurfaceState::Available) && !vessels.is_empty() {
             SurfaceState::Available
         } else {
@@ -2775,6 +2772,59 @@ mod tests {
         let vessel = convoy.vessels.first().expect("vessel row");
         assert!(vessel.surface_state.needs_attention());
         assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
+    }
+
+    #[tokio::test]
+    async fn vessel_needs_you_overrides_a_different_handled_stall() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        let status = convoy.status.as_mut().expect("convoy status");
+        status
+            .workflow_snapshot
+            .as_mut()
+            .expect("workflow")
+            .vessels
+            .push(VesselRequirement::builder().name("review".to_string()).crew(Vec::new()).build());
+        status.work.insert("review".into(), WorkState::builder().phase(ResourceWorkPhase::Ready).build());
+        status.stalled = Some(StalledCondition {
+            leaves: Vec::new(),
+            maker: Some(flotilla_resources::LeafMaker::Actor { vessel: "implement".into(), role: "coder".into() }),
+            evidence: "idle at turn end".into(),
+            source: flotilla_resources::StallEvidenceSource::Hook,
+            began_at: Utc::now(),
+            rung: StallRung::Nudge,
+            nudge_history: Vec::new(),
+        });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let mut session = session_object("terminal-convoy-a-review").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "review".to_string())]);
+        session.status.as_mut().expect("session status").completion_pending = Some(flotilla_resources::CrewCompletionPending {
+            message: None,
+            disposition: None,
+            decision_ledger_ref: None,
+            force: false,
+            principal_ref: None,
+            attempted_at: Utc::now(),
+            authority: "local".into(),
+            last_error: "authority unreachable".into(),
+        });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+
+        let result = state.result_set().await;
+        let convoy = &result.rows.as_convoys().expect("convoys")[0];
+        assert_eq!(convoy.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(
+            convoy.vessels.iter().find(|vessel| vessel.name == "implement").expect("maker vessel").surface_state,
+            SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge }
+        );
+        assert_eq!(
+            convoy.vessels.iter().find(|vessel| vessel.name == "review").expect("review vessel").surface_state,
+            SurfaceState::NeedsYou
+        );
     }
 
     #[tokio::test]
@@ -4372,7 +4422,7 @@ mod tests {
 
         let result = state.result_set().await;
         assert_eq!(result.rows.as_convoys().expect("convoy rows")[0].name, "convoy-a");
-        assert!(!aggregator.salience_facts_at(now).attention[0].work_unsettled);
+        assert_eq!(aggregator.salience_facts_at(now).attention[0].state, TerminalAttentionState::Idle);
     }
 
     #[tokio::test]
