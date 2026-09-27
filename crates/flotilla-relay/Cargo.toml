@@ -23,9 +23,3 @@ worker = "0.8.6"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
-futures = "0.3"
-reqwest = { workspace = true }
-rustls = { workspace = true }
-tempfile = "3"
-tokio = { workspace = true }
-tokio-tungstenite = "0.28"

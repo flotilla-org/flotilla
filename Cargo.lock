@@ -1346,16 +1346,11 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "js-sys",
- "reqwest 0.13.2",
  "rusqlite",
- "rustls",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
  "worker",
 ]
 
