@@ -190,13 +190,21 @@ prefix = "installation-a"
 credential_file = "/etc/flotilla/blob-store-credentials.json"
 ```
 
+Fleet endpoints require HTTPS by default. Plain HTTP is accepted for loopback
+hosts (`localhost`, `127.0.0.0/8`, or `::1`) to support local development. For a
+trusted non-loopback HTTP endpoint, set `allow_insecure_http = true` in that
+store's entry. The daemon logs a warning naming the store for either HTTP
+exception and rejects non-loopback HTTP without the opt-in at startup.
+
 The daemon reads the credential file at startup. Its JSON object has
 `access_key_id` and `secret_access_key` fields, and optionally `session_token`.
 Keep the file readable only by the daemon account. It is never staged into
 crew vessels. Writes complete in the local store even when S3 is unavailable;
 background sync retries with backoff. `flotilla host list` and
 `flotilla host status` show the pending count and last sync error. A blob outlives a failed
-host only after sync reaches a fleet store.
+host only after sync reaches a fleet store. On startup, sync recovers pending
+uploads from local blobs and per-store markers; later passes process new writes
+and cache fills without walking the full local blob directory.
 
 ## Daemon logging
 
