@@ -8208,7 +8208,9 @@ impl InProcessDaemon {
         }
         let namespace = self.provisioning_namespace().await;
         let convoys = self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|err| err.to_string())?;
-        let context_convoy = if let Some(crew_id) = crew_id {
+        let context_convoy = if project.is_some() {
+            None
+        } else if let Some(crew_id) = crew_id {
             let sessions = self
                 .resource_backend
                 .including_replicas::<ResourceTerminalSession>(&namespace)
