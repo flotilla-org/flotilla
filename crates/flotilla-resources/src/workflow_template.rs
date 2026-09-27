@@ -4,11 +4,11 @@ use std::{
     str::FromStr,
 };
 
-use flotilla_protocol::LeafOperator;
+use flotilla_protocol::{LeafKind, LeafOperator};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
+use crate::{leaf::validate_leaf_literal, resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
 
 define_resource!(
     WorkflowTemplate,
@@ -455,6 +455,7 @@ pub enum ValidationError {
     EmptyExitTable,
     InvalidExitLeaf { disposition: String, template: String },
     InvalidTurnDeliveryLeaf { source: String, template: String },
+    InvalidTurnDeliveryLiteral { source: String, template: String, reason: String },
     EmptyTurnDeliveryBrief { source: String },
     UnknownTurnDeliveryVessel { source: String, vessel: String },
     UnknownTurnDeliveryRole { source: String, vessel: String, role: String },
@@ -511,6 +512,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::InvalidTurnDeliveryLeaf { source, template } => {
                 write!(f, "turn-delivery source `{source}` is not an admitted change-request leaf: `{template}`")
+            }
+            ValidationError::InvalidTurnDeliveryLiteral { source, template, reason } => {
+                write!(f, "turn-delivery source `{source}` has invalid condition `{template}`: {reason}")
             }
             ValidationError::EmptyTurnDeliveryBrief { source } => {
                 write!(f, "turn-delivery source `{source}` must declare a non-empty brief")
@@ -608,6 +612,18 @@ fn validate_turn_delivery(
             && (rule.on.field_path == ".updated-at" || matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual));
         if !admitted {
             push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
+        } else {
+            let kind = match rule.on.subject {
+                SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
+                SubjectVariable::Issue => LeafKind::Issue,
+            };
+            if let Err(reason) = validate_leaf_literal(kind, &rule.on.field_path, &rule.on.literal) {
+                push_error(errors, ValidationError::InvalidTurnDeliveryLiteral {
+                    source: source.clone(),
+                    template: rule.on.to_string(),
+                    reason,
+                });
+            }
         }
         if rule.brief.trim().is_empty() {
             push_error(errors, ValidationError::EmptyTurnDeliveryBrief { source: source.clone() });

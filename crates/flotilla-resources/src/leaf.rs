@@ -105,23 +105,26 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     {
         return Err(format!("operator `{}` is not admitted for text leaf `{kind}{}`; use `==` or `!=`", leaf.operator, leaf.field_path));
     }
-    if leaf.field_path == ".latest-claim.claimed-at"
-        || leaf.field_path == ".updated-at"
-        || (kind == LeafKind::Usage && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| field == "resets-at"))
+    validate_leaf_literal(kind, &leaf.field_path, &leaf.literal)
+}
+
+/// Validate the typed value independently of an address, so template admission
+/// and concrete leaf admission use the same literal rules.
+pub fn validate_leaf_literal(kind: LeafKind, field_path: &str, literal: &str) -> Result<(), String> {
+    if field_path == ".latest-claim.claimed-at"
+        || field_path == ".updated-at"
+        || (kind == LeafKind::Usage && usage_window_path(field_path).is_some_and(|(_, field)| field == "resets-at"))
     {
-        leaf.literal
+        literal
             .parse::<DateTime<Utc>>()
-            .map_err(|error| format!("invalid timestamp literal `{}` for {kind}{}: {error}", leaf.literal, leaf.field_path))?;
+            .map_err(|error| format!("invalid timestamp literal `{literal}` for {kind}{field_path}: {error}"))?;
     }
-    if kind == LeafKind::Issue && issue_label_path(&leaf.field_path).is_some() && !matches!(leaf.literal.as_str(), "true" | "false") {
-        return Err(format!("issue label leaf literal must be `true` or `false`, got `{}`", leaf.literal));
+    if kind == LeafKind::Issue && issue_label_path(field_path).is_some() && !matches!(literal, "true" | "false") {
+        return Err(format!("issue label leaf literal must be `true` or `false`, got `{literal}`"));
     }
-    if kind == LeafKind::Usage
-        && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes"))
+    if kind == LeafKind::Usage && usage_window_path(field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes"))
     {
-        leaf.literal
-            .parse::<f64>()
-            .map_err(|error| format!("invalid number literal `{}` for usage{}: {error}", leaf.literal, leaf.field_path))?;
+        literal.parse::<f64>().map_err(|error| format!("invalid number literal `{literal}` for usage{field_path}: {error}"))?;
     }
     Ok(())
 }
