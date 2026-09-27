@@ -2003,11 +2003,16 @@ async fn reconcile_credential_refresh_attention(
     errors: &[CredentialRefreshError],
 ) -> Result<(), String> {
     let backend = daemon.resource_backend();
+    let demands = backend.using::<Demand>(namespace);
+    let existing = demands.list().await.map_err(|error| error.to_string())?;
+    if errors.is_empty()
+        && existing.items.iter().all(|demand| !demand.metadata.annotations.contains_key(CREDENTIAL_REFRESH_REASON_ANNOTATION))
+    {
+        return Ok(());
+    }
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?;
     let convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
     let convoys = convoys.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
-    let demands = backend.using::<Demand>(namespace);
-    let existing = demands.list().await.map_err(|error| error.to_string())?;
     let mut desired = BTreeMap::new();
     let mut still_failing = BTreeSet::new();
     for error in errors {

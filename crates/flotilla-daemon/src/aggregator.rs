@@ -2113,17 +2113,23 @@ impl Aggregator {
                     .collect()
             })
             .unwrap_or_default();
-        let attention_demand = self.demands.values().find(|demand| {
-            let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
-            let target = &demand.spec.originating_work_ref;
-            matches!(state, DemandState::Raised | DemandState::Escalated)
-                && target.api_version == resource.api_version
-                && target.kind == resource.kind
-                && target.namespace == resource.namespace
-                && target.name == resource.name
-                && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
-                    || demand.metadata.annotations.contains_key("flotilla.work/credential-refresh-reason"))
-        });
+        let attention_demand = self
+            .demands
+            .values()
+            .filter(|demand| {
+                let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
+                let target = &demand.spec.originating_work_ref;
+                matches!(state, DemandState::Raised | DemandState::Escalated)
+                    && target.api_version == resource.api_version
+                    && target.kind == resource.kind
+                    && target.namespace == resource.namespace
+                    && target.name == resource.name
+                    && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                        || demand.metadata.annotations.contains_key("flotilla.work/credential-refresh-reason"))
+            })
+            .min_by_key(|demand| {
+                (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
+            });
         let needs_attention = attention_demand.is_some() || vessels.iter().any(|vessel| vessel.needs_attention);
         ConvoyRow::builder()
             .resource(resource.clone())
@@ -2556,6 +2562,14 @@ mod tests {
         assert!(convoy.needs_attention);
         assert!(convoy.vessels[0].needs_attention);
         assert!(convoy.vessels[0].message.as_deref().is_some_and(|message| message.contains("github-app")));
+
+        let mut reclaim = demand.clone();
+        reclaim.metadata.name = "reclaim-refusal-convoy-a".to_string();
+        reclaim.metadata.annotations = BTreeMap::from([(RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(), "reclaim failed".to_string())]);
+        aggregator.apply_demand_event(WatchEvent::Added(reclaim.clone())).await;
+        let result_set = state.result_set().await;
+        assert_eq!(result_set.rows.as_convoys().expect("convoy rows")[0].message.as_deref(), Some("reclaim failed"));
+        aggregator.apply_demand_event(WatchEvent::Deleted(reclaim)).await;
 
         aggregator.apply_demand_event(WatchEvent::Deleted(demand)).await;
         let result_set = state.result_set().await;

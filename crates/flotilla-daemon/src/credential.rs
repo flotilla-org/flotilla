@@ -1209,12 +1209,14 @@ impl CredentialStore {
 
     fn refresh_failure_message(&self, name: &str, expires_at: DateTime<Utc>, error: &str) -> String {
         let remaining = expires_at - self.clock.now();
-        let expiry = if remaining <= Duration::zero() {
-            format!("expired {} minutes ago", (-remaining.num_seconds()).saturating_add(59) / 60)
-        } else {
-            format!("expires in {} minutes", remaining.num_seconds().saturating_add(59) / 60)
-        };
-        format!("{}; {expiry}", bounded_adapter_error(name, "github-app", error))
+        let expired = remaining <= Duration::zero();
+        let seconds = if expired { -remaining.num_seconds() } else { remaining.num_seconds() };
+        let minutes = seconds.saturating_add(59) / 60;
+        let unit = if minutes == 1 { "minute" } else { "minutes" };
+        let expiry = if expired { format!("expired {minutes} {unit} ago") } else { format!("expires in {minutes} {unit}") };
+        let prefix = format!("credential `{name}` adapter `github-app`: ");
+        let detail = error.strip_prefix(&prefix).unwrap_or(error);
+        format!("{}; {expiry}", bounded_adapter_error(name, "github-app", detail))
     }
 
     pub(crate) async fn set_github_app_scopes(&self, environment_ref: &str, scopes: &BTreeMap<String, GithubAppScope>) {
@@ -2763,7 +2765,6 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-
         store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
         store.prepare_scoped("env-a", &refs, &scopes, runner).await.expect("second preparation after invalidation");
         session.assert_complete();
@@ -3119,6 +3120,14 @@ interactions:
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
 
+        assert_eq!(
+            store.refresh_failure_message(
+                "github-app",
+                now + Duration::seconds(45),
+                "credential `github-app` adapter `github-app`: invalid scalar",
+            ),
+            "credential `github-app` adapter `github-app`: invalid scalar; expires in 1 minute"
+        );
         let environment = store
             .prepare_scoped("standing-vessel", &refs, &scopes, runner.clone())
             .await
