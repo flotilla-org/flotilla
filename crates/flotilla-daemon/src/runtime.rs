@@ -5245,7 +5245,9 @@ mod tests {
         .expect("bad SSH preflight must not abort daemon startup");
 
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
-        assert!(hosts.get(&local_id).await.expect("local host remains registered").status.expect("local heartbeat").ready);
+        let local = hosts.get(&local_id).await.expect("local host remains registered");
+        assert!(local.spec.connection.is_daemon(), "colliding SSH host must not overwrite the daemon Host");
+        assert!(local.status.expect("local heartbeat").ready);
         assert!(hosts.get("bad-ssh-host").await.is_err(), "host without a persistent terminal pool must be skipped");
         let good = hosts.get("good-ssh-host").await.expect("other SSH host remains registered");
         assert!(good.status.expect("other SSH observation").ready);
