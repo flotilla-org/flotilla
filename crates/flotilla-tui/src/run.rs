@@ -27,6 +27,31 @@ pub enum EventLoopExit {
     DaemonDisconnected(Box<App>),
 }
 
+#[derive(Default)]
+struct SubscriptionRetry {
+    next_attempt: Option<Instant>,
+    failures: u32,
+}
+
+impl SubscriptionRetry {
+    fn ready(&self, now: Instant) -> bool {
+        self.next_attempt.is_none_or(|next| now >= next)
+    }
+
+    /// Returns whether this is the first failure in the current streak.
+    fn failed(&mut self, now: Instant) -> bool {
+        let first = self.failures == 0;
+        let delay = (1_u64 << self.failures.min(5)).min(30);
+        self.next_attempt = Some(now + Duration::from_secs(delay));
+        self.failures = self.failures.saturating_add(1);
+        first
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Run the TUI event loop: replay initial state, then process events until quit.
 ///
 /// Takes ownership of a fully-constructed `App` (with daemon already connected)
@@ -50,7 +75,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     // Subscribe the named queries the open Views consume — the tab set is
     // the subscription set (ADR 0013). The subscribe replay returns the
     // initial result sets.
-    resync_subscriptions(&mut app).await;
+    let mut subscription_retry = SubscriptionRetry::default();
+    resync_subscriptions(&mut app, &mut subscription_retry, Instant::now()).await;
 
     execute!(stdout(), EnableMouseCapture)?;
     let mut terminal_title = None;
@@ -193,7 +219,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
         // ── Re-sync query subscriptions after tab-set changes ──
         if app.subscriptions_dirty {
-            resync_subscriptions(&mut app).await;
+            resync_subscriptions(&mut app, &mut subscription_retry, Instant::now()).await;
         }
 
         // ── Check quit before rendering ──
@@ -240,18 +266,24 @@ fn sync_terminal_title(app: &App, current: &mut Option<String>) -> Result<()> {
 
 /// Replace the daemon-side query subscription set with the union the open
 /// Views consume, applying any replayed result sets for stale cursors.
-async fn resync_subscriptions(app: &mut App) {
+async fn resync_subscriptions(app: &mut App, retry: &mut SubscriptionRetry, now: Instant) {
+    if !app.subscriptions_dirty || !retry.ready(now) {
+        return;
+    }
     let cursors = app.query_cursors();
     app.subscriptions_dirty = false;
     match app.daemon.subscribe_queries(app.session_id, &cursors).await {
         Ok(events) => {
+            retry.succeeded();
             for event in events {
                 app.handle_daemon_event(event);
             }
         }
         Err(e) => {
             app.subscriptions_dirty = true;
-            tracing::warn!(%e, "query subscription re-sync failed");
+            if retry.failed(now) {
+                tracing::warn!(%e, "query subscription re-sync failed; retrying with backoff");
+            }
         }
     }
 }
@@ -314,11 +346,14 @@ pub fn render_reconnect_frame(
 
 #[cfg(test)]
 mod reconnect_tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{atomic::Ordering, Arc},
+        time::{Duration, Instant},
+    };
 
     use flotilla_protocol::{QueryId, ViewAddress};
 
-    use super::resync_subscriptions;
+    use super::{resync_subscriptions, SubscriptionRetry};
     use crate::{
         app::test_support::{stub_app_with_daemon, StubDaemon},
         table_view::{PendingRowContext, RowId, RowState},
@@ -340,7 +375,7 @@ mod reconnect_tests {
 
         let daemon = Arc::new(StubDaemon::builder().subscribe_result(Err("subscription unavailable".into())).build());
         app.reconnect_daemon(daemon, vec![]);
-        resync_subscriptions(&mut app).await;
+        resync_subscriptions(&mut app, &mut SubscriptionRetry::default(), Instant::now()).await;
 
         assert!(app.subscriptions_dirty, "failed subscription should be retried");
         let view = app.views.iter().find(|view| view.address() == Some(&address)).expect("inactive view should remain open");
@@ -348,5 +383,47 @@ mod reconnect_tests {
         app.views.begin_pending_row(&row, "new action".into()).expect("stale pending row should no longer block actions");
         let view = app.views.iter().find(|view| view.address() == Some(&address)).expect("inactive view should remain open");
         assert!(matches!(view.table_state.row_state(&row.row_id), Some(RowState::Submitting { .. })));
+    }
+
+    #[tokio::test]
+    async fn failed_subscriptions_back_off_and_recover_after_a_transient_failure() {
+        let daemon = Arc::new(StubDaemon::builder().subscribe_result(Err("temporarily unavailable".into())).build());
+        let mut app = stub_app_with_daemon(daemon.clone(), vec![]);
+        let mut retry = SubscriptionRetry::default();
+        let start = Instant::now();
+
+        resync_subscriptions(&mut app, &mut retry, start).await;
+        assert!(app.subscriptions_dirty);
+        assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(retry.next_attempt, Some(start + Duration::from_secs(1)));
+
+        resync_subscriptions(&mut app, &mut retry, start + Duration::from_millis(999)).await;
+        assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 1);
+
+        resync_subscriptions(&mut app, &mut retry, start + Duration::from_secs(1)).await;
+        assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(retry.next_attempt, Some(start + Duration::from_secs(3)));
+
+        *daemon.subscribe_result.lock().expect("subscribe result lock") = Ok(vec![]);
+        resync_subscriptions(&mut app, &mut retry, start + Duration::from_secs(2)).await;
+        assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 2);
+        resync_subscriptions(&mut app, &mut retry, start + Duration::from_secs(3)).await;
+        assert_eq!(daemon.subscribe_calls.load(Ordering::SeqCst), 3);
+        assert!(!app.subscriptions_dirty);
+        assert_eq!(retry.failures, 0);
+        assert_eq!(retry.next_attempt, None);
+    }
+
+    #[test]
+    fn repeated_failures_warn_once_per_streak_and_cap_the_delay() {
+        let mut retry = SubscriptionRetry::default();
+        let start = Instant::now();
+        assert!(retry.failed(start));
+        for attempt in 1..8 {
+            assert!(!retry.failed(start + Duration::from_secs(attempt)));
+        }
+        assert_eq!(retry.next_attempt, Some(start + Duration::from_secs(7 + 30)));
+        retry.succeeded();
+        assert!(retry.failed(start + Duration::from_secs(38)));
     }
 }
