@@ -342,7 +342,10 @@ enum ResourceSubCommand {
     /// Create or update a raw resource document
     Apply(ResourceApplyArgs),
     /// Validate resource documents offline against this binary's schema
-    Validate { path: PathBuf },
+    Validate {
+        /// Resource document or directory containing JSON/YAML manifests
+        path: PathBuf,
+    },
     /// Make the manifest overwrite a drifted live spec
     Sync(ResourceManifestResolutionArgs),
     /// Write the live spec back to its manifest

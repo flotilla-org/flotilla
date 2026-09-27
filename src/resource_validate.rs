@@ -50,20 +50,22 @@ pub fn validate_path(path: &Path) -> Result<()> {
 }
 
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if path.is_file() {
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    if file_type.is_file() {
         files.push(path.to_path_buf());
-    } else if path.is_dir() {
+    } else if file_type.is_dir() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let candidate = entry.path();
-            if candidate.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
                 collect_files(&candidate, files)?;
-            } else if matches!(candidate.extension().and_then(|ext| ext.to_str()), Some("json" | "yaml" | "yml")) {
+            } else if file_type.is_file() && matches!(candidate.extension().and_then(|ext| ext.to_str()), Some("json" | "yaml" | "yml")) {
                 files.push(candidate);
             }
         }
     } else {
-        return Err(eyre!("resource path does not exist: {}", path.display()));
+        return Err(eyre!("resource path is not a regular file or directory: {}", path.display()));
     }
     Ok(())
 }
@@ -92,7 +94,7 @@ mod tests {
 
     use flotilla_resources::validate_resource_document;
 
-    use super::parse_documents;
+    use super::{collect_files, parse_documents};
 
     #[test]
     fn reports_the_nested_field_of_a_stale_manifest() {
@@ -107,5 +109,21 @@ mod tests {
     fn parses_multiple_yaml_documents() {
         let yaml = "kind: PlacementPolicy\n---\nkind: Forge\n";
         assert_eq!(parse_documents(Path::new("resources.yaml"), yaml).expect("parse yaml").len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_directories() {
+        let root = std::env::temp_dir().join(format!("flotilla-validate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("create test directory");
+        let manifest = root.join("resource.yaml");
+        std::fs::write(&manifest, "kind: PlacementPolicy\n").expect("write manifest");
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("create directory symlink");
+
+        let mut files = Vec::new();
+        collect_files(&root, &mut files).expect("collect files");
+        assert_eq!(files, vec![manifest]);
+
+        std::fs::remove_dir_all(&root).expect("remove test directory");
     }
 }
