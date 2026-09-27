@@ -679,6 +679,166 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     assert_eq!(resolved.status, flotilla_protocol::ChangeRequestStatus::Open);
 }
 
+struct BatchedObservationRunner {
+    calls: std::sync::Mutex<Vec<String>>,
+    rate_limit_two: std::sync::atomic::AtomicBool,
+    block_one: std::sync::atomic::AtomicBool,
+    one_started: tokio::sync::Notify,
+    release_one: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl CommandRunner for BatchedObservationRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        match (cmd, args) {
+            ("gh", ["--version"]) => Ok("gh version 2.49.0\n".into()),
+            ("git", ["--version"]) => Ok("git version 2.43.0\n".into()),
+            _ => Err(format!("unexpected command: {cmd} {args:?}")),
+        }
+    }
+
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<crate::providers::CommandOutput, String> {
+        if cmd != "gh" || args.first() != Some(&"api") || args.get(1) != Some(&"graphql") {
+            return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                success: true,
+            });
+        }
+        let query = args.iter().find_map(|arg| arg.strip_prefix("query=")).ok_or("missing GraphQL query")?;
+        self.calls.lock().expect("calls").push(query.to_string());
+        if query.contains("name:\"one\"") && self.block_one.load(std::sync::atomic::Ordering::SeqCst) {
+            self.one_started.notify_one();
+            self.release_one.notified().await;
+        }
+        if query.contains("name:\"two\"") && self.rate_limit_two.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(crate::providers::CommandOutput {
+                stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
+                stderr: "gh: API rate limit exceeded".into(),
+                success: false,
+            });
+        }
+        let requests = query
+            .split("pullRequest(number:")
+            .skip(1)
+            .filter_map(|tail| {
+                let number = tail.split(')').next()?.parse::<u64>().ok()?;
+                Some((
+                    format!("pr{number}"),
+                    serde_json::json!({
+                        "state": "OPEN", "isDraft": false, "headRefOid": "abc", "reviewDecision": null,
+                        "mergeable": "MERGEABLE", "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}
+                    }),
+                ))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        Ok(crate::providers::CommandOutput {
+            stdout: format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": requests}})),
+            stderr: String::new(),
+            success: true,
+        })
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit() {
+    let runner = Arc::new(BatchedObservationRunner {
+        calls: std::sync::Mutex::new(Vec::new()),
+        rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        block_one: std::sync::atomic::AtomicBool::new(false),
+        one_started: tokio::sync::Notify::new(),
+        release_one: tokio::sync::Notify::new(),
+    });
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"batch-observation-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("gh discovery");
+    let mut subjects = Vec::new();
+    for (scope, ids) in [("team/one", vec![1, 2, 3]), ("team/two", vec![4, 5])] {
+        let scheme = if scope == "team/one" { "http" } else { "https" };
+        let repository = RepositorySpec::remote(format!("{scheme}://github.com/{scope}")).expect("repository");
+        let repository_key = repository.key();
+        backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
+        for id in ids {
+            let mut spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+            spec.change_request =
+                Some(BoundChangeRequest { id: id.to_string(), repository_ref: repository_key.clone(), title: format!("PR {id}") });
+            backend.using::<ResourceConvoy>("flotilla").create(&test_meta(&format!("convoy-{id}")), &spec).await.expect("convoy");
+            subjects.push(ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: scope.into(), number: id });
+        }
+    }
+    for subject in &subjects {
+        daemon.change_request_observation_source.observe(subject).await.expect("live observation");
+    }
+    assert_eq!(runner.calls.lock().expect("calls").len(), 2, "one GitHub request per repository for five bound CRs");
+
+    let first = &subjects[0];
+    let repository_key = backend
+        .using::<Repository>("flotilla")
+        .list()
+        .await
+        .expect("repositories")
+        .items
+        .into_iter()
+        .find(|repository| repository.spec.forge().is_some_and(|forge| forge.repository == "team/one"))
+        .expect("first repository")
+        .spec
+        .key();
+    let mut spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    spec.change_request = Some(BoundChangeRequest { id: "6".into(), repository_ref: repository_key, title: "PR 6".into() });
+    backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-6"), &spec).await.expect("new convoy");
+    daemon.change_request_observation_source.observe(first).await.expect("expanded batch");
+    assert_eq!(runner.calls.lock().expect("calls").len(), 3, "a new bound CR invalidates its repository batch");
+
+    runner.rate_limit_two.store(true, std::sync::atomic::Ordering::SeqCst);
+    let limited = &subjects[3];
+    let error = daemon.change_request_observation_source.observe_for_completion(limited).await.expect_err("fresh read is rate limited");
+    assert!(error.contains("budget=GraphQL, identity=host gh login, reset_at="), "{error}");
+    assert_eq!(runner.calls.lock().expect("calls").len(), 4);
+    assert_eq!(daemon.change_request_observation_source.observe(limited).await.expect_err("cached rate limit"), error);
+    assert_eq!(runner.calls.lock().expect("calls").len(), 4, "rate-limited repository waits for reset");
+
+    runner.block_one.store(true, std::sync::atomic::Ordering::SeqCst);
+    let started = runner.one_started.notified();
+    let source = Arc::clone(&daemon.change_request_observation_source);
+    let first = first.clone();
+    let blocked = tokio::spawn(async move { source.observe_for_completion(&first).await });
+    started.await;
+    tokio::time::timeout(Duration::from_secs(1), daemon.change_request_observation_source.observe_for_completion(limited))
+        .await
+        .expect("second repository must not wait for first repository")
+        .expect_err("second repository remains rate limited");
+    runner.release_one.notify_one();
+    blocked.await.expect("first observation task").expect("first repository resumes");
+}
+
+#[test]
+fn observation_service_matching_preserves_http_and_authority_port() {
+    assert!(forge_service_matches("http://forgejo.local:3000", "forgejo.local:3000"));
+    assert!(forge_service_matches("https://github.com/", "github.com"));
+    assert!(!forge_service_matches("http://forgejo.local:3000", "forgejo.local:3001"));
+}
+
 #[tokio::test]
 async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_reviewer() {
     let temp = tempfile::tempdir().expect("tempdir");

@@ -1,7 +1,11 @@
 pub mod forgejo;
 pub mod github;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState};
 
 use crate::providers::types::ChangeRequest;
 
@@ -12,8 +16,43 @@ pub struct ChangeRequestAdmission {
     pub base_ref: Option<String>,
 }
 
+pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
+
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
+    /// Observe bound requests together. The default uses individual provider
+    /// reads and reports only the state; GitHub overrides this with one query
+    /// that also includes checks, review, mergeability, and head SHA.
+    async fn observe_bound(&self, numbers: &[u64]) -> Result<BoundObservations, String> {
+        let mut statuses = HashMap::new();
+        for number in numbers {
+            let (_, request) = match self.get_change_request(&number.to_string()).await {
+                Ok(request) => request,
+                Err(error) => {
+                    statuses.insert(*number, Err(error));
+                    continue;
+                }
+            };
+            let state = match request.status {
+                flotilla_protocol::ChangeRequestStatus::Open => ObservedChangeRequestState::Open,
+                flotilla_protocol::ChangeRequestStatus::Draft => ObservedChangeRequestState::Draft,
+                flotilla_protocol::ChangeRequestStatus::Merged => ObservedChangeRequestState::Merged,
+                flotilla_protocol::ChangeRequestStatus::Closed => ObservedChangeRequestState::Closed,
+            };
+            let observed_at = Utc::now();
+            statuses.insert(
+                *number,
+                Ok(ChangeRequestStatus {
+                    state: Observation::known(state, observed_at),
+                    head_sha: Observation::unknown(observed_at),
+                    checks: Observation::unknown(observed_at),
+                    review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(observed_at) },
+                    mergeable: Observation::unknown(observed_at),
+                }),
+            );
+        }
+        Ok(statuses)
+    }
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String>;
     /// Resolve the newest change request whose head is exactly `branch`.
     /// Provider overrides may include terminal requests so callers can
@@ -35,4 +74,31 @@ pub trait ChangeRequestTracker: Send + Sync {
     async fn close_change_request(&self, id: &str) -> Result<(), String>;
     async fn merge_change_request(&self, id: &str) -> Result<(), String>;
     async fn list_merged_branch_names(&self, limit: usize) -> Result<Vec<String>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::discovery::test_support::FakeChangeRequest;
+
+    #[tokio::test]
+    async fn default_bound_observation_preserves_healthy_requests_after_a_missing_one() {
+        let provider = FakeChangeRequest::new();
+        provider
+            .add_change_requests(vec![("2".to_string(), ChangeRequest {
+                title: "Healthy PR".to_string(),
+                branch: "healthy".to_string(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: None,
+                provider_name: "fake".to_string(),
+                provider_display_name: "Fake".to_string(),
+            })])
+            .await;
+        let observed = provider.observe_bound(&[1, 2]).await.expect("independent reads");
+        assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());
+        assert_eq!(
+            observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR").state.value,
+            Some(ObservedChangeRequestState::Open)
+        );
+    }
 }
