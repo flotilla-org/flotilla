@@ -19,14 +19,20 @@ impl Resource for Forge {
         if meta.name != spec.forge_id || spec.forge_id.trim().is_empty() {
             return Err(ResourceError::invalid("Forge resource name must equal a non-empty forge_id"));
         }
+        if !spec.forge_id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            || !spec.forge_id.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+            || !spec.forge_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(ResourceError::invalid("Forge forge_id must be a lowercase DNS label"));
+        }
         if spec.hosts.is_empty() || spec.hosts.iter().any(|host| host.trim().is_empty() || host.contains('/')) {
             return Err(ResourceError::invalid("Forge hosts must be non-empty hostnames or SSH aliases"));
         }
         let Some(front) = spec.https_url.strip_prefix("https://") else {
             return Err(ResourceError::invalid("Forge https_url must use HTTPS"));
         };
-        if front.trim_matches('/').is_empty() || front.trim_end_matches('/').contains('/') {
-            return Err(ResourceError::invalid("Forge https_url must name a host without a path"));
+        if front.split('/').next().is_none_or(str::is_empty) || front.contains(['?', '#']) {
+            return Err(ResourceError::invalid("Forge https_url must name a host and optional path prefix"));
         }
         if spec.git_ssh_host.trim().is_empty() || spec.git_ssh_host.contains('/') || spec.git_ssh_host.contains(char::is_whitespace) {
             return Err(ResourceError::invalid("Forge git_ssh_host must be a hostname or SSH alias"));
@@ -54,6 +60,20 @@ pub enum ForgeKind {
 }
 
 impl ForgeSpec {
+    /// Whether an issue service URL names this installation, including a
+    /// declared host alias and the installation's path prefix.
+    pub fn owns_issue_service(&self, service_url: &str) -> bool {
+        let Some(front) = service_url.strip_prefix("https://") else { return false };
+        let (host, path) = front.split_once('/').unwrap_or((front, ""));
+        let forge_path = self
+            .https_url
+            .strip_prefix("https://")
+            .and_then(|front| front.split_once('/'))
+            .map_or("", |(_, path)| path)
+            .trim_end_matches('/');
+        self.matches_host(host) && path.trim_end_matches('/') == forge_path
+    }
+
     pub fn matches_host(&self, host: &str) -> bool {
         self.hosts.iter().any(|alias| alias.eq_ignore_ascii_case(host))
             || self
@@ -71,6 +91,15 @@ impl ForgeSpec {
         if !self.matches_host(host) {
             return Ok(None);
         }
+        let prefix =
+            self.https_url.strip_prefix("https://").and_then(|front| front.split_once('/')).map(|(_, prefix)| prefix.trim_matches('/'));
+        let path = match prefix.filter(|prefix| !prefix.is_empty()) {
+            Some(prefix) => match path.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/')) {
+                Some(path) => path,
+                None => return Ok(None),
+            },
+            None => path,
+        };
         let (owner, repo_name) = path.rsplit_once('/').ok_or_else(|| format!("forge repository URL requires owner and name: {remote}"))?;
         if owner.is_empty() || repo_name.is_empty() {
             return Err(format!("forge repository URL requires owner and name: {remote}"));

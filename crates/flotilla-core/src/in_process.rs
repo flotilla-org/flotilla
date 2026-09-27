@@ -154,14 +154,41 @@ struct ProviderIssueObservationSource {
     daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
 }
 
+fn issue_source_for_subject(
+    subject: &crate::issue_observer::IssueRef,
+    forges: &[flotilla_resources::ForgeSpec],
+) -> Result<flotilla_protocol::IssueSource, String> {
+    let service = if let Some(forge) = forges.iter().find(|forge| forge.forge_id == subject.service) {
+        forge.https_url.clone()
+    } else {
+        if !subject.service.starts_with("host%3a") && !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") {
+            return Err(format!("issue service `{}` has no Forge declaration or host-derived address", subject.service));
+        }
+        let encoded = subject.service.strip_prefix("host%3a").unwrap_or(&subject.service);
+        let location = encoded.replace("%2f", "/").replace("%3a", ":").replace("%25", "%");
+        if location.contains("://") {
+            location
+        } else {
+            format!("https://{location}")
+        }
+    };
+    Ok(flotilla_protocol::IssueSource { service, scope: subject.scope.clone() })
+}
+
 #[async_trait]
 impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationSource {
     async fn observe(&self, subject: &crate::issue_observer::IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
         let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("issue observation daemon unavailable")?;
-        let fallback = flotilla_protocol::IssueRef {
-            source: flotilla_protocol::IssueSource { service: format!("https://{}", subject.service), scope: subject.scope.clone() },
-            id: subject.number.to_string(),
-        };
+        let forges = daemon
+            .resource_backend
+            .definitions::<Forge>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let fallback = flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges)?, id: subject.number.to_string() };
         let reference = daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)
@@ -173,7 +200,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .flat_map(|convoy| convoy.object.spec.issues)
             .map(|issue| issue.reference)
             .find(|reference| {
-                flotilla_resources::issue_address(reference).is_ok_and(|address| {
+                flotilla_resources::issue_address_with_forges(reference, &forges).is_ok_and(|address| {
                     address
                         == flotilla_protocol::LeafAddress::Issue {
                             service: subject.service.clone(),

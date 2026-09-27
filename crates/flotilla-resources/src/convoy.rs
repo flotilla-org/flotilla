@@ -244,13 +244,14 @@ pub struct InstantiatedTurnDelivery {
 pub fn instantiate_turn_delivery(
     convoy: &crate::ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+    forges: &[crate::ForgeSpec],
 ) -> Result<Vec<InstantiatedTurnDelivery>, String> {
     let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
         return Ok(Vec::new());
     };
     let change_requests = bound_change_request_addresses(convoy, checkouts)?;
     let issues = if snapshot.turn_delivery.values().any(|rule| rule.on.subject == SubjectVariable::Issue) {
-        convoy.spec.issues.iter().map(|issue| issue_address(&issue.reference)).collect::<Result<Vec<_>, _>>()?
+        convoy.spec.issues.iter().map(|issue| issue_address_with_forges(&issue.reference, forges)).collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
     };
@@ -277,16 +278,36 @@ pub fn instantiate_turn_delivery(
 }
 
 pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
-    let service = reference
-        .source
-        .service
-        .strip_prefix("https://")
-        .or_else(|| reference.source.service.strip_prefix("http://"))
-        .unwrap_or(&reference.source.service)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(service, &reference.source.scope);
+    issue_address_with_forges(reference, &[])
+}
+
+/// The relay service is a declared forge name when one owns the issue source.
+/// Without a declaration, encode the source path in the service component so
+/// installations sharing a host cannot claim the same subject.
+pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpec]) -> Result<LeafAddress, String> {
+    let source = crate::normalize_issue_source(&reference.source);
+    let service_url = source.service.trim_end_matches('/');
+    let matches = forges.iter().filter(|forge| forge.owns_issue_service(service_url)).collect::<Vec<_>>();
+    let (service, scope) = match matches.as_slice() {
+        [forge] => {
+            let scope = if forge.kind == crate::ForgeKind::Github { source.scope.to_ascii_lowercase() } else { source.scope.clone() };
+            (forge.forge_id.clone(), scope)
+        }
+        [] => {
+            let (scheme, location) = service_url.split_once("://").map_or(("https", service_url), |(scheme, rest)| (scheme, rest));
+            let location = location.to_ascii_lowercase().replace('%', "%25").replace('/', "%2f");
+            let service = if scheme != "https" {
+                format!("{scheme}%3a%2f%2f{location}")
+            } else if !location.contains(['.', ':']) && !location.contains("%2f") {
+                format!("host%3a{location}")
+            } else {
+                location
+            };
+            (service, source.scope.clone())
+        }
+        _ => return Err(format!("issue source {service_url} matches multiple Forge definitions")),
+    };
+    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(&service, &scope);
     let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
     Ok(LeafAddress::Issue { service, scope, number })
 }
