@@ -64,17 +64,14 @@ pub trait LeafSubject {
 pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let kind = leaf.address.kind();
     let usage_field = kind == LeafKind::Usage && admitted_usage_field(&leaf.field_path);
-    let crew_field = kind == LeafKind::Work
-        && leaf.field_path.starts_with(".crew.")
-        && leaf.field_path.ends_with(".phase")
-        && leaf.field_path[6..leaf.field_path.len() - 6].chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        && leaf.field_path.len() > 12;
+    let crew_field = kind == LeafKind::Work && crew_role_path(&leaf.field_path).is_some();
     let admitted = usage_field
         || crew_field
         || ADMITTED_LEAF_VOCABULARY.iter().any(|(candidate_kind, path)| *candidate_kind == kind.to_string() && *path == leaf.field_path);
     if !admitted {
         let mut vocabulary = ADMITTED_LEAF_VOCABULARY.iter().map(|(kind, path)| format!("{kind}{path}")).collect::<Vec<_>>();
         vocabulary.extend([
+            "work.crew.<role>.phase".to_string(),
             "usage.provider".to_string(),
             "usage.plan".to_string(),
             "usage.organization".to_string(),
@@ -106,6 +103,11 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
             .map_err(|error| format!("invalid number literal `{}` for usage{}: {error}", leaf.literal, leaf.field_path))?;
     }
     Ok(())
+}
+
+fn crew_role_path(path: &str) -> Option<&str> {
+    let role = path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+    (!role.is_empty() && role.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))).then_some(role)
 }
 
 pub fn evaluate_leaf(
@@ -217,8 +219,8 @@ impl LeafSubject for WorkLeafSubject<'_> {
     fn value(&self, field_path: &str) -> Option<LeafValue> {
         match field_path {
             ".status.phase" => Some(LeafValue::Text(format!("{:?}", self.work.phase))),
-            path if path.starts_with(".crew.") && path.ends_with(".phase") => {
-                let role = &path[6..path.len() - 6];
+            path if crew_role_path(path).is_some() => {
+                let role = crew_role_path(path).expect("validated crew path");
                 self.crew?.get(role).map(|state| LeafValue::Text(format!("{:?}", state.phase)))
             }
             ".latest-claim.disposition" => self.latest_claim()?.disposition.clone().map(LeafValue::Text),
@@ -387,6 +389,21 @@ mod tests {
         assert!(error.contains("admitted vocabulary"));
         assert!(error.contains("convoy.status.phase"));
         assert!(error.contains("work.latest-claim.disposition"));
+    }
+
+    #[test]
+    fn crew_leaf_path_rejects_overlapping_or_empty_roles() {
+        for path in [".crew.phase", ".crew..phase", ".crew.a/b.phase"] {
+            let leaf = Leaf {
+                address: flotilla_protocol::LeafAddress::Work { convoy: "demo".into(), work: "work".into() },
+                field_path: path.into(),
+                operator: LeafOperator::Equal,
+                literal: "Done".into(),
+            };
+            assert!(admit_leaf(&leaf).is_err(), "{path} must be rejected");
+            assert_eq!(crew_role_path(path), None);
+        }
+        assert_eq!(crew_role_path(".crew.coder.phase"), Some("coder"));
     }
 
     #[test]

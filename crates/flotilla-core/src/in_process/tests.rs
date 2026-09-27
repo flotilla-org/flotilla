@@ -4695,8 +4695,21 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     .await;
     let (sender, _receiver) = tokio::sync::mpsc::channel(16);
     let watch = daemon.reconciler_wake_watch();
+    let replica_check = replica.clone();
     let task = tokio::spawn(async move { watch.spawn(replica.clone(), "flotilla".into(), sender).await.expect("replica watch") });
     tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+    assert!(!task.is_finished(), "replica watch must remain healthy");
+    assert!(replica_check.using::<ResourceConvoy>("flotilla").list().await.expect("local convoys").items.is_empty());
+    assert!(replica_check
+        .including_replicas::<ResourceConvoy>("flotilla")
+        .get("replicated")
+        .await
+        .expect("replicated convoy")
+        .object
+        .status
+        .expect("replica status")
+        .stalled
+        .is_none());
     assert!(convoys.get("replicated").await.expect("authority convoy").status.expect("status").stalled.is_none());
     task.abort();
 }

@@ -597,7 +597,8 @@ impl ReconcilerWake {
                 continue;
             }
             let convoy_rows = rows.iter().filter(|row| {
-                matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
+                row.namespace == namespace
+                    && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
             let mut unable = None;
             let mut able = false;
@@ -749,13 +750,15 @@ impl ReconcilerWake {
                 None
             };
             if status.stalled != next {
-                flotilla_resources::apply_status_patch(
+                if let Err(error) = flotilla_resources::apply_status_patch(
                     &backend.clone().using::<Convoy>(namespace),
                     &convoy.metadata.name,
                     &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next },
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                {
+                    tracing::warn!(namespace, convoy = %convoy.metadata.name, %error, "write stalled condition failed");
+                }
             }
         }
         Ok(())
