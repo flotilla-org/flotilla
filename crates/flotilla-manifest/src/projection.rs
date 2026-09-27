@@ -96,6 +96,7 @@ pub fn work_badge(phase: WorkPhase) -> Badge {
         WorkPhase::Pending => Badge { state: BadgeState::Idle, attention: false },
         WorkPhase::Ready => Badge { state: BadgeState::Waiting, attention: true },
         WorkPhase::Launching | WorkPhase::Running => Badge { state: BadgeState::Active, attention: false },
+        WorkPhase::Stalled => Badge { state: BadgeState::Waiting, attention: false },
         WorkPhase::Interrupted => Badge { state: BadgeState::Waiting, attention: true },
         WorkPhase::Complete => Badge { state: BadgeState::Done, attention: false },
         WorkPhase::Failed => Badge { state: BadgeState::Failed, attention: true },

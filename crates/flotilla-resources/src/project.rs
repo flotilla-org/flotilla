@@ -17,6 +17,8 @@ pub const DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS: u64 = 3600;
 pub struct ProjectSpec {
     pub display_name: String,
     pub default_workflow_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<Vec<crate::SupervisionTarget>>,
     #[builder(default)]
     #[serde(default)]
     pub issue_source_bindings: Vec<IssueSourceBindingSpec>,
@@ -486,6 +488,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
+            supervision: None,
             issue_source_bindings: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
             repositories: vec![ProjectRepositorySpec {
                 repo: RepositoryKey("acme/widgets".to_string()),
@@ -516,6 +519,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
+            supervision: None,
             issue_source_bindings: Vec::new(),
             repositories: vec![member("ghostty"), member("ghostty-ops")],
             dispatch_policy: None,

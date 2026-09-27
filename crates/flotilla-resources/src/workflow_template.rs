@@ -32,7 +32,17 @@ pub struct WorkflowTemplateSpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub stall_nudges: IndexMap<String, StallNudgePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<Vec<SupervisionTarget>>,
     pub vessels: Vec<VesselRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SupervisionTarget {
+    ConvoyCrew { vessel: String, role: String },
+    ProjectCrew { convoy_role: String, vessel: String, role: String },
+    Operator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

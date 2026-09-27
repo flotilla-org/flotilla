@@ -12,11 +12,12 @@ use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, 
 use flotilla_resources::{
     actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
     select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
-    HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, StallEvidenceSource, StallNudge, StallRung, StalledCondition, StatusPatch, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue,
-    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject,
-    WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
+    StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -126,6 +127,13 @@ struct LeafSubscriptionTableInner {
 enum UnableEvidenceKey {
     Attention { state: TerminalAttentionState, source: TerminalAttentionSource },
     Absent,
+}
+
+fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
+    let leaf = condition.leaves.first()?;
+    let LeafAddress::Work { work, .. } = &leaf.address else { return None };
+    let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+    Some((work, role))
 }
 
 impl LeafSubscriptionTable {
@@ -723,6 +731,8 @@ impl ReconcilerWake {
 
     async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
+        let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let available_convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let sessions = backend.including_replicas::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let observations = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
@@ -731,6 +741,30 @@ impl ReconcilerWake {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, &sessions);
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored);
+            if let Some(stalled) =
+                status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some() && stalled.source != StallEvidenceSource::Crew)
+            {
+                if let Some((vessel, role)) = stalled_source_actor(stalled) {
+                    let source_working =
+                        selected_sessions.values().any(|session| {
+                            session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
+                                && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
+                                && session.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| {
+                                    attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now)
+                                })
+                        });
+                    if source_working {
+                        flotilla_resources::apply_status_patch(
+                            &backend.clone().using::<Convoy>(namespace),
+                            &convoy.metadata.name,
+                            &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: None },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        continue;
+                    }
+                }
+            }
             if !holding && status.stalled.is_none() {
                 continue;
             }
@@ -738,6 +772,9 @@ impl ReconcilerWake {
                 row.namespace == namespace
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
+            if convoy_rows.is_empty() && status.stalled.is_some() && holding {
+                continue;
+            }
             let mut unable = None;
             let mut able = false;
             let mut pending_debounce = false;
@@ -753,26 +790,90 @@ impl ReconcilerWake {
                             .and_then(|session| session.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Running)
                             .and_then(|status| status.attention.as_ref());
-                        match attention {
-                            Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
-                                self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
-                                Ok(())
+                        if status
+                            .crew_work
+                            .get(vessel)
+                            .and_then(|crew| crew.get(role))
+                            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Stalled)
+                        {
+                            Err((
+                                status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()),
+                                StallEvidenceSource::Crew,
+                            ))
+                        } else {
+                            match attention {
+                                Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
+                                    self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                    Ok(())
+                                }
+                                Some(attention) => {
+                                    let source = match attention.source {
+                                        TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
+                                        TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
+                                    };
+                                    let debounce = match attention.source {
+                                        TerminalAttentionSource::Screen => TerminalAttention::DEBOUNCE_FOR,
+                                        TerminalAttentionSource::Hook => chrono::Duration::zero(),
+                                    };
+                                    if self
+                                        .maker_debouncing(
+                                            row.id,
+                                            UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
+                                            attention.as_of,
+                                            debounce,
+                                            now,
+                                        )
+                                        .await
+                                    {
+                                        pending_debounce = true;
+                                        continue;
+                                    }
+                                    let evidence = if attention.is_stale_at(now) {
+                                        "attention stale".into()
+                                    } else {
+                                        match attention.state {
+                                            TerminalAttentionState::Idle => "idle".into(),
+                                            TerminalAttentionState::NeedsInput => "NeedsInput".into(),
+                                            TerminalAttentionState::Unobservable => "unobservable".into(),
+                                            TerminalAttentionState::Working => "working".into(),
+                                        }
+                                    };
+                                    Err((evidence, source))
+                                }
+                                None => {
+                                    if self
+                                        .maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now)
+                                        .await
+                                    {
+                                        pending_debounce = true;
+                                        continue;
+                                    }
+                                    Err(("session dead or absent".into(), StallEvidenceSource::Session))
+                                }
                             }
-                            Some(attention) => {
-                                let source = match attention.source {
-                                    TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
-                                    TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
-                                };
-                                let debounce = match attention.source {
-                                    TerminalAttentionSource::Screen => TerminalAttention::DEBOUNCE_FOR,
-                                    TerminalAttentionSource::Hook => chrono::Duration::zero(),
-                                };
+                        }
+                    }
+                    LeafMaker::Supervisor { convoy: supervisor_convoy, vessel, role } => {
+                        let attention = sessions
+                            .iter()
+                            .find(|source| {
+                                let session = &source.object;
+                                session.metadata.labels.get(CONVOY_LABEL) == Some(supervisor_convoy)
+                                    && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
+                                    && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                            })
+                            .and_then(|source| source.object.status.as_ref())
+                            .filter(|status| status.phase == TerminalSessionPhase::Running)
+                            .and_then(|status| status.attention.as_ref());
+                        match attention {
+                            Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => Ok(()),
+                            Some(attention) if attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now) => {
                                 if self
                                     .maker_debouncing(
                                         row.id,
                                         UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
-                                        attention.as_of,
-                                        debounce,
+                                        row.created_at,
+                                        TerminalAttention::DEBOUNCE_FOR,
                                         now,
                                     )
                                     .await
@@ -780,26 +881,12 @@ impl ReconcilerWake {
                                     pending_debounce = true;
                                     continue;
                                 }
-                                let evidence = if attention.is_stale_at(now) {
-                                    "attention stale".into()
-                                } else {
-                                    match attention.state {
-                                        TerminalAttentionState::Idle => "idle".into(),
-                                        TerminalAttentionState::NeedsInput => "NeedsInput".into(),
-                                        TerminalAttentionState::Unobservable => "unobservable".into(),
-                                        TerminalAttentionState::Working => "working".into(),
-                                    }
-                                };
-                                Err((evidence, source))
+                                Err(("supervisor idle".into(), StallEvidenceSource::Session))
                             }
-                            None => {
-                                if self.maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now).await
-                                {
-                                    pending_debounce = true;
-                                    continue;
-                                }
-                                Err(("session dead or absent".into(), StallEvidenceSource::Session))
+                            Some(attention) if attention.state == TerminalAttentionState::NeedsInput && !attention.is_stale_at(now) => {
+                                Err(("supervisor needs input".into(), StallEvidenceSource::Hook))
                             }
+                            _ => Err(("supervisor unavailable".into(), StallEvidenceSource::Session)),
                         }
                     }
                     LeafMaker::Observed { .. } => {
@@ -869,6 +956,9 @@ impl ReconcilerWake {
                     Err((evidence, source)) => unable.get_or_insert((row, evidence, source)),
                 };
             }
+            if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted) && !able && holding {
+                continue;
+            }
             let next = if holding && !able && !pending_debounce {
                 let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable.as_ref() {
                     (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
@@ -883,8 +973,30 @@ impl ReconcilerWake {
                     source,
                     began_at: prior.map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
+                    supervisor: None,
+                    supervision_index: None,
+                    supervision_exhausted: false,
+                    reason: None,
                     nudge_history: prior.map_or_else(Vec::new, |stalled| stalled.nudge_history.clone()),
                 };
+                let declared = status
+                    .stalled
+                    .as_ref()
+                    .filter(|stalled| stalled.source == StallEvidenceSource::Crew && stalled.leaves == condition.leaves);
+                if let Some(declared) = declared {
+                    condition.evidence = declared.evidence.clone();
+                    condition.source = StallEvidenceSource::Crew;
+                    condition.reason = declared.reason;
+                    condition.began_at = declared.began_at;
+                }
+                if matches!(condition.maker, Some(LeafMaker::Supervisor { .. })) {
+                    if let Some(prior) = prior {
+                        condition.evidence = prior.evidence.clone();
+                        condition.source = prior.source.clone();
+                        condition.reason = prior.reason;
+                        condition.began_at = prior.began_at;
+                    }
+                }
                 if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, unable.as_ref().map(|(row, _, _)| *row)) {
                     let session = selected_sessions.values().find(|session| {
                         session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
@@ -895,7 +1007,7 @@ impl ReconcilerWake {
                         .and_then(|status| status.attention.as_ref())
                         .filter(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
                         .map(|attention| attention.as_of);
-                    if let Some(idle_at) = idle_at {
+                    if let Some(idle_at) = idle_at.filter(|_| declared.is_none()) {
                         let limit = status
                             .workflow_snapshot
                             .as_ref()
@@ -934,9 +1046,137 @@ impl ReconcilerWake {
                         }
                     }
                 }
+                let needs_supervisor = matches!(condition.maker, Some(LeafMaker::Supervisor { .. }))
+                    || condition.source == StallEvidenceSource::Crew
+                    || condition.evidence == "NeedsInput"
+                    || (condition.rung == StallRung::Operator && !condition.nudge_history.is_empty())
+                    || (condition.rung == StallRung::Operator
+                        && matches!(condition.maker, Some(LeafMaker::Actor { .. }))
+                        && condition.evidence == "idle"
+                        && condition.nudge_history.is_empty());
+                if needs_supervisor && !condition.evidence.starts_with("nudge delivery failed:") {
+                    let project_policy = convoy.spec.project_ref.as_ref().and_then(|project| {
+                        projects
+                            .iter()
+                            .find(|source| source.object.metadata.name == *project)
+                            .and_then(|source| source.object.spec.supervision.clone())
+                    });
+                    let policy = status
+                        .workflow_snapshot
+                        .as_ref()
+                        .and_then(|workflow| workflow.supervision.clone())
+                        .or(project_policy)
+                        .unwrap_or_else(|| {
+                            vec![
+                                SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
+                                SupervisionTarget::ProjectCrew {
+                                    convoy_role: "governor".into(),
+                                    vessel: String::new(),
+                                    role: "governor".into(),
+                                },
+                            ]
+                        });
+                    let start = prior.and_then(|stalled| stalled.supervision_index.map(|index| index + 1)).unwrap_or(0);
+                    let keep_current = prior.is_some_and(|stalled| stalled.supervisor.is_some())
+                        && !matches!(condition.maker, Some(LeafMaker::Supervisor { .. }));
+                    if keep_current {
+                        condition = prior.expect("checked above").clone();
+                    } else {
+                        condition.rung = StallRung::Operator;
+                        condition.supervisor = None;
+                        condition.supervision_index = None;
+                        condition.maker = condition.leaves.first().and_then(|leaf| {
+                            let LeafAddress::Work { work, .. } = &leaf.address else { return None };
+                            let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
+                            Some(LeafMaker::Actor { vessel: work.clone(), role: role.to_string() })
+                        });
+                        condition.supervision_exhausted = true;
+                        for (index, target) in policy.iter().enumerate().skip(start) {
+                            let candidate = match target {
+                                SupervisionTarget::ConvoyCrew { vessel, role } => {
+                                    let found = status
+                                        .crew_work
+                                        .iter()
+                                        .find(|(name, crew)| (vessel.is_empty() || *name == vessel) && crew.contains_key(role));
+                                    found.map(|(name, _)| (convoy.metadata.name.clone(), name.clone(), role.clone(), StallRung::Bosun))
+                                }
+                                SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => available_convoys
+                                    .iter()
+                                    .map(|source| &source.object)
+                                    .find(|candidate| {
+                                        candidate.spec.project_ref == convoy.spec.project_ref
+                                            && candidate.spec.role == *convoy_role
+                                            && candidate.metadata.name != convoy.metadata.name
+                                    })
+                                    .and_then(|candidate| {
+                                        candidate.status.as_ref().and_then(|status| {
+                                            status
+                                                .crew_work
+                                                .iter()
+                                                .find(|(name, crew)| (vessel.is_empty() || *name == vessel) && crew.contains_key(role))
+                                                .map(|(name, _)| {
+                                                    (candidate.metadata.name.clone(), name.clone(), role.clone(), StallRung::Governor)
+                                                })
+                                        })
+                                    }),
+                                SupervisionTarget::Operator => None,
+                            };
+                            if let Some((target_convoy, target_vessel, target_role, rung)) = candidate {
+                                if target_convoy == convoy.metadata.name
+                                    && stalled_source_actor(&condition)
+                                        .is_some_and(|(vessel, role)| vessel == target_vessel && role == target_role)
+                                {
+                                    continue;
+                                }
+                                let brief = format!(
+                                    "Supervise stalled crew {} in convoy {}. Reason: {}. Resume it with guidance, fail it, or escalate it.",
+                                    condition.leaves.first().map(|leaf| leaf.field_path.as_str()).unwrap_or_default(),
+                                    convoy.metadata.name,
+                                    condition.evidence,
+                                );
+                                let delivery = TurnDeliveryRequest::builder()
+                                    .namespace(namespace.to_string())
+                                    .convoy(target_convoy.clone())
+                                    .source(format!("supervision-{}-{index}", convoy.metadata.name))
+                                    .vessel(target_vessel.clone())
+                                    .role(target_role.clone())
+                                    .brief(brief)
+                                    .head_sha(condition.began_at.timestamp_micros().to_string())
+                                    .build();
+                                if convoys.contains_key(&target_convoy) {
+                                    if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await
+                                    {
+                                        condition.evidence = format!("supervisor delivery failed: {error}");
+                                        break;
+                                    }
+                                }
+                                condition.rung = rung;
+                                condition.supervision_exhausted = false;
+                                condition.supervision_index = Some(index);
+                                condition.supervisor = Some(StallSupervisor {
+                                    convoy: target_convoy.clone(),
+                                    vessel: target_vessel.clone(),
+                                    role: target_role.clone(),
+                                });
+                                condition.maker =
+                                    Some(LeafMaker::Supervisor { convoy: target_convoy, vessel: target_vessel, role: target_role });
+                                break;
+                            }
+                            if matches!(target, SupervisionTarget::Operator) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Some(condition)
             } else {
-                None
+                status
+                    .stalled
+                    .as_ref()
+                    .filter(|stalled| {
+                        stalled.supervisor.is_some() || (stalled.rung == StallRung::Operator && stalled.source == StallEvidenceSource::Crew)
+                    })
+                    .cloned()
             };
             if status.stalled != next {
                 if let Err(error) = flotilla_resources::apply_status_patch(
@@ -1023,9 +1263,35 @@ impl ReconcilerWake {
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
             if status.phase == ConvoyPhase::Active {
+                if let Some(stalled) = status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some()) {
+                    if let Some(maker @ LeafMaker::Supervisor { .. }) = &stalled.maker {
+                        desired.push(LeafSubscriptionRow {
+                            id: uuid::Uuid::nil(),
+                            namespace: namespace.to_string(),
+                            leaves: stalled.leaves.clone(),
+                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            maker: maker.clone(),
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: EpisodeKeyFields::default(),
+                        });
+                    }
+                }
                 for (vessel, crew) in &status.crew_work {
                     for (role, work) in crew {
-                        if !status.work.get(vessel).is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running))
+                        if status.stalled.as_ref().is_some_and(|stalled| {
+                            stalled.supervisor.is_some()
+                                && stalled.leaves.iter().any(|leaf| {
+                                    leaf.address == LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() }
+                                        && leaf.field_path == format!(".crew.{role}.phase")
+                                })
+                        }) {
+                            continue;
+                        }
+                        if !status
+                            .work
+                            .get(vessel)
+                            .is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled))
                             || matches!(
                                 work.phase,
                                 flotilla_resources::CrewWorkPhase::Done
@@ -1704,6 +1970,7 @@ mod tests {
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(WorkflowSnapshot {
                 stall_nudges: Default::default(),
+                supervision: None,
                 exit: Some(ExitDeclaration::standard_table()),
                 turn_delivery: Default::default(),
                 vessels: Vec::new(),
@@ -1855,6 +2122,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: indexmap::IndexMap::from([(source.to_string(), rule.clone())]),
                     vessels: Vec::new(),
@@ -2039,6 +2307,7 @@ mod tests {
             observed_workflow_ref: Some("workflow".to_string()),
             workflow_snapshot: Some(WorkflowSnapshot {
                 stall_nudges: Default::default(),
+                supervision: None,
                 exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
                     "shipped".to_string(),
                     "$cr.state == merged".parse().expect("custom leaf template"),
@@ -2110,6 +2379,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),
@@ -2180,6 +2450,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),
@@ -2266,6 +2537,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),

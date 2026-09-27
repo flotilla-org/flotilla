@@ -307,6 +307,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     let workflow = valid_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: workflow.exit,
         turn_delivery: workflow.turn_delivery,
         vessels: workflow.vessels,
@@ -401,6 +402,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let workflow = tool_only_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: workflow.exit,
         turn_delivery: workflow.turn_delivery,
         vessels: workflow

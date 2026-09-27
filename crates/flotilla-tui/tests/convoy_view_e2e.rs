@@ -190,6 +190,7 @@ async fn generated_table_action_completes_work() {
     });
     let snapshot = WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![VesselRequirement {

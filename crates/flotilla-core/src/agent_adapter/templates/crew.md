@@ -2,6 +2,9 @@
 
 You are `{{ role }}` in convoy `{{ convoy }}`, aboard vessel `{{ vessel }}` (`{{ vessel_ref }}`).
 
+If work is blocked but still wanted, run `flotilla crew stall --reason <infra|scope|decision|access|other> --message '...'`.{% if not is_standing %} Use `flotilla crew fail --message '...'` when the work itself is wrong and cannot proceed as briefed.{% endif %}
+If a stall names you as supervisor, use `flotilla crew supervise --convoy <source-convoy> --vessel <work> --role <crew-role> resume --message 'guidance'`, or replace `resume` with `convert-to-failed` or `escalate`. Re-scope with the existing abandon and dispatch commands.
+
 ## Crew
 
 {% block crew %}{% for member in members %}- `{{ member.role }}`: {{ member.state }}

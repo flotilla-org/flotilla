@@ -38,6 +38,7 @@ fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
     let status = ConvoyStatus {
         workflow_snapshot: Some(WorkflowSnapshot {
             stall_nudges: Default::default(),
+            supervision: None,
             exit: workflow.exit,
             turn_delivery: workflow.turn_delivery,
             vessels: workflow.vessels,
@@ -654,6 +655,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: template.spec.exit.clone(),
         turn_delivery: template.spec.turn_delivery.clone(),
         vessels: template
@@ -811,6 +813,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -869,6 +872,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -1447,6 +1451,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -1622,6 +1627,7 @@ fn interactive_convoy_stays_active_until_crew_reports_complete() {
     status.phase = ConvoyPhase::Active;
     status.workflow_snapshot = Some(WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: None,
         turn_delivery: Default::default(),
         vessels: interactive_single_workflow_spec().vessels,

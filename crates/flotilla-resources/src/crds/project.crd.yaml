@@ -27,6 +27,11 @@ spec:
                 default_workflow_ref:
                   type: string
                   minLength: 1
+                supervision:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                 issue_source:
                   type: object
                   required: [service, scope]

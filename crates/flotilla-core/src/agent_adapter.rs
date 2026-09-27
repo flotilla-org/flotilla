@@ -1478,6 +1478,7 @@ mod tests {
         declared_exit.status = Some(ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 stall_nudges: Default::default(),
+                supervision: None,
                 exit: Some(ExitDeclaration::Claim(ClaimExit)),
                 turn_delivery: Default::default(),
                 vessels: Vec::new(),

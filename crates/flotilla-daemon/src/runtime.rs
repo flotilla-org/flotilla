@@ -1462,7 +1462,9 @@ async fn reconcile_work_credentials_filtered(
         };
         let (granted, running, scopes, live_scopes, permissions) = deliveries.entry(environment_ref.clone()).or_default();
         granted.extend(requirement.credential_refs.iter().cloned());
-        if work.phase == flotilla_resources::WorkPhase::Running && !status.phase.is_terminal() {
+        if matches!(work.phase, flotilla_resources::WorkPhase::Running | flotilla_resources::WorkPhase::Stalled)
+            && !status.phase.is_terminal()
+        {
             running.extend(requirement.credential_refs.iter().cloned());
             for name in &requirement.credential_refs {
                 let incoming = requirement.credential_permissions.get(name).cloned();
@@ -4742,6 +4744,7 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
@@ -8331,6 +8334,7 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
@@ -8416,6 +8420,7 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
@@ -8474,6 +8479,7 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
@@ -8513,6 +8519,12 @@ mod tests {
         vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
 
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
+        assert!(can_fill_git_credential().await);
+        let current = convoys.get("credential-work").await.expect("read running work");
+        let mut stalled = current.status.expect("work status");
+        stalled.work.get_mut("work").expect("work").phase = WorkPhase::Stalled;
+        convoys.update_status("credential-work", &current.metadata.resource_version, &stalled).await.expect("stall work");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("retain stalled credentials");
         assert!(can_fill_git_credential().await);
         settle(ConvoyPhase::Landing).await;
         reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke settled credentials");
@@ -9383,6 +9395,7 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],

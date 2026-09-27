@@ -104,6 +104,7 @@ pub async fn create_convoy_with_single_task(
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
                 stall_nudges: Default::default(),
+                supervision: None,
                 // This generic fixture has no exit. Tests that expect a dispatched
                 // agent brief must declare one on their pinned workflow snapshot.
                 exit: None,

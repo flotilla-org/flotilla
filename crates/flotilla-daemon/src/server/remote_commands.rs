@@ -32,6 +32,8 @@ fn command_action_name(command: &Command) -> &'static str {
         CommandAction::ConvoyResume { .. } => "convoy_resume",
         CommandAction::CrewComplete { .. } => "crew_complete",
         CommandAction::CrewFail { .. } => "crew_fail",
+        CommandAction::CrewStall { .. } => "crew_stall",
+        CommandAction::CrewSupervise { .. } => "crew_supervise",
         CommandAction::CrewHandoff { .. } => "crew_handoff",
         CommandAction::ResourceApply { .. } => "resource_apply",
         CommandAction::ResourceDelete { .. } => "resource_delete",
@@ -47,8 +49,12 @@ fn command_subject(action: &CommandAction) -> String {
         | CommandAction::ConvoyResume { namespace, name, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
         }
+        CommandAction::CrewSupervise { namespace, convoy, .. } => {
+            format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), convoy)
+        }
         CommandAction::CrewComplete { context, .. }
         | CommandAction::CrewFail { context, .. }
+        | CommandAction::CrewStall { context, .. }
         | CommandAction::CrewHandoff { context, .. } => format!(
             "crew:{}/{}/{}/{}",
             context.namespace.as_deref().unwrap_or("default"),
@@ -279,6 +285,8 @@ impl RemoteCommandRouter {
                         | CommandAction::ConvoyWorkForceComplete { .. }
                         | CommandAction::CrewComplete { .. }
                         | CommandAction::CrewFail { .. }
+                        | CommandAction::CrewStall { .. }
+                        | CommandAction::CrewSupervise { .. }
                         | CommandAction::CrewHandoff { .. }
                         | CommandAction::ResourceApply { .. }
                         | CommandAction::ResourceManifestResolve { .. }
@@ -1039,6 +1047,7 @@ impl RemoteCommandRouter {
                 (context, Some((message.clone(), disposition.clone(), decision_ledger_ref.clone(), *force)))
             }
             CommandAction::CrewFail { context, .. }
+            | CommandAction::CrewStall { context, .. }
             | CommandAction::CrewHandoff { context, .. }
             | CommandAction::QueryCrewList { context } => (context, None),
             _ => return Ok(None),

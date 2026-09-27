@@ -1855,6 +1855,18 @@ struct ResolvedCrewContext {
     caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
 }
 
+#[derive(bon::Builder)]
+struct CrewSupervisionRequest<'a> {
+    namespace: &'a str,
+    convoy_name: &'a str,
+    vessel: &'a str,
+    role: &'a str,
+    operation: flotilla_protocol::CrewSupervisionAction,
+    message: &'a str,
+    actor_crew_id: Option<&'a str>,
+    principal: Option<&'a PrincipalRef>,
+}
+
 struct DaemonTurnDeliveryActuator {
     daemon: Weak<InProcessDaemon>,
 }
@@ -3982,11 +3994,15 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
+            flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
+                (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
+            }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
                 (self.provisioning_namespace().await, convoy.as_str())
             }
             flotilla_protocol::CommandAction::CrewComplete { context, .. }
             | flotilla_protocol::CommandAction::CrewFail { context, .. }
+            | flotilla_protocol::CommandAction::CrewStall { context, .. }
             | flotilla_protocol::CommandAction::CrewHandoff { context, .. }
             | flotilla_protocol::CommandAction::QueryCrewList { context } => {
                 let namespace = context.namespace.clone().unwrap_or(self.provisioning_namespace().await);
@@ -4745,6 +4761,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
     normalize_project_spec(ProjectSpec {
         display_name,
         default_workflow_ref: "single-agent-contained".to_string(),
+        supervision: None,
         issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
             repo: repository_key,
@@ -7206,6 +7223,7 @@ impl InProcessDaemon {
         let spec = normalize_project_spec(ProjectSpec {
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent-contained".to_string()),
+            supervision: existing_project.as_ref().and_then(|project| project.spec.supervision.clone()),
             issue_source_bindings: Vec::new(),
             repositories: members,
             dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
@@ -9178,6 +9196,121 @@ impl InProcessDaemon {
         .await
     }
 
+    pub async fn crew_stall_internal(
+        &self,
+        requested: &CrewCommandContext,
+        reason: flotilla_protocol::StallReason,
+        message: String,
+    ) -> Result<(), String> {
+        if message.trim().is_empty() {
+            return Err("crew stall requires a non-empty message".to_string());
+        }
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
+        ensure_crew_work_is_defined(&convoy, &context)?;
+        let status = convoy.status.as_ref().ok_or_else(|| "convoy has no status".to_string())?;
+        if status.phase.is_terminal() {
+            return Err("cannot stall crew work in a terminal convoy".to_string());
+        }
+        if !status
+            .crew_work
+            .get(&context.vessel)
+            .and_then(|crew| crew.get(&context.caller_role))
+            .is_some_and(|state| matches!(state.phase, CrewWorkPhase::Working | CrewWorkPhase::Stalled))
+        {
+            return Err("only working crew can declare a stall".to_string());
+        }
+        apply_resource_status_patch(
+            &convoys,
+            &context.convoy,
+            &convoy_external_patches::mark_crew_stalled(
+                context.convoy.clone(),
+                context.vessel.clone(),
+                context.caller_role.clone(),
+                chrono::Utc::now(),
+                reason,
+                message,
+            ),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    async fn crew_supervise_internal(&self, request: CrewSupervisionRequest<'_>) -> Result<(), String> {
+        let CrewSupervisionRequest { namespace, convoy_name, vessel, role, operation: action, message, actor_crew_id, principal } = request;
+        if message.trim().is_empty() {
+            return Err("crew supervision requires a non-empty message".to_string());
+        }
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| "convoy has no status".to_string())?;
+        let stalled = status.stalled.as_ref().ok_or_else(|| "crew is not stalled".to_string())?;
+        if !stalled.leaves.iter().any(|leaf| {
+            matches!(&leaf.address,
+            flotilla_protocol::LeafAddress::Work { work, .. } if work == vessel)
+                && leaf.field_path == format!(".crew.{role}.phase")
+        }) {
+            return Err(format!("crew `{vessel}/{role}` is not the stalled obligation"));
+        }
+        if let Some(crew_id) = actor_crew_id {
+            let supervisor = stalled.supervisor.as_ref().ok_or_else(|| "this stall has no crew supervisor".to_string())?;
+            let sessions = self
+                .resource_backend
+                .clone()
+                .using::<ResourceTerminalSession>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            let authorized = sessions.items.iter().any(|session| {
+                session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id)
+                    && session.metadata.labels.get(CONVOY_LABEL) == Some(&supervisor.convoy)
+                    && session.metadata.labels.get(VESSEL_LABEL) == Some(&supervisor.vessel)
+                    && session.metadata.labels.get(ROLE_LABEL) == Some(&supervisor.role)
+            });
+            if !authorized {
+                return Err("crew identity does not own this supervision rung".to_string());
+            }
+        } else if principal.is_none() {
+            return Err("crew supervision requires the named supervisor or an operator principal".to_string());
+        }
+        match action {
+            flotilla_protocol::CrewSupervisionAction::Resume => {
+                self.convoy_resume_internal(namespace, convoy_name, message, Some(vessel), Some(role)).await?;
+            }
+            flotilla_protocol::CrewSupervisionAction::Fail => {
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &convoy_external_patches::mark_crew_failed(
+                        vessel.to_string(),
+                        role.to_string(),
+                        chrono::Utc::now(),
+                        message.to_string(),
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+            flotilla_protocol::CrewSupervisionAction::Escalate => {
+                if stalled.rung == flotilla_resources::StallRung::Operator {
+                    return Err("stall is already at the operator rung".to_string());
+                }
+                let mut condition = stalled.clone();
+                condition.supervisor = None;
+                condition.maker = Some(flotilla_resources::LeafMaker::Actor { vessel: vessel.to_string(), role: role.to_string() });
+                condition.rung = flotilla_resources::StallRung::Operator;
+                apply_resource_status_patch(&convoys, convoy_name, &flotilla_resources::ConvoyStatusPatch::SetStalled {
+                    condition: Some(condition),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
         self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
     }
@@ -9655,8 +9788,12 @@ impl InProcessDaemon {
             .iter()
             .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
             .filter(|(vessel, role, state)| {
-                matches!(state.phase, flotilla_resources::CrewWorkPhase::Working | flotilla_resources::CrewWorkPhase::Done)
-                    && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
+                matches!(
+                    state.phase,
+                    flotilla_resources::CrewWorkPhase::Working
+                        | flotilla_resources::CrewWorkPhase::Stalled
+                        | flotilla_resources::CrewWorkPhase::Done
+                ) && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
                     && requested_role.is_none_or(|requested| requested == role.as_str())
             })
             .map(|(vessel, role, _)| (vessel.clone(), role.clone()))
@@ -11220,6 +11357,56 @@ impl InProcessDaemon {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_fail_internal(context, message.clone()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::CrewStall { context, reason, message } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match self.crew_stall_internal(context, *reason, message.clone()).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } =
+            &command.action
+        {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, convoy).await {
+                Ok(name) => match self
+                    .crew_supervise_internal(
+                        CrewSupervisionRequest::builder()
+                            .namespace(&namespace)
+                            .convoy_name(&name)
+                            .vessel(vessel)
+                            .role(role)
+                            .operation(*operation)
+                            .message(message)
+                            .maybe_actor_crew_id(actor_crew_id.as_deref())
+                            .maybe_principal(dispatching_principal_ref.as_ref())
+                            .build(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.record_lifecycle_mutation_best_effort(
+                            &namespace,
+                            &name,
+                            &format!("crew_supervise_{operation:?}"),
+                            caller.as_ref(),
+                            false,
+                        )
+                        .await;
+                        flotilla_protocol::CommandValue::Ok
+                    }
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);

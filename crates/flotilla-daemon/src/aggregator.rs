@@ -2496,6 +2496,7 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
         ResourceWorkPhase::Ready => WorkPhase::Ready,
         ResourceWorkPhase::Launching => WorkPhase::Launching,
         ResourceWorkPhase::Running => WorkPhase::Running,
+        ResourceWorkPhase::Stalled => WorkPhase::Stalled,
         ResourceWorkPhase::Interrupted => WorkPhase::Interrupted,
         ResourceWorkPhase::Complete => WorkPhase::Complete,
         ResourceWorkPhase::Failed => WorkPhase::Failed,
@@ -3877,6 +3878,7 @@ mod tests {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
                 stall_nudges: Default::default(),
+                supervision: None,
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build()],
@@ -5163,6 +5165,7 @@ mod tests {
                 phase: convoy_phase,
                 workflow_snapshot: Some(WorkflowSnapshot {
                     stall_nudges: Default::default(),
+                    supervision: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![definition],
