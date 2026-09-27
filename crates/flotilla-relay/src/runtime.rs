@@ -19,6 +19,10 @@ use crate::{
 /// Longest a long-poll holds an empty response.
 const MAX_WAIT_SECS: u64 = 20;
 
+/// Largest admin or ack body the relay reads. Those bodies are at most a small JSON object
+/// (a supplied secret, or an ack frame); every body read is bounded, not only webhook payloads.
+const MAX_CONTROL_BODY_BYTES: usize = 4 * 1024;
+
 fn route_method(method: Method) -> RouteMethod {
     match method {
         Method::Get => RouteMethod::Get,
@@ -54,6 +58,9 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if !service::operator_authorized(expected.as_deref(), req.headers().get("Authorization")?.as_deref()) {
                 return unauthorized();
             }
+            if content_length(&req)?.is_some_and(|length| length > MAX_CONTROL_BODY_BYTES) {
+                return Response::error("payload too large", 413);
+            }
         }
         Route::Ingress { source, .. } => {
             // A source without an adapter is a fact about the relay, not about the install.
@@ -64,7 +71,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Response::error("payload too large", 413);
             }
         }
-        Route::Stream { .. } | Route::Ack { .. } => {}
+        Route::Ack { .. } => {
+            if content_length(&req)?.is_some_and(|length| length > MAX_CONTROL_BODY_BYTES) {
+                return Response::error("payload too large", 413);
+            }
+        }
+        Route::Stream { .. } => {}
     }
     let stub = env.durable_object("MAILBOX")?.id_from_name(route.install())?.get_stub()?;
     stub.fetch_with_request(req).await
@@ -121,6 +133,10 @@ fn query_u64(req: &Request, name: &str) -> Result<Option<u64>> {
 /// Reads at most `limit` bytes of body, or `None` when the body is larger.
 async fn read_limited(req: &mut Request, limit: usize) -> Result<Option<Vec<u8>>> {
     let mut body = Vec::new();
+    // A bodyless request (an admin POST without a supplied secret) has no stream to read.
+    if req.inner().body().is_none() {
+        return Ok(Some(body));
+    }
     let mut stream = req.stream()?;
     while let Some(chunk) = stream.next().await {
         body.extend_from_slice(&chunk?);
@@ -179,7 +195,9 @@ impl DurableObject for MailboxObject {
         let authorization = req.headers().get("Authorization")?;
         match route {
             Route::Admin { install, op } => {
-                let body = req.bytes().await?;
+                let Some(body) = read_limited(&mut req, MAX_CONTROL_BODY_BYTES).await? else {
+                    return Response::error("payload too large", 413);
+                };
                 let AdminOutcome { reply: outcome, disconnect } =
                     service::admin(store, install, op, &body, now_ms(), &mut random).map_err(store_error)?;
                 let sockets = match disconnect {
@@ -246,7 +264,12 @@ impl DurableObject for MailboxObject {
                     }
                     match select(woken, Delay::from(wait)).await {
                         Either::Left(_) => Response::from_json(&store.read(cursor, now_ms()).map_err(store_error)?),
-                        Either::Right(_) => Response::from_json(&Vec::<StreamFrame>::new()),
+                        Either::Right((_, woken)) => {
+                            // Release this poll's waiter now rather than at the next poll or append.
+                            drop(woken);
+                            self.waiters.borrow_mut().retain(|waiter| !waiter.is_canceled());
+                            Response::from_json(&Vec::<StreamFrame>::new())
+                        }
                     }
                 }
             }
@@ -254,7 +277,12 @@ impl DurableObject for MailboxObject {
                 if service::consumer_token_id(store, authorization.as_deref()).map_err(store_error)?.is_none() {
                     return unauthorized();
                 }
-                let ConsumerFrame::Ack { cursor } = req.json().await?;
+                let Some(body) = read_limited(&mut req, MAX_CONTROL_BODY_BYTES).await? else {
+                    return Response::error("payload too large", 413);
+                };
+                let Ok(ConsumerFrame::Ack { cursor }) = serde_json::from_slice(&body) else {
+                    return Response::error("invalid frame", 400);
+                };
                 match store.ack(cursor).map_err(store_error)? {
                     Ok(frame) => Response::from_json(&frame),
                     Err(message) => Response::error(message, 400),

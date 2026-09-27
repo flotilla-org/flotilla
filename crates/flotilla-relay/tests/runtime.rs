@@ -257,6 +257,7 @@ async fn worker_runtime_contract() {
     websocket_replays_then_broadcasts(&relay).await;
     long_poll_wakes_on_append_and_times_out(&relay).await;
     ack_over_http(&relay).await;
+    control_bodies_are_bounded(&relay).await;
     pruned_cursor_gets_gap(&relay).await;
     rotation_and_deprovisioning(&relay).await;
 }
@@ -356,6 +357,19 @@ async fn ack_over_http(relay: &Relay) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(serde_json::from_str::<StreamFrame>(&body).expect("frame"), StreamFrame::Acked { cursor: 1 });
     assert_eq!(ack(2).await.0, StatusCode::BAD_REQUEST);
+}
+
+async fn control_bodies_are_bounded(relay: &Relay) {
+    let (token, _) = relay.provision("bounded").await;
+    let oversized = || Some(" ".repeat(8 * 1024));
+    let secret = relay.request(Method::POST, "/admin/installs/bounded/sources/github/secrets", OPERATOR_TOKEN, oversized()).await;
+    assert_eq!(secret.0, StatusCode::PAYLOAD_TOO_LARGE, "{secret:?}");
+    let ack = relay.request(Method::POST, "/i/bounded/stream/ack", &token, oversized()).await;
+    assert_eq!(ack.0, StatusCode::PAYLOAD_TOO_LARGE, "{ack:?}");
+    let malformed = relay.request(Method::POST, "/i/bounded/stream/ack", &token, Some("not json".into())).await;
+    assert_eq!(malformed.0, StatusCode::BAD_REQUEST, "{malformed:?}");
+    let description: InstallDescription = relay.admin(Method::GET, "bounded", None).await;
+    assert_eq!(description.sources["github"].len(), 1, "a refused admin body adds nothing");
 }
 
 async fn pruned_cursor_gets_gap(relay: &Relay) {

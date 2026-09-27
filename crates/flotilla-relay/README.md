@@ -43,6 +43,7 @@ Requests for an unknown install fail exactly as requests with a bad credential d
 - Handled events: `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `check_run`, `check_suite`, `issues`, and `issue_comment`. A comment on a pull request produces a `cr/…` subject; a comment on an issue produces an `issue/…` subject. GitHub subjects are ASCII-lowercased (see `flotilla_relay_protocol::Subject`).
 - `GET /i/<install>/stream?cursor=<last-processed>` with `Authorization: Bearer <consumer token>`. `Upgrade: websocket` selects the websocket stream. This is the preferred path. It sends backlog frames immediately, or a `ready` frame when the consumer is caught up, then broadcasts new hints. Without the upgrade, the request long-polls. It returns a JSON array of frames as soon as there is anything to return, or `[]` after `wait` seconds (`&wait=<0..20>`, default 20). An append wakes waiting polls; idle polls do not re-read storage. The cursor is mandatory, and `0` means a new consumer.
 - Websocket consumers send `{"type":"ack","cursor":N}` and receive `{"type":"acked","cursor":N}`. Long-poll consumers send the same frame to `POST /i/<install>/stream/ack`. Acknowledgements validate progress but do not trim the mailbox; consumers persist their own cursor.
+- Admin and ack bodies are small JSON objects. Bodies over 4 KiB get `413`, and a malformed ack frame gets `400`.
 
 ### Read semantics
 
