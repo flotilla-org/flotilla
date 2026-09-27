@@ -100,6 +100,7 @@ define_patch_kinds! {
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalMarkRunning => DUPLICATE,
+    TerminalObserveCleatEndpoint => NONE,
     TerminalMarkMessageDelivered => NONE,
     TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalObserveAttention => NONE,
@@ -158,6 +159,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
     match patch {
         TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
+        TerminalSessionStatusPatch::ObserveCleatEndpoint { .. } => PatchKind::TerminalObserveCleatEndpoint,
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
@@ -624,6 +626,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = TerminalSessionStatus {
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("session-a".to_string()),
+                    cleat_endpoint: None,
                     pid: Some(42),
                     started_at: Some(ts(10)),
                     stopped_at: None,

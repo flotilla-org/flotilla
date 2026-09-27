@@ -62,6 +62,12 @@
 //! | `action.primary.vehicle` | Execution vehicle for the action. |
 //! | `action.primary.target` | Stable focus/deduplication target. |
 //! | `action.primary.recipe` | Command address used to materialize an entry, when known. |
+//! | `action.primary.direct.transport` | `local` or `ssh` packet transport for the same live terminal. |
+//! | `action.primary.direct.host` | Local host name or the viewer's SSH destination alias. |
+//! | `action.primary.direct.runtime_root` | Cleat runtime root on the hosting machine. |
+//! | `action.primary.direct.daemon` | Physical Cleat daemon generation, not its logical alias. |
+//! | `action.primary.direct.session` | Cleat session id on that daemon. |
+//! | `action.primary.direct.reason` | Why only the command recipe is available. |
 //!
 //! Display-label companions are stable producer-derived facts, not identities.
 //! Missing tiers are legal and consumers fall back toward `display.label`.

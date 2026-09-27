@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_protocol::{arg::Arg, commands::AttachMode};
+use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint};
 use serde::Deserialize;
 
 use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSize};
@@ -21,6 +21,13 @@ struct SessionInfo {
     cmd: Option<String>,
     status: SessionStatus,
     screen_activity: Option<ScreenActivityWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonInfo {
+    name: String,
+    runtime_root: String,
+    alive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +108,24 @@ impl CleatTerminalPool {
 
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
+    async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
+        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
+        let mut found = None;
+        for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
+            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
+            let Ok(output) = run!(self.runner, &self.binary, &args, Path::new("/")) else { continue };
+            let Ok(sessions) = Self::parse_list_output(&output) else { continue };
+            if sessions.iter().any(|session| session.id == session_id) {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(CleatEndpoint { runtime_root: daemon.runtime_root, daemon: daemon.name, session: session_id.to_owned() });
+            }
+        }
+        Ok(found)
+    }
+
     fn tracks_session_liveness(&self) -> bool {
         true
     }
@@ -227,6 +252,25 @@ mod tests {
         path_context::ExecutionEnvironmentPath,
         providers::{testing::MockRunner, CommandRunner},
     };
+
+    #[tokio::test]
+    async fn direct_endpoint_uses_physical_daemon_that_contains_session() {
+        let inventory = r#"[
+            {"name":"work@2","runtime_root":"/state/cleat","alive":true},
+            {"name":"work@3","runtime_root":"/state/cleat","alive":true}
+        ]"#;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(inventory.into()),
+            Ok("[]".into()),
+            Ok(r#"[{"id":"session-42","cwd":null,"cmd":null,"status":"Detached"}]"#.into()),
+        ]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let endpoint = pool.cleat_endpoint("session-42").await.expect("endpoint").expect("physical daemon");
+        assert_eq!(endpoint.runtime_root, "/state/cleat");
+        assert_eq!(endpoint.daemon, "work@3");
+        assert_eq!(endpoint.session, "session-42");
+        assert_eq!(runner.calls()[2].1, vec!["--runtime-root", "/state/cleat", "--server", "work@3", "list", "--json"]);
+    }
 
     #[tokio::test]
     async fn list_sessions_parses_json() {

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessLink, AwarenessNode, AwarenessState, CrewMemberSummary},
     ChangeRequestStatus, ConvoyChangeRequest, HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
@@ -44,6 +46,69 @@ fn text(patch: &MetadataPatch, key: &str) -> String {
         MetadataValue::Text(value) => value.clone(),
         other => panic!("{key} is not text: {other:?}"),
     }
+}
+
+fn catalog_input(convoys: &[ConvoyRow]) -> CatalogInput<'_> {
+    CatalogInput { awareness: None, convoys, independents: &[], standing_roles: &[], project_repositories: &[] }
+}
+
+#[test]
+fn direct_cleat_recipe_contract_covers_remote_local_fallback_and_withdrawal() {
+    let reference = convoy_ref("dev", "remote");
+    let endpoint =
+        CleatEndpoint { runtime_root: "/var/lib/flotilla/cleat".to_owned(), daemon: "work@3".to_owned(), session: "session-42".to_owned() };
+    let mut terminal = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-remote-coder").call();
+    terminal.cleat_endpoint = Some(endpoint.clone());
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("remote")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .message("waiting for a reviewer")
+        .vessels(vec![terminal.clone()])
+        .build();
+    let remote_mint = mint().with_host_routes(HostName::new("kiwi"), BTreeMap::from([("feta".to_owned(), "crew-alias".to_owned())]));
+    let remote = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &remote_mint);
+    let vessel_entity = entity::vessel("dev", "remote", "coder", "feta");
+    let patch = find_entity(&remote.reassert_patches(), &vessel_entity).clone();
+    assert_eq!(text(&patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-remote-coder'");
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_TRANSPORT), "ssh");
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_HOST), "crew-alias");
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_RUNTIME_ROOT), endpoint.runtime_root);
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_DAEMON), endpoint.daemon);
+    assert_eq!(text(&patch, KEY_PRIMARY_DIRECT_SESSION), endpoint.session);
+    assert_eq!(
+        text(find_entity(&remote.reassert_patches(), &entity::convoy("dev", "remote", "kiwi")), KEY_SUMMARY_TEXT),
+        "waiting for a reviewer"
+    );
+
+    let local_mint = mint().with_host_routes(HostName::new("feta"), BTreeMap::new());
+    let local = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &local_mint);
+    let local_patch = find_entity(&local.reassert_patches(), &vessel_entity).clone();
+    assert_eq!(text(&local_patch, KEY_PRIMARY_DIRECT_TRANSPORT), "local");
+
+    let unreachable = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &mint());
+    let fallback = find_entity(&unreachable.reassert_patches(), &vessel_entity).clone();
+    assert!(fallback.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    assert!(text(&fallback, KEY_PRIMARY_DIRECT_REASON).contains("SSH reachability"));
+    assert!(!fallback.set.contains_key(KEY_PRIMARY_DIRECT_DAEMON));
+
+    let mut endpoint_lost = convoy.clone();
+    endpoint_lost.vessels[0].cleat_endpoint = None;
+    let command_only = project_catalog(&catalog_input(&[endpoint_lost]), &remote_mint);
+    let lost = find_entity(&command_only.diff_patches(&remote), &vessel_entity).clone();
+    assert!(lost.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
+    assert!(lost.set.contains_key(KEY_PRIMARY_DIRECT_REASON));
+    assert!(!lost.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
+
+    let mut withdrawn_convoy = convoy;
+    withdrawn_convoy.vessels[0].materialize = None;
+    withdrawn_convoy.vessels[0].cleat_endpoint = None;
+    let withdrawn = project_catalog(&catalog_input(&[withdrawn_convoy]), &remote_mint);
+    let diff = withdrawn.diff_patches(&remote);
+    let withdrawal = find_entity(&diff, &vessel_entity);
+    assert!(withdrawal.unset.contains(&KEY_PRIMARY_DIRECT_DAEMON.to_owned()));
+    assert!(withdrawal.unset.contains(&KEY_PRIMARY_ACTION_RECIPE.to_owned()));
 }
 
 #[test]

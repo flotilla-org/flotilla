@@ -2454,6 +2454,7 @@ async fn create_running_terminal(
         .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
             phase: TerminalSessionPhase::Running,
             session_id: Some(format!("session-{name}")),
+            cleat_endpoint: None,
             pid: Some(42),
             started_at: Some(Utc::now()),
             stopped_at: None,

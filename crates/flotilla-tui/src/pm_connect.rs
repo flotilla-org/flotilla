@@ -13,7 +13,7 @@
 //! (`factory.id` dedupe, same source id).
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,7 +21,10 @@ use std::{
 };
 
 pub use flotilla_client::reconnect::is_incompatible_daemon_error;
-use flotilla_core::daemon::DaemonHandle;
+use flotilla_core::{
+    config::{ssh_destination, ConfigStore},
+    daemon::DaemonHandle,
+};
 use flotilla_manifest::{
     keys::REASSERT_INTERVAL_MS,
     pm::PmInstance,
@@ -35,7 +38,7 @@ use flotilla_protocol::{
         AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, ProjectRepositoriesRow, QueryChanges, ResultDelta,
         ResultSet, Rows, StandingRoleRow,
     },
-    DaemonEvent, QueryCursor, QueryId, ResourceRef,
+    DaemonEvent, HostName, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
@@ -365,7 +368,21 @@ pub async fn run(
         .with_writer(std::io::stderr)
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
-    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()));
+    let config = ConfigStore::with_base(config_dir);
+    let local_host = config.load_daemon_config()?.host_name.map(HostName::new).unwrap_or_else(HostName::local);
+    let hosts = config.load_hosts()?;
+    let mut ssh_hosts = BTreeMap::new();
+    let mut ambiguous = HashSet::new();
+    for remote in hosts.hosts.values() {
+        let destination = ssh_destination(&remote.hostname, remote.user.as_deref());
+        if ssh_hosts.insert(remote.expected_host_name.clone(), destination).is_some() {
+            ambiguous.insert(remote.expected_host_name.clone());
+        }
+    }
+    for host in ambiguous {
+        ssh_hosts.remove(&host);
+    }
+    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_host_routes(local_host, ssh_hosts));
     run_reconnecting(
         || async {
             let surface = flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla");

@@ -130,6 +130,14 @@ pub const KEY_PRIMARY_ACTION_KEY: &str = "action.primary.key";
 pub const KEY_PRIMARY_ACTION_LABEL: &str = "action.primary.label";
 pub const KEY_PRIMARY_ACTION_VEHICLE: &str = "action.primary.vehicle";
 pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
+/// Direct Cleat packet endpoint; all five facts appear or disappear together.
+pub const KEY_PRIMARY_DIRECT_TRANSPORT: &str = "action.primary.direct.transport";
+pub const KEY_PRIMARY_DIRECT_HOST: &str = "action.primary.direct.host";
+pub const KEY_PRIMARY_DIRECT_RUNTIME_ROOT: &str = "action.primary.direct.runtime_root";
+pub const KEY_PRIMARY_DIRECT_DAEMON: &str = "action.primary.direct.daemon";
+pub const KEY_PRIMARY_DIRECT_SESSION: &str = "action.primary.direct.session";
+/// Why the command recipe is the only available opening path.
+pub const KEY_PRIMARY_DIRECT_REASON: &str = "action.primary.direct.reason";
 /// Managed primary content (Andamento): `ready | held`. Published together
 /// with [`KEY_WORKSPACE_PRIMARY_TARGET`], the recipe and the cwd.
 pub const KEY_WORKSPACE_PRIMARY_STATE: &str = "workspace.primary.state";
