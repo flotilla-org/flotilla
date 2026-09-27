@@ -948,12 +948,15 @@ impl Reconciler for VesselReconciler {
                                 None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
                                 None => CrewAssignment::Unassigned,
                             };
-                            let mut render_options = self.brief_templates.render_options_with_fork_stance(
-                                brief_template.as_deref(),
-                                convoy.spec.project_ref.as_deref(),
-                                checkout_paths.values().map(PathBuf::from),
-                                fork_stance,
-                            );
+                            let mut render_options = self
+                                .brief_templates
+                                .render_options_with_fork_stance(
+                                    brief_template.as_deref(),
+                                    convoy.spec.project_ref.as_deref(),
+                                    checkout_paths.values().map(PathBuf::from),
+                                    fork_stance,
+                                )
+                                .for_convoy(&convoy);
                             render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
                             let mut brief = match build_crew_brief_with_options(
                                 &context,

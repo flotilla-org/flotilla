@@ -18,9 +18,9 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
     ensure_repository, interactive_single_workflow_spec, BoundChangeRequest, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
+    DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ExitDeclaration, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority,
     ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief,
     TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
@@ -1753,6 +1753,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-crew", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(ExitDeclaration::Claim(ClaimExit));
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![
         CrewSpec::builder()
             .role("coder".to_string())
@@ -1845,6 +1846,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-repo-override", "implement", REPO_URL, GIT_REF).await;
     let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
     let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").exit = Some(ExitDeclaration::Claim(ClaimExit));
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![CrewSpec::builder()
         .role("coder".to_string())
         .source(CrewSource::Agent { selector: Selector::for_capability("coding"), prompt: None, brief_template: None })
