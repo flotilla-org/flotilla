@@ -746,7 +746,11 @@ pub enum CommandAction {
         target_environment_id: crate::EnvironmentId,
     },
     QueryFleetHealth {},
-    QueryFleetList {},
+    QueryFleetList {
+        project: Option<String>,
+        crew_id: Option<String>,
+        convoy: Option<String>,
+    },
     QueryCrewList {
         context: CrewCommandContext,
     },
@@ -824,7 +828,7 @@ impl CommandAction {
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetHealth {}
-                | CommandAction::QueryFleetList {}
+                | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::QueryDaemonLogs { .. }
@@ -892,7 +896,7 @@ impl Command {
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetHealth {} => "query fleet health",
-            CommandAction::QueryFleetList {} => "query fleet list",
+            CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
@@ -1304,7 +1308,7 @@ mod tests {
             Command::builder().action(CommandAction::QueryHostList {}).build(),
             Command::builder().action(CommandAction::QueryProjectList {}).build(),
             Command::builder().action(CommandAction::QueryDispatchQueue { project: Some("widgets".to_string()) }).build(),
-            Command::builder().action(CommandAction::QueryFleetList {}).build(),
+            Command::builder().action(CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None }).build(),
             Command::builder()
                 .action(CommandAction::QueryCrewList {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
