@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-24
+**Amended by:** ADR 0042 (the review bundle is a `review-bundle` artifact; the daemon writes it, superseding the crew-staged credential in §6) and ADR 0043 (the review verdict is a flotilla artifact and the PR only a projection; "pure placement choice" in §4 holds once inter-crew transport runs over artifacts)
 **Relates to:** ADR 0021 (convoy lifecycle settlement anchors — this ADR
 adds the observed-digest anchor, amendment rides with its implementation
 slice), ADR 0034 (decision-ledger shape for findings and Demands), issue

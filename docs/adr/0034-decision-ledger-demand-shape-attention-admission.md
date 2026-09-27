@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-21
+**Amended by:** ADR 0043 (a ledger-less completion is refused, as the code has done since #1974, not "flagged, not rejected"; the ledger becomes a `decision-ledger` artifact kind, with a PR comment as at most its projection)
 **Relates to:** ADR 0017 (settlement claims / conditions / attention — this
 ADR adds a claims-plane artifact and two admission rules), ADR 0018
 (Demands and Regards — this ADR completes the Demand's shape), ADR 0027
