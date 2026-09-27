@@ -392,7 +392,7 @@ impl LeafSubscriptionTable {
                     let copies = change_requests.get_all(&name).await.map_err(|error| error.to_string())?;
                     let mut by_source = BTreeMap::new();
                     for item in copies.items {
-                        by_source.insert(change_request_source(&item.provenance), item.object);
+                        by_source.insert(resource_source(&item.provenance), item.object);
                     }
                     if by_source.is_empty() {
                         change_request_sources.remove(&name);
@@ -410,7 +410,7 @@ impl LeafSubscriptionTable {
                     let copies = issues.get_all(&name).await.map_err(|error| error.to_string())?;
                     let mut by_source = BTreeMap::new();
                     for item in copies.items {
-                        by_source.insert(change_request_source(&item.provenance), item.object);
+                        by_source.insert(resource_source(&item.provenance), item.object);
                     }
                     if by_source.is_empty() {
                         issue_sources.remove(&name);
@@ -1190,7 +1190,7 @@ fn apply_read_event<T: flotilla_resources::Resource>(
 
 type ChangeRequestSources = HashMap<String, BTreeMap<Option<NodeId>, ResourceObject<ChangeRequest>>>;
 
-fn change_request_source(provenance: &ResourceProvenance) -> Option<NodeId> {
+fn resource_source(provenance: &ResourceProvenance) -> Option<NodeId> {
     match provenance {
         ResourceProvenance::Local => None,
         ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
@@ -1200,7 +1200,7 @@ fn change_request_source(provenance: &ResourceProvenance) -> Option<NodeId> {
 fn change_request_sources(list: flotilla_resources::ReadResourceList<ChangeRequest>) -> ChangeRequestSources {
     let mut sources = ChangeRequestSources::new();
     for ReadResourceObject { object, provenance } in list.items {
-        sources.entry(object.metadata.name.clone()).or_default().insert(change_request_source(&provenance), object);
+        sources.entry(object.metadata.name.clone()).or_default().insert(resource_source(&provenance), object);
     }
     sources
 }
@@ -1240,7 +1240,7 @@ type IssueSources = HashMap<String, BTreeMap<Option<NodeId>, ResourceObject<Issu
 fn issue_sources(list: flotilla_resources::ReadResourceList<Issue>) -> IssueSources {
     let mut sources = IssueSources::new();
     for ReadResourceObject { object, provenance } in list.items {
-        sources.entry(object.metadata.name.clone()).or_default().insert(change_request_source(&provenance), object);
+        sources.entry(object.metadata.name.clone()).or_default().insert(resource_source(&provenance), object);
     }
     sources
 }

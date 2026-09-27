@@ -62,10 +62,6 @@ pub fn issue_record_name(service: &str, scope: &str, number: u64) -> String {
     fn hex(value: &str) -> String {
         value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
     }
-    let (service, scope) = if service.eq_ignore_ascii_case("github.com") {
-        (service.to_ascii_lowercase(), scope.to_ascii_lowercase())
-    } else {
-        (service.to_string(), scope.to_string())
-    };
+    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(service, scope);
     format!("issue-{}-{}-{number}", hex(&service), hex(&scope))
 }

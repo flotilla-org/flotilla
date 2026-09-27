@@ -285,11 +285,7 @@ pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
         .split('/')
         .next()
         .unwrap_or_default();
-    let (service, scope) = if service.eq_ignore_ascii_case("github.com") {
-        (service.to_ascii_lowercase(), reference.source.scope.to_ascii_lowercase())
-    } else {
-        (service.to_string(), reference.source.scope.clone())
-    };
+    let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(service, &reference.source.scope);
     let number = reference.id.parse::<u64>().map_err(|_| format!("issue id `{}` is not a numeric forge number", reference.id))?;
     Ok(LeafAddress::Issue { service, scope, number })
 }
@@ -320,23 +316,20 @@ pub fn instantiate_exit(
     let ExitDeclaration::Table(entries) = declaration else {
         unreachable!("claim declaration returned above");
     };
+    if entries.iter().any(|(_, template)| template.subject == SubjectVariable::Issue) {
+        return Err("issue exit leaves are not admitted".to_string());
+    }
     Ok(InstantiatedExit::Table(
         entries
             .into_iter()
             .map(|(disposition, template)| {
                 let leaves = subjects
                     .iter()
-                    .map(|address| {
-                        let address = match template.subject {
-                            SubjectVariable::ChangeRequest => address.clone(),
-                            SubjectVariable::Issue => address.clone(),
-                        };
-                        Leaf {
-                            address,
-                            field_path: template.field_path.clone(),
-                            operator: template.operator,
-                            literal: template.literal.clone(),
-                        }
+                    .map(|address| Leaf {
+                        address: address.clone(),
+                        field_path: template.field_path.clone(),
+                        operator: template.operator,
+                        literal: template.literal.clone(),
                     })
                     .collect();
                 InstantiatedExitEntry { disposition, template, leaves }

@@ -113,6 +113,9 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
             .parse::<DateTime<Utc>>()
             .map_err(|error| format!("invalid timestamp literal `{}` for {kind}{}: {error}", leaf.literal, leaf.field_path))?;
     }
+    if kind == LeafKind::Issue && issue_label_path(&leaf.field_path).is_some() && !matches!(leaf.literal.as_str(), "true" | "false") {
+        return Err(format!("issue label leaf literal must be `true` or `false`, got `{}`", leaf.literal));
+    }
     if kind == LeafKind::Usage
         && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes"))
     {
