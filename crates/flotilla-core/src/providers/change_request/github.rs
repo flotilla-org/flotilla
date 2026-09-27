@@ -99,6 +99,9 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
         let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
         let mut query = format!("query {{ repository(owner:{owner}, name:{name}) {{");
+        // Keep every bound CR in one repository query so request count is
+        // independent of convoy count. If a repository exceeds GitHub's query
+        // limits, surface the forge error instead of silently omitting CRs.
         for number in numbers {
             query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ state isDraft headRefOid reviewDecision mergeable commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }

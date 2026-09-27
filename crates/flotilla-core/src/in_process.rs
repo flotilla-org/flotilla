@@ -142,7 +142,7 @@ struct CachedObservation {
 
 struct ProviderChangeRequestObservationSource {
     daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
-    cache: Mutex<HashMap<ObservationScope, CachedObservation>>,
+    cache: Mutex<HashMap<ObservationScope, Arc<Mutex<Option<CachedObservation>>>>>,
 }
 
 impl ProviderChangeRequestObservationSource {
@@ -159,7 +159,13 @@ impl ProviderChangeRequestObservationSource {
         let key = (subject.namespace.clone(), subject.service.clone(), subject.scope.clone());
         let mut numbers = subjects.iter().map(|subject| subject.number).collect::<BTreeSet<_>>();
         numbers.insert(subject.number);
-        let mut cache = self.cache.lock().await;
+        let scope_cache = {
+            let mut cache = self.cache.lock().await;
+            Arc::clone(cache.entry(key).or_insert_with(|| Arc::new(Mutex::new(None))))
+        };
+        // Hold only this repository's lock through its forge read. Other
+        // repositories can continue observing even when one query is slow.
+        let mut cache = scope_cache.lock().await;
         let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("change request observation daemon unavailable")?;
         let repositories =
             daemon.resource_backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
@@ -193,7 +199,7 @@ impl ProviderChangeRequestObservationSource {
         }
         let queried = numbers;
         if !fresh {
-            if let Some(entry) = cache.get(&key) {
+            if let Some(entry) = cache.as_ref() {
                 if tokio::time::Instant::now() < entry.expires_at && queried.is_subset(&entry.queried) {
                     return entry
                         .result
@@ -215,7 +221,7 @@ impl ProviderChangeRequestObservationSource {
             .and_then(|reset| reset.signed_duration_since(Utc::now()).to_std().ok())
             .unwrap_or(Duration::from_secs(9));
         let status = result.as_ref().map(|statuses| statuses.get(&subject.number).cloned()).map_err(Clone::clone);
-        cache.insert(key, CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
+        *cache = Some(CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
         status?.ok_or_else(|| format!("change request {} was not found", subject.number))
     }
 }
@@ -4354,11 +4360,7 @@ impl InProcessDaemon {
 
         let mut failures = setup_failures;
         for (repository, _, provider) in live_candidates {
-            let resolved = match change_request_id {
-                Some(id) => provider.get_change_request(id).await.map(Some),
-                None => provider.find_change_request_by_branch(branch).await,
-            };
-            match resolved {
+            match provider.find_change_request_by_branch(branch).await {
                 Ok(Some((id, request))) => {
                     return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
                 }
