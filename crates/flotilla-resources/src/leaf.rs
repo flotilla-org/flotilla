@@ -7,6 +7,7 @@ use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, ResourceObject,
 
 pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("convoy", ".status.phase"),
+    ("convoy", ".status.stalled"),
     ("vessel", ".status.phase"),
     ("work", ".status.phase"),
     ("work", ".latest-claim.disposition"),
@@ -63,7 +64,13 @@ pub trait LeafSubject {
 pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let kind = leaf.address.kind();
     let usage_field = kind == LeafKind::Usage && admitted_usage_field(&leaf.field_path);
+    let crew_field = kind == LeafKind::Work
+        && leaf.field_path.starts_with(".crew.")
+        && leaf.field_path.ends_with(".phase")
+        && leaf.field_path[6..leaf.field_path.len() - 6].chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        && leaf.field_path.len() > 12;
     let admitted = usage_field
+        || crew_field
         || ADMITTED_LEAF_VOCABULARY.iter().any(|(candidate_kind, path)| *candidate_kind == kind.to_string() && *path == leaf.field_path);
     if !admitted {
         let mut vocabulary = ADMITTED_LEAF_VOCABULARY.iter().map(|(kind, path)| format!("{kind}{path}")).collect::<Vec<_>>();
@@ -166,6 +173,7 @@ impl LeafSubject for ConvoyLeafSubject<'_> {
     fn value(&self, field_path: &str) -> Option<LeafValue> {
         match field_path {
             ".status.phase" => self.0.status.as_ref().map(|status| LeafValue::Text(format!("{:?}", status.phase))),
+            ".status.stalled" => self.0.status.as_ref().map(|status| LeafValue::Text(status.stalled.is_some().to_string())),
             _ => None,
         }
     }
@@ -209,6 +217,10 @@ impl LeafSubject for WorkLeafSubject<'_> {
     fn value(&self, field_path: &str) -> Option<LeafValue> {
         match field_path {
             ".status.phase" => Some(LeafValue::Text(format!("{:?}", self.work.phase))),
+            path if path.starts_with(".crew.") && path.ends_with(".phase") => {
+                let role = &path[6..path.len() - 6];
+                self.crew?.get(role).map(|state| LeafValue::Text(format!("{:?}", state.phase)))
+            }
             ".latest-claim.disposition" => self.latest_claim()?.disposition.clone().map(LeafValue::Text),
             ".latest-claim.claimed-at" => self.latest_claim()?.finished_at.map(LeafValue::Timestamp),
             _ => None,

@@ -400,6 +400,8 @@ pub enum InputValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<StalledCondition>,
     /// Durable evidence of whether this convoy reached provisioning. An absent
     /// value means the evidence predates this field and must be treated as
     /// unknown rather than as `NotStarted`.
@@ -442,6 +444,49 @@ pub struct ConvoyStatus {
     /// Mutating lifecycle requests retained for operator explanation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<LifecycleMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeafMaker {
+    Observed { refresher: String, external_party: String },
+    Actor { vessel: String, role: String },
+    Controller { resource_kind: String, name: String, disposition: ControllerRetryDisposition },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ControllerRetryDisposition {
+    Retryable { next_attempt_at: DateTime<Utc> },
+    Terminal { needs: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallEvidenceSource {
+    Screen,
+    Hook,
+    Observation,
+    Session,
+    LeafEngine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallRung {
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StalledCondition {
+    pub leaves: Vec<Leaf>,
+    pub maker: Option<LeafMaker>,
+    pub evidence: String,
+    pub source: StallEvidenceSource,
+    pub began_at: DateTime<Utc>,
+    pub rung: StallRung,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nudge_history: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,6 +730,9 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    SetStalled {
+        condition: Option<StalledCondition>,
+    },
     RecordLifecycleMutation {
         mutation: LifecycleMutation,
     },
@@ -838,10 +886,13 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // current status, so accepting it here would resurrect the convoy and
         // erase its terminal history. Once stamped, the historical record is
         // immutable, including under duplicate abandon requests.
-        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. }) {
+        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. }) {
             return;
         }
         match self {
+            Self::SetStalled { condition } => {
+                status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
+            }
             Self::RecordLifecycleMutation { mutation } => {
                 const RETAINED_MUTATIONS: usize = 32;
                 status.lifecycle_mutations.push(mutation.clone());

@@ -8,13 +8,15 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, NodeId, WaitSubscriptionRequest};
+use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
     select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
-    HoldAct, InstantiatedExit, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    StatusPatch, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel,
-    VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject,
+    HoldAct, InstantiatedExit, LeafMaker, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, StallEvidenceSource, StallRung, StalledCondition, StatusPatch, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -76,6 +78,7 @@ pub struct LeafSubscriptionRow {
     pub namespace: String,
     pub leaves: Vec<Leaf>,
     pub watcher: LeafWatcher,
+    pub maker: LeafMaker,
     pub freshness_demand: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub episode_key: EpisodeKeyFields,
@@ -98,11 +101,18 @@ struct LeafSubscriptionTableInner {
     event_tx: broadcast::Sender<DaemonEvent>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
+    unable_since: Mutex<HashMap<uuid::Uuid, (UnableEvidenceKey, DateTime<Utc>)>>,
     tasks: Mutex<HashMap<uuid::Uuid, JoinHandle<()>>>,
     change_requests: ChangeRequestRefresher,
     reconciler_tx: broadcast::Sender<String>,
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnableEvidenceKey {
+    Attention { state: TerminalAttentionState, source: TerminalAttentionSource },
+    Absent,
 }
 
 impl LeafSubscriptionTable {
@@ -123,6 +133,7 @@ impl LeafSubscriptionTable {
                 event_tx,
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),
+                unable_since: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(HashMap::new()),
                 change_requests,
                 reconciler_tx,
@@ -153,6 +164,7 @@ impl LeafSubscriptionTable {
             namespace: request.namespace,
             leaves,
             watcher: LeafWatcher::WaitCaller { connection_id },
+            maker: LeafMaker::Observed { refresher: "caller".into(), external_party: "unknown".into() },
             freshness_demand: request.freshness_demand,
             created_at: Utc::now(),
             episode_key: EpisodeKeyFields::default(),
@@ -254,6 +266,7 @@ impl LeafSubscriptionTable {
 
     async fn forget_firings(&self, id: uuid::Uuid) {
         self.inner.last_firings.lock().await.retain(|(subscription_id, _), _| *subscription_id != id);
+        self.inner.unable_since.lock().await.remove(&id);
     }
 
     async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
@@ -554,6 +567,200 @@ impl SecondaryWatch for ReconcilerWake {
 }
 
 impl ReconcilerWake {
+    async fn maker_debouncing(
+        &self,
+        row_id: uuid::Uuid,
+        key: UnableEvidenceKey,
+        first_seen: DateTime<Utc>,
+        delay: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut episodes = self.subscriptions.inner.unable_since.lock().await;
+        let episode = episodes.entry(row_id).or_insert((key, first_seen));
+        if episode.0 != key {
+            *episode = (key, first_seen);
+        }
+        now.signed_duration_since(episode.1) < delay
+    }
+
+    async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+        let backend = &self.subscriptions.inner.backend;
+        let sessions = backend.including_replicas::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let observations = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let rows = self.subscriptions.rows().await;
+        let now = Utc::now();
+        for convoy in convoys.values() {
+            let Some(status) = &convoy.status else { continue };
+            let selected_sessions = select_convoy_children(convoy, &sessions);
+            let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored);
+            if !holding && status.stalled.is_none() {
+                continue;
+            }
+            let convoy_rows = rows.iter().filter(|row| {
+                matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
+            }).collect::<Vec<_>>();
+            let mut unable = None;
+            let mut able = false;
+            let mut pending_debounce = false;
+            for row in convoy_rows {
+                let judgement = match &row.maker {
+                    LeafMaker::Actor { vessel, role } => {
+                        let session = selected_sessions.values().find(|session| {
+                            session.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.metadata.name)
+                                && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
+                                && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                        });
+                        let attention = session
+                            .and_then(|session| session.status.as_ref())
+                            .filter(|status| status.phase == TerminalSessionPhase::Running)
+                            .and_then(|status| status.attention.as_ref());
+                        match attention {
+                            Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
+                                self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                                Ok(())
+                            }
+                            Some(attention) => {
+                                let source = match attention.source {
+                                    TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
+                                    TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
+                                };
+                                let debounce = match attention.source {
+                                    TerminalAttentionSource::Screen => TerminalAttention::DEBOUNCE_FOR,
+                                    TerminalAttentionSource::Hook => chrono::Duration::zero(),
+                                };
+                                if self
+                                    .maker_debouncing(
+                                        row.id,
+                                        UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
+                                        attention.as_of,
+                                        debounce,
+                                        now,
+                                    )
+                                    .await
+                                {
+                                    pending_debounce = true;
+                                    continue;
+                                }
+                                let evidence = if attention.is_stale_at(now) {
+                                    "attention stale".into()
+                                } else {
+                                    match attention.state {
+                                        TerminalAttentionState::Idle => "idle".into(),
+                                        TerminalAttentionState::NeedsInput => "NeedsInput".into(),
+                                        TerminalAttentionState::Unobservable => "unobservable".into(),
+                                        TerminalAttentionState::Working => "working".into(),
+                                    }
+                                };
+                                Err((evidence, source))
+                            }
+                            None => {
+                                if self.maker_debouncing(row.id, UnableEvidenceKey::Absent, now, TerminalAttention::DEBOUNCE_FOR, now).await
+                                {
+                                    pending_debounce = true;
+                                    continue;
+                                }
+                                Err(("session dead or absent".into(), StallEvidenceSource::Session))
+                            }
+                        }
+                    }
+                    LeafMaker::Observed { .. } => {
+                        let mut reason = None;
+                        for leaf in &row.leaves {
+                            if let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address {
+                                let name = flotilla_resources::change_request_record_name(service, scope, *number);
+                                let observation = observations
+                                    .iter()
+                                    .filter(|source| source.object.metadata.name == name)
+                                    .filter_map(|source| source.object.status.as_ref())
+                                    .max_by_key(|status| status.state.observed_at);
+                                let has_value = observation.is_some_and(|status| match leaf.field_path.as_str() {
+                                    ".state" => status.state.value.is_some(),
+                                    ".head-sha" => status.head_sha.value.is_some(),
+                                    ".checks" => status.checks.value.is_some(),
+                                    ".review.actionable-at-head" => status.review.actionable_at_head.value.is_some(),
+                                    ".mergeable" => status.mergeable.value.is_some(),
+                                    _ => false,
+                                });
+                                let fresh = has_value
+                                    && observation.is_some_and(|status| {
+                                        let at = match leaf.field_path.as_str() {
+                                            ".head-sha" => status.head_sha.observed_at,
+                                            ".checks" => status.checks.observed_at,
+                                            ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
+                                            ".mergeable" => status.mergeable.observed_at,
+                                            _ => status.state.observed_at,
+                                        };
+                                        row.freshness_demand.is_none_or(|demand| at >= demand)
+                                            && now.signed_duration_since(at)
+                                                < chrono::Duration::from_std(self.subscriptions.change_request_stale_after())
+                                                    .expect("duration fits")
+                                    });
+                                if !fresh {
+                                    let subject = ChangeRequestRef {
+                                        namespace: namespace.into(),
+                                        service: service.clone(),
+                                        scope: scope.clone(),
+                                        number: *number,
+                                    };
+                                    let refresh_error = self.subscriptions.change_request_observation_error(&subject).await;
+                                    reason = Some(match (observation.is_some(), has_value, refresh_error) {
+                                        (true, true, Some(error)) => format!("stale; refresh failed: {error}"),
+                                        (true, true, None) => "stale".into(),
+                                        (_, _, Some(error)) => error,
+                                        _ => "not refreshed".into(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                        reason.map_or(Ok(()), |reason| Err((reason, StallEvidenceSource::Observation)))
+                    }
+                    LeafMaker::Controller { disposition, .. } => match disposition {
+                        flotilla_resources::ControllerRetryDisposition::Retryable { .. } => Ok(()),
+                        flotilla_resources::ControllerRetryDisposition::Terminal { needs } => {
+                            Err((needs.clone(), StallEvidenceSource::LeafEngine))
+                        }
+                    },
+                };
+                match judgement {
+                    Ok(()) => {
+                        able = true;
+                        break;
+                    }
+                    Err((evidence, source)) => unable.get_or_insert((row, evidence, source)),
+                };
+            }
+            let next = if holding && !able && !pending_debounce {
+                let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable {
+                    (row.leaves.clone(), Some(row.maker.clone()), evidence, source)
+                } else {
+                    (Vec::new(), None, "no armed row with an able maker".into(), StallEvidenceSource::LeafEngine)
+                };
+                Some(StalledCondition {
+                    leaves,
+                    maker,
+                    evidence,
+                    source,
+                    began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
+                    rung: StallRung::Operator,
+                    nudge_history: Vec::new(),
+                })
+            } else {
+                None
+            };
+            if status.stalled != next {
+                flotilla_resources::apply_status_patch(
+                    &backend.clone().using::<Convoy>(namespace),
+                    &convoy.metadata.name,
+                    &flotilla_resources::ConvoyStatusPatch::SetStalled { condition: next },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     async fn run(&self, namespace: String, sender: mpsc::Sender<String>) -> Result<(), String> {
         let convoys = self.subscriptions.inner.backend.clone().using::<Convoy>(&namespace);
         let checkouts = self.subscriptions.inner.backend.including_replicas::<Checkout>(&namespace);
@@ -564,9 +771,13 @@ impl ReconcilerWake {
             listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
+        let mut judge_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             tokio::select! {
+                _ = judge_tick.tick() => {
+                    self.judge_stalls(&namespace, &convoy_objects).await?;
+                }
                 event = convoy_watch.next() => {
                     let event = event.ok_or_else(|| "reconciler wake convoy watch closed".to_string())?.map_err(|error| error.to_string())?;
                     match event {
@@ -613,8 +824,44 @@ impl ReconcilerWake {
             .items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
         for convoy in convoys.values().filter(|convoy| {
-            convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landing | ConvoyPhase::Anchored))
+            convoy
+                .status
+                .as_ref()
+                .is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
+            let status = convoy.status.as_ref().expect("holding convoy has status");
+            if status.phase == ConvoyPhase::Active {
+                for (vessel, crew) in &status.crew_work {
+                    for (role, work) in crew {
+                        if !status.work.get(vessel).is_some_and(|work| matches!(work.phase, WorkPhase::Launching | WorkPhase::Running))
+                            || matches!(
+                                work.phase,
+                                flotilla_resources::CrewWorkPhase::Done
+                                    | flotilla_resources::CrewWorkPhase::Failed
+                                    | flotilla_resources::CrewWorkPhase::HandedBack
+                            )
+                        {
+                            continue;
+                        }
+                        desired.push(LeafSubscriptionRow {
+                            id: uuid::Uuid::nil(),
+                            namespace: namespace.to_string(),
+                            leaves: vec![Leaf {
+                                address: LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() },
+                                field_path: format!(".crew.{role}.phase"),
+                                operator: LeafOperator::Equal,
+                                literal: "Done".into(),
+                            }],
+                            watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            maker: LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() },
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: EpisodeKeyFields::default(),
+                        });
+                    }
+                }
+                continue;
+            }
             let checkouts = select_convoy_children(convoy, &checkout_sources);
             let exit = match instantiate_exit(convoy, &checkouts) {
                 Ok(exit) => exit,
@@ -631,6 +878,7 @@ impl ReconcilerWake {
                             namespace: namespace.to_string(),
                             leaves: entry.leaves,
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
                             freshness_demand: Some(Utc::now()),
                             created_at: Utc::now(),
                             episode_key: EpisodeKeyFields::default(),
@@ -657,6 +905,7 @@ impl ReconcilerWake {
                         source: delivery.source.clone(),
                         rule: delivery.rule.clone(),
                     },
+                    maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
                     freshness_demand: Some(claim_at),
                     created_at: Utc::now(),
                     episode_key: EpisodeKeyFields {
@@ -736,6 +985,7 @@ fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) ->
     left.namespace == right.namespace
         && left.leaves == right.leaves
         && left.watcher == right.watcher
+        && left.maker == right.maker
         && same_freshness
         && left.episode_key == right.episode_key
 }
@@ -889,6 +1139,7 @@ mod tests {
             namespace: "flotilla".to_string(),
             leaves: vec!["cr/github.com/flotilla-org/flotilla/1699 .state == merged".parse().expect("leaf")],
             watcher: LeafWatcher::ReconcilerWake { convoy: "landing".to_string() },
+            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
             freshness_demand: Some(freshness_demand),
             created_at: freshness_demand,
             episode_key: EpisodeKeyFields::default(),
@@ -1283,6 +1534,7 @@ mod tests {
             namespace: "flotilla".to_string(),
             leaves: vec![fired_leaf.clone()],
             watcher: LeafWatcher::ReconcilerWake { convoy: "held".to_string() },
+            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
             freshness_demand: None,
             created_at: Utc::now(),
             episode_key: EpisodeKeyFields::default(),
@@ -1399,6 +1651,7 @@ mod tests {
             namespace: "flotilla".to_string(),
             leaves: vec![leaf.clone()],
             watcher: LeafWatcher::TurnDelivery { convoy: "wake-turn".to_string(), source: source.to_string(), rule: rule.clone() },
+            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
             freshness_demand: Some(base),
             created_at: base,
             episode_key: EpisodeKeyFields::default(),

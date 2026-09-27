@@ -18,6 +18,7 @@ fn crew_follow_up_result_tells_the_crew_to_complete_again() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        stalled: None,
         recent_events: Vec::new(),
         lifecycle_mutations: Vec::new(),
         namespace: "flotilla".into(),
