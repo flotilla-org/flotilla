@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{future::Future, path::Path, sync::Arc};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -58,7 +58,11 @@ impl<'a> RequestDispatcher<'a> {
         Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, caller }
     }
 
-    pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
+    pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
+        Box::pin(self.dispatch_inner(id, request))
+    }
+
+    async fn dispatch_inner(&self, id: u64, request: Request) -> Message {
         match request {
             Request::Shutdown => Message::ok_response(id, Response::Shutdown),
             Request::ListRepos => match self.daemon.list_repos().await {
