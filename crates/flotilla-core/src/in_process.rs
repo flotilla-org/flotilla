@@ -8319,18 +8319,11 @@ impl InProcessDaemon {
         let mut response = self.host_registry.get_host_status(environment_id, &counts).await?;
         if let Some(host_id) = environment_id.host_id() {
             let namespace = self.provisioning_namespace().await;
-            let hosts = self
-                .resource_backend
-                .clone()
-                .including_replicas::<ResourceHost>(&namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?;
-            response.blob_sync = hosts
-                .items
-                .into_iter()
-                .find(|host| host.object.metadata.name == host_id.to_string())
-                .and_then(|host| host.object.status.and_then(|status| status.blob_sync));
+            response.blob_sync = match self.resource_backend.including_replicas::<ResourceHost>(&namespace).get(host_id.as_str()).await {
+                Ok(host) => host.object.status.and_then(|status| status.blob_sync),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
         }
         if environment_id == &local_summary.environment_id {
             response.visible_environments = self.environment_manager.visible_environments().await;

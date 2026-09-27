@@ -183,3 +183,41 @@ fn topology_dot_uses_stable_ids_and_escapes_labels() {
 
     assert!(format_topology_dot(&response).contains(r#"  "node \"one" [label="desk\\office\nprimary", shape=doublecircle];"#));
 }
+
+#[test]
+fn blob_sync_diagnostics_render_in_host_list_and_status() {
+    let sync = flotilla_protocol::BlobSyncStatus { pending_count: 2, last_error: Some("endpoint unavailable".to_string()) };
+    let fleet = flotilla_protocol::FleetHealthResponse {
+        hosts: vec![flotilla_protocol::FleetHostRow::builder()
+            .host(HostName::new("local"))
+            .is_local(true)
+            .configured(false)
+            .link(PeerConnectionState::Connected)
+            .crew_count(0)
+            .convoy_count(0)
+            .staleness(flotilla_protocol::FleetHostStaleness::Current)
+            .observation_agreement(flotilla_protocol::FleetObservationAgreement::Agree)
+            .blob_sync(sync.clone())
+            .build()],
+        ..Default::default()
+    };
+    let list = super::format_fleet_health_human(&fleet);
+    assert!(list.contains("Blob Sync"));
+    assert!(list.contains("2 pending; endpoint unavailable"));
+
+    let status = flotilla_protocol::HostStatusResponse {
+        environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("local")),
+        host_name: HostName::new("local"),
+        node: NodeInfo::new(NodeId::new("local-node"), "Local"),
+        is_local: true,
+        configured: false,
+        connection_status: PeerConnectionState::Connected,
+        summary: None,
+        visible_environments: Vec::new(),
+        repo_count: 0,
+        blob_sync: Some(sync),
+    };
+    let output = super::format_host_status_human(&status);
+    assert!(output.contains("Blob sync: 2 pending"));
+    assert!(output.contains("Blob sync error: endpoint unavailable"));
+}

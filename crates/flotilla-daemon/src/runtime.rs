@@ -43,8 +43,7 @@ use flotilla_resources::{
     CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
     EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust,
-    Resource,
+    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource,
     ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
@@ -4312,6 +4311,7 @@ mod tests {
     use super::{test_git_repo::TestGitRepo, *};
     use crate::{
         agent_material::{CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV},
+        blob_store::{BlobStore, MemoryBlobStore},
         environment_tools::{
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
@@ -10236,6 +10236,11 @@ mod tests {
         .expect("seed sleep inhibition health");
         let heartbeat =
             spawn_heartbeat_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, test_health_identity(), Duration::from_millis(20));
+        let blob_store =
+            Arc::new(TieredBlobStore::new(temp.path(), vec![("test-fleet".to_string(), Arc::new(MemoryBlobStore::default()))]));
+        blob_store.put(b"pending host status blob").await.expect("local blob put");
+        let blob_status_task =
+            spawn_blob_sync_status_task(Arc::clone(&blob_store), daemon.resource_backend(), NAMESPACE.to_string(), host_id.clone());
 
         wait_until_with_timeout(Duration::from_secs(30), || {
             let hosts = hosts.clone();
@@ -10243,7 +10248,25 @@ mod tests {
             async move { hosts.get(&host_id).await.ok().and_then(|host| host.status).is_some_and(|status| status.heartbeat_at.is_some()) }
         })
         .await;
+        wait_until_with_timeout(Duration::from_secs(30), || {
+            let hosts = hosts.clone();
+            let host_id = host_id.clone();
+            async move {
+                hosts
+                    .get(&host_id)
+                    .await
+                    .ok()
+                    .and_then(|host| host.status)
+                    .and_then(|status| status.blob_sync)
+                    .is_some_and(|sync| sync.pending_count == 1)
+            }
+        })
+        .await;
         let status = hosts.get(&host_id).await.expect("get host").status.expect("host status");
+        assert_eq!(status.blob_sync.as_ref().expect("blob sync status").pending_count, 1);
+        let local_environment_id = daemon.local_host_summary().await.environment_id;
+        let host_status = daemon.get_host_status_internal(&local_environment_id).await.expect("query host status");
+        assert_eq!(host_status.blob_sync.as_ref().expect("host query blob sync").pending_count, 1);
         assert!(!status.ready, "sleep inhibition failure should keep the host degraded");
         assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
@@ -10262,6 +10285,7 @@ mod tests {
         );
         let fleet = daemon.fleet_health_internal().await.expect("query fleet health");
         let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet-health row");
+        assert_eq!(local.blob_sync.as_ref().expect("fleet list blob sync").pending_count, 1);
         assert!(
             local.degraded_conditions.iter().any(|condition| condition.contains("SleepInhibition") && condition.contains("polkit denied")),
             "fleet health should expose the sleep-inhibition condition: {:?}",
@@ -10270,6 +10294,8 @@ mod tests {
 
         heartbeat.abort();
         let _ = heartbeat.await;
+        blob_status_task.abort();
+        let _ = blob_status_task.await;
     }
 
     #[tokio::test]

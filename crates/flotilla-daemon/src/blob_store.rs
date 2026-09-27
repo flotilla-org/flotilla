@@ -92,6 +92,31 @@ impl LocalBlobStore {
     fn path(&self, digest: &BlobDigest) -> PathBuf {
         self.root.join(&digest.0[..2]).join(&digest.0[2..])
     }
+    async fn write_digest(&self, digest: &BlobDigest, bytes: &[u8]) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let path = self.path(digest);
+        let parent = path.parent().expect("blob path has parent");
+        tokio::fs::create_dir_all(parent).await.map_err(|error| format!("create blob directory: {error}"))?;
+        // Re-read an existing blob so a repeated put can repair corruption.
+        // The read costs O(blob size), but a plain stat would preserve a bad copy.
+        if self.get(digest).await.ok().flatten().is_some() {
+            return Ok(());
+        }
+        let temp = parent.join(format!(".{}-{}.tmp", digest.0, uuid::Uuid::new_v4()));
+        let result = async {
+            let mut file =
+                tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await.map_err(|error| error.to_string())?;
+            file.write_all(bytes).await.map_err(|error| error.to_string())?;
+            file.sync_all().await.map_err(|error| error.to_string())?;
+            tokio::fs::rename(&temp, &path).await.map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        result
+    }
     pub async fn digests(&self) -> Result<Vec<BlobDigest>, String> {
         let mut result = Vec::new();
         let mut prefixes = match tokio::fs::read_dir(&self.root).await {
@@ -127,28 +152,8 @@ impl LocalBlobStore {
 #[async_trait]
 impl BlobStore for LocalBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
-        use tokio::io::AsyncWriteExt;
         let digest = BlobDigest::of(bytes);
-        let path = self.path(&digest);
-        let parent = path.parent().expect("blob path has parent");
-        tokio::fs::create_dir_all(parent).await.map_err(|error| format!("create blob directory: {error}"))?;
-        if self.get(&digest).await.ok().flatten().is_some() {
-            return Ok(digest);
-        }
-        let temp = parent.join(format!(".{}-{}.tmp", digest.0, uuid::Uuid::new_v4()));
-        let result = async {
-            let mut file =
-                tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await.map_err(|error| error.to_string())?;
-            file.write_all(bytes).await.map_err(|error| error.to_string())?;
-            file.sync_all().await.map_err(|error| error.to_string())?;
-            tokio::fs::rename(&temp, &path).await.map_err(|error| error.to_string())?;
-            Ok::<(), String>(())
-        }
-        .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temp).await;
-        }
-        result?;
+        self.write_digest(&digest, bytes).await?;
         Ok(digest)
     }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
@@ -223,7 +228,7 @@ impl S3BlobStore {
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.query().is_some() || endpoint.fragment().is_some() {
             return Err("S3 endpoint must be an HTTP URL without query or fragment".into());
         }
-        if bucket.is_empty() || !bucket.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.') {
+        if bucket.is_empty() || !bucket.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.') {
             return Err("invalid S3 bucket".into());
         }
         if !prefix.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'/')) {
@@ -470,8 +475,9 @@ impl TieredBlobStore {
 #[async_trait]
 impl BlobStore for TieredBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
-        let was_present = self.local.has(&BlobDigest::of(bytes)).await?;
-        let digest = self.local.put(bytes).await?;
+        let digest = BlobDigest::of(bytes);
+        let was_present = self.local.has(&digest).await?;
+        self.local.write_digest(&digest, bytes).await?;
         if !was_present && !self.fleet.is_empty() {
             self.status.lock().await.pending_count += self.fleet.len();
             self.wake.notify_one();
