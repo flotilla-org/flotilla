@@ -8703,7 +8703,11 @@ impl InProcessDaemon {
             .build())
     }
 
-    pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
+    pub async fn crew_complete_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: Option<String>,
+    ) -> Result<flotilla_protocol::CommandValue, String> {
         self.crew_complete_with_disposition_internal(requested, message, None, None).await
     }
 
@@ -8713,7 +8717,7 @@ impl InProcessDaemon {
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<flotilla_protocol::CommandValue, String> {
         self.crew_complete_as_principal_internal(requested, message, disposition, decision_ledger_ref, false, None).await
     }
 
@@ -8725,7 +8729,7 @@ impl InProcessDaemon {
         decision_ledger_ref: Option<String>,
         force: bool,
         principal: Option<PrincipalRef>,
-    ) -> Result<(), String> {
+    ) -> Result<flotilla_protocol::CommandValue, String> {
         if decision_ledger_ref.as_deref().is_some_and(|reference| !(reference.starts_with("https://") || reference.starts_with("http://")))
         {
             return Err("decision ledger reference must use an HTTP(S) URL".to_string());
@@ -8758,7 +8762,7 @@ impl InProcessDaemon {
                 claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
             });
         if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
-            return Ok(());
+            return Ok(flotilla_protocol::CommandValue::Ok);
         }
         if forced_by.is_none() && !existing_claim_is_admitted {
             let checkout_sources =
@@ -8835,7 +8839,8 @@ impl InProcessDaemon {
             })?;
             let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
             let session = sessions.get(session_name).await.map_err(|err| err.to_string())?;
-            queue_pending_crew_message(&sessions, &session, &pending.content).await?;
+            let framed = format!("{}\n\n{}", flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION, pending.content);
+            queue_pending_crew_message(&sessions, &session, &framed).await?;
             apply_resource_status_patch(
                 &convoys,
                 convoy_name,
@@ -8854,7 +8859,7 @@ impl InProcessDaemon {
             .await
             .map_err(|err| err.to_string())?;
             self.clear_crew_completion_pending(namespace, session_name).await?;
-            return Ok(());
+            return Ok(flotilla_protocol::CommandValue::CrewFollowUpDelivered);
         }
         apply_resource_status_patch(
             &convoys,
@@ -8875,7 +8880,7 @@ impl InProcessDaemon {
         if let Some(session_name) = routing.session_name {
             self.clear_crew_completion_pending(namespace, &session_name).await?;
         }
-        Ok(())
+        Ok(flotilla_protocol::CommandValue::Ok)
     }
 
     pub async fn crew_fail_internal(&self, requested: &CrewCommandContext, message: String) -> Result<(), String> {
@@ -10859,13 +10864,13 @@ impl InProcessDaemon {
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(value) => {
                     if let Some(resolved) = routing {
                         let namespace = resolved.command_context.namespace.as_deref().unwrap_or("flotilla");
                         self.record_lifecycle_mutation_best_effort(namespace, &resolved.convoy, "crew_complete", caller.as_ref(), false)
                             .await;
                     }
-                    flotilla_protocol::CommandValue::Ok
+                    value
                 }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
@@ -12130,17 +12135,37 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
         .into_iter()
         .flat_map(|status| &status.crew_work)
         .flat_map(|(vessel, crew)| {
-            crew.iter().filter(|(_, claim)| matches!(claim.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack)).map(
-                move |(role, claim)| ExplainedDecisionLedger {
-                    vessel: vessel.clone(),
-                    role: role.clone(),
-                    claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
-                    comment_url: claim.decision_ledger_ref.clone(),
-                    missing: claim.decision_ledger_ref.is_none(),
-                    override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
-                    completed_while_crew_active: claim.completed_while_crew_active,
-                },
-            )
+            crew.iter().flat_map(move |(role, claim)| {
+                let mut ledgers = claim
+                    .superseded_claims
+                    .iter()
+                    .map(|superseded| ExplainedDecisionLedger {
+                        vessel: vessel.clone(),
+                        role: role.clone(),
+                        claimed_at: Some(superseded.claimed_at.to_rfc3339()),
+                        comment_url: superseded.decision_ledger_ref.clone(),
+                        missing: superseded.decision_ledger_ref.is_none(),
+                        override_principal: superseded.completion_override.as_ref().map(|override_| override_.principal.clone()),
+                        completed_while_crew_active: superseded.completed_while_crew_active,
+                        message: superseded.message.clone(),
+                        superseded: true,
+                    })
+                    .collect::<Vec<_>>();
+                if matches!(claim.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
+                    ledgers.push(ExplainedDecisionLedger {
+                        vessel: vessel.clone(),
+                        role: role.clone(),
+                        claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
+                        comment_url: claim.decision_ledger_ref.clone(),
+                        missing: claim.decision_ledger_ref.is_none(),
+                        override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
+                        completed_while_crew_active: claim.completed_while_crew_active,
+                        message: claim.message.clone(),
+                        superseded: false,
+                    });
+                }
+                ledgers
+            })
         })
         .collect()
 }

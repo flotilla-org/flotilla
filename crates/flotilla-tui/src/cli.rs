@@ -721,6 +721,18 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         output.push_str("  (no settlement claims)\n");
     } else {
         for ledger in &explanation.decision_ledgers {
+            if ledger.superseded {
+                let _ = writeln!(
+                    output,
+                    "  - {}/{} superseded claim at={} comment={} message={}",
+                    ledger.vessel,
+                    ledger.role,
+                    ledger.claimed_at.as_deref().unwrap_or("-"),
+                    ledger.comment_url.as_deref().unwrap_or("-"),
+                    ledger.message.as_deref().unwrap_or("-")
+                );
+                continue;
+            }
             if ledger.missing {
                 let detail = ledger.override_principal.as_ref().map_or_else(
                     || "crew completed without a decision ledger".to_string(),
@@ -839,6 +851,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
+        CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
