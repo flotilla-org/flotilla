@@ -304,6 +304,21 @@ pub enum Request {
     /// Ask this daemon process to finish active work and exit cleanly.
     Shutdown,
     ListRepos,
+    ArtifactPut {
+        kind: String,
+        subject: String,
+        summary: std::collections::BTreeMap<String, serde_json::Value>,
+        media_type: String,
+        body: Vec<u8>,
+    },
+    ArtifactGet {
+        reference: String,
+    },
+    ArtifactList {
+        convoy: Option<String>,
+        kind: Option<String>,
+        subject: Option<String>,
+    },
     Execute {
         command: Command,
     },
@@ -358,6 +373,16 @@ pub enum Request {
 pub enum Response {
     Shutdown,
     ListRepos(Vec<RepoInfo>),
+    ArtifactPut {
+        address: String,
+        digest: String,
+    },
+    ArtifactGet {
+        body: Vec<u8>,
+    },
+    ArtifactList {
+        items: Vec<serde_json::Value>,
+    },
     Execute {
         command_id: u64,
     },

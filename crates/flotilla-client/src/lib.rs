@@ -166,6 +166,38 @@ pub struct SocketDaemon {
 }
 
 impl SocketDaemon {
+    pub async fn artifact_put(
+        &self,
+        kind: String,
+        subject: String,
+        summary: std::collections::BTreeMap<String, serde_json::Value>,
+        media_type: String,
+        body: Vec<u8>,
+    ) -> Result<(String, String), String> {
+        match into_success_response(self.request(Request::ArtifactPut { kind, subject, summary, media_type, body }).await?)? {
+            Response::ArtifactPut { address, digest } => Ok((address, digest)),
+            other => Err(format!("unexpected artifact put response: {other:?}")),
+        }
+    }
+
+    pub async fn artifact_get(&self, reference: String) -> Result<Vec<u8>, String> {
+        match into_success_response(self.request(Request::ArtifactGet { reference }).await?)? {
+            Response::ArtifactGet { body } => Ok(body),
+            other => Err(format!("unexpected artifact get response: {other:?}")),
+        }
+    }
+
+    pub async fn artifact_list(
+        &self,
+        convoy: Option<String>,
+        kind: Option<String>,
+        subject: Option<String>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        match into_success_response(self.request(Request::ArtifactList { convoy, kind, subject }).await?)? {
+            Response::ArtifactList { items } => Ok(items),
+            other => Err(format!("unexpected artifact list response: {other:?}")),
+        }
+    }
     /// Connect to a running daemon at the given Unix socket path.
     ///
     /// Requires a bounded, stateful Hello handshake before starting the shared

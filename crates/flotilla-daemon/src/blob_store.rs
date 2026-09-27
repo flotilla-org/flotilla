@@ -484,6 +484,47 @@ impl TieredBlobStore {
             }
         }
     }
+
+    /// Reap each tier independently, using local files and sync markers as
+    /// that tier's inventory. Failed fleet deletions retain their marker and
+    /// are retried on the next sweep.
+    pub async fn gc_unreferenced(&self, referenced: &HashSet<BlobDigest>, grace: Duration) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for digest in self.local.digests().await? {
+            if !referenced.contains(&digest) && older_than(&self.local.path(&digest), grace).await? {
+                if let Err(error) = self.local.delete(&digest).await {
+                    failures.push(format!("local {}: {error}", digest.as_str()));
+                }
+            }
+        }
+        for target in &self.fleet {
+            let directory = self.markers.join(&target.id);
+            let mut entries = match tokio::fs::read_dir(&directory).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("read blob sync inventory: {error}")),
+            };
+            while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+                let Ok(digest) = BlobDigest::parse(&name) else { continue };
+                if !referenced.contains(&digest) && older_than(&entry.path(), grace).await? {
+                    match target.store.delete(&digest).await {
+                        Ok(()) => {
+                            if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                                failures.push(format!("{} marker {}: {error}", target.id, digest.as_str()));
+                            }
+                        }
+                        Err(error) => failures.push(format!("{} {}: {error}", target.id, digest.as_str())),
+                    }
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
     pub async fn sync_once(&self) -> Result<BlobSyncStatus, String> {
         let _sync = self.sync_lock.lock().await;
         self.recover_inventory().await?;
@@ -557,6 +598,11 @@ impl TieredBlobStore {
             }
         }
     }
+}
+
+async fn older_than(path: &Path, grace: Duration) -> Result<bool, String> {
+    let modified = tokio::fs::metadata(path).await.map_err(|error| error.to_string())?.modified().map_err(|error| error.to_string())?;
+    Ok(std::time::SystemTime::now().duration_since(modified).is_ok_and(|age| age >= grace))
 }
 
 #[async_trait]
@@ -875,5 +921,27 @@ mod tests {
 
         assert_eq!(tiered.get(&digest).await.expect("read healthy mirror"), Some(b"valid bytes".to_vec()));
         assert_eq!(tiered.local.get(&digest).await.expect("cache valid blob"), Some(b"valid bytes".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn gc_reaps_unreferenced_copies_per_backend_and_retries_unavailable_fleet() {
+        let state = tempfile::tempdir().expect("state dir");
+        let unavailable = Arc::new(SwitchableFleet::new());
+        unavailable.available.store(true, Ordering::SeqCst);
+        let healthy = Arc::new(MemoryBlobStore::default());
+        let tiered =
+            TieredBlobStore::new(state.path(), vec![("unavailable".into(), unavailable.clone()), ("healthy".into(), healthy.clone())]);
+        let stale = tiered.put(b"stale").await.expect("put stale");
+        let keep = tiered.put(b"keep").await.expect("put referenced");
+        tiered.sync_once().await.expect("sync both tiers");
+        unavailable.available.store(false, Ordering::SeqCst);
+        let referenced = HashSet::from([keep.clone()]);
+        assert!(tiered.gc_unreferenced(&referenced, Duration::ZERO).await.is_err());
+        assert!(!tiered.local.has(&stale).await.expect("local stale removed"));
+        assert!(!healthy.has(&stale).await.expect("healthy stale removed"));
+        assert!(healthy.has(&keep).await.expect("referenced copy kept"));
+        unavailable.available.store(true, Ordering::SeqCst);
+        tiered.gc_unreferenced(&referenced, Duration::ZERO).await.expect("retry unavailable backend");
+        assert!(!unavailable.has(&stale).await.expect("stale copy removed on retry"));
     }
 }

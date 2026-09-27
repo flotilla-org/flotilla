@@ -584,6 +584,7 @@ impl DaemonRuntime {
 
         let mut tasks = vec![
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
+            tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
             spawn_blob_sync_status_task(
                 Arc::clone(&blob_store),
                 daemon.resource_backend(),
@@ -734,6 +735,29 @@ impl DaemonRuntime {
 
 pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str) -> bool {
     declared_root == local_root
+}
+
+async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let retention_days = BTreeMap::new();
+    loop {
+        interval.tick().await;
+        let service = crate::artifact::ArtifactService {
+            backend: &backend,
+            blobs: blobs.as_ref(),
+            namespace: &namespace,
+            retention_days: &retention_days,
+        };
+        match service.reap_expired().await {
+            Ok(referenced) => {
+                if let Err(error) = blobs.gc_unreferenced(&referenced, Duration::from_secs(24 * 60 * 60)).await {
+                    warn!(%error, "artifact blob GC failed");
+                }
+            }
+            Err(error) => warn!(%error, "artifact retention sweep failed"),
+        }
+    }
 }
 
 fn spawn_blob_sync_status_task(

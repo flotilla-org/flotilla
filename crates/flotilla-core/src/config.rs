@@ -325,6 +325,25 @@ pub struct DaemonConfig {
     pub relay: Option<RelayConfig>,
     #[serde(default)]
     pub blob_stores: Vec<BlobStoreConfig>,
+    /// Retention in days by artifact kind. Unknown kinds use 30 days.
+    #[serde(default = "default_artifact_retention_days")]
+    pub artifact_retention_days: BTreeMap<String, u64>,
+}
+
+fn default_artifact_retention_days() -> BTreeMap<String, u64> {
+    [
+        ("brief", 3650),
+        ("decision-ledger", 3650),
+        ("review-round", 3650),
+        ("review-bundle", 3650),
+        ("explainer", 3650),
+        ("recording", 14),
+        ("test-report", 14),
+        ("raw-test-output", 7),
+    ]
+    .into_iter()
+    .map(|(kind, days)| (kind.to_string(), days))
+    .collect()
 }
 
 /// Host-local event relay settings. The token is read from a daemon-owned file;

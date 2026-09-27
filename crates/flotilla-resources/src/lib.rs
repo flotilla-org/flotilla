@@ -1,3 +1,4 @@
+mod artifact;
 mod backend;
 mod change_request;
 mod checkout;
@@ -47,6 +48,7 @@ mod vessel;
 mod watch;
 mod workflow_template;
 
+pub use artifact::{artifact_record_name, Artifact, ArtifactSpec};
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use change_request::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
@@ -187,6 +189,7 @@ pub use watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchSt
 #[macro_export]
 macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::Artifact>($($argument),*);
         $callback::<$crate::Checkout>($($argument),*);
         $callback::<$crate::ChangeRequest>($($argument),*);
         $callback::<$crate::Issue>($($argument),*);
