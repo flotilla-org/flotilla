@@ -17,6 +17,7 @@ mod error;
 mod event;
 mod field_ownership;
 mod forge;
+mod fulfilment_kind;
 mod host;
 mod http;
 mod in_memory;
@@ -100,11 +101,12 @@ pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DE
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
+pub use fulfilment_kind::{FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
-    canonical_host_id, CredentialExpiry, Host, HostCondition, HostConnection, HostSpec, HostStatus, HostStatusPatch, AGENTLESS_CAPABILITY,
-    AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE, CREDENTIAL_EXPIRY_CAPABILITY, HEARTBEAT_READY_TTL_SECS,
-    HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, SLEEP_INHIBITION_CONDITION_TYPE,
-    TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
+    canonical_host_id, CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec, HostStatus,
+    HostStatusPatch, ModelFact, ModelFactSource, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    CREDENTIAL_EXPIRY_CAPABILITY, HEARTBEAT_READY_TTL_SECS, HELD_CREDENTIALS_CAPABILITY, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    SLEEP_INHIBITION_CONDITION_TYPE, TERMINAL_POOLS_CAPABILITY, TRANSPORT_CAPABILITY,
 };
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
@@ -199,6 +201,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::CrewImageBaseline>($($argument),*);
+        $callback::<$crate::FulfilmentKind>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);

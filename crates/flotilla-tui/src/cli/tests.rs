@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
     CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement, ExplainedUnclaimedWork,
@@ -13,6 +13,37 @@ fn crew_follow_up_result_tells_the_crew_to_complete_again() {
     assert!(output.contains("Completion received"));
     assert!(output.contains("follow-up brief was delivered"));
     assert!(output.contains("run `flotilla crew complete` again"));
+}
+
+#[test]
+fn fulfilment_list_distinguishes_image_and_host_model_support() {
+    let make = |name: &str, realisation: &str, version: &str, usable: bool| flotilla_protocol::FulfilmentRow {
+        name: name.to_string(),
+        host_ref: "kiwi".to_string(),
+        pool: "cleat".to_string(),
+        realisation: realisation.to_string(),
+        grants: vec!["platform:linux".to_string()],
+        harnesses: BTreeMap::from([("claude-code".to_string(), flotilla_protocol::FulfilmentHarness {
+            version: version.to_string(),
+            models: BTreeMap::from([("claude-new-model".to_string(), flotilla_protocol::FulfilmentModel {
+                usable,
+                source: "probe".to_string(),
+            })]),
+        })]),
+        toolchains: BTreeMap::new(),
+        gui_session_logged_in: Some(false),
+        free_vessel_slots: None,
+        image: None,
+    };
+    let response = flotilla_protocol::FulfilmentListResponse {
+        kinds: vec![
+            make("docker-crew-image-kiwi", "docker_per_vessel", "2.1.280", false),
+            make("host-direct-kiwi", "host_direct", "2.1.282", true),
+        ],
+    };
+    let output = super::format_fulfilment_list_human(&response);
+    assert!(output.contains("claude-code 2.1.280: claude-new-model: no (probe)"), "{output}");
+    assert!(output.contains("claude-code 2.1.282: claude-new-model: yes (probe)"), "{output}");
 }
 
 #[test]

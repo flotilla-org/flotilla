@@ -187,6 +187,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::HostStatus(_)
         | CommandValue::HostProviders(_)
         | CommandValue::FleetHealth(_)
+        | CommandValue::FulfilmentList(_)
         | CommandValue::FleetList(_)
         | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_)

@@ -75,6 +75,11 @@ impl HostConnection {
 pub struct HostStatus {
     #[serde(default)]
     pub capabilities: BTreeMap<String, serde_json::Value>,
+    /// Live observations keyed by FulfilmentKind name. A fact remains tied to
+    /// the image or host binary version it was obtained from.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[builder(default)]
+    pub fulfilment_facts: BTreeMap<String, FulfilmentFacts>,
     /// Last adapter inventory that did not regress from the preceding
     /// generation. A regressed generation retains this baseline so another
     /// restart cannot silently absorb the loss.
@@ -105,6 +110,40 @@ pub struct HostStatus {
     #[serde(default)]
     #[builder(default)]
     pub sleep_inhibition: SleepInhibitionHealth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentFacts {
+    #[serde(default)]
+    pub harnesses: BTreeMap<String, HarnessFacts>,
+    #[serde(default)]
+    pub toolchains: BTreeMap<String, String>,
+    pub gui_session_logged_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_vessel_slots: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessFacts {
+    pub version: String,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFact {
+    pub usable: bool,
+    pub source: ModelFactSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFactSource {
+    Probe,
+    Declaration,
 }
 
 impl HostStatus {

@@ -9,8 +9,9 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
-    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeId,
-    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
+    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow,
+    HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse,
+    StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -189,6 +190,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             "Sleep Inhibition",
             "Staleness",
             "Diagnosis",
+            "Fulfilments",
         ]);
         for host in &response.hosts {
             let name = if host.is_local { format!("{} (local)", host.host) } else { host.host.to_string() };
@@ -245,6 +247,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
                 Cell::new(format_sleep_inhibition(&host.sleep_inhibition)),
                 Cell::new(row),
                 Cell::new(diagnosis),
+                Cell::new(host.fulfilments.iter().map(format_fulfilment_summary).collect::<Vec<_>>().join("; ")),
             ]);
         }
         format!("{table}\n")
@@ -252,6 +255,61 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
     output.push_str("\nDispatch queue:\n");
     output.push_str(&format_dispatch_queue_human(&response.dispatch_queue));
     output
+}
+
+fn format_fulfilment_summary(kind: &FulfilmentRow) -> String {
+    let harnesses = kind
+        .harnesses
+        .iter()
+        .map(|(name, facts)| {
+            let models = facts
+                .models
+                .iter()
+                .map(|(model, fact)| format!("{model}={} ({})", if fact.usable { "yes" } else { "no" }, fact.source))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name} {} [{models}]", facts.version)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{}: {} | {}", kind.name, kind.grants.join(", "), harnesses)
+}
+
+pub(crate) fn format_fulfilment_list_human(response: &FulfilmentListResponse) -> String {
+    if response.kinds.is_empty() {
+        return "No fulfilment kinds known.\n".to_string();
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Kind", "Host", "Realisation", "Pool", "Grants", "Harness / Models", "Toolchains", "GUI", "Free Slots"]);
+    for kind in &response.kinds {
+        let harnesses = kind
+            .harnesses
+            .iter()
+            .map(|(name, facts)| {
+                let models = facts
+                    .models
+                    .iter()
+                    .map(|(model, fact)| format!("{model}: {} ({})", if fact.usable { "yes" } else { "no" }, fact.source))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name} {}: {models}", facts.version)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        table.add_row(vec![
+            Cell::new(&kind.name),
+            Cell::new(&kind.host_ref),
+            Cell::new(&kind.realisation),
+            Cell::new(&kind.pool),
+            Cell::new(kind.grants.join(", ")),
+            Cell::new(harnesses),
+            Cell::new(kind.toolchains.iter().map(|(name, version)| format!("{name} {version}")).collect::<Vec<_>>().join(", ")),
+            Cell::new(kind.gui_session_logged_in.map_or("-", |logged_in| if logged_in { "yes" } else { "no" })),
+            Cell::new(kind.free_vessel_slots.map_or_else(|| "unbounded".to_string(), |slots| slots.to_string())),
+        ]);
+    }
+    format!("{table}\n")
 }
 
 fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueResponse) -> String {
@@ -929,6 +987,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),
+        CommandValue::FulfilmentList(kinds) => format_fulfilment_list_human(kinds),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),

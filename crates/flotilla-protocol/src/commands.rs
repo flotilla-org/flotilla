@@ -9,7 +9,7 @@ use crate::{
     qualified_path::QualifiedPath,
     query::{
         CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
-        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
+        FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
     AttachableSetId, IssueRef, PrincipalRef, RepoIdentity,
 };
@@ -787,6 +787,7 @@ pub enum CommandAction {
         target_environment_id: crate::EnvironmentId,
     },
     QueryFleetHealth {},
+    QueryFulfilmentList {},
     QueryFleetList {
         project: Option<String>,
         crew_id: Option<String>,
@@ -869,6 +870,7 @@ impl CommandAction {
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetHealth {}
+                | CommandAction::QueryFulfilmentList {}
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
@@ -939,6 +941,7 @@ impl Command {
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetHealth {} => "query fleet health",
+            CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
@@ -1076,6 +1079,7 @@ pub enum CommandValue {
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
     FleetHealth(Box<FleetHealthResponse>),
+    FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
     CrewList(Box<CrewListResponse>),
     FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),

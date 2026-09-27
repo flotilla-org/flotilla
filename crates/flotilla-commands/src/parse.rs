@@ -33,6 +33,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_fulfilment_list() {
+        let noun = parse_noun_command(&["fulfilment", "list"]).expect("parse fulfilment list");
+        let resolved = noun.resolve().expect("resolve fulfilment list");
+        assert!(matches!(resolved, Resolved::Ready(ref command) if matches!(command.action, CommandAction::QueryFulfilmentList {})));
+    }
+
+    #[test]
     fn parse_unknown_noun_errors() {
         assert!(parse_noun_command(&["bogus", "verb"]).is_err());
     }
