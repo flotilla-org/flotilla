@@ -44,6 +44,11 @@ impl ChangeRequestRef {
 pub trait ChangeRequestObservationSource: Send + Sync {
     async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String>;
 
+    async fn observe_group(&self, subjects: &[ChangeRequestRef], subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+        let _ = subjects;
+        self.observe(subject).await
+    }
+
     async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
         self.observe(subject).await
     }
@@ -98,7 +103,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
     }
 }
 
-fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
+pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Result<ChangeRequestStatus, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| format!("decode gh pr observation: {error}"))?;
     let state = match value["state"].as_str() {
         Some("OPEN") if value["isDraft"] == true => Some(ObservedChangeRequestState::Draft),
@@ -224,7 +229,22 @@ impl ChangeRequestRefresher {
         if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
-        let status = self.inner.source.observe_for_completion(subject).await?;
+        let status = if create_missing {
+            self.inner.source.observe_for_completion(subject).await?
+        } else {
+            let group = self
+                .inner
+                .active
+                .lock()
+                .await
+                .keys()
+                .filter(|candidate| {
+                    candidate.namespace == subject.namespace && candidate.service == subject.service && candidate.scope == subject.scope
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            self.inner.source.observe_group(&group, subject).await?
+        };
         self.publish(subject, &subject.record_name(), status, true, false, create_missing).await
     }
 
@@ -388,7 +408,18 @@ impl ChangeRequestRefresher {
                 }
                 Ok(true) => {}
             }
-            match self.inner.source.observe(&subject).await {
+            let group = self
+                .inner
+                .active
+                .lock()
+                .await
+                .keys()
+                .filter(|candidate| {
+                    candidate.namespace == subject.namespace && candidate.service == subject.service && candidate.scope == subject.scope
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            match self.inner.source.observe_group(&group, &subject).await {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));

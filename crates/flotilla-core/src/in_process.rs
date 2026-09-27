@@ -12,7 +12,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Weak,
+        Arc, OnceLock, Weak,
     },
     time::Duration,
 };
@@ -77,6 +77,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::{required_agent_adapters, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
+    change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef},
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
@@ -114,6 +115,7 @@ use crate::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
         },
+        github_api::rate_limit_reset,
         issue_tracker::{forge_issue_source, IssueProvider},
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -130,6 +132,112 @@ use crate::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
 };
+
+type ObservationScope = (String, String, String);
+struct CachedObservation {
+    expires_at: tokio::time::Instant,
+    queried: BTreeSet<u64>,
+    result: Result<HashMap<u64, flotilla_resources::ChangeRequestStatus>, String>,
+}
+
+struct ProviderChangeRequestObservationSource {
+    daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
+    cache: Mutex<HashMap<ObservationScope, CachedObservation>>,
+}
+
+impl ProviderChangeRequestObservationSource {
+    fn new(daemon: Arc<OnceLock<Weak<InProcessDaemon>>>) -> Self {
+        Self { daemon, cache: Mutex::new(HashMap::new()) }
+    }
+
+    async fn query(
+        &self,
+        subjects: &[ChangeRequestRef],
+        subject: &ChangeRequestRef,
+        fresh: bool,
+    ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        let key = (subject.namespace.clone(), subject.service.clone(), subject.scope.clone());
+        let mut numbers = subjects.iter().map(|subject| subject.number).collect::<BTreeSet<_>>();
+        numbers.insert(subject.number);
+        let mut cache = self.cache.lock().await;
+        let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("change request observation daemon unavailable")?;
+        let repositories =
+            daemon.resource_backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+        let repository = repositories
+            .items
+            .into_iter()
+            .find(|repository| {
+                repository.object.spec.forge().is_some_and(|forge| {
+                    forge.repository == subject.scope && forge.service_url.trim_end_matches('/') == format!("https://{}", subject.service)
+                })
+            })
+            .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
+        for convoy in daemon
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+        {
+            if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                continue;
+            }
+            if let Some(bound) =
+                convoy.object.spec.change_request.as_ref().filter(|bound| bound.repository_ref == repository.object.spec.key())
+            {
+                if let Ok(number) = bound.id.parse() {
+                    numbers.insert(number);
+                }
+            }
+        }
+        let queried = numbers;
+        if !fresh {
+            if let Some(entry) = cache.get(&key) {
+                if tokio::time::Instant::now() < entry.expires_at && queried.is_subset(&entry.queried) {
+                    return entry
+                        .result
+                        .as_ref()
+                        .map_err(Clone::clone)?
+                        .get(&subject.number)
+                        .cloned()
+                        .ok_or_else(|| format!("change request {} was not found", subject.number));
+                }
+            }
+        }
+        let numbers = queried.iter().copied().collect::<Vec<_>>();
+        let provider = daemon.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
+        let result = provider.observe_bound(&numbers).await;
+        let delay = result
+            .as_ref()
+            .err()
+            .and_then(|error| rate_limit_reset(error))
+            .and_then(|reset| reset.signed_duration_since(Utc::now()).to_std().ok())
+            .unwrap_or(Duration::from_secs(9));
+        let status = result.as_ref().map(|statuses| statuses.get(&subject.number).cloned()).map_err(Clone::clone);
+        cache.insert(key, CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
+        status?.ok_or_else(|| format!("change request {} was not found", subject.number))
+    }
+}
+
+#[async_trait]
+impl ChangeRequestObservationSource for ProviderChangeRequestObservationSource {
+    async fn observe(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        self.query(std::slice::from_ref(subject), subject, false).await
+    }
+
+    async fn observe_group(
+        &self,
+        subjects: &[ChangeRequestRef],
+        subject: &ChangeRequestRef,
+    ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        self.query(subjects, subject, false).await
+    }
+
+    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        self.query(std::slice::from_ref(subject), subject, true).await
+    }
+}
 
 fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
     let mut encoded = String::with_capacity(config_key.len() * 2);
@@ -2287,6 +2395,7 @@ pub struct InProcessDaemon {
     /// observations using the identity that originally created them.
     repository_keys_by_path: RwLock<HashMap<PathBuf, RepositoryKey>>,
     repository_change_requests: RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>,
+    change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,
     host_registry: crate::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
@@ -2638,10 +2747,12 @@ impl InProcessDaemon {
         .await;
 
         let (fleet_replica_tx, _) = broadcast::channel(32);
+        let observer_daemon = Arc::new(OnceLock::new());
+        let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(Arc::clone(&observer_daemon)));
         let change_request_refresher = crate::change_request_observer::ChangeRequestRefresher::new(
             resource_backend.clone(),
             local_node_id.to_string(),
-            Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(discovery.runner.clone())),
+            observation_source.clone(),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
         if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
@@ -2660,6 +2771,7 @@ impl InProcessDaemon {
             path_identities: RwLock::new(path_identities),
             repository_keys_by_path: RwLock::new(repository_keys_by_path),
             repository_change_requests: RwLock::new(HashMap::new()),
+            change_request_observation_source: observation_source,
             host_registry: crate::host_registry::HostRegistry::new(
                 NodeInfo::new(local_node_id.clone(), host_name.to_string()),
                 local_host_summary,
@@ -2696,6 +2808,10 @@ impl InProcessDaemon {
             admission_free_space_path: std::sync::RwLock::new(admission_free_space_path),
             leaf_subscriptions: leaf_subscriptions.clone(),
         });
+        observer_daemon
+            .set(Arc::downgrade(&daemon))
+            .map_err(|_| "observation daemon already initialized")
+            .expect("initialize observation daemon");
         leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { daemon: Arc::downgrade(&daemon) })).await;
 
         let weak = Arc::downgrade(&daemon);
@@ -4070,6 +4186,9 @@ impl InProcessDaemon {
 
         match matches.len() {
             1 => Ok(matches.remove(0)),
+            0 if failures.iter().any(|failure| failure.contains("rate limited")) => {
+                Err(format!("change request {requested_id} lookup was rate limited: {}", failures.join("; ")))
+            }
             0 if consulted.is_empty() => Err(format!(
                 "change request {requested_id} could not be resolved because no project repository could be consulted{}",
                 if failures.is_empty() { String::new() } else { format!(": {}", failures.join("; ")) }
@@ -4139,10 +4258,11 @@ impl InProcessDaemon {
         let forge = match repository.identity() {
             RepositoryIdentity::Forge { forge_ref, .. } => Some(
                 self.resource_backend
-                    .definitions::<Forge>(namespace)
+                    .including_replicas::<Forge>(namespace)
                     .get(forge_ref)
                     .await
                     .map_err(|error| format!("Forge {forge_ref}: {error}"))?
+                    .object
                     .spec,
             ),
             _ => forge_for_remote(&self.resource_backend, namespace, remote).await?,
@@ -4195,10 +4315,44 @@ impl InProcessDaemon {
         if let Some(change_request) = self.resolve_observed_convoy_change_request(repository_keys, change_request_id).await? {
             return Ok(Some(change_request));
         }
+        if let Some(id) = change_request_id {
+            let namespace = self.provisioning_namespace().await;
+            let repositories = self.resource_backend.including_replicas::<Repository>(&namespace);
+            let mut failures = Vec::new();
+            for repository_key in repository_keys {
+                let repository = match repositories.get(&repository_key.to_string()).await {
+                    Ok(repository) => repository,
+                    Err(error) => {
+                        failures.push(error.to_string());
+                        continue;
+                    }
+                };
+                let Some(remote) = repository.object.spec.live_remote() else { continue };
+                let address = change_request_address(remote, id)?;
+                let Some(subject) = ChangeRequestRef::from_address(&namespace, &address) else { continue };
+                match self.change_request_observation_source.observe(&subject).await {
+                    Ok(observation) => {
+                        let status = match observation.state.value {
+                            Some(ObservedChangeRequestState::Open) => flotilla_protocol::ChangeRequestStatus::Open,
+                            Some(ObservedChangeRequestState::Draft) => flotilla_protocol::ChangeRequestStatus::Draft,
+                            Some(ObservedChangeRequestState::Merged) => flotilla_protocol::ChangeRequestStatus::Merged,
+                            Some(ObservedChangeRequestState::Closed) => flotilla_protocol::ChangeRequestStatus::Closed,
+                            None => continue,
+                        };
+                        return Ok(Some(ConvoyChangeRequest { id: id.to_string(), status, repository_key: repository_key.clone() }));
+                    }
+                    Err(error) => failures.push(error),
+                }
+            }
+            if let Some(error) = failures.iter().find(|error| error.contains("rate limited")) {
+                return Err(error.clone());
+            }
+            return failures.into_iter().next().map_or(Ok(None), Err);
+        }
 
         let (live_candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
 
-        let mut first_error = setup_failures.into_iter().next();
+        let mut failures = setup_failures;
         for (repository, _, provider) in live_candidates {
             let resolved = match change_request_id {
                 Some(id) => provider.get_change_request(id).await.map(Some),
@@ -4210,14 +4364,14 @@ impl InProcessDaemon {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    first_error.get_or_insert(error);
+                    failures.push(error);
                 }
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(None),
+        if let Some(error) = failures.iter().find(|error| error.contains("rate limited")) {
+            return Err(error.clone());
         }
+        failures.into_iter().next().map_or(Ok(None), Err)
     }
 
     async fn resolve_observed_convoy_change_request(

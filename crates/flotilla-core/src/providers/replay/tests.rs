@@ -183,7 +183,7 @@ interactions:
 
     let error = api.get(endpoint, Path::new("/repo"), &label).await.expect_err("403 must fail");
 
-    assert_eq!(error, "github rate limit exceeded; reset_at=2026-07-23T16:00:00+00:00");
+    assert_eq!(error, "github rate limited (budget=REST core, identity=host gh login, reset_at=2026-07-23T16:00:00+00:00)");
     session.assert_complete();
 }
 

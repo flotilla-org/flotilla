@@ -1976,6 +1976,31 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
     );
     assert_eq!(convoy.spec.repositories[0].source_ref, "main");
     assert_eq!(convoy.spec.repositories[0].target_ref, "main");
+    let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 1071);
+    let record = records
+        .create(
+            &InputMeta::builder().name(name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("owner/repo".to_string())
+                .number(1071)
+                .observing_authority("test".to_string())
+                .build(),
+        )
+        .await
+        .expect("observed change request");
+    let at = chrono::Utc::now();
+    records
+        .update_status(&name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, at),
+            head_sha: flotilla_resources::Observation::unknown(at),
+            checks: flotilla_resources::Observation::unknown(at),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: flotilla_resources::Observation::unknown(at) },
+            mergeable: flotilla_resources::Observation::unknown(at),
+        })
+        .await
+        .expect("observed status");
     assert_eq!(
         daemon
             .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "feat/existing-pr", Some("1071"))

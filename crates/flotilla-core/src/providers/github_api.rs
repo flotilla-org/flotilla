@@ -10,7 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use crate::providers::{run_output, ChannelLabel, CommandRunner};
 
 const MAX_PER_PAGE: usize = 100;
-const RATE_LIMIT_RESET_PREFIX: &str = "github rate limit exceeded; reset_at=";
+const RATE_LIMIT_PREFIX: &str = "github rate limited (budget=";
 
 /// Extract a GitHub rate-limit reset timestamp from a provider error.
 ///
@@ -18,7 +18,7 @@ const RATE_LIMIT_RESET_PREFIX: &str = "github rate limit exceeded; reset_at=";
 /// small and private to the provider layer while giving polling callers a
 /// reliable way to distinguish a rate limit from an ordinary failure.
 pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
-    error.strip_prefix(RATE_LIMIT_RESET_PREFIX)?.parse().ok()
+    error.strip_prefix(RATE_LIMIT_PREFIX)?.rsplit_once("reset_at=")?.1.strip_suffix(')')?.parse().ok()
 }
 
 /// Clamp a limit to GitHub's max per_page (100), warning if truncated.
@@ -71,19 +71,28 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
     GhApiResponse { status, etag, body, has_next_page, total_count: None }
 }
 
-pub(crate) fn rate_limit_error(reset: &str) -> String {
+pub(crate) fn rate_limit_error_for(budget: &str, reset: &str) -> String {
     let reset = reset
         .parse::<i64>()
         .ok()
         .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
         .map(|time| time.to_rfc3339())
         .unwrap_or_else(|| reset.to_string());
-    format!("{RATE_LIMIT_RESET_PREFIX}{reset}")
+    format!("github rate limited (budget={budget}, identity=host gh login, reset_at={reset})")
 }
 
-fn rate_limit_error_from_response(raw: &str) -> Option<String> {
+#[cfg(any(test, feature = "replay"))]
+pub(crate) fn rate_limit_error(reset: &str) -> String {
+    rate_limit_error_for("REST core", reset)
+}
+
+pub(crate) fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<String> {
     let response = parse_gh_api_response(raw);
-    if response.status != 403 {
+    let lower = raw.to_ascii_lowercase();
+    if response.status != 403 && !lower.contains("rate limit") {
+        return None;
+    }
+    if !lower.contains("rate limit") && !lower.contains("x-ratelimit-remaining: 0") {
         return None;
     }
 
@@ -91,7 +100,7 @@ fn rate_limit_error_from_response(raw: &str) -> Option<String> {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("x-ratelimit-reset").then_some(value.trim())
     })?;
-    Some(rate_limit_error(reset))
+    Some(rate_limit_error_for(budget, reset))
 }
 
 #[async_trait]
@@ -163,7 +172,7 @@ impl GhApi for GhApiClient {
         }
 
         if !output.success {
-            if let Some(error) = rate_limit_error_from_response(&output.stdout) {
+            if let Some(error) = rate_limit_error_from_response(&output.stdout, "REST core") {
                 return Err(error);
             }
             return Err(output.stderr);
@@ -247,7 +256,7 @@ mod tests {
     #[test]
     fn extracts_rate_limit_reset_from_403_response() {
         let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
-        let error = rate_limit_error_from_response(raw).expect("rate limit error");
+        let error = rate_limit_error_from_response(raw, "REST core").expect("rate limit error");
         assert_eq!(rate_limit_reset(&error).expect("reset timestamp"), Utc.timestamp_opt(1784736000, 0).single().expect("valid timestamp"));
     }
 }
