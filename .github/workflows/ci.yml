@@ -89,6 +89,29 @@ jobs:
       - run: cargo build -p flotilla-relay --target wasm32-unknown-unknown --locked
       - run: cargo clippy -p flotilla-relay --target wasm32-unknown-unknown --locked -- -D warnings
 
+  relay-runtime:
+    name: Relay Workers runtime
+    runs-on: ubuntu-latest
+    # The suite takes well under a minute once built; a stuck runtime must not hold a runner for hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "relay-runtime"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Pinned together: worker-build must match the `worker` crate's minor version.
+      - run: npm install -g wrangler@4.42.2
+      - run: cargo install worker-build --version 0.8.7 --locked
+      # Build the test binary as its own step so compile time and test time show separately.
+      - run: cargo test -p flotilla-relay --test runtime --locked --no-run
+      - run: cargo test -p flotilla-relay --test runtime --locked -- --ignored
+
   test:
     name: Test
     runs-on: ubuntu-latest
