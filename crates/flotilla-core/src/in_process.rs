@@ -3420,6 +3420,11 @@ impl InProcessDaemon {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn set_direct_environment_ssh_destination_for_test(&self, env_id: &EnvironmentId, destination: String) -> Result<(), String> {
+        self.environment_manager.set_direct_environment_ssh_destination(env_id, destination)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn register_provisioned_environment_for_test(
         &self,
         env_id: EnvironmentId,
@@ -9891,15 +9896,7 @@ impl InProcessDaemon {
             )
         {
             let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-            let registry = self.registry_for_resource_environment(&environment, cwd.as_path()).await?;
-            let pool = registry
-                .terminal_pools
-                .get(&session.spec.pool)
-                .map(|(_, pool)| Arc::clone(pool))
-                .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-            let attach_target = terminal_session_attach_target(session)?;
-            pool.preflight_attach(seat).await?;
-            let attach_args = pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new(), seat)?;
+            let attach_args = self.terminal_pool_attach_args(session, &environment, &cwd, seat).await?;
             let plan = ResolvedAttachPlan::command(vec![
                 Arg::Literal("ssh".to_string()),
                 Arg::Literal("-tt".to_string()),
@@ -9959,15 +9956,7 @@ impl InProcessDaemon {
         seat: AttachMode,
     ) -> Result<ResolvedAttachPlan, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
-        let pool = registry
-            .terminal_pools
-            .get(&session.spec.pool)
-            .map(|(_, pool)| Arc::clone(pool))
-            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-        let attach_target = terminal_session_attach_target(session)?;
-        pool.preflight_attach(seat).await?;
-        let attach_args = pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new(), seat)?;
+        let attach_args = self.terminal_pool_attach_args(session, environment, &cwd, seat).await?;
         if environment.spec.docker.is_some() {
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
             let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
@@ -9993,6 +9982,24 @@ impl InProcessDaemon {
             return hop_resolver.resolve(&plan, &mut context).map(|resolved| ResolvedAttachPlan(resolved.0));
         }
         Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
+    }
+
+    async fn terminal_pool_attach_args(
+        &self,
+        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        cwd: &ExecutionEnvironmentPath,
+        seat: AttachMode,
+    ) -> Result<Vec<Arg>, String> {
+        let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
+        let pool = registry
+            .terminal_pools
+            .get(&session.spec.pool)
+            .map(|(_, pool)| Arc::clone(pool))
+            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
+        let attach_target = terminal_session_attach_target(session)?;
+        pool.preflight_attach(seat).await?;
+        pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, cwd, &Vec::new(), seat)
     }
 
     async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
