@@ -256,6 +256,7 @@ pub(crate) struct GithubAppScope {
 #[derive(Debug)]
 pub(crate) struct CredentialRefreshError {
     pub(crate) environment_ref: String,
+    pub(crate) credential_name: Option<String>,
     pub(crate) message: String,
     pub(crate) should_surface: bool,
 }
@@ -885,6 +886,7 @@ impl CredentialStore {
         *failures += 1;
         CredentialRefreshError {
             environment_ref: environment_ref.to_string(),
+            credential_name: None,
             message,
             should_surface: *failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD,
         }
@@ -1143,7 +1145,8 @@ impl CredentialStore {
                         let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                         errors.push(CredentialRefreshError {
                             environment_ref: key.0.clone(),
-                            message: bounded_adapter_error(&key.1, "github-app", &error),
+                            credential_name: Some(key.1.clone()),
+                            message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
                             should_surface,
                         });
                         continue;
@@ -1164,7 +1167,8 @@ impl CredentialStore {
                     let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                     errors.push(CredentialRefreshError {
                         environment_ref: key.0.clone(),
-                        message: format!("credential `{}` adapter `github-app`: {error}", key.1),
+                        credential_name: Some(key.1.clone()),
+                        message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
                         should_surface,
                     });
                     continue;
@@ -1172,7 +1176,12 @@ impl CredentialStore {
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
                 let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
-                errors.push(CredentialRefreshError { environment_ref: key.0.clone(), message: error, should_surface });
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    credential_name: Some(key.1.clone()),
+                    message: self.refresh_failure_message(&key.1, delivery.expires_at, &error),
+                    should_surface,
+                });
                 continue;
             }
             let mut deliveries = self.github_app_deliveries.lock().await;
@@ -1183,8 +1192,10 @@ impl CredentialStore {
                 current.refresh_failures += 1;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
-                    message: bounded_adapter_error(&key.1, "github-app", &error),
-                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                    credential_name: Some(key.1.clone()),
+                    message: self.refresh_failure_message(&key.1, current.expires_at, &error),
+                    should_surface: (current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        && self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at)
                         || self.clock.now() >= current.expires_at,
                 });
                 continue;
@@ -1194,6 +1205,18 @@ impl CredentialStore {
             current.request = request;
         }
         errors
+    }
+
+    fn refresh_failure_message(&self, name: &str, expires_at: DateTime<Utc>, error: &str) -> String {
+        let remaining = expires_at - self.clock.now();
+        let expired = remaining <= Duration::zero();
+        let seconds = if expired { -remaining.num_seconds() } else { remaining.num_seconds() };
+        let minutes = seconds.saturating_add(59) / 60;
+        let unit = if minutes == 1 { "minute" } else { "minutes" };
+        let expiry = if expired { format!("expired {minutes} {unit} ago") } else { format!("expires in {minutes} {unit}") };
+        let prefix = format!("credential `{name}` adapter `github-app`: ");
+        let detail = error.strip_prefix(&prefix).unwrap_or(error);
+        format!("{}; {expiry}", bounded_adapter_error(name, "github-app", detail))
     }
 
     pub(crate) async fn set_github_app_scopes(&self, environment_ref: &str, scopes: &BTreeMap<String, GithubAppScope>) {
@@ -1224,7 +1247,9 @@ impl CredentialStore {
             return false;
         };
         current.refresh_failures += 1;
-        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || self.clock.now() >= current.expires_at
+        (current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+            && self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at)
+            || self.clock.now() >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -2740,7 +2765,6 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-
         store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
         store.prepare_scoped("env-a", &refs, &scopes, runner).await.expect("second preparation after invalidation");
         session.assert_complete();
@@ -3096,6 +3120,14 @@ interactions:
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
 
+        assert_eq!(
+            store.refresh_failure_message(
+                "github-app",
+                now + Duration::seconds(45),
+                "credential `github-app` adapter `github-app`: invalid scalar",
+            ),
+            "credential `github-app` adapter `github-app`: invalid scalar; expires in 1 minute"
+        );
         let environment = store
             .prepare_scoped("standing-vessel", &refs, &scopes, runner.clone())
             .await

@@ -47,6 +47,9 @@ pub struct CrewListResponse {
     pub vessel_ref: String,
     pub vessel: String,
     pub members: Vec<CrewListMember>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub credential_alerts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

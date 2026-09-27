@@ -2917,6 +2917,35 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
     assert_eq!(crew_attention(Some(&status), true, now), None);
 }
 
+#[tokio::test]
+async fn credential_alerts_match_the_exact_convoy_and_vessel() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let demand = backend
+        .using::<ResourceDemand>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("credential-refresh-conv-implement-review-github-app".to_string())
+                .annotations(BTreeMap::from([
+                    ("flotilla.work/credential-refresh-vessel".to_string(), "implement-review".to_string()),
+                    ("flotilla.work/credential-refresh-reason".to_string(), "github-app expires in 2 minutes".to_string()),
+                ]))
+                .build(),
+            &DemandSpec::for_dispatching_principal(
+                flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "conv"),
+                DemandKind::HumanGate,
+                flotilla_resources::PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("create credential attention demand");
+    assert_eq!(
+        credential_refresh_alert_for_vessel(&demand, "conv", "implement-review"),
+        Some("github-app expires in 2 minutes".to_string())
+    );
+    assert_eq!(credential_refresh_alert_for_vessel(&demand, "conv", "implement"), None);
+    assert_eq!(credential_refresh_alert_for_vessel(&demand, "other-convoy", "implement-review"), None);
+}
+
 #[test]
 fn handed_back_crew_is_settled_for_its_own_attention() {
     assert!(crew_work_unsettled(CrewWorkPhase::Working));

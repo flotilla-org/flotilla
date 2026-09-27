@@ -840,6 +840,19 @@ fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, 
     })
 }
 
+fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDemand>, convoy: &str, vessel: &str) -> Option<String> {
+    if demand.spec.originating_work_ref.name != convoy
+        || demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel").is_none_or(|name| name != vessel)
+        || !matches!(
+            demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
+            DemandState::Raised | DemandState::Escalated
+        )
+    {
+        return None;
+    }
+    demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned()
+}
+
 fn crew_work_unsettled(phase: CrewWorkPhase) -> bool {
     !matches!(phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack | CrewWorkPhase::Failed)
 }
@@ -8679,6 +8692,17 @@ impl InProcessDaemon {
             .into_iter()
             .map(|session| (session.spec.role.clone(), session))
             .collect();
+        let credential_alerts = self
+            .resource_backend
+            .clone()
+            .using::<ResourceDemand>(&context.namespace)
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .filter_map(|demand| credential_refresh_alert_for_vessel(&demand, &context.convoy, &context.vessel))
+            .collect::<Vec<_>>();
         let members = task
             .crew
             .iter()
@@ -8715,6 +8739,7 @@ impl InProcessDaemon {
             .vessel_ref(context.vessel_ref)
             .vessel(context.vessel)
             .members(members)
+            .credential_alerts(credential_alerts)
             .build())
     }
 
