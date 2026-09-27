@@ -77,6 +77,23 @@ jobs:
           source orchestration/ci/fleet-candidates/setup-linux-toolchain.sh
           orchestration/ci/fleet-candidates/build-candidate.sh
 
+      - name: Validate project-map manifests against the Linux candidate
+        shell: bash
+        env:
+          PROJECT_MAP_READ_TOKEN: ${{ secrets.PROJECT_MAP_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$PROJECT_MAP_READ_TOKEN"
+          git init project-map
+          git -C project-map remote add origin https://github.com/robert/project-map.git
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PROJECT_MAP_READ_TOKEN" | base64 -w 0)"
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="$auth" \
+            git -C project-map fetch --depth=1 origin main
+          git -C project-map checkout --detach FETCH_HEAD
+          dist/fleet-candidate-linux-x86_64-gnu2.36/bin/flotilla resource validate project-map/flotilla-manifests/
+
       - name: Upload seven-day Linux candidate
         uses: https://code.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32
         with:

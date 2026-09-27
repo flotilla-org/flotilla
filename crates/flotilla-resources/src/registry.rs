@@ -6,7 +6,7 @@ pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream::BoxStream, StreamExt};
-use serde::Deserialize;
+use serde::{de::IntoDeserializer, Deserialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -692,6 +692,29 @@ pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceE
         .ok_or_else(|| ResourceError::decode("decode resource document: missing or non-string kind"))?;
     let spec = document.get("spec").ok_or_else(|| ResourceError::decode("decode resource document: missing spec"))?;
     dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
+}
+
+/// Check a manifest document against the same registered spec types used by
+/// application, without contacting a backend or mutating any resource.
+pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError> {
+    let decoded: DynamicApplyDocument = serde_path_to_error::deserialize(document.clone().into_deserializer())
+        .map_err(|error| ResourceError::decode(format!("decode resource document at {}: {error}", error.path())))?;
+    let version = document
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ResourceError::decode("decode resource document: missing or non-string apiVersion"))?;
+    let registered = lookup_resource_kind(&decoded.kind)?;
+    let expected = dispatch_resource_kind!(registered.resource, api_version_typed());
+    if version != expected {
+        return Err(ResourceError::decode(format!("apiVersion: expected {expected}, got {version}")));
+    }
+    dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))
+}
+
+fn validate_typed_spec<T: Resource>(spec: &Value) -> Result<(), ResourceError> {
+    serde_path_to_error::deserialize::<_, T::Spec>(spec.clone().into_deserializer())
+        .map(|_| ())
+        .map_err(|error| ResourceError::decode(format!("spec.{}: {error}", error.path())))
 }
 
 fn typed_spec_hash<T: Resource>(spec: &Value) -> Result<String, ResourceError> {
