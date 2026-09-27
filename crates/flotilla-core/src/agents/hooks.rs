@@ -2,7 +2,7 @@
 //!
 //! Each agent harness (Claude Code, Codex, Gemini, etc.) has its own native
 //! hook format. This module provides a trait for normalizing native events
-//! into a common `AgentHookEvent`, plus a Claude Code parser implementation.
+//! into a common `AgentHookEvent`, with parsers for Claude Code and Codex.
 
 use flotilla_protocol::{AgentEventType, AgentHarness};
 // Re-export protocol types used by callers of this module.
