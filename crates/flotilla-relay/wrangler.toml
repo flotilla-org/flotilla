@@ -2,8 +2,22 @@ name = "flotilla-relay"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-09-26"
 
+# Requires `worker-build` on PATH (`cargo install worker-build --locked`).
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+command = "worker-build --release"
+
+# Non-secret settings. Retention defaults to 7 days and 10000 subjects per install.
+# [vars]
+# RELAY_RETENTION_SECS = "604800"
+# RELAY_SUBJECT_CAP = "10000"
+#
+# The only Worker secret is the operator credential's digest; tenant material lives in each
+# install's Durable Object. Set it in the deployment environment, never here:
+#   printf %s "$OPERATOR_TOKEN" | shasum -a 256 | cut -d' ' -f1 | wrangler secret put RELAY_OPERATOR_TOKEN_SHA256
+#
+# Custom domain, declared per deployment environment (deployment itself is an ops step):
+# [env.production]
+# routes = [{ pattern = "relay.example.com", custom_domain = true }]
 
 [[durable_objects.bindings]]
 name = "MAILBOX"

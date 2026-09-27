@@ -4,7 +4,7 @@ Date: 2026-09-26
 
 ## Status
 
-Accepted
+Accepted. Amended 2026-09-27 (#2072, see Amendment below).
 
 Amends ADR 0029 (resolves its deferred "Webhook refreshers" entry). Grilled on
 #1680.
@@ -152,3 +152,69 @@ held by the relay. Crews never hold it.
 - **Ownership contention as a human question.** Wheelhouse/attention work.
 - **Infrastructure-as-config.** Deploying the hosted relay (and a self-hosted
   flotilla governor) likely belongs in a flotilla-ops repository.
+
+## Amendment (2026-09-27): per-subject mailbox, per-install secrets
+
+Ruled in #2072, after review of the first reference implementation (#2069).
+
+### The mailbox coalesces per subject
+
+The mailbox was a hint log capped at 256 hints and 24 hours. Hints are
+invalidations, so that shape spent its capacity on repeats. One pull-request
+push with a few CI jobs emits dozens of check events, so a handful of active
+convoys forced every consumer into a gap and a full resync within the hour, and
+a home that slept overnight always gapped. That is the polling cost the relay
+exists to remove.
+
+The mailbox keeps **the latest delivery per subject** instead. Each new hint
+takes the next cursor and replaces its subject's entry. `read(cursor)` returns
+the subjects whose latest cursor is newer than `cursor`, oldest first. A burst
+on one subject occupies one entry, and a consumer resuming after a quiet period
+gets each changed subject once.
+
+Retention is by time (default 7 days, configurable) plus a per-install subject
+cap. The relay records the newest cursor it has pruned (its **horizon**). A
+consumer whose cursor is below the horizon may have missed a pruned subject and
+gets `gap`, with the same meaning as before: refresh everything it demands, then
+resume from `latest_cursor`. Delivery stays at-least-once. A redelivery of a
+subject's latest delivery (same delivery id) is dropped.
+
+In the reference implementation, each subject is a row in the install's
+SQLite-backed Durable Object.
+
+### Credentials live with their install; operators provision them
+
+The first cut kept every install's consumer token and webhook secrets in one
+Worker secret: one blast radius across tenants, and a redeploy per install.
+Instead:
+
+- Each install's per-source webhook secrets and consumer tokens are stored
+  **with that install** (in the reference implementation, its Durable Object's
+  storage). Consumer tokens are stored **hashed**. An install may hold several
+  valid tokens, and several secrets per source, so rotation is add, switch,
+  revoke, with no window in which nothing verifies.
+- An **operator-authenticated admin API** creates and deletes installs, mints
+  and revokes consumer tokens, and adds and revokes source secrets. The relay's
+  only global secret is the operator credential, stored as a digest. It holds
+  no tenant material.
+- Requests for an unknown install fail exactly as requests with bad credentials
+  do, so install ids cannot be enumerated.
+
+This supersedes "signup and provisioning are not built yet" above:
+provisioning is built, and **public signup remains deferred**.
+
+### Subjects are case-normalized
+
+GitHub owner and repository names are case-insensitive, but subjects are
+compared as exact strings. For GitHub subjects the service and the
+`owner/repo` scope are **ASCII-lowercased**. The rule is defined in
+`flotilla-relay-protocol` (`Subject`). Consumers that key local state by
+subject, such as the daemon's change-request record name, must apply the same
+normalization (#2051).
+
+### Review feedback wakes the refresher
+
+`issue_comment` (on a pull request it produces a `cr/…` subject, on an issue an
+`issue/…` subject), `pull_request_review_comment`, and
+`pull_request_review_thread` are handled events, so review comments and thread
+resolution trigger a change-request refresh (#1680).
