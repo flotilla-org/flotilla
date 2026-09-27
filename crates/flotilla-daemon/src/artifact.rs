@@ -261,6 +261,21 @@ mod tests {
             .role("coder".to_string())
             .crew_id("crew-1".to_string())
             .build();
+        for (mut invalid, expected) in [
+            (input("head", BTreeMap::new(), b"body"), "kind"),
+            (input("", BTreeMap::new(), b"body"), "subject"),
+            (input("head", BTreeMap::new(), b"body"), "media type"),
+            (input("head", BTreeMap::from([("items".into(), serde_json::json!([1, 2]))]), b"body"), "scalar"),
+            (input("head", BTreeMap::from([("large".into(), serde_json::json!("x".repeat(4096)))]), b"body"), "4096"),
+        ] {
+            match expected {
+                "kind" => invalid.kind.clear(),
+                "media type" => invalid.media_type.clear(),
+                _ => {}
+            }
+            let error = service.prepare_put(&caller, invalid, &retention).await.expect_err("reject invalid artifact input");
+            assert!(error.contains(expected), "unexpected validation error: {error}");
+        }
         let first = service
             .put(&caller, input("head-1", BTreeMap::from([("disposition".into(), serde_json::json!("approve"))]), b"one"), &retention)
             .await

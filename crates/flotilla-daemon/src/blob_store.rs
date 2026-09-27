@@ -327,12 +327,7 @@ impl S3BlobStore {
         url.set_path(&path);
         Ok(url)
     }
-    async fn request(
-        &self,
-        method: reqwest::Method,
-        digest: &BlobDigest,
-        body: Option<&[u8]>,
-    ) -> Result<http::Response<bytes::Bytes>, String> {
+    fn signed_request(&self, method: reqwest::Method, digest: &BlobDigest, body: Option<&[u8]>) -> Result<reqwest::Request, String> {
         let url = self.object_url(digest)?;
         let payload_hash = format!("{:x}", Sha256::digest(body.unwrap_or_default()));
         let now = self.signing_time.unwrap_or_else(Utc::now);
@@ -372,7 +367,15 @@ impl S3BlobStore {
         if let Some(body) = body {
             builder = builder.body(body.to_vec());
         }
-        let request = builder.build().map_err(|error| error.to_string())?;
+        builder.build().map_err(|error| error.to_string())
+    }
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        digest: &BlobDigest,
+        body: Option<&[u8]>,
+    ) -> Result<http::Response<bytes::Bytes>, String> {
+        let request = self.signed_request(method, digest, body)?;
         self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await
     }
     fn check(status: http::StatusCode, expected: &[http::StatusCode]) -> Result<(), String> {
@@ -431,6 +434,20 @@ impl BlobStore for S3BlobStore {
         let bytes = response.into_body().to_vec();
         digest.verify(&bytes)?;
         Ok(Some(bytes))
+    }
+    async fn get_file(&self, digest: &BlobDigest, path: &Path) -> Result<Option<u64>, String> {
+        let request = self.signed_request(reqwest::Method::GET, digest, None)?;
+        let status = self.http.execute_to_file(request, &ChannelLabel::Http("blob-store".into()), path).await?;
+        if status == http::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check(status, &[http::StatusCode::OK])?;
+        let (actual, size) = digest_file(path).await?;
+        if actual != *digest {
+            let _ = tokio::fs::remove_file(path).await;
+            return Err(format!("blob digest mismatch for {}", digest.as_str()));
+        }
+        Ok(Some(size))
     }
     async fn has(&self, digest: &BlobDigest) -> Result<bool, String> {
         let response = self.request(reqwest::Method::HEAD, digest, None).await?;
@@ -662,6 +679,23 @@ async fn older_than(path: &Path, grace: Duration) -> Result<bool, String> {
     Ok(std::time::SystemTime::now().duration_since(modified).is_ok_and(|age| age >= grace))
 }
 
+async fn digest_file(path: &Path) -> Result<(BlobDigest, u64), String> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.map_err(|error| error.to_string())?;
+    let mut hash = Sha256::new();
+    let mut size = 0_u64;
+    let mut chunk = [0_u8; 65536];
+    loop {
+        let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&chunk[..read]);
+        size += read as u64;
+    }
+    Ok((BlobDigest(format!("{:x}", hash.finalize())), size))
+}
+
 #[async_trait]
 impl BlobStore for TieredBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
@@ -673,20 +707,7 @@ impl BlobStore for TieredBlobStore {
     }
 
     async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
-        use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::open(path).await.map_err(|error| error.to_string())?;
-        let mut hash = Sha256::new();
-        let mut size = 0_u64;
-        let mut chunk = [0_u8; 65536];
-        loop {
-            let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            hash.update(&chunk[..read]);
-            size += read as u64;
-        }
-        let digest = BlobDigest(format!("{:x}", hash.finalize()));
+        let (digest, size) = digest_file(path).await?;
         let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
         self.local.write_file(&digest, path).await?;
         if !was_present && !self.fleet.is_empty() {
@@ -701,9 +722,30 @@ impl BlobStore for TieredBlobStore {
             tokio::fs::copy(self.local.path(digest), path).await.map_err(|error| error.to_string())?;
             return Ok(Some(size));
         }
-        let Some(bytes) = self.get(digest).await? else { return Ok(None) };
-        tokio::fs::write(path, &bytes).await.map_err(|error| error.to_string())?;
-        Ok(Some(bytes.len() as u64))
+        let mut error = self.local.verified_file_size(digest).await.err();
+        for target in &self.fleet {
+            match target.store.get_file(digest, path).await {
+                Ok(Some(size)) => {
+                    let (actual, _) = digest_file(path).await?;
+                    if actual != *digest {
+                        error = Some(format!("blob digest mismatch for {}", digest.as_str()));
+                        continue;
+                    }
+                    self.local.write_file(digest, path).await?;
+                    let marker = self.marker(&target.id, digest);
+                    tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
+                    tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
+                    self.wake.notify_one();
+                    return Ok(Some(size));
+                }
+                Ok(None) => {}
+                Err(failure) => error = Some(failure),
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
         let mut error = match self.local.get(digest).await {
@@ -916,6 +958,36 @@ mod tests {
         session.finish();
     }
 
+    struct FixedBodyHttp(Vec<u8>);
+
+    #[async_trait]
+    impl HttpClient for FixedBodyHttp {
+        async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            assert_eq!(request.method(), reqwest::Method::GET);
+            http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(bytes::Bytes::copy_from_slice(&self.0))
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_file_read_verifies_streamed_body() {
+        let state = tempfile::tempdir().expect("state dir");
+        let body = vec![0, 1, 127, 128, 255];
+        let digest = BlobDigest::of(&body);
+        let credentials = S3Credentials { access_key_id: "access".into(), secret_access_key: "secret".into(), session_token: None };
+        let store = S3BlobStore::new("https://example.test", "artifacts", "", credentials, Arc::new(FixedBodyHttp(body.clone())))
+            .expect("S3 store");
+        let destination = state.path().join("body");
+
+        assert_eq!(store.get_file(&digest, &destination).await.expect("get file"), Some(body.len() as u64));
+        assert_eq!(tokio::fs::read(&destination).await.expect("read file"), body);
+        let wrong = BlobDigest::of(b"different");
+        assert!(store.get_file(&wrong, &destination).await.expect_err("reject corrupt body").contains("digest mismatch"));
+        assert!(!destination.exists(), "corrupt file must be removed");
+    }
+
     struct SwitchableFleet {
         available: AtomicBool,
         inner: MemoryBlobStore,
@@ -973,6 +1045,47 @@ mod tests {
         assert_eq!(tiered.get(&digest).await.expect("fleet fallback"), Some(b"offline write".to_vec()));
         fleet.available.store(false, Ordering::SeqCst);
         assert_eq!(tiered.get(&digest).await.expect("cached read"), Some(b"offline write".to_vec()));
+    }
+
+    struct FileOnlyFleet {
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl BlobStore for FileOnlyFleet {
+        async fn put(&self, _bytes: &[u8]) -> Result<BlobDigest, String> {
+            Err("unused put".into())
+        }
+        async fn get(&self, _digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
+            Err("buffered get must not run".into())
+        }
+        async fn get_file(&self, digest: &BlobDigest, path: &Path) -> Result<Option<u64>, String> {
+            if *digest != BlobDigest::of(&self.bytes) {
+                return Ok(None);
+            }
+            tokio::fs::write(path, &self.bytes).await.map_err(|error| error.to_string())?;
+            Ok(Some(self.bytes.len() as u64))
+        }
+        async fn has(&self, _digest: &BlobDigest) -> Result<bool, String> {
+            Ok(false)
+        }
+        async fn delete(&self, _digest: &BlobDigest) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tiered_file_read_uses_fleet_file_stream_and_caches_locally() {
+        let state = tempfile::tempdir().expect("state dir");
+        let bytes = vec![0, 1, 127, 128, 255];
+        let digest = BlobDigest::of(&bytes);
+        let fleet = Arc::new(FileOnlyFleet { bytes: bytes.clone() });
+        let tiered = TieredBlobStore::new(state.path(), vec![("streaming".into(), fleet)]);
+        let destination = state.path().join("materialized");
+
+        assert_eq!(tiered.get_file(&digest, &destination).await.expect("stream fleet file"), Some(bytes.len() as u64));
+        assert_eq!(tokio::fs::read(&destination).await.expect("materialized body"), bytes);
+        assert_eq!(tiered.local.get(&digest).await.expect("cached body"), Some(bytes));
     }
 
     #[tokio::test]

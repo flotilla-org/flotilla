@@ -629,6 +629,17 @@ pub(crate) use http_execute;
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String>;
+
+    /// Stream a response body to a file. Test clients may use the buffered
+    /// `execute` implementation; production overrides this to bound memory.
+    async fn execute_to_file(&self, request: reqwest::Request, label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        let response = self.execute(request, label).await?;
+        let status = response.status();
+        if status.is_success() {
+            tokio::fs::write(path, response.body()).await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
+    }
 }
 
 /// Production implementation that delegates to `reqwest::Client`.
@@ -662,6 +673,20 @@ impl HttpClient for ReqwestHttpClient {
             builder = builder.header(name, value);
         }
         builder.body(body).map_err(|e| e.to_string())
+    }
+
+    async fn execute_to_file(&self, request: reqwest::Request, _label: &ChannelLabel, path: &Path) -> Result<http::StatusCode, String> {
+        use tokio::io::AsyncWriteExt;
+        let mut response = self.client.execute(request).await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            let mut file = tokio::fs::File::create(path).await.map_err(|error| error.to_string())?;
+            while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+                file.write_all(&chunk).await.map_err(|error| error.to_string())?;
+            }
+            file.flush().await.map_err(|error| error.to_string())?;
+        }
+        Ok(status)
     }
 }
 
