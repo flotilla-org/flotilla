@@ -66,7 +66,8 @@ pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBac
 pub use convoy::{
     bound_change_request_record_name, change_request_address, controller_patches, convoy_sanctions_checkout_reclaim,
     evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches,
-    instantiate_exit, instantiate_turn_delivery, issue_address, pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile,
+    instantiate_exit, instantiate_turn_delivery, issue_address, issue_address_with_forges, pinned_placement_ref, pinned_workflow_ref,
+    provisioning_patches, reconcile,
     select_convoy_children, BoundChangeRequest, Convoy, ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState,
     ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim,
     CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LeafMaker,

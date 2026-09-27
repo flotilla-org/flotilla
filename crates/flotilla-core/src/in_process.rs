@@ -154,14 +154,31 @@ struct ProviderIssueObservationSource {
     daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
 }
 
+fn issue_source_for_subject(
+    subject: &crate::issue_observer::IssueRef,
+    forges: &[flotilla_resources::ForgeSpec],
+) -> flotilla_protocol::IssueSource {
+    let service = forges
+        .iter()
+        .find(|forge| forge.forge_id == subject.service)
+        .map_or_else(|| format!("https://{}", subject.service.replace("%2f", "/").replace("%25", "%")), |forge| forge.https_url.clone());
+    flotilla_protocol::IssueSource { service, scope: subject.scope.clone() }
+}
+
 #[async_trait]
 impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationSource {
     async fn observe(&self, subject: &crate::issue_observer::IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
         let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("issue observation daemon unavailable")?;
-        let fallback = flotilla_protocol::IssueRef {
-            source: flotilla_protocol::IssueSource { service: format!("https://{}", subject.service), scope: subject.scope.clone() },
-            id: subject.number.to_string(),
-        };
+        let forges = daemon
+            .resource_backend
+            .definitions::<Forge>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let fallback = flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges), id: subject.number.to_string() };
         let reference = daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)
@@ -173,7 +190,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .flat_map(|convoy| convoy.object.spec.issues)
             .map(|issue| issue.reference)
             .find(|reference| {
-                flotilla_resources::issue_address(reference).is_ok_and(|address| {
+                flotilla_resources::issue_address_with_forges(reference, &forges).is_ok_and(|address| {
                     address
                         == flotilla_protocol::LeafAddress::Issue {
                             service: subject.service.clone(),

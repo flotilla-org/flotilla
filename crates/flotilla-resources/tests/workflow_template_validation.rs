@@ -3,9 +3,9 @@ mod common;
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
-    admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_record_name,
-    single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate,
-    ExitDeclaration, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+    admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_address_with_forges,
+    issue_record_name, single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec,
+    validate, ExitDeclaration, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
 
@@ -265,8 +265,45 @@ vessels:
     assert_eq!(issue_record_name("GitHub.com", "Owner/Repo", 12), issue_record_name("github.com", "owner/repo", 12));
     let forgejo =
         IssueRef { source: IssueSource { service: "https://forgejo.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
-    assert_eq!(issue_address(&forgejo).expect("forgejo address").to_string(), "issue/forgejo.example/Team/Repo/12");
+    assert_eq!(issue_address(&forgejo).expect("forgejo address").to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
     assert_ne!(issue_record_name("forgejo.example", "Team/Repo", 12), issue_record_name("forgejo.example", "team/repo", 12));
+}
+
+#[test]
+fn issue_subjects_distinguish_installations_on_one_host() {
+    use std::collections::BTreeSet;
+
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
+    let source = |path: &str| IssueRef {
+        source: IssueSource { service: format!("https://Forgejo.Example/{path}/"), scope: "Team/Repo".into() },
+        id: "12".into(),
+    };
+    let lab = source("Lab");
+    let stage = source("Stage");
+    let fallback_lab = issue_address(&lab).expect("lab");
+    let fallback_stage = issue_address(&stage).expect("stage");
+    assert_eq!(fallback_lab.to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
+    assert_eq!(fallback_stage.to_string(), "issue/forgejo.example%2fstage/Team/Repo/12");
+    assert_ne!(fallback_lab, fallback_stage);
+    assert_ne!(issue_record_name("forgejo.example%2flab", "Team/Repo", 12), issue_record_name("forgejo.example%2fstage", "Team/Repo", 12));
+
+    let forge = |id: &str, path: &str| {
+        ForgeSpec::builder()
+            .forge_id(id.into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["forgejo.example".into()]))
+            .https_url(format!("https://forgejo.example/{path}"))
+            .git_ssh_host("forgejo.example".into())
+            .build()
+    };
+    let forges = [forge("lab", "lab"), forge("stage", "stage")];
+    let lab_address = issue_address_with_forges(&lab, &forges).expect("declared lab");
+    let stage_address = issue_address_with_forges(&stage, &forges).expect("declared stage");
+    assert_eq!(lab_address.to_string(), "issue/lab/Team/Repo/12");
+    assert_eq!(stage_address.to_string(), "issue/stage/Team/Repo/12");
+    assert_ne!(lab_address, stage_address);
+    assert_ne!(issue_record_name("lab", "Team/Repo", 12), issue_record_name("stage", "Team/Repo", 12));
 }
 
 #[test]

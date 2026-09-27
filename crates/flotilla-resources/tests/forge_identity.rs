@@ -58,6 +58,41 @@ fn equivalent_urls_have_one_forge_relative_repository_key() {
     assert_eq!(clone_keys.len(), 1);
 }
 
+#[test]
+fn path_prefixed_forges_claim_only_their_own_repositories() {
+    let mut lab = lab();
+    lab.forge_id = "lab".into();
+    lab.https_url = "https://forgejo.lab.flotilla.work/lab".into();
+    let mut stage = lab.clone();
+    stage.forge_id = "stage".into();
+    stage.https_url = "https://forgejo.lab.flotilla.work/stage".into();
+
+    assert_eq!(
+        lab.repository_path("https://forgejo.lab.flotilla.work/lab/team/repo").expect("lab path"),
+        Some(("team".into(), "repo".into()))
+    );
+    assert_eq!(stage.repository_path("https://forgejo.lab.flotilla.work/lab/team/repo").expect("stage path"), None);
+    let lab_repo =
+        RepositorySpec::remote("https://forgejo.lab.flotilla.work/lab/team/repo").expect("lab repo").on_forge(&lab).expect("lab identity");
+    let stage_repo = RepositorySpec::remote("https://forgejo.lab.flotilla.work/stage/team/repo")
+        .expect("stage repo")
+        .on_forge(&stage)
+        .expect("stage identity");
+    assert_ne!(lab_repo.key(), stage_repo.key());
+}
+
+#[tokio::test]
+async fn path_prefixed_forge_declarations_share_a_host() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    for (id, prefix) in [("lab", "lab"), ("stage", "stage")] {
+        let mut forge = lab();
+        forge.forge_id = id.into();
+        forge.https_url = format!("https://forgejo.lab.flotilla.work/{prefix}");
+        backend.definitions::<Forge>("flotilla").create(&InputMeta::builder().name(id.into()).build(), &forge).await.expect("path forge");
+    }
+    assert_eq!(backend.definitions::<Forge>("flotilla").list().await.expect("forges").len(), 2);
+}
+
 #[tokio::test]
 async fn forge_definition_is_visible_from_a_replica() {
     let source_root = flotilla_protocol::NodeId::new("source");

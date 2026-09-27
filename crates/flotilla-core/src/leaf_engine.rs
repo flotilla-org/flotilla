@@ -12,7 +12,7 @@ use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, 
 use flotilla_resources::{
     actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
     select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, Convoy, ConvoyAttention, ConvoyLeafSubject,
-    ConvoyPhase, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
+    ConvoyPhase, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
     ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung,
     StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
@@ -1219,6 +1219,8 @@ impl ReconcilerWake {
         let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
         let mut vessel_watch =
             self.subscriptions.inner.backend.including_replicas::<Vessel>(&namespace).watch().await.map_err(|error| error.to_string())?;
+        let mut forge_watch =
+            self.subscriptions.inner.backend.including_replicas::<Forge>(&namespace).watch().await.map_err(|error| error.to_string())?;
         let mut convoy_objects =
             listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
@@ -1253,6 +1255,10 @@ impl ReconcilerWake {
                     event.ok_or_else(|| "reconciler wake vessel watch closed".to_string())?.map_err(|error| error.to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
+                event = forge_watch.next() => {
+                    event.ok_or_else(|| "reconciler wake forge watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    self.sync_rows(&namespace, &convoy_objects).await?;
+                }
                 wake = wake_rx.recv() => match wake {
                     Ok(convoy) => sender.send(convoy).await.map_err(|_| "convoy controller queue closed".to_string())?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1269,6 +1275,17 @@ impl ReconcilerWake {
     }
 
     async fn sync_rows(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+        let forges = self
+            .subscriptions
+            .inner
+            .backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
         let checkout_sources = self
             .subscriptions
             .inner
@@ -1434,7 +1451,7 @@ impl ReconcilerWake {
                 }
             }
             let status = convoy.status.as_ref().expect("parked convoy has status");
-            for delivery in instantiate_turn_delivery(convoy, &checkouts)? {
+            for delivery in instantiate_turn_delivery(convoy, &checkouts, &forges)? {
                 let Some(claim_at) = status
                     .crew_work
                     .get(&delivery.rule.to.vessel)
