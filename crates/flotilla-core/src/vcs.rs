@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::CheckoutIntent;
-use flotilla_resources::CheckoutBranchProvenance;
+use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
 use tracing::warn;
 
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
     providers::{
         command_channel_label,
         types::Checkout,
-        vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy},
+        vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy, CloneProvisioner, GitCloneProvisioner},
         CommandOutput, CommandRunner,
     },
 };
@@ -77,6 +77,40 @@ pub enum VcsQuery<'a> {
     DefaultRemoteBranch,
     LogOneline(&'a str),
     StatusPorcelain,
+}
+
+/// Repository facts used by consumers without exposing command arguments.
+pub enum RepositoryRead<'a> {
+    CheckoutRoot,
+    CurrentBranch,
+    SymbolicBranch,
+    HeadRevision,
+    SharedMetadataDir,
+    RemoteNames,
+    ConfiguredRemoteUrls(&'a str),
+    TrackedRemote(&'a str),
+    EffectiveRemoteUrl(&'a str),
+    FileAtRevision(&'a str),
+    AdvertisedRefs(&'a str),
+    IsAncestor { ancestor: &'a str, descendant: &'a str },
+    UpstreamOf(&'a str),
+    CommitLog(&'a str),
+    WorkingTreeChanges,
+}
+
+/// Discovers a provider for the checkout containing a path.
+#[async_trait]
+pub trait CheckoutVcsResolver: Send + Sync {
+    async fn vcs_for(&self, environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String>;
+}
+
+pub struct FixedVcsResolver(pub Arc<dyn Vcs>);
+
+#[async_trait]
+impl CheckoutVcsResolver for FixedVcsResolver {
+    async fn vcs_for(&self, _environment: Option<&flotilla_protocol::EnvironmentId>, _path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        Ok(Arc::clone(&self.0))
+    }
 }
 
 impl VcsQuery<'_> {
@@ -171,6 +205,12 @@ pub trait VcsBackend: Send + Sync {
 /// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
 #[async_trait]
 pub trait Vcs: Send + Sync {
+    async fn read_repository(&self, _path: &Path, _read: RepositoryRead<'_>) -> Result<String, String> {
+        Err("repository inspection is unavailable".into())
+    }
+    async fn operational_entry_paths(&self, _path: &Path, _revision: &str) -> Result<CommandOutput, String> {
+        Err("operational entry inspection is unavailable".into())
+    }
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
@@ -189,6 +229,47 @@ pub trait Vcs: Send + Sync {
     }
     async fn current_branch(&self) -> Result<String, String> {
         Err("current branch inspection is unavailable".into())
+    }
+
+    async fn clone_repository(&self, _url: &str, _target: &Path) -> Result<(), String> {
+        Err("repository cloning is unavailable".into())
+    }
+
+    async fn inspect_clone(&self, _target: &Path) -> Result<Option<String>, String> {
+        Err("clone inspection is unavailable".into())
+    }
+
+    async fn clone_origin(&self, _target: &Path) -> Result<String, String> {
+        Err("clone origin inspection is unavailable".into())
+    }
+
+    async fn materialise_fresh_clone(
+        &self,
+        _url: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
+        Err("fresh clone materialisation is unavailable".into())
+    }
+
+    async fn remote_ref_digest(&self, _remote: &str, _reference: &str) -> Result<Option<String>, String> {
+        Err("remote ref inspection is unavailable".into())
+    }
+
+    async fn commits_beyond_base(&self, _base_ref: Option<&str>) -> Result<(String, usize), String> {
+        Err("base comparison is unavailable".into())
+    }
+
+    async fn exclude_file_path(&self) -> Result<Option<PathBuf>, String> {
+        Err("checkout exclude path is unavailable".into())
+    }
+
+    async fn clean_revision(&self) -> Result<String, String> {
+        Err("clean revision inspection is unavailable".into())
+    }
+    async fn push_current_branch(&self, _remote: &str) -> Result<CommandOutput, String> {
+        Err("push is unavailable".into())
     }
 }
 
@@ -231,8 +312,11 @@ impl FlotillaVcs {
     async fn checkout_removal_guard(&self, branch: &str, target: &str) -> Result<Option<CheckoutRemoval>, String> {
         let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
-        if backend.current_branch().await.ok().as_deref().map(str::trim) != Some(branch) {
-            return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+        match backend.current_branch().await {
+            Ok(current) if current.trim() != branch => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+            Err(error) if error.contains("not a git repository") => return Ok(None),
+            Err(_) => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+            _ => {}
         }
         let status = backend.working_tree_status(false).await?;
         if !status.success || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
@@ -249,10 +333,43 @@ impl FlotillaVcs {
         };
         backend.with_strategy(&self.strategy)
     }
+
+    fn controller_cli(&self) -> GitCliBackend<'_> {
+        GitCliBackend::explicit_checkout(self.checkout.as_path(), &*self.runner).with_strategy(&self.strategy)
+    }
 }
 
 #[async_trait]
 impl Vcs for FlotillaVcs {
+    async fn read_repository(&self, path: &Path, read: RepositoryRead<'_>) -> Result<String, String> {
+        let backend = GitCliBackend::new(path, &*self.runner);
+        let query = match read {
+            RepositoryRead::CheckoutRoot => VcsQuery::TopLevel,
+            RepositoryRead::CurrentBranch => VcsQuery::AbbrevHead,
+            RepositoryRead::SymbolicBranch => VcsQuery::SymbolicHead,
+            RepositoryRead::HeadRevision => VcsQuery::Head,
+            RepositoryRead::SharedMetadataDir => VcsQuery::GitCommonDir,
+            RepositoryRead::RemoteNames => VcsQuery::ListRemotes,
+            RepositoryRead::ConfiguredRemoteUrls(remote) => {
+                return backend.query(VcsQuery::ConfigGetAll(&format!("remote.{remote}.url"))).await;
+            }
+            RepositoryRead::TrackedRemote(branch) => {
+                return backend.query(VcsQuery::ConfigGet(&format!("branch.{branch}.remote"))).await;
+            }
+            RepositoryRead::EffectiveRemoteUrl(remote) => VcsQuery::RemoteUrl(remote),
+            RepositoryRead::FileAtRevision(reference) => VcsQuery::Show(reference),
+            RepositoryRead::AdvertisedRefs(remote) => VcsQuery::RemoteRefs(remote),
+            RepositoryRead::IsAncestor { ancestor, descendant } => VcsQuery::IsAncestor { ancestor, descendant },
+            RepositoryRead::UpstreamOf(reference) => VcsQuery::UpstreamOf(reference),
+            RepositoryRead::CommitLog(range) => VcsQuery::LogOneline(range),
+            RepositoryRead::WorkingTreeChanges => VcsQuery::StatusPorcelain,
+        };
+        backend.query(query).await
+    }
+
+    async fn operational_entry_paths(&self, path: &Path, revision: &str) -> Result<CommandOutput, String> {
+        GitCliBackend::new(path, &*self.runner).grep_operational_entries(revision).await
+    }
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
         self.cli().validate_target(branch, intent).await
     }
@@ -271,7 +388,7 @@ impl Vcs for FlotillaVcs {
 
     async fn materialise_checkout(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
         match &self.strategy {
-            GitCheckoutStrategy::Worktree(_) => self.cli().create_worktree(branch, base_ref, target).await,
+            GitCheckoutStrategy::Worktree(_) => self.controller_cli().create_worktree(branch, base_ref, target).await,
             GitCheckoutStrategy::ReferenceClone(strategy) => strategy.materialise_checkout(branch, base_ref, target).await,
         }
     }
@@ -291,16 +408,16 @@ impl Vcs for FlotillaVcs {
             return Ok(CheckoutRemoval::Removed);
         }
         if target_exists {
-            let remove = self.cli().worktree_remove(target).await?;
+            let remove = self.controller_cli().worktree_remove(target).await?;
             if !remove.success && !remove.stderr.contains("is not a working tree") {
                 return Err(remove.stderr);
             }
         }
         remove_worktree_path(&*self.runner, target).await?;
-        self.cli().worktree_prune().await?;
+        self.controller_cli().worktree_prune().await?;
         remove_empty_worktree_parents(&*self.runner, clone_path, target).await?;
 
-        match self.cli().branch_ownership(branch, CheckoutSharing::Shared).await? {
+        match self.controller_cli().branch_ownership(branch, CheckoutSharing::Shared).await? {
             CheckoutOwnership::Missing => Ok(CheckoutRemoval::Removed),
             CheckoutOwnership::PreExisting => {
                 Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::NotCreatedForConvoy })
@@ -312,7 +429,7 @@ impl Vcs for FlotillaVcs {
                 Ok(CheckoutRemoval::PreservedBranch { branch: branch.to_string(), reason: CheckoutPreservationReason::CheckedOutElsewhere })
             }
             CheckoutOwnership::OwnedAtBase => {
-                self.cli().delete_owned_branch(branch).await?;
+                self.controller_cli().delete_owned_branch(branch).await?;
                 Ok(CheckoutRemoval::Removed)
             }
         }
@@ -366,6 +483,144 @@ impl Vcs for FlotillaVcs {
 
     async fn current_branch(&self) -> Result<String, String> {
         self.cli().current_branch().await
+    }
+
+    async fn clone_repository(&self, url: &str, target: &Path) -> Result<(), String> {
+        GitCloneProvisioner::new(Arc::clone(&self.runner)).clone_repo(url, &ExecutionEnvironmentPath::new(target)).await
+    }
+
+    async fn inspect_clone(&self, target: &Path) -> Result<Option<String>, String> {
+        Ok(GitCloneProvisioner::new(Arc::clone(&self.runner)).inspect_clone(&ExecutionEnvironmentPath::new(target)).await?.default_branch)
+    }
+
+    async fn clone_origin(&self, target: &Path) -> Result<String, String> {
+        GitCliBackend::explicit_checkout(target, &*self.runner).remote_url("origin").await
+    }
+
+    async fn materialise_fresh_clone(
+        &self,
+        url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
+        if self.runner.path_exists(Path::new(target)).await? {
+            let origin = self
+                .clone_origin(Path::new(target))
+                .await
+                .map_err(|error| format!("checkout target {target} already exists but is not a reusable clone: {error}"))?;
+            let same_origin = origin.trim() == url
+                || canonicalize_repo_url(origin.trim())
+                    .ok()
+                    .zip(canonicalize_repo_url(url).ok())
+                    .is_some_and(|(origin, expected)| origin == expected);
+            if !same_origin {
+                return Err(format!("checkout target {target} already exists with origin {}, expected {url}", origin.trim()));
+            }
+            let target_backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
+            if branch != "HEAD" {
+                let current = target_backend
+                    .current_branch()
+                    .await
+                    .map_err(|error| format!("checkout target {target} already exists but its branch cannot be resolved: {error}"))?;
+                if current.trim() != branch {
+                    return Err(format!("checkout target {target} already exists on branch {}, expected {branch}", current.trim()));
+                }
+            }
+            return Ok(CheckoutMaterialisation {
+                commit: Some(target_backend.head_commit_text().await?.trim().to_string()),
+                provenance: CheckoutBranchProvenance::PreExisting,
+            });
+        }
+        let staging = format!("{target}.flotilla-clone-partial");
+        remove_worktree_path(&*self.runner, &staging).await?;
+        let clone_ref = base_ref.unwrap_or(branch);
+        let prepare = async {
+            GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, (clone_ref != "HEAD").then_some(clone_ref)).await?;
+            let staging_backend = GitCliBackend::explicit_checkout(Path::new(&staging), &*self.runner);
+            if clone_ref != branch {
+                let remote_ref = format!("refs/remotes/origin/{branch}");
+                let track = format!("origin/{branch}");
+                staging_backend.switch_create(branch, staging_backend.ref_exists(&remote_ref).await.then_some(track.as_str())).await?;
+            }
+            staging_backend.head_commit_text().await.map(|commit| commit.trim().to_string())
+        }
+        .await;
+        let commit = match prepare {
+            Ok(commit) => commit,
+            Err(error) => return Err(cleanup_clone_path(&*self.runner, &staging, error).await),
+        };
+        if let Err(error) =
+            self.runner.run("mv", &[&staging, target], Path::new("/"), &command_channel_label("mv", &[&staging, target])).await
+        {
+            return Err(cleanup_clone_path(&*self.runner, &staging, format!("publish fresh clone: {error}")).await);
+        }
+        Ok(CheckoutMaterialisation { commit: Some(commit), provenance: CheckoutBranchProvenance::PreExisting })
+    }
+
+    async fn remote_ref_digest(&self, remote: &str, reference: &str) -> Result<Option<String>, String> {
+        let output = self.cli().remote_ref(remote, reference).await?;
+        if !output.success {
+            return Err(non_empty_output_or("remote ref inspection failed", &output.stderr));
+        }
+        Ok(output.stdout.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next()?;
+            (fields.next()? == reference).then(|| digest.to_string())
+        }))
+    }
+
+    async fn commits_beyond_base(&self, base_ref: Option<&str>) -> Result<(String, usize), String> {
+        let base_ref = match base_ref {
+            Some(base_ref) => base_ref.to_string(),
+            None => {
+                let output = self.cli().default_remote_branch("origin").await?;
+                if !output.success || output.stdout.trim().is_empty() {
+                    return Err(non_empty_output_or("the base ref could not be determined", &output.stderr));
+                }
+                output.stdout.trim().to_string()
+            }
+        };
+        let output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
+        if !output.success {
+            return Err(non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr));
+        }
+        let count = output
+            .stdout
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("could not parse commit count beyond {base_ref}: {}", output.stdout.trim()))?;
+        Ok((base_ref, count))
+    }
+
+    async fn exclude_file_path(&self) -> Result<Option<PathBuf>, String> {
+        let output = self.cli().git_path("info/exclude").await?;
+        Ok((output.success && !output.stdout.trim().is_empty()).then(|| PathBuf::from(output.stdout.trim())))
+    }
+
+    async fn clean_revision(&self) -> Result<String, String> {
+        let status = self.cli().working_tree_status(true).await?;
+        if !status.success {
+            return Err(format!("checkout status failed: {}", status.stderr.trim()));
+        }
+        if !status.stdout.is_empty() {
+            return Err(format!("manifest directory {} has changes not represented by a revision", self.checkout.as_path().display()));
+        }
+        let head = self.cli().head_commit().await?;
+        if !head.success {
+            return Err(format!("resolve manifest revision: {}", head.stderr.trim()));
+        }
+        Ok(head.stdout.trim().to_string())
+    }
+    async fn push_current_branch(&self, remote: &str) -> Result<CommandOutput, String> {
+        self.cli().push_head(remote).await
+    }
+}
+
+async fn cleanup_clone_path(runner: &dyn CommandRunner, path: &str, error: String) -> String {
+    match remove_worktree_path(runner, path).await {
+        Ok(()) => error,
+        Err(cleanup_error) => format!("{error}; additionally failed to remove partial checkout: {cleanup_error}"),
     }
 }
 

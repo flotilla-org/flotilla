@@ -26,11 +26,34 @@ use crate::{
     config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
-        change_request::ChangeRequestTracker, discovery::EnvVars, issue_tracker::IssueProvider, presentation::PresentationManager,
-        terminal::TerminalPool, types::BranchInfo, vcs::VcsInspection, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+        change_request::ChangeRequestTracker,
+        discovery::EnvVars,
+        issue_tracker::IssueProvider,
+        presentation::PresentationManager,
+        terminal::TerminalPool,
+        types::BranchInfo,
+        vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
+        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
-    vcs::Vcs,
+    vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
+
+struct TestVcsResolver(Arc<dyn CommandRunner>);
+
+#[async_trait]
+impl CheckoutVcsResolver for TestVcsResolver {
+    async fn vcs_for(&self, _environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        Ok(Arc::new(FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(path),
+            Arc::clone(&self.0),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&self.0)))),
+        )))
+    }
+}
+
+pub fn test_vcs_resolver(runner: Arc<dyn CommandRunner>) -> Arc<dyn CheckoutVcsResolver> {
+    Arc::new(TestVcsResolver(runner))
+}
 
 type ResponseMap = HashMap<(String, String), Vec<Result<String, String>>>;
 

@@ -1567,6 +1567,37 @@ async fn forge_for_remote(
     Ok(matching.into_iter().next())
 }
 
+async fn discover_vcs_for_checkout(
+    environment_manager: &EnvironmentManager,
+    discovery: &DiscoveryRuntime,
+    config: &ConfigStore,
+    local_environment_id: &EnvironmentId,
+    environment_id: &EnvironmentId,
+    checkout_path: &Path,
+) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    let runner = environment_manager
+        .environment_runner(environment_id)
+        .ok_or_else(|| format!("command runner unavailable for environment {environment_id}"))?;
+    let host_bag = environment_manager
+        .environment_bag(environment_id)
+        .ok_or_else(|| format!("discovery environment unavailable: {environment_id}"))?;
+    let remote_env = StaticEnvVars::from_bag(&host_bag);
+    let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+    let checkout = ExecutionEnvironmentPath::new(checkout_path);
+    let mut bag = host_bag;
+    for detector in &discovery.repo_detectors {
+        bag = bag.extend(detector.detect(&checkout, &*runner, env).await);
+    }
+    let mut unmet = Vec::new();
+    for factory in &discovery.factories.vcs {
+        match factory.probe(&bag, config, &checkout, Arc::clone(&runner)).await {
+            Ok(provider) => return Ok(provider),
+            Err(requirements) => unmet.extend(requirements),
+        }
+    }
+    Err(format!("no VCS provider discovered for {} in {environment_id}: {unmet:?}", checkout.as_path().display()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
@@ -1584,7 +1615,7 @@ async fn discover_repo_for_environment(
         environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
     // Resolve the forge while the resource backend is available. Factories only
     // receive assertions, so their probe interface remains independent of storage.
-    if let Ok(origin_url) = crate::providers::run!(runner, "git", &["remote", "get-url", "origin"], repo_path) {
+    if let Ok(origin_url) = crate::providers::vcs::detection::origin_url(&*runner, repo_path).await {
         if let Some(remote) = crate::providers::discovery::detectors::git::remote_assertion(origin_url.trim(), "origin") {
             host_bag = host_bag.with(remote);
         }
@@ -2221,6 +2252,15 @@ fn managed_terminal_changes(
     changes
 }
 
+#[async_trait::async_trait]
+impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
+    async fn vcs_for(&self, environment: Option<&EnvironmentId>, path: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+        self.vcs_for_checkout(environment.unwrap_or(&self.local_environment_id), path).await
+    }
+}
+
+type CheckoutVcsCache = HashMap<(EnvironmentId, PathBuf), Arc<tokio::sync::OnceCell<Arc<dyn crate::vcs::Vcs>>>>;
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -2245,6 +2285,8 @@ pub struct InProcessDaemon {
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: DiscoveryRuntime,
+    /// VCS capabilities are selected once for each checkout in its execution environment.
+    checkout_vcs: Mutex<CheckoutVcsCache>,
     /// Running commands, keyed by command ID, for cancellation.
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
@@ -2491,13 +2533,26 @@ impl InProcessDaemon {
             )
             .await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
-        let startup_repository_inspector = GitRepositoryInspector::new(discovery.runner.clone(), local_host_id.to_string());
-
+        let mut checkout_vcs = CheckoutVcsCache::new();
         for path in repo_paths {
             if path_identities.contains_key(&path) {
                 continue;
             }
-            let startup_inspection = startup_repository_inspector.inspect_path(&path, None).await;
+            let initial_vcs =
+                discover_vcs_for_checkout(&environment_manager, &discovery, &config, &local_environment_id, &local_environment_id, &path)
+                    .await;
+            let startup_inspection = match initial_vcs {
+                Ok(vcs) => {
+                    GitRepositoryInspector::new(
+                        discovery.runner.clone(),
+                        Arc::new(crate::vcs::FixedVcsResolver(vcs)),
+                        local_host_id.to_string(),
+                    )
+                    .inspect_path(&path, None)
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             if let Ok(inspection) = &startup_inspection {
                 let mut spec = inspection.spec.clone();
                 if let Some(live_remote) = spec.live_remote() {
@@ -2538,6 +2593,11 @@ impl InProcessDaemon {
                 }
             }
             let slug = repo_slug.clone();
+            if let Some(vcs) = registry.vcs.preferred() {
+                let cell = tokio::sync::OnceCell::new();
+                let _ = cell.set(Arc::clone(vcs));
+                checkout_vcs.insert((local_environment_id.clone(), path.clone()), Arc::new(cell));
+            }
             let model = RepoModel::new(registry, Some(local_environment_id.clone()));
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -2593,6 +2653,7 @@ impl InProcessDaemon {
             local_environment_id,
             environment_manager,
             discovery,
+            checkout_vcs: Mutex::new(checkout_vcs),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             pending_convoy_starts: Mutex::new(HashSet::new()),
@@ -2720,7 +2781,12 @@ impl InProcessDaemon {
         let forges =
             self.resource_backend.definitions::<flotilla_resources::Forge>(&namespace).list().await.map_err(|error| error.to_string())?;
         Ok(Arc::new(
-            GitRepositoryInspector::new(runner, host_ref.to_string()).with_forges(forges.into_iter().map(|forge| forge.spec).collect()),
+            GitRepositoryInspector::new(
+                runner,
+                self.self_weak.upgrade().ok_or("repository inspector daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
+                host_ref.to_string(),
+            )
+            .with_forges(forges.into_iter().map(|forge| forge.spec).collect()),
         ))
     }
 
@@ -3151,6 +3217,30 @@ impl InProcessDaemon {
         self.environment_manager.environment_runner(env_id)
     }
 
+    /// Resolve the VCS through the registered discovery factories once per checkout.
+    /// The key includes the environment because the same path may name different
+    /// checkouts on the host and inside a provisioned environment.
+    pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+        let key = (env_id.clone(), checkout.to_path_buf());
+        let cell = self.checkout_vcs.lock().await.entry(key).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone();
+        cell.get_or_try_init(|| {
+            discover_vcs_for_checkout(
+                &self.environment_manager,
+                &self.discovery,
+                &self.config,
+                &self.local_environment_id,
+                env_id,
+                checkout,
+            )
+        })
+        .await
+        .map(Arc::clone)
+    }
+
+    pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+        self.vcs_for_checkout(&self.local_environment_id, checkout).await
+    }
+
     pub fn environment_bag_for_environment(&self, env_id: &EnvironmentId) -> Option<EnvironmentBag> {
         self.environment_manager.environment_bag(env_id)
     }
@@ -3359,6 +3449,7 @@ impl InProcessDaemon {
                 continue;
             };
             let runner = self.runner_for_resource_checkout(&checkout).await?;
+            let vcs = self.vcs_for_checkout(&self.local_environment_id, Path::new(path)).await?;
             let convoy_ref = checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str);
             let source_root = checkout.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str);
             let convoy = self
@@ -3387,11 +3478,20 @@ impl InProcessDaemon {
                 });
             let integration = if let Some(convoy) = convoy.as_ref() {
                 let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
-                inspect_convoy_checkout_integration(&*runner, Path::new(path), &checkout.spec, convoy, change_request_id.as_deref(), None)
-                    .await
+                inspect_convoy_checkout_integration(
+                    &*runner,
+                    vcs.as_ref(),
+                    Path::new(path),
+                    &checkout.spec,
+                    convoy,
+                    change_request_id.as_deref(),
+                    None,
+                )
+                .await
             } else {
                 inspect_checkout_integration(
                     &*runner,
+                    vcs.as_ref(),
                     Path::new(path),
                     &checkout.spec,
                     checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
@@ -8815,8 +8915,8 @@ impl InProcessDaemon {
                 );
                 continue;
             }
-            let runner = match self.runner_for_resource_checkout(&checkout).await {
-                Ok(runner) => runner,
+            let vcs = match self.local_vcs_for_checkout(Path::new(path)).await {
+                Ok(vcs) => vcs,
                 Err(error) => {
                     warn!(checkout = %checkout.metadata.name, %error, "best-effort abandon archive push failed");
                     outcomes.push(
@@ -8829,7 +8929,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Default).await;
+            let output = vcs.push_current_branch("origin").await;
             let outcome = match output {
                 Ok(output) if output.success => {
                     CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()
@@ -10250,6 +10350,7 @@ impl InProcessDaemon {
             local_node_id: self.node_id.clone(),
             local_host: self.host_name.clone(),
             environment_manager: Arc::clone(&self.environment_manager),
+            vcs_resolver: self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
         };
 
         let result = execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await;
@@ -11393,6 +11494,7 @@ impl InProcessDaemon {
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         let environment_manager = Arc::clone(&self.environment_manager);
+        let vcs_resolver = self.self_weak.upgrade().ok_or("VCS resolver daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>;
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
@@ -11449,6 +11551,7 @@ impl InProcessDaemon {
                         local_node_id: local_node_id.clone(),
                         local_host: resolver_local_host.clone(),
                         environment_manager: Arc::clone(&environment_manager),
+                        vcs_resolver: Arc::clone(&vcs_resolver),
                     };
                     let result = run_step_plan_with_remote_executor(
                         step_plan,

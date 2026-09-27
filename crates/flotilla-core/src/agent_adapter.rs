@@ -528,6 +528,15 @@ pub trait AgentAdapter: Send + Sync {
     ) -> Result<(), String> {
         self.prepare(cwd, brief).await
     }
+    async fn prepare_with_vcs(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        brief: &TerminalBrief,
+        environment: &TerminalEnvVars,
+        _vcs: &dyn crate::vcs::Vcs,
+    ) -> Result<(), String> {
+        self.prepare_with_environment(cwd, brief, environment).await
+    }
     async fn cleanup(&self, _cwd: &ExecutionEnvironmentPath, _brief: &TerminalBrief) -> Result<(), String> {
         Ok(())
     }
@@ -644,48 +653,18 @@ impl AgentAdapter for CliAgentAdapter {
         brief: &TerminalBrief,
         environment: &TerminalEnvVars,
     ) -> Result<(), String> {
-        match &self.flavor {
-            AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
-                if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
-                    return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
-                }
-                if *contained
-                    && environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
-                    && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
-                {
-                    return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
-                }
-                let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
-                    let config_dir_string = config_dir.display().to_string();
-                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
-                    Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
-                } else {
-                    None
-                };
-                if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
-                    seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
-                }
-                let mut settings = crate::agents::claude_code_hook_settings();
-                settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
-                if *contained {
-                    settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
-                    settings["includeCoAuthoredBy"] = serde_json::Value::Bool(false);
-                }
-                let settings =
-                    serde_json::to_string_pretty(&settings).map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
-                self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
-            }
-            AdapterFlavor::Codex { trust_config, contained } => {
-                let config = trust_config
-                    .as_ref()
-                    .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
-                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config, *contained).await?;
-            }
-        }
-        self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
-        ensure_flotilla_git_exclude(&*self.runner, cwd.as_path()).await
+        self.prepare_impl(cwd, brief, environment, None).await
     }
 
+    async fn prepare_with_vcs(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        brief: &TerminalBrief,
+        environment: &TerminalEnvVars,
+        vcs: &dyn crate::vcs::Vcs,
+    ) -> Result<(), String> {
+        self.prepare_impl(cwd, brief, environment, Some(vcs)).await
+    }
     async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
         remove_agent_files(&*self.runner, cwd.as_path(), brief, self.flavor.managed_files()).await
     }
@@ -732,6 +711,60 @@ impl AgentAdapter for CliAgentAdapter {
             env.retain(|(name, _)| name != "CLAUDE_CONFIG_DIR");
         }
         Ok(AgentLaunchPlan { command: self.command(request), env, stance: TRUSTED_IMPLICIT_STANCE.into() })
+    }
+}
+
+impl CliAgentAdapter {
+    async fn prepare_impl(
+        &self,
+        cwd: &ExecutionEnvironmentPath,
+        brief: &TerminalBrief,
+        environment: &TerminalEnvVars,
+        vcs: Option<&dyn crate::vcs::Vcs>,
+    ) -> Result<(), String> {
+        match &self.flavor {
+            AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
+                if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
+                    return Err("contained Claude Code requires credential environment `CLAUDE_CODE_OAUTH_TOKEN`".to_string());
+                }
+                if *contained
+                    && environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN")
+                    && !environment.iter().any(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                {
+                    return Err("Claude Code OAuth requires seam-resolved environment `CLAUDE_CONFIG_DIR`".to_string());
+                }
+                let invocation_state = if let Some(config_dir) = self.claude_invocation_config_dir(environment) {
+                    let config_dir_string = config_dir.display().to_string();
+                    self.runner.run("mkdir", &["-p", &config_dir_string], Path::new("/"), &ChannelLabel::Default).await?;
+                    Some(ClaudeStateConfig { path: config_dir.join(".claude.json"), lock: Arc::clone(state_lock) })
+                } else {
+                    None
+                };
+                if let Some(state_config) = invocation_state.as_ref().or(state_config.as_ref()) {
+                    seed_claude_headless_state(&*self.runner, cwd.as_path(), state_config).await?;
+                }
+                let mut settings = crate::agents::claude_code_hook_settings();
+                settings["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+                if *contained {
+                    settings["attribution"] = serde_json::json!({ "commit": "", "pr": "", "sessionUrl": false });
+                    settings["includeCoAuthoredBy"] = serde_json::Value::Bool(false);
+                }
+                let settings =
+                    serde_json::to_string_pretty(&settings).map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
+                self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
+            }
+            AdapterFlavor::Codex { trust_config, contained } => {
+                let config = trust_config
+                    .as_ref()
+                    .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
+                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config, *contained).await?;
+            }
+        }
+        self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
+        if let Some(vcs) = vcs {
+            ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path()).await?;
+        }
+        Ok(())
     }
 }
 
@@ -837,21 +870,14 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
     runner.write_file(&config.path, &rendered).await
 }
 
-async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
-    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Default).await else {
+async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, vcs: &dyn crate::vcs::Vcs, cwd: &Path) -> Result<(), String> {
+    let Ok(Some(exclude_path)) = vcs.exclude_file_path().await else {
         return Ok(());
     };
-    if !output.success {
-        return Ok(());
-    }
-    let exclude_path = output.stdout.trim();
-    if exclude_path.is_empty() {
-        return Ok(());
-    }
 
     let script = format!(
         "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; grep -qxF '.flotilla/' \"$exclude\" || printf '%s\\n' '.flotilla/' >> \"$exclude\"",
-        flotilla_protocol::arg::shell_quote(exclude_path),
+        flotilla_protocol::arg::shell_quote(&exclude_path.to_string_lossy()),
     );
     let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Default).await;
     Ok(())
@@ -963,7 +989,7 @@ mod tests {
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
-            discovery::{EnvironmentAssertion, EnvironmentBag},
+            discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
             testing::MockRunner,
             ProcessCommandRunner,
         },
@@ -1920,8 +1946,18 @@ mod tests {
 
         let env = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("CODEX_HOME", temp.path().join("codex-home").display().to_string()))
-            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"))
+            .with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let vcs = GitVcsFactory
+            .probe(
+                &env,
+                &crate::config::ConfigStore::with_base(temp.path()),
+                &ExecutionEnvironmentPath::new(&repo),
+                Arc::new(ProcessCommandRunner),
+            )
+            .await
+            .expect("discovered VCS");
         let brief = flotilla_resources::TerminalBrief {
             path: ".flotilla/briefs/coder.md".into(),
             content: "secret assignment".into(),
@@ -1930,7 +1966,7 @@ mod tests {
         registry
             .get("codex")
             .expect("codex adapter")
-            .prepare(&ExecutionEnvironmentPath::new(repo.to_str().expect("utf-8 repo path")), &brief)
+            .prepare_with_vcs(&ExecutionEnvironmentPath::new(repo.to_str().expect("utf-8 repo path")), &brief, &Vec::new(), vcs.as_ref())
             .await
             .expect("prepare brief");
 

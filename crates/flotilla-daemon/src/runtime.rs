@@ -32,24 +32,23 @@ use flotilla_core::{
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSize},
-        vcs::{CloneInspection, CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
     canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, watch_resource_kind,
-    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutBranchProvenance,
-    CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler,
-    ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host,
-    HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
-    ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy,
-    TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
+    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase,
+    CloneSpec, ConditionValue, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource,
+    CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
+    EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, Resource, ResourceBackend,
+    ResourceError, ResourceObject, Stance, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
+    HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, REGISTERED_RESOURCE_KINDS,
+    SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -133,7 +132,8 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                 }
                 let mut reconciler =
                     ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
-                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
+                        .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
+                        .with_vcs(self.state.daemon.local_vcs_for_checkout(&manifests.dir).await?);
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
@@ -617,7 +617,7 @@ impl DaemonRuntime {
         if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
-                    daemon.resource_backend(),
+                    Arc::clone(&daemon),
                     options.namespace.clone(),
                     manifests,
                     MANIFEST_RECONCILE_INTERVAL,
@@ -703,7 +703,7 @@ pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str)
 }
 
 fn spawn_manifest_reconciler_task(
-    backend: ResourceBackend,
+    daemon: Arc<InProcessDaemon>,
     namespace: String,
     manifests: flotilla_core::config::ResourceManifestsConfig,
     interval: Duration,
@@ -712,9 +712,17 @@ fn spawn_manifest_reconciler_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         supervise_controller("manifest", supervision, runtime_health, move || {
-            let reconciler = ResourceManifestReconciler::new(backend.clone(), namespace.clone(), manifests.dir.clone())
-                .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone());
-            async move { reconciler.run(interval).await }
+            let daemon = Arc::clone(&daemon);
+            let namespace = namespace.clone();
+            let manifests = manifests.clone();
+            async move {
+                let vcs = daemon.local_vcs_for_checkout(&manifests.dir).await.map_err(ResourceError::other)?;
+                ResourceManifestReconciler::new(daemon.resource_backend(), namespace, manifests.dir)
+                    .with_declared_source(manifests.source, manifests.reconciler_root)
+                    .with_vcs(vcs)
+                    .run(interval)
+                    .await
+            }
         })
         .await;
     })
@@ -3305,7 +3313,32 @@ impl CloneFlights {
 
 struct CloneControllerRuntime {
     runner: Arc<dyn CommandRunner>,
+    vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
     flights: Arc<CloneFlights>,
+}
+
+fn controller_vcs(
+    discovered: &Option<Arc<dyn flotilla_core::vcs::Vcs>>,
+    _runner: &Arc<dyn CommandRunner>,
+    _checkout: &str,
+) -> Result<Arc<dyn flotilla_core::vcs::Vcs>, String> {
+    if let Some(vcs) = discovered {
+        return Ok(Arc::clone(vcs));
+    }
+    #[cfg(test)]
+    {
+        use flotilla_core::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        Ok(Arc::new(FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(_checkout),
+            Arc::clone(_runner),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(_runner)))),
+        )))
+    }
+    #[cfg(not(test))]
+    Err("discovered VCS provider unavailable".into())
 }
 
 struct RoutingCloneRuntime {
@@ -3313,52 +3346,56 @@ struct RoutingCloneRuntime {
 }
 
 impl RoutingCloneRuntime {
-    fn runtime_for(&self, env_ref: &str) -> Result<CloneControllerRuntime, String> {
+    async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CloneControllerRuntime, String> {
         let runner = if env_ref == self.state.host_direct_environment_name {
             self.state.daemon.local_command_runner()
         } else {
             self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
         }
         .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
-        Ok(CloneControllerRuntime { runner, flights: Arc::clone(&self.state.clone_flights) })
+        let vcs = if env_ref == self.state.host_direct_environment_name {
+            self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
+        } else {
+            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(env_ref), Path::new(checkout)).await?
+        };
+        Ok(CloneControllerRuntime { runner, vcs: Some(vcs), flights: Arc::clone(&self.state.clone_flights) })
     }
 }
 
 #[async_trait]
 impl CloneRuntime for RoutingCloneRuntime {
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.clone_and_inspect(repo_url, target_path).await
+        self.runtime_for(&self.state.host_direct_environment_name, target_path).await?.clone_and_inspect(repo_url, target_path).await
     }
 
     async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.inspect_existing(target_path).await
+        self.runtime_for(&self.state.host_direct_environment_name, target_path).await?.inspect_existing(target_path).await
     }
 
     async fn clone_and_inspect_in(&self, env_ref: &str, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
-        self.runtime_for(env_ref)?.clone_and_inspect(repo_url, target_path).await
+        self.runtime_for(env_ref, target_path).await?.clone_and_inspect(repo_url, target_path).await
     }
 
     async fn inspect_existing_in(&self, env_ref: &str, target_path: &str) -> Result<Option<String>, String> {
-        self.runtime_for(env_ref)?.inspect_existing(target_path).await
+        self.runtime_for(env_ref, target_path).await?.inspect_existing(target_path).await
     }
 }
 
 #[async_trait]
 impl CloneRuntime for CloneControllerRuntime {
     async fn clone_and_inspect(&self, repo_url: &str, target_path: &str) -> Result<Option<String>, String> {
+        let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
         let flight = self.flights.for_target(target_path);
         let _flight_guard = flight.lock().await;
-        if let Some(inspection) = recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await? {
-            return Ok(inspection.default_branch);
+        if let Some(inspection) = recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path).await? {
+            return Ok(inspection);
         }
 
         let staging_path = clone_staging_path(target_path);
         remove_checkout_path(&*self.runner, &staging_path).await?;
-        let provisioner = GitCloneProvisioner::new(Arc::clone(&self.runner));
-        let staging = ExecutionEnvironmentPath::new(&staging_path);
         let prepare = async {
-            provisioner.clone_repo(repo_url, &staging).await?;
-            provisioner.inspect_clone(&staging).await
+            vcs.clone_repository(repo_url, Path::new(&staging_path)).await?;
+            vcs.inspect_clone(Path::new(&staging_path)).await
         }
         .await;
         let inspection = match prepare {
@@ -3367,38 +3404,42 @@ impl CloneRuntime for CloneControllerRuntime {
         };
         if let Err(error) = self.runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Default).await {
             let error = cleanup_failed_checkout(&*self.runner, &staging_path, format!("publish clone: {error}")).await;
-            return match recover_existing_clone(Arc::clone(&self.runner), repo_url, target_path).await {
-                Ok(Some(inspection)) => Ok(inspection.default_branch),
+            return match recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path).await {
+                Ok(Some(inspection)) => Ok(inspection),
                 Ok(None) => Err(error),
                 Err(adoption_error) => Err(format!("{error}; additionally failed to adopt clone at target: {adoption_error}")),
             };
         }
-        Ok(inspection.default_branch)
+        Ok(inspection)
     }
 
     async fn inspect_existing(&self, target_path: &str) -> Result<Option<String>, String> {
-        let provisioner = GitCloneProvisioner::new(Arc::clone(&self.runner));
-        let inspection = provisioner.inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await?;
-        Ok(inspection.default_branch)
+        controller_vcs(&self.vcs, &self.runner, target_path)?.inspect_clone(Path::new(target_path)).await
     }
 }
 
 async fn recover_existing_clone(
-    runner: Arc<dyn CommandRunner>,
+    vcs: &dyn flotilla_core::vcs::Vcs,
+    runner: &dyn CommandRunner,
     repo_url: &str,
     target_path: &str,
-) -> Result<Option<CloneInspection>, String> {
+) -> Result<Option<Option<String>>, String> {
     if !runner.path_exists(Path::new(target_path)).await? {
         return Ok(None);
     }
 
-    verify_clone_origin(&*runner, repo_url, target_path, "clone target").await?;
-    GitCloneProvisioner::new(runner).inspect_clone(&ExecutionEnvironmentPath::new(target_path)).await.map(Some)
+    verify_clone_origin(vcs, repo_url, target_path, "clone target").await?;
+    vcs.inspect_clone(Path::new(target_path)).await.map(Some)
 }
 
-async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_path: &str, target_label: &str) -> Result<(), String> {
-    let origin = runner
-        .run("git", &["-C", target_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default)
+async fn verify_clone_origin(
+    vcs: &dyn flotilla_core::vcs::Vcs,
+    repo_url: &str,
+    target_path: &str,
+    target_label: &str,
+) -> Result<(), String> {
+    let origin = vcs
+        .clone_origin(Path::new(target_path))
         .await
         .map_err(|error| format!("{target_label} {target_path} already exists but is not a reusable clone: {error}"))?;
     let origin = origin.trim();
@@ -3416,6 +3457,7 @@ async fn verify_clone_origin(runner: &dyn CommandRunner, repo_url: &str, target_
 
 struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
+    vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
 }
 
@@ -3425,14 +3467,26 @@ struct RoutingCheckoutRuntime {
 }
 
 impl RoutingCheckoutRuntime {
-    fn runtime_for(&self, env_ref: &str) -> Result<CheckoutControllerRuntime, String> {
+    async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CheckoutControllerRuntime, String> {
         let runner = if env_ref == self.state.host_direct_environment_name {
             self.state.daemon.local_command_runner()
         } else {
             self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
         }
         .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
-        Ok(CheckoutControllerRuntime { runner, change_requests: self.change_requests.clone() })
+        let vcs = if env_ref == self.state.host_direct_environment_name {
+            self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
+        } else {
+            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(env_ref), Path::new(checkout)).await?
+        };
+        Ok(CheckoutControllerRuntime { runner, vcs: Some(vcs), change_requests: self.change_requests.clone() })
+    }
+}
+
+fn removal_source_path(removal: &CheckoutRemoval) -> &str {
+    match removal {
+        CheckoutRemoval::Worktree { clone_path, .. } => clone_path,
+        CheckoutRemoval::FreshClone { target_path } | CheckoutRemoval::OrphanedWorktree { target_path } => target_path,
     }
 }
 
@@ -3445,7 +3499,10 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.create_worktree(clone_path, branch, base_ref, target_path).await
+        self.runtime_for(&self.state.host_direct_environment_name, clone_path)
+            .await?
+            .create_worktree(clone_path, branch, base_ref, target_path)
+            .await
     }
 
     async fn create_fresh_clone(
@@ -3455,7 +3512,10 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+        self.runtime_for(&self.state.host_direct_environment_name, target_path)
+            .await?
+            .create_fresh_clone(repo_url, branch, base_ref, target_path)
+            .await
     }
 
     async fn inspect_integration(
@@ -3463,11 +3523,12 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         checkout: &ResourceObject<Checkout>,
         convoy: Option<&ResourceObject<Convoy>>,
     ) -> Result<CheckoutIntegrationStatus, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.inspect_integration(checkout, convoy).await
+        let path = checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec).ok_or("checkout path unavailable")?;
+        self.runtime_for(&self.state.host_direct_environment_name, path).await?.inspect_integration(checkout, convoy).await
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.runtime_for(&self.state.host_direct_environment_name)?.remove_checkout(removal).await
+        self.runtime_for(&self.state.host_direct_environment_name, removal_source_path(removal)).await?.remove_checkout(removal).await
     }
 
     async fn create_worktree_in(
@@ -3478,7 +3539,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(env_ref)?.create_worktree(clone_path, branch, base_ref, target_path).await
+        self.runtime_for(env_ref, clone_path).await?.create_worktree(clone_path, branch, base_ref, target_path).await
     }
 
     async fn create_fresh_clone_in(
@@ -3489,7 +3550,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(env_ref)?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
+        self.runtime_for(env_ref, target_path).await?.create_fresh_clone(repo_url, branch, base_ref, target_path).await
     }
 
     async fn inspect_integration_in(
@@ -3498,11 +3559,12 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         checkout: &ResourceObject<Checkout>,
         convoy: Option<&ResourceObject<Convoy>>,
     ) -> Result<CheckoutIntegrationStatus, String> {
-        self.runtime_for(env_ref)?.inspect_integration(checkout, convoy).await
+        let path = checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec).ok_or("checkout path unavailable")?;
+        self.runtime_for(env_ref, path).await?.inspect_integration(checkout, convoy).await
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.runtime_for(env_ref)?.remove_checkout(removal).await
+        self.runtime_for(env_ref, removal_source_path(removal)).await?.remove_checkout(removal).await
     }
 }
 
@@ -3547,125 +3609,14 @@ impl CheckoutControllerRuntime {
 impl CheckoutRuntime for CheckoutControllerRuntime {
     async fn create_worktree(
         &self,
-        clone_path: &str,
+        _clone_path: &str,
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        let runner = self.local_runner()?;
-        let clone_path = utf8_path(clone_path)?;
-        let target_path = utf8_path(target_path)?;
-        if let Some(prepared) = recover_existing_worktree(&*runner, clone_path, branch, target_path).await? {
-            return Ok(prepared);
-        }
-
-        let local_ref = format!("refs/heads/{branch}");
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        let local_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .is_ok();
-        let has_origin = !local_exists
-            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Default).await.is_ok();
-        if has_origin {
-            let remote_head = format!("refs/heads/{branch}");
-            let advertised = runner
-                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
-            if !advertised.trim().is_empty() {
-                let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
-                runner
-                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default)
-                    .await
-                    .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
-            }
-        }
-        let remote_exists = runner
-            .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .is_ok();
-        let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
-            CheckoutBranchProvenance::CreatedForConvoy
-        } else {
-            CheckoutBranchProvenance::PreExisting
-        };
-
-        if local_exists {
-            // Multiple vessels can intentionally share the convoy branch. `--force`
-            // overrides Git's protection against attaching it to another worktree.
-            runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-        } else if remote_exists {
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        } else if let Some(base_ref) = base_ref {
-            let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
-            if has_origin {
-                // Force-update the tracking ref: a plain (non-force) fetch would fail on a
-                // rebased/force-pushed base branch and silently fall through to whatever
-                // origin/{base_ref} was last cached, reproducing a narrower version of the
-                // staleness bug this arm exists to fix.
-                let refspec = format!("+{base_ref}:refs/remotes/origin/{base_ref}");
-                if let Err(error) =
-                    runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Default).await
-                {
-                    warn!(%base_ref, %error, "fetch convoy base ref failed; falling back to local ref for branch-off");
-                }
-            }
-            // A shared clone always has a local base_ref from its initial clone, but
-            // nothing keeps it advancing — prefer the freshly fetched remote tip and
-            // only fall back to the local ref when origin has no such branch.
-            let resolved_base_ref = if runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await
-                .is_ok()
-            {
-                format!("origin/{base_ref}")
-            } else {
-                base_ref.to_string()
-            };
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        } else {
-            runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-        }
-
-        let commit = resolve_head_commit(&*runner, target_path).await?;
-        if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
-            // Ownership belongs to the branch, not one checkout: sibling vessels
-            // can share it and may finalize in either order.
-            let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
-            runner
-                .run(
-                    "git",
-                    &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        }
-        Ok(PreparedCheckout { commit, branch_provenance })
+        let vcs = controller_vcs(&self.vcs, &self.runner, _clone_path)?;
+        let materialisation = vcs.materialise_checkout(branch, base_ref, target_path).await?;
+        Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
     async fn create_fresh_clone(
@@ -3675,59 +3626,9 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
-        let runner = self.local_runner()?;
-        let target_path = utf8_path(target_path)?;
-        if let Some(prepared) = recover_existing_fresh_clone(&*runner, repo_url, branch, target_path).await? {
-            return Ok(prepared);
-        }
-        let staging_path = clone_staging_path(target_path);
-        remove_checkout_path(&*runner, &staging_path).await?;
-        let clone_ref = base_ref.unwrap_or(branch);
-        let prepare = async {
-            if clone_ref == "HEAD" {
-                runner.run("git", &["clone", repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default).await?;
-            } else {
-                runner
-                    .run("git", &["clone", "--branch", clone_ref, repo_url, &staging_path], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-            }
-            if clone_ref != branch {
-                let remote_ref = format!("refs/remotes/origin/{branch}");
-                let remote_exists = runner
-                    .run(
-                        "git",
-                        &["-C", &staging_path, "show-ref", "--verify", "--quiet", &remote_ref],
-                        Path::new("/"),
-                        &ChannelLabel::Default,
-                    )
-                    .await
-                    .is_ok();
-                if remote_exists {
-                    runner
-                        .run(
-                            "git",
-                            &["-C", &staging_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                        )
-                        .await?;
-                } else {
-                    runner.run("git", &["-C", &staging_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Default).await?;
-                }
-            }
-            resolve_head_commit(&*runner, &staging_path).await
-        }
-        .await;
-        let commit = match prepare {
-            Ok(commit) => commit,
-            Err(error) => {
-                return Err(cleanup_failed_checkout(&*runner, &staging_path, error).await);
-            }
-        };
-        if let Err(error) = runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Default).await {
-            return Err(cleanup_failed_checkout(&*runner, &staging_path, format!("publish fresh clone: {error}")).await);
-        }
-        Ok(PreparedCheckout { commit, branch_provenance: CheckoutBranchProvenance::PreExisting })
+        let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
+        let materialisation = vcs.materialise_fresh_clone(repo_url, branch, base_ref, target_path).await?;
+        Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
     async fn inspect_integration(
@@ -3737,6 +3638,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     ) -> Result<CheckoutIntegrationStatus, String> {
         let runner = self.local_runner()?;
         let path = Path::new(self.checkout_path(checkout)?);
+        let vcs = controller_vcs(&self.vcs, &self.runner, self.checkout_path(checkout)?)?;
         if let Some(convoy) = convoy {
             let change_request_id = convoy_change_request_id_for_checkout(convoy, checkout);
             let observed_change_request = match change_request_id.as_deref() {
@@ -3745,6 +3647,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             };
             return Ok(inspect_convoy_checkout_integration(
                 &*runner,
+                vcs.as_ref(),
                 path,
                 &checkout.spec,
                 convoy,
@@ -3755,6 +3658,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         }
         Ok(inspect_checkout_integration(
             &*runner,
+            vcs.as_ref(),
             path,
             &checkout.spec,
             checkout.metadata.labels.get(flotilla_resources::CHANGE_REQUEST_ID_LABEL).map(String::as_str),
@@ -3775,159 +3679,35 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
-            CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
-                let clone_path = utf8_path(clone_path)?;
-                let target_path = utf8_path(target_path)?;
-                let target_exists = runner.path_exists(Path::new(target_path)).await?;
-                if !target_exists && !runner.path_exists(Path::new(clone_path)).await? {
-                    return Ok(CheckoutRemovalOutcome::Removed);
-                }
-                if target_exists {
-                    let remove = runner
-                        .run_output(
-                            "git",
-                            &["-C", clone_path, "worktree", "remove", "--force", target_path],
-                            Path::new("/"),
-                            &ChannelLabel::Default,
-                        )
-                        .await?;
-                    if !remove.success && !remove.stderr.contains("is not a working tree") {
-                        return Err(remove.stderr);
+            CheckoutRemoval::Worktree { branch, target_path, .. } => {
+                let vcs = controller_vcs(&self.vcs, &self.runner, removal_source_path(removal))?;
+                match vcs.remove_materialised_checkout(branch, target_path).await? {
+                    flotilla_core::vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
+                    flotilla_core::vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
+                        let reason = match reason {
+                            flotilla_core::vcs::CheckoutPreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
+                            flotilla_core::vcs::CheckoutPreservationReason::CheckedOutElsewhere => {
+                                BranchPreservationReason::CheckedOutElsewhere
+                            }
+                            flotilla_core::vcs::CheckoutPreservationReason::NotCreatedForConvoy => {
+                                BranchPreservationReason::NotCreatedForConvoy
+                            }
+                            other => return Err(format!("checkout branch {branch} preserved: {other:?}")),
+                        };
+                        Ok(CheckoutRemovalOutcome::PreservedBranch { branch, reason })
+                    }
+                    flotilla_core::vcs::CheckoutRemoval::PreservedCheckout { path, reason } => {
+                        Err(format!("checkout {path} preserved: {reason:?}"))
                     }
                 }
-                remove_checkout_path(&*runner, target_path).await?;
-                runner.run("git", &["-C", clone_path, "worktree", "prune"], Path::new("/"), &ChannelLabel::Default).await?;
-                remove_empty_checkout_parents(&*runner, clone_path, target_path).await?;
-
-                let branch_ref = format!("refs/heads/{branch}");
-                let bootstrap_ref = bootstrap_branch_ref(branch);
-                let head = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if !head.success {
-                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                    return Ok(CheckoutRemovalOutcome::Removed);
-                }
-                let bootstrap = runner
-                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if !bootstrap.success {
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::NotCreatedForConvoy,
-                    });
-                }
-                if head.stdout.trim() != bootstrap.stdout.trim() {
-                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::CommitsPastBase,
-                    });
-                }
-
-                let worktrees = runner
-                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
-                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
-                        branch: branch.clone(),
-                        reason: BranchPreservationReason::CheckedOutElsewhere,
-                    });
-                }
-
-                runner
-                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Default)
-                    .await?;
-                delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
-                Ok(CheckoutRemovalOutcome::Removed)
             }
         }
     }
 }
 
-async fn recover_existing_worktree(
-    runner: &dyn CommandRunner,
-    clone_path: &str,
-    branch: &str,
-    target_path: &str,
-) -> Result<Option<PreparedCheckout>, String> {
-    if !runner.path_exists(Path::new(target_path)).await? {
-        return Ok(None);
-    }
-
-    let target_common_dir = runner
-        .run("git", &["-C", target_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map_err(|error| format!("checkout target {target_path} already exists but is not a reusable git worktree: {error}"))?;
-    let clone_common_dir = runner
-        .run("git", &["-C", clone_path, "rev-parse", "--path-format=absolute", "--git-common-dir"], Path::new("/"), &ChannelLabel::Default)
-        .await?;
-    if target_common_dir.trim() != clone_common_dir.trim() {
-        return Err(format!("checkout target {target_path} already exists but belongs to a different git repository"));
-    }
-
-    let current_branch =
-        runner.run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default).await;
-    if current_branch.as_deref().map(str::trim) != Ok(branch) {
-        let target_commit = resolve_head_commit(runner, target_path).await?;
-        let expected_commit = runner.run("git", &["-C", clone_path, "rev-parse", branch], Path::new("/"), &ChannelLabel::Default).await?;
-        if target_commit.as_deref() != Some(expected_commit.trim()) {
-            return Err(format!("checkout target {target_path} already exists at a different ref than {branch}"));
-        }
-    }
-
-    let branch_provenance = if runner
-        .run(
-            "git",
-            &["-C", clone_path, "show-ref", "--verify", "--quiet", &bootstrap_branch_ref(branch)],
-            Path::new("/"),
-            &ChannelLabel::Default,
-        )
-        .await
-        .is_ok()
-    {
-        CheckoutBranchProvenance::CreatedForConvoy
-    } else {
-        CheckoutBranchProvenance::PreExisting
-    };
-    Ok(Some(PreparedCheckout { commit: resolve_head_commit(runner, target_path).await?, branch_provenance }))
-}
-
-async fn recover_existing_fresh_clone(
-    runner: &dyn CommandRunner,
-    repo_url: &str,
-    branch: &str,
-    target_path: &str,
-) -> Result<Option<PreparedCheckout>, String> {
-    if !runner.path_exists(Path::new(target_path)).await? {
-        return Ok(None);
-    }
-
-    verify_clone_origin(runner, repo_url, target_path, "checkout target").await?;
-
-    if branch != "HEAD" {
-        let current_branch = runner
-            .run("git", &["-C", target_path, "symbolic-ref", "--quiet", "--short", "HEAD"], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .map_err(|error| format!("checkout target {target_path} already exists but its branch cannot be resolved: {error}"))?;
-        if current_branch.trim() != branch {
-            return Err(format!("checkout target {target_path} already exists on branch {}, expected {branch}", current_branch.trim()));
-        }
-    }
-
-    Ok(Some(PreparedCheckout {
-        commit: resolve_head_commit(runner, target_path).await?,
-        branch_provenance: CheckoutBranchProvenance::PreExisting,
-    }))
-}
-
+#[cfg(test)]
 fn bootstrap_branch_ref(branch: &str) -> String {
     format!("refs/flotilla/bootstrap/{branch}")
-}
-
-async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
-    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Default).await?;
-    Ok(())
 }
 
 async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
@@ -3950,38 +3730,6 @@ async fn cleanup_failed_checkout(runner: &dyn CommandRunner, target_path: &str, 
 
 fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
-}
-
-async fn remove_empty_checkout_parents(runner: &dyn CommandRunner, clone_path: &str, target_path: &str) -> Result<(), String> {
-    let Some(checkout_root) = Path::new(clone_path).parent() else {
-        return Ok(());
-    };
-    let Some(mut parent) = Path::new(target_path).parent() else {
-        return Ok(());
-    };
-    while parent != checkout_root && parent.starts_with(checkout_root) {
-        let path = parent.to_string_lossy();
-        match runner.run_output("rmdir", &[&path], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(output) if output.success => {}
-            Ok(_) => {
-                let exists = runner.run_output("test", &["-e", &path], Path::new("/"), &ChannelLabel::Default).await?;
-                if exists.success {
-                    break;
-                }
-            }
-            Err(error) => return Err(format!("remove empty checkout parent {}: {error}", parent.display())),
-        }
-        let Some(next) = parent.parent() else {
-            break;
-        };
-        parent = next;
-    }
-    Ok(())
-}
-
-async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
-    let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Default).await?;
-    Ok(Some(commit.trim().to_string()))
 }
 
 struct TerminalControllerRuntime {
@@ -4104,11 +3852,21 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .agent_adapters
                     .get(&requirement.adapter)
                     .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-                adapter.prepare_with_environment(&cwd, brief, &credential_env).await?;
+                let vcs = if spec.env_ref == self.state.host_direct_environment_name {
+                    self.state.daemon.local_vcs_for_checkout(cwd.as_path()).await?
+                } else {
+                    self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
+                };
+                adapter.prepare_with_vcs(&cwd, brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {
                     let copy_root = ExecutionEnvironmentPath::new(copy_root);
                     if copy_root != cwd {
-                        adapter.prepare_with_environment(&copy_root, brief, &credential_env).await?;
+                        let vcs = if spec.env_ref == self.state.host_direct_environment_name {
+                            self.state.daemon.local_vcs_for_checkout(copy_root.as_path()).await?
+                        } else {
+                            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), copy_root.as_path()).await?
+                        };
+                        adapter.prepare_with_vcs(&copy_root, brief, &credential_env, vcs.as_ref()).await?;
                     }
                 }
                 let plan = adapter.launch(&AgentLaunchRequest {
@@ -4447,7 +4205,7 @@ mod tests {
     use flotilla_resources::{
         clone_key,
         controller::{Actuation, Reconciler},
-        delete_resource_kind, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
+        delete_resource_kind, Checkout as ResourceCheckout, CheckoutBranchProvenance, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec,
         CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, CheckoutWorktreeSpec, ConvoyEnsure,
         ConvoyEnsureSpec, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
         CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSource, CrewSpec,
@@ -5291,7 +5049,9 @@ mod tests {
             .register_direct_environment_for_test(
                 environment_id.clone(),
                 Arc::clone(&runner),
-                EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string())),
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string()))
+                    .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
                 Some(flotilla_protocol::qualified_path::HostId::new(host_id)),
             )
             .expect("register SSH environment");
@@ -5313,7 +5073,9 @@ mod tests {
             },
             environment_id: environment_id.clone(),
             destination: "crew@beaufort.example".to_string(),
-            env_bag: EnvironmentBag::new().with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string())),
+            env_bag: EnvironmentBag::new()
+                .with(EnvironmentAssertion::env_var("HOME", temp.path().display().to_string()))
+                .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
             runner,
         };
         register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
@@ -5671,8 +5433,8 @@ mod tests {
             release_clone: Notify::new(),
         });
         let flights = Arc::new(CloneFlights::default());
-        let first_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::clone(&flights) });
-        let second_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights });
+        let first_runtime = Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::clone(&flights) });
+        let second_runtime = Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights });
         let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
         let target_path = target.to_str().expect("utf-8 target path").to_string();
 
@@ -5708,8 +5470,10 @@ mod tests {
             clone_started: Notify::new(),
             release_clone: Notify::new(),
         });
-        let first_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
-        let external_runtime = Arc::new(CloneControllerRuntime { runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let first_runtime =
+            Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let external_runtime =
+            Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
         let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
         let target_path = target.to_str().expect("utf-8 target path").to_string();
 
@@ -5739,6 +5503,7 @@ mod tests {
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("clone");
         let runtime = CloneControllerRuntime {
+            vcs: None,
             runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
             flights: Arc::new(CloneFlights::default()),
         };
@@ -5800,7 +5565,11 @@ mod tests {
                 primary: backend.using::<Clone>(NAMESPACE),
                 secondaries: Vec::new(),
                 reconciler: CloneReconciler::new(
-                    Arc::new(CloneControllerRuntime { runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) }),
+                    Arc::new(CloneControllerRuntime {
+                        vcs: None,
+                        runner: Arc::new(ProcessCommandRunner),
+                        flights: Arc::new(CloneFlights::default()),
+                    }),
                     backend.using::<Repository>(NAMESPACE),
                 ),
                 resync_interval: Duration::from_secs(60),
@@ -5866,7 +5635,8 @@ mod tests {
         let target = temp.path().join("clone");
         fs::create_dir_all(&target).expect("dirty target directory");
         fs::write(target.join("leftover"), "debris").expect("dirty target contents");
-        let runtime = CloneControllerRuntime { runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) };
+        let runtime =
+            CloneControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) };
         let repo_url = source.path().to_str().expect("utf-8 source path");
         let target_path = target.to_str().expect("utf-8 target path");
 
@@ -6919,7 +6689,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -6963,7 +6733,7 @@ mod tests {
         let origin_tip = String::from_utf8(origin_tip.stdout).expect("utf-8 rev").trim().to_string();
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(clone_path, "feature/fresh-from-origin", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -7011,7 +6781,7 @@ mod tests {
         assert_ne!(origin_tip, cached_tip, "the rewrite should actually diverge from what the clone cached");
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(clone_path, "feature/onto-rewritten-base", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -7041,7 +6811,7 @@ mod tests {
             .with_initial_commit()
             .with_origin(origin.path().to_str().expect("utf-8 origin path"));
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -7065,7 +6835,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let first = runtime
             .create_worktree(
@@ -7095,7 +6865,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("flotilla.feature-cleanup");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -7135,7 +6905,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = temp.path().join("clone-that-failed-auth");
         let target = temp.path().join("workspace/never-created");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         let removal = CheckoutRemoval::Worktree {
             clone_path: clone.to_str().expect("utf-8 clone path").to_string(),
             branch: "feature/never-created".to_string(),
@@ -7153,7 +6923,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/removed-out-of-band");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         runtime
             .create_worktree(
                 clone.path().to_str().expect("utf-8 clone path"),
@@ -7224,6 +6994,7 @@ mod tests {
         let stale_target = temp.path().join("checkout-root/stale-convoy/flotilla.feature-stale");
         let commands = Arc::new(StdMutex::new(Vec::new()));
         let runtime = CheckoutControllerRuntime {
+            vcs: None,
             runner: Arc::new(RecordingProcessRunner { commands: Arc::clone(&commands) }),
             change_requests: None,
         };
@@ -7287,7 +7058,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
         TestGitRepo::init(target.join("embedded")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         let removal = CheckoutRemoval::Worktree {
             clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
             branch: "feature/cleanup".to_string(),
@@ -7308,7 +7079,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("feature-work/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -7367,7 +7138,7 @@ mod tests {
     async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         for reverse_teardown in [false, true] {
             let case = if reverse_teardown { "reverse" } else { "forward" };
@@ -7422,7 +7193,7 @@ mod tests {
             .with_initial_commit()
             .with_origin(missing_origin.to_str().expect("utf-8 origin path"));
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let prepared = runtime
             .create_worktree(
@@ -7483,7 +7254,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -7528,7 +7299,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_worktree(
@@ -7578,7 +7349,7 @@ mod tests {
             .success());
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
         runtime
             .create_worktree(
                 clone_path.to_str().expect("utf-8 clone path"),
@@ -7602,7 +7373,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(
@@ -7627,7 +7398,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let first = runtime
             .create_fresh_clone(
@@ -7657,6 +7428,7 @@ mod tests {
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
         let runtime = CheckoutControllerRuntime {
+            vcs: None,
             runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
             change_requests: None,
         };
@@ -7698,7 +7470,7 @@ mod tests {
         let staging_path = clone_staging_path(target);
         fs::create_dir_all(&staging_path).expect("create partial clone directory");
         fs::write(Path::new(&staging_path).join("partial"), "incomplete clone").expect("write partial clone content");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let outcome = runtime
             .remove_checkout(&CheckoutRemoval::FreshClone { target_path: target.to_string() })
@@ -7713,7 +7485,7 @@ mod tests {
     async fn checkout_runtime_treats_an_already_missing_orphaned_worktree_as_removed() {
         let temp = TempDir::new().expect("tempdir");
         let target = temp.path().join("already-removed-worktree");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         let outcome = runtime
             .remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: target.to_str().expect("utf-8 target path").to_string() })
@@ -7728,7 +7500,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(
@@ -7765,7 +7537,7 @@ mod tests {
             .expect("git commit should run")
             .success());
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
 
         runtime
             .create_fresh_clone(source_path, "feature/existing", Some("main"), target.to_str().expect("utf-8 target path"))
@@ -9323,7 +9095,7 @@ mod tests {
 
         let checkout = checkouts.get("checkout-b").await.expect("get checkout on authority host B");
         let observer = CheckoutReconciler::new(
-            Arc::new(CheckoutControllerRuntime { runner: Arc::new(MergedPrProcessRunner::new(1367)), change_requests: None }),
+            Arc::new(CheckoutControllerRuntime { vcs: None, runner: Arc::new(MergedPrProcessRunner::new(1367)), change_requests: None }),
             checkout_host.clone(),
             NAMESPACE,
         )
@@ -9433,17 +9205,6 @@ mod tests {
         insert_undecodable_resource::<TerminalSession>(&connection, "poisoned-terminal-session");
         drop(connection);
 
-        let log_output = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = LogCaptureWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
         let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
             heartbeat_interval: Duration::from_secs(300),
@@ -9469,12 +9230,6 @@ mod tests {
         ] {
             assert!(diagnosis.contains(identity), "fleet diagnosis should name {identity}: {diagnosis}");
         }
-
-        let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
-        for field in ["kind", "name", "error"] {
-            assert!(logs.contains(field), "quarantine warning should include {field}: {logs}");
-        }
-        assert!(logs.contains("quarantin"), "quarantine warning should be explicit: {logs}");
 
         runtime.shutdown();
     }
@@ -9845,10 +9600,11 @@ mod tests {
 
     async fn crew_daemon_with_backend(config: Arc<ConfigStore>, backend: ResourceBackend) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         let pool = Arc::new(FakeTerminalPool::new());
-        let discovery = fake_discovery_with_provider_set(
+        let mut discovery = fake_discovery_with_provider_set(
             FakeDiscoveryProviders::new()
                 .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
         );
+        discovery.factories.vcs.push(Box::new(flotilla_core::providers::discovery::factories::git::GitVcsFactory));
         let daemon =
             InProcessDaemon::new_with_resource_backend(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy"), backend)
                 .await;
@@ -9871,6 +9627,7 @@ mod tests {
             FakeDiscoveryProviders::new()
                 .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
         );
+        discovery.factories.vcs.push(Box::new(flotilla_core::providers::discovery::factories::git::GitVcsFactory));
         discovery.runner = Arc::new(ProcessCommandRunner);
         let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
         daemon
@@ -10785,7 +10542,8 @@ mod tests {
         ));
         let bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", env_id.to_string()))
-            .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"));
+            .with(EnvironmentAssertion::binary("claude", "/usr/local/bin/claude"))
+            .with(EnvironmentAssertion::binary("git", "/usr/bin/git"));
         assert!(bag.find_env_var("CLAUDE_CONFIG_DIR").is_none(), "the contained discovery environment must reproduce udder");
         let pool = Arc::new(FakeTerminalPool::new());
         let mut contained_registry = ProviderRegistry::new();

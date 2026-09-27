@@ -1,7 +1,9 @@
 pub mod clone;
+pub mod detection;
 pub mod git;
 pub mod git_worktree;
 pub mod provisioning;
+pub mod skill_source;
 
 use std::path::Path;
 
