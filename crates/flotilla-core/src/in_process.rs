@@ -1567,6 +1567,37 @@ async fn forge_for_remote(
     Ok(matching.into_iter().next())
 }
 
+async fn discover_vcs_for_checkout(
+    environment_manager: &EnvironmentManager,
+    discovery: &DiscoveryRuntime,
+    config: &ConfigStore,
+    local_environment_id: &EnvironmentId,
+    environment_id: &EnvironmentId,
+    checkout_path: &Path,
+) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    let runner = environment_manager
+        .environment_runner(environment_id)
+        .ok_or_else(|| format!("command runner unavailable for environment {environment_id}"))?;
+    let host_bag = environment_manager
+        .environment_bag(environment_id)
+        .ok_or_else(|| format!("discovery environment unavailable: {environment_id}"))?;
+    let remote_env = StaticEnvVars::from_bag(&host_bag);
+    let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+    let checkout = ExecutionEnvironmentPath::new(checkout_path);
+    let mut bag = host_bag;
+    for detector in &discovery.repo_detectors {
+        bag = bag.extend(detector.detect(&checkout, &*runner, env).await);
+    }
+    let mut unmet = Vec::new();
+    for factory in &discovery.factories.vcs {
+        match factory.probe(&bag, config, &checkout, Arc::clone(&runner)).await {
+            Ok(provider) => return Ok(provider),
+            Err(requirements) => unmet.extend(requirements),
+        }
+    }
+    Err(format!("no VCS provider discovered for {} in {environment_id}: {unmet:?}", checkout.as_path().display()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
@@ -2506,29 +2537,20 @@ impl InProcessDaemon {
             if path_identities.contains_key(&path) {
                 continue;
             }
-            let initial_discovery = discover_repo_for_environment(
-                &environment_manager,
-                &discovery,
-                &config,
-                &resource_backend,
-                DEFAULT_PROVISIONING_NAMESPACE,
-                &local_environment_id,
-                &local_environment_id,
-                &path,
-            )
-            .await
-            .expect("local direct environment discovery should always be available");
-            let startup_inspection = match initial_discovery.registry.vcs.preferred() {
-                Some(vcs) => {
+            let initial_vcs =
+                discover_vcs_for_checkout(&environment_manager, &discovery, &config, &local_environment_id, &local_environment_id, &path)
+                    .await;
+            let startup_inspection = match initial_vcs {
+                Ok(vcs) => {
                     GitRepositoryInspector::new(
                         discovery.runner.clone(),
-                        Arc::new(crate::vcs::FixedVcsResolver(Arc::clone(vcs))),
+                        Arc::new(crate::vcs::FixedVcsResolver(vcs)),
                         local_host_id.to_string(),
                     )
                     .inspect_path(&path, None)
                     .await
                 }
-                None => Err(format!("no VCS provider discovered for {}", path.display())),
+                Err(error) => Err(error),
             };
             if let Ok(inspection) = &startup_inspection {
                 let mut spec = inspection.spec.clone();
@@ -3200,29 +3222,15 @@ impl InProcessDaemon {
     pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
         let key = (env_id.clone(), checkout.to_path_buf());
         let cell = self.checkout_vcs.lock().await.entry(key).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone();
-        cell.get_or_try_init(|| async {
-            let runner = self
-                .environment_manager
-                .environment_runner(env_id)
-                .ok_or_else(|| format!("command runner unavailable for environment {env_id}"))?;
-            let host_bag =
-                self.environment_manager.environment_bag(env_id).ok_or_else(|| format!("discovery environment unavailable: {env_id}"))?;
-            let env = StaticEnvVars::from_bag(&host_bag);
-            let env_vars: &dyn crate::providers::discovery::EnvVars =
-                if env_id == &self.local_environment_id { &*self.discovery.env } else { &env };
-            let checkout = ExecutionEnvironmentPath::new(checkout);
-            let mut bag = host_bag;
-            for detector in &self.discovery.repo_detectors {
-                bag = bag.extend(detector.detect(&checkout, &*runner, env_vars).await);
-            }
-            let mut unmet = Vec::new();
-            for factory in &self.discovery.factories.vcs {
-                match factory.probe(&bag, &self.config, &checkout, Arc::clone(&runner)).await {
-                    Ok(provider) => return Ok(provider),
-                    Err(requirements) => unmet.extend(requirements),
-                }
-            }
-            Err(format!("no VCS provider discovered for {} in {env_id}: {unmet:?}", checkout.as_path().display()))
+        cell.get_or_try_init(|| {
+            discover_vcs_for_checkout(
+                &self.environment_manager,
+                &self.discovery,
+                &self.config,
+                &self.local_environment_id,
+                env_id,
+                checkout,
+            )
         })
         .await
         .map(Arc::clone)
