@@ -2,7 +2,6 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_resources::ChangeRequestStatus as ObservedChangeRequestStatus;
 
 use crate::{
     change_request_observer::parse_gh_observation,
@@ -91,7 +90,7 @@ impl GitHubChangeRequest {
 
 #[async_trait]
 impl super::ChangeRequestTracker for GitHubChangeRequest {
-    async fn observe_bound(&self, numbers: &[u64]) -> Result<HashMap<u64, ObservedChangeRequestStatus>, String> {
+    async fn observe_bound(&self, numbers: &[u64]) -> Result<super::BoundObservations, String> {
         if numbers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -135,7 +134,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             }
             let mut request = request.clone();
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
-            statuses.insert(*number, parse_gh_observation(&request.to_string(), observed_at)?);
+            statuses.insert(*number, Ok(parse_gh_observation(&request.to_string(), observed_at)?));
         }
         Ok(statuses)
     }

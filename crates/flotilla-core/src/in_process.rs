@@ -110,7 +110,7 @@ use crate::{
     },
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
-        change_request::ChangeRequestTracker,
+        change_request::{BoundObservations, ChangeRequestTracker},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
@@ -137,7 +137,7 @@ type ObservationScope = (String, String, String);
 struct CachedObservation {
     expires_at: tokio::time::Instant,
     queried: BTreeSet<u64>,
-    result: Result<HashMap<u64, flotilla_resources::ChangeRequestStatus>, String>,
+    result: Result<BoundObservations, String>,
 }
 
 struct ProviderChangeRequestObservationSource {
@@ -207,7 +207,7 @@ impl ProviderChangeRequestObservationSource {
                         .map_err(Clone::clone)?
                         .get(&subject.number)
                         .cloned()
-                        .ok_or_else(|| format!("change request {} was not found", subject.number));
+                        .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)));
                 }
             }
         }
@@ -220,9 +220,11 @@ impl ProviderChangeRequestObservationSource {
             .and_then(|error| rate_limit_reset(error))
             .and_then(|reset| reset.signed_duration_since(Utc::now()).to_std().ok())
             .unwrap_or(Duration::from_secs(9));
-        let status = result.as_ref().map(|statuses| statuses.get(&subject.number).cloned()).map_err(Clone::clone);
+        let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
+            statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
+        });
         *cache = Some(CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
-        status?.ok_or_else(|| format!("change request {} was not found", subject.number))
+        status
     }
 }
 
