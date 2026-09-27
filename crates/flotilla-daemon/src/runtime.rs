@@ -600,12 +600,7 @@ impl DaemonRuntime {
             ),
         ];
         if let Some(relay) = relay {
-            tasks.push(crate::event_relay::spawn(
-                Arc::clone(&daemon),
-                options.namespace.clone(),
-                relay,
-                config.state_dir().as_path().to_path_buf(),
-            )?);
+            tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
         }
         for ssh in &ssh_profiles {
             let daemon = Arc::clone(&daemon);

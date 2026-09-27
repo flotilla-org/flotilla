@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::LeafAddress;
-use flotilla_relay_protocol::Subject;
+use flotilla_relay_protocol::{Subject, SubjectKind};
 use flotilla_resources::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, InputMeta,
     Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ResourceBackend, ResourceProvenance,
@@ -216,12 +216,16 @@ impl ChangeRequestRefresher {
     /// Refresh a claim-time observation even before Landing has armed its
     /// standing leaf subscriptions.
     pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+        self.refresh_once_with_creation(subject, true).await
+    }
+
+    async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), String> {
         let subject = &subject.clone().normalized();
-        if !self.owns_record(subject, false).await? {
+        if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
         let status = self.inner.source.observe_for_completion(subject).await?;
-        self.publish(subject, &subject.record_name(), status, true, false).await
+        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await
     }
 
     pub async fn demand(
@@ -299,21 +303,41 @@ impl ChangeRequestRefresher {
         let subjects = self.inner.active.lock().await.keys().cloned().collect::<Vec<_>>();
         let mut owned = Vec::new();
         for subject in subjects {
-            if self.owns_record(&subject, false).await? {
+            if self.owns_record(&subject, false, false).await? {
                 owned.push(subject);
             }
         }
         Ok(owned)
     }
 
-    pub async fn has_demand(&self, subject: &ChangeRequestRef) -> bool {
-        self.inner.active.lock().await.contains_key(&subject.clone().normalized())
+    /// Match a relay address across all namespaces with live demand. The wire
+    /// subject has no namespace, while one daemon can serve several.
+    pub async fn refresh_hint(&self, hint: &Subject) -> Result<(), String> {
+        if hint.kind != SubjectKind::ChangeRequest {
+            return Ok(());
+        }
+        let subjects = self
+            .inner
+            .active
+            .lock()
+            .await
+            .keys()
+            .filter(|subject| subject.service == hint.service && subject.scope == hint.scope && subject.number == hint.number)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for subject in subjects {
+            if let Err(error) = self.refresh_once_with_creation(&subject, false).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn refresh_demanded_owned(&self) -> Result<(), String> {
         let mut first_error = None;
         for subject in self.demanded_owned().await? {
-            if let Err(error) = self.refresh_once(&subject).await {
+            if let Err(error) = self.refresh_once_with_creation(&subject, false).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -348,7 +372,7 @@ impl ChangeRequestRefresher {
     async fn refresh_loop(&self, subject: ChangeRequestRef) {
         let record_name = subject.record_name();
         loop {
-            match self.owns_record(&subject, true).await {
+            match self.owns_record(&subject, true, true).await {
                 Ok(false) => {
                     if !self.wait_for_next(&subject, self.inner.cadence.state).await {
                         break;
@@ -368,7 +392,7 @@ impl ChangeRequestRefresher {
                 Ok(status) => {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
-                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true).await {
+                    if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
                         self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
@@ -401,7 +425,7 @@ impl ChangeRequestRefresher {
         }
     }
 
-    async fn owns_record(&self, subject: &ChangeRequestRef, allow_takeover: bool) -> Result<bool, String> {
+    async fn owns_record(&self, subject: &ChangeRequestRef, allow_takeover: bool, create_missing: bool) -> Result<bool, String> {
         let name = subject.record_name();
         let records = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace);
         // A former owner can still hold its local copy after another host has
@@ -415,6 +439,9 @@ impl ChangeRequestRefresher {
             )
         });
         let Some(record) = record else {
+            if !create_missing {
+                return Ok(false);
+            }
             let created = self.get_or_create_record(subject, &name).await?;
             return Ok(created.spec.observing_authority == self.inner.authority);
         };
@@ -472,8 +499,9 @@ impl ChangeRequestRefresher {
         status: ChangeRequestStatus,
         heartbeat: bool,
         allow_takeover: bool,
+        create_missing: bool,
     ) -> Result<(), String> {
-        if !self.owns_record(subject, allow_takeover).await? {
+        if !self.owns_record(subject, allow_takeover, create_missing).await? {
             return Ok(());
         }
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
@@ -763,6 +791,49 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_hint_matches_demands_in_each_namespace_without_recreating_missing_records() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(CountingSource(Arc::clone(&calls))),
+            ChangeRequestRefreshCadence::default(),
+        );
+        for namespace in ["flotilla", "ops"] {
+            refresher
+                .demand(
+                    uuid::Uuid::new_v4(),
+                    ChangeRequestRef {
+                        namespace: namespace.to_string(),
+                        service: "GitHub.com".to_string(),
+                        scope: "Flotilla-Org/Flotilla".to_string(),
+                        number: 2051,
+                    },
+                    None,
+                )
+                .await
+                .expect("demand");
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let before = calls.load(Ordering::SeqCst);
+        let hint = Subject::new(SubjectKind::ChangeRequest, "github.com", "flotilla-org/flotilla", 2051);
+        refresher.refresh_hint(&hint).await.expect("hint");
+        assert_eq!(calls.load(Ordering::SeqCst), before + 2, "both namespaces refresh once");
+
+        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 2051);
+        backend.using::<ChangeRequest>("ops").delete(&name).await.expect("delete record during live demand");
+        refresher.refresh_hint(&hint).await.expect("hint after record deletion");
+        assert!(
+            matches!(backend.using::<ChangeRequest>("ops").get(&name).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+            "hint does not recreate a missing record"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), before + 3, "remaining namespace still refreshes");
     }
 
     #[tokio::test(start_paused = true)]

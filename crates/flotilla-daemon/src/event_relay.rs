@@ -3,8 +3,8 @@
 use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use flotilla_core::{change_request_observer::ChangeRequestRef, config::RelayConfig, in_process::InProcessDaemon};
-use flotilla_relay_protocol::{ConsumerFrame, StreamFrame, Subject, SubjectKind};
+use flotilla_core::{config::RelayConfig, in_process::InProcessDaemon};
+use flotilla_relay_protocol::{ConsumerFrame, StreamFrame, Subject};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{
@@ -33,28 +33,12 @@ trait RefreshTarget: Send + Sync {
 
 struct DaemonRefreshTarget {
     daemon: Arc<InProcessDaemon>,
-    namespace: String,
 }
 
 #[async_trait]
 impl RefreshTarget for DaemonRefreshTarget {
     async fn hint(&self, subject: &Subject) -> Result<(), String> {
-        if subject.kind != SubjectKind::ChangeRequest {
-            return Ok(());
-        }
-        let reference = ChangeRequestRef {
-            namespace: self.namespace.clone(),
-            service: subject.service.clone(),
-            scope: subject.scope.clone(),
-            number: subject.number,
-        };
-        // refresh_once checks the currently winning observing authority again.
-        // A non-demanded local record cannot arise in steady state, but demand
-        // is checked explicitly so a delayed hint does not resurrect it.
-        if self.daemon.has_change_request_demand(&reference).await {
-            self.daemon.refresh_change_request_hint(&reference).await?;
-        }
-        Ok(())
+        self.daemon.refresh_change_request_hint(subject).await
     }
 
     async fn resync(&self) -> Result<(), String> {
@@ -168,7 +152,9 @@ impl RelayClient {
                     return Ok(());
                 }
                 if let Ok(subject) = delivery.hint.subject.parse::<Subject>() {
-                    self.target.hint(&subject).await?;
+                    if let Err(error) = self.target.hint(&subject).await {
+                        warn!(%error, subject = %subject, "relay hint refresh failed; polling will retry");
+                    }
                 }
                 self.advance(delivery.cursor, cursor, session).await?;
             }
@@ -338,15 +324,10 @@ impl RelaySession for LongPollSession {
     }
 }
 
-pub(crate) fn spawn(
-    daemon: Arc<InProcessDaemon>,
-    namespace: String,
-    config: RelayConfig,
-    state_dir: PathBuf,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+pub(crate) fn spawn(daemon: Arc<InProcessDaemon>, config: RelayConfig, state_dir: PathBuf) -> Result<tokio::task::JoinHandle<()>, String> {
     let install_id = config.install_id.clone();
     let connector = Arc::new(HttpRelayConnector::new(config)?);
-    let target = Arc::new(DaemonRefreshTarget { daemon, namespace });
+    let target = Arc::new(DaemonRefreshTarget { daemon });
     let cursor_file = CursorFile { path: state_dir.join("relay-cursor.json"), install_id };
     Ok(tokio::spawn(RelayClient { connector, target, cursor_file }.run()))
 }
@@ -355,13 +336,14 @@ pub(crate) fn spawn(
 mod tests {
     use std::{collections::HashSet, sync::Mutex};
 
-    use flotilla_relay_protocol::{Delivery, Hint};
+    use flotilla_relay_protocol::{Delivery, Hint, SubjectKind};
 
     use super::*;
 
     #[derive(Default)]
     struct MemoryTarget {
         owned: HashSet<Subject>,
+        failing: HashSet<Subject>,
         refreshed: Mutex<Vec<Subject>>,
         resyncs: Mutex<usize>,
         health: Mutex<Vec<bool>>,
@@ -370,6 +352,9 @@ mod tests {
     #[async_trait]
     impl RefreshTarget for MemoryTarget {
         async fn hint(&self, subject: &Subject) -> Result<(), String> {
+            if self.failing.contains(subject) {
+                return Err("forge unavailable".into());
+            }
             if self.owned.contains(subject) {
                 self.refreshed.lock().expect("refreshes").push(subject.clone());
             }
@@ -484,5 +469,34 @@ mod tests {
         assert_eq!(*acks.lock().expect("acks"), vec![12]);
         assert_eq!(client.cursor_file.load().expect("cursor"), 12);
         assert_eq!(*target.health.lock().expect("health"), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn failing_refresh_does_not_block_later_hints() {
+        let failing = Subject::github(SubjectKind::ChangeRequest, "flotilla-org", "flotilla", 1);
+        let healthy = Subject::github(SubjectKind::ChangeRequest, "flotilla-org", "flotilla", 2);
+        let target =
+            Arc::new(MemoryTarget { owned: HashSet::from([healthy.clone()]), failing: HashSet::from([failing]), ..Default::default() });
+        let acks = Arc::new(Mutex::new(Vec::new()));
+        let relay = Arc::new(MemoryRelay {
+            horizon: 0,
+            latest: 2,
+            deliveries: vec![hint(1, "cr/github.com/flotilla-org/flotilla/1"), hint(2, "cr/github.com/flotilla-org/flotilla/2")],
+            acks: Arc::clone(&acks),
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = RelayClient {
+            connector: relay.clone(),
+            target: target.clone(),
+            cursor_file: CursorFile { path: dir.path().join("cursor"), install_id: "test".into() },
+        };
+        let mut session = relay.connect(0).await.expect("connect");
+        let mut cursor = 0;
+        for _ in 0..2 {
+            let frame = session.next().await.expect("hint");
+            client.process(frame, &mut cursor, &mut *session).await.expect("continue after forge failure");
+        }
+        assert_eq!(*target.refreshed.lock().expect("refreshes"), vec![healthy]);
+        assert_eq!(*acks.lock().expect("acks"), vec![1, 2]);
     }
 }

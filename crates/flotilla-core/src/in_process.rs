@@ -3403,16 +3403,12 @@ impl InProcessDaemon {
         self.leaf_subscriptions.change_request_stale_after()
     }
 
-    pub async fn refresh_change_request_hint(&self, subject: &crate::change_request_observer::ChangeRequestRef) -> Result<(), String> {
-        self.leaf_subscriptions.refresh_change_request_once(subject).await
+    pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+        self.leaf_subscriptions.refresh_change_request_hint(hint).await
     }
 
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
         self.leaf_subscriptions.refresh_demanded_owned_change_requests().await
-    }
-
-    pub async fn has_change_request_demand(&self, subject: &crate::change_request_observer::ChangeRequestRef) -> bool {
-        self.leaf_subscriptions.has_change_request_demand(subject).await
     }
 
     pub fn set_change_request_relay_healthy(&self, healthy: bool) {
