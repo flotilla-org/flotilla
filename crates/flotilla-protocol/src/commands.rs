@@ -1506,6 +1506,7 @@ mod tests {
                 }),
                 visible_environments: vec![],
                 repo_count: 1,
+                blob_sync: None,
             })),
             CommandValue::HostProviders(Box::new(HostProvidersResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),

@@ -8252,6 +8252,7 @@ impl InProcessDaemon {
                     .crew_count(crew_count)
                     .convoy_count(convoys.len())
                     .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
+                    .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
                     .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                     .staleness(staleness)
                     .observation_agreement(observation_agreement)
@@ -8316,6 +8317,21 @@ impl InProcessDaemon {
         let local_summary = self.refresh_local_host_summary().await;
         let counts = self.local_host_counts().await;
         let mut response = self.host_registry.get_host_status(environment_id, &counts).await?;
+        if let Some(host_id) = environment_id.host_id() {
+            let namespace = self.provisioning_namespace().await;
+            let hosts = self
+                .resource_backend
+                .clone()
+                .including_replicas::<ResourceHost>(&namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            response.blob_sync = hosts
+                .items
+                .into_iter()
+                .find(|host| host.object.metadata.name == host_id.to_string())
+                .and_then(|host| host.object.status.and_then(|status| status.blob_sync));
+        }
         if environment_id == &local_summary.environment_id {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
