@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -1288,10 +1288,14 @@ impl ReconcilerWake {
                 .is_some_and(|status| matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored))
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
+            let mut controller_rows = HashSet::<(String, String)>::new();
             let checkouts = select_convoy_children(convoy, &checkout_sources);
             for checkout in checkouts.values() {
                 let CheckoutSpec::Worktree(spec) = &checkout.spec else { continue };
                 let Some(retry) = checkout.status.as_ref().and_then(|status| status.clone_retry.clone()) else { continue };
+                if !controller_rows.insert(("Clone".into(), spec.clone_ref.clone())) {
+                    continue;
+                }
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.to_string(),
@@ -1321,6 +1325,9 @@ impl ReconcilerWake {
                     ("CredentialRefresh", vessel_status.credential_refresh_retry.as_ref()),
                 ] {
                     let Some(retry) = retry else { continue };
+                    if !controller_rows.insert((kind.into(), environment_ref.clone())) {
+                        continue;
+                    }
                     desired.push(LeafSubscriptionRow {
                         id: uuid::Uuid::nil(),
                         namespace: namespace.to_string(),

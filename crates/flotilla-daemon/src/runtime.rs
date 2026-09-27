@@ -1619,6 +1619,15 @@ async fn record_credential_delivery_retry(
         Err(error) => return Err(format!("read credential delivery environment: {error}")),
     };
     let previous = environment.status.as_ref().and_then(|status| status.credential_delivery_retry.as_ref());
+    if !terminal
+        && error.is_some()
+        && previous.is_some_and(
+            |retry| matches!(retry.disposition, ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at),
+        )
+    {
+        mirror_credential_retry_to_vessels(backend, namespace, environment_ref, previous.cloned(), false).await?;
+        return Ok(());
+    }
     let retry = error.map(|error| {
         if terminal {
             ControllerRetry::terminal(previous, Utc::now(), error)
@@ -8720,6 +8729,15 @@ mod tests {
             .credential_delivery_retry
             .expect("durable conflict retry");
         assert!(matches!(conflict_retry.disposition, ControllerRetryDisposition::Retryable { .. }));
+        let conflict_environment_version = environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version;
+        let conflict_vessel_version = vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version;
+        let repeated_error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("persistent conflict remains retryable");
+        assert!(repeated_error.contains("different minted permissions for `work-token`"), "{repeated_error}");
+        assert_eq!(
+            environments.get(env_id.as_str()).await.expect("shared environment").metadata.resource_version,
+            conflict_environment_version
+        );
+        assert_eq!(vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version, conflict_vessel_version);
         vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
 
         // Simulate the retry deadline elapsing while preserving the persisted
