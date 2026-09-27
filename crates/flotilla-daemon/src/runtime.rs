@@ -123,9 +123,9 @@ struct RuntimeWorkCredentialReconciler {
 
 #[async_trait]
 impl WorkCredentialReconciler for RuntimeWorkCredentialReconciler {
-    async fn reconcile(&self, namespace: &str) -> Result<(), String> {
+    async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {
         let state = self.state.upgrade().ok_or_else(|| "credential controller is unavailable".to_string())?;
-        reconcile_work_credentials(&state, namespace).await
+        reconcile_work_credentials_for_environment(&state, namespace, environment_ref).await
     }
 }
 
@@ -1343,36 +1343,92 @@ async fn reconcile_provisioned_environment(
 /// Completed work contributes grants to remove; a resumed or review turn
 /// contributes them again, causing a fresh mint after the settled cache clears.
 async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
+    reconcile_work_credentials_filtered(state, namespace, None).await
+}
+
+async fn reconcile_work_credentials_for_environment(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    environment_ref: &str,
+) -> Result<(), String> {
+    reconcile_work_credentials_filtered(state, namespace, Some(environment_ref)).await
+}
+
+async fn reconcile_work_credentials_filtered(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    target_environment: Option<&str>,
+) -> Result<(), String> {
     let Some(store) = &state.credential_store else { return Ok(()) };
     let backend = state.daemon.resource_backend();
-    let convoy_sources =
-        backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| format!("list credential convoys: {error}"))?;
-    let convoys =
-        convoy_sources.items.into_iter().map(|source| (source.object.metadata.name.clone(), source.object)).collect::<BTreeMap<_, _>>();
     let vessels = backend.using::<Vessel>(namespace).list().await.map_err(|error| format!("list credential vessels: {error}"))?;
-    let grants = backend
-        .including_replicas::<flotilla_resources::CredentialGrant>(namespace)
-        .list()
-        .await
-        .map_err(|error| format!("list credential grants: {error}"))?
+    let vessels = vessels
         .items
         .into_iter()
-        .map(|grant| grant.object.spec)
-        .collect::<Vec<_>>();
-    let repository_trust = backend
-        .including_replicas::<Repository>(namespace)
-        .list()
-        .await
-        .map_err(|error| format!("list repositories for credential grants: {error}"))?
-        .items
-        .into_iter()
-        .map(|source| {
-            (
-                flotilla_resources::RepositoryKey(source.object.metadata.name),
-                if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own },
-            )
+        .filter(|vessel| {
+            target_environment
+                .is_none_or(|target| vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) == Some(target))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Vec<_>>();
+    let convoys = if target_environment.is_some() {
+        let mut convoys = BTreeMap::new();
+        for name in vessels.iter().map(|vessel| &vessel.spec.convoy_ref).collect::<BTreeSet<_>>() {
+            let convoy = backend
+                .including_replicas::<Convoy>(namespace)
+                .get(name)
+                .await
+                .map_err(|error| format!("read credential convoy {name}: {error}"))?
+                .object;
+            convoys.insert(name.clone(), convoy);
+        }
+        convoys
+    } else {
+        backend
+            .including_replicas::<Convoy>(namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list credential convoys: {error}"))?
+            .items
+            .into_iter()
+            .map(|source| (source.object.metadata.name.clone(), source.object))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let needs_grants = vessels.iter().any(|vessel| {
+        convoys
+            .get(&vessel.spec.convoy_ref)
+            .and_then(|convoy| convoy.status.as_ref())
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.vessels.iter().find(|requirement| requirement.name == vessel.spec.vessel_name))
+            .is_some_and(|requirement| !requirement.credential_scopes.is_empty())
+    });
+    let (grants, repository_trust) = if needs_grants {
+        let grants = backend
+            .including_replicas::<flotilla_resources::CredentialGrant>(namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list credential grants: {error}"))?
+            .items
+            .into_iter()
+            .map(|grant| grant.object.spec)
+            .collect::<Vec<_>>();
+        let repository_trust = backend
+            .including_replicas::<Repository>(namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list repositories for credential grants: {error}"))?
+            .items
+            .into_iter()
+            .map(|source| {
+                (
+                    flotilla_resources::RepositoryKey(source.object.metadata.name),
+                    if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        (grants, repository_trust)
+    } else {
+        (Vec::new(), BTreeMap::new())
+    };
     type Delivery = (
         BTreeSet<String>,
         BTreeSet<String>,
@@ -1382,7 +1438,7 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     );
     let mut deliveries = BTreeMap::<String, Delivery>::new();
     let mut permission_conflicts = BTreeMap::<String, String>::new();
-    for vessel in vessels.items {
+    for vessel in vessels {
         let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
         let Some(status) = &convoy.status else { continue };
@@ -1447,6 +1503,9 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     }
     let current_environments = deliveries.keys().cloned().collect::<BTreeSet<_>>();
     for (environment_ref, previously_delivered) in store.tracked_work_deliveries().await {
+        if target_environment.is_some_and(|target| environment_ref != target) {
+            continue;
+        }
         deliveries.entry(environment_ref).or_default().0.extend(previously_delivered);
     }
     let mut errors = Vec::new();
@@ -8269,6 +8328,14 @@ mod tests {
             })
             .await
             .expect("place unavailable vessel");
+        reconcile_work_credentials_for_environment(&state, NAMESPACE, env_id.as_str())
+            .await
+            .expect("target environment stages despite unrelated failure");
+        assert!(can_fill_git_credential().await);
+        let scoped_error = reconcile_work_credentials_for_environment(&state, NAMESPACE, "aaa-unavailable")
+            .await
+            .expect_err("unavailable target still fails");
+        assert!(scoped_error.contains("aaa-unavailable"), "{scoped_error}");
         assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
         assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");

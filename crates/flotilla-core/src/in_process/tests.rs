@@ -32,7 +32,8 @@ struct RecordingWorkCredentials {
 
 #[async_trait]
 impl WorkCredentialReconciler for RecordingWorkCredentials {
-    async fn reconcile(&self, namespace: &str) -> Result<(), String> {
+    async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {
+        assert_eq!(environment_ref, "credential-env");
         let convoy =
             self.backend.clone().using::<ResourceConvoy>(namespace).get("turn-credential-work").await.map_err(|error| error.to_string())?;
         let status = convoy.status.ok_or_else(|| "missing convoy status".to_string())?;
@@ -56,6 +57,183 @@ impl WorkCredentialReconciler for RecordingWorkCredentials {
         self.delivered.lock().await.extend(refs);
         Ok(())
     }
+}
+
+struct SessionStagingProbe {
+    backend: ResourceBackend,
+    session: String,
+    environment: String,
+    fail_next: std::sync::atomic::AtomicBool,
+    invalidate_next: std::sync::atomic::AtomicBool,
+    staged: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl WorkCredentialReconciler for SessionStagingProbe {
+    async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {
+        assert_eq!(environment_ref, self.environment);
+        let sessions = self.backend.clone().using::<ResourceTerminalSession>(namespace);
+        let session = sessions.get(&self.session).await.map_err(|error| error.to_string())?;
+        let TerminalSessionSource::Agent { message, .. } = &session.spec.source else { return Err("expected agent session".to_string()) };
+        assert!(message.is_none(), "message became deliverable before credential staging");
+        if self.fail_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err("credential staging failed".to_string());
+        }
+        self.staged.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.invalidate_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let mut changed_spec = session.spec.clone();
+            let TerminalSessionSource::Agent { brief, .. } = &mut changed_spec.source else { unreachable!("checked above") };
+            brief.content.push_str(" (concurrent edit)");
+            sessions
+                .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &changed_spec)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(&test_meta("resume-staging"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Landing,
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+            }),
+            work: BTreeMap::from([(
+                "work".to_string(),
+                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("convoy status");
+    backend
+        .clone()
+        .using::<ResourceTerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("resume-staging-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "resume-staging".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "resume-env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".to_string(),
+                        content: "original".to_string(),
+                        copies: vec![],
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "resume-staging".to_string(),
+                        vessel_ref: "resume-vessel".to_string(),
+                    }),
+                    message: None,
+                },
+                cwd: "/repo".to_string(),
+                pool: "passthrough".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    let probe = Arc::new(SessionStagingProbe {
+        backend: backend.clone(),
+        session: "resume-staging-session".to_string(),
+        environment: "resume-env".to_string(),
+        fail_next: std::sync::atomic::AtomicBool::new(true),
+        invalidate_next: std::sync::atomic::AtomicBool::new(false),
+        staged: std::sync::atomic::AtomicUsize::new(0),
+    });
+    daemon.set_work_credential_reconciler(probe.clone()).await;
+    (daemon, backend, probe)
+}
+
+#[tokio::test]
+async fn resume_stages_credentials_before_message_and_retries_failure() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let resume = || daemon.convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"));
+    assert!(resume().await.expect_err("staging should fail").contains("credential staging failed"));
+    assert_eq!(
+        convoys.get("resume-staging").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
+        CrewWorkPhase::Done
+    );
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
+        panic!("agent")
+    };
+    assert!(message.is_none());
+    resume().await.expect("retry resume");
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
+        panic!("agent")
+    };
+    assert_eq!(message.expect("queued message").text, "continue");
+}
+
+#[tokio::test]
+async fn resume_restores_convoy_when_session_write_fails_after_staging() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = daemon
+        .convoy_resume_internal("flotilla", "resume-staging", "continue", Some("work"), Some("coder"))
+        .await
+        .expect_err("stale session write");
+    assert!(error.contains("conflict") || error.contains("version"), "{error}");
+    let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    probe.invalidate_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("resume-staging".to_string())
+        .source("review".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .brief("continue".to_string())
+        .head_sha("new-head".to_string())
+        .build();
+    daemon.deliver_standing_turn(&request).await.expect_err("stale session write");
+    let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -579,6 +757,20 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .await
         .expect("vessel");
 
+    let requested = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some("convoy-two-crew".to_string()),
+        vessel_ref: Some("convoy-two-crew-work".to_string()),
+        role: Some("coder".to_string()),
+    };
+    let error =
+        daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("missing anchor");
+    assert!(error.contains("no active session to anchor"), "{error}");
+    let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
+
     let coder_identity = TerminalSessionIdentity::builder()
         .vessel_ref("convoy-two-crew-work".to_string())
         .convoy("convoy-two-crew".to_string())
@@ -588,7 +780,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .crew_index(0)
         .build();
     let coder_meta = terminal_meta_with_vessel_credentials(coder_identity.input_meta(), &requirement);
-    backend
+    let coder = backend
         .clone()
         .using::<ResourceTerminalSession>("flotilla")
         .create(&coder_meta, &ResourceTerminalSessionSpec {
@@ -614,20 +806,51 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .await
         .expect("eager coder terminal");
 
-    daemon
-        .crew_handoff_internal(
-            &CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".to_string()),
-                convoy: Some("convoy-two-crew".to_string()),
-                vessel_ref: Some("convoy-two-crew-work".to_string()),
-                role: Some("coder".to_string()),
-            },
-            "reviewer",
-            "Please review the implementation.",
-        )
+    let reviewer_identity = TerminalSessionIdentity::builder()
+        .vessel_ref("convoy-two-crew-work".to_string())
+        .convoy("convoy-two-crew".to_string())
+        .vessel("work".to_string())
+        .role("reviewer".to_string())
+        .vessel_index(0)
+        .crew_index(1)
+        .build();
+    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+    let failed_reviewer = sessions
+        .create(&reviewer_identity.input_meta(), &ResourceTerminalSessionSpec { role: "reviewer".to_string(), ..coder.spec.clone() })
         .await
-        .expect("handoff to latent reviewer");
+        .expect("failed reviewer target");
+    let failed_reviewer = sessions
+        .update_status(&failed_reviewer.metadata.name, &failed_reviewer.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("failed phase");
+    let error = daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("failed target");
+    assert!(error.contains("failed provisioning"), "{error}");
+    let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
+    sessions.delete(&failed_reviewer.metadata.name).await.expect("remove failed target");
+    let probe = Arc::new(SessionStagingProbe {
+        backend: backend.clone(),
+        session: coder.metadata.name.clone(),
+        environment: "contained-env".to_string(),
+        fail_next: std::sync::atomic::AtomicBool::new(true),
+        invalidate_next: std::sync::atomic::AtomicBool::new(false),
+        staged: std::sync::atomic::AtomicUsize::new(0),
+    });
+    daemon.set_work_credential_reconciler(probe.clone()).await;
+    let error =
+        daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect_err("staging failure");
+    assert!(error.contains("credential staging failed"), "{error}");
+    let status = convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["work"]["reviewer"].phase, CrewWorkPhase::Pending);
+    assert!(sessions.get("terminal-convoy-two-crew-work-reviewer").await.is_err());
+
+    daemon.crew_handoff_internal(&requested, "reviewer", "Please review the implementation.").await.expect("handoff to latent reviewer");
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let reviewer = backend
         .using::<ResourceTerminalSession>("flotilla")
