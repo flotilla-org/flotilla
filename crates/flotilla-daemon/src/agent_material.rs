@@ -503,10 +503,15 @@ impl SkillBundle {
 }
 
 fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
-    // The stage script emits its actionable failure last. Git can write hints
-    // and fetch progress first, which otherwise hides the failure in convoy
-    // summaries that show only the beginning of the message.
-    let reason = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("skill staging command failed");
+    const DIAGNOSTIC_PREFIX: &str = "flotilla-stage-skills: ";
+    // A git child can write to the shared stderr pipe after the script reports
+    // its failure, so prefer the script's marked diagnostic regardless of order.
+    let reason = stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(DIAGNOSTIC_PREFIX))
+        .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
+        .unwrap_or("skill staging command failed");
     format!("stage generation-pinned skills for {environment_ref}: {reason}")
 }
 
@@ -1004,11 +1009,28 @@ esac
 
     #[test]
     fn skill_stage_error_leads_with_declared_path_failure() {
-        let stderr = "hint: Using 'master' as the name for the initial branch.\nFrom https://github.com/flotilla-org/cleat\n * branch 0f23944 -> FETCH_HEAD\nskill source cleat declared path skills is missing at pinned revision 0f23944\n";
+        let stderr = "hint: Using 'master' as the name for the initial branch.\nFrom https://github.com/flotilla-org/cleat\n * branch 0f23944 -> FETCH_HEAD\nflotilla-stage-skills: skill source cleat declared path skills is missing at pinned revision 0f23944\n";
         let message = skill_stage_error("crew-work", stderr);
         assert_eq!(
             message,
             "stage generation-pinned skills for crew-work: skill source cleat declared path skills is missing at pinned revision 0f23944"
+        );
+    }
+
+    #[test]
+    fn skill_stage_error_prefers_script_diagnostic_over_late_git_stderr() {
+        let stderr = "fatal: early git failure\nflotilla-stage-skills: skill source missing-source anonymous fetch failed at pinned revision 0000000000000000000000000000000000000000\nfatal: git upload-pack: not our ref 0000000000000000000000000000000000000000\n";
+        assert_eq!(
+            skill_stage_error("crew-fetch", stderr),
+            "stage generation-pinned skills for crew-fetch: skill source missing-source anonymous fetch failed at pinned revision 0000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn skill_stage_error_uses_last_nonempty_line_without_script_diagnostic() {
+        assert_eq!(
+            skill_stage_error("crew-fetch", "fatal: early git failure\nfatal: final git failure\n"),
+            "stage generation-pinned skills for crew-fetch: fatal: final git failure"
         );
     }
 
