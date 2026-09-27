@@ -1,0 +1,51 @@
+name: Relay runtime
+
+# Split out of ci.yml while #2087 (the runtime suite hangs GitHub's Linux runners) is open,
+# so unrelated PRs don't each hold a runner for the full timeout.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/flotilla-relay/**"
+      - "crates/flotilla-relay-protocol/**"
+      - ".github/workflows/relay-runtime.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/flotilla-relay/**"
+      - "crates/flotilla-relay-protocol/**"
+      - ".github/workflows/relay-runtime.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+
+jobs:
+  relay-runtime:
+    name: Relay Workers runtime
+    runs-on: ubuntu-latest
+    # The suite takes well under a minute once built. It currently hangs GitHub's Linux runners (#2087),
+    # so it runs only for relay changes and is capped well below the default timeout.
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "relay-runtime"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Pinned together: worker-build must match the `worker` crate's minor version.
+      - run: npm install -g wrangler@4.42.2
+      - run: cargo install worker-build --version 0.8.7 --locked
+      # Build the test binary as its own step so compile time and test time show separately.
+      - run: cargo test -p flotilla-relay --test runtime --locked --no-run
+      - run: cargo test -p flotilla-relay --test runtime --locked -- --ignored
+
