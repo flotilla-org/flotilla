@@ -150,6 +150,55 @@ struct ProviderChangeRequestObservationSource {
     cache: Mutex<HashMap<ObservationScope, Arc<Mutex<Option<CachedObservation>>>>>,
 }
 
+struct ProviderIssueObservationSource {
+    daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
+}
+
+#[async_trait]
+impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationSource {
+    async fn observe(&self, subject: &crate::issue_observer::IssueRef) -> Result<flotilla_resources::IssueStatus, String> {
+        let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("issue observation daemon unavailable")?;
+        let fallback = flotilla_protocol::IssueRef {
+            source: flotilla_protocol::IssueSource { service: format!("https://{}", subject.service), scope: subject.scope.clone() },
+            id: subject.number.to_string(),
+        };
+        let reference = daemon
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .flat_map(|convoy| convoy.object.spec.issues)
+            .map(|issue| issue.reference)
+            .find(|reference| {
+                flotilla_resources::issue_address(reference).is_ok_and(|address| {
+                    address
+                        == flotilla_protocol::LeafAddress::Issue {
+                            service: subject.service.clone(),
+                            scope: subject.scope.clone(),
+                            number: subject.number,
+                        }
+                })
+            })
+            .unwrap_or(fallback);
+        let issue = daemon.fetch_issue_by_ref(&reference).await?;
+        let observed_at = chrono::Utc::now();
+        Ok(flotilla_resources::IssueStatus {
+            state: flotilla_resources::Observation::known(
+                match issue.state {
+                    flotilla_protocol::IssueState::Open => flotilla_resources::ObservedIssueState::Open,
+                    flotilla_protocol::IssueState::Closed => flotilla_resources::ObservedIssueState::Closed,
+                },
+                observed_at,
+            ),
+            labels: flotilla_resources::Observation::known(issue.labels, observed_at),
+            updated_at: flotilla_resources::Observation::known(issue.as_of, observed_at),
+        })
+    }
+}
+
 impl ProviderChangeRequestObservationSource {
     fn new(daemon: Arc<OnceLock<Weak<InProcessDaemon>>>) -> Self {
         Self { daemon, cache: Mutex::new(HashMap::new()) }
@@ -2781,7 +2830,17 @@ impl InProcessDaemon {
         if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }
-        let leaf_subscriptions = LeafSubscriptionTable::new(resource_backend.clone(), event_tx.clone(), change_request_refresher);
+        let issue_refresher = crate::issue_observer::IssueRefresher::new(
+            resource_backend.clone(),
+            local_node_id.to_string(),
+            Arc::new(ProviderIssueObservationSource { daemon: Arc::clone(&observer_daemon) }),
+            crate::issue_observer::IssueRefreshCadence::default(),
+        );
+        if let Err(error) = issue_refresher.garbage_collect_orphans().await {
+            tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
+        }
+        let leaf_subscriptions =
+            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_tx.clone(), change_request_refresher, issue_refresher);
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
@@ -9743,8 +9802,10 @@ impl InProcessDaemon {
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
         };
-        let delivery_message =
-            TerminalCrewMessage { id: format!("turn-delivery:{}:{}", request.source, request.head_sha), text: request.brief.clone() };
+        let delivery_message = TerminalCrewMessage {
+            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
+            text: request.brief.clone(),
+        };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
         let previous_status = convoys

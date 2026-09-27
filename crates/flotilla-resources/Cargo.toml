@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }

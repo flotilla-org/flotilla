@@ -18,6 +18,7 @@ mod forge;
 mod host;
 mod http;
 mod in_memory;
+mod issue;
 mod labels;
 mod landing_gate;
 mod leaf;
@@ -63,7 +64,7 @@ pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, C
 pub use convoy::{
     bound_change_request_record_name, change_request_address, controller_patches, convoy_sanctions_checkout_reclaim,
     evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches,
-    instantiate_exit, instantiate_turn_delivery, pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile,
+    instantiate_exit, instantiate_turn_delivery, issue_address, pinned_placement_ref, pinned_workflow_ref, provisioning_patches, reconcile,
     select_convoy_children, BoundChangeRequest, ControllerRetryDisposition, Convoy, ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase,
     ConvoyProvisioningState, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime,
     CrewCompletionClaim, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery,
@@ -103,6 +104,7 @@ pub use host::{
 };
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
+pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
     LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, GENERATION_LABEL, MANAGED_BY_LABEL,
     MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
@@ -110,8 +112,8 @@ pub use labels::{
 };
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
-    actor_obligation, admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue,
-    ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+    actor_obligation, admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject, LeafEvaluation,
+    LeafSubject, LeafValue, ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
@@ -184,6 +186,7 @@ macro_rules! for_each_registered_resource {
     ($callback:ident, $($argument:expr),* $(,)?) => {{
         $callback::<$crate::Checkout>($($argument),*);
         $callback::<$crate::ChangeRequest>($($argument),*);
+        $callback::<$crate::Issue>($($argument),*);
         $callback::<$crate::Clone>($($argument),*);
         $callback::<$crate::Convoy>($($argument),*);
         $callback::<$crate::ConvoyEnsure>($($argument),*);

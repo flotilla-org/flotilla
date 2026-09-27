@@ -1,10 +1,11 @@
 mod common;
 
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
+use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
-    implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
-    single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ExitDeclaration, InterpolationField,
-    InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+    admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_record_name,
+    single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate,
+    ExitDeclaration, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
 
@@ -172,6 +173,65 @@ vessels:
     assert!(errors
         .iter()
         .any(|error| matches!(error, ValidationError::InvalidTurnDeliveryLeaf { source, .. } if source == "actionable-review")));
+}
+
+#[test]
+fn issue_turn_delivery_admits_state_labels_and_updated_at() {
+    for condition in ["$issue.state == closed", "$issue.labels.ready == true", "$issue.updated-at > 2026-09-27T00:00:00Z"] {
+        let yaml = format!(
+            r#"
+inputs: []
+turn_delivery:
+  issue-change:
+    on: {condition}
+    to:
+      vessel: implement
+      role: coder
+    brief: Respond to the issue.
+    hold:
+      kind: change-request-comment
+      body: Automatic delivery paused.
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#
+        );
+        validate(&parse_spec(&yaml)).expect("issue turn-delivery condition is admitted");
+    }
+    let bad: flotilla_protocol::Leaf = "issue/github.com/owner/repo/1 .labels.ready == yes".parse().expect("leaf syntax");
+    assert!(admit_leaf(&bad).is_err(), "label membership must compare to true or false");
+}
+
+#[test]
+fn issue_exit_is_rejected_and_issue_subjects_follow_relay_casing() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+exit:
+  closed: $issue.state == closed
+vessels:
+  - name: implement
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#,
+    );
+    assert!(validate(&spec)
+        .expect_err("issue exit is not admitted")
+        .iter()
+        .any(|error| matches!(error, ValidationError::InvalidExitLeaf { .. })));
+
+    let github = IssueRef { source: IssueSource { service: "https://GitHub.com".into(), scope: "Owner/Repo".into() }, id: "12".into() };
+    assert_eq!(issue_address(&github).expect("github address").to_string(), "issue/github.com/owner/repo/12");
+    assert_eq!(issue_record_name("GitHub.com", "Owner/Repo", 12), issue_record_name("github.com", "owner/repo", 12));
+    let forgejo =
+        IssueRef { source: IssueSource { service: "https://forgejo.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
+    assert_eq!(issue_address(&forgejo).expect("forgejo address").to_string(), "issue/forgejo.example/Team/Repo/12");
+    assert_ne!(issue_record_name("forgejo.example", "Team/Repo", 12), issue_record_name("forgejo.example", "team/repo", 12));
 }
 
 #[test]

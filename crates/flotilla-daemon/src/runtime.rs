@@ -8541,7 +8541,7 @@ mod tests {
             &flotilla_resources::external_patches::record_turn_delivery(
                 "actionable-review".to_string(),
                 flotilla_resources::TurnDeliveryEpisode::builder()
-                    .head_sha("abc".to_string())
+                    .subject_revision("abc".to_string())
                     .evidence_at(Utc::now())
                     .judged_claim_at(Utc::now())
                     .outcome(flotilla_resources::TurnDeliveryOutcome::Delivered {

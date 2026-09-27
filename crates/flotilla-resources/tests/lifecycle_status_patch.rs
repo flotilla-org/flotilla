@@ -905,7 +905,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 let patch = ConvoyStatusPatch::RecordTurnDelivery {
                     source: "review".to_string(),
                     episode: TurnDeliveryEpisode {
-                        head_sha: "abc123".to_string(),
+                        subject_revision: "abc123".to_string(),
                         evidence_at: ts(30),
                         judged_claim_at: ts(20),
                         outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) },
