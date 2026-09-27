@@ -330,6 +330,7 @@ impl LeafSubscriptionTable {
     async fn forget_firings(&self, id: uuid::Uuid) {
         self.inner.last_firings.lock().await.retain(|(subscription_id, _), _| *subscription_id != id);
         self.inner.unable_since.lock().await.remove(&id);
+        self.inner.stale_attention_reported.lock().await.remove(&id);
     }
 
     async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
@@ -904,14 +905,13 @@ impl ReconcilerWake {
                         }
                     }
                     LeafMaker::Supervisor { convoy: supervisor_convoy, vessel, role } => {
-                        let attention = sessions
-                            .iter()
-                            .find(|source| {
-                                let session = &source.object;
-                                session.metadata.labels.get(CONVOY_LABEL) == Some(supervisor_convoy)
-                                    && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
-                                    && session.metadata.labels.get(ROLE_LABEL) == Some(role)
-                            })
+                        let session = sessions.iter().find(|source| {
+                            let session = &source.object;
+                            session.metadata.labels.get(CONVOY_LABEL) == Some(supervisor_convoy)
+                                && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
+                                && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                        });
+                        let attention = session
                             .and_then(|source| source.object.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Running)
                             .and_then(|status| status.attention.as_ref());
@@ -947,9 +947,32 @@ impl ReconcilerWake {
                                 unknown = true;
                                 continue;
                             }
-                            _ => {
+                            None if session.is_some_and(|source| {
+                                source.object.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
+                            }) =>
+                            {
                                 unknown = true;
                                 continue;
+                            }
+                            Some(_) => {
+                                unknown = true;
+                                continue;
+                            }
+                            None => {
+                                if self
+                                    .maker_debouncing(
+                                        row.id,
+                                        UnableEvidenceKey::Absent,
+                                        row.created_at,
+                                        TerminalAttention::DEBOUNCE_FOR,
+                                        now,
+                                    )
+                                    .await
+                                {
+                                    unknown = true;
+                                    continue;
+                                }
+                                Err(("supervisor session dead or absent".into(), StallEvidenceSource::Session))
                             }
                         }
                     }
@@ -1557,7 +1580,6 @@ impl ReconcilerWake {
             }
             self.subscriptions.inner.rows.lock().await.remove(&row.id);
             self.subscriptions.forget_firings(row.id).await;
-            self.subscriptions.inner.stale_attention_reported.lock().await.remove(&row.id);
             if let Some(task) = self.subscriptions.inner.tasks.lock().await.remove(&row.id) {
                 task.abort();
             }
