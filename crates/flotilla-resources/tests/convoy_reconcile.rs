@@ -36,7 +36,12 @@ fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
         Some(BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("Work".to_string()).build());
     let workflow = implement_review_workflow_spec();
     let status = ConvoyStatus {
-        workflow_snapshot: Some(WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels }),
+        workflow_snapshot: Some(WorkflowSnapshot {
+            stall_nudges: Default::default(),
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        }),
         ..Default::default()
     };
     let convoy = convoy_object("completion", spec, Some(status));
@@ -648,6 +653,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
     let outcome = reconcile(&convoy, Some(&template), timestamp(10));
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
         exit: template.spec.exit.clone(),
         turn_delivery: template.spec.turn_delivery.clone(),
         vessels: template
@@ -804,6 +810,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -861,6 +868,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
 fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -1438,6 +1446,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
         exit: None,
         turn_delivery: Default::default(),
         vessels: vec![
@@ -1611,8 +1620,12 @@ fn all_agent_crew_done_rolls_vessel_work_complete() {
 fn interactive_convoy_stays_active_until_crew_reports_complete() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;
-    status.workflow_snapshot =
-        Some(WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: interactive_single_workflow_spec().vessels });
+    status.workflow_snapshot = Some(WorkflowSnapshot {
+        stall_nudges: Default::default(),
+        exit: None,
+        turn_delivery: Default::default(),
+        vessels: interactive_single_workflow_spec().vessels,
+    });
     let mut work = status.work.remove("implement").expect("seed work");
     work.phase = WorkPhase::Running;
     status.work = BTreeMap::from([("work".to_string(), work)]);

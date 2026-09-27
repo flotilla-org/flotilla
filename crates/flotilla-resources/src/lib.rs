@@ -68,8 +68,8 @@ pub use convoy::{
     ConvoyProvisioningState, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime,
     CrewCompletionClaim, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery,
     IssueSnapshot, LeafMaker, LifecycleMutation, PendingBrief, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode,
-    StallEvidenceSource, StallRung, StalledCondition, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
-    TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    StallEvidenceSource, StallNudge, StallRung, StalledCondition, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome,
+    TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
     PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
@@ -110,8 +110,8 @@ pub use labels::{
 };
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
-    admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue, ThreeValue,
-    UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+    actor_obligation, admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, LeafEvaluation, LeafSubject, LeafValue,
+    ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
@@ -209,6 +209,7 @@ macro_rules! for_each_registered_resource {
 pub use workflow_template::{
     implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
     single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ClaimExit, CrewCompletionExpectation, CrewSource,
-    CrewSpec, ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, Selector, Stance,
-    SubjectVariable, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    CrewSpec, ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, Selector,
+    StallNudgePolicy, Stance, SubjectVariable, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
 };

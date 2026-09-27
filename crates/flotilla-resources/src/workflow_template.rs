@@ -29,7 +29,16 @@ pub struct WorkflowTemplateSpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub turn_delivery: IndexMap<String, TurnDeliveryRule>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub stall_nudges: IndexMap<String, StallNudgePolicy>,
     pub vessels: Vec<VesselRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StallNudgePolicy {
+    pub max_per_episode: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -446,6 +455,7 @@ pub enum ValidationError {
     EmptyTurnDeliveryBrief { source: String },
     UnknownTurnDeliveryVessel { source: String, vessel: String },
     UnknownTurnDeliveryRole { source: String, vessel: String, role: String },
+    UnknownStallNudgeRole { target: String },
     DuplicateVesselName { name: String },
     EmptyRepositoryScope { vessel: String },
     DuplicateRepositoryRef { vessel: String, repo_ref: RepositoryKey },
@@ -508,6 +518,9 @@ impl std::fmt::Display for ValidationError {
             ValidationError::UnknownTurnDeliveryRole { source, vessel, role } => {
                 write!(f, "turn-delivery source `{source}` targets unknown agent role `{role}` on vessel `{vessel}`")
             }
+            ValidationError::UnknownStallNudgeRole { target } => {
+                write!(f, "stall-nudge target `{target}` is not a declared agent vessel/role")
+            }
             ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
             ValidationError::EmptyRepositoryScope { vessel } => write!(f, "vessel `{vessel}` has an empty repository scope"),
             ValidationError::DuplicateRepositoryRef { vessel, repo_ref } => {
@@ -553,6 +566,19 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
     let declared_inputs = collect_inputs(spec, &mut errors);
     let vessels_by_name = collect_vessels(spec, &mut errors);
     validate_turn_delivery(spec, &vessels_by_name, &mut errors);
+    for target in spec.stall_nudges.keys() {
+        let admitted = target
+            .split_once('/')
+            .and_then(|(vessel, role)| {
+                vessels_by_name
+                    .get(vessel)
+                    .map(|vessel| vessel.crew.iter().any(|member| member.role == role && matches!(member.source, CrewSource::Agent { .. })))
+            })
+            .unwrap_or(false);
+        if !admitted {
+            push_error(&mut errors, ValidationError::UnknownStallNudgeRole { target: target.clone() });
+        }
+    }
 
     for vessel in &spec.vessels {
         validate_vessel(vessel, &declared_inputs, &vessels_by_name, &mut errors);

@@ -915,7 +915,12 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
     let workflow = implement_review_workflow_spec();
     let mut status = flotilla_resources::ConvoyStatus {
         phase: ConvoyPhase::Landing,
-        workflow_snapshot: Some(WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels }),
+        workflow_snapshot: Some(WorkflowSnapshot {
+            stall_nudges: Default::default(),
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        }),
         observed_workflow_ref: Some("implement-review@1".to_string()),
         ..Default::default()
     };
@@ -3401,7 +3406,12 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
         &convoys,
         &record_name,
         &convoy_controller_patches::bootstrap(
-            WorkflowSnapshot { exit: None, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels },
+            WorkflowSnapshot {
+                stall_nudges: Default::default(),
+                exit: None,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            },
             "single-agent-contained".into(),
             BTreeMap::new(),
             BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
@@ -6576,6 +6586,7 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
                 )]),
             )]),
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: flotilla_resources::interactive_single_workflow_spec().vessels,

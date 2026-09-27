@@ -474,7 +474,14 @@ pub enum StallEvidenceSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StallRung {
+    Nudge,
     Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StallNudge {
+    pub at: DateTime<Utc>,
+    pub row: Leaf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,7 +493,7 @@ pub struct StalledCondition {
     pub began_at: DateTime<Utc>,
     pub rung: StallRung,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub nudge_history: Vec<String>,
+    pub nudge_history: Vec<StallNudge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +538,8 @@ pub struct WorkflowSnapshot {
     pub exit: Option<ExitDeclaration>,
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub turn_delivery: indexmap::IndexMap<String, TurnDeliveryRule>,
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub stall_nudges: indexmap::IndexMap<String, crate::StallNudgePolicy>,
     pub vessels: Vec<VesselRequirement>,
 }
 

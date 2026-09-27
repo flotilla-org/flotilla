@@ -10,13 +10,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
-    admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
+    actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
     select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase,
     HoldAct, InstantiatedExit, LeafMaker, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, StallEvidenceSource, StallRung, StalledCondition, StatusPatch, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    ResourceProvenance, StallEvidenceSource, StallNudge, StallRung, StalledCondition, StatusPatch, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue,
+    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject,
+    WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -732,20 +732,71 @@ impl ReconcilerWake {
                 };
             }
             let next = if holding && !able && !pending_debounce {
-                let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable {
-                    (row.leaves.clone(), Some(row.maker.clone()), evidence, source)
+                let (leaves, maker, evidence, source) = if let Some((row, evidence, source)) = unable.as_ref() {
+                    (row.leaves.clone(), Some(row.maker.clone()), evidence.clone(), source.clone())
                 } else {
                     (Vec::new(), None, "no armed row with an able maker".into(), StallEvidenceSource::LeafEngine)
                 };
-                Some(StalledCondition {
+                let prior = status.stalled.as_ref().filter(|prior| prior.leaves == leaves && prior.maker == maker);
+                let mut condition = StalledCondition {
                     leaves,
                     maker,
                     evidence,
                     source,
-                    began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
+                    began_at: prior.map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
-                    nudge_history: Vec::new(),
-                })
+                    nudge_history: prior.map_or_else(Vec::new, |stalled| stalled.nudge_history.clone()),
+                };
+                if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, unable.as_ref().map(|(row, _, _)| *row)) {
+                    let session = selected_sessions.values().find(|session| {
+                        session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                    });
+                    let idle_at = session
+                        .filter(|session| matches!(session.spec.source, TerminalSessionSource::Agent { .. }))
+                        .and_then(|session| session.status.as_ref())
+                        .and_then(|status| status.attention.as_ref())
+                        .filter(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
+                        .map(|attention| attention.as_of);
+                    if let Some(idle_at) = idle_at {
+                        let limit = status
+                            .workflow_snapshot
+                            .as_ref()
+                            .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
+                            .map_or(2, |policy| policy.max_per_episode) as usize;
+                        let new_idle = condition.nudge_history.last().is_none_or(|nudge| idle_at > nudge.at);
+                        if prior.is_some_and(|stalled| {
+                            stalled.rung == StallRung::Operator && stalled.evidence.starts_with("nudge delivery failed:")
+                        }) {
+                            condition.rung = StallRung::Operator;
+                            condition.evidence = prior.expect("checked above").evidence.clone();
+                        } else if condition.nudge_history.len() < limit {
+                            condition.rung = StallRung::Nudge;
+                            if new_idle {
+                                let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
+                                let brief = actor_obligation(leaf)?;
+                                let request = TurnDeliveryRequest::builder()
+                                    .namespace(namespace.to_string())
+                                    .convoy(convoy.metadata.name.clone())
+                                    .source(format!("stall-nudge-{}", condition.nudge_history.len() + 1))
+                                    .vessel(vessel.clone())
+                                    .role(role.clone())
+                                    .brief(brief)
+                                    .head_sha(now.timestamp_micros().to_string())
+                                    .build();
+                                match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&request).await {
+                                    Ok(_) => condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() }),
+                                    Err(error) => {
+                                        condition.rung = StallRung::Operator;
+                                        condition.evidence = format!("nudge delivery failed: {error}");
+                                    }
+                                }
+                            }
+                        } else if !new_idle {
+                            condition.rung = StallRung::Nudge;
+                        }
+                    }
+                }
+                Some(condition)
             } else {
                 None
             };
@@ -846,15 +897,17 @@ impl ReconcilerWake {
                         {
                             continue;
                         }
+                        let leaf = Leaf {
+                            address: LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() },
+                            field_path: format!(".crew.{role}.phase"),
+                            operator: LeafOperator::Equal,
+                            literal: "Done".into(),
+                        };
+                        actor_obligation(&leaf)?;
                         desired.push(LeafSubscriptionRow {
                             id: uuid::Uuid::nil(),
                             namespace: namespace.to_string(),
-                            leaves: vec![Leaf {
-                                address: LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: vessel.clone() },
-                                field_path: format!(".crew.{role}.phase"),
-                                operator: LeafOperator::Equal,
-                                literal: "Done".into(),
-                            }],
+                            leaves: vec![leaf],
                             watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
                             maker: LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() },
                             freshness_demand: None,
@@ -1454,6 +1507,7 @@ mod tests {
         let status = ConvoyStatus {
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: Some(ExitDeclaration::standard_table()),
                 turn_delivery: Default::default(),
                 vessels: Vec::new(),
@@ -1604,6 +1658,7 @@ mod tests {
             .update_status("wake-turn", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: indexmap::IndexMap::from([(source.to_string(), rule.clone())]),
                     vessels: Vec::new(),
@@ -1787,6 +1842,7 @@ mod tests {
             phase: ConvoyPhase::Landing,
             observed_workflow_ref: Some("workflow".to_string()),
             workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
                     "shipped".to_string(),
                     "$cr.state == merged".parse().expect("custom leaf template"),
@@ -1857,6 +1913,7 @@ mod tests {
             .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),
@@ -1926,6 +1983,7 @@ mod tests {
             .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),
@@ -2011,6 +2069,7 @@ mod tests {
             .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
                     exit: Some(ExitDeclaration::standard_table()),
                     turn_delivery: Default::default(),
                     vessels: Vec::new(),

@@ -305,8 +305,12 @@ pub fn tool_only_workflow_template_object(name: &str) -> ResourceObject<Workflow
 
 pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     let workflow = valid_workflow_template_spec();
-    let snapshot =
-        flotilla_resources::WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels };
+    let snapshot = flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
+        exit: workflow.exit,
+        turn_delivery: workflow.turn_delivery,
+        vessels: workflow.vessels,
+    };
     let work = [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();
     let crew_work = BTreeMap::from([
         ("implement".to_string(), BTreeMap::from([("coder".to_string(), pending_crew_work_state())])),
@@ -396,6 +400,7 @@ where
 pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let workflow = tool_only_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
         exit: workflow.exit,
         turn_delivery: workflow.turn_delivery,
         vessels: workflow

@@ -101,6 +101,32 @@ vessels:
 }
 
 #[test]
+fn stall_nudge_policy_roundtrips_and_rejects_unknown_roles() {
+    let yaml = r#"
+inputs: []
+stall_nudges:
+  work/coder:
+    max_per_episode: 0
+vessels:
+  - name: work
+    crew:
+      - role: coder
+        selector:
+          capability: code
+"#;
+    let spec = parse_spec(yaml);
+    validate(&spec).expect("declared agent role");
+    assert_eq!(spec.stall_nudges["work/coder"].max_per_episode, 0);
+    assert!(serde_yml::to_string(&spec).expect("serialize").contains("max_per_episode: 0"));
+    let mut invalid = spec;
+    invalid.stall_nudges.insert("work/reviewer".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: 1 });
+    assert!(validate(&invalid)
+        .expect_err("unknown role")
+        .iter()
+        .any(|error| matches!(error, ValidationError::UnknownStallNudgeRole { target } if target == "work/reviewer")));
+}
+
+#[test]
 fn turn_delivery_schema_rejects_control_flow_extensions() {
     let yaml = r#"
 inputs: []
@@ -183,8 +209,12 @@ fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() 
 #[test]
 fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
     let workflow = single_agent_contained_workflow_spec();
-    let snapshot =
-        flotilla_resources::WorkflowSnapshot { exit: workflow.exit, turn_delivery: workflow.turn_delivery, vessels: workflow.vessels };
+    let snapshot = flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
+        exit: workflow.exit,
+        turn_delivery: workflow.turn_delivery,
+        vessels: workflow.vessels,
+    };
 
     let rendered = serde_json::to_value(snapshot).expect("render workflow snapshot");
     let rules = rendered["turn_delivery"].as_object().expect("turn-delivery object");
