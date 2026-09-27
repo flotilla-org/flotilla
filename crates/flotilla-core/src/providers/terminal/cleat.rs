@@ -1,4 +1,9 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint};
@@ -13,6 +18,7 @@ use crate::{
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DELIVERY_ENTER_DELAY: Duration = Duration::from_millis(100);
+const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
 struct SessionInfo {
@@ -48,11 +54,22 @@ pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     attach_capability: tokio::sync::OnceCell<()>,
+    endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
+}
+
+struct EndpointCache {
+    updated: Instant,
+    endpoints: HashMap<String, Option<CleatEndpoint>>,
 }
 
 impl CleatTerminalPool {
     pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>) -> Self {
-        Self { runner, binary: binary.into(), attach_capability: tokio::sync::OnceCell::new() }
+        Self {
+            runner,
+            binary: binary.into(),
+            attach_capability: tokio::sync::OnceCell::new(),
+            endpoint_cache: tokio::sync::Mutex::new(None),
+        }
     }
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
@@ -109,21 +126,32 @@ impl CleatTerminalPool {
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
     async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
-        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
-        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
-        let mut found = None;
-        for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
-            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
-            let Ok(output) = run!(self.runner, &self.binary, &args, Path::new("/")) else { continue };
-            let Ok(sessions) = Self::parse_list_output(&output) else { continue };
-            if sessions.iter().any(|session| session.id == session_id) {
-                if found.is_some() {
-                    return Ok(None);
-                }
-                found = Some(CleatEndpoint { runtime_root: daemon.runtime_root, daemon: daemon.name, session: session_id.to_owned() });
+        // Share one physical-daemon inventory across sessions reconciled in the
+        // same burst. Expire it quickly so daemon turnover retracts stale facts.
+        let mut cache = self.endpoint_cache.lock().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.updated.elapsed() < ENDPOINT_CACHE_TTL {
+                return Ok(snapshot.endpoints.get(session_id).cloned().flatten());
             }
         }
-        Ok(found)
+        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
+        let mut endpoints = HashMap::new();
+        for daemon in daemons.into_iter().filter(|daemon| daemon.alive && Path::new(&daemon.runtime_root).is_absolute()) {
+            let args = ["--runtime-root", daemon.runtime_root.as_str(), "--server", daemon.name.as_str(), "list", "--json"];
+            let output = run!(self.runner, &self.binary, &args, Path::new("/"))?;
+            let sessions = Self::parse_list_output(&output)?;
+            for session in sessions {
+                let endpoint =
+                    CleatEndpoint { runtime_root: daemon.runtime_root.clone(), daemon: daemon.name.clone(), session: session.id.clone() };
+                // A duplicate session id is ambiguous even if more daemons
+                // report it later in the inventory.
+                endpoints.entry(session.id).and_modify(|existing| *existing = None).or_insert(Some(endpoint));
+            }
+        }
+        let endpoint = endpoints.get(session_id).cloned().flatten();
+        *cache = Some(EndpointCache { updated: Instant::now(), endpoints });
+        Ok(endpoint)
     }
 
     fn tracks_session_liveness(&self) -> bool {
@@ -270,6 +298,20 @@ mod tests {
         assert_eq!(endpoint.daemon, "work@3");
         assert_eq!(endpoint.session, "session-42");
         assert_eq!(runner.calls()[2].1, vec!["--runtime-root", "/state/cleat", "--server", "work@3", "list", "--json"]);
+    }
+
+    #[tokio::test]
+    async fn direct_endpoint_shares_inventory_across_sessions() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(r#"[{"name":"work@3","runtime_root":"/state/cleat","alive":true}]"#.into()),
+            Ok(r#"[{"id":"first","cwd":null,"cmd":null,"status":"Detached"},{"id":"second","cwd":null,"cmd":null,"status":"Detached"}]"#
+                .into()),
+        ]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        assert_eq!(pool.cleat_endpoint("first").await.expect("first").expect("endpoint").session, "first");
+        assert_eq!(pool.cleat_endpoint("second").await.expect("second").expect("endpoint").session, "second");
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[tokio::test]

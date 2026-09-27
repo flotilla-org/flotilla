@@ -321,9 +321,16 @@ where
                     );
                 }
             }
-            let endpoint = self.runtime.cleat_endpoint(session_id, &obj.spec).await.map_err(ResourceError::other)?;
-            if obj.status.as_ref().and_then(|status| status.cleat_endpoint.as_ref()) != endpoint.as_ref() {
-                return Ok(TerminalPrepared::CleatEndpoint(endpoint));
+            match self.runtime.cleat_endpoint(session_id, &obj.spec).await {
+                Ok(endpoint) if obj.status.as_ref().and_then(|status| status.cleat_endpoint.as_ref()) != endpoint.as_ref() => {
+                    return Ok(TerminalPrepared::CleatEndpoint(endpoint));
+                }
+                Err(error) => {
+                    // Keep the last known endpoint on transient discovery failures.
+                    // Attention reconciliation and command attach can still proceed.
+                    tracing::warn!(%session_id, %error, "cleat endpoint discovery failed");
+                }
+                Ok(_) => {}
             }
             if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Attention(observation));

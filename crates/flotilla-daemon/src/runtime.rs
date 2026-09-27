@@ -4024,9 +4024,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
     ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
         let pool = self.pool_for_spec(spec)?;
-        // Endpoint discovery is an optional capability. A stale daemon inventory
-        // must not degrade a running terminal or its command attach path.
-        Ok(pool.cleat_endpoint(session_id).await.unwrap_or(None))
+        pool.cleat_endpoint(session_id).await
     }
 
     async fn ensure_session(
