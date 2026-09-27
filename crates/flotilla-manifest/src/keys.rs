@@ -59,6 +59,10 @@ pub const KEY_CONVOY_SUPERSEDED: &str = "flotilla.convoy.superseded";
 pub const KEY_CONVOY_PHASE: &str = "flotilla.convoy.phase";
 pub const KEY_CONVOY_WORKFLOW: &str = "flotilla.convoy.workflow";
 pub const KEY_CONVOY_MESSAGE: &str = "flotilla.convoy.message";
+/// Presentation state judged from live evidence and the authority's stall condition.
+pub const KEY_SURFACE_STATE: &str = "flotilla.surface.state";
+/// The active handled stall rung, when `flotilla.surface.state` is `stalled_handled`.
+pub const KEY_SURFACE_RUNG: &str = "flotilla.surface.rung";
 /// `WorkPhase` — the state of the work aboard a vessel, never a vessel
 /// lifecycle (vessels don't complete).
 pub const KEY_WORK_PHASE: &str = "flotilla.work.phase";

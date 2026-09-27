@@ -74,7 +74,6 @@ pub struct CrewListMember {
 pub enum CrewAttention {
     Working,
     NeedsInput,
-    Stalled,
     DeliveryUnconfirmed,
     Idle,
     Unobservable,
@@ -85,7 +84,6 @@ impl std::fmt::Display for CrewAttention {
         formatter.write_str(match self {
             Self::Working => "working",
             Self::NeedsInput => "needs input",
-            Self::Stalled => "stalled",
             Self::DeliveryUnconfirmed => "delivery unconfirmed",
             Self::Idle => "idle",
             Self::Unobservable => "unobservable",
@@ -263,6 +261,9 @@ pub struct FleetHostRow {
     pub replica_generation: Option<String>,
     pub crew_count: usize,
     pub convoy_count: usize,
+    #[builder(default)]
+    #[serde(default)]
+    pub surface_states: FleetSurfaceCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,6 +281,13 @@ pub struct FleetHostRow {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_attention: Vec<CredentialAttention>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSurfaceCounts {
+    pub available: usize,
+    pub stalled_handled: usize,
+    pub needs_you: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +350,9 @@ pub struct FleetListRow {
     pub authority: Option<String>,
     pub crew: String,
     pub crew_state: String,
+    #[builder(default)]
+    #[serde(default)]
+    pub surface_state: crate::result_set::SurfaceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<CrewAttention>,
     pub host: HostName,

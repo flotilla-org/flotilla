@@ -788,6 +788,7 @@ mod tests {
                 .map(|t| VesselSummary {
                     placement_decision: None,
                     name: (*t).into(),
+                    surface_state: Default::default(),
                     depends_on: vec![],
                     phase: WorkPhase::Pending,
                     crew: vec![],
@@ -807,7 +808,7 @@ mod tests {
             finished_at: None,
             observed_workflow_ref: None,
             initializing: false,
-            needs_attention: false,
+            surface_state: Default::default(),
         };
         let mut model = crate::app::NamespaceModel::default();
         model.convoys.insert(convoy.id.clone(), convoy);

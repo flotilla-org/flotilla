@@ -272,8 +272,11 @@ pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCom
 pub(crate) fn normal_mode_indicators(ui: &UiState, namespaces: &NamespaceMap) -> Vec<ModeIndicator> {
     let host_label = ui.provisioning_target.to_string();
 
-    let attention_count =
-        namespaces.values().flat_map(|namespace| namespace.convoys.values()).filter(|convoy| convoy.needs_attention).count();
+    let attention_count = namespaces
+        .values()
+        .flat_map(|namespace| namespace.convoys.values())
+        .filter(|convoy| convoy.surface_state.needs_attention())
+        .count();
     let mut indicators = vec![ModeIndicator::new("", &host_label, StatusBarAction::None)];
     if attention_count > 0 {
         indicators.push(ModeIndicator::new("⚠", &format!("{attention_count} need attention"), StatusBarAction::None));
@@ -330,7 +333,11 @@ mod tests {
             .project_ref("flotilla".to_string())
             .vessels(Vec::new())
             .initializing(false)
-            .needs_attention(needs_attention)
+            .surface_state(if needs_attention {
+                flotilla_protocol::result_set::SurfaceState::NeedsYou
+            } else {
+                flotilla_protocol::result_set::SurfaceState::Available
+            })
             .build()
     }
 

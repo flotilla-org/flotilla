@@ -934,6 +934,66 @@ impl fmt::Display for WorkPhase {
 }
 
 /// One row of the [`QueryId::Convoys`] result set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SurfaceState {
+    #[default]
+    Working,
+    Available,
+    StalledHandled {
+        rung: HandledRung,
+    },
+    NeedsYou,
+}
+
+impl SurfaceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Available => "available",
+            Self::StalledHandled { .. } => "stalled_handled",
+            Self::NeedsYou => "needs_you",
+        }
+    }
+
+    pub fn rung(self) -> Option<HandledRung> {
+        match self {
+            Self::StalledHandled { rung } => Some(rung),
+            _ => None,
+        }
+    }
+
+    pub fn needs_attention(self) -> bool {
+        matches!(self, Self::NeedsYou)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Available => "available",
+            Self::StalledHandled { rung: HandledRung::Nudge } => "stalled (rung 0: nudge)",
+            Self::StalledHandled { rung: HandledRung::Supervisor } => "stalled (rung 1: supervisor)",
+            Self::NeedsYou => "needs you",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandledRung {
+    Nudge,
+    Supervisor,
+}
+
+impl HandledRung {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nudge => "nudge",
+            Self::Supervisor => "supervisor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ConvoyRow {
@@ -990,7 +1050,7 @@ pub struct ConvoyRow {
     #[builder(default)]
     pub vessels: Vec<VesselRow>,
     #[builder(default)]
-    pub needs_attention: bool,
+    pub surface_state: SurfaceState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1062,9 +1122,9 @@ pub struct VesselRow {
     /// Capability fact: the daemon will accept completing this vessel's work.
     #[builder(default)]
     pub complete_work: bool,
-    /// A live observation requests human attention; it never changes `phase`.
+    /// Presentation state derived from live evidence and the authority's stall condition.
     #[builder(default)]
-    pub needs_attention: bool,
+    pub surface_state: SurfaceState,
 }
 
 /// Crew membership summary on a vessel row.

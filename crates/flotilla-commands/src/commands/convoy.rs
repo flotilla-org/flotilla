@@ -21,6 +21,8 @@ pub struct ConvoyNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ConvoyVerb {
+    /// List convoys and their crew across the fleet
+    List,
     /// Explain why this convoy is holding in its current phase
     Explain,
     /// Manage the work aboard a convoy's vessels
@@ -184,6 +186,17 @@ pub enum ConvoyWorkVerb {
 impl ConvoyNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
+            ConvoyVerb::List => {
+                if self.subject.is_some() {
+                    return Err("convoy list takes no subject".to_string());
+                }
+                Ok(Resolved::Ready(Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryFleetList { project: None, crew_id: None, convoy: None },
+                }))
+            }
             ConvoyVerb::Explain => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
@@ -397,6 +410,7 @@ impl std::fmt::Display for ConvoyNoun {
             write!(f, " {subject}")?;
         }
         match &self.verb {
+            ConvoyVerb::List => write!(f, " list")?,
             ConvoyVerb::Explain => write!(f, " explain")?,
             ConvoyVerb::Work(work) => {
                 write!(f, " work {}", work.subject)?;
@@ -536,6 +550,13 @@ mod tests {
 
     fn parse(args: &[&str]) -> ConvoyNoun {
         ConvoyNoun::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn convoy_list_resolves_as_fleet_query() {
+        let resolved = parse(&["convoy", "list"]).resolve().expect("resolve");
+        assert!(matches!(resolved, Resolved::Ready(Command { action: CommandAction::QueryFleetList { .. }, .. })));
+        assert_round_trip::<ConvoyNoun>(&["convoy", "list"]);
     }
 
     #[test]

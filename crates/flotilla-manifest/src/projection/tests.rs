@@ -1009,7 +1009,17 @@ fn live_role_carries_its_attempts_vessel_attention() {
     let quiet = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
     assert!(!find_entity(&quiet, &role_entity_for("p", "governor")).set.contains_key(KEY_STATUS_ATTENTION));
 
-    live.vessels[0].phase = WorkPhase::Ready;
+    live.vessels[0].surface_state =
+        flotilla_protocol::result_set::SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge };
+    live.surface_state = live.vessels[0].surface_state;
+    let handled = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live)).reassert_patches();
+    let handled_facts = find_entity(&handled, &role_entity_for("p", "governor"));
+    assert!(!handled_facts.set.contains_key(KEY_STATUS_ATTENTION));
+    assert_eq!(text(handled_facts, KEY_SURFACE_STATE), "stalled_handled");
+    assert_eq!(text(handled_facts, KEY_SURFACE_RUNG), "nudge");
+
+    live.vessels[0].surface_state = flotilla_protocol::result_set::SurfaceState::NeedsYou;
+    live.surface_state = live.vessels[0].surface_state;
     let waiting = role_catalog(&[role], &[live]).reassert_patches();
     let facts = find_entity(&waiting, &role_entity_for("p", "governor"));
     assert_eq!(facts.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));

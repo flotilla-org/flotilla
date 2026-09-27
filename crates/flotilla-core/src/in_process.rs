@@ -944,7 +944,7 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     }
 }
 
-fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, now: DateTime<Utc>) -> Option<CrewAttention> {
+fn crew_attention(status: Option<&TerminalSessionStatus>, now: DateTime<Utc>) -> Option<CrewAttention> {
     let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
     if status.degraded.as_ref().is_some_and(|condition| condition.reason == "DeliveryUnconfirmed") {
         return Some(CrewAttention::DeliveryUnconfirmed);
@@ -956,7 +956,6 @@ fn crew_attention(status: Option<&TerminalSessionStatus>, work_unsettled: bool, 
     Some(match attention.state {
         TerminalAttentionState::Working => CrewAttention::Working,
         TerminalAttentionState::NeedsInput => CrewAttention::NeedsInput,
-        TerminalAttentionState::Idle if work_unsettled => CrewAttention::Stalled,
         TerminalAttentionState::Idle => CrewAttention::Idle,
         TerminalAttentionState::Unobservable => CrewAttention::Unobservable,
     })
@@ -973,10 +972,6 @@ fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDemand>, 
         return None;
     }
     demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned()
-}
-
-fn crew_work_unsettled(phase: CrewWorkPhase) -> bool {
-    !matches!(phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack | CrewWorkPhase::Failed)
 }
 
 fn convoy_state_label(row: &ConvoyRow) -> String {
@@ -1011,6 +1006,7 @@ fn append_crewless_convoy_rows(
                     .vessel("-")
                     .crew("-")
                     .crew_state(convoy_state_label(row))
+                    .surface_state(row.surface_state)
                     .host(host.clone())
                     .maybe_placement_decision(row.placement_decision.clone())
                     .namespace(target_namespace)
@@ -8388,6 +8384,21 @@ impl InProcessDaemon {
         let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
         accumulate_fleet_health_counts(&mut counts, &local_rows);
         let replicas = self.fleet_replica_cache.read().await;
+        let mut surface_by_convoy = HashMap::new();
+        for row in local_rows.iter().chain(replicas.values().flat_map(|entry| entry.rows.iter())) {
+            let Some(convoy) = &row.convoy_ref else { continue };
+            surface_by_convoy
+                .entry((row.host.clone(), convoy.clone()))
+                .and_modify(|state: &mut flotilla_protocol::result_set::SurfaceState| {
+                    if row.surface_state.needs_attention()
+                        || (matches!(row.surface_state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
+                            && !state.needs_attention())
+                    {
+                        *state = row.surface_state;
+                    }
+                })
+                .or_insert(row.surface_state);
+        }
         for entry in replicas.values() {
             accumulate_fleet_health_counts(&mut counts, &entry.rows);
         }
@@ -8424,6 +8435,19 @@ impl InProcessDaemon {
                 is_local,
             );
             let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
+            let surface_states = flotilla_protocol::FleetSurfaceCounts {
+                available: surface_by_convoy
+                    .iter()
+                    .filter(|((row_host, _), state)| row_host == &host && **state == flotilla_protocol::result_set::SurfaceState::Available)
+                    .count(),
+                stalled_handled: surface_by_convoy
+                    .iter()
+                    .filter(|((row_host, _), state)| {
+                        row_host == &host && matches!(state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
+                    })
+                    .count(),
+                needs_you: surface_by_convoy.iter().filter(|((row_host, _), state)| row_host == &host && state.needs_attention()).count(),
+            };
             let degraded_conditions = status
                 .into_iter()
                 .flat_map(|status| status.conditions.iter())
@@ -8449,6 +8473,7 @@ impl InProcessDaemon {
                     .maybe_replica_generation(replica_generation)
                     .crew_count(crew_count)
                     .convoy_count(convoys.len())
+                    .surface_states(surface_states)
                     .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
                     .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
                     .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
@@ -8878,12 +8903,6 @@ impl InProcessDaemon {
             .iter()
             .map(|process| {
                 let session = by_role.get(&process.role);
-                let work_unsettled = convoy
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.crew_work.get(&context.vessel))
-                    .and_then(|crew| crew.get(&process.role))
-                    .is_none_or(|work| crew_work_unsettled(work.phase));
                 let state = match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
                     Some(ResourceTerminalSessionPhase::Starting) => "starting",
                     Some(ResourceTerminalSessionPhase::Running) => "active",
@@ -8897,7 +8916,7 @@ impl InProcessDaemon {
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
-                    .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), work_unsettled, Utc::now()))
+                    .maybe_attention(crew_attention(session.and_then(|session| session.status.as_ref()), Utc::now()))
                     .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
                     .maybe_model(crew.and_then(|crew| crew.model.clone()))
                     .maybe_stance(crew.map(|crew| crew.stance.clone()))
@@ -9944,6 +9963,12 @@ impl InProcessDaemon {
                     .map(|decision| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), decision))
             })
             .collect::<HashMap<_, _>>();
+        let surface_by_convoy = result_sets
+            .iter()
+            .filter_map(|result_set| result_set.rows.as_convoys())
+            .flatten()
+            .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.surface_state))
+            .collect::<HashMap<_, _>>();
         let environment_map: HashMap<_, _> = environments
             .list()
             .await
@@ -9962,20 +9987,6 @@ impl InProcessDaemon {
                     .as_ref()
                     .map_or_else(|| convoy.spec.role.clone(), |project| format!("{} @ {project}", convoy.spec.role));
                 (convoy.metadata.name.clone(), address)
-            })
-            .collect::<HashMap<_, _>>();
-        let work_unsettled = convoy_items
-            .into_iter()
-            .flat_map(|convoy| {
-                let convoy_name = convoy.metadata.name;
-                convoy.status.into_iter().flat_map(move |status| {
-                    let convoy_name = convoy_name.clone();
-                    status.crew_work.into_iter().flat_map(move |(vessel, crew)| {
-                        let convoy_name = convoy_name.clone();
-                        crew.into_iter()
-                            .map(move |(role, work)| ((convoy_name.clone(), vessel.clone(), role), crew_work_unsettled(work.phase)))
-                    })
-                })
             })
             .collect::<HashMap<_, _>>();
         let mut authority_by_convoy = HashMap::new();
@@ -10003,11 +10014,7 @@ impl InProcessDaemon {
                 Some(task) => format!("{task}/{role}"),
                 None => role.clone(),
             };
-            let attention = crew_attention(
-                session.status.as_ref(),
-                task.as_ref().and_then(|task| work_unsettled.get(&(convoy.clone(), task.clone(), role))).copied().unwrap_or(true),
-                Utc::now(),
-            );
+            let attention = crew_attention(session.status.as_ref(), Utc::now());
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
@@ -10033,6 +10040,7 @@ impl InProcessDaemon {
                     .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
                     .crew(crew)
                     .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
+                    .surface_state(surface_by_convoy.get(&convoy_key).copied().unwrap_or_default())
                     .maybe_attention(attention)
                     .host(host)
                     .maybe_placement_decision(placement_by_convoy.get(&convoy_key).cloned())
