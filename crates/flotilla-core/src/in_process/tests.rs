@@ -118,7 +118,7 @@ async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc
                 supervision: None,
                 exit: None,
                 turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![claim_crew("coder")]).build()],
             }),
             work: BTreeMap::from([(
                 "work".to_string(),
@@ -4990,6 +4990,56 @@ async fn wait_for_stall(backend: &ResourceBackend, name: &str, expected: bool) -
     .expect("stall judgement timed out")
 }
 
+fn stall_workflow_snapshot(crew: Vec<flotilla_resources::CrewSpec>) -> flotilla_resources::WorkflowSnapshot {
+    flotilla_resources::WorkflowSnapshot {
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+        vessels: vec![flotilla_resources::VesselRequirement::builder().name("work".into()).crew(crew).build()],
+    }
+}
+
+fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
+    flotilla_resources::CrewSpec::builder()
+        .role(role.to_string())
+        .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+        .completion_expectations(vec![flotilla_resources::CrewCompletionExpectation::DecisionLedger])
+        .build()
+}
+
+async fn stall_test_session(backend: &ResourceBackend, convoy: &str, name: &str, role: &str, attention: TerminalAttention) {
+    let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name(name.into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), convoy.into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                    (ROLE_LABEL.into(), role.into()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "env".into(),
+                role: role.into(),
+                source: TerminalSessionSource::Tool { command: "test".into() },
+                cwd: "/tmp".into(),
+                pool: "test".into(),
+            },
+        )
+        .await
+        .expect("session");
+    sessions
+        .update_status(name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            attention: Some(attention),
+            ..Default::default()
+        })
+        .await
+        .expect("attention");
+}
+
 #[tokio::test]
 async fn active_idle_crew_stalls_and_working_crew_clears() {
     let (daemon, backend, _temp, watch) = stall_test_daemon().await;
@@ -4999,6 +5049,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     convoys
         .update_status("idle-crew", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
             work: BTreeMap::from([(
                 "work".into(),
                 flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
@@ -5080,6 +5131,123 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
         Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
     sessions.update_status("idle-session", &idle.metadata.resource_version, &working).await.expect("working attention");
     assert!(wait_for_stall(&backend, "idle-crew", false).await.stalled.is_none());
+    watch.abort();
+}
+
+#[tokio::test]
+async fn stale_working_attention_does_not_stall_crew() {
+    let (_daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created =
+        convoys.create(&test_meta("stale-crew"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
+    convoys
+        .update_status("stale-crew", &created.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
+            work: BTreeMap::from([(
+                "work".into(),
+                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("active status");
+    stall_test_session(&backend, "stale-crew", "stale-session", "coder", TerminalAttention {
+        state: TerminalAttentionState::Working,
+        as_of: Utc::now() - chrono::Duration::minutes(3),
+        source: TerminalAttentionSource::Hook,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+    assert!(convoys.get("stale-crew").await.expect("convoy").status.expect("status").stalled.is_none());
+    watch.abort();
+}
+
+#[tokio::test]
+async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
+    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let repository = flotilla_resources::RepositoryKey("repo".into());
+    let spec = ConvoySpec::builder()
+        .workflow_ref("test".into())
+        .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".into())
+            .repo_ref(repository.clone())
+            .source_ref("feature/landing".into())
+            .target_ref("main".into())
+            .workspace_slug("flotilla".into())
+            .subpaths(Vec::new())
+            .build()])
+        .change_request(
+            flotilla_resources::BoundChangeRequest::builder().id("1392".into()).repository_ref(repository).title("test".into()).build(),
+        )
+        .build();
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys.create(&test_meta("landed-claim"), &spec).await.expect("convoy");
+    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
+        "shipped".into(),
+        "$cr.state == merged".parse().expect("leaf template"),
+    )])));
+    convoys
+        .update_status("landed-claim", &created.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Landing,
+            workflow_snapshot: Some(snapshot),
+            work: BTreeMap::from([(
+                "work".into(),
+                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("landing status");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if daemon
+                .leaf_subscriptions
+                .rows()
+                .await
+                .iter()
+                .any(|row| matches!(&row.watcher, crate::leaf_engine::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("exit row armed");
+    let records = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let record_name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 1392);
+    let record = records.get(&record_name).await.expect("demanded observation record");
+    let fresh = Utc::now();
+    records
+        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, fresh),
+            head_sha: flotilla_resources::Observation::known("head".into(), fresh),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, fresh),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, fresh),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, fresh),
+        })
+        .await
+        .expect("fresh observation");
+    stall_test_session(&backend, "landed-claim", "idle-landing-session", "coder", TerminalAttention {
+        state: TerminalAttentionState::Idle,
+        as_of: Utc::now(),
+        source: TerminalAttentionSource::Hook,
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+    assert!(convoys.get("landed-claim").await.expect("convoy").status.expect("status").stalled.is_none());
     watch.abort();
 }
 
@@ -5188,22 +5356,24 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
     convoys
         .update_status("standing", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(stall_workflow_snapshot(vec![flotilla_resources::CrewSpec::builder()
+                .role("governor".into())
+                .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+                .build()])),
             work: BTreeMap::from([(
                 "work".into(),
                 flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
             )]),
             crew_work: BTreeMap::from([(
                 "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
             )]),
             ..Default::default()
         })
         .await
         .expect("active status");
     let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
-    for (name, role, state) in
-        [("coder-session", "coder", TerminalAttentionState::Working), ("governor-session", "governor", TerminalAttentionState::Idle)]
-    {
+    for (name, role, state) in [("governor-session", "governor", TerminalAttentionState::Idle)] {
         let session = sessions
             .create(
                 &InputMeta::builder()
