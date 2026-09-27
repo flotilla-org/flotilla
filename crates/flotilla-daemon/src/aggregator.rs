@@ -2269,9 +2269,13 @@ impl Aggregator {
             .min_by_key(|demand| &demand.metadata.name);
         let surface_state = if credential_attention.is_some() || completion_pending.is_some() {
             SurfaceState::NeedsYou
-        } else if let Some(stalled) = stalled.filter(
-            |stalled| matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name),
-        ) {
+        } else if let Some(stalled) = stalled.filter(|stalled| {
+            matches!(&stalled.maker, Some(flotilla_resources::LeafMaker::Actor { vessel, .. }) if vessel == &definition.name)
+                || stalled
+                    .leaves
+                    .iter()
+                    .any(|leaf| matches!(&leaf.address, flotilla_protocol::LeafAddress::Work { work, .. } if work == &definition.name))
+        }) {
             stalled_surface_state(stalled)
         } else {
             matching_sessions()
@@ -2430,6 +2434,8 @@ fn stalled_surface_state(stalled: &StalledCondition) -> SurfaceState {
     match stalled.rung {
         StallRung::Nudge => SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge },
         StallRung::Supervisor => SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Supervisor },
+        StallRung::Bosun => SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Bosun },
+        StallRung::Governor => SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Governor },
         StallRung::Operator => SurfaceState::NeedsYou,
     }
 }
@@ -2559,6 +2565,10 @@ mod tests {
                     source: flotilla_resources::StallEvidenceSource::Hook,
                     began_at: Utc::now(),
                     rung: if name == "crew" { StallRung::Nudge } else { StallRung::Operator },
+                    supervisor: None,
+                    supervision_index: None,
+                    supervision_exhausted: false,
+                    reason: None,
                     nudge_history: Vec::new(),
                 });
             }
@@ -2594,12 +2604,18 @@ mod tests {
             source: flotilla_resources::StallEvidenceSource::Hook,
             began_at: Utc::now(),
             rung: StallRung::Supervisor,
+            supervisor: None,
+            supervision_index: None,
+            supervision_exhausted: false,
+            reason: None,
             nudge_history: Vec::new(),
         };
         let supervisor_state = stalled_surface_state(&supervised);
         assert_eq!(supervisor_state, SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Supervisor });
         assert_eq!(supervisor_state.label(), "stalled (rung 1: supervisor)");
         assert!(!supervisor_state.needs_attention());
+        let governor = StalledCondition { rung: StallRung::Governor, ..supervised.clone() };
+        assert_eq!(stalled_surface_state(&governor).label(), "stalled (rung 1: governor)");
         let no_maker = StalledCondition { maker: None, rung: StallRung::Nudge, ..supervised };
         assert_eq!(stalled_surface_state(&no_maker), SurfaceState::NeedsYou);
     }
@@ -2796,6 +2812,10 @@ mod tests {
             source: flotilla_resources::StallEvidenceSource::Hook,
             began_at: Utc::now(),
             rung: StallRung::Nudge,
+            supervisor: None,
+            supervision_index: None,
+            supervision_exhausted: false,
+            reason: None,
             nudge_history: Vec::new(),
         });
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
