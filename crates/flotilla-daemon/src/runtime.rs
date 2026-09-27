@@ -954,18 +954,22 @@ async fn register_agentless_ssh_resources(
     }
     ensure_host_direct_environment_exists(backend, namespace, provisioning).await?;
     ensure_default_policies(backend, namespace, provisioning).await?;
-    let platform = match profile.runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default).await {
+    let platform = agentless_platform(profile.runner.as_ref()).await;
+    migrate_live_placement_policies(backend, namespace, &provisioning.host_id, &platform).await
+}
+
+async fn agentless_platform(runner: &dyn CommandRunner) -> String {
+    match runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default).await {
         Ok(output) => match output.trim() {
             "Darwin" => "macos".to_string(),
             "Linux" => "linux".to_string(),
             other => other.to_ascii_lowercase(),
         },
-        Err(_) => match profile.runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default).await {
+        Err(_) => match runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default).await {
             Ok(output) if output.contains("Windows") => "windows".to_string(),
             _ => "unknown".to_string(),
         },
-    };
-    migrate_live_placement_policies(backend, namespace, &provisioning.host_id, &platform).await
+    }
 }
 
 async fn apply_agentless_ssh_observation(
@@ -1023,6 +1027,8 @@ async fn apply_agentless_ssh_observation(
                 .build(),
         );
     }
+    let platform = agentless_platform(ssh.runner.as_ref()).await;
+    migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
         host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
     } else {
@@ -5776,6 +5782,22 @@ mod tests {
             .expect("SSH credential expiry")
             .contains_key(flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE));
         assert!(daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE).get("host-direct-ssh-test-host").await.is_ok());
+        let policies = daemon.resource_backend().using::<PlacementPolicy>(NAMESPACE);
+        let policy = policies.get("host-direct-ssh-test-host").await.expect("SSH policy");
+        let mut changed = policy.spec.clone();
+        changed.pool = "alternate-pool".to_string();
+        policies
+            .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &changed)
+            .await
+            .expect("edit SSH policy while the daemon runs");
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("refresh SSH observation");
+        let kind = daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .get("host-direct-ssh-test-host")
+            .await
+            .expect("refreshed SSH kind");
+        assert_eq!(kind.spec.pool, "alternate-pool");
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),

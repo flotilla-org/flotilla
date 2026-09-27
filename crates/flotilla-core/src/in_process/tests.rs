@@ -3554,8 +3554,8 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
         .await
         .expect("publish facts");
     let listed = daemon.fulfilment_list_internal().await.expect("list facts");
-    assert_eq!(listed.kinds.iter().find(|kind| kind.name == "local-kind").unwrap().harnesses["claude-code"].version, "2.1.282");
-    assert!(listed.kinds.iter().find(|kind| kind.name == "unmatched-kind").unwrap().harnesses.is_empty());
+    assert_eq!(listed.kinds.iter().find(|kind| kind.name == "local-kind").expect("local kind").harnesses["claude-code"].version, "2.1.282");
+    assert!(listed.kinds.iter().find(|kind| kind.name == "unmatched-kind").expect("unmatched kind").harnesses.is_empty());
     let fleet = daemon.fleet_health_internal().await.expect("fleet health");
     let local = fleet.hosts.iter().find(|host| host.host == HostName::new("local-host")).expect("local host row");
     assert_eq!(local.fulfilments.len(), 1);
