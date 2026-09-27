@@ -710,10 +710,7 @@ impl BlobStore for TieredBlobStore {
         let (digest, size) = digest_file(path).await?;
         let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
         self.local.write_file(&digest, path).await?;
-        if !was_present && !self.fleet.is_empty() {
-            self.status.lock().await.pending_count += self.fleet.len();
-            self.wake.notify_one();
-        }
+        self.queue_new(&digest, was_present, None).await;
         Ok((digest, size))
     }
 
@@ -731,11 +728,12 @@ impl BlobStore for TieredBlobStore {
                         error = Some(format!("blob digest mismatch for {}", digest.as_str()));
                         continue;
                     }
+                    let was_present = self.local.verified_file_size(digest).await.ok().flatten().is_some();
                     self.local.write_file(digest, path).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
                     tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
-                    self.wake.notify_one();
+                    self.queue_new(digest, was_present, Some(&target.id)).await;
                     return Ok(Some(size));
                 }
                 Ok(None) => {}
@@ -1080,12 +1078,32 @@ mod tests {
         let bytes = vec![0, 1, 127, 128, 255];
         let digest = BlobDigest::of(&bytes);
         let fleet = Arc::new(FileOnlyFleet { bytes: bytes.clone() });
-        let tiered = TieredBlobStore::new(state.path(), vec![("streaming".into(), fleet)]);
+        let mirror = Arc::new(MemoryBlobStore::default());
+        let tiered = TieredBlobStore::new(state.path(), vec![("streaming".into(), fleet), ("mirror".into(), mirror.clone())]);
         let destination = state.path().join("materialized");
 
         assert_eq!(tiered.get_file(&digest, &destination).await.expect("stream fleet file"), Some(bytes.len() as u64));
         assert_eq!(tokio::fs::read(&destination).await.expect("materialized body"), bytes);
         assert_eq!(tiered.local.get(&digest).await.expect("cached body"), Some(bytes));
+        assert_eq!(tiered.status().await.pending_count, 1);
+        assert_eq!(tiered.sync_once().await.expect("sync mirror").pending_count, 0);
+        assert!(mirror.has(&digest).await.expect("mirror copy"));
+    }
+
+    #[tokio::test]
+    async fn tiered_file_put_queues_fleet_sync() {
+        let state = tempfile::tempdir().expect("state dir");
+        let source = state.path().join("source");
+        let bytes = [0, 1, 127, 128, 255];
+        tokio::fs::write(&source, bytes).await.expect("source file");
+        let fleet = Arc::new(MemoryBlobStore::default());
+        let tiered = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+
+        let (digest, size) = tiered.put_file(&source).await.expect("put file");
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(tiered.status().await.pending_count, 1);
+        assert_eq!(tiered.sync_once().await.expect("sync file").pending_count, 0);
+        assert_eq!(fleet.get(&digest).await.expect("fleet read"), Some(bytes.to_vec()));
     }
 
     #[tokio::test]
