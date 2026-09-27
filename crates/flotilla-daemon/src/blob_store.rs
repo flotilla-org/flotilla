@@ -493,7 +493,10 @@ impl BlobStore for TieredBlobStore {
         for target in &self.fleet {
             match target.store.get(digest).await {
                 Ok(Some(bytes)) => {
-                    digest.verify(&bytes)?;
+                    if let Err(failure) = digest.verify(&bytes) {
+                        error = Some(failure);
+                        continue;
+                    }
                     self.local.put(&bytes).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
@@ -701,5 +704,19 @@ mod tests {
         let tiered = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet)]);
         assert!(tiered.get(&digest).await.expect_err("reject corrupt fleet blob").contains("digest mismatch"));
         assert!(!tiered.local.has(&digest).await.expect("no corrupt cache"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_fleet_mirror_falls_back_to_healthy_mirror() {
+        let state = tempfile::tempdir().expect("state dir");
+        let corrupt = Arc::new(MemoryBlobStore::default());
+        let healthy = Arc::new(MemoryBlobStore::default());
+        let digest = corrupt.put(b"valid bytes").await.expect("put corrupt mirror blob");
+        healthy.put(b"valid bytes").await.expect("put healthy mirror blob");
+        corrupt.blobs.lock().await.insert(digest.clone(), b"wrong bytes".to_vec());
+        let tiered = TieredBlobStore::new(state.path(), vec![("corrupt".into(), corrupt), ("healthy".into(), healthy)]);
+
+        assert_eq!(tiered.get(&digest).await.expect("read healthy mirror"), Some(b"valid bytes".to_vec()));
+        assert_eq!(tiered.local.get(&digest).await.expect("cache valid blob"), Some(b"valid bytes".to_vec()));
     }
 }
