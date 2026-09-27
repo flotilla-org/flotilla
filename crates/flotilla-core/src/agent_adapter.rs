@@ -1477,6 +1477,7 @@ mod tests {
         let mut declared_exit = convoy.clone();
         declared_exit.status = Some(ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: Some(ExitDeclaration::Claim(ClaimExit)),
                 turn_delivery: Default::default(),
                 vessels: Vec::new(),

@@ -3720,6 +3720,7 @@ mod tests {
         let status = ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build()],
@@ -5004,7 +5005,12 @@ mod tests {
             spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
             status: Some(ConvoyStatus {
                 phase: convoy_phase,
-                workflow_snapshot: Some(WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: vec![definition] }),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![definition],
+                }),
                 work,
                 ..Default::default()
             }),

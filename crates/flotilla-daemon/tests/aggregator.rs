@@ -595,6 +595,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],

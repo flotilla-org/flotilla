@@ -354,7 +354,12 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let mut status = active_convoy_status();
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::Bootstrap {
-                    workflow_snapshot: WorkflowSnapshot { exit: None, turn_delivery: Default::default(), vessels: Vec::new() },
+                    workflow_snapshot: WorkflowSnapshot {
+                        stall_nudges: Default::default(),
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: Vec::new(),
+                    },
                     observed_workflow_ref: "workflow-a".to_string(),
                     observed_workflows: BTreeMap::new(),
                     work: status.work.clone(),

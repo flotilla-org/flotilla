@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, time::Duration};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{Leaf, LeafKind, LeafOperator};
+use flotilla_protocol::{Leaf, LeafAddress, LeafKind, LeafOperator};
 
 use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, ResourceObject, Usage, Vessel, WorkState};
 
@@ -18,6 +18,17 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("cr", ".review.actionable-at-head"),
     ("cr", ".mergeable"),
 ];
+
+/// Phrasing is part of the closed actor-leaf vocabulary. An actor row without
+/// one cannot be armed, since it could never receive a meaningful nudge.
+pub fn actor_obligation(leaf: &Leaf) -> Result<String, String> {
+    match (&leaf.address, crew_role_path(&leaf.field_path), leaf.operator, leaf.literal.as_str()) {
+        (LeafAddress::Work { work, .. }, Some(role), LeafOperator::Equal, "Done") => Ok(format!(
+            "You owe a settlement claim for {work}/{role}: finish, then run `flotilla crew complete --decision-ledger-ref …`, or `crew fail --message …`."
+        )),
+        _ => Err(format!("actor leaf `{leaf:?}` has no obligation phrasing")),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreeValue {

@@ -208,6 +208,15 @@ spec:
                       additionalProperties:
                         type: object
                         x-kubernetes-preserve-unknown-fields: true
+                    stall_nudges:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        required: [max_per_episode]
+                        properties:
+                          max_per_episode:
+                            type: integer
+                            minimum: 0
                     vessels:
                       type: array
                       items:

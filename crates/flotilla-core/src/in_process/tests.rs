@@ -114,6 +114,7 @@ async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
@@ -265,6 +266,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: flotilla_resources::ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    stall_nudges: Default::default(),
                     exit: None,
                     turn_delivery: Default::default(),
                     vessels: vec![VesselRequirement::builder()
@@ -354,6 +356,109 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
         } else {
             assert_eq!(message.expect("queued message").text, "rebase the PR");
         }
+    }
+}
+
+#[tokio::test]
+async fn idle_crew_nudges_are_bounded_and_credential_staged() {
+    use flotilla_resources::StallRung;
+
+    for limit in [0, 2] {
+        let (daemon, backend, probe) = resume_staging_fixture().await;
+        probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+        let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let mut status = convoy.status.expect("status");
+        status.phase = flotilla_resources::ConvoyPhase::Active;
+        status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
+        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
+        status
+            .workflow_snapshot
+            .as_mut()
+            .expect("workflow")
+            .stall_nudges
+            .insert("work/coder".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: limit });
+        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
+        let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+        let session = sessions.get("resume-staging-session").await.expect("session");
+        let mut session_status = ResourceTerminalSessionStatus { phase: ResourceTerminalSessionPhase::Running, ..Default::default() };
+        session_status.attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Idle,
+            as_of: chrono::Utc::now(),
+            source: TerminalAttentionSource::Hook,
+        });
+        sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let watcher = daemon.reconciler_wake_watch();
+        let task = tokio::spawn(watcher.spawn(backend.clone(), "flotilla".to_string(), tx));
+        let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled;
+                if stalled.as_ref().is_some_and(|stall| stall.rung == expected_rung && stall.nudge_history.len() == limit.min(1) as usize) {
+                    break stalled.expect("stalled");
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first stall judgement");
+        assert_eq!(first.nudge_history.len(), limit.min(1) as usize);
+        let session = sessions.get("resume-staging-session").await.expect("session");
+        let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent") };
+        if limit == 0 {
+            assert!(message.is_none());
+            assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(message.expect("nudge").text, "You owe a settlement claim for work/coder: finish, then run `flotilla crew complete --decision-ledger-ref …`, or `crew fail --message …`.");
+            assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+            for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
+                let session = sessions.get("resume-staging-session").await.expect("session");
+                let mut spec = session.spec.clone();
+                let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
+                *message = None;
+                sessions
+                    .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
+                    .await
+                    .expect("consume nudge");
+                let session = sessions.get("resume-staging-session").await.expect("session");
+                session_status.attention.as_mut().expect("attention").as_of = chrono::Utc::now() + chrono::Duration::seconds(offset);
+                sessions
+                    .update_status("resume-staging-session", &session.metadata.resource_version, &session_status)
+                    .await
+                    .expect("idle again");
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let stalled =
+                            convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+                        if stalled.nudge_history.len() == 2 && stalled.rung == desired_rung {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("next idle episode judgement");
+            }
+            let stalled = convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.expect("stalled");
+            assert_eq!(stalled.nudge_history.len(), 2);
+        }
+        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let mut status = convoy.status.expect("status");
+        status.phase = flotilla_resources::ConvoyPhase::Landed;
+        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Done;
+        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("complete");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if convoys.get("resume-staging").await.expect("convoy").status.expect("status").stalled.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stall cleared");
+        task.abort();
     }
 }
 
@@ -890,6 +995,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: vec![requirement.clone()],
@@ -4708,6 +4814,7 @@ async fn landing_without_armed_exit_rows_stalls() {
         .update_status("unarmed-landing", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: None,
                 turn_delivery: Default::default(),
                 vessels: Vec::new(),
@@ -4746,6 +4853,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .update_status("stale-observation", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
                 exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
                     "shipped".into(),
                     "$cr.state == merged".parse().expect("leaf template"),
