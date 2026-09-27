@@ -264,6 +264,10 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.stale_after()
     }
 
+    pub fn issue_stale_after(&self) -> std::time::Duration {
+        self.inner.issues.stale_after()
+    }
+
     pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
         self.inner.change_requests.observation_error(subject).await
     }
@@ -354,16 +358,11 @@ impl LeafSubscriptionTable {
 
         let mut issue_sources = issue_sources(issue_list);
         let mut issue_objects = freshest_issues(&issue_sources);
+        let staleness = LeafObservationStaleness { change_request: self.change_request_stale_after(), issue: self.issue_stale_after() };
 
-        if let Some(fire) = evaluate_row(
-            &row,
-            &convoy_objects,
-            &vessel_objects,
-            &change_request_objects,
-            &usage_objects,
-            &issue_objects,
-            self.inner.change_requests.stale_after(),
-        )? {
+        if let Some(fire) =
+            evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, &usage_objects, &issue_objects, staleness)?
+        {
             self.fire(row.id, fire).await;
             if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                 return Ok(());
@@ -424,15 +423,9 @@ impl LeafSubscriptionTable {
                     apply_read_event(event, &mut usage_objects);
                 }
             }
-            if let Some(fire) = evaluate_row(
-                &row,
-                &convoy_objects,
-                &vessel_objects,
-                &change_request_objects,
-                &usage_objects,
-                &issue_objects,
-                self.inner.change_requests.stale_after(),
-            )? {
+            if let Some(fire) =
+                evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, &usage_objects, &issue_objects, staleness)?
+            {
                 self.fire(row.id, fire).await;
                 if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                     return Ok(());
@@ -516,7 +509,7 @@ impl LeafSubscriptionTable {
                 };
                 let brief = claim_at
                     .map(|claim_at| {
-                        compose_turn_brief(
+                        compose_change_request_turn_brief(
                             &convoy,
                             source,
                             rule,
@@ -549,8 +542,23 @@ impl LeafSubscriptionTable {
                     path if path.starts_with(".labels.") => issue.labels.observed_at,
                     _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
                 };
-                let brief = format!("{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf}`\n- Issue updated at: `{updated_at}`\n- Issue state: {:?}\n- Issue labels: {:?}\n- Durable convoy record: `{}/{}`\n",
-                    rule.brief.trim(), issue.state.value, issue.labels.value, convoy.metadata.namespace, convoy.metadata.name);
+                let observation = format!(
+                    "- Issue updated at: `{updated_at}`\n- Issue state: {:?}\n- Issue labels: {:?}\n",
+                    issue.state.value, issue.labels.value
+                );
+                let brief = claim_at
+                    .map(|claim_at| {
+                        compose_subject_turn_brief(
+                            &convoy,
+                            source,
+                            rule,
+                            leaf,
+                            &observation,
+                            claim_at,
+                            claim.and_then(|claim| claim.decision_ledger_ref.as_deref()),
+                        )
+                    })
+                    .unwrap_or_default();
                 (format!("{}@{}", leaf.address, updated_at.to_rfc3339()), evidence_at, brief)
             }
             _ => return Err("turn-delivery leaf is not externally observed".into()),
@@ -624,12 +632,31 @@ impl LeafSubscriptionTable {
     }
 }
 
-fn compose_turn_brief(
+fn compose_change_request_turn_brief(
     convoy: &ResourceObject<Convoy>,
     source: &str,
     rule: &TurnDeliveryRule,
     leaf: &Leaf,
     cr: &flotilla_resources::ChangeRequestStatus,
+    claim_at: DateTime<Utc>,
+    decision_ledger_ref: Option<&str>,
+) -> String {
+    let observation = format!(
+        "- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n",
+        cr.head_sha.value.as_deref().unwrap_or("unknown"),
+        cr.review.actionable_at_head.value,
+        cr.checks.value,
+        cr.mergeable.value,
+    );
+    compose_subject_turn_brief(convoy, source, rule, leaf, &observation, claim_at, decision_ledger_ref)
+}
+
+fn compose_subject_turn_brief(
+    convoy: &ResourceObject<Convoy>,
+    source: &str,
+    rule: &TurnDeliveryRule,
+    leaf: &Leaf,
+    observation: &str,
     claim_at: DateTime<Utc>,
     decision_ledger_ref: Option<&str>,
 ) -> String {
@@ -641,12 +668,9 @@ fn compose_turn_brief(
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n- Claim durability fence: `{}`\n- Decision ledger: {}\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Change request and branches\n\n{}\n",
+        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Fired leaf: `{leaf:?}`\n{}- Claim durability fence: `{}`\n- Decision ledger: {}\n- Durable convoy record: `{}/{}`\n- Target crew: `{}/{}`\n\n## Repositories and branches\n\n{}\n",
         rule.brief.trim(),
-        cr.head_sha.value.as_deref().unwrap_or("unknown"),
-        cr.review.actionable_at_head.value,
-        cr.checks.value,
-        cr.mergeable.value,
+        observation,
         claim_at.to_rfc3339(),
         decision_ledger_ref.unwrap_or("MISSING (crew completed without a decision ledger)"),
         convoy.metadata.namespace,
@@ -1270,6 +1294,12 @@ fn freshest_issues(sources: &IssueSources) -> HashMap<String, ResourceObject<Iss
     selected
 }
 
+#[derive(Clone, Copy)]
+struct LeafObservationStaleness {
+    change_request: std::time::Duration,
+    issue: std::time::Duration,
+}
+
 fn evaluate_row(
     row: &LeafSubscriptionRow,
     convoys: &HashMap<String, ResourceObject<Convoy>>,
@@ -1277,7 +1307,7 @@ fn evaluate_row(
     change_requests: &HashMap<String, ResourceObject<ChangeRequest>>,
     usages: &HashMap<String, ResourceObject<Usage>>,
     issues: &HashMap<String, ResourceObject<Issue>>,
-    change_request_stale_after: std::time::Duration,
+    staleness: LeafObservationStaleness,
 ) -> Result<Option<LeafFire>, String> {
     let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
     let mut matched = None;
@@ -1302,14 +1332,13 @@ fn evaluate_row(
                 let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
                     change_request,
                     now: Utc::now(),
-                    stale_after: change_request_stale_after,
+                    stale_after: staleness.change_request,
                 });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
             LeafAddress::Issue { service, scope, number } => {
                 let name = flotilla_resources::issue_record_name(service, scope, *number);
-                let subject =
-                    issues.get(&name).map(|issue| IssueLeafSubject { issue, now: Utc::now(), stale_after: change_request_stale_after });
+                let subject = issues.get(&name).map(|issue| IssueLeafSubject { issue, now: Utc::now(), stale_after: staleness.issue });
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
             LeafAddress::Usage { provider, account } => {
@@ -2979,6 +3008,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn issue_leaf_uses_issue_refresher_staleness() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let records = backend.using::<Issue>("flotilla");
+        let name = flotilla_resources::issue_record_name("github.com", "flotilla-org/flotilla", 2052);
+        let created = records
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &flotilla_resources::IssueSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(2052)
+                    .observing_authority("issue-owner".into())
+                    .build(),
+            )
+            .await
+            .expect("issue");
+        let old = Utc::now() - chrono::Duration::seconds(5);
+        let stale = flotilla_resources::IssueStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, old),
+            labels: flotilla_resources::Observation::known(vec![], old),
+            updated_at: flotilla_resources::Observation::known(old, old),
+        };
+        let created = records.update_status(&name, &created.metadata.resource_version, &stale).await.expect("stale issue");
+        let (event_tx, mut events) = broadcast::channel(16);
+        let change_requests = ChangeRequestRefresher::new(
+            backend.clone(),
+            "cr-owner".into(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let issues = IssueRefresher::new(backend.clone(), "issue-owner".into(), Arc::new(UnavailableIssues), IssueRefreshCadence {
+            state: Duration::from_secs(90),
+            freshness_demanded: Duration::from_secs(10),
+            stale_after: Duration::from_secs(1),
+        });
+        let table = LeafSubscriptionTable::with_issues(backend.clone(), event_tx, change_requests, issues);
+        let connection = uuid::Uuid::new_v4();
+        table
+            .subscribe_wait(connection, WaitSubscriptionRequest {
+                namespace: "flotilla".into(),
+                leaves: vec!["issue/github.com/flotilla-org/flotilla/2052 .state == closed".parse().expect("leaf")],
+                freshness_demand: None,
+            })
+            .await
+            .expect("subscribe");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv()).await.is_err(),
+            "stale issue must not fire under issue cadence"
+        );
+        let now = Utc::now();
+        records
+            .update_status(&name, &created.metadata.resource_version, &flotilla_resources::IssueStatus {
+                state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
+                labels: flotilla_resources::Observation::known(vec![], now),
+                updated_at: flotilla_resources::Observation::known(now, now),
+            })
+            .await
+            .expect("fresh issue");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv()).await.expect("fire").expect("event"),
+            DaemonEvent::LeafFired(_)
+        ));
+        table.unsubscribe_connection(connection).await;
+    }
+
+    #[tokio::test]
     async fn issue_turn_delivery_fires_once_for_changed_issue() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(4);
@@ -3003,6 +3098,14 @@ mod tests {
         };
         let spec = ConvoySpec::builder()
             .workflow_ref("workflow".into())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".into())
+                .repo_ref(RepositoryKey("repo".into()))
+                .source_ref("feature/issue".into())
+                .target_ref("main".into())
+                .workspace_slug("flotilla".into())
+                .subpaths(Vec::new())
+                .build()])
             .issues(vec![flotilla_resources::ConvoyIssue {
                 reference: reference.clone(),
                 repository_ref: None,
@@ -3023,7 +3126,14 @@ mod tests {
                 phase: ConvoyPhase::Landing,
                 crew_work: BTreeMap::from([(
                     "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(claim_at).build())]),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        CrewWorkState::builder()
+                            .phase(CrewWorkPhase::Done)
+                            .finished_at(claim_at)
+                            .decision_ledger_ref("https://example.com/ledger".into())
+                            .build(),
+                    )]),
                 )]),
                 ..Default::default()
             })
@@ -3088,6 +3198,10 @@ mod tests {
         .expect("observed issue change wakes turn delivery");
         table.deliver_turn(subscription_id, "issue-turn", "issue", &rule, &leaf).await.expect("duplicate issue event");
         assert_eq!(actuator.requests.lock().expect("requests").len(), 1);
+        let brief = actuator.requests.lock().expect("requests")[0].brief.clone();
+        assert!(brief.contains("Target crew: `work/coder`"));
+        assert!(brief.contains("Decision ledger: https://example.com/ledger"));
+        assert!(brief.contains("feature/issue"));
         let status = convoys.get("issue-turn").await.expect("convoy").status.expect("status");
         assert_eq!(status.turn_deliveries["issue"].episodes.len(), 1);
         watch.abort();
