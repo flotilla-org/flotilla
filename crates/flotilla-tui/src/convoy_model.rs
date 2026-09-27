@@ -4,7 +4,10 @@
 //! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
 //! surface-owned and may evolve with consumer-side view requirements.
 
-use flotilla_protocol::{result_set as wire, HostName, PlacementDecision, PrincipalRef, RepoKey, ResourceRef};
+use flotilla_protocol::{
+    result_set::{self as wire, SurfaceState},
+    HostName, PlacementDecision, PrincipalRef, RepoKey, ResourceRef,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConvoyId(String);
@@ -141,6 +144,8 @@ pub struct WorkCompletionTarget {
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct VesselSummary {
     pub name: String,
+    #[builder(default)]
+    pub surface_state: SurfaceState,
     pub depends_on: Vec<String>,
     pub phase: WorkPhase,
     pub placement_decision: Option<PlacementDecision>,
@@ -186,7 +191,7 @@ pub struct ConvoySummary {
     pub observed_workflow_ref: Option<String>,
     pub initializing: bool,
     #[builder(default)]
-    pub needs_attention: bool,
+    pub surface_state: SurfaceState,
 }
 
 impl From<&wire::ConvoyRow> for ConvoySummary {
@@ -213,7 +218,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             finished_at: row.finished_at,
             observed_workflow_ref: row.observed_workflow_ref.clone(),
             initializing: row.initializing,
-            needs_attention: row.needs_attention,
+            surface_state: row.surface_state,
         }
     }
 }
@@ -236,6 +241,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         .collect();
     VesselSummary {
         name: vessel.name.clone(),
+        surface_state: vessel.surface_state,
         depends_on: vessel.depends_on.clone(),
         phase: vessel.phase.into(),
         placement_decision: vessel.placement_decision.clone(),

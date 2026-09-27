@@ -183,6 +183,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             "Replica Gen",
             "Crew",
             "Convoys",
+            "Surfaces",
             "Disk Free",
             "Blob Sync",
             "Sleep Inhibition",
@@ -229,6 +230,10 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
                 Cell::new(host.replica_generation.as_deref().unwrap_or("-")),
                 Cell::new(host.crew_count),
                 Cell::new(host.convoy_count),
+                Cell::new(format!(
+                    "{} available · {} handled · {} need you",
+                    host.surface_states.available, host.surface_states.stalled_handled, host.surface_states.needs_you
+                )),
                 Cell::new(format_disk_free(host.disk_free_bytes)),
                 Cell::new(host.blob_sync.as_ref().map_or_else(
                     || "-".to_string(),
@@ -569,7 +574,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Attention", "Host", "Placement", "Staleness"]);
+        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Surface", "Attention", "Host", "Placement", "Staleness"]);
         for row in &response.rows {
             let vessel = match &row.authority {
                 Some(authority) => format!("{} ({authority})", row.vessel),
@@ -580,6 +585,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
                 Cell::new(vessel),
                 Cell::new(&row.crew),
                 Cell::new(&row.crew_state),
+                Cell::new(if row.convoy_ref.is_some() { row.surface_state.label() } else { "-" }),
                 Cell::new(row.attention.map_or_else(|| "-".to_string(), |attention| attention.to_string())),
                 Cell::new(row.host.as_str()),
                 Cell::new(row.placement_decision.as_ref().map_or_else(

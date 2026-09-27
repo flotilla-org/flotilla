@@ -3163,8 +3163,7 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
         ..Default::default()
     };
 
-    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Stalled));
-    assert_eq!(crew_attention(Some(&status), false, now), Some(CrewAttention::Idle));
+    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Idle));
 
     status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
         reason: "DeliveryUnconfirmed".to_string(),
@@ -3173,14 +3172,14 @@ fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
         consecutive_failures: 1,
         observed_at: now,
     });
-    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::DeliveryUnconfirmed));
+    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
     status.degraded = None;
 
     status.attention.as_mut().expect("attention").as_of = now - TerminalAttention::FRESH_FOR;
-    assert_eq!(crew_attention(Some(&status), true, now), Some(CrewAttention::Unobservable));
+    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Unobservable));
 
     status.phase = ResourceTerminalSessionPhase::Stopped;
-    assert_eq!(crew_attention(Some(&status), true, now), None);
+    assert_eq!(crew_attention(Some(&status), now), None);
 }
 
 #[tokio::test]
@@ -3210,14 +3209,6 @@ async fn credential_alerts_match_the_exact_convoy_and_vessel() {
     );
     assert_eq!(credential_refresh_alert_for_vessel(&demand, "conv", "implement"), None);
     assert_eq!(credential_refresh_alert_for_vessel(&demand, "other-convoy", "implement-review"), None);
-}
-
-#[test]
-fn handed_back_crew_is_settled_for_its_own_attention() {
-    assert!(crew_work_unsettled(CrewWorkPhase::Working));
-    assert!(!crew_work_unsettled(CrewWorkPhase::Done));
-    assert!(!crew_work_unsettled(CrewWorkPhase::HandedBack));
-    assert!(!crew_work_unsettled(CrewWorkPhase::Failed));
 }
 
 #[tokio::test]

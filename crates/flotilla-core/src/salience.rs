@@ -48,16 +48,15 @@ pub struct SalienceEvaluation {
 }
 
 /// Compute the surface-independent salience judgment for one projection
-/// entry. `work_unsettled` gives ADR 0017's precise meaning to an `Idle`
-/// observation.
+/// entry. Idle evidence alone is availability; the authority's `Stalled`
+/// condition decides whether owed work needs an operator.
 pub fn compute_salience(
     demand: Option<DemandState>,
     regard_covers: bool,
     attention: Option<TerminalAttentionState>,
-    work_unsettled: bool,
+    _work_unsettled: bool,
 ) -> Salience {
-    let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput))
-        || matches!(attention, Some(TerminalAttentionState::Idle)) && work_unsettled;
+    let attention_needs_human = matches!(attention, Some(TerminalAttentionState::NeedsInput));
     let demand_is_unacknowledged = matches!(demand, Some(DemandState::Raised | DemandState::Satisfied | DemandState::Escalated));
     if demand_is_unacknowledged && regard_covers && attention_needs_human {
         return Salience::Urgent;
@@ -71,7 +70,6 @@ pub fn compute_salience(
     };
     let attention_salience = match attention {
         Some(TerminalAttentionState::NeedsInput) => Salience::Attention,
-        Some(TerminalAttentionState::Idle) if work_unsettled => Salience::Attention,
         Some(TerminalAttentionState::Working | TerminalAttentionState::Idle) => Salience::Info,
         Some(TerminalAttentionState::Unobservable) | None => Salience::None,
     };
@@ -191,7 +189,7 @@ mod tests {
             (None, true, None, true, Salience::Info, "regarded work"),
             (None, false, Some(TerminalAttentionState::Working), true, Salience::Info, "working observation"),
             (None, false, Some(TerminalAttentionState::Idle), false, Salience::Info, "settled idle observation"),
-            (None, false, Some(TerminalAttentionState::Idle), true, Salience::Attention, "idle unsettled work"),
+            (None, false, Some(TerminalAttentionState::Idle), true, Salience::Info, "idle unsettled work without a stall"),
             (None, false, Some(TerminalAttentionState::NeedsInput), true, Salience::Attention, "unrouted input need"),
             (Some(DemandState::Raised), false, Some(TerminalAttentionState::Working), true, Salience::Attention, "raised demand"),
             (Some(DemandState::Raised), true, Some(TerminalAttentionState::Working), true, Salience::Attention, "regarded raised demand"),
@@ -203,14 +201,7 @@ mod tests {
                 Salience::Urgent,
                 "in-searchlight input demand",
             ),
-            (
-                Some(DemandState::Raised),
-                true,
-                Some(TerminalAttentionState::Idle),
-                true,
-                Salience::Urgent,
-                "in-searchlight idle unsettled demand",
-            ),
+            (Some(DemandState::Raised), true, Some(TerminalAttentionState::Idle), true, Salience::Attention, "in-searchlight idle demand"),
             (
                 Some(DemandState::Raised),
                 false,

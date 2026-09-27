@@ -475,6 +475,7 @@ pub enum StallEvidenceSource {
 #[serde(rename_all = "snake_case")]
 pub enum StallRung {
     Nudge,
+    Supervisor,
     Operator,
 }
 

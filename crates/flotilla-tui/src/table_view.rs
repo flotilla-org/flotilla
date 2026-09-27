@@ -10,9 +10,11 @@ use std::{
 };
 
 use flotilla_protocol::{
-    issue_query::READY_ISSUE_LABEL, result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode,
-    ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey,
-    ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
+    issue_query::READY_ISSUE_LABEL,
+    result_set::{SurfaceState, Timestamp},
+    AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow,
+    IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase,
+    ViewAddress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -896,13 +898,21 @@ fn checkout_spec() -> TableSpec<CheckoutRow> {
     }
 }
 
+fn surface_label(name: &str, state: SurfaceState) -> String {
+    match state {
+        SurfaceState::Working => name.to_string(),
+        SurfaceState::NeedsYou => format!("⚠ {name} · {}", state.label()),
+        SurfaceState::Available | SurfaceState::StalledHandled { .. } => format!("{name} · {}", state.label()),
+    }
+}
+
 static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
     ColumnSpec {
         id: "name",
         label: "CONVOY",
         width: WidthHint::Flexible { minimum: 12, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.display_name()) } else { row.display_name() }),
+        extract: |row| CellValue::plain(surface_label(&row.display_name(), row.surface_state)),
     },
     ColumnSpec {
         id: "workflow",
@@ -949,7 +959,7 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
         label: "VESSEL",
         width: WidthHint::Flexible { minimum: 12, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(&row.vessel.name),
+        extract: |row| CellValue::plain(surface_label(&row.vessel.name, row.vessel.surface_state)),
     },
     ColumnSpec {
         id: "crew",
@@ -1432,6 +1442,7 @@ mod tests {
         VesselSummary {
             placement_decision: None,
             name: name.into(),
+            surface_state: Default::default(),
             depends_on: depends_on.iter().map(ToString::to_string).collect(),
             phase,
             crew: vec![ProcessSummary { role: "coder".into(), command_preview: "codex".into() }],
@@ -1471,7 +1482,7 @@ mod tests {
             finished_at: None,
             observed_workflow_ref: None,
             initializing: false,
-            needs_attention: false,
+            surface_state: Default::default(),
         }
     }
 
@@ -1620,13 +1631,13 @@ mod tests {
     }
 
     #[test]
-    fn project_convoy_row_badges_needs_attention() {
+    fn project_convoy_row_shows_surface_state() {
         let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
-        row.needs_attention = true;
+        row.surface_state = flotilla_protocol::result_set::SurfaceState::NeedsYou;
 
         let view = project_convoys("convoys/dev", &[&row]).expect("convoy table");
 
-        assert_eq!(view.rows[0].cells[0].text, "⚠ tables @ flotilla");
+        assert_eq!(view.rows[0].cells[0].text, "⚠ tables @ flotilla · needs you");
     }
 
     #[test]

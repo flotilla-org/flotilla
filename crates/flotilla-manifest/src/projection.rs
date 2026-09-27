@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow,
-        IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, VesselRow, WorkPhase,
+        IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
     ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -24,9 +24,9 @@ use crate::{
         KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
         KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
         KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME,
-        KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL,
-        KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT,
-        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG,
+        KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET,
+        KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -45,6 +45,14 @@ pub struct CatalogInput<'a> {
 pub struct Badge {
     pub state: BadgeState,
     pub attention: bool,
+}
+
+fn surface_facts(state: SurfaceState) -> Vec<(&'static str, MetadataValue)> {
+    let mut facts = vec![(KEY_SURFACE_STATE, MetadataValue::text(state.as_str()))];
+    if let Some(rung) = state.rung() {
+        facts.push((KEY_SURFACE_RUNG, MetadataValue::text(rung.as_str())));
+    }
+    facts
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,10 +306,8 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
         // attempt's own attention (e.g. a vessel waiting for input) surfaces here.
         (None, Some(convoy)) => {
             let badge = convoy_badge(convoy.phase, convoy.initializing);
-            // The Aggregator folds vessel needs_attention into the convoy's, but
-            // other ConvoyRow producers need not, so vessels are checked too.
-            let vessel_attention = convoy.vessels.iter().any(|vessel| vessel.needs_attention || work_badge(vessel.phase).attention);
-            Badge { attention: badge.attention || convoy.needs_attention || vessel_attention, ..badge }
+            let vessel_attention = convoy.vessels.iter().any(|vessel| vessel.surface_state.needs_attention());
+            Badge { attention: convoy.surface_state.needs_attention() || vessel_attention, ..badge }
         }
         // Between generations the ensure loop is expected to admit the next
         // attempt; a superseded failure is not the role's current state.
@@ -329,6 +335,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     }
     if let Some(convoy) = live {
         facts.push((KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())));
+        facts.extend(surface_facts(convoy.surface_state));
     }
     if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
@@ -491,7 +498,18 @@ fn project_awareness_entry(
     if let Some(host) = entry.annotations.get(KEY_VESSEL_HOST) {
         facts.push((KEY_VESSEL_HOST, MetadataValue::text(host.clone())));
     }
-    if matches!(entry.state, AwarenessState::Waiting | AwarenessState::Failed) {
+    let surface_state = match entry.id.parse().ok() {
+        Some(ViewAddress::Convoy { namespace, name }) => find_convoy(convoys, &namespace, &name).map(|row| row.surface_state),
+        Some(ViewAddress::Vessel { namespace, convoy, vessel }) => {
+            find_vessel(convoys, &namespace, &convoy, &vessel).map(|row| row.surface_state)
+        }
+        _ => None,
+    };
+    if let Some(state) = surface_state {
+        facts.extend(surface_facts(state));
+    }
+    if surface_state.map_or_else(|| matches!(entry.state, AwarenessState::Waiting | AwarenessState::Failed), SurfaceState::needs_attention)
+    {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some((recipe, target)) = awareness_entry_recipe(entry, convoys, mint) {
@@ -708,13 +726,14 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
     facts.extend(label_tier_facts(&convoy.name));
+    facts.extend(surface_facts(convoy.surface_state));
     if let Some(change_request) = &convoy.change_request {
         facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(change_request.id.clone())));
     }
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));
     }
-    if badge.attention {
+    if convoy.surface_state.needs_attention() {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some(message) = &convoy.message {
@@ -764,10 +783,11 @@ fn project_vessel(
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
     facts.extend(label_tier_facts(&vessel.name));
+    facts.extend(surface_facts(vessel.surface_state));
     if !vessel.crew.is_empty() {
         facts.push((KEY_CREW_ROLES, MetadataValue::StringList(vessel.crew.iter().map(|member| member.role.clone()).collect())));
     }
-    if badge.attention {
+    if vessel.surface_state.needs_attention() {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some(message) = &vessel.message {
