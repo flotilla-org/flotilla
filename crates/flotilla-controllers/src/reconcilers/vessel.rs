@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{
-    append_convoy_work_context, build_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
+    append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
     CrewBriefTemplateResolver,
 };
 use flotilla_protocol::{CanonicalHostId, PlacementDecision};
@@ -948,17 +948,15 @@ impl Reconciler for VesselReconciler {
                                 None if convoy.spec.change_request.is_some() => CrewAssignment::CarriedChangeRequest,
                                 None => CrewAssignment::Unassigned,
                             };
-                            let mut render_options = self
-                                .brief_templates
-                                .render_options_with_fork_stance(
-                                    brief_template.as_deref(),
-                                    convoy.spec.project_ref.as_deref(),
-                                    checkout_paths.values().map(PathBuf::from),
-                                    fork_stance,
-                                )
-                                .for_convoy(&convoy);
+                            let mut render_options = self.brief_templates.render_options_with_fork_stance(
+                                brief_template.as_deref(),
+                                convoy.spec.project_ref.as_deref(),
+                                checkout_paths.values().map(PathBuf::from),
+                                fork_stance,
+                            );
                             render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
-                            let mut brief = match build_crew_brief_with_options(
+                            let mut brief = match build_convoy_crew_brief_with_options(
+                                &convoy,
                                 &context,
                                 &obj.spec.vessel_name,
                                 &process.role,

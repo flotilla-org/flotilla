@@ -1720,7 +1720,8 @@ fn handoff_crew_brief(
         None if convoy.spec.change_request.is_some() => crate::agent_adapter::CrewAssignment::CarriedChangeRequest,
         None => crate::agent_adapter::CrewAssignment::Unassigned,
     };
-    let brief = crate::agent_adapter::build_crew_brief_with_options(
+    let brief = crate::agent_adapter::build_convoy_crew_brief_with_options(
+        convoy,
         &TerminalCrewContext {
             namespace: context.namespace.clone(),
             convoy: context.convoy.clone(),
@@ -9020,7 +9021,6 @@ impl InProcessDaemon {
                             repo_roots,
                             fork_stance,
                         );
-                render_options = render_options.for_convoy(&convoy);
                 render_options.has_credential_scope = !task.credential_scopes.is_empty();
                 let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                 let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
