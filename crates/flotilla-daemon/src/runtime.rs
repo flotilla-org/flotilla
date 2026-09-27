@@ -2260,6 +2260,13 @@ async fn record_credential_refresh_dispositions(
     for environment in listed.items {
         let previous = environment.status.as_ref().and_then(|status| status.credential_refresh_retry.as_ref());
         let error = errors.iter().find(|error| error.environment_ref == environment.metadata.name);
+        if error.is_some()
+            && previous.is_some_and(|retry| {
+                matches!(retry.disposition, ControllerRetryDisposition::Retryable { next_attempt_at } if Utc::now() < next_attempt_at)
+            })
+        {
+            continue;
+        }
         let retry = error.map(|_| {
             ControllerRetry::retryable(previous, Utc::now(), RetryBackoff {
                 initial: Duration::from_secs(30),
@@ -4867,6 +4874,44 @@ mod tests {
             )]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_retry_waits_until_deadline_without_rewriting_status() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let environments = backend.clone().using::<Environment>(NAMESPACE);
+        environments
+            .create(&empty_meta("refresh-work"), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                docker: None,
+            })
+            .await
+            .expect("create environment");
+        let failure = CredentialRefreshError {
+            environment_ref: "refresh-work".into(),
+            credential_name: Some("github-app".into()),
+            message: "provider unavailable".into(),
+            should_surface: true,
+        };
+        record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure)).await.expect("record first failure");
+        let first = environments.get("refresh-work").await.expect("environment after first failure");
+        let retry = first.status.expect("status").credential_refresh_retry.expect("retry record");
+        assert_eq!(retry.attempts, 1);
+        record_credential_refresh_dispositions(&backend, NAMESPACE, std::slice::from_ref(&failure))
+            .await
+            .expect("observe failure again before deadline");
+        let second = environments.get("refresh-work").await.expect("environment after repeated failure");
+        assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+        assert_eq!(second.status.expect("status").credential_refresh_retry, Some(retry));
+        record_credential_refresh_dispositions(&backend, NAMESPACE, &[]).await.expect("clear on recovery");
+        assert!(environments
+            .get("refresh-work")
+            .await
+            .expect("environment after recovery")
+            .status
+            .expect("status")
+            .credential_refresh_retry
+            .is_none());
     }
 
     #[tokio::test]
