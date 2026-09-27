@@ -68,9 +68,17 @@ impl Relay {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         // Build once up front. Left to itself, `wrangler dev` rebuilds and restarts whenever it
         // sees `src` change, which races the first requests.
-        let build =
-            Command::new("worker-build").arg("--release").current_dir(crate_dir).output().await.expect("run worker-build (is it on PATH?)");
-        assert!(build.status.success(), "worker-build failed:\n{}", String::from_utf8_lossy(&build.stderr));
+        // Its output goes straight to the test's stderr so a slow or failing build is visible in CI.
+        let build = Command::new("worker-build")
+            .arg("--release")
+            .current_dir(crate_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .await
+            .expect("run worker-build (is it on PATH?)");
+        assert!(build.success(), "worker-build failed: {build}");
 
         // wrangler watches `main`. On macOS, file events for the build output just written can
         // reach its watcher after it starts, and the resulting reload kills in-flight requests.
@@ -98,7 +106,14 @@ impl Relay {
             .kill_on_drop(true)
             .spawn()
             .expect("spawn wrangler dev (is wrangler on PATH?)");
-        let relay = Self { base: format!("127.0.0.1:{port}"), http: reqwest::Client::new(), child, log, _state: state };
+        // The runtime's proxy holds requests while the Worker loads, so an unbounded request would
+        // hang forever if the runtime never comes up. Long-polls wait at most 20 seconds.
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("HTTP client");
+        let relay = Self { base: format!("127.0.0.1:{port}"), http, child, log, _state: state };
         let deadline = Instant::now() + Duration::from_secs(120);
         // Our Worker answers `/` with 404; the runtime's proxy answers 503 while it (re)loads.
         while !matches!(relay.http.get(relay.url("/")).send().await, Ok(response) if response.status() == StatusCode::NOT_FOUND) {
@@ -184,7 +199,11 @@ impl Relay {
     async fn connect(&self, install: &str, token: &str, cursor: u64) -> Socket {
         let mut request = format!("ws://{}/i/{install}/stream?cursor={cursor}", self.base).into_client_request().expect("ws request");
         request.headers_mut().insert("Authorization", format!("Bearer {token}").parse().expect("header"));
-        tokio_tungstenite::connect_async(request).await.expect("websocket connect").0
+        tokio::time::timeout(Duration::from_secs(30), tokio_tungstenite::connect_async(request))
+            .await
+            .expect("websocket connect within 30s")
+            .expect("websocket connect")
+            .0
     }
 }
 
