@@ -740,15 +740,9 @@ pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str)
 async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let retention_days = BTreeMap::new();
     loop {
         interval.tick().await;
-        let service = crate::artifact::ArtifactService {
-            backend: &backend,
-            blobs: blobs.as_ref(),
-            namespace: &namespace,
-            retention_days: &retention_days,
-        };
+        let service = crate::artifact::ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
         match service.reap_expired().await {
             Ok(referenced) => {
                 if let Err(error) = blobs.gc_unreferenced(&referenced, Duration::from_secs(24 * 60 * 60)).await {

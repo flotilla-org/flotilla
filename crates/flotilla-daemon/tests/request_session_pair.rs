@@ -15,10 +15,14 @@ use flotilla_core::{
         issue_tracker::IssueProvider,
     },
 };
-use flotilla_daemon::server::test_support::{
-    apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
-    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
-    spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestTopology,
+use flotilla_daemon::{
+    blob_store::TieredBlobStore,
+    server::test_support::{
+        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
+        spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
+        spawn_in_memory_request_topology_stateful_with_caller_and_blob_store, spawn_in_memory_request_topology_stateful_with_surface,
+        InMemoryRequestTopology,
+    },
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -28,13 +32,14 @@ use flotilla_protocol::{
     SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
+    api_version, Artifact, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard,
-    Resource, ResourceBackend, ResourceError, ResourceProvenance, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL,
-    ROLE_LABEL,
+    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
+    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -508,6 +513,123 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
         .expect("explain convoy");
     let CommandValue::ConvoyExplanation(explanation) = value else { panic!("expected convoy explanation") };
     assert_eq!(explanation.lifecycle_mutations[0].caller.crew.as_ref().expect("crew caller").crew_id, "crew-123");
+}
+
+#[tokio::test]
+async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home() {
+    let leader = empty_daemon_named("artifact-crew-host").await;
+    let follower = empty_daemon_named("artifact-home").await;
+    let namespace = "flotilla";
+    let convoy = "artifact-demo";
+    follower
+        .resource_backend()
+        .using::<Convoy>(namespace)
+        .create(&InputMeta::builder().name(convoy.to_string()).build(), &ConvoySpec::builder().workflow_ref("scratch".to_string()).build())
+        .await
+        .expect("create home convoy");
+    let sessions = leader.resource_backend().using::<TerminalSession>(namespace);
+    let session = sessions
+        .create(
+            &InputMeta::builder().name("terminal-artifact-coder".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("env".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief { path: "brief.md".into(), content: String::new(), copies: vec![] },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: namespace.into(),
+                        convoy: convoy.into(),
+                        vessel_ref: "artifact-demo-work".into(),
+                    }),
+                    message: None,
+                })
+                .cwd("/work".to_string())
+                .pool("cleat".to_string())
+                .build(),
+        )
+        .await
+        .expect("create crew terminal");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+            crew: Some(
+                CrewSessionStatus::builder()
+                    .id("crew-artifact".to_string())
+                    .adapter("codex".to_string())
+                    .stance("trusted".to_string())
+                    .build(),
+            ),
+            ..TerminalSessionStatus::default()
+        })
+        .await
+        .expect("mark crew session");
+    let caller = CommandCaller {
+        principal_ref: PrincipalRef::implicit_for_namespace(namespace),
+        process: None,
+        crew: Some(
+            CallerCrew::builder()
+                .namespace(namespace.to_string())
+                .convoy(convoy.to_string())
+                .vessel("artifact-demo-work".to_string())
+                .role("coder".to_string())
+                .crew_id("crew-artifact".to_string())
+                .build(),
+        ),
+    };
+    let state = tempfile::tempdir().expect("blob state");
+    let store = Arc::new(TieredBlobStore::new(state.path(), vec![]));
+    let topology = spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
+        Arc::clone(&leader),
+        Arc::clone(&follower),
+        SurfaceDeclaration::focal_for_namespace(namespace),
+        caller,
+        Arc::clone(&store),
+    )
+    .await
+    .expect("connect crew and home");
+    apply_convoy_replica_feed(&leader, namespace, convoy, topology.follower_host.clone()).await;
+
+    let bytes = vec![0, 1, 2, 127, 255];
+    let (address, digest) = topology
+        .client
+        .artifact_put(
+            "review-round".into(),
+            "head-1".into(),
+            BTreeMap::from([("approved".into(), serde_json::json!(true))]),
+            "application/octet-stream".into(),
+            bytes.clone(),
+        )
+        .await
+        .expect("put through dispatcher and remote home");
+    assert_eq!(topology.client.artifact_get(digest.clone()).await.expect("get local body"), bytes);
+    assert!(leader.resource_backend().using::<Artifact>(namespace).list().await.expect("leader artifacts").items.is_empty());
+    let home_artifacts = follower.resource_backend().using::<Artifact>(namespace).list().await.expect("home artifacts");
+    assert_eq!(home_artifacts.items.len(), 1);
+    assert_eq!(home_artifacts.items[0].spec.producer, "coder");
+    leader
+        .resource_backend()
+        .replica_writer::<Artifact>(follower.node_id().clone(), namespace)
+        .replace(&home_artifacts, Utc::now())
+        .await
+        .expect("deliver envelope replica");
+    assert_eq!(topology.client.artifact_get(address.clone()).await.expect("get by address"), bytes);
+    assert_eq!(
+        topology.client.artifact_list(Some(convoy.into()), Some("review-round".into()), None).await.expect("list artifacts").len(),
+        1
+    );
+
+    let home_resolver = follower.resource_backend().using::<Artifact>(namespace);
+    let current = home_resolver.get(&home_artifacts.items[0].metadata.name).await.expect("home artifact");
+    home_resolver.delete(&current.metadata.name).await.expect("remove home envelope");
+    let mut conflicting = current.spec.clone();
+    conflicting.subject = "different-head".into();
+    home_resolver.create(&InputMeta::from(&current.metadata), &conflicting).await.expect("create conflicting home address");
+    let error = topology
+        .client
+        .artifact_put("review-round".into(), "head-1".into(), BTreeMap::new(), "text/plain".into(), b"new".to_vec())
+        .await
+        .expect_err("remote apply must report address conflict");
+    assert!(error.contains("artifact address cannot change"), "unexpected routed error: {error}");
 }
 
 // ---------------------------------------------------------------------------

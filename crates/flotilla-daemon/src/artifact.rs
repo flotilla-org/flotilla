@@ -12,25 +12,31 @@ use crate::blob_store::{BlobDigest, BlobStore};
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_SUMMARY_BYTES: usize = 4096;
 
+#[derive(Debug, bon::Builder)]
+pub struct ArtifactPutInput {
+    pub kind: String,
+    pub subject: String,
+    #[builder(default)]
+    pub summary: BTreeMap<String, serde_json::Value>,
+    pub media_type: String,
+    pub body: Vec<u8>,
+}
+
 /// The daemon owns both the envelope write and every blob-store operation.
 pub struct ArtifactService<'a> {
     pub backend: &'a ResourceBackend,
     pub blobs: &'a dyn BlobStore,
     pub namespace: &'a str,
-    pub retention_days: &'a BTreeMap<String, u64>,
 }
 
 impl ArtifactService<'_> {
     pub async fn put(
         &self,
         caller: &CallerCrew,
-        kind: String,
-        subject: String,
-        summary: BTreeMap<String, serde_json::Value>,
-        media_type: String,
-        body: &[u8],
+        input: ArtifactPutInput,
+        retention_days: &BTreeMap<String, u64>,
     ) -> Result<ResourceObject<Artifact>, String> {
-        let (name, spec, owner) = self.prepare_put(caller, kind, subject, summary, media_type, body).await?;
+        let (name, spec, owner) = self.prepare_put(caller, input, retention_days).await?;
         let resolver = self.backend.using::<Artifact>(self.namespace);
         let prior = match resolver.get(&name).await {
             Ok(prior) => Some(prior),
@@ -47,44 +53,41 @@ impl ArtifactService<'_> {
     pub async fn prepare_put(
         &self,
         caller: &CallerCrew,
-        kind: String,
-        subject: String,
-        summary: BTreeMap<String, serde_json::Value>,
-        media_type: String,
-        body: &[u8],
+        input: ArtifactPutInput,
+        retention_days: &BTreeMap<String, u64>,
     ) -> Result<(String, ArtifactSpec, OwnerReference), String> {
         let producer = self.stamped_role(caller).await?;
-        if kind.is_empty() || subject.is_empty() || media_type.is_empty() {
+        if input.kind.is_empty() || input.subject.is_empty() || input.media_type.is_empty() {
             return Err("artifact kind, subject, and media type must be nonempty".into());
         }
-        if summary.values().any(|value| !value.is_string() && !value.is_number() && !value.is_boolean()) {
+        if input.summary.values().any(|value| !value.is_string() && !value.is_number() && !value.is_boolean()) {
             return Err("artifact summary values must be string, number, or boolean scalars".into());
         }
-        if serde_json::to_vec(&summary).map_err(|error| error.to_string())?.len() > MAX_SUMMARY_BYTES {
+        if serde_json::to_vec(&input.summary).map_err(|error| error.to_string())?.len() > MAX_SUMMARY_BYTES {
             return Err("artifact summary exceeds 4096 bytes".into());
         }
-        let digest = self.blobs.put(body).await?;
-        let name = artifact_record_name(&caller.convoy, &producer, &kind, &subject);
+        let digest = self.blobs.put(&input.body).await?;
+        let name = artifact_record_name(&caller.convoy, &producer, &input.kind, &input.subject);
         let prior = match self.backend.including_replicas::<Artifact>(self.namespace).get(&name).await {
             Ok(prior) => Some(prior.object),
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
-        let days = self.retention_days.get(&kind).copied().unwrap_or(DEFAULT_RETENTION_DAYS);
+        let days = retention_days.get(&input.kind).copied().unwrap_or(DEFAULT_RETENTION_DAYS);
         let expires_at = i64::try_from(days)
             .ok()
             .and_then(Duration::try_days)
             .and_then(|duration| Utc::now().checked_add_signed(duration))
-            .ok_or_else(|| format!("artifact retention for `{kind}` is too large"))?;
+            .ok_or_else(|| format!("artifact retention for `{}` is too large", input.kind))?;
         let spec = ArtifactSpec::builder()
             .convoy(caller.convoy.clone())
             .producer(producer)
-            .kind(kind)
-            .subject(subject)
-            .summary(summary)
+            .kind(input.kind)
+            .subject(input.subject)
+            .summary(input.summary)
             .digest(digest.as_str().to_string())
-            .size(body.len() as u64)
-            .media_type(media_type)
+            .size(input.body.len() as u64)
+            .media_type(input.media_type)
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|object| object.spec.pinned))
             .build();
@@ -174,6 +177,16 @@ mod tests {
     use super::*;
     use crate::blob_store::MemoryBlobStore;
 
+    fn input(subject: &str, summary: BTreeMap<String, serde_json::Value>, body: &[u8]) -> ArtifactPutInput {
+        ArtifactPutInput::builder()
+            .kind("review-round".to_string())
+            .subject(subject.to_string())
+            .summary(summary)
+            .media_type("text/plain".to_string())
+            .body(body.to_vec())
+            .build()
+    }
+
     async fn contract(backend: ResourceBackend) {
         let namespace = "flotilla";
         let sessions = backend.using::<TerminalSession>(namespace);
@@ -214,7 +227,7 @@ mod tests {
             .expect("mark crew");
         let blobs = MemoryBlobStore::default();
         let retention = BTreeMap::from([("review-round".to_string(), 10)]);
-        let service = ArtifactService { backend: &backend, blobs: &blobs, namespace, retention_days: &retention };
+        let service = ArtifactService { backend: &backend, blobs: &blobs, namespace };
         let caller = CallerCrew::builder()
             .namespace(namespace.to_string())
             .convoy("demo".to_string())
@@ -223,32 +236,20 @@ mod tests {
             .crew_id("crew-1".to_string())
             .build();
         let first = service
-            .put(
-                &caller,
-                "review-round".into(),
-                "head-1".into(),
-                BTreeMap::from([("disposition".into(), serde_json::json!("approve"))]),
-                "text/plain".into(),
-                b"one",
-            )
+            .put(&caller, input("head-1", BTreeMap::from([("disposition".into(), serde_json::json!("approve"))]), b"one"), &retention)
             .await
             .expect("put first body");
         assert_eq!(first.spec.producer, "coder");
         assert!(!first.metadata.owner_references[0].controller);
         assert_eq!(service.get(&format!("artifact/{}", first.metadata.name)).await.expect("get address"), b"one");
         assert_eq!(service.get(&first.spec.digest).await.expect("get digest"), b"one");
-        let second = service
-            .put(&caller, "review-round".into(), "head-1".into(), BTreeMap::new(), "text/plain".into(), b"two")
-            .await
-            .expect("replace latest");
+        let second = service.put(&caller, input("head-1", BTreeMap::new(), b"two"), &retention).await.expect("replace latest");
         assert_eq!(second.metadata.name, first.metadata.name);
         assert_eq!(service.list(Some("demo"), Some("review-round"), Some("head-1")).await.expect("list").len(), 1);
         assert_eq!(service.get(&second.metadata.name).await.expect("get latest"), b"two");
         let remote_home = ResourceBackend::InMemory(InMemoryBackend::default());
-        let (remote_name, remote_spec, remote_owner) = service
-            .prepare_put(&caller, "review-round".into(), "head-2".into(), BTreeMap::new(), "text/plain".into(), b"remote")
-            .await
-            .expect("prepare remote envelope");
+        let (remote_name, remote_spec, remote_owner) =
+            service.prepare_put(&caller, input("head-2", BTreeMap::new(), b"remote"), &retention).await.expect("prepare remote envelope");
         apply_resource_document(
             &remote_home,
             namespace,
@@ -265,10 +266,7 @@ mod tests {
         assert_eq!(remote_home.using::<Artifact>(namespace).get(&remote_name).await.expect("remote owns envelope").spec.producer, "coder");
         let mut spoofed = caller.clone();
         spoofed.role = "reviewer".into();
-        assert!(service
-            .put(&spoofed, "review-round".into(), "head-1".into(), BTreeMap::new(), "text/plain".into(), b"spoof")
-            .await
-            .is_err());
+        assert!(service.put(&spoofed, input("head-1", BTreeMap::new(), b"spoof"), &retention).await.is_err());
 
         let resolver = backend.using::<Artifact>(namespace);
         let mut expired = second.spec.clone();

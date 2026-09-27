@@ -11,7 +11,7 @@ use flotilla_protocol::{
 use tracing::warn;
 
 use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
-use crate::{artifact::ArtifactService, blob_store::TieredBlobStore};
+use crate::artifact::{ArtifactPutInput, ArtifactService};
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
@@ -61,15 +61,12 @@ impl<'a> RequestDispatcher<'a> {
                     let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
                     let config = self.daemon.config_store();
                     let settings = config.load_daemon_config()?;
-                    let blobs = TieredBlobStore::from_config(config.state_dir().as_path(), &settings.blob_stores)?;
+                    let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService {
-                        backend: &backend,
-                        blobs: &blobs,
-                        namespace: &namespace,
-                        retention_days: &settings.artifact_retention_days,
-                    };
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+                    let input =
+                        ArtifactPutInput::builder().kind(kind).subject(subject).summary(summary).media_type(media_type).body(body).build();
                     let target = self
                         .daemon
                         .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
@@ -79,7 +76,7 @@ impl<'a> RequestDispatcher<'a> {
                         .await?;
                     match target {
                         Some(target) if target.node_id != *self.daemon.node_id() => {
-                            let (name, spec, owner) = service.prepare_put(caller, kind, subject, summary, media_type, &body).await?;
+                            let (name, spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
                             let digest = spec.digest.clone();
                             let document = serde_json::json!({
                                 "apiVersion": "flotilla.work/v1",
@@ -122,14 +119,14 @@ impl<'a> RequestDispatcher<'a> {
                             }
                         }
                         Some(_) => {
-                            let object = service.put(caller, kind, subject, summary, media_type, &body).await?;
+                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
                             Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
                         }
                         None => {
                             if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
                                 return Err("convoy home is unavailable for artifact put".to_string());
                             }
-                            let object = service.put(caller, kind, subject, summary, media_type, &body).await?;
+                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
                             Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
                         }
                     }
@@ -142,17 +139,10 @@ impl<'a> RequestDispatcher<'a> {
             }
             Request::ArtifactGet { reference } => {
                 let result = async {
-                    let config = self.daemon.config_store();
-                    let settings = config.load_daemon_config()?;
-                    let blobs = TieredBlobStore::from_config(config.state_dir().as_path(), &settings.blob_stores)?;
+                    let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService {
-                        backend: &backend,
-                        blobs: &blobs,
-                        namespace: &namespace,
-                        retention_days: &settings.artifact_retention_days,
-                    };
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
                     Ok::<_, String>(Response::ArtifactGet { body: service.get(&reference).await? })
                 }
                 .await;
@@ -163,17 +153,10 @@ impl<'a> RequestDispatcher<'a> {
             }
             Request::ArtifactList { convoy, kind, subject } => {
                 let result = async {
-                    let config = self.daemon.config_store();
-                    let settings = config.load_daemon_config()?;
-                    let blobs = TieredBlobStore::from_config(config.state_dir().as_path(), &settings.blob_stores)?;
+                    let blobs = self.remote_command_router.blob_store()?;
                     let backend = self.daemon.resource_backend();
                     let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService {
-                        backend: &backend,
-                        blobs: &blobs,
-                        namespace: &namespace,
-                        retention_days: &settings.artifact_retention_days,
-                    };
+                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
                     let items = service.list(convoy.as_deref(), kind.as_deref(), subject.as_deref()).await?;
                     let items = items
                         .into_iter()

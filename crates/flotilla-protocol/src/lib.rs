@@ -29,6 +29,20 @@ pub mod test_support;
 
 use std::fmt;
 
+mod blob_body {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(body))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
 pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan};
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
@@ -309,6 +323,7 @@ pub enum Request {
         subject: String,
         summary: std::collections::BTreeMap<String, serde_json::Value>,
         media_type: String,
+        #[serde(with = "blob_body")]
         body: Vec<u8>,
     },
     ArtifactGet {
@@ -378,6 +393,7 @@ pub enum Response {
         digest: String,
     },
     ArtifactGet {
+        #[serde(with = "blob_body")]
         body: Vec<u8>,
     },
     ArtifactList {
