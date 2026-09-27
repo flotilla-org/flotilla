@@ -702,6 +702,17 @@ impl CredentialStore {
         let mut prepared_cache_keys = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
+            if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
+                let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
+                if self.github_app_deliveries.lock().await.get(&cache_key).is_some_and(|existing| existing.request.permissions != requested)
+                {
+                    return Err(bounded_adapter_error(
+                        name,
+                        "github-app",
+                        "crews sharing one environment require different minted permissions; use separate credential environments",
+                    ));
+                }
+            }
             let cached_material = {
                 let materials = self.materials.lock().await;
                 materials.get(&cache_key).cloned()
@@ -2293,6 +2304,7 @@ mod tests {
             .await
             .expect_err("shared environment must not overwrite a different crew's token");
         assert!(error.contains("different minted permissions"), "{error}");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3, "conflicting crew must not mint a discarded token");
         assert!(!runner.writes.lock().expect("writes lock").iter().any(|(_, contents)| contents.contains("different-role")));
     }
 

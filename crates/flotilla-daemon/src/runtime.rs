@@ -1329,9 +1329,10 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
         BTreeSet<String>,
         BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
         BTreeMap<String, GithubAppScope>,
-        BTreeMap<String, BTreeMap<String, String>>,
+        BTreeMap<String, Option<BTreeMap<String, String>>>,
     );
     let mut deliveries = BTreeMap::<String, Delivery>::new();
+    let mut permission_conflicts = BTreeMap::<String, String>::new();
     for vessel in vessels.items {
         let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
@@ -1358,6 +1359,19 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
         granted.extend(requirement.credential_refs.iter().cloned());
         if work.phase == flotilla_resources::WorkPhase::Running && !status.phase.is_terminal() {
             running.extend(requirement.credential_refs.iter().cloned());
+            for name in &requirement.credential_refs {
+                let incoming = requirement.credential_permissions.get(name).cloned();
+                if let Some(existing) = permissions.get(name) {
+                    if existing != &incoming {
+                        permission_conflicts.insert(
+                            environment_ref.clone(),
+                            format!("crews sharing environment `{environment_ref}` require different minted permissions for `{name}`"),
+                        );
+                    }
+                } else {
+                    permissions.insert(name.clone(), incoming);
+                }
+            }
             for (name, repositories) in &requirement.credential_scopes {
                 scopes.entry(name.clone()).or_default().extend(repositories.iter().cloned());
             }
@@ -1380,7 +1394,6 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
                 entry.projects.extend(scope.projects);
                 entry.permissions = scope.permissions;
             }
-            permissions.extend(requirement.credential_permissions.clone());
         }
     }
     let current_environments = deliveries.keys().cloned().collect::<BTreeSet<_>>();
@@ -1389,6 +1402,11 @@ async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &
     }
     let mut errors = Vec::new();
     for (environment_ref, (granted, running, scopes, live_scopes, permissions)) in deliveries {
+        if let Some(error) = permission_conflicts.remove(&environment_ref) {
+            errors.push(error);
+            continue;
+        }
+        let permissions = permissions.into_iter().filter_map(|(name, value)| value.map(|value| (name, value))).collect();
         if granted.is_empty() {
             continue;
         }
@@ -8203,6 +8221,55 @@ mod tests {
         assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
         assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
+
+        let conflicting_convoy = convoys
+            .create(
+                &empty_meta("conflicting-credential-work"),
+                &ConvoySpec::builder().workflow_ref("test".to_string()).placement_policy("test".to_string()).build(),
+            )
+            .await
+            .expect("create second crew convoy");
+        convoys
+            .update_status(&conflicting_convoy.metadata.name, &conflicting_convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("other-work".to_string())
+                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                        .credential_permissions(BTreeMap::from([(
+                            "work-token".to_string(),
+                            BTreeMap::from([("contents".to_string(), "read".to_string())]),
+                        )]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                work: BTreeMap::from([("other-work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("mark second crew running");
+        let conflicting_vessel = vessels
+            .create(&empty_meta("conflicting-work-vessel"), &VesselSpec {
+                convoy_ref: "conflicting-credential-work".to_string(),
+                vessel_name: "other-work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("create second vessel");
+        vessels
+            .update_status(&conflicting_vessel.metadata.name, &conflicting_vessel.metadata.resource_version, &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some(env_id.as_str().to_string()),
+                ..VesselStatus::default()
+            })
+            .await
+            .expect("place second vessel in shared environment");
+        let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
+        assert!(error.contains("different minted permissions for `work-token`"), "{error}");
+        vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
 
         reconcile_work_credentials(&state, NAMESPACE).await.expect("stage running credentials");
         assert!(can_fill_git_credential().await);
