@@ -9111,6 +9111,15 @@ impl InProcessDaemon {
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
+        if sessions
+            .get(&terminal_name)
+            .await
+            .ok()
+            .and_then(|session| session.status)
+            .is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed)
+        {
+            return Err(format!("crew target `{target}` failed provisioning and cannot be revived"));
+        }
         let previous_status = convoy.status.clone().ok_or_else(|| format!("convoy `{}` has no status", context.convoy))?;
         let reopened = apply_resource_status_patch(
             &convoys,
@@ -9125,7 +9134,7 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|err| err.to_string())?;
-        self.reconcile_or_restore_crew_work(&context.namespace, &convoys, &context.convoy, previous_status, &reopened).await?;
+        self.reconcile_or_restore_crew_work(&context.namespace, &convoys, &context.convoy, previous_status.clone(), &reopened).await?;
         let handoff_result = match sessions.get(&terminal_name).await {
             Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
                 Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &existing, &delivered_message).await,
@@ -9199,7 +9208,13 @@ impl InProcessDaemon {
             }
             Err(err) => Err(err.to_string()),
         };
-        handoff_result
+        if let Err(error) = handoff_result {
+            return match convoys.update_status(&context.convoy, &reopened.metadata.resource_version, &previous_status).await {
+                Ok(_) => Err(error),
+                Err(restore_error) => Err(format!("{error}; could not restore crew work after handoff failure: {restore_error}")),
+            };
+        }
+        Ok(())
     }
 
     pub async fn convoy_resume_internal(
