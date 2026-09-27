@@ -472,7 +472,12 @@ impl SkillBundle {
         let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
             .await
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
-        let mut args = vec![format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"), String::new(), String::new()];
+        let mut args = vec![
+            "flotilla-stage-skills".to_string(),
+            format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
+            String::new(),
+            String::new(),
+        ];
         for source in &inspection.sources {
             let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
             args.extend([
@@ -487,8 +492,8 @@ impl SkillBundle {
         }
         let destination_count = destinations.len();
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
-            args[1] = destination.to_string_lossy().into_owned();
-            args[2] = (index + 1 == destination_count).to_string();
+            args[2] = destination.to_string_lossy().into_owned();
+            args[3] = (index + 1 == destination_count).to_string();
             let result = stage_git_skill_sources(runner, &args).await;
             result.map_err(|error| skill_stage_error(environment_ref, &error))?;
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
@@ -1152,7 +1157,7 @@ esac
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 2);
         let destinations =
-            calls.iter().map(|(_, args)| args.get(4).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
+            calls.iter().map(|(_, args)| args.get(5).expect("staging call must include its destination").as_str()).collect::<BTreeSet<_>>();
         assert_eq!(destinations, BTreeSet::from([claude_skills, codex_skills.as_str()]));
     }
 
