@@ -2735,12 +2735,7 @@ async fn default_remote_placement_routes_before_admission() {
         .create(
             &test_meta("andamento-governor"),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder()
-                        .stance(Stance::Contained)
-                        .projects(BTreeSet::from(["andamento".to_string()]))
-                        .build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["andamento".to_string()])).build())
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
         )
@@ -2828,7 +2823,7 @@ async fn default_remote_placement_routes_before_admission() {
         .expect("resolve admission workflow");
     let placement =
         backend.including_replicas::<PlacementPolicy>("flotilla").get("docker-udder-id").await.expect("placement replica").object;
-    resolve_workflow_credentials(&backend, "flotilla", Some("andamento"), &[], Some(&placement), &mut resolved_workflow)
+    resolve_workflow_credentials(&backend, "flotilla", Some("andamento"), &[], &mut resolved_workflow)
         .await
         .expect("resolve replicated credential grant");
     assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
@@ -3454,6 +3449,112 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
 }
 
 #[tokio::test]
+async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_isolation() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+    let own = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("own repository");
+    let fork = RepositorySpec::remote("https://github.com/example/flotilla")
+        .expect("fork repository")
+        .with_upstream("https://github.com/flotilla-org/flotilla", flotilla_resources::RepositoryRelation::Fork)
+        .expect("upstream");
+    for repository in [&own, &fork] {
+        backend
+            .using::<Repository>("flotilla")
+            .create(&test_meta(&repository.key().to_string()), repository)
+            .await
+            .expect("create repository");
+    }
+    backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&test_meta("github-app"), &CredentialSpecSpec {
+            consumer: CredentialConsumer::GithubApp {
+                installation_id: Some(1),
+                installation_repository: None,
+                permissions: Some(BTreeMap::from([
+                    ("contents".to_string(), "write".to_string()),
+                    ("actions".to_string(), "read".to_string()),
+                ])),
+            },
+            source: CredentialSource::GithubApp { app_id_path: "app-id".to_string(), private_key_path: "key".to_string() },
+            lifecycle: CredentialLifecycle::Refreshable,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("declaration");
+    for (name, roles, trust, permissions) in [
+        (
+            "coder-contents",
+            BTreeSet::from(["coder".to_string()]),
+            Some(RepositoryTrust::Own),
+            BTreeMap::from([("contents".to_string(), "write".to_string())]),
+        ),
+        (
+            "coder-actions",
+            BTreeSet::from(["coder".to_string()]),
+            Some(RepositoryTrust::Own),
+            BTreeMap::from([("actions".to_string(), "write".to_string())]),
+        ),
+        ("reviewer", BTreeSet::from(["reviewer".to_string()]), None, BTreeMap::from([("contents".to_string(), "read".to_string())])),
+    ] {
+        backend
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &test_meta(name),
+                &CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .projects(BTreeSet::from(["flotilla".to_string()]))
+                            .roles(roles)
+                            .maybe_repository_trust(trust)
+                            .build(),
+                    )
+                    .credentials(BTreeSet::from(["github-app".to_string()]))
+                    .permissions(BTreeMap::from([("github-app".to_string(), permissions)]))
+                    .build(),
+            )
+            .await
+            .expect("grant");
+    }
+    let resolve = |role: &str, stance: Stance, repository: &RepositorySpec| {
+        let role = role.to_string();
+        let repository = repository.clone();
+        let backend = backend.clone();
+        async move {
+            let mut workflow = WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(stance)
+                    .crew(vec![CrewSpec::builder().role(role).source(CrewSource::Tool { command: "true".to_string() }).build()])
+                    .build()])
+                .build();
+            let repositories = [ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla".to_string())
+                .repo_ref(repository.key())
+                .source_ref("main".to_string())
+                .target_ref("work".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()];
+            resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &repositories, &mut workflow)
+                .await
+                .expect("resolve grants");
+            workflow.vessels.remove(0)
+        }
+    };
+    let contained = resolve("coder", Stance::Contained, &own).await;
+    let direct = resolve("coder", Stance::Trusted, &own).await;
+    assert_eq!(contained.credential_refs, direct.credential_refs);
+    assert_eq!(contained.credential_permissions, direct.credential_permissions);
+    assert_eq!(
+        contained.credential_permissions["github-app"],
+        BTreeMap::from([("contents".to_string(), "write".to_string()), ("actions".to_string(), "read".to_string()),])
+    );
+    let reviewer = resolve("reviewer", Stance::Contained, &own).await;
+    assert_eq!(reviewer.credential_permissions["github-app"], BTreeMap::from([("contents".to_string(), "read".to_string())]));
+    let fork_coder = resolve("coder", Stance::Contained, &fork).await;
+    assert!(fork_coder.credential_refs.is_empty());
+}
+
+#[tokio::test]
 async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
@@ -3483,7 +3584,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .build();
 
     let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut without_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
         .await
         .expect("resolve default-deny grants");
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
@@ -3500,16 +3601,14 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
         .create(
             &test_meta("claude-max-contained"),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
         )
         .await
         .expect("create project-selected Claude grant");
     let mut with_grant = workflow;
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut with_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
         .await
         .expect("resolve matching Claude grant");
     assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
@@ -3541,9 +3640,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
         .create(
             &test_meta("github-contained"),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
                 .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
                 .build(),
         )
@@ -3555,7 +3652,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
         .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Trusted).crew(Vec::new()).build()])
         .build();
 
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut workflow)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut workflow)
         .await
         .expect("resolve credentials against effective stance");
 
@@ -3567,7 +3664,7 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
 }
 
 #[tokio::test]
-async fn host_direct_placement_selects_only_the_matching_trusted_credential_grant() {
+async fn project_grant_entitlement_is_independent_of_vessel_stance() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
     backend
         .clone()
@@ -3580,8 +3677,6 @@ async fn host_direct_placement_selects_only_the_matching_trusted_credential_gran
         })
         .await
         .expect("create GitHub credential declaration");
-    create_host_direct_placement(&backend, "host-direct-kiwi", "kiwi", BTreeSet::new()).await;
-    let placement = backend.using::<PlacementPolicy>("flotilla").get("host-direct-kiwi").await.expect("get host-direct placement");
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
         .build();
@@ -3590,43 +3685,23 @@ async fn host_direct_placement_selects_only_the_matching_trusted_credential_gran
         .clone()
         .definitions::<CredentialGrant>("flotilla")
         .create(
-            &test_meta("github-contained"),
+            &test_meta("github-project"),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["flotilla".to_string()])).build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
                 .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
                 .build(),
         )
         .await
-        .expect("create non-matching contained grant");
+        .expect("create project grant");
 
-    let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut without_grant)
-        .await
-        .expect("resolve default-deny grants");
-    assert!(without_grant.vessels[0].credential_refs.is_empty(), "host-direct must not fall back to ambient GitHub credentials");
+    let mut host_direct = workflow.clone();
+    host_direct.vessels[0].stance = Stance::Trusted;
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut host_direct).await.expect("resolve host-direct grant");
 
-    backend
-        .clone()
-        .definitions::<CredentialGrant>("flotilla")
-        .create(
-            &test_meta("github-trusted"),
-            &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Trusted).projects(BTreeSet::from(["flotilla".to_string()])).build(),
-                )
-                .credentials(BTreeSet::from(["github-crew-pr".to_string()]))
-                .build(),
-        )
-        .await
-        .expect("create trusted GitHub grant");
-    let mut with_grant = workflow;
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], Some(&placement), &mut with_grant)
-        .await
-        .expect("resolve matching trusted grant");
-    assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["github-crew-pr".to_string()]));
-    assert_eq!(with_grant.vessels[0].stance, Stance::Contained, "requested stance remains part of the workflow contract");
+    let mut contained = workflow;
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut contained).await.expect("resolve contained grant");
+    assert_eq!(host_direct.vessels[0].credential_refs, BTreeSet::from(["github-crew-pr".to_string()]));
+    assert_eq!(host_direct.vessels[0].credential_refs, contained.vessels[0].credential_refs);
 }
 
 #[tokio::test]
@@ -3732,7 +3807,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
         .build();
 
     let mut without_grant = workflow.clone();
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut without_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut without_grant)
         .await
         .expect("resolve default-deny grants");
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
@@ -3746,16 +3821,14 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
         .create(
             &test_meta("claude-max-trusted"),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Trusted).projects(BTreeSet::from(["flotilla".to_string()])).build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
         )
         .await
         .expect("create project-selected trusted Claude grant");
     let mut with_grant = workflow;
-    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], None, &mut with_grant)
+    resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut with_grant)
         .await
         .expect("resolve matching trusted Claude grant");
     assert_eq!(with_grant.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));

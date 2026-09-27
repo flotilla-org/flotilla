@@ -76,10 +76,11 @@ pub use convoy_ensure::{
     DRIVER_ADMISSION_CONDITION_TYPE,
 };
 pub use credential::{
-    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, LandingCredentialScope,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG,
+    capped_github_app_permissions, permission_level_rank, CredentialConsumer, CredentialGrant, CredentialGrantSelector,
+    CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec,
+    LandingCredentialScope, RepositoryTrust, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG,
 };
 pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use definition::DefinitionResolver;

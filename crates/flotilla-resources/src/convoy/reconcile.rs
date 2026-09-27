@@ -955,6 +955,7 @@ fn bootstrap_outcome(
                 repository_refs: vessel.repository_refs.clone(),
                 credential_refs: vessel.credential_refs.clone(),
                 credential_scopes: vessel.credential_scopes.clone(),
+                credential_permissions: vessel.credential_permissions.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
             .collect(),

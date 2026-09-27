@@ -661,6 +661,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
                 credential_refs: task.credential_refs.clone(),
                 credential_scopes: task.credential_scopes.clone(),
                 depends_on: task.depends_on.clone(),
+                credential_permissions: Default::default(),
                 crew: task.crew.clone(),
             })
             .collect(),
@@ -813,6 +814,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -822,6 +824,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -831,6 +834,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
         ],
@@ -867,6 +871,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -876,6 +881,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -885,6 +891,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: vec!["implement".to_string(), "verify".to_string()],
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
         ],
@@ -1441,6 +1448,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -1450,6 +1458,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
@@ -1459,6 +1468,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 depends_on: Vec::new(),
+                credential_permissions: Default::default(),
                 crew: Vec::new(),
             },
         ],

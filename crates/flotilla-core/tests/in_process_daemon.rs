@@ -1775,9 +1775,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(
             &InputMeta::builder().name("claude-max-contained".to_string()).build(),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder().stance(Stance::Contained).projects(BTreeSet::from(["zellij".to_string()])).build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["zellij".to_string()])).build())
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
         )
@@ -4923,12 +4921,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .create(
             &InputMeta::builder().name("legacy-grant".to_string()).build(),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder()
-                        .stance(Stance::Contained)
-                        .repositories(BTreeSet::from([front.key(), ssh.key()]))
-                        .build(),
-                )
+                .selector(CredentialGrantSelector::builder().repositories(BTreeSet::from([front.key(), ssh.key()])).build())
                 .credentials(BTreeSet::new())
                 .landing_credentials(BTreeMap::from([("landing".to_string(), LandingCredentialScope::Branch {
                     repository: front.key(),

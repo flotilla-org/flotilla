@@ -1051,12 +1051,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .create(
             &InputMeta::builder().name("claude-max-trusted".to_string()).build(),
             &CredentialGrantSpec::builder()
-                .selector(
-                    CredentialGrantSelector::builder()
-                        .stance(flotilla_resources::Stance::Trusted)
-                        .projects(BTreeSet::from(["flotilla".to_string()]))
-                        .build(),
-                )
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
                 .credentials(BTreeSet::from(["claude-max".to_string()]))
                 .build(),
         )

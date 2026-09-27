@@ -23,8 +23,8 @@ use flotilla_resources::{
     PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
     TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION,
-    CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
+    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -452,6 +452,7 @@ impl Reconciler for VesselReconciler {
                                         env.clone(),
                                         &requirement.credential_refs,
                                         &requirement.credential_scopes,
+                                        &requirement.credential_permissions,
                                     ),
                                 }),
                             },
@@ -813,6 +814,7 @@ impl Reconciler for VesselReconciler {
                                         env.clone(),
                                         &requirement.credential_refs,
                                         &requirement.credential_scopes,
+                                        &requirement.credential_permissions,
                                     ),
                                 }),
                             },
@@ -991,6 +993,12 @@ impl Reconciler for VesselReconciler {
                             serde_json::to_string(&requirement.credential_scopes).expect("credential scopes serialize"),
                         );
                     }
+                    if !requirement.credential_permissions.is_empty() {
+                        terminal_meta.annotations.insert(
+                            CREDENTIAL_PERMISSIONS_ANNOTATION.to_string(),
+                            serde_json::to_string(&requirement.credential_permissions).expect("credential permissions serialize"),
+                        );
+                    }
                     actuations.push(Actuation::CreateTerminalSession {
                         meta: terminal_meta,
                         spec: TerminalSessionSpec {
@@ -1113,12 +1121,16 @@ fn environment_with_credentials(
     mut env: BTreeMap<String, String>,
     credentials: &std::collections::BTreeSet<String>,
     scopes: &BTreeMap<String, BTreeSet<flotilla_resources::RepositoryKey>>,
+    permissions: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> BTreeMap<String, String> {
     if !credentials.is_empty() {
         env.insert(CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(credentials).expect("credential names serialize"));
     }
     if !scopes.is_empty() {
         env.insert(CREDENTIAL_SCOPES_ENV.to_string(), serde_json::to_string(scopes).expect("credential scopes serialize"));
+    }
+    if !permissions.is_empty() {
+        env.insert(CREDENTIAL_PERMISSIONS_ENV.to_string(), serde_json::to_string(permissions).expect("credential permissions serialize"));
     }
     env
 }
@@ -1445,7 +1457,7 @@ mod tests {
         let credentials = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
 
-        let env = environment_with_credentials(BTreeMap::new(), &credentials, &scopes);
+        let env = environment_with_credentials(BTreeMap::new(), &credentials, &scopes, &BTreeMap::new());
 
         assert_eq!(
             serde_json::from_str::<BTreeSet<String>>(&env[flotilla_resources::CREDENTIAL_REFS_ENV]).expect("decode credential refs"),

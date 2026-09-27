@@ -12,9 +12,9 @@ use flotilla_core::providers::{
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
 use flotilla_resources::{
-    Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge,
-    ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError, SystemClock,
-    AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
+    capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError,
+    SystemClock, AMBIENT_CLAUDE_CREDENTIAL_SCOPE,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
@@ -250,6 +250,7 @@ struct GithubAppDelivery {
 pub(crate) struct GithubAppScope {
     pub(crate) fixed_repositories: BTreeSet<RepositoryKey>,
     pub(crate) projects: BTreeSet<String>,
+    pub(crate) permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -591,6 +592,7 @@ impl CredentialStore {
         self.prepare_scoped(environment_ref, credential_refs, &BTreeMap::new(), runner).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_scoped(
         &self,
         environment_ref: &str,
@@ -598,7 +600,18 @@ impl CredentialStore {
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
-        self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, runner).await
+        self.prepare_scoped_with_permissions(environment_ref, credential_refs, credential_scopes, &BTreeMap::new(), runner).await
+    }
+
+    pub(crate) async fn prepare_scoped_with_permissions(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        credential_permissions: &BTreeMap<String, BTreeMap<String, String>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.prepare_scoped_inner(environment_ref, credential_refs, credential_scopes, credential_permissions, runner).await
     }
 
     async fn prepare_scoped_inner(
@@ -606,6 +619,7 @@ impl CredentialStore {
         environment_ref: &str,
         credential_refs: &BTreeSet<String>,
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        credential_permissions: &BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Vec<(String, String)>, String> {
         let mut specs = Vec::new();
@@ -688,6 +702,17 @@ impl CredentialStore {
         let mut prepared_cache_keys = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
+            if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
+                let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
+                if self.github_app_deliveries.lock().await.get(&cache_key).is_some_and(|existing| existing.request.permissions != requested)
+                {
+                    return Err(bounded_adapter_error(
+                        name,
+                        "github-app",
+                        "crews sharing one environment require different minted permissions; use separate credential environments",
+                    ));
+                }
+            }
             let cached_material = {
                 let materials = self.materials.lock().await;
                 materials.get(&cache_key).cloned()
@@ -696,11 +721,11 @@ impl CredentialStore {
             // that environment. Refreshable material is resolved for every
             // preparation; static material follows the same environment cache.
             let resolved = if spec.lifecycle == CredentialLifecycle::Refreshable {
-                self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?
+                self.resolve_for_adapter(name, spec, credential_scopes.get(name), credential_permissions.get(name)).await?
             } else if let Some(material) = cached_material {
                 ResolvedMaterial { value: material, github_app: None }
             } else {
-                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name)).await?;
+                let material = self.resolve_for_adapter(name, spec, credential_scopes.get(name), credential_permissions.get(name)).await?;
                 self.materials.lock().await.insert(cache_key.clone(), material.value.clone());
                 material
             };
@@ -712,6 +737,15 @@ impl CredentialStore {
             }
             let mut github_app_deliveries =
                 if resolved.github_app.is_some() { Some(self.github_app_deliveries.lock().await) } else { None };
+            if let (Some(deliveries), Some((request, _))) = (&github_app_deliveries, &resolved.github_app) {
+                if deliveries.get(&cache_key).is_some_and(|existing| existing.request.permissions != request.permissions) {
+                    return Err(bounded_adapter_error(
+                        name,
+                        "github-app",
+                        "crews sharing one environment require different minted permissions; use separate credential environments",
+                    ));
+                }
+            }
             let delivered =
                 match self.prepare_adapter(name, spec, material, Arc::clone(&runner), already_prepared, delivery_paths.as_ref()).await {
                     Ok(delivered) => delivered,
@@ -793,11 +827,24 @@ impl CredentialStore {
     /// Rebuild refresh registrations for an already-running environment from
     /// its durable credential requirements. Reconciliation calls this on every
     /// pass, so a live registration makes the operation a no-op.
+    #[cfg(test)]
     pub(crate) async fn adopt_github_app_deliveries(
         &self,
         environment_ref: &str,
         credential_refs: &BTreeSet<String>,
         credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), CredentialRefreshError> {
+        self.adopt_github_app_deliveries_with_permissions(environment_ref, credential_refs, credential_scopes, &BTreeMap::new(), runner)
+            .await
+    }
+
+    pub(crate) async fn adopt_github_app_deliveries_with_permissions(
+        &self,
+        environment_ref: &str,
+        credential_refs: &BTreeSet<String>,
+        credential_scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        credential_permissions: &BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<(), CredentialRefreshError> {
         let mut github_app_refs = BTreeSet::new();
@@ -822,7 +869,10 @@ impl CredentialStore {
             .filter(|(name, _)| github_app_refs.contains(*name))
             .map(|(name, scopes)| (name.clone(), scopes.clone()))
             .collect();
-        if let Err(message) = self.prepare_scoped(environment_ref, &github_app_refs, &github_app_scopes, runner).await {
+        if let Err(message) = self
+            .prepare_scoped_with_permissions(environment_ref, &github_app_refs, &github_app_scopes, credential_permissions, runner)
+            .await
+        {
             return Err(self.record_adoption_failure(environment_ref, message).await);
         }
         self.github_app_adoption_failures.lock().await.remove(environment_ref);
@@ -871,7 +921,7 @@ impl CredentialStore {
                 .await
                 .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("remove stale writable cache: {error}")))?;
         }
-        let material = self.resolve_for_adapter(&name, &spec, None).await?;
+        let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
         let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
         let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
@@ -993,12 +1043,25 @@ impl CredentialStore {
     /// Reconcile the files and cached material for one work environment. The
     /// caller supplies every grant for that environment, including settled
     /// work, so a restarted daemon can remove files it did not prepare itself.
+    #[cfg(test)]
     pub(crate) async fn reconcile_work_delivery(
         &self,
         environment_ref: &str,
         granted: &BTreeSet<String>,
         running: &BTreeSet<String>,
         scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<(), String> {
+        self.reconcile_work_delivery_with_permissions(environment_ref, granted, running, scopes, &BTreeMap::new(), runner).await
+    }
+
+    pub(crate) async fn reconcile_work_delivery_with_permissions(
+        &self,
+        environment_ref: &str,
+        granted: &BTreeSet<String>,
+        running: &BTreeSet<String>,
+        scopes: &BTreeMap<String, BTreeSet<RepositoryKey>>,
+        permissions: &BTreeMap<String, BTreeMap<String, String>>,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<(), String> {
         let mut delivered = BTreeSet::new();
@@ -1037,7 +1100,7 @@ impl CredentialStore {
         if !missing.is_empty() {
             let missing_scopes =
                 scopes.iter().filter(|(name, _)| missing.contains(*name)).map(|(name, scope)| (name.clone(), scope.clone())).collect();
-            self.prepare_scoped(environment_ref, &missing, &missing_scopes, runner.clone()).await?;
+            self.prepare_scoped_with_permissions(environment_ref, &missing, &missing_scopes, permissions, runner.clone()).await?;
         }
         let fragments = self.git_config_fragments.lock().await.get(environment_ref).cloned().unwrap_or_default();
         if fragments.is_empty() {
@@ -1087,8 +1150,12 @@ impl CredentialStore {
                     }
                 };
                 request.repositories = repositories;
+                request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
             }
-            if delivery.expires_at > refresh_before && request.repositories == delivery.request.repositories {
+            if delivery.expires_at > refresh_before
+                && request.repositories == delivery.request.repositories
+                && request.permissions == delivery.request.permissions
+            {
                 continue;
             }
             let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
@@ -1228,6 +1295,7 @@ impl CredentialStore {
         name: &str,
         spec: &CredentialSpecSpec,
         repository_scope: Option<&BTreeSet<RepositoryKey>>,
+        granted_permissions: Option<&BTreeMap<String, String>>,
     ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
             (
@@ -1258,7 +1326,7 @@ impl CredentialStore {
                     app_id_path: app_id_path.clone(),
                     private_key_path: private_key_path.clone(),
                     repositories,
-                    permissions: permissions.clone(),
+                    permissions: capped_github_app_permissions(granted_permissions, permissions.as_ref())?,
                 };
                 self.mint_github_app(&mut request, installation_repository.as_deref())
                     .await
@@ -2081,6 +2149,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_app_mint_uses_resolved_permissions_for_each_crew() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { value: "coder-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "reviewer-token".to_string(), expires_at: now + Duration::hours(1) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+        backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+            .await
+            .expect("create repository");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner,
+            GithubAppMinting { clock: Arc::new(VirtualClock::new(now)), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        let spec = CredentialSpecSpec {
+            consumer: CredentialConsumer::GithubApp {
+                installation_id: Some(9876),
+                installation_repository: None,
+                permissions: Some(BTreeMap::from([("contents".to_string(), "write".to_string())])),
+            },
+            source: CredentialSource::GithubApp { app_id_path: "/host/app-id".to_string(), private_key_path: "/host/key".to_string() },
+            lifecycle: CredentialLifecycle::Refreshable,
+            placement: CredentialPlacementRequirements::default(),
+        };
+        let scope = BTreeSet::from([repository.key()]);
+        for permissions in [
+            BTreeMap::from([("contents".to_string(), "write".to_string())]),
+            BTreeMap::from([("contents".to_string(), "read".to_string())]),
+        ] {
+            store.resolve_for_adapter("github-app", &spec, Some(&scope), Some(&permissions)).await.expect("mint token");
+        }
+        let requests = minter.requests.lock().expect("requests lock");
+        assert_eq!(requests[0].permissions.as_ref().expect("coder permissions")["contents"], "write");
+        assert_eq!(requests[1].permissions.as_ref().expect("reviewer permissions")["contents"], "read");
+    }
+
+    #[tokio::test]
     async fn project_membership_remints_live_token_without_widening_fixed_scope() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
@@ -2089,6 +2206,7 @@ mod tests {
                 Ok(GithubAppToken { value: "project-initial".to_string(), expires_at: now + Duration::hours(1) }),
                 Ok(GithubAppToken { value: "fixed-initial".to_string(), expires_at: now + Duration::hours(1) }),
                 Ok(GithubAppToken { value: "project-expanded".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "different-role".to_string(), expires_at: now + Duration::hours(1) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2149,6 +2267,7 @@ mod tests {
                 &BTreeMap::from([("github-app".to_string(), GithubAppScope {
                     fixed_repositories: BTreeSet::new(),
                     projects: BTreeSet::from(["island".to_string()]),
+                    permissions: None,
                 })]),
             )
             .await;
@@ -2158,6 +2277,7 @@ mod tests {
                 &BTreeMap::from([("github-app".to_string(), GithubAppScope {
                     fixed_repositories: BTreeSet::from([first.key()]),
                     projects: BTreeSet::new(),
+                    permissions: None,
                 })]),
             )
             .await;
@@ -2168,11 +2288,24 @@ mod tests {
             .expect("expand project membership");
 
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
-        let requests = minter.requests.lock().expect("requests lock");
-        assert_eq!(requests.len(), 3, "membership change remints before expiry; explicit scope stays unchanged");
-        assert_eq!(requests[2].repositories, ["first", "second"]);
-        let token_writes = runner.writes.lock().expect("writes lock");
-        assert!(token_writes.iter().any(|(_, contents)| contents.contains("project-expanded")));
+        {
+            let requests = minter.requests.lock().expect("requests lock");
+            assert_eq!(requests.len(), 3, "membership change remints before expiry; explicit scope stays unchanged");
+            assert_eq!(requests[2].repositories, ["first", "second"]);
+        }
+        {
+            let token_writes = runner.writes.lock().expect("writes lock");
+            assert!(token_writes.iter().any(|(_, contents)| contents.contains("project-expanded")));
+        }
+        let different_permissions =
+            BTreeMap::from([("github-app".to_string(), BTreeMap::from([("contents".to_string(), "read".to_string())]))]);
+        let error = store
+            .prepare_scoped_with_permissions("project-env", &refs, &initial, &different_permissions, runner.clone())
+            .await
+            .expect_err("shared environment must not overwrite a different crew's token");
+        assert!(error.contains("different minted permissions"), "{error}");
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 3, "conflicting crew must not mint a discarded token");
+        assert!(!runner.writes.lock().expect("writes lock").iter().any(|(_, contents)| contents.contains("different-role")));
     }
 
     type RecordedCall = (String, Vec<String>, Vec<u8>);
@@ -3158,7 +3291,7 @@ interactions:
         };
 
         for scope in [None, Some(&BTreeSet::new())] {
-            let error = store.resolve_for_adapter("github-app", &spec, scope).await.expect_err("empty scopes must fail");
+            let error = store.resolve_for_adapter("github-app", &spec, scope, None).await.expect_err("empty scopes must fail");
             assert!(error.contains("empty repository scope"), "unexpected error: {error}");
         }
         let missing_key = RepositoryKey("missing-repository".to_string());
@@ -3174,7 +3307,7 @@ interactions:
         static_spec.lifecycle = CredentialLifecycle::Static;
         let non_empty_scope = BTreeSet::from([RepositoryKey("not-resolved".to_string())]);
         let error = store
-            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope))
+            .resolve_for_adapter("github-app", &static_spec, Some(&non_empty_scope), None)
             .await
             .expect_err("non-refreshable GitHub App credentials must fail");
         assert!(error.contains("must use the refreshable lifecycle"), "unexpected error: {error}");
