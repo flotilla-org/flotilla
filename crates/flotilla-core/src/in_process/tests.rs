@@ -24,6 +24,149 @@ use crate::providers::{
     testing::MockRunner,
 };
 
+struct RecordingWorkCredentials {
+    backend: ResourceBackend,
+    delivered: tokio::sync::Mutex<BTreeSet<String>>,
+}
+
+#[async_trait]
+impl WorkCredentialReconciler for RecordingWorkCredentials {
+    async fn reconcile(&self, namespace: &str) -> Result<(), String> {
+        let convoy =
+            self.backend.clone().using::<ResourceConvoy>(namespace).get("turn-credential-work").await.map_err(|error| error.to_string())?;
+        let status = convoy.status.ok_or_else(|| "missing convoy status".to_string())?;
+        if status.phase != flotilla_resources::ConvoyPhase::Active
+            || status.work.get("work").is_none_or(|work| work.phase != flotilla_resources::WorkPhase::Running)
+            || status.crew_work.get("work").and_then(|crew| crew.get("coder")).is_none_or(|crew| crew.phase != CrewWorkPhase::Working)
+        {
+            return Err("credentials reconciled before work reopened".to_string());
+        }
+        let refs = status
+            .workflow_snapshot
+            .ok_or_else(|| "missing workflow snapshot".to_string())?
+            .vessels
+            .into_iter()
+            .find(|vessel| vessel.name == "work")
+            .ok_or_else(|| "missing work vessel".to_string())?
+            .credential_refs;
+        self.delivered.lock().await.extend(refs);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_rung() {
+    for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"turn-credential-test\"\n").expect("daemon config");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("test-host"),
+            backend.clone(),
+        )
+        .await;
+        let credentials =
+            Arc::new(RecordingWorkCredentials { backend: backend.clone(), delivered: tokio::sync::Mutex::new(BTreeSet::new()) });
+        daemon.set_work_credential_reconciler(credentials.clone()).await;
+        let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+        let convoy = convoys
+            .create(&test_meta("turn-credential-work"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
+            .await
+            .expect("convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landing,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                work: BTreeMap::from([(
+                    "work".to_string(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Complete).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Done).build())]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("admitted claim");
+        let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("turn-credential-session".to_string())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.to_string(), "turn-credential-work".to_string()),
+                        (VESSEL_LABEL.to_string(), "work".to_string()),
+                        (ROLE_LABEL.to_string(), "coder".to_string()),
+                    ]))
+                    .build(),
+                &ResourceTerminalSessionSpec {
+                    env_ref: "credential-env".to_string(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Agent {
+                        selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                        brief: flotilla_resources::TerminalBrief {
+                            path: "brief.md".to_string(),
+                            content: "original".to_string(),
+                            copies: vec![],
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".to_string(),
+                            convoy: "turn-credential-work".to_string(),
+                            vessel_ref: "turn-credential-vessel".to_string(),
+                        }),
+                        message: None,
+                    },
+                    cwd: "/repo".to_string(),
+                    pool: "passthrough".to_string(),
+                },
+            )
+            .await
+            .expect("session");
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+                phase,
+                ..Default::default()
+            })
+            .await
+            .expect("session phase");
+        daemon
+            .deliver_standing_turn(
+                &crate::leaf_engine::TurnDeliveryRequest::builder()
+                    .namespace("flotilla".to_string())
+                    .convoy("turn-credential-work".to_string())
+                    .source("conflicting".to_string())
+                    .vessel("work".to_string())
+                    .role("coder".to_string())
+                    .brief("rebase the PR".to_string())
+                    .head_sha("new-head".to_string())
+                    .build(),
+            )
+            .await
+            .expect("deliver conflicting turn");
+        let delivered = sessions.get("turn-credential-session").await.expect("delivered session");
+        assert_eq!(*credentials.delivered.lock().await, BTreeSet::from(["github-crew-pr".to_string()]));
+        let TerminalSessionSource::Agent { brief, message, .. } = delivered.spec.source else { panic!("agent session expected") };
+        if phase == ResourceTerminalSessionPhase::Stopped {
+            assert_eq!(brief.content, "rebase the PR");
+            assert!(message.is_none());
+        } else {
+            assert_eq!(message.expect("queued message").text, "rebase the PR");
+        }
+    }
+}
+
 struct ForgeAwareTestChangeRequestFactory(Arc<dyn ChangeRequestTracker>);
 
 #[async_trait]

@@ -471,9 +471,13 @@ impl LeafSubscriptionTable {
                 request.brief.clone(),
             )
         };
-        let mut next = status.clone();
+        // The actuator may reopen the work before publishing the session message.
+        // Apply the delivery record to that newer status rather than restoring
+        // the pre-delivery snapshot (which would revoke credentials again).
+        let current = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let mut next = current.status.clone().ok_or_else(|| format!("convoy {convoy_name} has no status"))?;
         patch.apply(&mut next);
-        convoys.update_status(convoy_name, &convoy.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
+        convoys.update_status(convoy_name, &current.metadata.resource_version, &next).await.map_err(|error| error.to_string())?;
         if let Some(row) = self.inner.rows.lock().await.get_mut(&subscription_id) {
             row.episode_key.head_sha = Some(head_sha);
         }
