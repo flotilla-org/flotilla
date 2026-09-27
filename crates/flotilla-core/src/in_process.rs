@@ -161,10 +161,11 @@ fn issue_source_for_subject(
     let service = if let Some(forge) = forges.iter().find(|forge| forge.forge_id == subject.service) {
         forge.https_url.clone()
     } else {
-        if !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") && subject.service != "localhost" {
+        if !subject.service.starts_with("host%3a") && !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") {
             return Err(format!("issue service `{}` has no Forge declaration or host-derived address", subject.service));
         }
-        let location = subject.service.replace("%2f", "/").replace("%3a", ":").replace("%25", "%");
+        let encoded = subject.service.strip_prefix("host%3a").unwrap_or(&subject.service);
+        let location = encoded.replace("%2f", "/").replace("%3a", ":").replace("%25", "%");
         if location.contains("://") {
             location
         } else {

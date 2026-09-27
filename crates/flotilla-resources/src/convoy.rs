@@ -296,7 +296,13 @@ pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpe
         [] => {
             let (scheme, location) = service_url.split_once("://").map_or(("https", service_url), |(scheme, rest)| (scheme, rest));
             let location = location.to_ascii_lowercase().replace('%', "%25").replace('/', "%2f");
-            let service = if scheme == "https" { location } else { format!("{scheme}%3a%2f%2f{location}") };
+            let service = if scheme != "https" {
+                format!("{scheme}%3a%2f%2f{location}")
+            } else if !location.contains(['.', ':']) && !location.contains("%2f") {
+                format!("host%3a{location}")
+            } else {
+                location
+            };
             (service, source.scope.clone())
         }
         _ => return Err(format!("issue source {service_url} matches multiple Forge definitions")),

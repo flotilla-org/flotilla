@@ -123,4 +123,8 @@ async fn malformed_forge_definition_is_rejected_when_authored() {
     insecure_front.https_url = "http://forgejo.lab.flotilla.work".to_string();
     let invalid_front = forges.create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &insecure_front).await;
     assert!(invalid_front.expect_err("HTTPS front is required").to_string().contains("HTTPS"));
+    let mut host_like_id = lab();
+    host_like_id.forge_id = "lab.example".into();
+    let invalid_id = forges.create(&InputMeta::builder().name("lab.example".into()).build(), &host_like_id).await;
+    assert!(invalid_id.expect_err("forge ref cannot look like a host-derived service").to_string().contains("forge_id"));
 }

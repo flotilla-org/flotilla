@@ -19,6 +19,12 @@ impl Resource for Forge {
         if meta.name != spec.forge_id || spec.forge_id.trim().is_empty() {
             return Err(ResourceError::invalid("Forge resource name must equal a non-empty forge_id"));
         }
+        if !spec.forge_id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            || !spec.forge_id.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+            || !spec.forge_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(ResourceError::invalid("Forge forge_id must be a lowercase DNS label"));
+        }
         if spec.hosts.is_empty() || spec.hosts.iter().any(|host| host.trim().is_empty() || host.contains('/')) {
             return Err(ResourceError::invalid("Forge hosts must be non-empty hostnames or SSH aliases"));
         }

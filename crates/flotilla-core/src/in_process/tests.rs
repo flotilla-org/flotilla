@@ -43,6 +43,7 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
         ("forgejo.example%2flab", "https://forgejo.example/lab"),
         ("forgejo.example%2fstage", "https://forgejo.example/stage"),
         ("http%3a%2f%2fforgejo.example%2flab", "http://forgejo.example/lab"),
+        ("host%3aforgejo", "https://forgejo"),
     ] {
         let subject = crate::issue_observer::IssueRef {
             namespace: "flotilla".into(),

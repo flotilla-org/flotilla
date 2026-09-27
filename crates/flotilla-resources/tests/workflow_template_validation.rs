@@ -325,6 +325,12 @@ fn undeclared_issue_subjects_keep_non_https_schemes_distinct() {
 }
 
 #[test]
+fn undeclared_single_label_host_has_a_distinct_service_spelling() {
+    let reference = IssueRef { source: IssueSource { service: "https://forgejo".into(), scope: "Team/Repo".into() }, id: "12".into() };
+    assert_eq!(issue_address(&reference).expect("single-label host").to_string(), "issue/host%3aforgejo/Team/Repo/12");
+}
+
+#[test]
 fn stock_workflows_transcribe_the_standard_exit_table() {
     let expected = Some(ExitDeclaration::standard_table());
     for spec in [

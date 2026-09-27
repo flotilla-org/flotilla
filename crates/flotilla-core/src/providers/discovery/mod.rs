@@ -208,7 +208,7 @@ impl EnvironmentBag {
 
     /// Return `owner/repo` from origin.
     pub fn repo_slug(&self) -> Option<String> {
-        self.find_origin_remote().map(|(_, owner, repo)| format!("{owner}/{repo}"))
+        self.repo_identity().map(|identity| identity.path)
     }
 
     /// Create a new bag containing assertions from both `self` and `other`.
@@ -223,12 +223,13 @@ impl EnvironmentBag {
     /// Uses the origin remote, whose authority is independent of the forge kind.
     pub fn repo_identity(&self) -> Option<flotilla_protocol::RepoIdentity> {
         self.find_origin_remote().map(|(host, owner, repo)| {
-            let authority = self
-                .find_origin_forge()
-                .and_then(|forge| forge.https_url.strip_prefix("https://"))
-                .and_then(|rest| rest.split('/').next())
-                .unwrap_or(host);
-            flotilla_protocol::RepoIdentity { authority: authority.into(), path: format!("{owner}/{repo}") }
+            let forge_identity = self.find_origin_forge().and_then(|forge| {
+                forge.repository_path(&format!("https://{host}/{owner}/{repo}")).ok().flatten().map(|(owner, repo)| {
+                    (forge.https_url.trim_start_matches("https://").trim_end_matches('/').to_string(), format!("{owner}/{repo}"))
+                })
+            });
+            let (authority, path) = forge_identity.unwrap_or_else(|| (host.to_string(), format!("{owner}/{repo}")));
+            flotilla_protocol::RepoIdentity { authority, path }
         })
     }
 }
