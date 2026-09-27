@@ -80,15 +80,18 @@ jobs:
       - name: Validate project-map manifests against the Linux candidate
         shell: bash
         env:
+          # project-map lives on lab Forgejo. The token belongs to the read-only
+          # fleet-reader account, which needs read access to robert/project-map.
+          PROJECT_MAP_READ_USER: fleet-reader
           PROJECT_MAP_READ_TOKEN: ${{ secrets.PROJECT_MAP_READ_TOKEN }}
         run: |
           set -euo pipefail
           test -n "$PROJECT_MAP_READ_TOKEN"
           git init project-map
-          git -C project-map remote add origin https://github.com/robert/project-map.git
-          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PROJECT_MAP_READ_TOKEN" | base64 -w 0)"
+          git -C project-map remote add origin https://forgejo.lab.flotilla.work/robert/project-map.git
+          auth="AUTHORIZATION: basic $(printf '%s:%s' "$PROJECT_MAP_READ_USER" "$PROJECT_MAP_READ_TOKEN" | base64 -w 0)"
           GIT_CONFIG_COUNT=1 \
-            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_KEY_0=http.https://forgejo.lab.flotilla.work/.extraheader \
             GIT_CONFIG_VALUE_0="$auth" \
             git -C project-map fetch --depth=1 origin main
           git -C project-map checkout --detach FETCH_HEAD
