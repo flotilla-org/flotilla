@@ -10,7 +10,7 @@ use super::{HostDetector, RepoDetector};
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     vec![
-        Box::new(CommandDetector::new("git", &["--version"], parse_first_dotted_version)),
+        Box::new(crate::providers::vcs::detection::git_binary_detector()),
         Box::new(CommandDetector::new("curl", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),

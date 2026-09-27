@@ -18,7 +18,7 @@ use super::*;
 use crate::providers::{
     discovery::test_support::{
         fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
-        FakeTerminalPool,
+        FakeTerminalPool, FakeVcsFactory, FakeVcsState,
     },
     terminal::{managed_session_name, ManagedSessionMetadata, TerminalSession},
     testing::MockRunner,
@@ -215,10 +215,12 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
         Ok("archived stale head".to_string()),
     ]));
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let mut discovery = fake_discovery_with_runner(false, runner.clone());
+    discovery.repo_detectors.clear();
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery_with_runner(false, runner.clone()),
+        discovery,
         HostName::local(),
         backend.clone(),
     )
@@ -3756,4 +3758,26 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
     assert_eq!(admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v1"));
     let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy")).await.expect("next admission");
     assert_eq!(next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v2"));
+}
+
+#[tokio::test]
+async fn checkout_vcs_discovery_is_cached_per_checkout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"checkout-vcs-cache-test\"\n").expect("daemon config");
+    let first_path = temp.path().join("first");
+    let second_path = temp.path().join("second");
+    let mut discovery = fake_discovery(false);
+    discovery.factories.vcs = vec![
+        Box::new(FakeVcsFactory::new(FakeVcsState::builder(&first_path).build())),
+        Box::new(FakeVcsFactory::new(FakeVcsState::builder(&second_path).build())),
+    ];
+    let daemon =
+        InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("local-host")).await;
+
+    let first = daemon.local_vcs_for_checkout(&first_path).await.expect("first checkout VCS");
+    let first_again = daemon.local_vcs_for_checkout(&first_path).await.expect("cached first checkout VCS");
+    let second = daemon.local_vcs_for_checkout(&second_path).await.expect("second checkout VCS");
+
+    assert!(Arc::ptr_eq(&first, &first_again));
+    assert!(!Arc::ptr_eq(&first, &second));
 }

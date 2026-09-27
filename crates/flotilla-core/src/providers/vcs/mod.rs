@@ -1,4 +1,5 @@
 pub mod clone;
+pub mod detection;
 pub mod git;
 pub mod git_worktree;
 pub mod provisioning;

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -8,8 +9,8 @@ use flotilla_resources::{ForgeSpec, RepositoryKey, RepositorySpec};
 
 use crate::{
     ops_entry::OperationalEntryFile,
-    path_context::ExecutionEnvironmentPath,
-    providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandRunner},
+    providers::{ChannelLabel, CommandRunner},
+    vcs::{CheckoutVcsResolver, RepositoryRead, Vcs},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -113,13 +114,15 @@ fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Ve
 
 pub struct GitRepositoryInspector {
     runner: Arc<dyn CommandRunner>,
+    vcs: Arc<dyn CheckoutVcsResolver>,
+    vcs_cache: tokio::sync::Mutex<HashMap<PathBuf, Arc<dyn Vcs>>>,
     host_ref: String,
     forges: Vec<ForgeSpec>,
 }
 
 impl GitRepositoryInspector {
-    pub fn new(runner: Arc<dyn CommandRunner>, host_ref: impl Into<String>) -> Self {
-        Self { runner, host_ref: host_ref.into(), forges: Vec::new() }
+    pub fn new(runner: Arc<dyn CommandRunner>, vcs: Arc<dyn CheckoutVcsResolver>, host_ref: impl Into<String>) -> Self {
+        Self { runner, vcs, vcs_cache: tokio::sync::Mutex::new(HashMap::new()), host_ref: host_ref.into(), forges: Vec::new() }
     }
 
     pub fn with_forges(mut self, forges: Vec<ForgeSpec>) -> Self {
@@ -127,17 +130,22 @@ impl GitRepositoryInspector {
         self
     }
 
-    async fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, String> {
-        self.runner
-            .run("git", args, cwd, &ChannelLabel::Default)
-            .await
-            .map(|output| output.trim().to_string())
-            .map_err(|error| format!("git {} in {}: {error}", args.join(" "), cwd.display()))
+    async fn read(&self, cwd: &Path, read: RepositoryRead<'_>) -> Result<String, String> {
+        self.provider(cwd).await?.read_repository(cwd, read).await.map(|output| output.trim().to_string())
+    }
+
+    async fn provider(&self, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        let mut cache = self.vcs_cache.lock().await;
+        if let Some(provider) = cache.get(path).cloned() {
+            return Ok(provider);
+        }
+        let provider = self.vcs.vcs_for(None, path).await?;
+        cache.insert(path.to_path_buf(), Arc::clone(&provider));
+        Ok(provider)
     }
 
     async fn configured_remote_url(&self, cwd: &Path, remote: &str) -> Result<String, String> {
-        let key = format!("remote.{remote}.url");
-        self.git(cwd, &["config", "--get-all", &key])
+        self.read(cwd, RepositoryRead::ConfiguredRemoteUrls(remote))
             .await?
             .lines()
             .map(str::trim)
@@ -148,7 +156,7 @@ impl GitRepositoryInspector {
 
     async fn remote_urls(&self, cwd: &Path, remote: &str) -> Result<(String, String), String> {
         let configured = self.configured_remote_url(cwd, remote).await?;
-        let effective = self.git(cwd, &["remote", "get-url", remote]).await?;
+        let effective = self.read(cwd, RepositoryRead::EffectiveRemoteUrl(remote)).await?;
         Ok((configured, effective))
     }
 
@@ -165,7 +173,7 @@ impl GitRepositoryInspector {
         }
 
         let remotes = self
-            .git(cwd, &["remote"])
+            .read(cwd, RepositoryRead::RemoteNames)
             .await?
             .lines()
             .map(str::trim)
@@ -176,8 +184,7 @@ impl GitRepositoryInspector {
             [] => Ok(None),
             [remote] => self.remote_urls(cwd, remote).await.map(Some),
             _ => {
-                let branch_key = format!("branch.{branch}.remote");
-                let tracked = self.git(cwd, &["config", "--get", &branch_key]).await.ok();
+                let tracked = self.read(cwd, RepositoryRead::TrackedRemote(branch)).await.ok();
                 match tracked.filter(|tracked| remotes.contains(tracked)) {
                     Some(remote) => self.remote_urls(cwd, &remote).await.map(Some),
                     None => {
@@ -200,7 +207,7 @@ impl GitRepositoryInspector {
                         }
                         if identities.len() == 1 {
                             let (remote, configured) = identities.into_values().next().expect("one identity has one remote");
-                            let effective = self.git(cwd, &["remote", "get-url", &remote]).await?;
+                            let effective = self.read(cwd, RepositoryRead::EffectiveRemoteUrl(&remote)).await?;
                             Ok(Some((configured, effective)))
                         } else {
                             Err(format!(
@@ -251,16 +258,18 @@ impl RepositoryInspector for GitRepositoryInspector {
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let path =
             std::fs::canonicalize(path).map_err(|error| format!("repository path {} cannot be resolved: {error}", path.display()))?;
-        let top_level = PathBuf::from(self.git(&path, &["rev-parse", "--show-toplevel"]).await?);
+        let top_level = PathBuf::from(self.read(&path, RepositoryRead::CheckoutRoot).await?);
         let top_level = std::fs::canonicalize(&top_level)
             .map_err(|error| format!("repository root {} cannot be resolved: {error}", top_level.display()))?;
+        let provider = self.provider(&path).await?;
+        self.vcs_cache.lock().await.insert(top_level.clone(), provider);
         // `rev-parse HEAD` can fail before the first commit, while the symbolic
         // ref still exposes the initial branch name.
-        let branch = match self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+        let branch = match self.read(&top_level, RepositoryRead::CurrentBranch).await {
             Ok(branch) => branch,
-            Err(_) => self.git(&top_level, &["symbolic-ref", "--short", "HEAD"]).await?,
+            Err(_) => self.read(&top_level, RepositoryRead::SymbolicBranch).await?,
         };
-        let git_ref = if branch == "HEAD" { self.git(&top_level, &["rev-parse", "HEAD"]).await? } else { branch.clone() };
+        let git_ref = if branch == "HEAD" { self.read(&top_level, RepositoryRead::HeadRevision).await? } else { branch.clone() };
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
         let (spec, transport_url) = match selected_remote {
             Some((configured, effective)) => {
@@ -270,7 +279,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 (RepositorySpec::remote(identity_remote)?.update_remotes(live_remote)?, Some(effective))
             }
             None => {
-                let common_dir = PathBuf::from(self.git(&top_level, &["rev-parse", "--git-common-dir"]).await?);
+                let common_dir = PathBuf::from(self.read(&top_level, RepositoryRead::SharedMetadataDir).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
                 let common_dir = std::fs::canonicalize(&common_dir)
                     .map_err(|error| format!("git common directory {} cannot be resolved: {error}", common_dir.display()))?;
@@ -292,9 +301,9 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn inspect_project_declaration(&self, path: &Path) -> Result<ProjectDeclarationInspection, String> {
         let repository = self.inspect_path(path, None).await?;
-        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let commit = self.read(&repository.checkout.path, RepositoryRead::HeadRevision).await?;
         let declaration_ref = format!("{commit}:{}", crate::project_declaration::DECLARATION_FILE);
-        let yaml = self.git(&repository.checkout.path, &["show", &declaration_ref]).await.map_err(|error| {
+        let yaml = self.read(&repository.checkout.path, RepositoryRead::FileAtRevision(&declaration_ref)).await.map_err(|error| {
             format!(
                 "read {} from bootstrap commit {commit}: {error}",
                 repository.checkout.path.join(crate::project_declaration::DECLARATION_FILE).display()
@@ -305,19 +314,15 @@ impl RepositoryInspector for GitRepositoryInspector {
 
     async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
         let repository = self.inspect_path(path, None).await?;
-        let commit = self.git(&repository.checkout.path, &["rev-parse", "HEAD"]).await?;
+        let commit = self.read(&repository.checkout.path, RepositoryRead::HeadRevision).await?;
         // Use one tree-wide grep to find content candidates. Operational entry
         // kind and scope remain content-authoritative; this only avoids one
         // `git show` subprocess for every unrelated file in a large ops+code
         // repository.
         let grep = self
-            .runner
-            .run_output(
-                "git",
-                &["grep", "-Il", "-e", "^kind:[[:space:]]", &commit, "--"],
-                &repository.checkout.path,
-                &ChannelLabel::Default,
-            )
+            .provider(&repository.checkout.path)
+            .await?
+            .operational_entry_paths(&repository.checkout.path, &commit)
             .await
             .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
         let paths = if grep.success || grep.stderr.trim().is_empty() {
@@ -329,7 +334,7 @@ impl RepositoryInspector for GitRepositoryInspector {
         let mut files = Vec::new();
         for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
             let object_ref = format!("{commit}:{entry_path}");
-            let Ok(contents) = self.git(&repository.checkout.path, &["show", &object_ref]).await else {
+            let Ok(contents) = self.read(&repository.checkout.path, RepositoryRead::FileAtRevision(&object_ref)).await else {
                 continue;
             };
             files.push(OperationalEntryFile { path: entry_path.to_string(), contents });
@@ -345,7 +350,7 @@ impl RepositoryInspector for GitRepositoryInspector {
         let Some(previous_remote) = previous.live_remote() else {
             return RepositoryContinuity::Unproven { evidence: "previous Repository has no transport remote".to_string() };
         };
-        let advertised = match self.git(path, &["ls-remote", "--refs", previous_remote]).await {
+        let advertised = match self.read(path, RepositoryRead::AdvertisedRefs(previous_remote)).await {
             Ok(advertised) => advertised,
             Err(error) => return RepositoryContinuity::Unproven { evidence: format!("old remote refs unavailable: {error}") },
         };
@@ -355,7 +360,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 continue;
             };
             refs += 1;
-            if self.git(path, &["merge-base", "--is-ancestor", commit, "HEAD"]).await.is_ok() {
+            if self.read(path, RepositoryRead::IsAncestor { ancestor: commit, descendant: "HEAD" }).await.is_ok() {
                 return RepositoryContinuity::Continuous {
                     evidence: format!("old remote ref {reference} ({commit}) is reachable from HEAD"),
                 };
@@ -365,10 +370,7 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
-        // The path template is used only when creating a worktree;
-        // enumeration reads Git's existing worktree registry.
-        let manager = GitWorktreeStrategy::new(crate::config::default_checkout_path(), Arc::clone(&self.runner));
-        manager.list_checkouts(&ExecutionEnvironmentPath::new(&inspection.checkout.path)).await.map(|checkouts| {
+        self.provider(&inspection.checkout.path).await?.list_checkouts().await.map(|checkouts| {
             checkouts
                 .into_iter()
                 .map(|(path, checkout)| LocalCheckoutInspection {
@@ -404,7 +406,34 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use crate::providers::discovery::test_support::DiscoveryMockRunner;
+    use crate::{
+        providers::{discovery::test_support::DiscoveryMockRunner, vcs::git_worktree::GitWorktreeStrategy, CommandRunner},
+        vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
+    };
+
+    struct TestVcsResolver(Arc<dyn CommandRunner>);
+
+    #[async_trait::async_trait]
+    impl CheckoutVcsResolver for TestVcsResolver {
+        async fn vcs_for(
+            &self,
+            _environment: Option<&flotilla_protocol::EnvironmentId>,
+            path: &std::path::Path,
+        ) -> Result<Arc<dyn Vcs>, String> {
+            Ok(Arc::new(FlotillaVcs::new(
+                crate::path_context::ExecutionEnvironmentPath::new(path),
+                Arc::clone(&self.0),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(
+                    crate::config::default_checkout_path(),
+                    Arc::clone(&self.0),
+                ))),
+            )))
+        }
+    }
+
+    fn test_inspector(runner: Arc<dyn CommandRunner>, host_ref: &str) -> GitRepositoryInspector {
+        GitRepositoryInspector::new(Arc::clone(&runner), Arc::new(TestVcsResolver(runner)), host_ref)
+    }
 
     fn git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -422,7 +451,7 @@ mod tests {
             .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
             .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Ok(String::new()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
         let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
 
         assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Continuous { .. }));
@@ -436,7 +465,7 @@ mod tests {
             .on_run("git", &["ls-remote", "--refs", "https://github.com/org/old"], Ok(format!("{commit}\trefs/heads/main\n")))
             .on_run("git", &["merge-base", "--is-ancestor", commit, "HEAD"], Err("unrelated histories".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
         let previous = RepositorySpec::remote("https://github.com/org/old").expect("old repository");
 
         assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Unproven { .. }));
@@ -456,7 +485,7 @@ mod tests {
             .on_run("git", &["worktree", "list", "--porcelain"], Ok(porcelain))
             .on_run("git", &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], Ok("origin/main\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
         let inspection = RepositoryInspection {
             spec: RepositorySpec::remote("https://github.com/org/repo").expect("repository spec"),
             checkout: LocalCheckoutInspection {
@@ -488,7 +517,7 @@ mod tests {
             .on_run("git", &["remote", "get-url", "origin"], Ok("work-github:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "work-github"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("inspection should succeed");
 
@@ -507,8 +536,7 @@ mod tests {
             .https_url("https://forgejo.lab.flotilla.work".to_string())
             .git_ssh_host("manchego.lab.flotilla.work".to_string())
             .build();
-        let inspector =
-            GitRepositoryInspector::new(Arc::new(DiscoveryMockRunner::builder().build()), "host-01").with_forges(vec![forge.clone()]);
+        let inspector = test_inspector(Arc::new(DiscoveryMockRunner::builder().build()), "host-01").with_forges(vec![forge.clone()]);
         let resolved = inspector.resolve_remote("forgejo-manchego:robert/ghostty-ops.git").await.expect("resolve alias");
         let on_forge = resolved.on_forge(&forge).expect("forge identity");
         assert!(matches!(on_forge.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
@@ -529,7 +557,7 @@ mod tests {
             .on_run("git", &["remote", "get-url", "origin"], Ok("forgejo-manchego:fork-issues/ghostty.git\n".to_string()))
             .on_run("ssh", &["-G", "forgejo-manchego"], Ok("hostname manchego.lab.flotilla.work\nuser git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("inspection should use the configured URL");
 
@@ -559,7 +587,7 @@ mod tests {
             )
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/org/repo.git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("multi-URL remote should use its first URL");
 
@@ -580,7 +608,7 @@ mod tests {
             .on_run("git", &["remote", "get-url", "origin"], Ok("mystery:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "mystery"], Ok("hostname mystery\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let error = inspector.inspect_path(&root, None).await.expect_err("unknown alias should fail");
 
@@ -598,7 +626,7 @@ mod tests {
             .on_run("git", &["remote", "get-url", "origin"], Ok("github.work:org/repo.git\n".to_string()))
             .on_run("ssh", &["-G", "github.work"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("dotted alias should resolve");
 
@@ -627,7 +655,7 @@ mod tests {
             .on_run("git", &["rev-parse", "--git-common-dir"], Ok(common.to_string_lossy().into_owned()))
             .on_run("git", &["rev-parse", "--git-common-dir"], Ok(common.to_string_lossy().into_owned()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let first = inspector.inspect_path(&first, None).await.expect("first inspection");
         let second = inspector.inspect_path(&second, None).await.expect("second inspection");
@@ -645,7 +673,7 @@ mod tests {
             .on_run("git", &["remote"], Ok(String::new()))
             .on_run("git", &["rev-parse", "--git-common-dir"], Ok(".git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("unborn repository should be inspected");
 
@@ -664,7 +692,7 @@ mod tests {
             .on_run("git", &["config", "--get-all", "remote.origin.url"], Ok("https://github.com/fork/repo.git\n".to_string()))
             .on_run("git", &["config", "--get-all", "remote.upstream.url"], Ok("https://github.com/upstream/repo.git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let error = inspector.inspect_path(&root, None).await.expect_err("ambiguous remotes should fail");
 
@@ -685,7 +713,7 @@ mod tests {
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
-        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+        let inspector = test_inspector(Arc::new(runner), "host-01");
 
         let inspected = inspector.inspect_path(&root, None).await.expect("same identity should be unambiguous");
 

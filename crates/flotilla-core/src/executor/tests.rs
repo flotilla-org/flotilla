@@ -32,8 +32,28 @@ use crate::{
         CommandRunner,
     },
     step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
-    vcs::Vcs,
+    vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
+
+struct TestVcsResolver(Arc<dyn CommandRunner>);
+
+#[async_trait]
+impl CheckoutVcsResolver for TestVcsResolver {
+    async fn vcs_for(&self, _environment: Option<&flotilla_protocol::EnvironmentId>, path: &Path) -> Result<Arc<dyn Vcs>, String> {
+        Ok(Arc::new(FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(path),
+            Arc::clone(&self.0),
+            GitCheckoutStrategy::Worktree(Box::new(crate::providers::vcs::git_worktree::GitWorktreeStrategy::new(
+                crate::config::default_checkout_path(),
+                Arc::clone(&self.0),
+            ))),
+        )))
+    }
+}
+
+fn test_vcs_resolver(runner: Arc<dyn CommandRunner>) -> Arc<dyn CheckoutVcsResolver> {
+    Arc::new(TestVcsResolver(runner))
+}
 
 fn desc(name: &str) -> ProviderDescriptor {
     ProviderDescriptor::named(ProviderCategory::Vcs, name)
@@ -2199,7 +2219,8 @@ async fn run_build_plan_to_completion_with(
                 repo,
                 registry,
                 providers_data,
-                runner,
+                runner: runner.clone(),
+                vcs_resolver: test_vcs_resolver(runner),
                 env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
                 config_base,
                 attachable_store,
@@ -2587,7 +2608,8 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         repo,
         registry,
         providers_data,
-        runner,
+        runner: runner.clone(),
+        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable.clone(),
@@ -2665,7 +2687,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         repo,
         registry,
         providers_data,
-        runner,
+        runner: runner.clone(),
+        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable,
@@ -2729,7 +2752,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         repo,
         registry,
         providers_data,
-        runner,
+        runner: runner.clone(),
+        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable,
@@ -3452,6 +3476,7 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3489,6 +3514,7 @@ async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() 
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3614,7 +3640,8 @@ async fn executor_step_resolver_create_environment() {
         repo: RepoExecutionContext { identity: repo_identity(), root: repo_root() },
         registry: Arc::new(registry),
         providers_data: Arc::new(empty_data()),
-        runner,
+        runner: runner.clone(),
+        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::new([("GITHUB_TOKEN", "gh-test-token")])),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3652,6 +3679,7 @@ async fn executor_step_resolver_create_environment_errors_without_spec_outcome()
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3685,6 +3713,7 @@ async fn executor_step_resolver_destroy_environment() {
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3713,6 +3742,7 @@ async fn executor_step_resolver_destroy_environment_not_found() {
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
@@ -3744,6 +3774,7 @@ async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_fo
         registry: Arc::new(empty_registry()),
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
+        vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),

@@ -1,6 +1,6 @@
 //! Checkout-scoped Git provider factory.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -9,8 +9,8 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        vcs::{clone::ReferenceCloneStrategy, git_worktree::GitWorktreeStrategy},
-        ChannelLabel, CommandRunner,
+        vcs::{clone::ReferenceCloneStrategy, detection::reference_clone_available, git_worktree::GitWorktreeStrategy},
+        CommandRunner,
     },
     vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
@@ -37,11 +37,7 @@ impl Factory for GitVcsFactory {
             return Err(vec![UnmetRequirement::MissingBinary("git".into())]);
         }
 
-        let reference_available = env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some()
-            && runner
-                .run("git", &["--git-dir", "/ref/repo", "rev-parse", "--git-dir"], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .is_ok();
+        let reference_available = env.find_env_var("FLOTILLA_ENVIRONMENT_ID").is_some() && reference_clone_available(&*runner).await;
         let strategy = if reference_available {
             GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
                 Arc::clone(&runner),

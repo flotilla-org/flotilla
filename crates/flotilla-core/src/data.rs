@@ -2,13 +2,17 @@ use std::path::Path;
 
 use flotilla_protocol::CheckoutStatus;
 
-use crate::providers::run;
+use crate::{
+    providers::run,
+    vcs::{RepositoryRead, Vcs},
+};
 
 pub async fn fetch_checkout_status(
     branch: &str,
     checkout_path: Option<&Path>,
     change_request_id: Option<&str>,
     repo_root: &Path,
+    vcs: &dyn Vcs,
     runner: &dyn crate::providers::CommandRunner,
 ) -> CheckoutStatus {
     let branch_owned = branch.to_string();
@@ -23,14 +27,14 @@ pub async fn fetch_checkout_status(
         async {
             let base = async {
                 let upstream =
-                    run!(runner, "git", &["rev-parse", "--abbrev-ref", &format!("{branch_for_base}@{{upstream}}")], &repo_for_base);
+                    vcs.read_repository(&repo_for_base, RepositoryRead::UpstreamOf(&format!("{branch_for_base}@{{upstream}}"))).await;
                 if let Ok(ref upstream) = upstream {
                     let upstream = upstream.trim();
                     if !upstream.is_empty() {
                         return Ok(upstream.to_string());
                     }
                 }
-                let remote_head = run!(runner, "git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], &repo_for_base);
+                let remote_head = vcs.read_repository(&repo_for_base, RepositoryRead::UpstreamOf("origin/HEAD")).await;
                 if let Ok(ref remote_head) = remote_head {
                     let remote_head = remote_head.trim();
                     if !remote_head.is_empty() {
@@ -42,14 +46,16 @@ pub async fn fetch_checkout_status(
             .await;
 
             match base {
-                Ok(base_ref) => Ok(run!(runner, "git", &["log", &format!("{base_ref}..{branch_for_base}"), "--oneline"], &repo_for_base)
+                Ok(base_ref) => Ok(vcs
+                    .read_repository(&repo_for_base, RepositoryRead::CommitLog(&format!("{base_ref}..{branch_for_base}")))
+                    .await
                     .unwrap_or_default()),
                 Err(warning) => Err(warning),
             }
         },
         async {
             if let Some(path) = &checkout_path {
-                run!(runner, "git", &["status", "--porcelain"], path).unwrap_or_default()
+                vcs.read_repository(path, RepositoryRead::WorkingTreeChanges).await.unwrap_or_default()
             } else {
                 String::new()
             }

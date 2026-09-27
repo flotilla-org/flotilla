@@ -685,6 +685,7 @@ pub(crate) struct ExecutorStepResolver {
     pub local_node_id: NodeId,
     pub local_host: HostName,
     pub environment_manager: Arc<EnvironmentManager>,
+    pub vcs_resolver: Arc<dyn crate::vcs::CheckoutVcsResolver>,
 }
 
 impl ExecutorStepResolver {
@@ -1104,11 +1105,14 @@ impl StepResolver for ExecutorStepResolver {
                 }
             }
             StepAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => {
+                let vcs_path = checkout_path.as_ref().map_or(effective_repo_root.as_path(), |path| path.as_path());
+                let vcs = self.vcs_resolver.vcs_for(context_environment_id.as_ref(), vcs_path).await?;
                 let info = data::fetch_checkout_status(
                     &branch,
                     checkout_path.as_ref().map(|p| p.as_path()),
                     change_request_id.as_deref(),
-                    self.repo.root.as_path(),
+                    effective_repo_root.as_path(),
+                    vcs.as_ref(),
                     effective_runner.as_ref(),
                 )
                 .await;
@@ -1189,13 +1193,11 @@ impl StepResolver for ExecutorStepResolver {
             // Environment lifecycle actions — always use host-side providers
             // -----------------------------------------------------------------
             StepAction::ReadEnvironmentSpec => {
-                let yaml = self
-                    .runner
-                    .run(
-                        "git",
-                        &["show", "HEAD:.flotilla/environment.yaml"],
+                let vcs = self.vcs_resolver.vcs_for(None, self.repo.root.as_path()).await?;
+                let yaml = vcs
+                    .read_repository(
                         self.repo.root.as_path(),
-                        &crate::providers::ChannelLabel::Default,
+                        crate::vcs::RepositoryRead::FileAtRevision("HEAD:.flotilla/environment.yaml"),
                     )
                     .await
                     .map_err(|e| format!("failed to read .flotilla/environment.yaml from HEAD: {e}"))?;
@@ -1260,10 +1262,8 @@ impl ExecutorStepResolver {
     // path to bind-mount). This should move into the EnvironmentProvider or CreateOpts
     // preparation rather than living on the executor.
     async fn resolve_reference_repo(&self) -> Option<DaemonHostPath> {
-        let result = self
-            .runner
-            .run("git", &["rev-parse", "--git-common-dir"], self.repo.root.as_path(), &crate::providers::ChannelLabel::Default)
-            .await;
+        let vcs = self.vcs_resolver.vcs_for(None, self.repo.root.as_path()).await.ok()?;
+        let result = vcs.read_repository(self.repo.root.as_path(), crate::vcs::RepositoryRead::SharedMetadataDir).await;
         match result {
             Ok(path) => {
                 let git_dir = std::path::Path::new(path.trim());

@@ -8,9 +8,11 @@ use std::{
     fmt,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
+use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, patch_resource_annotations, resource_document_spec_hash, EventRecorder,
     EventRegarding, ObjectEvent, ResourceBackend, ResourceError, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION,
@@ -78,6 +80,7 @@ pub struct ResourceManifestReconciler {
     source: String,
     reconciler_root: String,
     fixed_revision: Option<String>,
+    vcs: Option<Arc<dyn Vcs>>,
     warned_unmanaged: HashSet<ObjectIdentity>,
     warned_drift: HashSet<(ObjectIdentity, String, String)>,
     events: EventRecorder,
@@ -93,6 +96,7 @@ impl ResourceManifestReconciler {
             source: "local".to_string(),
             reconciler_root: "local".to_string(),
             fixed_revision: Some("unversioned".to_string()),
+            vcs: None,
             warned_unmanaged: HashSet::new(),
             warned_drift: HashSet::new(),
         }
@@ -102,6 +106,11 @@ impl ResourceManifestReconciler {
         self.source = source.into();
         self.reconciler_root = reconciler_root.into();
         self.fixed_revision = None;
+        self
+    }
+
+    pub fn with_vcs(mut self, vcs: Arc<dyn Vcs>) -> Self {
+        self.vcs = Some(vcs);
         self
     }
 
@@ -152,12 +161,7 @@ impl ResourceManifestReconciler {
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
         let revision = match &self.fixed_revision {
             Some(revision) => revision.clone(),
-            None => {
-                let root = self.root.clone();
-                tokio::task::spawn_blocking(move || resolve_clean_git_revision(&root))
-                    .await
-                    .map_err(|error| format!("manifest revision task failed: {error}"))??
-            }
+            None => self.vcs.as_ref().ok_or("manifest VCS provider unavailable")?.clean_revision().await?,
         };
         let root = self.root.clone();
         let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
@@ -465,6 +469,7 @@ impl ResourceManifestReconciler {
     }
 }
 
+#[cfg(test)]
 fn resolve_clean_git_revision(root: &Path) -> Result<String, String> {
     let status = std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all", "--ignored=matching", "--", "."])

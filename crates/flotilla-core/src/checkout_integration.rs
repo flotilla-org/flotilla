@@ -12,7 +12,10 @@ use flotilla_resources::{
     RemoteRefObservation, ResourceObject, CHANGE_REQUEST_ID_LABEL,
 };
 
-use crate::providers::{ChannelLabel, CommandRunner};
+use crate::{
+    providers::{ChannelLabel, CommandRunner},
+    vcs::{Vcs, VcsCheck},
+};
 
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
 pub const LANDING_EVIDENCE_TTL: Duration = Duration::from_secs(30);
@@ -114,18 +117,28 @@ pub(crate) fn change_request_id_from_completion_message(message: &str, repositor
 /// owning convoy. An absent change request therefore cannot produce Landed.
 pub async fn inspect_checkout_integration(
     runner: &dyn CommandRunner,
+    vcs: &dyn Vcs,
     checkout_path: &Path,
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
 ) -> CheckoutIntegrationStatus {
-    inspect_checkout_integration_with_association(runner, checkout_path, spec, change_request_id, None, change_request_id.is_some(), false)
-        .await
+    inspect_checkout_integration_with_association(
+        IntegrationProviders { runner, vcs },
+        checkout_path,
+        spec,
+        change_request_id,
+        None,
+        change_request_id.is_some(),
+        false,
+    )
+    .await
 }
 
 /// Inspect a checkout for settlement after the caller has resolved the
 /// convoy's associated change request, if any.
 pub async fn inspect_convoy_checkout_integration(
     runner: &dyn CommandRunner,
+    vcs: &dyn Vcs,
     checkout_path: &Path,
     spec: &CheckoutSpec,
     convoy: &ResourceObject<Convoy>,
@@ -136,7 +149,7 @@ pub async fn inspect_convoy_checkout_integration(
         status.crew_work.values().flat_map(BTreeMap::values).any(|work| work.phase == CrewWorkPhase::Done && work.claim_evidence.is_some())
     });
     inspect_checkout_integration_with_association(
-        runner,
+        IntegrationProviders { runner, vcs },
         checkout_path,
         spec,
         change_request_id,
@@ -147,8 +160,14 @@ pub async fn inspect_convoy_checkout_integration(
     .await
 }
 
+#[derive(Clone, Copy)]
+struct IntegrationProviders<'a> {
+    runner: &'a dyn CommandRunner,
+    vcs: &'a dyn Vcs,
+}
+
 async fn inspect_checkout_integration_with_association(
-    runner: &dyn CommandRunner,
+    providers: IntegrationProviders<'_>,
     checkout_path: &Path,
     spec: &CheckoutSpec,
     change_request_id: Option<&str>,
@@ -157,10 +176,10 @@ async fn inspect_checkout_integration_with_association(
     observe_remote_ref: bool,
 ) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();
-    let clean = inspect_clean(runner, checkout_path, &observed_at).await;
-    let pushed = inspect_pushed(runner, checkout_path, observed_change_request, &observed_at).await;
+    let clean = inspect_clean(providers.vcs, &observed_at).await;
+    let pushed = inspect_pushed(providers.vcs, observed_change_request, &observed_at).await;
     let (landed, landed_evidence, change_request) = inspect_landed(
-        runner,
+        providers,
         checkout_path,
         checkout_branch_from_spec(spec),
         checkout_base_ref_from_spec(spec),
@@ -170,270 +189,46 @@ async fn inspect_checkout_integration_with_association(
     )
     .await;
     let remote_refs = if observe_remote_ref {
-        inspect_remote_ref(runner, checkout_path, checkout_branch_from_spec(spec), &observed_at).await
+        inspect_remote_ref(providers.vcs, checkout_branch_from_spec(spec), &observed_at).await
     } else {
         BTreeMap::new()
     };
     CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence, change_request, remote_refs }
 }
 
-async fn inspect_remote_ref(
-    runner: &dyn CommandRunner,
-    checkout_path: &Path,
-    branch: &str,
-    observed_at: &str,
-) -> BTreeMap<String, RemoteRefObservation> {
+async fn inspect_remote_ref(vcs: &dyn Vcs, branch: &str, observed_at: &str) -> BTreeMap<String, RemoteRefObservation> {
     let remote_ref = if branch.starts_with("refs/") { branch.to_string() } else { format!("refs/heads/{branch}") };
-    let Ok(output) = runner.run_output("git", &["ls-remote", "--refs", "origin", &remote_ref], checkout_path, &ChannelLabel::Default).await
-    else {
-        return BTreeMap::new();
+    match vcs.remote_ref_digest("origin", &remote_ref).await {
+        Ok(Some(digest)) => {
+            BTreeMap::from([(remote_ref, RemoteRefObservation::builder().digest(digest).observed_at(observed_at.to_string()).build())])
+        }
+        _ => BTreeMap::new(),
+    }
+}
+
+async fn inspect_clean(vcs: &dyn Vcs, observed_at: &str) -> IntegrationCondition {
+    let (value, details) = match vcs.is_clean().await {
+        VcsCheck::True(details) => (ConditionValue::True, details),
+        VcsCheck::False(details) => (ConditionValue::False, details),
+        VcsCheck::Unknown(details) => (ConditionValue::Unknown, details),
     };
-    if !output.success {
-        return BTreeMap::new();
-    }
-    output
-        .stdout
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let digest = fields.next()?;
-            let observed_ref = fields.next()?;
-            (observed_ref == remote_ref).then(|| {
-                (
-                    remote_ref.clone(),
-                    RemoteRefObservation::builder().digest(digest.to_string()).observed_at(observed_at.to_string()).build(),
-                )
-            })
-        })
-        .collect()
+    IntegrationCondition::builder().value(value).details(details).observed_at(observed_at.to_string()).build()
 }
 
-async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
-    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Default).await {
-        Ok(output) if output.success => {
-            let mut details = output
-                .stdout
-                .lines()
-                .filter(|line| {
-                    let trimmed = line.trim_start();
-                    !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
-                })
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            match inspect_embedded_repositories(runner, checkout_path).await {
-                Ok(repositories) => details.extend(repositories.into_iter().map(|repository| repository.to_string())),
-                Err(error) => {
-                    details.push(error);
-                    return IntegrationCondition::builder()
-                        .value(ConditionValue::Unknown)
-                        .details(details)
-                        .observed_at(observed_at.to_string())
-                        .build();
-                }
-            }
-            if details.is_empty() {
-                IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
-            } else {
-                IntegrationCondition::builder().value(ConditionValue::False).details(details).observed_at(observed_at.to_string()).build()
-            }
-        }
-        Ok(output) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![non_empty_output_or("git status failed", &output.stderr)])
-            .observed_at(observed_at.to_string())
-            .build(),
-        Err(error) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![format!("git status could not run: {error}")])
-            .observed_at(observed_at.to_string())
-            .build(),
-    }
-}
-
-async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<Vec<EmbeddedRepository>, String> {
-    let output = runner
-        .run_output(
-            "find",
-            &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"],
-            checkout_path,
-            &ChannelLabel::Default,
-        )
-        .await
-        .map_err(|error| format!("embedded repository scan could not run: {error}"))?;
-    if !output.success {
-        return Err(non_empty_output_or("embedded repository scan failed", &output.stderr));
-    }
-
-    let mut paths = output
-        .stdout
-        .lines()
-        .filter_map(|git_path| Path::new(git_path).parent())
-        .filter_map(|repository_path| repository_path.strip_prefix(".").ok())
-        .filter(|repository_path| !repository_path.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-
-    let mut repositories = Vec::new();
-    for path in paths {
-        let path_arg = path.to_string_lossy();
-        let ignored = runner
-            .run_output("git", &["check-ignore", "--quiet", "--", &path_arg], checkout_path, &ChannelLabel::Default)
-            .await
-            .is_ok_and(|output| output.success);
-        let repository = inspect_embedded_repository(runner, checkout_path, path).await;
-        if !ignored || repository.local_commits != Some(0) {
-            repositories.push(repository);
-        }
-    }
-    Ok(repositories)
-}
-
-async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
-    let path_arg = path.to_string_lossy();
-    let branch = match runner
-        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Default)
-        .await
-    {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => {
-            match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Default).await
-            {
-                Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
-                _ => "unknown".to_string(),
-            }
-        }
-    };
-    let local_commits = runner
-        .run_output(
-            "git",
-            &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"],
-            checkout_path,
-            &ChannelLabel::Default,
-        )
-        .await
-        .ok()
-        .filter(|output| output.success)
-        .and_then(|output| output.stdout.trim().parse().ok());
-    let uncommitted_entries = runner
-        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Default)
-        .await
-        .ok()
-        .filter(|output| output.success)
-        .map(|output| output.stdout.lines().count());
-    EmbeddedRepository::builder()
-        .path(path)
-        .branch(branch)
-        .maybe_local_commits(local_commits)
-        .maybe_uncommitted_entries(uncommitted_entries)
-        .build()
-}
-
-async fn inspect_pushed(
-    runner: &dyn CommandRunner,
-    checkout_path: &Path,
-    observed_change_request: Option<&ChangeRequestStatus>,
-    observed_at: &str,
-) -> IntegrationCondition {
-    if let Some(head_sha) = observed_change_request
+async fn inspect_pushed(vcs: &dyn Vcs, observed_change_request: Option<&ChangeRequestStatus>, observed_at: &str) -> IntegrationCondition {
+    let merged_head = observed_change_request
         .filter(|status| status.state.value == Some(ObservedChangeRequestState::Merged))
-        .and_then(|status| status.head_sha.value.as_deref())
-    {
-        let ancestor =
-            runner.run_output("git", &["merge-base", "--is-ancestor", "HEAD", head_sha], checkout_path, &ChannelLabel::Default).await;
-        if ancestor.is_ok_and(|output| output.success) {
-            return IntegrationCondition::builder()
-                .value(ConditionValue::True)
-                .details(vec![format!("HEAD is preserved by merged change request head {head_sha}")])
-                .observed_at(observed_at.to_string())
-                .build();
-        }
-    }
-
-    let upstream = runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Default).await;
-    let upstream = match upstream {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => return inspect_pushed_without_upstream(runner, checkout_path, observed_at).await,
+        .and_then(|status| status.head_sha.value.as_deref());
+    let (value, details) = match vcs.unpushed_commits(merged_head).await {
+        VcsCheck::True(details) => (ConditionValue::True, details),
+        VcsCheck::False(details) => (ConditionValue::False, details),
+        VcsCheck::Unknown(details) => (ConditionValue::Unknown, details),
     };
-    let range = format!("{upstream}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
-        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
-            Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
-            Ok(count) => IntegrationCondition::builder()
-                .value(ConditionValue::False)
-                .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
-                .observed_at(observed_at.to_string())
-                .build(),
-            Err(_) => IntegrationCondition::builder()
-                .value(ConditionValue::Unknown)
-                .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
-                .observed_at(observed_at.to_string())
-                .build(),
-        },
-        Ok(output) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
-            .observed_at(observed_at.to_string())
-            .build(),
-        Err(error) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![format!("git rev-list could not run: {error}")])
-            .observed_at(observed_at.to_string())
-            .build(),
-    }
-}
-
-async fn inspect_pushed_without_upstream(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
-    match runner.run_output("git", &["branch", "--remotes", "--contains", "HEAD"], checkout_path, &ChannelLabel::Default).await {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => {
-            IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
-        }
-        Ok(output) if output.success => {
-            match runner
-                .run_output("git", &["rev-list", "--count", "HEAD", "--not", "--remotes"], checkout_path, &ChannelLabel::Default)
-                .await
-            {
-                Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
-                    Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
-                    Ok(count) => IntegrationCondition::builder()
-                        .value(ConditionValue::False)
-                        .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
-                        .observed_at(observed_at.to_string())
-                        .build(),
-                    Err(_) => IntegrationCondition::builder()
-                        .value(ConditionValue::Unknown)
-                        .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
-                        .observed_at(observed_at.to_string())
-                        .build(),
-                },
-                Ok(output) => IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
-                    .observed_at(observed_at.to_string())
-                    .build(),
-                Err(error) => IntegrationCondition::builder()
-                    .value(ConditionValue::Unknown)
-                    .details(vec![format!("git rev-list could not run: {error}")])
-                    .observed_at(observed_at.to_string())
-                    .build(),
-            }
-        }
-        Ok(output) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![non_empty_output_or("could not inspect remote branches for pushed check", &output.stderr)])
-            .observed_at(observed_at.to_string())
-            .build(),
-        Err(error) => IntegrationCondition::builder()
-            .value(ConditionValue::Unknown)
-            .details(vec![format!("could not inspect remote branches for pushed check: {error}")])
-            .observed_at(observed_at.to_string())
-            .build(),
-    }
+    IntegrationCondition::builder().value(value).details(details).observed_at(observed_at.to_string()).build()
 }
 
 async fn inspect_landed(
-    runner: &dyn CommandRunner,
+    providers: IntegrationProviders<'_>,
     checkout_path: &Path,
     branch: &str,
     base_ref: Option<&str>,
@@ -445,14 +240,14 @@ async fn inspect_landed(
     // outstanding. In particular, a crew may publish its work from a branch
     // other than the checkout's provisioned ref. Always consult the forge;
     // failure to do so leaves the condition unknown.
-    let comparison = compare_branch_to_base(runner, checkout_path, base_ref).await;
+    let comparison = compare_branch_to_base(providers.vcs, base_ref).await;
     let args = match change_request_id {
         Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable"],
         None => {
             vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName,mergeable", "--limit", "1"]
         }
     };
-    match runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
+    match providers.runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
                 let item = match value {
@@ -556,33 +351,10 @@ enum BaseComparison {
     Indeterminate { detail: String },
 }
 
-async fn compare_branch_to_base(runner: &dyn CommandRunner, checkout_path: &Path, base_ref: Option<&str>) -> BaseComparison {
-    let base_ref = match base_ref {
-        Some(base_ref) => base_ref.to_string(),
-        None => {
-            match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Default).await {
-                Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-                Ok(output) => {
-                    return BaseComparison::Indeterminate {
-                        detail: non_empty_output_or("the base ref could not be determined", &output.stderr),
-                    };
-                }
-                Err(error) => return BaseComparison::Indeterminate { detail: format!("the base ref could not be determined: {error}") },
-            }
-        }
-    };
-    let range = format!("{base_ref}..HEAD");
-    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Default).await {
-        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
-            Ok(count) => BaseComparison::Counted { base_ref, count },
-            Err(_) => BaseComparison::Indeterminate {
-                detail: format!("could not parse commit count beyond {base_ref}: {}", output.stdout.trim()),
-            },
-        },
-        Ok(output) => BaseComparison::Indeterminate {
-            detail: non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr),
-        },
-        Err(error) => BaseComparison::Indeterminate { detail: format!("could not compare branch with base ref {base_ref}: {error}") },
+async fn compare_branch_to_base(vcs: &dyn Vcs, base_ref: Option<&str>) -> BaseComparison {
+    match vcs.commits_beyond_base(base_ref).await {
+        Ok((base_ref, count)) => BaseComparison::Counted { base_ref, count },
+        Err(detail) => BaseComparison::Indeterminate { detail },
     }
 }
 
@@ -634,8 +406,22 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::providers::testing::MockRunner;
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::{testing::MockRunner, vcs::git_worktree::GitWorktreeStrategy},
+        vcs::{FlotillaVcs, GitCheckoutStrategy},
+    };
+
+    fn test_vcs(runner: Arc<MockRunner>) -> FlotillaVcs {
+        FlotillaVcs::new(
+            ExecutionEnvironmentPath::new("/checkout"),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner))),
+        )
+    }
 
     fn merged_change_request(head_sha: &str) -> ChangeRequestStatus {
         let observed_at = "2026-08-04T12:00:00Z".parse().expect("valid timestamp");
@@ -652,9 +438,10 @@ mod tests {
 
     #[tokio::test]
     async fn git_transport_observes_the_exact_remote_ref_digest() {
-        let runner = MockRunner::new(vec![Ok("abc123\trefs/heads/topic\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Ok("abc123\trefs/heads/topic\n".into())]));
+        let vcs = test_vcs(runner.clone());
 
-        let observations = inspect_remote_ref(&runner, Path::new("/checkout"), "topic", "2026-08-04T12:00:00Z").await;
+        let observations = inspect_remote_ref(&vcs, "topic", "2026-08-04T12:00:00Z").await;
 
         assert_eq!(observations["refs/heads/topic"].digest, "abc123");
         assert_eq!(observations["refs/heads/topic"].observed_at, "2026-08-04T12:00:00Z");
@@ -663,10 +450,11 @@ mod tests {
 
     #[tokio::test]
     async fn squash_merged_head_is_pushed_even_after_remote_branch_deletion() {
-        let runner = MockRunner::new(vec![Ok(String::new())]);
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let vcs = test_vcs(runner.clone());
         let change_request = merged_change_request("merged-head");
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), Some(&change_request), "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, Some(&change_request), "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
         assert_eq!(runner.calls(), vec![("git".to_string(), vec![
@@ -679,10 +467,11 @@ mod tests {
 
     #[tokio::test]
     async fn commit_after_squash_merged_head_remains_unpushed() {
-        let runner = MockRunner::new(vec![Err("not an ancestor".into()), Ok("origin/feature\n".into()), Ok("1\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Err("not an ancestor".into()), Ok("origin/feature\n".into()), Ok("1\n".into())]));
+        let vcs = test_vcs(runner.clone());
         let change_request = merged_change_request("merged-head");
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), Some(&change_request), "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, Some(&change_request), "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::False);
         assert_eq!(pushed.details, vec!["1 unpushed commit"]);
@@ -690,9 +479,10 @@ mod tests {
 
     #[tokio::test]
     async fn squash_merged_branch_without_upstream_is_pushed_when_remote_ref_contains_head() {
-        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok("  origin/feature\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok("  origin/feature\n".into())]));
+        let vcs = test_vcs(runner.clone());
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
         assert_eq!(runner.calls()[1].1, vec!["branch", "--remotes", "--contains", "HEAD"]);
@@ -700,9 +490,10 @@ mod tests {
 
     #[tokio::test]
     async fn branch_without_upstream_or_containing_remote_reports_unpushed_commit_count() {
-        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("2\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("2\n".into())]));
+        let vcs = test_vcs(runner.clone());
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::False);
         assert_eq!(pushed.details, vec!["2 unpushed commits"]);
@@ -711,18 +502,20 @@ mod tests {
 
     #[tokio::test]
     async fn branch_pushed_between_no_upstream_probes_reports_pushed() {
-        let runner = MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Err("no upstream configured".into()), Ok(String::new()), Ok("0\n".into())]));
+        let vcs = test_vcs(runner.clone());
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
     }
 
     #[tokio::test]
     async fn checkout_without_change_request_keeps_upstream_pushed_probe() {
-        let runner = MockRunner::new(vec![Ok("origin/feature\n".into()), Ok("0\n".into())]);
+        let runner = Arc::new(MockRunner::new(vec![Ok("origin/feature\n".into()), Ok("0\n".into())]));
+        let vcs = test_vcs(runner.clone());
 
-        let pushed = inspect_pushed(&runner, Path::new("/checkout"), None, "2026-08-04T12:00:00Z").await;
+        let pushed = inspect_pushed(&vcs, None, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(pushed.value, ConditionValue::True);
         assert_eq!(runner.calls()[0].1, vec!["rev-parse", "--abbrev-ref", "@{upstream}"]);
@@ -730,7 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn ignored_embedded_repository_without_local_commits_keeps_checkout_clean() {
-        let runner = MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok(String::new()),
             Ok("./.tools/ghostty-src/.git\n".into()),
             Ok(String::new()),
@@ -738,9 +531,10 @@ mod tests {
             Ok("64daa599c\n".into()),
             Ok("0\n".into()),
             Ok(String::new()),
-        ]);
+        ]));
+        let vcs = test_vcs(runner.clone());
 
-        let clean = inspect_clean(&runner, Path::new("/checkout"), "2026-08-04T12:00:00Z").await;
+        let clean = inspect_clean(&vcs, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(clean.value, ConditionValue::True);
         assert_eq!(runner.calls()[2].1, vec!["check-ignore", "--quiet", "--", ".tools/ghostty-src"]);
@@ -748,33 +542,52 @@ mod tests {
 
     #[tokio::test]
     async fn ignored_embedded_repository_with_local_commits_makes_checkout_unclean() {
-        let runner = MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok(String::new()),
             Ok("./.tools/ghostty-src/.git\n".into()),
             Ok(String::new()),
             Ok("feature/local-work\n".into()),
             Ok("2\n".into()),
             Ok(String::new()),
-        ]);
+        ]));
+        let vcs = test_vcs(runner.clone());
 
-        let clean = inspect_clean(&runner, Path::new("/checkout"), "2026-08-04T12:00:00Z").await;
+        let clean = inspect_clean(&vcs, "2026-08-04T12:00:00Z").await;
 
         assert_eq!(clean.value, ConditionValue::False);
         assert_eq!(clean.details, vec!["embedded repository .tools/ghostty-src/ (branch feature/local-work, 2 local commits)"]);
     }
 
     async fn landed_with_responses(responses: Vec<Result<String, String>>) -> IntegrationCondition {
-        let runner = MockRunner::new(responses);
-        let (landed, _, _) =
-            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
+        let runner = Arc::new(MockRunner::new(responses));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
         landed
     }
 
     #[tokio::test]
     async fn untouched_branch_is_landed_after_forge_reports_no_change_request() {
-        let runner = MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]);
-        let (landed, _, _) =
-            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
+        let runner = Arc::new(MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
 
         assert_eq!(landed.value, ConditionValue::True);
         assert_eq!(runner.calls()[1].0, "gh");
@@ -782,11 +595,21 @@ mod tests {
 
     #[tokio::test]
     async fn open_associated_change_request_from_another_branch_holds_landing_when_spec_ref_is_at_base() {
-        let runner =
-            MockRunner::new(vec![Ok("0".into()), Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into())]);
-        let (landed, _, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "provisioned-ref", Some("main"), Some("1338"), true, "2026-07-27T00:00:00Z")
-                .await;
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("0".into()),
+            Ok(r#"{"number":1338,"state":"OPEN","mergedAt":null,"baseRefName":"main"}"#.into()),
+        ]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, change_request) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "provisioned-ref",
+            Some("main"),
+            Some("1338"),
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
 
         assert_eq!(landed.value, ConditionValue::False);
         assert_eq!(change_request.expect("associated change request should be observed").state, ChangeRequestState::Open);
@@ -801,9 +624,18 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_only_lookup_cannot_prove_that_the_convoy_has_no_change_request() {
-        let runner = MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]);
-        let (landed, _, _) =
-            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, false, "2026-07-27T00:00:00Z").await;
+        let runner = Arc::new(MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            false,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
 
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
@@ -830,12 +662,21 @@ mod tests {
 
     #[tokio::test]
     async fn bound_change_request_landing_is_keyed_by_id_instead_of_branch() {
-        let runner = MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok("0".into()),
             Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}"#.into()),
-        ]);
-        let (landed, evidence, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "renamed-head", Some("main"), Some("1071"), true, "2026-07-27T00:00:00Z").await;
+        ]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, evidence, change_request) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "renamed-head",
+            Some("main"),
+            Some("1071"),
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
 
         assert_eq!(landed.value, ConditionValue::True);
         assert_eq!(evidence.as_ref().map(|evidence| evidence.change_request_id.as_str()), Some("1071"));
@@ -855,13 +696,22 @@ mod tests {
 
     #[tokio::test]
     async fn conflicting_change_request_is_part_of_the_integration_observation() {
-        let runner = MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok("2".into()),
             Ok(r#"[{"number": 1162, "state": "OPEN", "mergedAt": null, "baseRefName": "main", "mergeable": "CONFLICTING"}]"#.into()),
-        ]);
+        ]));
+        let vcs = test_vcs(runner.clone());
 
-        let (_, _, change_request) =
-            inspect_landed(&runner, Path::new("/checkout"), "feature/x", Some("main"), None, true, "2026-07-27T00:00:00Z").await;
+        let (_, _, change_request) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
 
         assert_eq!(change_request.expect("open change request should be observed").mergeability, ChangeRequestMergeability::Conflicting);
     }
@@ -878,8 +728,18 @@ mod tests {
 
     #[tokio::test]
     async fn indeterminate_base_without_change_request_is_unknown() {
-        let runner = MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]);
-        let (landed, _, _) = inspect_landed(&runner, Path::new("/checkout"), "feature/x", None, None, true, "2026-07-27T00:00:00Z").await;
+        let runner = Arc::new(MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            None,
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 }

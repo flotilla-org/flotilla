@@ -15,10 +15,13 @@ use flotilla_core::{
     config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
-        discovery::{EnvironmentAssertion, EnvironmentBag, FactoryRegistry},
+        discovery::{
+            detectors::default_host_detectors, run_host_detectors, EnvironmentAssertion, EnvironmentBag, FactoryRegistry, ProcessEnvVars,
+        },
         environment::{docker::DockerEnvironmentProvider, CreateOpts, EnvironmentProvider},
         ChannelLabel, CommandRunner, ProcessCommandRunner,
     },
+    vcs::RepositoryRead,
 };
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, ImageSource};
 
@@ -33,12 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
     let provider = DockerEnvironmentProvider::new(runner.clone());
+    let config_dir = tempfile::tempdir()?;
+    let config = ConfigStore::with_base(config_dir.path());
+    let factory_registry = FactoryRegistry::default_all();
+    let host_bag = run_host_detectors(&default_host_detectors(), &*runner, &ProcessEnvVars).await;
+    let host_registry = factory_registry.probe_all(&host_bag, &config, &ExecutionEnvironmentPath::new(&repo_path), runner.clone()).await;
+    let host_vcs = host_registry.vcs.preferred().ok_or("no VCS provider discovered for reference repo")?;
 
     // 1. Resolve the reference repo (.git common dir)
-    let git_common_dir = runner
-        .run("git", &["rev-parse", "--git-common-dir"], &repo_path, &ChannelLabel::Default)
-        .await
-        .map_err(|e| format!("not a git repo: {e}"))?;
+    let git_common_dir =
+        host_vcs.read_repository(&repo_path, RepositoryRead::SharedMetadataDir).await.map_err(|e| format!("not a git repo: {e}"))?;
     let reference_repo = DaemonHostPath::new(std::fs::canonicalize(repo_path.join(git_common_dir.trim()))?);
     println!("Ref:    {reference_repo}");
 
@@ -87,10 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Env vars: {} entries", raw_vars.len());
     println!("FLOTILLA_ENVIRONMENT_ID = {:?}", raw_vars.get("FLOTILLA_ENVIRONMENT_ID"));
 
-    let config_dir = tempfile::tempdir()?;
-    let config = ConfigStore::with_base(config_dir.path());
     let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
-    let factory_registry = FactoryRegistry::default_all();
     let provider_registry = factory_registry.probe_all(&bag, &config, &env_repo_root, env_runner.clone()).await;
 
     let checkout_mgr = provider_registry.vcs.preferred();
