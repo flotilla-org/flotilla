@@ -4664,7 +4664,6 @@ async fn resolve_workflow_credentials(
     namespace: &str,
     project_ref: Option<&str>,
     repositories: &[ConvoyRepositorySpec],
-    _placement: Option<&ResourceObject<PlacementPolicy>>,
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
     let grants = backend
@@ -4796,7 +4795,7 @@ async fn resolve_and_validate_workflow_credentials(
     placement: Option<&ResourceObject<PlacementPolicy>>,
     workflow: &mut WorkflowTemplateSpec,
 ) -> Result<(), String> {
-    resolve_workflow_credentials(backend, namespace, project_ref, repositories, placement, workflow).await?;
+    resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
     validate_workflow_credentials(backend, namespace, workflow, placement).await
 }
 
