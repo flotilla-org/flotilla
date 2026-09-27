@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-07-08
+**Amended by:** ADR 0046 (workflows no longer declare stance; a vessel's effective confinement is its fulfilment's grant set, recorded on status, and harness permission flags derive from it)
 
 How convoys launch agent crews (claude / codex / pi) that come up *properly* —
 right sandboxing, right config, right prompt — without hand-holding.

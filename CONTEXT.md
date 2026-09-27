@@ -109,7 +109,9 @@ call), or a human (CLI pins / the picker). Templates carry abstract
 requirements only; launch-time **pins** (host=X, reuse hull Y, adopt this
 checkout) and fleet-level **PlacementPolicy** preferences merge at resolution
 (pins > requirements > policy preferences; unsatisfiable = loud failure, no
-silent fallback).
+silent fallback). Since ADR 0046, admission's allocation stage authors
+requirements from role **Capability Needs**, and **Fulfilment Kinds** replace
+PlacementPolicy preferences.
 _Avoid_: placement (the act, not the declaration), recipe, target.
 
 **Vessel**:
@@ -163,12 +165,40 @@ later, possibly agentic resolution eventually.
 _Avoid_: Launch config, agent args.
 
 **Stance**:
-The declared permission/sandbox posture of a **Vessel**, shared by all crew
-aboard — `trusted`, `workspace-write`, or `contained`. A floor of confinement,
-realised **walls-first** (environment sandbox; wrapper sandbox on host-direct)
-with harness flags as fallback; under-realization fails loudly, extra
-confinement is recorded as effective stance.
-_Avoid_: Permission mode, sandbox flag (those are harness spellings).
+A **Vessel**'s effective confinement, shared by all crew aboard. Since ADR
+0046 it is no longer declared by workflows: it is the **Grant Set** of the
+vessel's **Fulfilment Kind**, recorded on status. It is realised
+**walls-first** (the environment sandbox; a wrapper sandbox on host-direct),
+with harness flags derived from the grant set as a fallback.
+Under-realisation fails loudly.
+_Avoid_: Permission mode, sandbox flag (those are harness spellings),
+trusted/contained as workflow words.
+
+**Capability Need**:
+A capability a role's work requires, such as `platform: windows`,
+`gui_session`, `gpu`, `harness: claude-code >= X` or `toolchain: <name>`
+(ADR 0046). Needs attach to roles and compose by union across layers that
+only add: template role, project, issue, derived, dispatch. The result is
+frozen at admission. An uncovered need refuses admission by name.
+_Avoid_: Stance, trust level (provenance proves little; the principle is
+least privilege).
+
+**Fulfilment Kind**:
+A declared way of realising a **Vessel**, for example `docker-per-vessel`
+on feta with image X, `tart-vm` on comte, or `host-direct` on beaufort. It
+declares a **Grant Set**, which hosts complete with live facts (harness
+versions, models, toolchains, GUI session, capacity). Placement picks the
+*minimal* covering fulfilment kinds (least privilege, a partial order on
+grant sets), and cost and availability break ties. Choosing a non-minimal
+one is a recorded escalation (ADR 0046). This replaces per-host placement
+policies.
+_Avoid_: Placement policy (the retired form), backend.
+
+**Grant Set**:
+The capabilities a **Fulfilment Kind** grants its crew: platform, GUI
+session, GPU, network scope, host-account reach, container runtime, and so
+on. Privilege compares by subset, not by a score.
+_Avoid_: Permissions (that word belongs to minted credentials, ADR 0044).
 
 **Brief**:
 The per-crew-member statement of why they are here — a durable file in the
