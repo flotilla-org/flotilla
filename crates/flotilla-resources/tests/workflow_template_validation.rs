@@ -292,7 +292,7 @@ fn issue_subjects_distinguish_installations_on_one_host() {
         ForgeSpec::builder()
             .forge_id(id.into())
             .kind(ForgeKind::Forgejo)
-            .hosts(BTreeSet::from(["forgejo.example".into()]))
+            .hosts(BTreeSet::from(["forgejo.example".into(), format!("{id}.example")]))
             .https_url(format!("https://forgejo.example/{path}"))
             .git_ssh_host("forgejo.example".into())
             .build()
@@ -302,6 +302,9 @@ fn issue_subjects_distinguish_installations_on_one_host() {
     let stage_address = issue_address_with_forges(&stage, &forges).expect("declared stage");
     assert_eq!(lab_address.to_string(), "issue/lab/Team/Repo/12");
     assert_eq!(stage_address.to_string(), "issue/stage/Team/Repo/12");
+    let lab_alias =
+        IssueRef { source: IssueSource { service: "https://lab.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
+    assert_eq!(issue_address_with_forges(&lab_alias, &forges).expect("declared lab alias"), lab_address);
     assert_ne!(lab_address, stage_address);
     assert_ne!(issue_record_name("lab", "Team/Repo", 12), issue_record_name("stage", "Team/Repo", 12));
 }

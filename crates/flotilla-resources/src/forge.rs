@@ -54,6 +54,20 @@ pub enum ForgeKind {
 }
 
 impl ForgeSpec {
+    /// Whether an issue service URL names this installation, including a
+    /// declared host alias and the installation's path prefix.
+    pub fn owns_issue_service(&self, service_url: &str) -> bool {
+        let Some(front) = service_url.strip_prefix("https://") else { return false };
+        let (host, path) = front.split_once('/').unwrap_or((front, ""));
+        let forge_path = self
+            .https_url
+            .strip_prefix("https://")
+            .and_then(|front| front.split_once('/'))
+            .map_or("", |(_, path)| path)
+            .trim_end_matches('/');
+        self.matches_host(host) && path.trim_end_matches('/').eq_ignore_ascii_case(forge_path)
+    }
+
     pub fn matches_host(&self, host: &str) -> bool {
         self.hosts.iter().any(|alias| alias.eq_ignore_ascii_case(host))
             || self

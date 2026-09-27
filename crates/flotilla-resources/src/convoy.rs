@@ -287,7 +287,7 @@ pub fn issue_address(reference: &IssueRef) -> Result<LeafAddress, String> {
 pub fn issue_address_with_forges(reference: &IssueRef, forges: &[crate::ForgeSpec]) -> Result<LeafAddress, String> {
     let source = crate::normalize_issue_source(&reference.source);
     let service_url = source.service.trim_end_matches('/');
-    let matches = forges.iter().filter(|forge| forge.https_url.trim_end_matches('/').eq_ignore_ascii_case(service_url)).collect::<Vec<_>>();
+    let matches = forges.iter().filter(|forge| forge.owns_issue_service(service_url)).collect::<Vec<_>>();
     let (service, scope) = match matches.as_slice() {
         [forge] => {
             let scope = if forge.kind == crate::ForgeKind::Github { source.scope.to_ascii_lowercase() } else { source.scope.clone() };
