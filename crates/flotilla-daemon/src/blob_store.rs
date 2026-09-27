@@ -568,6 +568,10 @@ impl TieredBlobStore {
             if !referenced.contains(&digest) && older_than(&self.local.path(&digest), grace).await? {
                 if let Err(error) = self.local.delete(&digest).await {
                     failures.push(format!("local {}: {error}", digest.as_str()));
+                } else {
+                    let mut inventory = self.inventory.lock().await;
+                    inventory.known.remove(&digest);
+                    inventory.pending.remove(&digest);
                 }
             }
         }
@@ -1165,5 +1169,24 @@ mod tests {
         unavailable.available.store(true, Ordering::SeqCst);
         tiered.gc_unreferenced(&referenced, Duration::ZERO).await.expect("retry unavailable backend");
         assert!(!unavailable.has(&stale).await.expect("stale copy removed on retry"));
+    }
+
+    #[tokio::test]
+    async fn gc_reaped_digest_can_be_put_and_synced_again() {
+        let state = tempfile::tempdir().expect("state dir");
+        let source = state.path().join("source");
+        tokio::fs::write(&source, b"repeatable output").await.expect("source file");
+        let fleet = Arc::new(MemoryBlobStore::default());
+        let tiered = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+
+        let (digest, _) = tiered.put_file(&source).await.expect("initial put");
+        assert_eq!(tiered.sync_once().await.expect("initial sync").pending_count, 0);
+        tiered.gc_unreferenced(&HashSet::new(), Duration::ZERO).await.expect("reap");
+        assert!(!fleet.has(&digest).await.expect("fleet copy reaped"));
+
+        assert_eq!(tiered.put_file(&source).await.expect("repeat put").0, digest);
+        assert_eq!(tiered.status().await.pending_count, 1);
+        assert_eq!(tiered.sync_once().await.expect("repeat sync").pending_count, 0);
+        assert!(fleet.has(&digest).await.expect("fleet copy restored"));
     }
 }
