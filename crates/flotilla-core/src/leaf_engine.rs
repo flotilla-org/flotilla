@@ -368,9 +368,16 @@ impl LeafSubscriptionTable {
         let mut issue_objects = freshest_issues(&issue_sources);
         let staleness = LeafObservationStaleness { change_request: self.change_request_stale_after(), issue: self.issue_stale_after() };
 
-        if let Some(fire) =
-            evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, &usage_objects, &issue_objects, staleness)?
-        {
+        let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
+        if let Some(fire) = evaluate_row(
+            &current_row,
+            &convoy_objects,
+            &vessel_objects,
+            &change_request_objects,
+            &usage_objects,
+            &issue_objects,
+            staleness,
+        )? {
             self.fire(row.id, fire).await;
             if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                 return Ok(());
@@ -431,9 +438,16 @@ impl LeafSubscriptionTable {
                     apply_read_event(event, &mut usage_objects);
                 }
             }
-            if let Some(fire) =
-                evaluate_row(&row, &convoy_objects, &vessel_objects, &change_request_objects, &usage_objects, &issue_objects, staleness)?
-            {
+            let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
+            if let Some(fire) = evaluate_row(
+                &current_row,
+                &convoy_objects,
+                &vessel_objects,
+                &change_request_objects,
+                &usage_objects,
+                &issue_objects,
+                staleness,
+            )? {
                 self.fire(row.id, fire).await;
                 if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                     return Ok(());
@@ -1475,7 +1489,13 @@ impl ReconcilerWake {
         }
 
         'desired_rows: for mut row in desired {
-            if existing.iter().any(|existing| same_standing_row(&row, existing)) {
+            if let Some(existing) = existing.iter().find(|existing| same_standing_row(&row, existing)) {
+                if existing.maker != row.maker {
+                    let mut rows = self.subscriptions.inner.rows.lock().await;
+                    if let Some(stored) = rows.get_mut(&existing.id) {
+                        stored.maker = row.maker;
+                    }
+                }
                 continue;
             }
             let id = uuid::Uuid::new_v4();
@@ -1522,9 +1542,19 @@ fn same_standing_row(left: &LeafSubscriptionRow, right: &LeafSubscriptionRow) ->
     left.namespace == right.namespace
         && left.leaves == right.leaves
         && left.watcher == right.watcher
-        && left.maker == right.maker
+        && same_standing_maker(&left.maker, &right.maker)
         && same_freshness
         && left.episode_key == right.episode_key
+}
+
+fn same_standing_maker(left: &LeafMaker, right: &LeafMaker) -> bool {
+    match (left, right) {
+        (
+            LeafMaker::Controller { resource_kind: left_kind, name: left_name, ceiling: left_ceiling, .. },
+            LeafMaker::Controller { resource_kind: right_kind, name: right_name, ceiling: right_ceiling, .. },
+        ) => left_kind == right_kind && left_name == right_name && left_ceiling == right_ceiling,
+        _ => left == right,
+    }
 }
 
 fn apply_read_event<T: flotilla_resources::Resource>(
@@ -1883,6 +1913,7 @@ mod tests {
                 Some("retrying without progress"),
             ),
         ];
+        let mut standing_row_id = None;
         for (retry, expected) in scenarios {
             flotilla_resources::apply_status_patch(&vessels, "delivery-work", &flotilla_resources::VesselStatusPatch::CredentialDelivery {
                 retry: Some(retry),
@@ -1892,6 +1923,17 @@ mod tests {
             let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
             let objects = HashMap::from([("delivery".to_string(), convoy)]);
             wake.sync_rows("flotilla", &objects).await.expect("arm controller row");
+            let controller_row = wake
+                .subscriptions
+                .rows()
+                .await
+                .into_iter()
+                .find(|row| matches!(&row.maker, LeafMaker::Controller { resource_kind, .. } if resource_kind == "CredentialDelivery"))
+                .expect("credential delivery row");
+            if let Some(id) = standing_row_id {
+                assert_eq!(controller_row.id, id, "retry changes should update the standing row without reopening its watches");
+            }
+            standing_row_id = Some(controller_row.id);
             wake.judge_stalls("flotilla", &objects).await.expect("judge controller row");
             let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
             assert_eq!(stalled.as_ref().map(|stalled| stalled.evidence.as_str()), expected);

@@ -179,7 +179,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
             }
             "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
             _ => Err(format!(
-                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, manifest-root, or Repository"
+                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, manifest-root, or Repository"
             )),
         }
     }
@@ -9717,8 +9717,39 @@ mod tests {
             .expect("status")
             .credential_delivery_retry
             .expect("delivery retry");
-        assert_eq!(retry.stall_reason(Utc::now(), flotilla_resources::RetryCeiling::default()), Some(need));
+        assert_eq!(retry.stall_reason(Utc::now(), flotilla_resources::RetryCeiling::default()), Some(need.clone()));
         assert!(matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }));
+        let resource_version = environments.get("credential-work").await.expect("environment").metadata.resource_version;
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some(need), true)
+            .await
+            .expect("repeat terminal disposition");
+        // A repeated terminal failure does not churn durable status.
+        let after_repeat = environments.get("credential-work").await.expect("environment");
+        assert_eq!(after_repeat.metadata.resource_version, resource_version);
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", None, false).await.expect("operator retry reset");
+        assert!(environments
+            .get("credential-work")
+            .await
+            .expect("environment")
+            .status
+            .expect("status")
+            .credential_delivery_retry
+            .is_none());
+        record_credential_delivery_retry(&backend, NAMESPACE, "credential-work", Some("provider unavailable".into()), false)
+            .await
+            .expect("retry after operator reset");
+        assert_eq!(
+            environments
+                .get("credential-work")
+                .await
+                .expect("environment")
+                .status
+                .expect("status")
+                .credential_delivery_retry
+                .expect("new episode")
+                .attempts,
+            1
+        );
     }
 
     #[tokio::test]

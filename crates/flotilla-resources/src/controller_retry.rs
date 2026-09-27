@@ -76,10 +76,16 @@ impl ControllerRetry {
     }
 
     pub fn terminal(previous: Option<&Self>, now: DateTime<Utc>, needs: impl Into<String>) -> Self {
+        let needs = needs.into();
+        if let Some(previous) = previous.filter(
+            |previous| matches!(&previous.disposition, ControllerRetryDisposition::Terminal { needs: existing } if existing == &needs),
+        ) {
+            return previous.clone();
+        }
         Self {
             attempts: previous.map_or(1, |retry| retry.attempts.saturating_add(1)),
             first_failure_at: previous.map_or(now, |retry| retry.first_failure_at),
-            disposition: ControllerRetryDisposition::Terminal { needs: needs.into() },
+            disposition: ControllerRetryDisposition::Terminal { needs },
         }
     }
 
@@ -122,5 +128,9 @@ mod tests {
         assert_eq!(retry.stall_reason(now + chrono::Duration::hours(2), RetryCeiling::default()), Some("retrying without progress".into()));
         let terminal = ControllerRetry::terminal(None, now, "credential spec does not decode");
         assert_eq!(terminal.stall_reason(now, RetryCeiling::default()), Some("credential spec does not decode".into()));
+        assert_eq!(
+            ControllerRetry::terminal(Some(&terminal), now + chrono::Duration::seconds(60), "credential spec does not decode"),
+            terminal
+        );
     }
 }
