@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-03
+**Amended by:** ADR 0045 (rows are armed in every holding phase, not only `Landing`/`Anchored`; rows declare a maker, and the leaf engine judges stalls over them)
 **Relates to:** Amends ADR 0021 (Landing/Landed/Anchored — supplies the phase
 skeleton this builds on) and ADR 0027 (the verb surface and condition
 leaves). ADR 0017 (claims/conditions split, unchanged), #1340 (the grill that

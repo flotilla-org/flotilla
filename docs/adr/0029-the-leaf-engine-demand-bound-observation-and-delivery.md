@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-04
+**Amended by:** ADR 0045 (rows declare a maker, observed, actor or controller, and the engine judges stalls over them; arming extends to every holding phase; stalls are a `Stalled` condition judged by the authority host)
 **Relates to:** ADR 0027 (condition leaves, the single subscription surface —
 this ADR builds its engine), ADR 0028 (world-terminal exits and vessel-as-cache
 — the consumer contracts), ADR 0021 (Landing/Landed writers, unchanged),

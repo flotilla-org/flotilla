@@ -615,8 +615,41 @@ The single daemon-side event-delivery mechanism evaluating **Condition
 Leaves** for all watcher kinds — hanging `wait` callers and parked convoys
 (the `Landing`/`Anchored` reconcilers) alike (ADR 0028; built by #1322). Its
 leaf enumeration is the shared legal vocabulary for **Exit Tables**, wakeups,
-and waits.
+and waits. Since ADR 0045, every holding phase arms rows, each row declares
+its **Maker**, and the engine judges **Stalls** over them.
 _Avoid_: Event bus (there is no second one — ADR 0027), scheduler.
+
+**Maker**:
+What can turn an armed **Condition Leaf** True, declared on every leaf row
+(ADR 0045). There are three kinds:
+- *observed*: a refresher maintains the fact, and an external system acts;
+- *actor*: a named crew member, governor or operator acts through a verb;
+- *controller*: the owning reconciler retries, with a declared retry
+  disposition.
+
+A maker is *able* when it will act without prompting: a fresh refresher, a
+Working actor, or a retryable controller under its ceiling.
+_Avoid_: Owner (ownership is the owner-ref GC relation), producer.
+
+**Stall**:
+A non-terminal holding state with no armed row whose **Maker** is able
+(ADR 0045). It is judged by the **Leaf Engine** on the resource's authority
+host and recorded as a `Stalled` condition. It is structural, never an idle
+timer: an idle actor owing an unmet row is stalled at once, after a
+debounce sized to how good the idle evidence is. Standing roles that owe
+nothing are *available*, not stalled.
+_Avoid_: Hang, timeout, idle (idleness is evidence about a maker, not the
+stall itself).
+
+**Supervision Ladder**:
+The declared escalation path a **Stall** climbs (ADR 0045):
+1. a bounded mechanical nudge phrased from the leaf;
+2. the convoy's Bosun, otherwise the island's Governor;
+3. the operator.
+
+Workflows may override it. Supervisors act only through verbs and never
+transition phases. A crew member's `crew stall` enters the ladder directly.
+_Avoid_: Escalation policy, on-call.
 
 **Park Depth**:
 Where on the vessel-is-a-cache spectrum a parked vessel sits: warm process →
