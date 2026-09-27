@@ -2,6 +2,7 @@
 
 **Status:** Accepted — amended 2026-07-28 (see Amendment below)
 **Date:** 2026-07-27
+**Amended by:** ADR 0044 (grants select on the work, meaning project, repositories, role and repository trust, rather than stance; vessel isolation affects delivery only; grants declare minted permission sets; ambient-identity inheritance is superseded)
 **Relates to:** ADR 0016 (replication classes — declarations and grants ride
 the definitions class), ADR 0010 (Hull/Crew boundary — credential state is
 crew/vessel state), the fork-stance rulings (#978, #1047/#1049), #954
