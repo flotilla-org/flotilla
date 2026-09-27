@@ -4175,6 +4175,15 @@ async fn deliver_and_confirm(
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
+    async fn cleat_endpoint(
+        &self,
+        session_id: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
+        let pool = self.pool_for_spec(spec)?;
+        pool.cleat_endpoint(session_id).await
+    }
+
     async fn ensure_session(
         &self,
         name: &str,

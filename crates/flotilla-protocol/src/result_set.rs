@@ -786,7 +786,17 @@ pub struct IndependentRow {
     /// capability fact: the daemon can currently resolve the attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
+    /// Physical Cleat daemon endpoint for a live session, when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleat_endpoint: Option<CleatEndpoint>,
     pub phase: SessionPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleatEndpoint {
+    pub runtime_root: String,
+    pub daemon: String,
+    pub session: String,
 }
 
 /// One authoritative Project definition. Presence of this row makes an empty
@@ -1127,6 +1137,9 @@ pub struct VesselRow {
     /// from `attach`, which names an already-observed PM workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialize: Option<String>,
+    /// Endpoint of the terminal selected by `materialize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleat_endpoint: Option<CleatEndpoint>,
     /// Capability fact: the daemon will accept completing this vessel's work.
     #[builder(default)]
     pub complete_work: bool,

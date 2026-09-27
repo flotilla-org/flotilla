@@ -69,6 +69,13 @@ pub trait TerminalRuntime: Send + Sync {
     async fn session_is_running(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
         Ok(true)
     }
+    async fn cleat_endpoint(
+        &self,
+        _session_id: &str,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
+        Ok(None)
+    }
     async fn observe_attention(
         &self,
         _session_id: &str,
@@ -224,6 +231,7 @@ pub enum TerminalPrepared {
     MessageDeliveryPending,
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
+    CleatEndpoint(Option<flotilla_protocol::result_set::CleatEndpoint>),
     Attention(TerminalObservation),
     AttentionStale,
     OwnerMissing,
@@ -313,6 +321,17 @@ where
                     );
                 }
             }
+            match self.runtime.cleat_endpoint(session_id, &obj.spec).await {
+                Ok(endpoint) if obj.status.as_ref().and_then(|status| status.cleat_endpoint.as_ref()) != endpoint.as_ref() => {
+                    return Ok(TerminalPrepared::CleatEndpoint(endpoint));
+                }
+                Err(error) => {
+                    // Keep the last known endpoint on transient discovery failures.
+                    // Attention reconciliation and command attach can still proceed.
+                    tracing::warn!(%session_id, %error, "cleat endpoint discovery failed");
+                }
+                Ok(_) => {}
+            }
             if let Some(observation) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Attention(observation));
             }
@@ -389,6 +408,7 @@ where
                 TerminalPrepared::Waiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
+                | TerminalPrepared::CleatEndpoint(_)
                 | TerminalPrepared::MessageDelivered(_)
                 | TerminalPrepared::MessageDeliveryPending
                 | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
@@ -406,6 +426,9 @@ where
                 })
             }
             TerminalSessionPhase::Running => match prepared {
+                TerminalPrepared::CleatEndpoint(endpoint) => {
+                    Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
+                }
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }

@@ -8,10 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{
     result_set::{
-        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow,
-        IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
+        AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
+        ConvoyRow, IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow,
+        WorkPhase,
     },
-    ViewAddress, AWARENESS_REL_FOR_CONVOY,
+    HostName, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
 
 use crate::{
@@ -23,12 +24,14 @@ use crate::{
         KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
         KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
         KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
-        KEY_PRIMARY_ACTION_VEHICLE, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME,
-        KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG,
-        KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET,
-        KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON,
+        KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
+        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST,
+        KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE,
+        SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
-    recipe::{Recipe, RecipeMint},
+    recipe::{DirectTransport, Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
 
@@ -347,6 +350,9 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     match attach {
         Some((target, recipe)) if role.hold.is_none() => {
             facts.extend(action_facts(&entity, &recipe, "workspace"));
+            if let Some(vessel) = live.and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0])) {
+                facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+            }
             facts.push((KEY_WORKSPACE_PRIMARY_STATE, MetadataValue::text("ready")));
             facts.push((KEY_WORKSPACE_PRIMARY_TARGET, MetadataValue::text(target.action_target())));
         }
@@ -515,6 +521,15 @@ fn project_awareness_entry(
     }
     if let Some((recipe, target)) = awareness_entry_recipe(entry, convoys, mint) {
         facts.extend(action_facts(&target, &recipe, "workspace"));
+        if let Some(vessel) = match entry.id.parse() {
+            Ok(ViewAddress::Vessel { namespace, convoy, vessel }) => find_vessel(convoys, &namespace, &convoy, &vessel),
+            Ok(ViewAddress::Convoy { namespace, name }) => {
+                find_convoy(convoys, &namespace, &name).and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0]))
+            }
+            _ => None,
+        } {
+            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
+        }
     }
     catalog.assert_entity(entity, facts, None);
 }
@@ -746,6 +761,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
             let target = entity::vessel(namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
             facts.extend(action_facts(&target, &recipe, "workspace"));
+            facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
         }
     }
     catalog.assert_entity(convoy_entity, facts, ordinal);
@@ -796,6 +812,7 @@ fn project_vessel(
     }
     if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
         facts.extend(action_facts(&entity, &recipe, "workspace"));
+        facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -826,6 +843,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
         facts.extend(action_facts(&entity, &recipe, "pane"));
+        facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), &independent.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
 }
@@ -907,6 +925,28 @@ fn action_facts(target: &EntityRef, recipe: &Recipe, vehicle: &'static str) -> V
         (KEY_PRIMARY_ACTION_TARGET, MetadataValue::text(target.action_target())),
         (KEY_PRIMARY_ACTION_RECIPE, MetadataValue::text(recipe.command())),
     ]
+}
+
+fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {
+    let Some(endpoint) = endpoint else {
+        return vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text("no observed Cleat daemon endpoint for this session"))];
+    };
+    match mint.direct_transport(host) {
+        Ok(transport) => {
+            let (kind, address) = match transport {
+                DirectTransport::Local => ("local", host.as_str().to_owned()),
+                DirectTransport::Ssh(destination) => ("ssh", destination),
+            };
+            vec![
+                (KEY_PRIMARY_DIRECT_TRANSPORT, MetadataValue::text(kind)),
+                (KEY_PRIMARY_DIRECT_HOST, MetadataValue::text(address)),
+                (KEY_PRIMARY_DIRECT_RUNTIME_ROOT, MetadataValue::text(&endpoint.runtime_root)),
+                (KEY_PRIMARY_DIRECT_DAEMON, MetadataValue::text(&endpoint.daemon)),
+                (KEY_PRIMARY_DIRECT_SESSION, MetadataValue::text(&endpoint.session)),
+            ]
+        }
+        Err(reason) => vec![(KEY_PRIMARY_DIRECT_REASON, MetadataValue::text(reason))],
+    }
 }
 
 #[cfg(test)]

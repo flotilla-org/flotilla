@@ -3,7 +3,7 @@ pub mod passthrough;
 pub mod shpool;
 
 use async_trait::async_trait;
-use flotilla_protocol::{arg::Arg, commands::AttachMode, AttachableId, AttachableSetId, TerminalStatus};
+use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint, AttachableId, AttachableSetId, TerminalStatus};
 pub use flotilla_resources::TerminalSessionTag;
 
 use crate::path_context::ExecutionEnvironmentPath;
@@ -98,6 +98,10 @@ pub(crate) fn parse_managed_session_name(session_name: &str) -> Option<ManagedSe
 /// No store, no identity management — the `TerminalManager` handles those concerns.
 #[async_trait]
 pub trait TerminalPool: Send + Sync {
+    /// Physical Cleat daemon hosting this session, when the pool can resolve it.
+    async fn cleat_endpoint(&self, _session_id: &str) -> Result<Option<CleatEndpoint>, String> {
+        Ok(None)
+    }
     /// Returns a provider-safe, self-describing session name when the pool can
     /// rediscover managed sessions after the local registry is lost.
     fn managed_session_name(&self, _metadata: &ManagedSessionMetadata) -> Option<String> {

@@ -2056,6 +2056,7 @@ impl Aggregator {
                 .maybe_repository_key(repository_key)
                 .host(host)
                 .maybe_attach(attach)
+                .maybe_cleat_endpoint(session.status.as_ref().and_then(|status| status.cleat_endpoint.clone()))
                 .phase(SessionPhase::Running)
                 .build(),
         )
@@ -2094,6 +2095,28 @@ impl Aggregator {
             })
             .min_by_key(|session| &session.object.metadata.name)
             .map(|session| session.object.metadata.name.clone())
+    }
+
+    fn vessel_cleat_endpoint(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        vessel: &str,
+        vessel_host: &HostName,
+    ) -> Option<flotilla_protocol::result_set::CleatEndpoint> {
+        let name = self.vessel_materialize(namespace, convoy, vessel, vessel_host)?;
+        self.terminal_sessions
+            .values()
+            .find(|session| {
+                session.object.metadata.namespace == namespace
+                    && session.object.metadata.name == name
+                    && self.read_host(&session.provenance).as_ref() == Some(vessel_host)
+            })?
+            .object
+            .status
+            .as_ref()?
+            .cleat_endpoint
+            .clone()
     }
 
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
@@ -2318,6 +2341,7 @@ impl Aggregator {
             .host(vessel_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .maybe_materialize(self.vessel_materialize(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
+            .maybe_cleat_endpoint(self.vessel_cleat_endpoint(&convoy_ref.namespace, &convoy_ref.name, &definition.name, &vessel_host))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .surface_state(surface_state)
             .build()
@@ -2869,6 +2893,12 @@ mod tests {
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
         session.status.as_mut().expect("running status").attention =
             Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
+        let endpoint = flotilla_protocol::result_set::CleatEndpoint {
+            runtime_root: "/var/lib/flotilla/cleat".to_owned(),
+            daemon: "work@3".to_owned(),
+            session: "terminal-convoy-a-implement-coder".to_owned(),
+        };
+        session.status.as_mut().expect("running status").cleat_endpoint = Some(endpoint.clone());
         aggregator
             .replace_replica_sessions(vec![ReadResourceObject {
                 object: session,
@@ -2884,6 +2914,7 @@ mod tests {
         let vessel = convoy.vessels.first().expect("vessel row");
         assert_eq!(vessel.host, HostName::new("feta"));
         assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-a-implement-coder"));
+        assert_eq!(vessel.cleat_endpoint.as_ref(), Some(&endpoint));
         assert!(vessel.surface_state.needs_attention());
         assert!(convoy.surface_state.needs_attention());
     }

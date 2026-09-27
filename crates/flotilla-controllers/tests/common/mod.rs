@@ -364,6 +364,7 @@ pub async fn create_stopped_terminal(
         .update_status(&fixture.name, &created.metadata.resource_version, &TerminalSessionStatus {
             phase: TerminalSessionPhase::Stopped,
             session_id: Some(format!("session-{}", fixture.name)),
+            cleat_endpoint: None,
             pid: Some(42),
             started_at: Some(Utc::now()),
             stopped_at: Some(Utc::now()),

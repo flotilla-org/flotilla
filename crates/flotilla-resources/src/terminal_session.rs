@@ -151,6 +151,8 @@ pub struct TerminalSessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleat_endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
@@ -312,6 +314,9 @@ pub enum TerminalSessionStatusPatch {
     /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
     /// Failed-session retry is not currently a legal controller transition.
     MarkStarting,
+    ObserveCleatEndpoint {
+        endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
+    },
     MarkRunning {
         session_id: String,
         pid: Option<i64>,
@@ -364,6 +369,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 let completion_pending = status.completion_pending.take();
                 *status = TerminalSessionStatus { completion_pending, ..Default::default() };
             }
+            Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
             Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
@@ -393,6 +399,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
+                status.cleat_endpoint = None;
                 status.stopped_at.get_or_insert(*stopped_at);
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
@@ -405,6 +412,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             }
             Self::MarkFailed { message, stopped_at } => {
                 status.phase = TerminalSessionPhase::Failed;
+                status.cleat_endpoint = None;
                 if let Some(stopped_at) = stopped_at {
                     status.stopped_at.get_or_insert(*stopped_at);
                 }

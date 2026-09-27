@@ -1,4 +1,4 @@
-//! Recipe minting — the commands a PM runs to materialise a catalog entry.
+//! Recipe minting — commands and viewer-specific direct transport reachability.
 //!
 //! The formatter is pluggable so v0 can ship attach-only: entities with a
 //! live session get a host-qualified `flotilla attach`; everything else truthfully
@@ -6,9 +6,18 @@
 //! flotilla-org/flotilla#589) gives scoped views a command. The connector
 //! owns the entity-facts → action-address mapping.
 
+use std::collections::BTreeMap;
+
 use flotilla_protocol::{arg::shell_quote, HostName};
 
-/// A materialisation recipe. Command-only for now; the Leg-1 freeze is asked
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectTransport {
+    Local,
+    Ssh(String),
+}
+
+/// A command materialisation recipe. Direct Cleat endpoints are published as
+/// separate facts alongside this fallback command. The Leg-1 freeze is asked
 /// to bless a `{kind: command | layout}` shape (gap report §9.1) since
 /// andamento's factory tabs use layout paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +34,9 @@ impl Recipe {
 }
 
 pub trait RecipeMint: Send + Sync {
+    fn direct_transport(&self, _host: &HostName) -> Result<DirectTransport, String> {
+        Err("viewer has no known transport to the session host".to_owned())
+    }
     /// Recipe attaching a live entity — a session into a pane, or a vessel's
     /// running session into a workspace; `attach_ref` is any reference the
     /// daemon accepts (rows expose it as a capability fact).
@@ -39,15 +51,34 @@ pub trait RecipeMint: Send + Sync {
 /// scoped focal view for an awareness-band latent.
 pub struct FlotillaRecipes {
     flotilla_bin: String,
+    local_host: Option<HostName>,
+    ssh_hosts: BTreeMap<String, String>,
 }
 
 impl FlotillaRecipes {
     pub fn new(flotilla_bin: impl Into<String>) -> Self {
-        Self { flotilla_bin: flotilla_bin.into() }
+        Self { flotilla_bin: flotilla_bin.into(), local_host: None, ssh_hosts: BTreeMap::new() }
+    }
+
+    pub fn with_host_routes(mut self, local_host: HostName, ssh_hosts: BTreeMap<String, String>) -> Self {
+        self.local_host = Some(local_host);
+        self.ssh_hosts = ssh_hosts;
+        self
     }
 }
 
 impl RecipeMint for FlotillaRecipes {
+    fn direct_transport(&self, host: &HostName) -> Result<DirectTransport, String> {
+        if self.local_host.as_ref() == Some(host) {
+            return Ok(DirectTransport::Local);
+        }
+        self.ssh_hosts
+            .get(host.as_str())
+            .cloned()
+            .map(DirectTransport::Ssh)
+            .ok_or_else(|| format!("host {} has no configured SSH reachability from this viewer", host.as_str()))
+    }
+
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
         Some(Recipe::Command(format!(
             "{} attach --host {} {}",
