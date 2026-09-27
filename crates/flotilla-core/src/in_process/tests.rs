@@ -3287,6 +3287,35 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     assert_eq!(hosts_by_convoy.get("convoy-local"), Some(&daemon.host_name));
 }
 
+#[tokio::test]
+async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+    let host = daemon.local_host_id().expect("local host id").to_string();
+    let env = create_test_environment(&daemon, "local-env", &host).await;
+    for (convoy, project) in [("convoy-one", "island-one"), ("convoy-two", "island-two")] {
+        create_identity_convoy(&daemon.resource_backend(), convoy, convoy, Some(project)).await;
+        create_running_session(&daemon, &env, &format!("terminal-{convoy}"), convoy, "coder").await;
+    }
+
+    let fleet = daemon.scoped_fleet_list(None, None, None).await.expect("fleet");
+    assert_eq!(fleet.rows.len(), 2);
+    let scoped = daemon.scoped_fleet_list(None, None, Some("convoy-one")).await.expect("crew convoy scope");
+    assert_eq!(scoped.rows.len(), 1);
+    assert_eq!(scoped.rows[0].convoy_ref.as_deref(), Some("convoy-one"));
+    let explicit = daemon.scoped_fleet_list(Some("island-two"), None, Some("convoy-one")).await.expect("explicit scope");
+    assert_eq!(explicit.rows.len(), 1);
+    assert_eq!(explicit.rows[0].convoy_ref.as_deref(), Some("convoy-two"));
+}
+
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts

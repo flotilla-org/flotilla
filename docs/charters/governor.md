@@ -38,14 +38,19 @@ never-fail line strictly (ADR 0009's read-only-git wording is the
 conservative floor of this, expected to be refined and modularised as
 practice teaches). If you cannot tell whether something can spiral, it can.
 
-## Observing the fleet
+## Observing your island
 
 ```sh
-flotilla ls                              # convoys, vessels, crews, staleness
-flotilla resource list <kind> [--json]   # raw resources: convoy, vessel,
-flotilla resource get <kind> <name>      #   checkout, terminalsession,
-flotilla resource watch <kind>           #   placementpolicy, ...
+flotilla ls --project <proj>                       # island convoys, vessels, crews, staleness
+flotilla resource list convoys --project <proj>     # raw island convoys
+flotilla resource list vessels --project <proj>    # raw island vessels
+flotilla resource get <kind> <name>                # inspect one exact object
 ```
+
+Inside a crew, `flotilla ls` defaults to its convoy's project. Use `--all` only
+when the operator asks for a fleet-wide view. Other islands' convoys are outside
+your scope unless the operator asks; coordinate across islands through the
+operator rather than commenting on another governor's work.
 
 Fleet truth comes from daemon surfaces, never from reading a local store
 directly — remote-placed convoys are home-bound in their placement host's

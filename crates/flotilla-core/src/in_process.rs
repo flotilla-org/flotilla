@@ -8196,6 +8196,64 @@ impl InProcessDaemon {
         Ok(FleetListResponse { rows, replicas })
     }
 
+    async fn scoped_fleet_list(
+        &self,
+        project: Option<&str>,
+        crew_id: Option<&str>,
+        convoy: Option<&str>,
+    ) -> Result<FleetListResponse, String> {
+        let mut fleet = self.fleet_list_internal().await?;
+        if project.is_none() && crew_id.is_none() && convoy.is_none() {
+            return Ok(fleet);
+        }
+        let namespace = self.provisioning_namespace().await;
+        let convoys = self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|err| err.to_string())?;
+        let context_convoy = if let Some(crew_id) = crew_id {
+            let sessions = self
+                .resource_backend
+                .including_replicas::<ResourceTerminalSession>(&namespace)
+                .list()
+                .await
+                .map_err(|err| err.to_string())?;
+            let session = sessions
+                .items
+                .iter()
+                .find(|source| source.object.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
+                .ok_or_else(|| format!("unknown FLOTILLA_CREW_ID `{crew_id}`"))?;
+            match &session.object.spec.source {
+                TerminalSessionSource::Agent { context, .. } => Some(context.convoy.clone()),
+                TerminalSessionSource::Tool { .. } => return Err(format!("crew identity `{crew_id}` belongs to a non-agent process")),
+            }
+        } else {
+            convoy.map(ToOwned::to_owned)
+        };
+        let selected_project = match project {
+            Some(project) => project.to_string(),
+            None => {
+                let convoy = context_convoy.expect("scope requires a convoy");
+                convoys
+                    .items
+                    .iter()
+                    .find(|source| source.object.metadata.name == convoy)
+                    .ok_or_else(|| format!("crew convoy `{convoy}` not found"))?
+                    .object
+                    .spec
+                    .project_ref
+                    .clone()
+                    .ok_or_else(|| format!("crew convoy `{convoy}` has no project"))?
+            }
+        };
+        let matching: HashSet<_> = convoys
+            .items
+            .iter()
+            .filter(|source| source.object.spec.project_ref.as_deref() == Some(selected_project.as_str()))
+            .map(|source| source.object.metadata.name.as_str())
+            .collect();
+        fleet.rows.retain(|row| row.convoy_ref.as_deref().is_some_and(|reference| matching.contains(reference)));
+        fleet.replicas.clear();
+        Ok(fleet)
+    }
+
     /// Resolve enough crew identity locally to route a verb to the convoy
     /// authority. Unlike `resolve_crew_context`, this does not read the
     /// authority-owned Convoy or Vessel.
@@ -11896,10 +11954,12 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetHealth(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::QueryFleetList {} => match self.fleet_list_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
+            CommandAction::QueryFleetList { project, crew_id, convoy } => {
+                match self.scoped_fleet_list(project.as_deref(), crew_id.as_deref(), convoy.as_deref()).await {
+                    Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
+                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),

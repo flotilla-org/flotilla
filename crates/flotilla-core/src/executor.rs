@@ -399,7 +399,7 @@ pub async fn build_plan(
         | CommandAction::QueryProjectList {}
         | CommandAction::QueryDispatchQueue { .. }
         | CommandAction::QueryFleetHealth {}
-        | CommandAction::QueryFleetList {}
+        | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryFleetReplicaSnapshot {}
         | CommandAction::QueryDaemonLogs { .. }

@@ -138,7 +138,14 @@ enum SubCommand {
     /// Show fleet-wide host health without collapsing independent observations
     Fleet,
     /// List convoy vessels and crew sessions
-    Ls,
+    Ls {
+        /// Show only one project's convoys
+        #[arg(long, conflicts_with = "all")]
+        project: Option<String>,
+        /// Show the whole fleet, including inside a crew
+        #[arg(long, conflicts_with = "project")]
+        all: bool,
+    },
     /// Attach to a running convoy crew session
     Attach {
         /// Observe without taking the controller seat from another client
@@ -365,6 +372,9 @@ struct ResourceDedupSweepArgs {
 struct ResourceListArgs {
     /// Resource kind or plural name, e.g. convoys or WorkflowTemplate
     kind: String,
+    /// Show only resources belonging to this project
+    #[arg(long)]
+    project: Option<String>,
     /// Resource namespace
     #[arg(long, default_value = "flotilla")]
     namespace: String,
@@ -663,7 +673,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Topology { dot }) => run_topology_command(&cli, format, dot).await,
         Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
-        Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
+        Some(SubCommand::Ls { project, all }) => run_fleet_list(&cli, format, project, all).await,
         Some(SubCommand::Attach { reference, watch, strict, take, transient, host }) => {
             run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
@@ -677,6 +687,7 @@ async fn main() -> Result<()> {
                 &cli,
                 ResourceSubCommand::List(ResourceListArgs {
                     kind: "events".to_string(),
+                    project: None,
                     namespace,
                     host,
                     local_only,
@@ -1380,13 +1391,28 @@ async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol
     }
 }
 
-async fn run_fleet_list(cli: &Cli, format: OutputFormat) -> Result<()> {
+async fn run_fleet_list(cli: &Cli, format: OutputFormat, project: Option<String>, all: bool) -> Result<()> {
+    let (crew_id, convoy) = ls_crew_scope(project.as_deref(), all, |key| std::env::var(key).ok());
     run_control_command(
         cli,
-        Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
+        Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::QueryFleetList { project, crew_id, convoy },
+        },
         format,
     )
     .await
+}
+
+fn ls_crew_scope(project: Option<&str>, all: bool, env: impl Fn(&str) -> Option<String>) -> (Option<String>, Option<String>) {
+    if project.is_some() || all {
+        return (None, None);
+    }
+    let crew_id = env("FLOTILLA_CREW_ID");
+    let convoy = if crew_id.is_none() { env("FLOTILLA_CONVOY") } else { None };
+    (crew_id, convoy)
 }
 
 async fn run_fleet_health(cli: &Cli, format: OutputFormat) -> Result<()> {
@@ -1427,17 +1453,52 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
         ResourceSubCommand::List(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;
-            let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+            let mut response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
                 .list(
                     flotilla_client::resource::ResourceListRequest::builder()
-                        .kind(args.kind)
-                        .namespace(args.namespace)
+                        .kind(args.kind.clone())
+                        .namespace(args.namespace.clone())
                         .maybe_node_id(node_id.clone())
                         .include_replicas(args.include_replicas || !args.local_only)
                         .build(),
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
+            if let Some(project) = args.project.as_deref() {
+                let kind = response.plural.as_str();
+                if !matches!(kind, "convoys" | "vessels" | "terminalsessions" | "environments" | "checkouts") {
+                    return Err(color_eyre::eyre::eyre!("--project is unsupported for resource kind `{kind}`"));
+                }
+                let convoys = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+                    .list(
+                        flotilla_client::resource::ResourceListRequest::builder()
+                            .kind("convoys".to_string())
+                            .namespace(args.namespace.clone())
+                            .maybe_node_id(node_id.clone())
+                            .include_replicas(args.include_replicas || !args.local_only)
+                            .build(),
+                    )
+                    .await
+                    .map_err(|e| color_eyre::eyre::eyre!(e))?;
+                let names: std::collections::HashSet<_> = convoys
+                    .records
+                    .iter()
+                    .filter_map(|record| record.object.as_ref())
+                    .filter(|object| object["spec"]["project_ref"].as_str() == Some(project))
+                    .filter_map(|object| object["metadata"]["name"].as_str().map(ToOwned::to_owned))
+                    .collect();
+                response.records.retain(|record| {
+                    record.object.as_ref().is_some_and(|object| {
+                        if kind == "convoys" {
+                            return object["spec"]["project_ref"].as_str() == Some(project);
+                        }
+                        let convoy =
+                            object["spec"]["convoy_ref"].as_str().or_else(|| object["metadata"]["labels"]["flotilla.work/convoy"].as_str());
+                        convoy.is_some_and(|name| names.contains(name))
+                            || object["metadata"]["labels"]["flotilla.work/project"].as_str() == Some(project)
+                    })
+                });
+            }
             print_resource_read(daemon.as_ref(), node_id, response, format).await
         }
         ResourceSubCommand::Get(args) => {
@@ -2599,17 +2660,48 @@ mod tests {
     #[test]
     fn cli_parses_ls_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "ls"]).expect("ls cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Ls)));
+        assert!(matches!(cli.command, Some(SubCommand::Ls { project: None, all: false })));
+        let scoped = Cli::try_parse_from(["flotilla", "ls", "--project", "island"]).expect("scoped ls should parse");
+        assert!(matches!(scoped.command, Some(SubCommand::Ls { project: Some(project), all: false }) if project == "island"));
+        let all = Cli::try_parse_from(["flotilla", "ls", "--all"]).expect("fleet ls should parse");
+        assert!(matches!(all.command, Some(SubCommand::Ls { project: None, all: true })));
+        assert!(Cli::try_parse_from(["flotilla", "ls", "--all", "--project", "island"]).is_err());
+    }
+
+    #[test]
+    fn ls_scope_defaults_to_crew_and_explicit_flags_win() {
+        let env = |key: &str| match key {
+            "FLOTILLA_CREW_ID" => Some("crew-1".to_string()),
+            "FLOTILLA_CONVOY" => Some("convoy-1".to_string()),
+            _ => None,
+        };
+        assert_eq!(super::ls_crew_scope(None, false, env), (Some("crew-1".to_string()), None));
+        assert_eq!(super::ls_crew_scope(Some("island"), false, env), (None, None));
+        assert_eq!(super::ls_crew_scope(None, true, env), (None, None));
+        assert_eq!(super::ls_crew_scope(None, false, |_| None), (None, None));
+        assert_eq!(
+            super::ls_crew_scope(None, false, |key| (key == "FLOTILLA_CONVOY").then(|| "convoy-1".to_string())),
+            (None, Some("convoy-1".to_string()))
+        );
     }
 
     #[test]
     fn cli_parses_resource_subcommands() {
+        let scoped = Cli::try_parse_from(["flotilla", "resource", "list", "convoys", "--project", "island"])
+            .expect("project resource list should parse");
+        assert!(matches!(
+            scoped.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::List(ResourceListArgs { project: Some(project), .. })
+            }) if project == "island"
+        ));
         let list = Cli::try_parse_from(["flotilla", "resource", "list", "convoys", "--host", "feta"]).expect("resource list should parse");
         assert!(matches!(
             list.command,
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::List(ResourceListArgs {
                     kind,
+                    project: None,
                     namespace,
                     host: Some(host),
                     local_only: false,
@@ -2625,6 +2717,7 @@ mod tests {
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::List(ResourceListArgs {
                     kind,
+                    project: None,
                     namespace,
                     host: None,
                     local_only: false,
