@@ -2236,15 +2236,19 @@ impl Aggregator {
             .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
             .min_by_key(|pending| pending.attempted_at)
             .cloned();
-        let credential_attention = self.demands.values().find(|demand| {
-            demand.spec.originating_work_ref.namespace == convoy_ref.namespace
-                && demand.spec.originating_work_ref.name == convoy_ref.name
-                && demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel") == Some(&definition.name)
-                && matches!(
-                    demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
-                    DemandState::Raised | DemandState::Escalated
-                )
-        });
+        let credential_attention = self
+            .demands
+            .values()
+            .filter(|demand| {
+                demand.spec.originating_work_ref.namespace == convoy_ref.namespace
+                    && demand.spec.originating_work_ref.name == convoy_ref.name
+                    && demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel") == Some(&definition.name)
+                    && matches!(
+                        demand.status.as_ref().map_or(DemandState::Raised, |status| status.state),
+                        DemandState::Raised | DemandState::Escalated
+                    )
+            })
+            .min_by_key(|demand| &demand.metadata.name);
         let needs_attention = credential_attention.is_some()
             || completion_pending.is_some()
             || matching_sessions().any(|session| {
@@ -2562,6 +2566,20 @@ mod tests {
         assert!(convoy.needs_attention);
         assert!(convoy.vessels[0].needs_attention);
         assert!(convoy.vessels[0].message.as_deref().is_some_and(|message| message.contains("github-app")));
+
+        let mut second_credential = demand.clone();
+        second_credential.metadata.name = "credential-refresh-vessel-zed".to_string();
+        second_credential
+            .metadata
+            .annotations
+            .insert("flotilla.work/credential-refresh-reason".to_string(), "credential `zed` failed; expires in 1 minute".to_string());
+        aggregator.apply_demand_event(WatchEvent::Added(second_credential.clone())).await;
+        let result_set = state.result_set().await;
+        assert!(result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("github-app")));
+        aggregator.apply_demand_event(WatchEvent::Deleted(second_credential)).await;
 
         let mut reclaim = demand.clone();
         reclaim.metadata.name = "reclaim-refusal-convoy-a".to_string();
