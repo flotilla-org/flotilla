@@ -959,14 +959,17 @@ async fn register_agentless_ssh_resources(
 }
 
 async fn agentless_platform(runner: &dyn CommandRunner) -> String {
-    match runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default).await {
-        Ok(output) => match output.trim() {
+    let uname = tokio::time::timeout(Duration::from_secs(15), runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default)).await;
+    match uname {
+        Ok(Ok(output)) => match output.trim() {
             "Darwin" => "macos".to_string(),
             "Linux" => "linux".to_string(),
             other => other.to_ascii_lowercase(),
         },
-        Err(_) => match runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(output) if output.contains("Windows") => "windows".to_string(),
+        _ => match tokio::time::timeout(Duration::from_secs(15), runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default))
+            .await
+        {
+            Ok(Ok(output)) if output.contains("Windows") => "windows".to_string(),
             _ => "unknown".to_string(),
         },
     }
@@ -1027,8 +1030,10 @@ async fn apply_agentless_ssh_observation(
                 .build(),
         );
     }
-    let platform = agentless_platform(ssh.runner.as_ref()).await;
-    migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
+    if probe_succeeded {
+        let platform = agentless_platform(ssh.runner.as_ref()).await;
+        migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
+    }
     let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
         host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
     } else {
