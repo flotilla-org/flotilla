@@ -1317,6 +1317,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
         WorkPhase::Ready => ("ready", CellTone::Warning),
         WorkPhase::Launching => ("launching", CellTone::Warning),
         WorkPhase::Running => ("running", CellTone::Plain),
+        WorkPhase::Stalled => ("stalled", CellTone::Warning),
         WorkPhase::Interrupted => ("interrupted", CellTone::Warning),
         WorkPhase::Complete => ("complete", CellTone::Success),
         WorkPhase::Failed => ("failed", CellTone::Error),

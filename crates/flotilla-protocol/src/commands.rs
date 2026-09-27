@@ -528,6 +528,24 @@ impl std::str::FromStr for AgentOverride {
 /// persisted by the selected execution host.
 ///
 /// Commands the client can send to the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrewSupervisionAction {
+    Resume,
+    Fail,
+    Escalate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallReason {
+    Infra,
+    Scope,
+    Decision,
+    Access,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
@@ -662,6 +680,20 @@ pub enum CommandAction {
     CrewFail {
         context: CrewCommandContext,
         message: String,
+    },
+    CrewStall {
+        context: CrewCommandContext,
+        reason: StallReason,
+        message: String,
+    },
+    CrewSupervise {
+        namespace: Option<String>,
+        convoy: String,
+        vessel: String,
+        role: String,
+        operation: CrewSupervisionAction,
+        message: String,
+        actor_crew_id: Option<String>,
     },
     ConvoyCreate {
         name: String,
@@ -883,6 +915,8 @@ impl Command {
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
+            CommandAction::CrewStall { .. } => "Stalling crew work...",
+            CommandAction::CrewSupervise { .. } => "Supervising crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::ConvoyStart { .. } => "Starting convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",

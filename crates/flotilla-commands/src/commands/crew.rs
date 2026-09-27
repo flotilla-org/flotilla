@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
+use flotilla_protocol::{Command, CommandAction, CrewCommandContext, CrewSupervisionAction, StallReason};
 
 use crate::{
     quote_value,
@@ -25,11 +25,17 @@ pub struct CrewNoun {
     /// Vessel resource name (e.g. `myconvoy-implement`)
     #[arg(long = "vessel-ref")]
     pub vessel_ref: Option<String>,
+    /// Work vessel name for `crew supervise`
+    #[arg(long)]
+    pub vessel: Option<String>,
     #[arg(long)]
     pub role: Option<String>,
     /// Completion or failure message
     #[arg(long)]
     pub message: Option<String>,
+    /// Why crew work is blocked while it remains wanted
+    #[arg(long)]
+    pub reason: Option<String>,
     /// Machine-readable settlement answer declared by the brief
     #[arg(long)]
     pub disposition: Option<String>,
@@ -48,10 +54,32 @@ pub enum CrewVerb {
         #[arg(long)]
         message: String,
     },
+    /// Resume stalled crew work with guidance
+    Resume {
+        #[arg(long)]
+        message: String,
+    },
+    /// Convert stalled crew work to failed
+    ConvertToFailed {
+        #[arg(long)]
+        message: String,
+    },
+    /// Escalate stalled crew work to the next supervisor
+    Escalate {
+        #[arg(long)]
+        message: String,
+    },
 }
 
 impl CrewNoun {
     pub fn resolve_with_crew_id(self, ambient_crew_id: Option<String>) -> Result<Resolved, String> {
+        let supervision_target = (
+            self.namespace.clone(),
+            self.convoy.clone(),
+            self.vessel.clone(),
+            self.role.clone(),
+            self.crew_id.clone().or(ambient_crew_id.clone()),
+        );
         let context = CrewCommandContext::builder()
             .maybe_crew_id(self.crew_id.or(ambient_crew_id))
             .maybe_namespace(self.namespace)
@@ -62,7 +90,11 @@ impl CrewNoun {
         let subject = self.subjects.resolve()?.ok_or_else(|| "crew command requires a command or target subject".to_string())?;
         let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
             ("list", SubjectInterpretation::Ordinary, None)
-                if self.message.is_none() && self.disposition.is_none() && self.decision_ledger_ref.is_none() && !self.force =>
+                if self.message.is_none()
+                    && self.reason.is_none()
+                    && self.disposition.is_none()
+                    && self.decision_ledger_ref.is_none()
+                    && !self.force =>
             {
                 CommandAction::QueryCrewList { context }
             }
@@ -70,6 +102,9 @@ impl CrewNoun {
                 return Err("`flotilla crew list` does not accept completion options".to_string());
             }
             ("complete", SubjectInterpretation::Ordinary, None) => {
+                if self.reason.is_some() {
+                    return Err("--reason is only valid with `flotilla crew stall`".to_string());
+                }
                 if self
                     .decision_ledger_ref
                     .as_deref()
@@ -86,7 +121,7 @@ impl CrewNoun {
                 }
             }
             ("fail", SubjectInterpretation::Ordinary, None)
-                if self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force =>
+                if self.reason.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force =>
             {
                 return Err("`flotilla crew fail` does not accept completion options".to_string());
             }
@@ -94,11 +129,49 @@ impl CrewNoun {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
             },
+            ("stall", SubjectInterpretation::Ordinary, None) => {
+                if self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force {
+                    return Err("`flotilla crew stall` does not accept completion options".to_string());
+                }
+                let reason = self.reason.ok_or_else(|| "`flotilla crew stall` requires --reason".to_string())?;
+                let reason = match reason.as_str() {
+                    "infra" => StallReason::Infra,
+                    "scope" => StallReason::Scope,
+                    "decision" => StallReason::Decision,
+                    "access" => StallReason::Access,
+                    "other" => StallReason::Other,
+                    _ => return Err(format!("invalid stall reason `{reason}`; expected infra, scope, decision, access, or other")),
+                };
+                CommandAction::CrewStall {
+                    context,
+                    reason,
+                    message: self.message.ok_or_else(|| "`flotilla crew stall` requires --message".to_string())?,
+                }
+            }
+            ("supervise", SubjectInterpretation::Ordinary, Some(verb)) => {
+                let (namespace, convoy, vessel, role, actor_crew_id) = supervision_target;
+                let (action, message) = match verb {
+                    CrewVerb::Resume { message } => (CrewSupervisionAction::Resume, message),
+                    CrewVerb::ConvertToFailed { message } => (CrewSupervisionAction::Fail, message),
+                    CrewVerb::Escalate { message } => (CrewSupervisionAction::Escalate, message),
+                    CrewVerb::Handoff { .. } => return Err("`flotilla crew supervise` requires resume, fail, or escalate".to_string()),
+                };
+                CommandAction::CrewSupervise {
+                    namespace,
+                    convoy: convoy.ok_or_else(|| "crew supervise requires --convoy".to_string())?,
+                    vessel: vessel.ok_or_else(|| "crew supervise requires --vessel".to_string())?,
+                    role: role.ok_or_else(|| "crew supervise requires --role".to_string())?,
+                    operation: action,
+                    message,
+                    actor_crew_id,
+                }
+            }
             (reserved, SubjectInterpretation::Ordinary, Some(_)) if is_crew_command_subject(reserved) => {
                 return Err(format!("`{reserved}` is a crew command; use `@{reserved}` to address the crew role"));
             }
             (_, _, Some(_)) if self.force => return Err("--force is only valid with `flotilla crew complete`".to_string()),
             (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
+            (_, _, Some(_)) => return Err("resume, fail, and escalate require `flotilla crew supervise`".to_string()),
             (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
         };
         Ok(Resolved::NeedsContext {
@@ -122,6 +195,7 @@ impl std::fmt::Display for CrewNoun {
             ("--namespace", self.namespace.as_ref()),
             ("--convoy", self.convoy.as_ref()),
             ("--vessel-ref", self.vessel_ref.as_ref()),
+            ("--vessel", self.vessel.as_ref()),
             ("--role", self.role.as_ref()),
         ] {
             if let Some(value) = value {
@@ -130,6 +204,9 @@ impl std::fmt::Display for CrewNoun {
         }
         if let Some(message) = &self.message {
             write!(f, " --message {}", quote_value(message))?;
+        }
+        if let Some(reason) = &self.reason {
+            write!(f, " --reason {}", quote_value(reason))?;
         }
         if let Some(disposition) = &self.disposition {
             write!(f, " --disposition {}", quote_value(disposition))?;
@@ -140,8 +217,14 @@ impl std::fmt::Display for CrewNoun {
         if self.force {
             write!(f, " --force")?;
         }
-        if let Some(CrewVerb::Handoff { message }) = &self.verb {
-            write!(f, " handoff --message {}", quote_value(message))?;
+        if let Some(verb) = &self.verb {
+            let (name, message) = match verb {
+                CrewVerb::Handoff { message } => ("handoff", message),
+                CrewVerb::Resume { message } => ("resume", message),
+                CrewVerb::ConvertToFailed { message } => ("convert-to-failed", message),
+                CrewVerb::Escalate { message } => ("escalate", message),
+            };
+            write!(f, " {name} --message {}", quote_value(message))?;
         }
         Ok(())
     }
@@ -150,7 +233,7 @@ impl std::fmt::Display for CrewNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{CommandAction, CrewCommandContext};
+    use flotilla_protocol::{CommandAction, CrewCommandContext, StallReason};
 
     use super::CrewNoun;
     use crate::{test_utils::assert_round_trip, Resolved};
@@ -168,6 +251,46 @@ mod tests {
         let noun = CrewNoun::try_parse_from(["crew", "list"]).expect("parse list");
         assert_eq!(action(noun, Some("crew-123")), CommandAction::QueryCrewList {
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }
+        });
+    }
+
+    #[test]
+    fn stall_requires_closed_reason_and_message() {
+        let noun = CrewNoun::try_parse_from(["crew", "stall", "--reason", "access", "--message", "repo denied"]).expect("parse stall");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewStall {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            reason: StallReason::Access,
+            message: "repo denied".into(),
+        });
+        let invalid =
+            CrewNoun::try_parse_from(["crew", "stall", "--reason", "maybe", "--message", "blocked"]).expect("parse invalid reason");
+        assert!(invalid.resolve_with_crew_id(None).expect_err("closed reason").contains("invalid stall reason"));
+    }
+
+    #[test]
+    fn supervisor_resume_names_source_and_actor() {
+        let noun = CrewNoun::try_parse_from([
+            "crew",
+            "supervise",
+            "--convoy",
+            "work",
+            "--vessel",
+            "implement",
+            "--role",
+            "coder",
+            "resume",
+            "--message",
+            "try again",
+        ])
+        .expect("parse supervisor resume");
+        assert_eq!(action(noun, Some("governor-crew")), CommandAction::CrewSupervise {
+            namespace: None,
+            convoy: "work".into(),
+            vessel: "implement".into(),
+            role: "coder".into(),
+            operation: flotilla_protocol::CrewSupervisionAction::Resume,
+            message: "try again".into(),
+            actor_crew_id: Some("governor-crew".into()),
         });
     }
 

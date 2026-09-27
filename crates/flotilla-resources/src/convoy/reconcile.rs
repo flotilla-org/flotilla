@@ -943,6 +943,7 @@ fn bootstrap_outcome(
 
     let workflow_snapshot = WorkflowSnapshot {
         stall_nudges: template.spec.stall_nudges.clone(),
+        supervision: template.spec.supervision.clone(),
         exit: template.spec.exit.clone(),
         turn_delivery: template.spec.turn_delivery.clone(),
         vessels: template
@@ -1183,9 +1184,11 @@ fn roll_up_crew_work_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -
         }
 
         let all_done = crew.values().all(|state| state.phase == CrewWorkPhase::Done);
-        let next_phase = match (work_state.phase, all_done) {
-            (WorkPhase::Running, true) => Some(WorkPhase::Complete),
-            (WorkPhase::Complete, false) => Some(WorkPhase::Running),
+        let any_stalled = crew.values().any(|state| state.phase == CrewWorkPhase::Stalled);
+        let next_phase = match (work_state.phase, all_done, any_stalled) {
+            (WorkPhase::Running | WorkPhase::Stalled, true, _) => Some(WorkPhase::Complete),
+            (WorkPhase::Running, false, true) => Some(WorkPhase::Stalled),
+            (WorkPhase::Stalled, false, false) | (WorkPhase::Complete, false, false) => Some(WorkPhase::Running),
             _ => None,
         };
         if let Some(next_phase) = next_phase {
@@ -1326,7 +1329,7 @@ fn vessel_outcome(
                     actuations.extend(outcome.actuations);
                 }
             }
-            WorkPhase::Running => {
+            WorkPhase::Running | WorkPhase::Stalled => {
                 if let Some(vessel) = vessel {
                     match vessel.status.as_ref().map(|status| status.phase) {
                         Some(VesselPhase::Failed) => {
@@ -1351,7 +1354,7 @@ fn vessel_outcome(
                                 actuations,
                                 events: vec![ConvoyEvent::WorkPhaseChanged {
                                     work: requirement.name.clone(),
-                                    from: WorkPhase::Running,
+                                    from: state.phase,
                                     to: WorkPhase::Interrupted,
                                 }],
                             };
@@ -1433,7 +1436,7 @@ fn cleanup_plan(
         let mut actuations = Vec::new();
         for (work, state) in &predicted_status.work {
             let resource_name = vessel_resource_name(&convoy.metadata.name, work);
-            if matches!(state.phase, WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running)
+            if matches!(state.phase, WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running | WorkPhase::Stalled)
                 && !presentations.contains_key(&resource_name)
             {
                 actuations.push(create_presentation_actuation(convoy, work));

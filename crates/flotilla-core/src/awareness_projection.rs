@@ -401,7 +401,7 @@ fn work_state(phase: WorkPhase) -> AwarenessState {
         WorkPhase::Pending => AwarenessState::Pending,
         WorkPhase::Ready => AwarenessState::Waiting,
         WorkPhase::Launching | WorkPhase::Running => AwarenessState::Active,
-        WorkPhase::Interrupted => AwarenessState::Waiting,
+        WorkPhase::Interrupted | WorkPhase::Stalled => AwarenessState::Waiting,
         WorkPhase::Complete => AwarenessState::Done,
         WorkPhase::Failed => AwarenessState::Failed,
         WorkPhase::Cancelled | WorkPhase::Abandoned => AwarenessState::Cancelled,

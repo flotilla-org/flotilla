@@ -89,6 +89,7 @@ define_patch_kinds! {
     ConvoyMarkConvoyAbandoned => DUPLICATE,
     ConvoyMarkCrewCompleted => DUPLICATE_RESETTLEMENT,
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
+    ConvoyMarkCrewStalled => NONE,
     ConvoyHandoffCrewWork => CONTINUATION,
     ConvoyResumeCrewWork => CONTINUATION,
     ConvoySetPendingBrief => DUPLICATE,
@@ -141,6 +142,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
+        ConvoyStatusPatch::MarkCrewStalled { .. } => PatchKind::ConvoyMarkCrewStalled,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
         ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
         ConvoyStatusPatch::SetPendingBrief { .. } => PatchKind::ConvoySetPendingBrief,
@@ -356,6 +358,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let patch = ConvoyStatusPatch::Bootstrap {
                     workflow_snapshot: WorkflowSnapshot {
                         stall_nudges: Default::default(),
+                        supervision: None,
                         exit: None,
                         turn_delivery: Default::default(),
                         vessels: Vec::new(),

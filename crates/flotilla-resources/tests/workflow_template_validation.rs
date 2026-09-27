@@ -271,6 +271,7 @@ fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
     let workflow = single_agent_contained_workflow_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
+        supervision: None,
         exit: workflow.exit,
         turn_delivery: workflow.turn_delivery,
         vessels: workflow.vessels,

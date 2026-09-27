@@ -69,9 +69,9 @@ pub use convoy::{
     ConvoyProvisioningState, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime,
     CrewCompletionClaim, CrewWorkPhase, CrewWorkState, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery,
     IssueSnapshot, LeafMaker, LifecycleMutation, PendingBrief, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode,
-    StallEvidenceSource, StallNudge, StallRung, StalledCondition, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome,
-    TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition, TargetMismatch, TurnDeliveryEpisode,
+    TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
     ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch,
@@ -213,6 +213,6 @@ pub use workflow_template::{
     implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec,
     single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec, validate, ClaimExit, CrewCompletionExpectation, CrewSource,
     CrewSpec, ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, Selector,
-    StallNudgePolicy, Stance, SubjectVariable, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec,
+    StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec,
 };

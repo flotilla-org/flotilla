@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+pub use flotilla_protocol::StallReason;
 use flotilla_protocol::{CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
@@ -473,6 +474,7 @@ pub struct ConvoyStatus {
 pub enum LeafMaker {
     Observed { refresher: String, external_party: String },
     Actor { vessel: String, role: String },
+    Supervisor { convoy: String, vessel: String, role: String },
     Controller { resource_kind: String, name: String, disposition: ControllerRetryDisposition },
 }
 
@@ -491,6 +493,7 @@ pub enum StallEvidenceSource {
     Observation,
     Session,
     LeafEngine,
+    Crew,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,7 +501,16 @@ pub enum StallEvidenceSource {
 pub enum StallRung {
     Nudge,
     Supervisor,
+    Bosun,
+    Governor,
     Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StallSupervisor {
+    pub convoy: String,
+    pub vessel: String,
+    pub role: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +527,14 @@ pub struct StalledCondition {
     pub source: StallEvidenceSource,
     pub began_at: DateTime<Utc>,
     pub rung: StallRung,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor: Option<StallSupervisor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_index: Option<usize>,
+    #[serde(default)]
+    pub supervision_exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<StallReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nudge_history: Vec<StallNudge>,
 }
@@ -563,6 +583,8 @@ pub struct WorkflowSnapshot {
     pub turn_delivery: indexmap::IndexMap<String, TurnDeliveryRule>,
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub stall_nudges: indexmap::IndexMap<String, crate::StallNudgePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<Vec<crate::SupervisionTarget>>,
     pub vessels: Vec<VesselRequirement>,
 }
 
@@ -589,6 +611,18 @@ fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
     }
     if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
         status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+    }
+}
+
+fn clear_stall_for_crew(status: &mut ConvoyStatus, vessel: &str, role: &str) {
+    let field_path = format!(".crew.{role}.phase");
+    if status.stalled.as_ref().is_some_and(|stalled| {
+        stalled
+            .leaves
+            .iter()
+            .any(|leaf| matches!(&leaf.address, LeafAddress::Work { work, .. } if work == vessel) && leaf.field_path == field_path)
+    }) {
+        status.stalled = None;
     }
 }
 
@@ -672,6 +706,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
+    Stalled,
     Interrupted,
     Complete,
     Failed,
@@ -749,6 +784,7 @@ pub enum CrewWorkPhase {
     Pending,
     Working,
     Interrupted,
+    Stalled,
     Done,
     HandedBack,
     Failed,
@@ -860,6 +896,14 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         role: String,
         finished_at: DateTime<Utc>,
+        message: String,
+    },
+    MarkCrewStalled {
+        convoy: String,
+        vessel: String,
+        role: String,
+        at: DateTime<Utc>,
+        reason: StallReason,
         message: String,
     },
     HandoffCrewWork {
@@ -1156,6 +1200,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.completed_while_crew_active |= *completed_while_crew_active;
                 }
+                clear_stall_for_crew(status, vessel, role);
                 enter_landing_if_completion_claims_settled(status);
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
@@ -1172,6 +1217,32 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(message.clone());
                 }
                 clear_pending_brief_for(status, vessel, role);
+                clear_stall_for_crew(status, vessel, role);
+            }
+            Self::MarkCrewStalled { convoy, vessel, role, at, reason, message } => {
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Stalled;
+                    state.finished_at = None;
+                    state.message = Some(message.clone());
+                }
+                status.stalled = Some(StalledCondition {
+                    leaves: vec![Leaf {
+                        address: LeafAddress::Work { convoy: convoy.clone(), work: vessel.clone() },
+                        field_path: format!(".crew.{role}.phase"),
+                        operator: LeafOperator::Equal,
+                        literal: "Done".into(),
+                    }],
+                    maker: Some(LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() }),
+                    evidence: message.clone(),
+                    source: StallEvidenceSource::Crew,
+                    began_at: *at,
+                    rung: StallRung::Operator,
+                    supervisor: None,
+                    supervision_index: None,
+                    supervision_exhausted: false,
+                    reason: Some(*reason),
+                    nudge_history: Vec::new(),
+                });
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -1213,6 +1284,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at = None;
                     state.message = Some(prompt.clone());
                 }
+                status.stalled = None;
                 clear_pending_brief_for(status, vessel, role);
             }
             Self::SetPendingBrief { pending_brief } => {
@@ -1309,7 +1381,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                             }
                             state.finished_at.get_or_insert(*transitioned_at);
                         }
-                        WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running | WorkPhase::Interrupted => {
+                        WorkPhase::Pending
+                        | WorkPhase::Ready
+                        | WorkPhase::Launching
+                        | WorkPhase::Running
+                        | WorkPhase::Stalled
+                        | WorkPhase::Interrupted => {
                             state.finished_at = None;
                         }
                     }
@@ -1459,6 +1536,17 @@ pub mod external_patches {
 
     pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
         ConvoyStatusPatch::MarkCrewFailed { vessel, role, finished_at, message }
+    }
+
+    pub fn mark_crew_stalled(
+        convoy: String,
+        vessel: String,
+        role: String,
+        at: DateTime<Utc>,
+        reason: StallReason,
+        message: String,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkCrewStalled { convoy, vessel, role, at, reason, message }
     }
 
     pub fn handoff_crew_work(

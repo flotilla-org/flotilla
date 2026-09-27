@@ -904,6 +904,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
+    Stalled,
     Interrupted,
     Complete,
     Failed,
@@ -918,6 +919,7 @@ impl WorkPhase {
             Self::Ready => "ready",
             Self::Launching => "launching",
             Self::Running => "running",
+            Self::Stalled => "stalled",
             Self::Interrupted => "interrupted",
             Self::Complete => "complete",
             Self::Failed => "failed",
@@ -973,6 +975,8 @@ impl SurfaceState {
             Self::Available => "available",
             Self::StalledHandled { rung: HandledRung::Nudge } => "stalled (rung 0: nudge)",
             Self::StalledHandled { rung: HandledRung::Supervisor } => "stalled (rung 1: supervisor)",
+            Self::StalledHandled { rung: HandledRung::Bosun } => "stalled (rung 1: bosun)",
+            Self::StalledHandled { rung: HandledRung::Governor } => "stalled (rung 1: governor)",
             Self::NeedsYou => "needs you",
         }
     }
@@ -983,6 +987,8 @@ impl SurfaceState {
 pub enum HandledRung {
     Nudge,
     Supervisor,
+    Bosun,
+    Governor,
 }
 
 impl HandledRung {
@@ -990,6 +996,8 @@ impl HandledRung {
         match self {
             Self::Nudge => "nudge",
             Self::Supervisor => "supervisor",
+            Self::Bosun => "bosun",
+            Self::Governor => "governor",
         }
     }
 }

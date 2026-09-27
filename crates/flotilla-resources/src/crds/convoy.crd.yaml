@@ -151,7 +151,10 @@ spec:
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Active, Completed, Failed, Cancelled]
+                  enum: [Pending, Active, Interrupted, Anchored, Landing, Landed, Failed, Cancelled, Abandoned]
+                stalled:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
                 observed_workflow_ref:
                   type: string
                 observed_workflows:
@@ -217,6 +220,11 @@ spec:
                           max_per_episode:
                             type: integer
                             minimum: 0
+                    supervision:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                     vessels:
                       type: array
                       items:
@@ -283,7 +291,7 @@ spec:
                     properties:
                       phase:
                         type: string
-                        enum: [Pending, Ready, Launching, Running, Complete, Failed, Cancelled]
+                        enum: [Pending, Ready, Launching, Running, Stalled, Interrupted, Complete, Failed, Cancelled, Abandoned]
                       completion_authority:
                         oneOf:
                           - type: string
@@ -323,7 +331,7 @@ spec:
                       properties:
                         phase:
                           type: string
-                          enum: [Pending, Working, Done, HandedBack, Failed]
+                          enum: [Pending, Working, Interrupted, Stalled, Done, HandedBack, Failed]
                         started_at:
                           type: string
                           format: date-time
