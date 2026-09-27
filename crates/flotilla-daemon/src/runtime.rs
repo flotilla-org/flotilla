@@ -518,6 +518,9 @@ impl DaemonRuntime {
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
             config.state_dir().as_path().to_path_buf(),
         ));
+        if let Err(error) = credential_store.cleanup_stale_github_app_token_files().await {
+            warn!(%error, "failed to clean up stale GitHub App token staging files");
+        }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
             generation: daemon

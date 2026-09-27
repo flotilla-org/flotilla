@@ -18,7 +18,7 @@ use flotilla_resources::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use url::Url;
 
 use crate::vessel_config::{
@@ -229,6 +229,7 @@ pub(crate) struct CredentialStore {
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
+    cleaned_delivery_environments: Mutex<BTreeMap<String, Arc<OnceCell<()>>>>,
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
@@ -386,6 +387,29 @@ impl GitCredentialPreflight {
 }
 
 impl CredentialStore {
+    /// Remove staging files left by a previous daemon process. The current
+    /// config base can differ from the previous one when XDG_RUNTIME_DIR
+    /// becomes available, so inspect the state fallback as well.
+    pub(crate) async fn cleanup_stale_github_app_token_files(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(error) = cleanup_stale_github_app_token_files_in(&self.state_dir).await {
+            errors.push(error);
+        }
+        match self.delivery_paths(&*self.host_runner).await {
+            Ok(paths) if paths.base != self.state_dir => {
+                if let Err(error) = cleanup_stale_github_app_token_files_in(&paths.base).await {
+                    errors.push(error);
+                }
+            }
+            Err(error) => errors.push(error),
+            Ok(_) => {}
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         backend: ResourceBackend,
         namespace: &str,
@@ -445,6 +469,7 @@ impl CredentialStore {
             github_app_deliveries: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
+            cleaned_delivery_environments: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -646,6 +671,16 @@ impl CredentialStore {
         } else {
             None
         };
+        if specs.iter().any(|(_, spec)| matches!(spec.consumer, CredentialConsumer::GithubApp { .. })) {
+            let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
+            let cleanup = {
+                let mut cleanups = self.cleaned_delivery_environments.lock().await;
+                Arc::clone(cleanups.entry(environment_ref.to_string()).or_insert_with(|| Arc::new(OnceCell::new())))
+            };
+            if let Err(error) = cleanup.get_or_try_init(|| cleanup_stale_github_app_token_files_with_runner(&*runner, &paths.base)).await {
+                tracing::warn!(%environment_ref, %error, "failed to clean up delivered GitHub App token staging files");
+            }
+        }
         let mut env = BTreeMap::new();
         let mut new_git_config_fragments = BTreeMap::new();
         let mut git_config_owner = None;
@@ -938,6 +973,7 @@ impl CredentialStore {
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
+        self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
         self.git_config_fragments.lock().await.remove(environment_ref);
@@ -1741,6 +1777,100 @@ fn github_app_token_file(paths: &CredentialDeliveryPaths, credential_name: &str)
     paths.credential_dir(credential_name).join("token")
 }
 
+async fn cleanup_stale_github_app_token_files_in(base: &Path) -> Result<(), String> {
+    let credentials = base.join("credentials");
+    let mut directories = match tokio::fs::read_dir(&credentials).await {
+        Ok(directories) => directories,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("list credential directories at {}: {error}", credentials.display())),
+    };
+    let mut errors = Vec::new();
+    while let Some(directory) = directories.next_entry().await.map_err(|error| format!("list credential directories: {error}"))? {
+        match directory.file_type().await {
+            Ok(file_type) if !file_type.is_dir() => continue,
+            Err(error) => {
+                errors.push(format!("inspect credential directory {}: {error}", directory.path().display()));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        if let Err(error) = cleanup_stale_github_app_token_files_in_directory(&directory.path()).await {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(directory)
+        .await
+        .map_err(|error| format!("list credential staging files in {}: {error}", directory.display()))?;
+    let mut errors = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
+        if uuid::Uuid::parse_str(suffix).is_err() {
+            continue;
+        }
+        match entry.file_type().await {
+            Ok(file_type) if !file_type.is_file() => continue,
+            Err(error) => {
+                errors.push(format!("inspect staging file {}: {error}", entry.path().display()));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let path = entry.path();
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            errors.push(format!("remove stale GitHub App token staging file {}: {error}", path.display()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRunner, base: &Path) -> Result<(), String> {
+    runner
+        .run(
+            "sh",
+            &[
+                "-c",
+                "failed=0; \
+                for directory in \"$1\"/credentials/*; do \
+                    [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
+                    for file in \"$directory\"/token.tmp-*; do \
+                        [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
+                        case \"${file##*/}\" in \
+                            token.tmp-????????-????-????-????-????????????) \
+                                name=${file##*/}; \
+                                hex=$(printf '%s' \"${name#token.tmp-}\" | tr -d '-'); \
+                                case \"$hex\" in \
+                                    ????????????????????????????????) \
+                                        case \"$hex\" in *[!0123456789abcdefABCDEF]*) continue;; esac; \
+                                        rm -f -- \"$file\" || failed=1;; \
+                                esac;; \
+                        esac; \
+                    done; \
+                done; \
+                exit \"$failed\"",
+                "flotilla-github-app-token-cleanup",
+                &base.to_string_lossy(),
+            ],
+            Path::new("/"),
+            &ChannelLabel::Default,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("clean delivered GitHub App token staging files: {error}"))
+}
+
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
     runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
     let path = path.to_string_lossy();
@@ -1874,7 +2004,7 @@ mod tests {
     use flotilla_core::providers::{
         discovery::EnvironmentAssertion,
         replay::{Masks, ReplayHttpClient, Session},
-        CommandOutput,
+        CommandOutput, ProcessCommandRunner,
     };
     use flotilla_protocol::NodeId;
     use flotilla_resources::{
@@ -2111,6 +2241,41 @@ mod tests {
 
     struct FailedTokenWriteRunner;
 
+    struct PathCommandRunner {
+        bin_dir: PathBuf,
+    }
+
+    #[async_trait]
+    impl CommandRunner for PathCommandRunner {
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            let output = self.run_output(cmd, args, cwd, label).await?;
+            if output.success {
+                Ok(output.stdout)
+            } else {
+                Err(output.stderr)
+            }
+        }
+
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            let output = tokio::process::Command::new(cmd)
+                .args(args)
+                .current_dir(cwd)
+                .env("PATH", format!("{}:/usr/bin:/bin", self.bin_dir.display()))
+                .output()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(CommandOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                success: output.status.success(),
+            })
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
     #[async_trait]
     impl CommandRunner for FailedTokenWriteRunner {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
@@ -2158,6 +2323,102 @@ mod tests {
         assert!(error.contains("simulated interrupted credential write"));
         assert_eq!(tokio::fs::read_to_string(&token_file).await.expect("read old token"), "still-valid-token");
         assert_eq!(std::fs::read_dir(directory.path()).expect("list credential directory").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_removes_only_github_app_staging_files() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let credential_dir = state.path().join("credentials/github-app");
+        tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
+        let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let live = credential_dir.join("token");
+        let unrelated = credential_dir.join("token.tmp-other");
+        for path in [&abandoned, &live, &unrelated] {
+            tokio::fs::write(path, "secret material").await.expect("write credential file");
+        }
+        cleanup_stale_github_app_token_files_in(state.path()).await.expect("clean staging files");
+
+        assert!(!abandoned.exists());
+        assert!(unrelated.exists());
+        assert!(live.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_sweeps_both_bases_even_if_one_fails() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let runtime = tempfile::tempdir().expect("create runtime directory");
+        let runtime_base = runtime.path().join("flotilla");
+        let state_credentials = state.path().join("credentials/github-app");
+        let runtime_credentials = runtime_base.join("credentials/github-app");
+        for directory in [&state_credentials, &runtime_credentials] {
+            tokio::fs::create_dir_all(directory).await.expect("create credential directory");
+        }
+        let state_staging = state_credentials.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let runtime_staging = runtime_credentials.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        for path in [&state_staging, &runtime_staging] {
+            tokio::fs::write(path, "abandoned material").await.expect("write staging file");
+        }
+        let store = CredentialStore::new(
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("XDG_RUNTIME_DIR".to_string(), runtime.path().to_string_lossy().into_owned())]))),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            state.path().to_path_buf(),
+        );
+
+        store.cleanup_stale_github_app_token_files().await.expect("sweep both credential bases");
+        assert!(!state_staging.exists());
+        assert!(!runtime_staging.exists());
+
+        tokio::fs::remove_dir_all(state.path().join("credentials")).await.expect("remove state credentials directory");
+        tokio::fs::write(state.path().join("credentials"), "block directory listing").await.expect("block state credentials directory");
+        tokio::fs::write(&runtime_staging, "abandoned material").await.expect("write another staging file");
+        store.cleanup_stale_github_app_token_files().await.expect_err("report state directory error");
+        assert!(!runtime_staging.exists(), "a bad state base must not prevent sweeping the runtime base");
+    }
+
+    #[tokio::test]
+    async fn delivered_environment_cleanup_removes_staging_file_without_touching_live_token() {
+        let base = tempfile::tempdir().expect("create delivery base");
+        let credential_dir = base.path().join("credentials/github-app");
+        tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
+        let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let live = credential_dir.join("token");
+        let malformed = credential_dir.join("token.tmp-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
+        tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
+        tokio::fs::write(&live, "live material").await.expect("write live token");
+        tokio::fs::write(&malformed, "unrelated material").await.expect("write unrelated file");
+
+        cleanup_stale_github_app_token_files_with_runner(&ProcessCommandRunner, base.path()).await.expect("clean delivered staging file");
+
+        assert!(!abandoned.exists());
+        assert!(live.exists());
+        assert!(malformed.exists());
+    }
+
+    #[tokio::test]
+    async fn delivered_cleanup_continues_after_one_removal_fails() {
+        let base = tempfile::tempdir().expect("create delivery base");
+        let bin_dir = tempfile::tempdir().expect("create command directory");
+        let fake_rm = bin_dir.path().join("rm");
+        tokio::fs::write(&fake_rm, "#!/bin/sh\ncase \"$3\" in */blocked/*) exit 1;; esac\nexec /bin/rm \"$@\"\n")
+            .await
+            .expect("write failing rm command");
+        tokio::fs::set_permissions(&fake_rm, std::fs::Permissions::from_mode(0o755)).await.expect("make rm command executable");
+        let blocked = base.path().join("credentials/blocked").join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let healthy = base.path().join("credentials/healthy").join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        for path in [&blocked, &healthy] {
+            tokio::fs::create_dir_all(path.parent().expect("credential directory")).await.expect("create credential directory");
+            tokio::fs::write(path, "abandoned material").await.expect("write staging file");
+        }
+
+        cleanup_stale_github_app_token_files_with_runner(&PathCommandRunner { bin_dir: bin_dir.path().to_path_buf() }, base.path())
+            .await
+            .expect_err("report failed removal after sweeping other directories");
+
+        assert!(blocked.exists());
+        assert!(!healthy.exists());
     }
 
     #[test]
