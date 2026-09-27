@@ -149,6 +149,16 @@ jobs:
             TERM=xterm-ghostty python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
             TERM=xterm-256color python3 -c "import curses; curses.setupterm(); assert curses.tigetnum(\"colors\") >= 256"
           '
+          # A checkout's rust-toolchain.toml must select a baked pin for the
+          # same non-root UID, which must also be able to write RUSTUP_HOME.
+          docker run --rm --user 12345:12345 "$CREW_IMAGE" sh -c '
+            set -eu
+            test -w "$RUSTUP_HOME/toolchains"
+            mkdir -p /tmp/pinned && cd /tmp/pinned
+            printf "[toolchain]\nchannel = \"1.98.1\"\ncomponents = [\"clippy\"]\n" > rust-toolchain.toml
+            cargo --version | grep -F " 1.98.1 "
+            cargo clippy --version
+          '
 
       - name: Report the pushed tag
         shell: bash
