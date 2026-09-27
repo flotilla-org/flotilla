@@ -1147,6 +1147,94 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
 }
 
 #[tokio::test]
+async fn managed_hook_turns_update_attention_through_terminal_session() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
+    for (harness_name, harness, active_event, active_payload, idle_event, idle_payload) in [
+        (
+            "claude-code",
+            AgentHarness::ClaudeCode,
+            "user-prompt-submit",
+            r#"{"session_id":"claude-1"}"#,
+            "stop",
+            r#"{"session_id":"claude-1"}"#,
+        ),
+        (
+            "codex",
+            AgentHarness::Codex,
+            "notify",
+            r#"{"type":"agent-turn-complete","thread-id":"codex-1"}"#,
+            "notify",
+            r#"{"type":"agent-turn-complete","thread-id":"codex-1"}"#,
+        ),
+    ] {
+        let name = format!("terminal-{harness_name}");
+        let created = sessions
+            .create(&InputMeta::builder().name(name.clone()).build(), &TerminalSessionSpec {
+                env_ref: "host-direct".into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: harness_name.into() },
+                cwd: "/repo".into(),
+                pool: "cleat".into(),
+            })
+            .await
+            .expect("terminal create");
+        let mut status = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkRunning {
+            session_id: name.clone(),
+            pid: None,
+            started_at: chrono::Utc::now(),
+            crew: None,
+            launch_command: harness_name.into(),
+            delivered_message_id: None,
+        }
+        .apply(&mut status);
+        sessions.update_status(&name, &created.metadata.resource_version, &status).await.expect("running status");
+        let store = flotilla_core::agents::shared_in_memory_agent_state_store();
+        let (_, parser) = flotilla_core::agents::parser_for_harness(harness_name).expect("parser");
+        for (event_type, payload, expected) in
+            [(active_event, active_payload, TerminalAttentionState::Working), (idle_event, idle_payload, TerminalAttentionState::Idle)]
+        {
+            if harness_name == "codex" && expected == TerminalAttentionState::Working {
+                let current = sessions.get(&name).await.expect("terminal for screen observation");
+                let mut status = current.status.expect("running status");
+                TerminalSessionStatusPatch::ObserveAttention {
+                    attention: flotilla_resources::TerminalAttention {
+                        state: TerminalAttentionState::Working,
+                        as_of: chrono::Utc::now(),
+                        source: flotilla_resources::TerminalAttentionSource::Screen,
+                    },
+                }
+                .apply(&mut status);
+                sessions.update_status(&name, &current.metadata.resource_version, &status).await.expect("screen working status");
+            } else {
+                let parsed = parser.parse_event(event_type, payload.as_bytes()).expect("parse hook");
+                let response = dispatch_request_with_state(&daemon, &store, 8, Request::AgentHook {
+                    event: AgentHookEvent::builder()
+                        .attachable_id(AttachableId::new(name.clone()))
+                        .harness(harness.clone())
+                        .event_type(parsed.event_type)
+                        .maybe_session_id(parsed.session_id)
+                        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.clone() })
+                        .build(),
+                })
+                .await;
+                assert!(matches!(ok_response(response, 8), Response::AgentHook));
+            }
+            let observed = sessions.get(&name).await.expect("observed terminal");
+            let attention = observed.status.and_then(|status| status.attention).expect("attention");
+            assert_eq!(attention.state, expected);
+            let source = if harness_name == "codex" && expected == TerminalAttentionState::Working {
+                flotilla_resources::TerminalAttentionSource::Screen
+            } else {
+                flotilla_resources::TerminalAttentionSource::Hook
+            };
+            assert_eq!(attention.source, source);
+        }
+    }
+}
+
+#[tokio::test]
 async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
     let (_tmp, daemon) = empty_daemon().await;
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
