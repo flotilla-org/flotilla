@@ -15,11 +15,10 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewImageBaseline,
-    Demand, DispatchObservation, Environment, Event, FieldOwnedResource, Forge, FulfilmentKind, Host, InputMeta, Issue, ObjectMeta, OwnerReference,
-
-    PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository,
-    Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent,
-    WatchStart, WorkflowTemplate, WriterIdentity,
+    Demand, DispatchObservation, Environment, Event, FieldOwnedResource, Forge, FulfilmentKind, Host, InputMeta, Issue, ObjectMeta,
+    OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass,
+    Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel,
+    WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";

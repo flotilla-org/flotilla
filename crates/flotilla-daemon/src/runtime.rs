@@ -1034,22 +1034,27 @@ async fn apply_agentless_ssh_observation(
         let platform = agentless_platform(ssh.runner.as_ref()).await;
         migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     }
-    let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
-        host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+    let fulfilment_facts = if probe_succeeded {
+        let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
+            host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let facts = observe_fulfilment_facts(
+            &daemon.resource_backend(),
+            namespace,
+            &profile.host_id,
+            &profile.available_pools,
+            &previous_facts,
+            ssh.runner.as_ref(),
+            &BagEnvVars(&ssh.env_bag),
+        )
+        .await?;
+        ssh.facts_probed_this_process.store(true, Ordering::Release);
+        facts
     } else {
         BTreeMap::new()
     };
-    let fulfilment_facts = observe_fulfilment_facts(
-        &daemon.resource_backend(),
-        namespace,
-        &profile.host_id,
-        &profile.available_pools,
-        &previous_facts,
-        ssh.runner.as_ref(),
-        &BagEnvVars(&ssh.env_bag),
-    )
-    .await?;
-    ssh.facts_probed_this_process.store(true, Ordering::Release);
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
@@ -5803,6 +5808,20 @@ mod tests {
             .await
             .expect("refreshed SSH kind");
         assert_eq!(kind.spec.pool, "alternate-pool");
+        let mut unreachable = profile.clone();
+        unreachable.runner = Arc::new(DiscoveryMockRunner::builder().on_run("rustc", &["--version"], Ok("rustc 9".into())).build());
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &unreachable, None).await.expect("publish unreachable SSH observation");
+        let unreachable_status = daemon
+            .resource_backend()
+            .using::<Host>(NAMESPACE)
+            .get(host_id)
+            .await
+            .expect("SSH Host")
+            .status
+            .expect("unreachable SSH status");
+        assert!(!unreachable_status.ready);
+        assert!(unreachable_status.fulfilment_facts.is_empty(), "unreachable SSH host must not retain or probe facts");
+        apply_agentless_ssh_observation(&daemon, NAMESPACE, &profile, None).await.expect("restore SSH observation");
         let state = Arc::new(
             ControllerRuntimeState::new(
                 Arc::clone(&daemon),
