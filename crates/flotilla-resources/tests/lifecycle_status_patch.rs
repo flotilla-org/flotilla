@@ -69,6 +69,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoySetStalled => NONE,
     ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
@@ -120,6 +121,7 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,
@@ -257,6 +259,7 @@ fn pending_brief() -> PendingBrief {
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        stalled: None,
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,

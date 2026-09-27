@@ -691,6 +691,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
     }
+    if let Some(stalled) = &explanation.stalled {
+        let _ = writeln!(output, "Stalled: {}", serde_json::to_string_pretty(stalled).expect("stall condition serializes"));
+    }
     let standing = explanation.settlement.mode == flotilla_protocol::commands::SETTLEMENT_MODE_STANDING;
     let verdict = if explanation.settlement.satisfied { "SATISFIED" } else { "HOLDING" };
     if standing {
