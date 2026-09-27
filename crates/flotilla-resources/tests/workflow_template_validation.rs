@@ -279,8 +279,8 @@ fn issue_subjects_distinguish_installations_on_one_host() {
         source: IssueSource { service: format!("https://Forgejo.Example/{path}/"), scope: "Team/Repo".into() },
         id: "12".into(),
     };
-    let lab = source("Lab");
-    let stage = source("Stage");
+    let lab = source("lab");
+    let stage = source("stage");
     let fallback_lab = issue_address(&lab).expect("lab");
     let fallback_stage = issue_address(&stage).expect("stage");
     assert_eq!(fallback_lab.to_string(), "issue/forgejo.example%2flab/Team/Repo/12");
@@ -305,6 +305,11 @@ fn issue_subjects_distinguish_installations_on_one_host() {
     let lab_alias =
         IssueRef { source: IssueSource { service: "https://lab.example/lab".into(), scope: "Team/Repo".into() }, id: "12".into() };
     assert_eq!(issue_address_with_forges(&lab_alias, &forges).expect("declared lab alias"), lab_address);
+    let distinct_case = source("Lab");
+    assert_eq!(
+        issue_address_with_forges(&distinct_case, &forges).expect("distinct case").to_string(),
+        "issue/forgejo.example%2flab/Team/Repo/12"
+    );
     assert_ne!(lab_address, stage_address);
     assert_ne!(issue_record_name("lab", "Team/Repo", 12), issue_record_name("stage", "Team/Repo", 12));
 }

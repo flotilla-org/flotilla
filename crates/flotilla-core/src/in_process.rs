@@ -157,12 +157,16 @@ struct ProviderIssueObservationSource {
 fn issue_source_for_subject(
     subject: &crate::issue_observer::IssueRef,
     forges: &[flotilla_resources::ForgeSpec],
-) -> flotilla_protocol::IssueSource {
-    let service = forges
-        .iter()
-        .find(|forge| forge.forge_id == subject.service)
-        .map_or_else(|| format!("https://{}", subject.service.replace("%2f", "/").replace("%25", "%")), |forge| forge.https_url.clone());
-    flotilla_protocol::IssueSource { service, scope: subject.scope.clone() }
+) -> Result<flotilla_protocol::IssueSource, String> {
+    let service = if let Some(forge) = forges.iter().find(|forge| forge.forge_id == subject.service) {
+        forge.https_url.clone()
+    } else {
+        if !subject.service.contains(['.', ':']) && !subject.service.contains("%2f") && subject.service != "localhost" {
+            return Err(format!("issue service `{}` has no Forge declaration or host-derived address", subject.service));
+        }
+        format!("https://{}", subject.service.replace("%2f", "/").replace("%25", "%"))
+    };
+    Ok(flotilla_protocol::IssueSource { service, scope: subject.scope.clone() })
 }
 
 #[async_trait]
@@ -178,7 +182,7 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
-        let fallback = flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges), id: subject.number.to_string() };
+        let fallback = flotilla_protocol::IssueRef { source: issue_source_for_subject(subject, &forges)?, id: subject.number.to_string() };
         let reference = daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)

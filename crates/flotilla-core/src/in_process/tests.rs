@@ -49,7 +49,7 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
             scope: "Team/Repo".into(),
             number: 12,
         };
-        let source = issue_source_for_subject(&subject, &forges);
+        let source = issue_source_for_subject(&subject, &forges).expect("source");
         assert_eq!(source.service, expected);
         let reference = flotilla_protocol::IssueRef { source, id: "12".into() };
         let declarations = if service.contains("%2f") { &[][..] } else { &forges[..] };
@@ -58,6 +58,9 @@ fn standalone_issue_source_lookup_round_trips_installation_identity() {
             format!("issue/{service}/Team/Repo/12")
         );
     }
+    let orphaned =
+        crate::issue_observer::IssueRef { namespace: "flotilla".into(), service: "lab".into(), scope: "Team/Repo".into(), number: 12 };
+    assert!(issue_source_for_subject(&orphaned, &[]).expect_err("missing Forge").contains("no Forge declaration"));
 }
 
 struct RecordingWorkCredentials {

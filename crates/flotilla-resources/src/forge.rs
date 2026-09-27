@@ -65,7 +65,7 @@ impl ForgeSpec {
             .and_then(|front| front.split_once('/'))
             .map_or("", |(_, path)| path)
             .trim_end_matches('/');
-        self.matches_host(host) && path.trim_end_matches('/').eq_ignore_ascii_case(forge_path)
+        self.matches_host(host) && path.trim_end_matches('/') == forge_path
     }
 
     pub fn matches_host(&self, host: &str) -> bool {
