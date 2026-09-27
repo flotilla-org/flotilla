@@ -497,7 +497,7 @@ impl BlobStore for TieredBlobStore {
                         error = Some(failure);
                         continue;
                     }
-                    self.local.put(&bytes).await?;
+                    self.local.write_digest(digest, &bytes).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
                     tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
