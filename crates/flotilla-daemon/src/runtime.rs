@@ -5217,6 +5217,24 @@ mod tests {
                 .expect("set SSH destination");
         }
 
+        // This host passes discovery but registration must reject its collision
+        // with the daemon's own Host identity.
+        let local_id = daemon.local_host_id().expect("local host identity").to_string();
+        let collision_environment_id = EnvironmentId::new(format!("host-direct-{local_id}"));
+        daemon
+            .register_direct_environment_for_test(
+                collision_environment_id.clone(),
+                Arc::new(DiscoveryMockRunner::builder().build()),
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", "/colliding-host"))
+                    .with(EnvironmentAssertion::binary("cleat", "/usr/bin/cleat")),
+                Some(flotilla_protocol::qualified_path::HostId::new(&local_id)),
+            )
+            .expect("register colliding direct environment");
+        daemon
+            .set_direct_environment_ssh_destination_for_test(&collision_environment_id, "crew@colliding-host".to_string())
+            .expect("set colliding SSH destination");
+
         let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
             heartbeat_interval: Duration::from_secs(300),
             controller_resync_interval: Duration::from_secs(300),
@@ -5227,8 +5245,7 @@ mod tests {
         .expect("bad SSH preflight must not abort daemon startup");
 
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
-        let local_id = daemon.local_host_id().expect("local host identity");
-        assert!(hosts.get(local_id.as_str()).await.expect("local host remains registered").status.expect("local heartbeat").ready);
+        assert!(hosts.get(&local_id).await.expect("local host remains registered").status.expect("local heartbeat").ready);
         assert!(hosts.get("bad-ssh-host").await.is_err(), "host without a persistent terminal pool must be skipped");
         let good = hosts.get("good-ssh-host").await.expect("other SSH host remains registered");
         assert!(good.status.expect("other SSH observation").ready);
