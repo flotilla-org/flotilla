@@ -11,6 +11,7 @@ use flotilla_core::providers::{
         runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
         ProvisionedMount, ProvisionedMountMode,
     },
+    vcs::skill_source::stage_git_skill_sources,
     ChannelLabel, CommandRunner,
 };
 use tokio::{fs, io::AsyncWriteExt};
@@ -472,8 +473,6 @@ impl SkillBundle {
             .await
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
         let mut args = vec![
-            "-c".to_string(),
-            "set -eu\nmanifest=$1\ndestination=$2\ncleanup_tokens=$3\nshift 3\nexport GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0\nstaged=\"${destination}.flotilla-staging\"\nsources=\"${destination}.flotilla-sources.$$\"\ntoken_files=\nsucceeded=false\ncleanup() { rm -rf \"$staged\" \"$sources\"; if [ \"$cleanup_tokens\" = true ] || [ \"$succeeded\" != true ]; then for token_file in $token_files; do rm -f \"$token_file\"; done; fi; }\ntrap cleanup EXIT HUP INT TERM\nrm -rf \"$staged\" \"$sources\"\nmkdir -p \"$staged\" \"$sources\"\nwhile [ \"$#\" -gt 0 ]; do\n  name=$1\n  repository=$2\n  revision=$3\n  token_file=$4\n  credential=$5\n  path_count=$6\n  shift 6\n  checkout=\"$sources/$name\"\n  paths_file=\"$sources/$name.paths\"\n  sparse_file=\"$sources/$name.sparse\"\n  : >\"$paths_file\"\n  : >\"$sparse_file\"\n  while [ \"$path_count\" -gt 0 ]; do\n    printf '%s\\n' \"$1\" >>\"$paths_file\"\n    printf '/%s/\\n' \"$1\" >>\"$sparse_file\"\n    shift\n    path_count=$((path_count - 1))\n  done\n  git -C \"$sources\" init --quiet \"$name\" >/dev/null\n  git -C \"$checkout\" remote add origin \"$repository\"\n  git -C \"$checkout\" sparse-checkout set --no-cone --stdin <\"$sparse_file\" >/dev/null\n  if [ -n \"$token_file\" ]; then\n    token_files=\"$token_files $token_file\"\n    export GITHUB_TOKEN_FILE=\"$token_file\"\n    helper='!f() { [ \"$1\" = get ] || exit 0; printf \"username=x-access-token\\npassword=\"; cat \"$GITHUB_TOKEN_FILE\"; printf \"\\n\"; }; f'\n    git -C \"$checkout\" config credential.helper \"$helper\"\n    git -C \"$checkout\" fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name credential $credential fetch failed at pinned revision $revision\" >&2; exit 1; }\n  else\n    git -C \"$checkout\" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin \"$revision\" >/dev/null || { echo \"skill source $name anonymous fetch failed at pinned revision $revision\" >&2; exit 1; }\n  fi\n  test \"$(git -C \"$checkout\" rev-parse FETCH_HEAD)\" = \"$revision\" || { echo \"skill source $name fetch failed at pinned revision $revision\" >&2; exit 1; }\n  git -C \"$checkout\" checkout --quiet --detach FETCH_HEAD >/dev/null\n  while IFS= read -r path; do\n    if [ ! -d \"$checkout/$path\" ]; then\n      echo \"skill source $name declared path $path is missing at pinned revision $revision\" >&2\n      exit 1\n    fi\n    find \"$checkout/$path\" -type f -name SKILL.md >\"$sources/skill-files\"\n    if [ ! -s \"$sources/skill-files\" ]; then\n      echo \"skill source $name declared path $path has no SKILL.md at pinned revision $revision\" >&2\n      exit 1\n    fi\n    while IFS= read -r skill_file; do\n      skill_dir=${skill_file%/SKILL.md}\n      skill_name=${skill_dir##*/}\n      target=\"$staged/$skill_name\"\n      if [ -e \"$target\" ]; then\n        echo \"duplicate skill name $skill_name from $repository\" >&2\n        exit 1\n      fi\n      mkdir -p \"$target\"\n      cp -R \"$skill_dir\"/. \"$target\"/\n    done <\"$sources/skill-files\"\n  done <\"$paths_file\"\n  if [ -n \"$token_file\" ]; then\n    unset GITHUB_TOKEN_FILE\n  fi\ndone\ncp \"$manifest\" \"$staged/.flotilla-sources.json\"\nrm -rf \"$destination\"\nmv \"$staged\" \"$destination\"\nrm -rf \"$sources\"\nsucceeded=true\ncleanup\ntrap - EXIT HUP INT TERM".to_string(),
             "flotilla-stage-skills".to_string(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
             String::new(),
@@ -493,10 +492,9 @@ impl SkillBundle {
         }
         let destination_count = destinations.len();
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
-            args[4] = destination.to_string_lossy().into_owned();
-            args[5] = (index + 1 == destination_count).to_string();
-            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let result = runner.run("sh", &arg_refs, Path::new("/"), &ChannelLabel::Default).await;
+            args[2] = destination.to_string_lossy().into_owned();
+            args[3] = (index + 1 == destination_count).to_string();
+            let result = stage_git_skill_sources(runner, &args).await;
             result.map_err(|error| skill_stage_error(environment_ref, &error))?;
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
         }
