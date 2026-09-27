@@ -4,26 +4,37 @@
 # version arguments belong immediately before the final layer so an adapter
 # update can reuse the much larger language-toolchain layers.
 
-# Builder stage: prepare the Ghostty install prefix cleat's ghostty-vt feature
-# needs. Zig and the ghostty source stay in this stage; only the installed
-# prefix reaches the final image (consumed via CLEAT_GHOSTTY_PREFIX).
-FROM ubuntu:24.04 AS ghostty-builder
-ARG TARGETARCH
+# Zig is shared by the terminfo builder and the final image, where cleat crews
+# build ghostty-vt from their checkout's pin.
 ARG ZIG_VERSION=0.16.0
-ARG CLEAT_REF=2f154566eb0e5ea3e70abbda2327f211ea183c2b
+FROM ubuntu:24.04 AS zig-toolchain
+ARG TARGETARCH
+ARG ZIG_VERSION
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils build-essential ncurses-bin \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq xz-utils \
     && rm -rf /var/lib/apt/lists/*
 RUN case "${TARGETARCH}" in \
         amd64) zig_arch=x86_64 ;; \
         arm64) zig_arch=aarch64 ;; \
         *) echo "unsupported Zig architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
-    && zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}" \
-    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" \
-    | tar -xJ -C /opt \
-    && ln -s "/opt/${zig_dir}/zig" /usr/local/bin/zig \
+    && zig_archive="zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz" \
+    && curl -fsSL "https://ziglang.org/download/index.json" -o /tmp/zig-index.json \
+    && zig_sha="$(jq -er --arg version "${ZIG_VERSION}" --arg target "${zig_arch}-linux" '.[$version][$target].shasum' /tmp/zig-index.json)" \
+    && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_archive}" -o "/tmp/${zig_archive}" \
+    && printf '%s  %s\n' "${zig_sha}" "/tmp/${zig_archive}" | sha256sum --check --strict - \
+    && mkdir -p /opt/zig \
+    && tar -xJf "/tmp/${zig_archive}" -C /opt/zig --strip-components=1 \
+    && ln -s /opt/zig/zig /usr/local/bin/zig \
+    && rm "/tmp/${zig_archive}" /tmp/zig-index.json \
     && test "$(zig version)" = "${ZIG_VERSION}"
+
+# Builder stage: generate xterm-ghostty terminfo from cleat's pinned source.
+FROM zig-toolchain AS ghostty-builder
+ARG CLEAT_REF=2f154566eb0e5ea3e70abbda2327f211ea183c2b
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git build-essential ncurses-bin \
+    && rm -rf /var/lib/apt/lists/*
 COPY ci/crew-image/emit-ghostty-terminfo.zig /tmp/emit-ghostty-terminfo.zig
 # Cleat's preparation script reads the Ghostty revision from its own
 # tools/ghostty-toolchain.toml. Verify Zig matches that same pin.
@@ -56,6 +67,7 @@ RUN apt-get update \
 ARG RUST_VERSION=1.94.1
 ARG RUST_NIGHTLY=nightly-2026-03-12
 ARG NODE_VERSION=24.18.0
+ARG ZIG_VERSION
 ARG TARGETARCH
 
 ENV CARGO_HOME=/usr/local/cargo
@@ -111,6 +123,10 @@ RUN case "${TARGETARCH}" in \
     && node --version \
     && npm --version
 
+COPY --from=zig-toolchain /opt/zig /opt/zig
+RUN ln -s /opt/zig/zig /usr/local/bin/zig \
+    && test "$(zig version)" = "${ZIG_VERSION}"
+
 # 3. Forge CLI and day-to-day utilities.
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -164,7 +180,6 @@ RUN npm install --global \
         "@openai/codex@${CODEX_VERSION}" \
     && npm cache clean --force
 
-COPY --from=ghostty-builder /src/cleat/.tools/ghostty-install /opt/ghostty-install
 # Ghostty terminfo comes from the same pinned source as libghostty-vt (see
 # CLEAT_REF and tools/ghostty-toolchain.toml in that checkout). It is MIT
 # licensed; retain the source licence alongside the installed database.
@@ -172,7 +187,6 @@ COPY --from=ghostty-builder /src/cleat/.tools/ghostty-install/share/terminfo/ /u
 COPY --from=ghostty-builder /src/cleat/.tools/ghostty-src/LICENSE /usr/share/doc/ghostty-terminfo/copyright
 RUN infocmp xterm-ghostty >/dev/null \
     && infocmp xterm-256color >/dev/null
-ENV CLEAT_GHOSTTY_PREFIX=/opt/ghostty-install
 
 ENV DISABLE_AUTOUPDATER=1
 ENV SHELL=/bin/zsh
@@ -192,6 +206,9 @@ RUN claude --version \
     && ld.lld --version \
     && make --version \
     && pkg-config --version \
+    && zig version \
+    && test -z "${CLEAT_GHOSTTY_PREFIX+x}" \
+    && test ! -e /opt/ghostty-install \
     && printf '#include <stdio.h>\nint main(void) { puts("c toolchain ready"); }\n' \
         | clang -fuse-ld=lld -x c - -o /tmp/c-toolchain-smoke \
     && /tmp/c-toolchain-smoke \
