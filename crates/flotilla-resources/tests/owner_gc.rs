@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::Utc;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
-    delete_resource_kind, Host, HostSpec, InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector, OwnerReference,
-    ResourceBackend, ResourceError, SqliteBackend, WatchEvent, WatchStart,
+    delete_resource_kind, EventRetention, Host, HostSpec, InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector,
+    OwnerReference, ResourceBackend, ResourceError, SqliteBackend, WatchEvent, WatchStart,
 };
 use futures::StreamExt;
 
@@ -53,6 +53,111 @@ async fn start(backend: &ResourceBackend) -> tokio::task::JoinHandle<Result<(), 
         result = &mut task => panic!("collector stopped: {result:?}"),
     }
     task
+}
+
+/// A deletion after the preceding writes on this kind confirms that the
+/// collector has consumed those watch events before assertions inspect it.
+async fn flush(backend: &ResourceBackend, marker: &str) {
+    let mut watch = backend.using::<Host>(NS).watch(WatchStart::Now).await.expect("watch marker");
+    create(backend, meta(marker, Some("missing"))).await;
+    deleted(&mut watch, marker).await;
+}
+
+async fn index_maintenance_contract(backend: ResourceBackend) {
+    create(&backend, meta("first-owner", None)).await;
+    create(&backend, meta("second-owner", None)).await;
+    create(&backend, meta("moving-child", Some("first-owner"))).await;
+    create(&backend, meta("removed-child", Some("first-owner"))).await;
+    let task = start(&backend).await;
+    let hosts = backend.using::<Host>(NS);
+
+    let moving = hosts.get("moving-child").await.expect("moving child");
+    hosts
+        .update(&meta("moving-child", Some("second-owner")), &moving.metadata.resource_version, &moving.spec)
+        .await
+        .expect("reparent child");
+    hosts.delete("removed-child").await.expect("delete indexed child");
+    flush(&backend, "after-reparent").await;
+    hosts.delete("first-owner").await.expect("delete old owner");
+    flush(&backend, "after-old-owner").await;
+    assert!(hosts.get("moving-child").await.is_ok(), "old owner must not collect reparented child");
+
+    let mut watch = hosts.watch(WatchStart::Now).await.expect("watch moving child");
+    hosts.delete("second-owner").await.expect("delete current owner");
+    deleted(&mut watch, "moving-child").await;
+
+    let mut watch = hosts.watch(WatchStart::Now).await.expect("watch late child");
+    create(&backend, meta("late-child", Some("second-owner"))).await;
+    deleted(&mut watch, "late-child").await;
+
+    task.abort();
+    let _ = task.await;
+    create(&backend, meta("restart-orphan", Some("second-owner"))).await;
+    let task = start(&backend).await;
+    assert!(matches!(hosts.get("restart-orphan").await, Err(ResourceError::NotFound { .. })), "restart sweep catches missed writes");
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn memory_index_maintenance() {
+    index_maintenance_contract(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn sqlite_index_maintenance() {
+    index_maintenance_contract(ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))).await;
+}
+
+async fn expired_cursor_recovery_contract(backend: ResourceBackend) {
+    let hosts = backend.using::<Host>(NS);
+    let first = hosts.create(&meta("old-event", None), &HostSpec::default()).await.expect("first event");
+    create(&backend, meta("new-event", None)).await;
+    create(&backend, meta("orphan-after-gap", Some("missing-owner"))).await;
+    assert!(matches!(hosts.watch(WatchStart::FromVersion(first.metadata.resource_version)).await, Err(ResourceError::WatchExpired { .. })));
+    let task = start(&backend).await;
+    assert!(matches!(hosts.get("orphan-after-gap").await, Err(ResourceError::NotFound { .. })));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn memory_expired_cursor_recovery() {
+    let retention = EventRetention::new(1).expect("retention");
+    expired_cursor_recovery_contract(ResourceBackend::InMemory(InMemoryBackend::with_event_retention(retention))).await;
+}
+
+#[tokio::test]
+async fn sqlite_expired_cursor_recovery() {
+    let retention = EventRetention::new(1).expect("retention");
+    expired_cursor_recovery_contract(ResourceBackend::Sqlite(
+        SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite"),
+    ))
+    .await;
+}
+
+/// Manual cost check at a fleet-sized namespace. Startup still relists, while
+/// the measured steady-state phase deletes leaves with no controlled children.
+#[tokio::test]
+#[ignore = "manual garbage collection cost measurement"]
+async fn leaf_deletion_cost_at_fleet_size() {
+    for (label, backend) in [
+        ("memory", ResourceBackend::InMemory(InMemoryBackend::default())),
+        ("sqlite", ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite"))),
+    ] {
+        for index in 0..1_000 {
+            create(&backend, meta(&format!("unrelated-{index}"), None)).await;
+        }
+        let task = start(&backend).await;
+        let begin = std::time::Instant::now();
+        for index in 0..100 {
+            backend.using::<Host>(NS).delete(&format!("unrelated-{index}")).await.expect("delete leaf");
+        }
+        flush(&backend, "benchmark-flush").await;
+        println!("{label}: 100 leaf deletions among 1000 resources: {:?}", begin.elapsed());
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 async fn cascade_contract(backend: ResourceBackend) {

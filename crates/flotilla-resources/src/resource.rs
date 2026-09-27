@@ -134,7 +134,7 @@ pub trait Resource: Send + Sync + 'static {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OwnerReference {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
