@@ -321,6 +321,17 @@ pub struct DaemonConfig {
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,
     #[serde(default)]
     pub manifests: Option<ResourceManifestsConfig>,
+    #[serde(default)]
+    pub relay: Option<RelayConfig>,
+}
+
+/// Host-local event relay settings. The token is read from a daemon-owned file;
+/// this path is never included in a vessel's staged credential set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayConfig {
+    pub endpoint: String,
+    pub install_id: String,
+    pub consumer_token_file: PathBuf,
 }
 
 /// Host-local directory whose resource documents are continuously applied as

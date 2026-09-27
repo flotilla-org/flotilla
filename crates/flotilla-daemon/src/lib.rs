@@ -4,6 +4,7 @@ mod codex_central;
 mod credential;
 mod dispatch_reconciler;
 mod environment_tools;
+mod event_relay;
 mod issue_materializer;
 mod resource_limits;
 pub mod resource_manifest;

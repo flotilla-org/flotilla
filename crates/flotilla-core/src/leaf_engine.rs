@@ -215,6 +215,18 @@ impl LeafSubscriptionTable {
         self.inner.change_requests.refresh_once(subject).await
     }
 
+    pub async fn has_change_request_demand(&self, subject: &ChangeRequestRef) -> bool {
+        self.inner.change_requests.has_demand(subject).await
+    }
+
+    pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
+        self.inner.change_requests.refresh_demanded_owned().await
+    }
+
+    pub fn set_change_request_relay_healthy(&self, healthy: bool) {
+        self.inner.change_requests.set_relay_healthy(healthy);
+    }
+
     pub async fn rows(&self) -> Vec<LeafSubscriptionRow> {
         self.inner.rows.lock().await.values().cloned().collect()
     }
