@@ -82,6 +82,48 @@ fn platform_matrix_expands_into_named_vessels() {
 }
 
 #[test]
+fn dual_authored_template_refuses_a_role_only_in_the_vessel_hint() {
+    let project = ProjectSpec::builder().display_name("example".to_string()).default_workflow_ref("work".to_string()).build();
+    let crew = |role: &str| CrewSpec::builder().role(role.to_string()).source(CrewSource::Tool { command: "true".to_string() }).build();
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .roles(vec![crew("coder")])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew("reviewer")]).build()])
+        .build();
+    let error = expand_allocation_roles(&mut workflow, &project).expect_err("missing role must refuse");
+    assert!(error.contains("reviewer"), "{error}");
+}
+
+#[test]
+fn matrix_turn_delivery_requires_a_concrete_vessel() {
+    let roles = ["macos", "windows"]
+        .into_iter()
+        .map(|platform| AllocationRole {
+            crew: CrewSpec::builder()
+                .role("verify".to_string())
+                .needs(BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]))
+                .source(CrewSource::Tool { command: "true".to_string() })
+                .build(),
+            hint: format!("verify[{platform}]"),
+            repository_refs: None,
+            depends_on: Vec::new(),
+            credential_signature: String::new(),
+        })
+        .collect::<Vec<_>>();
+    let rule = flotilla_resources::TurnDeliveryRule::builder()
+        .on("$cr.mergeable == conflicting".parse().expect("leaf"))
+        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("verify".to_string()).role("verify".to_string()).build())
+        .brief("Verify the result".to_string())
+        .hold(HoldAct::ChangeRequestComment { body: "Verification needed".to_string() })
+        .build();
+    let mut workflow = WorkflowTemplateSpec::builder().turn_delivery(indexmap::IndexMap::from([("verify".to_string(), rule)])).build();
+    let error = allocate_roles(&mut workflow, &roles).expect_err("ambiguous delivery must refuse");
+    assert!(error.contains("multiple vessels"), "{error}");
+    workflow.turn_delivery["verify"].to.vessel = "verify[macos]".to_string();
+    allocate_roles(&mut workflow, &roles).expect("explicit concrete target");
+    assert_eq!(workflow.turn_delivery["verify"].to.vessel, "verify[macos]");
+}
+
+#[test]
 fn standalone_issue_source_lookup_round_trips_installation_identity() {
     let lab = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".into())

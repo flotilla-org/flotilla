@@ -2144,7 +2144,7 @@ struct ConvoyAdmission {
     vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AllocationRole {
     crew: CrewSpec,
     hint: String,
@@ -2155,6 +2155,23 @@ struct AllocationRole {
 
 fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &ProjectSpec) -> Result<Vec<AllocationRole>, String> {
     let mut roles = Vec::new();
+    if !workflow.roles.is_empty() {
+        let mut declared = BTreeSet::new();
+        for crew in &workflow.roles {
+            if !declared.insert(crew.role.as_str()) {
+                return Err(format!("workflow roles declare `{}` more than once", crew.role));
+            }
+        }
+        let mut hinted = BTreeSet::new();
+        for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
+            if !declared.contains(crew.role.as_str()) {
+                return Err(format!("vessel hint includes role `{}` absent from workflow roles", crew.role));
+            }
+            if !hinted.insert(crew.role.as_str()) {
+                return Err(format!("more than one vessel hint includes role `{}`", crew.role));
+            }
+        }
+    }
     let authored = if workflow.roles.is_empty() {
         workflow.vessels.clone()
     } else {
@@ -2320,11 +2337,20 @@ fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[AllocationRole])
             }
         }
     }
-    for rule in workflow.turn_delivery.values_mut() {
+    for (source, rule) in &mut workflow.turn_delivery {
         if let Some(names) = role_to_vessels.get(&rule.to.role) {
-            if let Some(name) = names.iter().find(|name| *name == &rule.to.vessel).or_else(|| names.iter().next()) {
-                rule.to.vessel = name.clone();
-            }
+            let name = names
+                .iter()
+                .find(|name| *name == &rule.to.vessel)
+                .or_else(|| (names.len() == 1).then(|| names.iter().next()).flatten())
+                .ok_or_else(|| {
+                    format!(
+                        "turn delivery `{source}` targets role `{}` in multiple vessels ({}); name one concrete vessel",
+                        rule.to.role,
+                        names.iter().cloned().collect::<Vec<_>>().join(", ")
+                    )
+                })?;
+            rule.to.vessel = name.clone();
         }
     }
     if let Some(targets) = &mut workflow.supervision {
