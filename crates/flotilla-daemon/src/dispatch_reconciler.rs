@@ -253,7 +253,6 @@ impl DispatchReconciler {
                         continue;
                     }
                 }
-                let stance = flotilla_resources::Stance::Trusted;
                 let dispatched_at = convoy.metadata.creation_timestamp;
                 let time_from_ready_seconds =
                     dispatched_at.signed_duration_since(queue_entry.ready_observed_at).num_seconds().max(0) as u64;
@@ -263,7 +262,6 @@ impl DispatchReconciler {
                     .issue(issue.reference.clone())
                     .workflow_ref(convoy.spec.workflow_ref.clone())
                     .maybe_placement_policy(convoy.spec.placement_policy.clone())
-                    .stance(stance)
                     .ready_observed_at(queue_entry.ready_observed_at)
                     .dispatched_at(dispatched_at)
                     .time_from_ready_seconds(time_from_ready_seconds)
@@ -398,7 +396,7 @@ mod tests {
 
     use flotilla_protocol::IssueSource;
     use flotilla_resources::{
-        single_agent_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, Stance, VirtualClock,
+        single_agent_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, VirtualClock,
     };
 
     use super::*;
@@ -642,7 +640,6 @@ mod tests {
         assert_eq!(observation.issue, ready.reference);
         assert_eq!(observation.workflow_ref, "review-and-fix");
         assert_eq!(observation.placement_policy.as_deref(), Some("docker-local"));
-        assert_eq!(observation.stance, Stance::Trusted);
         assert_eq!(
             observation.time_from_ready_seconds,
             observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64

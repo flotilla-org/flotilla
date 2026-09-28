@@ -2224,6 +2224,44 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
 }
 
 #[tokio::test]
+async fn conflicting_role_platform_needs_refuse_the_shared_vessel() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
+        .vessels(vec![flotilla_resources::VesselRequirement::builder()
+            .name("work".to_string())
+            .crew(vec![
+                flotilla_resources::CrewSpec::builder()
+                    .role("linux".to_string())
+                    .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::Platform("linux".to_string())]))
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build(),
+                flotilla_resources::CrewSpec::builder()
+                    .role("windows".to_string())
+                    .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::Platform("windows".to_string())]))
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build(),
+            ])
+            .build()])
+        .build();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("conflicting-platforms".to_string()).build(), &workflow)
+        .await
+        .expect("workflow");
+    let result = start_capability_convoy(&daemon, "conflicting-platforms", |intent| {
+        intent.workflow_ref = Some("conflicting-platforms".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message }
+        if message.contains("vessel work") && message.contains("platform:linux") && message.contains("platform:windows")),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn requested_model_derives_harness_need_and_selects_host_direct() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
@@ -2299,6 +2337,17 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     };
     assert!(explanation.role_needs.values().flatten().any(|need| need == "harness:claude-code>=2.1.300"));
     assert_eq!(explanation.vessel_placements["work"].policy_name, "host-direct-model");
+    let refused = start_capability_convoy(&daemon, "model-unavailable", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("unavailable".to_string()),
+        });
+    })
+    .await;
+    assert!(
+        matches!(refused, CommandValue::Error { message } if message.contains("no observed claude-code harness accepts model unavailable"))
+    );
 }
 
 #[tokio::test]

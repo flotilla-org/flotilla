@@ -181,7 +181,6 @@ impl FulfilmentKindSpec {
                 let grants = BTreeSet::from([
                     FulfilmentGrant::Platform(host_platform.to_string()),
                     FulfilmentGrant::HostAccountReach,
-                    FulfilmentGrant::Network("scoped".to_string()),
                     FulfilmentGrant::Network("host".to_string()),
                     FulfilmentGrant::GuiSession,
                 ]);
