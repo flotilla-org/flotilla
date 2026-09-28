@@ -222,7 +222,6 @@ pub enum SettlementMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum UnmetSettlementExpectation {
-    MissingDecisionLedger { vessel: String, role: String },
     ChangeRequestNotReady { record: String, detail: String },
     InvalidExpectedCheckouts { message: String },
     ExitEntryAwaitingBinding { disposition: String, subject: String },
@@ -232,7 +231,6 @@ pub enum UnmetSettlementExpectation {
     CheckoutConditionUnknown { checkout: String, condition: String },
     StaleCheckoutEvidence { checkout: String, condition: String, observed_at: Option<String> },
     MissingChangeRequest { record: String },
-    MissingChangeRequestBinding { vessel: String, role: String },
     StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
     ChangeRequestConditionFalse { record: String, value: Option<String> },
     CompletionConditionUnsatisfied { subject: String, field_path: String, value: Option<String> },
@@ -331,12 +329,9 @@ fn evaluate_declared_completion_condition(
                     head.clone()
                 }
             };
+            let name = crate::artifact_record_name(&convoy.metadata.name, producer, kind, &subject);
             let address =
                 LeafAddress::Artifact { convoy: convoy.metadata.name.clone(), producer: producer.clone(), kind: kind.clone(), subject };
-            let name = crate::artifact_record_name(&convoy.metadata.name, producer, kind, match &address {
-                LeafAddress::Artifact { subject, .. } => subject,
-                _ => unreachable!(),
-            });
             let leaf = Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
             let subject = artifacts.get(&name).map(ArtifactLeafSubject);
             evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))

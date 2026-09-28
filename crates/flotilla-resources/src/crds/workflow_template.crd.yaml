@@ -165,6 +165,14 @@ spec:
                               items:
                                 type: object
                                 required: [subject, field_path, operator, literal]
+                                oneOf:
+                                  - required: [producer, kind, about]
+                                    properties:
+                                      subject:
+                                        enum: [artifact]
+                                  - properties:
+                                      subject:
+                                        enum: [change-request]
                                 properties:
                                   subject:
                                     type: string

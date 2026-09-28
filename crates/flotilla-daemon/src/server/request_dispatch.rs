@@ -77,6 +77,33 @@ curl --fail-with-body --silent --show-error -X POST \
         .ok_or_else(|| "projected ledger comment has no HTTPS URL".to_string())
 }
 
+async fn project_decision_ledger_once(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &str,
+    producer: &str,
+    body: &[u8],
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+) -> Result<Option<String>, String> {
+    let name = flotilla_resources::artifact_record_name(convoy, producer, "decision-ledger", convoy);
+    let existing = match backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&name).await {
+        Ok(record) => Some(record.object),
+        Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let digest = crate::blob_store::BlobDigest::of(body);
+    if let Some(url) = existing
+        .as_ref()
+        .filter(|record| record.spec.digest == digest.as_str())
+        .and_then(|record| record.spec.summary.get("comment_url"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Ok(Some(url.to_string()));
+    }
+    project_decision_ledger(backend, namespace, convoy, body, runner, cwd).await
+}
+
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
@@ -151,33 +178,16 @@ impl<'a> RequestDispatcher<'a> {
                         }
                         // Validation runs before the forge write; a path is never treated as content.
                         let body = crate::artifact::read_decision_ledger(temporary.path())?;
-                        let name = flotilla_resources::artifact_record_name(&caller.convoy, &session.spec.role, &kind, &subject);
-                        let existing = match backend.including_replicas::<flotilla_resources::Artifact>(&namespace).get(&name).await {
-                            Ok(record) => Some(record.object),
-                            Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
-                            Err(error) => return Err(error.to_string()),
-                        };
-                        let digest = crate::blob_store::BlobDigest::of(&body);
-                        let comment_url = existing
-                            .as_ref()
-                            .filter(|record| record.spec.digest == digest.as_str())
-                            .and_then(|record| record.spec.summary.get("comment_url"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string);
-                        let comment_url = match comment_url {
-                            Some(url) => Some(url),
-                            None => {
-                                project_decision_ledger(
-                                    &backend,
-                                    &namespace,
-                                    &caller.convoy,
-                                    &body,
-                                    runner.as_ref(),
-                                    Path::new(&session.spec.cwd),
-                                )
-                                .await?
-                            }
-                        };
+                        let comment_url = project_decision_ledger_once(
+                            &backend,
+                            &namespace,
+                            &caller.convoy,
+                            &session.spec.role,
+                            &body,
+                            runner.as_ref(),
+                            Path::new(&session.spec.cwd),
+                        )
+                        .await?;
                         if let Some(comment_url) = comment_url {
                             summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url));
                         }
@@ -522,7 +532,9 @@ mod ledger_projection_tests {
 
     use async_trait::async_trait;
     use flotilla_core::providers::CommandOutput;
-    use flotilla_resources::{BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, RepositoryKey};
+    use flotilla_resources::{
+        ArtifactSpec, BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, RepositoryKey,
+    };
 
     use super::*;
 
@@ -586,5 +598,35 @@ mod ledger_projection_tests {
         assert!(args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/42/comments"));
         assert!(!args.iter().any(|arg| arg.contains("Brief silence")));
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&input).expect("JSON")["body"], std::str::from_utf8(body).expect("UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn identical_ledger_digest_reuses_existing_comment_url() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
+        let comment_url = "https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7";
+        let spec = ArtifactSpec::builder()
+            .convoy("demo".to_string())
+            .producer("coder".to_string())
+            .kind("decision-ledger".to_string())
+            .subject("demo".to_string())
+            .summary(std::collections::BTreeMap::from([("comment_url".to_string(), serde_json::json!(comment_url))]))
+            .digest(crate::blob_store::BlobDigest::of(body).as_str().to_string())
+            .size(body.len() as u64)
+            .media_type("text/markdown".to_string())
+            .expires_at(chrono::Utc::now())
+            .build();
+        let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
+        backend
+            .using::<flotilla_resources::Artifact>("flotilla")
+            .create(&InputMeta::builder().name(name).build(), &spec)
+            .await
+            .expect("artifact");
+        let runner = CapturingRunner::default();
+        let result = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
+            .await
+            .expect("reuse comment");
+        assert_eq!(result.as_deref(), Some(comment_url));
+        assert!(runner.call.lock().expect("capture lock").is_none());
     }
 }

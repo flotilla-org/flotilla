@@ -546,11 +546,6 @@ fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: 
 
 fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
     match expectation {
-        UnmetSettlementExpectation::MissingDecisionLedger { vessel, role } => ExplainedUnmetExpectation {
-            reason: "missing_decision_ledger".to_string(),
-            subject: format!("crew/{vessel}/{role}"),
-            detail: "post the decision ledger comment and pass its URL with `--decision-ledger-ref`".to_string(),
-        },
         UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value } => ExplainedUnmetExpectation {
             reason: "completion_condition_unsatisfied".to_string(),
             detail: format!("{field_path} is {}", value.unwrap_or_else(|| "unavailable".to_string())),
@@ -598,11 +593,6 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
             reason: "missing_record".to_string(),
             subject: format!("change_request/{record}"),
             detail: "expected change request has no federated observation".to_string(),
-        },
-        UnmetSettlementExpectation::MissingChangeRequestBinding { vessel, role } => ExplainedUnmetExpectation {
-            reason: "missing_change_request_binding".to_string(),
-            subject: format!("crew/{vessel}/{role}"),
-            detail: "change request missing; create and bind a ready PR before completing".to_string(),
         },
         UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
             reason: "stale_evidence".to_string(),
