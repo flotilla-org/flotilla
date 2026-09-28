@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Capture the deployed generation's stored spec/status shapes through the CLI.
+
+Run after a fleet roll, review the resulting diff, and never refresh the corpus
+to make a schema-changing PR pass. Metadata and read-envelope provenance are
+omitted: compatibility is asserted for the persisted spec and status payloads.
+"""
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+
+KINDS = (
+    "Artifact", "ChangeRequest", "Issue", "Checkout", "Clone", "Convoy",
+    "ConvoyEnsure", "CredentialGrant", "CredentialSpec", "CrewImageBaseline",
+    "Demand", "DispatchObservation", "Environment", "Event", "Forge",
+    "FulfilmentKind", "Host", "PlacementPolicy", "Presentation", "Project",
+    "Regard", "Repository", "TerminalSession", "Usage", "Vessel",
+    "WorkflowTemplate",
+)
+
+# These fields contain arbitrary user/provider text, including terminal launch
+# commands and issue bodies. Their shape is a string; their content is not needed.
+FREE_TEXT = frozenset({
+    "argv", "body", "brief", "command", "content", "description", "detail", "details", "error", "instruction", "launch_command", "log",
+    "message", "notes", "output", "prompt", "stderr", "stdout", "summary",
+    "title",
+})
+HOSTS = ("feta", "kiwi", "udder")
+PATH = re.compile(r"(?:~/|(?<![\w])/(?:Users|home|root|mnt|workspace|tmp|var|opt|run|etc)/)[^\s\"'<>]+")
+EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+SECRET = re.compile(r"(?:gh[psu]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
+PRIVATE_DOMAIN = re.compile(r"\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.lab\.flotilla\.work\b")
+PRIVATE_ALIAS = re.compile(r"\bforgejo-manchego\b")
+
+
+def masked_host(match):
+    digest = hashlib.sha256(match.group().encode()).hexdigest()[:10]
+    return f"host-{digest}.example.invalid"
+
+
+def scrub(value, key=""):
+    if isinstance(value, dict):
+        return {scrub(k): scrub(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v, key) for v in value]
+    if not isinstance(value, str):
+        return value
+    if SECRET.search(value):
+        return "[redacted]"
+    if key.lower() in FREE_TEXT:
+        return "[redacted]"
+    value = PATH.sub("/masked/path", value)
+    value = EMAIL.sub("user@example.invalid", value)
+    value = PRIVATE_DOMAIN.sub(masked_host, value)
+    value = PRIVATE_ALIAS.sub(masked_host, value)
+    for index, host in enumerate(HOSTS, 1):
+        value = re.sub(rf"\b{host}\b", f"host-{index}", value)
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("generation", help="deployed release label, e.g. r355")
+    parser.add_argument("--host", help="route reads to this fleet host (default: local daemon)")
+    parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("crates/flotilla-resources/tests/fixtures/stored-records"))
+    args = parser.parse_args()
+    if not re.fullmatch(r"r[0-9]+", args.generation):
+        parser.error("generation must be a release label such as r355")
+    destination = args.output / args.generation
+    if destination.exists():
+        parser.error(f"{destination} already exists; never overwrite a corpus during a schema PR")
+    captured = {}
+    for kind in KINDS:
+        command = ["flotilla", "resource", "list", kind]
+        if args.host:
+            command += ["--host", args.host]
+        command.append("--json")
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        envelope = json.loads(result.stdout)
+        if envelope.get("resourceKind") != kind:
+            raise ValueError(f"{kind}: unexpected resourceKind {envelope.get('resourceKind')!r}")
+        documents = []
+        for record in envelope["records"]:
+            obj = record["object"]
+            if obj.get("kind") != kind or "spec" not in obj:
+                raise ValueError(f"{kind}: malformed resource object")
+            document = {field: obj[field] for field in ("apiVersion", "kind", "spec", "status") if field in obj}
+            documents.append(scrub(document))
+        captured[kind] = documents
+        print(f"{kind}: {len(documents)} records", file=sys.stderr)
+    destination.mkdir(parents=True)
+    for kind, documents in captured.items():
+        (destination / f"{kind}.json").write_text(json.dumps(documents, indent=2, sort_keys=True) + "\n")
+    print(f"Wrote {destination}; inspect every file before committing", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

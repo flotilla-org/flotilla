@@ -1,0 +1,9 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "CrewImageBaseline",
+    "spec": {
+      "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b"
+    }
+  }
+]

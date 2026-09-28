@@ -1,0 +1,403 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Host",
+    "spec": {
+      "display_name": "host-3"
+    },
+    "status": {
+      "admission_free_space_floor_bytes": 21474836480,
+      "agent_adapter_baseline": [
+        "claude-code"
+      ],
+      "blob_sync": {
+        "pending_count": 0
+      },
+      "capabilities": {
+        "agent_adapters": [
+          "claude-code"
+        ],
+        "credential_expiry": {},
+        "docker": true,
+        "held_credentials": [
+          "claude-max",
+          "github-crew-pr",
+          "github-ghostty-contents",
+          "github-rjwittams-crew",
+          "github-skills-fork",
+          "lab-forgejo-crew-pr",
+          "review-bundle-writer"
+        ],
+        "os": "linux",
+        "terminal_pools": [
+          "cleat",
+          "passthrough"
+        ]
+      },
+      "daemon_generation": "6f0295bc-7b94-42cd-a159-1b5f849524cf",
+      "daemon_started_at": "2026-09-28T15:56:24.391136115Z",
+      "daemon_version": "0.1.0",
+      "disk_free_bytes": 37064216576,
+      "fulfilment_facts": {
+        "docker-on-b2aac222-c72f-458e-baa0-b089c52c16af": {
+          "gui_session_logged_in": false,
+          "harnesses": {},
+          "image": "ubuntu:24.04",
+          "image_present": false,
+          "observed_at": "2026-09-28T16:01:29.409496705Z",
+          "toolchains": {}
+        },
+        "host-direct-b2aac222-c72f-458e-baa0-b089c52c16af": {
+          "gui_session_logged_in": false,
+          "harnesses": {
+            "claude-code": {
+              "models": {},
+              "version": "2.1.223"
+            }
+          },
+          "observed_at": "2026-09-28T16:01:29.409737030Z",
+          "toolchains": {
+            "cargo": "cargo 1.94.0 (85eff7c80 2026-01-15)",
+            "node": "v22.22.0",
+            "python3": "Python 3.13.5",
+            "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)"
+          }
+        }
+      },
+      "heartbeat_at": "2026-09-28T16:03:54.441674706Z",
+      "ready": true,
+      "resource_store": {
+        "event_count": 11050,
+        "max_retained_events": 19456,
+        "object_count": 71,
+        "resource_stream_count": 19
+      },
+      "sleep_inhibition": {
+        "state": "not_required"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Host",
+    "spec": {
+      "display_name": "host-2"
+    },
+    "status": {
+      "admission_free_space_floor_bytes": 21474836480,
+      "agent_adapter_baseline": [
+        "claude-code",
+        "codex"
+      ],
+      "blob_sync": {
+        "pending_count": 0
+      },
+      "capabilities": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "credential_expiry": {},
+        "docker": false,
+        "held_credentials": [
+          "claude-max",
+          "github-crew-pr",
+          "github-ghostty-contents",
+          "github-rjwittams-crew",
+          "github-skills-fork",
+          "lab-forgejo-crew-pr",
+          "review-bundle-writer"
+        ],
+        "os": "macos",
+        "terminal_pools": [
+          "cleat",
+          "passthrough",
+          "shpool"
+        ]
+      },
+      "daemon_generation": "82b1a56b-7314-4dd1-a013-127de7f4312f",
+      "daemon_started_at": "2026-09-28T15:56:53.239523Z",
+      "daemon_version": "0.1.0",
+      "disk_free_bytes": 157390254080,
+      "fulfilment_facts": {
+        "docker-crew-image-host-2": {
+          "gui_session_logged_in": false,
+          "harnesses": {},
+          "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+          "observed_at": "2026-09-28T16:01:58.518988Z",
+          "toolchains": {}
+        },
+        "docker-on-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3": {
+          "gui_session_logged_in": false,
+          "harnesses": {},
+          "image": "ubuntu:24.04",
+          "observed_at": "2026-09-28T16:01:58.522679Z",
+          "toolchains": {}
+        },
+        "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3": {
+          "gui_session_logged_in": true,
+          "harnesses": {
+            "claude-code": {
+              "models": {
+                "opus": {
+                  "source": "probe",
+                  "usable": true
+                },
+                "sonnet": {
+                  "source": "probe",
+                  "usable": true
+                }
+              },
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.157.0"
+            }
+          },
+          "observed_at": "2026-09-28T16:01:58.523442Z",
+          "toolchains": {
+            "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+            "node": "v26.3.0",
+            "python3": "Python 3.13.7",
+            "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+          }
+        },
+        "placement-snapshot-0c86eea7686f": {
+          "gui_session_logged_in": true,
+          "harnesses": {
+            "claude-code": {
+              "models": {
+                "opus": {
+                  "source": "probe",
+                  "usable": true
+                },
+                "sonnet": {
+                  "source": "probe",
+                  "usable": true
+                }
+              },
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.157.0"
+            }
+          },
+          "observed_at": "2026-09-28T16:01:58.525183Z",
+          "toolchains": {
+            "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+            "node": "v26.3.0",
+            "python3": "Python 3.13.7",
+            "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+          }
+        }
+      },
+      "heartbeat_at": "2026-09-28T16:03:53.587024Z",
+      "ready": true,
+      "resource_store": {
+        "event_count": 10634,
+        "max_retained_events": 23552,
+        "object_count": 99,
+        "resource_stream_count": 23
+      },
+      "sleep_inhibition": {
+        "state": "not_required"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Host",
+    "spec": {
+      "display_name": "host-1"
+    },
+    "status": {
+      "admission_free_space_floor_bytes": 21474836480,
+      "agent_adapter_baseline": [
+        "claude-code",
+        "codex"
+      ],
+      "blob_sync": {
+        "pending_count": 0
+      },
+      "capabilities": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "credential_expiry": {
+          "ambient:claude": {
+            "expires_at": "2026-09-28T17:11:45.111Z",
+            "refresh_expires_at": "2026-10-25T03:40:44.111Z"
+          }
+        },
+        "docker": true,
+        "held_credentials": [
+          "claude-max",
+          "github-crew-pr",
+          "github-ghostty-contents",
+          "github-rjwittams-crew",
+          "github-skills-fork",
+          "lab-forgejo-crew-pr",
+          "review-bundle-writer"
+        ],
+        "os": "linux",
+        "terminal_pools": [
+          "cleat",
+          "passthrough",
+          "shpool"
+        ]
+      },
+      "daemon_generation": "8c7b6dbe-0812-436e-a52b-90c8d18b5257",
+      "daemon_started_at": "2026-09-28T15:56:04.008255307Z",
+      "daemon_version": "0.1.0",
+      "disk_free_bytes": 664043479040,
+      "fulfilment_facts": {
+        "docker-crew-image-host-1": {
+          "gui_session_logged_in": false,
+          "harnesses": {
+            "claude-code": {
+              "models": {},
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.157.1"
+            }
+          },
+          "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+          "image_present": true,
+          "observed_at": "2026-09-28T16:01:04.037070841Z",
+          "toolchains": {
+            "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+            "node": "v24.18.0",
+            "python3": "Python 3.12.3",
+            "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"
+          }
+        },
+        "docker-on-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": {
+          "gui_session_logged_in": false,
+          "harnesses": {},
+          "image": "ubuntu:24.04",
+          "image_present": false,
+          "observed_at": "2026-09-28T16:01:04.037520231Z",
+          "toolchains": {}
+        },
+        "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": {
+          "gui_session_logged_in": true,
+          "harnesses": {
+            "claude-code": {
+              "models": {
+                "opus": {
+                  "source": "probe",
+                  "usable": true
+                },
+                "sonnet": {
+                  "source": "probe",
+                  "usable": true
+                }
+              },
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.154.0"
+            }
+          },
+          "observed_at": "2026-09-28T16:01:04.037734316Z",
+          "toolchains": {
+            "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+            "node": "v26.9.0",
+            "python3": "Python 3.14.7",
+            "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+          }
+        },
+        "placement-snapshot-383beb7581c1": {
+          "gui_session_logged_in": false,
+          "harnesses": {
+            "claude-code": {
+              "models": {},
+              "version": "2.1.280"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.156.1"
+            }
+          },
+          "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+          "image_present": true,
+          "observed_at": "2026-09-28T16:01:04.039585399Z",
+          "toolchains": {
+            "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+            "node": "v24.18.0",
+            "python3": "Python 3.12.3",
+            "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"
+          }
+        },
+        "placement-snapshot-7977e957d369": {
+          "gui_session_logged_in": false,
+          "harnesses": {
+            "claude-code": {
+              "models": {},
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.157.1"
+            }
+          },
+          "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+          "image_present": true,
+          "observed_at": "2026-09-28T16:01:04.039742787Z",
+          "toolchains": {
+            "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+            "node": "v24.18.0",
+            "python3": "Python 3.12.3",
+            "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"
+          }
+        },
+        "placement-snapshot-d53ef376dac0": {
+          "gui_session_logged_in": true,
+          "harnesses": {
+            "claude-code": {
+              "models": {
+                "opus": {
+                  "source": "probe",
+                  "usable": true
+                },
+                "sonnet": {
+                  "source": "probe",
+                  "usable": true
+                }
+              },
+              "version": "2.1.283"
+            },
+            "codex": {
+              "models": {},
+              "version": "0.154.0"
+            }
+          },
+          "observed_at": "2026-09-28T16:01:04.039875478Z",
+          "toolchains": {
+            "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+            "node": "v26.9.0",
+            "python3": "Python 3.14.7",
+            "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)"
+          }
+        }
+      },
+      "heartbeat_at": "2026-09-28T16:04:04.747836739Z",
+      "ready": true,
+      "resource_store": {
+        "event_count": 13249,
+        "max_retained_events": 20480,
+        "object_count": 321,
+        "resource_stream_count": 20
+      },
+      "sleep_inhibition": {
+        "state": "held"
+      }
+    }
+  }
+]

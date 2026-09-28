@@ -1,0 +1,18 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Artifact",
+    "spec": {
+      "convoy": "convoy-881c971cafea455a8afe81927da886cd",
+      "digest": "ef3741c8f38d81afb875ceabed1152fc3700edd1d8d114261c5765afb24d58d1",
+      "expires_at": "2026-10-28T12:25:02.404447354Z",
+      "kind": "smoke-test",
+      "media_type": "text/plain",
+      "pinned": false,
+      "producer": "governor",
+      "size": 43,
+      "subject": "r355-blob-store",
+      "summary": {}
+    }
+  }
+]

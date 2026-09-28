@@ -1,0 +1,114 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+      "url": "https://github.com/flotilla-org/jackstay"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+      "url": "https://github.com/flotilla-org/porthole"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+      "url": "https://github.com/rjwittams/katzensteg"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+      "url": "https://github.com/flotilla-org/cleat"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g",
+      "url": "https://github.com/flotilla-org/andamento"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+      "url": "https://github.com/flotilla-org/wheelhouse"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "url": "https://github.com/flotilla-org/flotilla.git"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Clone",
+    "spec": {
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "path": "/masked/path",
+      "repo_ref": "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+      "url": "https://github.com/rjwittams/pi"
+    },
+    "status": {
+      "default_branch": "main",
+      "phase": "Ready"
+    }
+  }
+]
