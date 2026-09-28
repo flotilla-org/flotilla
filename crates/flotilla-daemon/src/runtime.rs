@@ -1428,9 +1428,7 @@ async fn reconcile_provisioned_environment(
     Ok(())
 }
 
-/// Project active work into the credential files used by its environment.
-/// Completed work contributes grants to remove; a resumed or review turn
-/// contributes them again, causing a fresh mint after the settled cache clears.
+/// Keep crew credentials staged for the lifetime of their terminal sessions.
 async fn reconcile_work_credentials(state: &ControllerRuntimeState, namespace: &str) -> Result<(), String> {
     reconcile_work_credentials_filtered(state, namespace, None).await
 }
@@ -1459,6 +1457,28 @@ async fn reconcile_work_credentials_filtered(
                 .is_none_or(|target| vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) == Some(target))
         })
         .collect::<Vec<_>>();
+    let live_crew_vessels = backend
+        .using::<TerminalSession>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list crew terminal sessions for credential delivery: {error}"))?
+        .items
+        .into_iter()
+        .filter_map(|session| {
+            let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return None };
+            if context.namespace != namespace
+                || !session.status.as_ref().is_none_or(|status| {
+                    matches!(
+                        status.phase,
+                        flotilla_resources::TerminalSessionPhase::Starting | flotilla_resources::TerminalSessionPhase::Running
+                    )
+                })
+            {
+                return None;
+            }
+            Some((context.vessel_ref.clone(), context.convoy.clone(), session.spec.env_ref.clone()))
+        })
+        .collect::<BTreeSet<_>>();
     let convoys = if target_environment.is_some() {
         let mut convoys = BTreeMap::new();
         for name in vessels.iter().map(|vessel| &vessel.spec.convoy_ref).collect::<BTreeSet<_>>() {
@@ -1531,17 +1551,6 @@ async fn reconcile_work_credentials_filtered(
         let Some(environment_ref) = vessel.status.as_ref().and_then(|status| status.environment_ref.as_ref()) else { continue };
         let Some(convoy) = convoys.get(&vessel.spec.convoy_ref) else { continue };
         let Some(status) = &convoy.status else { continue };
-        let Some(work) = status.work.get(&vessel.spec.vessel_name) else { continue };
-        // Provisioning may already be staging a credential for the first
-        // launch. Once a turn has started, every non-running phase means the
-        // delivery is no longer needed, including interruption and teardown.
-        if matches!(
-            work.phase,
-            flotilla_resources::WorkPhase::Pending | flotilla_resources::WorkPhase::Ready | flotilla_resources::WorkPhase::Launching
-        ) && !status.phase.is_terminal()
-        {
-            continue;
-        }
         let Some(requirement) = status
             .workflow_snapshot
             .as_ref()
@@ -1549,11 +1558,10 @@ async fn reconcile_work_credentials_filtered(
         else {
             continue;
         };
+        let live = live_crew_vessels.contains(&(vessel.metadata.name.clone(), vessel.spec.convoy_ref.clone(), environment_ref.clone()));
         let (granted, running, scopes, live_scopes, permissions) = deliveries.entry(environment_ref.clone()).or_default();
         granted.extend(requirement.credential_refs.iter().cloned());
-        if matches!(work.phase, flotilla_resources::WorkPhase::Running | flotilla_resources::WorkPhase::Stalled)
-            && !status.phase.is_terminal()
-        {
+        if live {
             running.extend(requirement.credential_refs.iter().cloned());
             for name in &requirement.credential_refs {
                 let incoming = requirement.credential_permissions.get(name).cloned();
@@ -8818,6 +8826,40 @@ mod tests {
         Arc::new(registry)
     }
 
+    async fn create_credential_test_session(backend: &ResourceBackend, name: &str, convoy: &str, vessel_ref: &str, env_ref: &str) {
+        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+        let session = sessions
+            .create(&empty_meta(name), &TerminalSessionSpec {
+                env_ref: env_ref.to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Work on the issue".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: NAMESPACE.to_string(),
+                        convoy: convoy.to_string(),
+                        vessel_ref: vessel_ref.to_string(),
+                    }),
+                    message: None,
+                },
+                cwd: "/workspace".to_string(),
+                pool: "test".to_string(),
+            })
+            .await
+            .expect("create live crew session");
+        sessions
+            .update_status(name, &session.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                ..TerminalSessionStatus::default()
+            })
+            .await
+            .expect("mark crew session live");
+    }
+
     #[tokio::test]
     async fn convoy_work_state_reconciles_credentials_after_resume_and_review_delivery() {
         let temp = TempDir::new().expect("tempdir");
@@ -8910,6 +8952,8 @@ mod tests {
             })
             .await
             .expect("place vessel");
+        create_credential_test_session(&backend, "credential-work-session", "credential-work", "credential-work-vessel", env_id.as_str())
+            .await;
         let state = ControllerRuntimeState::new(
             Arc::clone(&daemon),
             config,
@@ -8999,6 +9043,14 @@ mod tests {
             })
             .await
             .expect("place unavailable vessel");
+        create_credential_test_session(
+            &backend,
+            "unavailable-work-session",
+            "unavailable-credential-work",
+            "unavailable-work-vessel",
+            "aaa-unavailable",
+        )
+        .await;
         reconcile_work_credentials_for_environment(&state, NAMESPACE, env_id.as_str())
             .await
             .expect("target environment stages despite unrelated failure");
@@ -9010,6 +9062,7 @@ mod tests {
         assert!(reconcile_work_credentials(&state, NAMESPACE).await.is_err());
         assert!(can_fill_git_credential().await, "unavailable placement must not block another environment's delivery");
         vessels.delete("unavailable-work-vessel").await.expect("remove unavailable vessel");
+        backend.clone().using::<TerminalSession>(NAMESPACE).delete("unavailable-work-session").await.expect("remove unavailable session");
 
         let environments = backend.clone().using::<Environment>(NAMESPACE);
         environments
@@ -9067,6 +9120,14 @@ mod tests {
             })
             .await
             .expect("place second vessel in shared environment");
+        create_credential_test_session(
+            &backend,
+            "conflicting-work-session",
+            "conflicting-credential-work",
+            "conflicting-work-vessel",
+            env_id.as_str(),
+        )
+        .await;
         let error = reconcile_work_credentials(&state, NAMESPACE).await.expect_err("shared environment must reject differing permissions");
         assert!(error.contains("different minted permissions for `work-token`"), "{error}");
         let conflict_retry = environments
@@ -9088,6 +9149,7 @@ mod tests {
         );
         assert_eq!(vessels.get("credential-work-vessel").await.expect("first vessel").metadata.resource_version, conflict_vessel_version);
         vessels.delete("conflicting-work-vessel").await.expect("remove second vessel");
+        backend.clone().using::<TerminalSession>(NAMESPACE).delete("conflicting-work-session").await.expect("remove second session");
 
         // Simulate the retry deadline elapsing while preserving the persisted
         // episode, then verify the normal pass can recover without an operator.
@@ -9121,8 +9183,8 @@ mod tests {
         reconcile_work_credentials(&state, NAMESPACE).await.expect("retain stalled credentials");
         assert!(can_fill_git_credential().await);
         settle(ConvoyPhase::Landing).await;
-        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke settled credentials");
-        assert!(!can_fill_git_credential().await);
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials after claim admission");
+        assert!(can_fill_git_credential().await, "live crew can act after its claim is admitted");
         flotilla_resources::apply_status_patch(
             &convoys,
             "credential-work",
@@ -9135,12 +9197,12 @@ mod tests {
         )
         .await
         .expect("deliver resume brief");
-        reconcile_work_credentials(&state, NAMESPACE).await.expect("re-mint resumed credentials");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials for resumed input");
         assert!(can_fill_git_credential().await);
 
         settle(ConvoyPhase::Landing).await;
-        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke review boundary credentials");
-        assert!(!can_fill_git_credential().await);
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials at review boundary");
+        assert!(can_fill_git_credential().await);
         flotilla_resources::apply_status_patch(
             &convoys,
             "credential-work",
@@ -9162,9 +9224,22 @@ mod tests {
         )
         .await
         .expect("deliver review turn");
-        reconcile_work_credentials(&state, NAMESPACE).await.expect("re-mint review credentials");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("retain credentials for review turn");
         assert!(can_fill_git_credential().await);
 
+        let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+        let session = sessions.get("credential-work-session").await.expect("live crew session");
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Stopped,
+                ..TerminalSessionStatus::default()
+            })
+            .await
+            .expect("stop last crew session");
+        reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke when last session ends");
+        assert!(!can_fill_git_credential().await);
+
+        sessions.delete("credential-work-session").await.expect("tear down crew session");
         vessels.delete("credential-work-vessel").await.expect("tear down vessel");
         reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke credentials after vessel teardown");
         assert!(!can_fill_git_credential().await);

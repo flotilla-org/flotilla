@@ -62,6 +62,8 @@ Credential material is delivered, never pooled or leased. Subscription limits (a
 ### 5. One delivery and refresh contract for every kind
 
 Material source → the daemon prepares it → staged into the crew's credential directory → the adapter wires env and helpers. The same contract covers codex, the GitHub App, Claude, Forgejo, and skill-source credentials (ADR 0038).
+
+**Delivery lifetime:** credentials are staged for the life of a live crew terminal session, regardless of claim or work phase. They are revoked when the session ends (including vessel teardown or convoy reaping). Refresh continues for that entire lifetime.
 - **Static material** is a read-only **copy, never a bind mount** (rotation replaces the file, and a mount would pin the old one), redelivered on resync.
 - **Minted material** is refreshed **daemon-side** and replaced atomically, so a failed refresh never removes still-valid material (#2036).
 - A refresh that keeps failing **surfaces**: a warning on the driver host and attention the crew and operator can see.
