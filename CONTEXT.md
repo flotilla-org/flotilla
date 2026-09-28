@@ -681,6 +681,10 @@ Workflows may override it. Supervisors act only through verbs and never
 transition phases. A crew member's `crew stall` enters the ladder directly.
 _Avoid_: Escalation policy, on-call.
 
+**ManifestRoot**:
+The resource that owns reconciliation of one declared manifest root, such as project-map on kiwi (ADR 0048). Its **spec** holds operator intent: per-document suspend, and sync/adopt requests as tokens. Its **status** holds the controller's judgement per document: applied, refused, drifted or suspended, with the reason and hashes. Its home is the host whose checkout it reads, and it replicates read-only. Managed objects carry only provenance annotations (source, path, revision, baseline hash).
+_Avoid_: Manifest annotations as state; refusal flag.
+
 **Park Depth**:
 Where on the vessel-is-a-cache spectrum a parked vessel sits: warm process →
 suspended vessel → no vessel, logs archived (ADR 0028). Depth changes

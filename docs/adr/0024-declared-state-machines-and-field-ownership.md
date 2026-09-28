@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-07-29
+**Amended by:** ADR 0048 (manifest refusal, drift and resolution state moves off managed objects' annotations onto a ManifestRoot resource's typed status and spec)
 **Relates to:** ADR 0003 (generalizes `LifecycleAuthority` into per-field owner
 roles), #1188 (adopts and extends its owner-authored vs actuator-observed
 vocabulary; the write helper is the future enforcement point for its

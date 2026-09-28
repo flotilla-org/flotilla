@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-06-21
+**Amended by:** ADR 0048 (annotations carry applier-owned metadata and provenance only; controller-derived state lives in typed status on the resource that owns the reconciliation; one-shot requests are spec tokens matched by an observed token in status)
 
 The control plane's typed resources are deliberately **isomorphic to Kubernetes
 objects** — every resource has a lossless k8s-object representation (`apiVersion`,
