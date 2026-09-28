@@ -95,7 +95,11 @@ jobs:
             GIT_CONFIG_VALUE_0="$auth" \
             git -C project-map fetch --depth=1 origin main
           git -C project-map checkout --detach FETCH_HEAD
-          dist/fleet-candidate-linux-x86_64-gnu2.36/bin/flotilla resource validate project-map/flotilla-manifests/
+          # build-candidate.sh removes the staged bundle after archiving it, so
+          # validate with the binary from the archive that will be promoted.
+          candidate_root="$(mktemp -d)"
+          tar -C "$candidate_root" -xzf dist/fleet-candidate-linux-x86_64-gnu2.36.tar.gz
+          "$candidate_root/fleet-candidate-linux-x86_64-gnu2.36/bin/flotilla" resource validate project-map/flotilla-manifests/
 
       - name: Upload seven-day Linux candidate
         uses: https://code.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32
