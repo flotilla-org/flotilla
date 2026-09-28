@@ -5721,7 +5721,7 @@ impl InProcessDaemon {
                             if !names.is_empty() {
                                 return Err(format!(
                                     "facts not yet observed for kind {} (needed for {adapter} model {model})",
-                                    names.join(", ")
+                                    names.join(", kind ")
                                 ));
                             }
                         }
@@ -5776,6 +5776,22 @@ impl InProcessDaemon {
             let host = hosts.items.iter().find(|host| host.object.metadata.name == kind.spec.host_ref);
             let facts =
                 host.and_then(|host| host.object.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            let structurally_missing = needs
+                .iter()
+                .filter(|need| match need {
+                    CapabilityNeed::GuiSession => !kind.spec.grants.contains(&FulfilmentGrant::GuiSession),
+                    CapabilityNeed::Toolchain(_) | CapabilityNeed::Harness { .. } => false,
+                    _ => !need.covered_by(&kind.spec.grants, None),
+                })
+                .collect::<Vec<_>>();
+            if !structurally_missing.is_empty() {
+                rejected.push(format!(
+                    "{}: uncovered {}",
+                    kind.metadata.name,
+                    structurally_missing.iter().map(|need| format!("`{need}`")).collect::<Vec<_>>().join(", ")
+                ));
+                continue;
+            }
             if facts.is_none()
                 && needs
                     .iter()

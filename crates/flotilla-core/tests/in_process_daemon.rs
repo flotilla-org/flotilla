@@ -2161,6 +2161,43 @@ async fn capability_admission_names_unobserved_kind_facts() {
         matches!(&result, CommandValue::Error { message } if message.contains("facts not yet observed for kind host-direct-unobserved")),
         "{result:?}"
     );
+    let structurally_refused = start_capability_convoy(&daemon, "unobserved-and-wrong-platform", |intent| {
+        intent.needs.push("harness:claude-code>=2.1.300".to_string());
+        intent.needs.push("platform:windows".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&structurally_refused, CommandValue::Error { message } if message.contains("uncovered `platform:windows`") && !message.contains("facts not yet observed")),
+        "{structurally_refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_selector_admission_names_unobserved_kind_facts() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(
+        &backend,
+        "host-direct-model-unknown",
+        "model-unknown",
+        100,
+        BTreeSet::from(["claude-code".to_string()]),
+    )
+    .await;
+
+    let result = start_capability_convoy(&daemon, "model-not-yet-observed", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("preview".to_string()),
+        });
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("facts not yet observed for kind") && message.contains("host-direct-model-unknown")),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

@@ -638,12 +638,7 @@ impl DaemonRuntime {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
         }
         for ssh in &ssh_profiles {
-            tasks.push(spawn_ssh_fulfilment_probe_task(
-                Arc::clone(&daemon),
-                options.namespace.clone(),
-                ssh.clone(),
-                Arc::clone(&credential_store),
-            ));
+            tasks.push(spawn_ssh_fulfilment_probe_task(Arc::clone(&daemon), options.namespace.clone(), ssh.clone()));
             let daemon = Arc::clone(&daemon);
             let namespace = options.namespace.clone();
             let ssh = ssh.clone();
@@ -2343,17 +2338,11 @@ fn spawn_local_fulfilment_probe_task(
     })
 }
 
-fn spawn_ssh_fulfilment_probe_task(
-    daemon: Arc<InProcessDaemon>,
-    namespace: String,
-    ssh: AgentlessSshProfile,
-    credential_store: Arc<CredentialStore>,
-) -> JoinHandle<()> {
+fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: AgentlessSshProfile) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let ssh = ssh.clone();
-        let credential_store = Arc::clone(&credential_store);
         async move {
             let previous = ssh.fulfilment_facts.read().await.clone();
             match observe_fulfilment_facts(
@@ -2368,8 +2357,14 @@ fn spawn_ssh_fulfilment_probe_task(
             .await
             {
                 Ok(facts) if facts != previous => {
-                    *ssh.fulfilment_facts.write().await = facts;
-                    if let Err(error) = apply_agentless_ssh_observation(&daemon, &namespace, &ssh, Some(&credential_store)).await {
+                    *ssh.fulfilment_facts.write().await = facts.clone();
+                    let hosts = daemon.resource_backend().using::<Host>(&namespace);
+                    if let Err(error) =
+                        flotilla_resources::apply_status_patch(&hosts, &ssh.provisioning.host_id, &HostStatusPatch::FulfilmentFacts {
+                            facts,
+                        })
+                        .await
+                    {
                         warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
                     }
                 }
@@ -11221,6 +11216,54 @@ mod tests {
         })
         .await
         .expect("timed out waiting for command result")
+    }
+
+    #[tokio::test]
+    async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"probe-task-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile = manual_profile(&host_id, false);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+        let kind_name = "host-direct-probe-task";
+        daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta(kind_name),
+                &FulfilmentKindSpec::builder()
+                    .host_ref(host_id.clone())
+                    .pool("passthrough".to_string())
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("fulfilment kind");
+        let runtime_health = RuntimeHealth::default();
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &test_health_identity(), &runtime_health)
+            .await
+            .expect("first heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        assert!(hosts.get(&host_id).await.expect("host").status.expect("status").fulfilment_facts.is_empty());
+
+        let task = spawn_local_fulfilment_probe_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, runtime_health.clone());
+        wait_until_with_timeout(Duration::from_secs(5), || {
+            let hosts = hosts.clone();
+            let host_id = host_id.clone();
+            async move {
+                hosts
+                    .get(&host_id)
+                    .await
+                    .ok()
+                    .and_then(|host| host.status)
+                    .is_some_and(|status| status.fulfilment_facts.contains_key(kind_name))
+            }
+        })
+        .await;
+        assert!(runtime_health.fulfilment_facts.read().await.contains_key(kind_name));
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
