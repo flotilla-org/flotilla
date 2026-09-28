@@ -5690,17 +5690,6 @@ impl InProcessDaemon {
                 }
                 if let CrewSource::Agent { selector, .. } = &crew.source {
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
-                        let minimum = hosts
-                            .items
-                            .iter()
-                            .flat_map(|host| host.object.status.as_ref().into_iter())
-                            .flat_map(|status| status.fulfilment_facts.values())
-                            .filter_map(|facts| facts.harnesses.get(adapter))
-                            .filter(|harness| harness.models.get(model).is_some_and(|model| model.usable))
-                            .map(|harness| harness.version.as_str())
-                            .reduce(
-                                |minimum, version| if flotilla_resources::version_at_least(minimum, version) { version } else { minimum },
-                            );
                         // Only an explicit rejection refuses. Model acceptance is often
                         // unobservable (credential-less probe containers, harnesses with
                         // no model probe), and unknown must not read as "rejected".
@@ -5711,6 +5700,13 @@ impl InProcessDaemon {
                             .flat_map(|status| status.fulfilment_facts.values())
                             .filter_map(|facts| facts.harnesses.get(adapter))
                             .collect::<Vec<_>>();
+                        let minimum = observed_harnesses
+                            .iter()
+                            .filter(|harness| harness.models.get(model).is_some_and(|model| model.usable))
+                            .map(|harness| harness.version.as_str())
+                            .reduce(
+                                |minimum, version| if flotilla_resources::version_at_least(minimum, version) { version } else { minimum },
+                            );
                         let rejected_everywhere = !observed_harnesses.is_empty()
                             && observed_harnesses.iter().all(|harness| harness.models.get(model).is_some_and(|model| !model.usable));
                         if let Some(minimum) = minimum {
