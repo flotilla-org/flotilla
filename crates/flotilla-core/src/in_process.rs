@@ -5843,6 +5843,14 @@ fn validate_convoy_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed, String> {
+    let need = value.parse::<CapabilityNeed>()?;
+    if matches!(&need, CapabilityNeed::Platform(platform) if platform == "$matrix") {
+        return Err("platform:$matrix is only valid on workflow roles or Project role needs".to_string());
+    }
+    Ok(need)
+}
+
 impl InProcessDaemon {
     async fn resolve_convoy_issue(
         &self,
@@ -5992,12 +6000,12 @@ impl InProcessDaemon {
         for issue in issues {
             for label in &issue.snapshot.labels {
                 if let Some(value) = label.strip_prefix("needs:") {
-                    common.insert(value.parse::<CapabilityNeed>().map_err(|error| format!("issue {}: {error}", issue.reference.id))?);
+                    common.insert(parse_ad_hoc_capability_need(value).map_err(|error| format!("issue {}: {error}", issue.reference.id))?);
                 }
             }
         }
         for value in &intent.needs {
-            common.insert(value.parse::<CapabilityNeed>()?);
+            common.insert(parse_ad_hoc_capability_need(value)?);
         }
         let hosts = self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
         let mut union = BTreeSet::new();
@@ -6398,16 +6406,6 @@ impl InProcessDaemon {
                                 reason: format!("split after placement could not cover union: {error}"),
                                 crossed_handoffs: Vec::new(),
                             }));
-                            for handoff in &workflow.handoffs {
-                                if let (Some(_source), Some(target)) = (
-                                    split.iter().find(|part| part.crew[0].role == handoff.from),
-                                    split.iter().find(|part| part.crew[0].role == handoff.to),
-                                ) {
-                                    if let Some(decision) = workflow.allocation.iter_mut().find(|decision| decision.vessel == target.name) {
-                                        decision.crossed_handoffs.push(format!("{} -> {}", handoff.from, handoff.to));
-                                    }
-                                }
-                            }
                             continue;
                         }
                         Err(error) => {

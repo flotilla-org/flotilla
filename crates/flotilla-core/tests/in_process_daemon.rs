@@ -2177,6 +2177,21 @@ async fn capability_admission_names_unobserved_kind_facts() {
 }
 
 #[tokio::test]
+async fn ad_hoc_matrix_need_is_refused_before_placement() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let result = start_capability_convoy(&daemon, "ad-hoc-matrix", |intent| {
+        intent.needs.push("platform:$matrix".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("platform:$matrix is only valid on workflow roles or Project role needs")),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn model_selector_admission_names_unobserved_kind_facts() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
