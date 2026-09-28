@@ -24,6 +24,18 @@ define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
 
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
+pub const VESSEL_PLACEMENTS_ANNOTATION: &str = "flotilla.work/vessel-placements";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VesselPlacementPin {
+    pub policy_ref: String,
+    pub decision: PlacementDecision,
+}
+
+pub fn vessel_placement_pin(convoy: &ResourceObject<Convoy>, vessel: &str) -> Option<VesselPlacementPin> {
+    let encoded = convoy.metadata.annotations.get(VESSEL_PLACEMENTS_ANNOTATION)?;
+    serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok()?.remove(vessel)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {

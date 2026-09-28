@@ -667,7 +667,6 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
             .iter()
             .map(|task| flotilla_resources::VesselRequirement {
                 name: task.name.clone(),
-                stance: task.stance,
                 repository_refs: task.repository_refs.clone(),
                 credential_refs: task.credential_refs.clone(),
                 credential_scopes: task.credential_scopes.clone(),
@@ -822,7 +821,6 @@ fn fan_out_advances_all_newly_ready_tasks() {
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -832,7 +830,6 @@ fn fan_out_advances_all_newly_ready_tasks() {
             },
             flotilla_resources::VesselRequirement {
                 name: "b".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -842,7 +839,6 @@ fn fan_out_advances_all_newly_ready_tasks() {
             },
             flotilla_resources::VesselRequirement {
                 name: "c".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -881,7 +877,6 @@ fn fan_in_waits_until_all_dependencies_complete() {
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "implement".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -891,7 +886,6 @@ fn fan_in_waits_until_all_dependencies_complete() {
             },
             flotilla_resources::VesselRequirement {
                 name: "verify".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -901,7 +895,6 @@ fn fan_in_waits_until_all_dependencies_complete() {
             },
             flotilla_resources::VesselRequirement {
                 name: "review".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -1463,7 +1456,6 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
         vessels: vec![
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -1473,7 +1465,6 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
             },
             flotilla_resources::VesselRequirement {
                 name: "b".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
@@ -1483,7 +1474,6 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
             },
             flotilla_resources::VesselRequirement {
                 name: "c".to_string(),
-                stance: Default::default(),
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),

@@ -4,8 +4,8 @@ use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
     admit_leaf, implement_review_workflow_spec, interactive_single_workflow_spec, issue_address, issue_address_with_forges,
-    issue_record_name, single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_trusted_workflow_spec,
-    validate, ExitDeclaration, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+    issue_record_name, single_agent_shepherd_workflow_spec, single_agent_workflow_spec, validate, ExitDeclaration, InterpolationField,
+    InterpolationLocation, RepositoryKey, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
 
@@ -334,9 +334,9 @@ fn undeclared_single_label_host_has_a_distinct_service_spelling() {
 fn stock_workflows_transcribe_the_standard_exit_table() {
     let expected = Some(ExitDeclaration::standard_table());
     for spec in [
-        single_agent_contained_workflow_spec(),
+        single_agent_workflow_spec(),
         single_agent_shepherd_workflow_spec(),
-        single_agent_trusted_workflow_spec(),
+        single_agent_workflow_spec(),
         interactive_single_workflow_spec(),
         implement_review_workflow_spec(),
     ] {
@@ -347,9 +347,8 @@ fn stock_workflows_transcribe_the_standard_exit_table() {
 #[test]
 fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() {
     for (name, spec, role) in [
-        ("single-agent-contained", single_agent_contained_workflow_spec(), "coder"),
         ("single-agent-shepherd", single_agent_shepherd_workflow_spec(), "shepherd"),
-        ("single-agent-trusted", single_agent_trusted_workflow_spec(), "coder"),
+        ("single-agent", single_agent_workflow_spec(), "coder"),
         ("implement-review", implement_review_workflow_spec(), "coder"),
     ] {
         validate(&spec).unwrap_or_else(|errors| panic!("stock workflow {name} must validate: {errors:?}"));
@@ -364,7 +363,7 @@ fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() 
 
 #[test]
 fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
-    let workflow = single_agent_contained_workflow_spec();
+    let workflow = single_agent_workflow_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
         stall_nudges: Default::default(),
         supervision: None,
@@ -664,7 +663,7 @@ fn parser_round_trip_preserves_sample_workflow() {
 }
 
 #[test]
-fn parser_round_trip_preserves_all_stances() {
+fn parser_rejects_vessel_stance() {
     let yaml = r#"
 vessels:
   - name: trusted
@@ -677,17 +676,8 @@ vessels:
     stance: contained
     crew: []
 "#;
-    let first = parse_spec(yaml);
-    assert_eq!(first.vessels.iter().map(|vessel| vessel.stance).collect::<Vec<_>>(), vec![
-        Stance::Trusted,
-        Stance::WorkspaceWrite,
-        Stance::Contained,
-    ]);
-
-    let encoded = serde_yml::to_string(&first).expect("serialize stances");
-    let second = parse_spec(&encoded);
-    assert_eq!(second, first);
-    assert!(validate(&second).is_ok());
+    let error = serde_yml::from_str::<WorkflowTemplateSpec>(yaml).expect_err("stance is no longer a template field");
+    assert!(error.to_string().contains("stance"));
 }
 
 #[test]

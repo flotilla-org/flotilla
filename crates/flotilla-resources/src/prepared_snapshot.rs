@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -57,6 +57,11 @@ impl PreparedSnapshotGarbageCollector {
             }
             if let Some(snapshot) = convoy.metadata.annotations.get(PLACEMENT_SNAPSHOT_ANNOTATION) {
                 placement_refs.insert(snapshot.clone());
+            }
+            if let Some(encoded) = convoy.metadata.annotations.get(crate::VESSEL_PLACEMENTS_ANNOTATION) {
+                if let Ok(pins) = serde_json::from_str::<BTreeMap<String, crate::VesselPlacementPin>>(encoded) {
+                    placement_refs.extend(pins.into_values().map(|pin| pin.policy_ref));
+                }
             }
         }
 

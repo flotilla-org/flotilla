@@ -28,8 +28,9 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Widgets".into(),
-        default_workflow_ref: "single-agent-contained".into(),
+        default_workflow_ref: "single-agent".into(),
         supervision: None,
         issue_source_bindings: vec![IssueSourceBindingSpec::builder().source(override_source.clone()).alias("widgets".to_string()).build()],
         dispatch_policy: None,
@@ -58,8 +59,9 @@ async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let github_source = IssueSource { service: "https://github.com".into(), scope: "acme/app".into() };
     let forgejo_source = IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() };
     let project = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Zellij".into(),
-        default_workflow_ref: "single-agent-contained".into(),
+        default_workflow_ref: "single-agent".into(),
         supervision: None,
         issue_source_bindings: vec![
             IssueSourceBindingSpec::builder().source(github_source).exclude(true).build(),
@@ -99,6 +101,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
         .creatable(true)
         .build();
     let spec = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
         supervision: None,
@@ -115,6 +118,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
 #[test]
 fn issue_bindings_reject_state_as_band_semantics() {
     let spec = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
         supervision: None,
@@ -140,8 +144,9 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     }
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Widgets".into(),
-        default_workflow_ref: "single-agent-contained".into(),
+        default_workflow_ref: "single-agent".into(),
         supervision: None,
         issue_source_bindings: vec![IssueSourceBindingSpec::builder()
             .source(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() })
@@ -197,8 +202,9 @@ async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
     repository_writer.create(&InputMeta::builder().name(key.to_string()).build(), &repository).await.expect("repository should create");
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "ghostty".into(),
-        default_workflow_ref: "single-agent-contained".into(),
+        default_workflow_ref: "single-agent".into(),
         supervision: None,
         repositories: vec![ProjectRepositorySpec::builder().repo(key).roles([ProjectRepositoryRole::Code].into()).build()],
         issue_source_bindings: Vec::new(),
@@ -221,8 +227,9 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     repository_writer.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Widgets".into(),
-        default_workflow_ref: "single-agent-contained".into(),
+        default_workflow_ref: "single-agent".into(),
         supervision: None,
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
@@ -417,8 +424,9 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let repo_a = RepositoryKey("a".to_string());
     let repo_b = RepositoryKey("b".to_string());
     let normalized = normalize_project_spec(ProjectSpec {
+        role_needs: Default::default(),
         display_name: " Example ".to_string(),
-        default_workflow_ref: " single-agent-contained ".to_string(),
+        default_workflow_ref: " single-agent ".to_string(),
         supervision: None,
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
@@ -436,14 +444,15 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     .expect("project should normalize");
 
     assert_eq!(normalized.display_name, "Example");
-    assert_eq!(normalized.default_workflow_ref, "single-agent-contained");
+    assert_eq!(normalized.default_workflow_ref, "single-agent");
     assert_eq!(normalized.repositories[0].repo, repo_a);
     assert_eq!(normalized.repositories[0].subpath, None);
     assert_eq!(normalized.repositories[1].subpath.as_deref(), Some("apps/api"));
 
     let duplicate = ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Example".to_string(),
-        default_workflow_ref: "single-agent-contained".to_string(),
+        default_workflow_ref: "single-agent".to_string(),
         supervision: None,
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
@@ -463,8 +472,9 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
 fn project_subpaths_reject_absolute_and_parent_traversal() {
     for subpath in ["/tmp/app", "apps/../../secret", "."] {
         let spec = ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Example".to_string(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: "single-agent".to_string(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,

@@ -48,7 +48,7 @@ use flotilla_resources::{
     FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
     InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
-    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, Stance, SystemClock, TerminalOccupancy,
+    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
     TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec,
     AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
@@ -1889,7 +1889,6 @@ fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
                 .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(Stance::Trusted)
                     .crew(vec![CrewSpec::builder()
                         .role("shell".to_string())
                         .source(CrewSource::Tool {
@@ -1901,9 +1900,8 @@ fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
         ),
         ("implement-review", flotilla_resources::implement_review_workflow_spec()),
         ("interactive-single", flotilla_resources::interactive_single_workflow_spec()),
-        ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("single-agent", flotilla_resources::single_agent_workflow_spec()),
         ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
-        ("single-agent-trusted", flotilla_resources::single_agent_trusted_workflow_spec()),
     ]
 }
 
@@ -4382,6 +4380,28 @@ async fn deliver_and_confirm(
     }
 }
 
+/// A terminal context names the Vessel resource, while admission pins use its
+/// within-convoy name. Resolve that identity before looking up agent grants.
+async fn fulfilment_grants_for_terminal(
+    backend: &ResourceBackend,
+    context: &flotilla_resources::TerminalCrewContext,
+) -> Option<BTreeSet<flotilla_resources::FulfilmentGrant>> {
+    let convoy = backend.including_replicas::<Convoy>(&context.namespace).get(&context.convoy).await.ok()?.object;
+    let vessel_name = backend
+        .including_replicas::<Vessel>(&context.namespace)
+        .get(&context.vessel_ref)
+        .await
+        .ok()
+        .map(|source| source.object.spec.vessel_name)
+        .or_else(|| context.vessel_ref.strip_prefix(&format!("{}-", context.convoy)).map(str::to_string));
+    let selected_kind = vessel_name
+        .as_deref()
+        .and_then(|name| flotilla_resources::vessel_placement_pin(&convoy, name))
+        .map(|pin| pin.decision.policy_name)
+        .or_else(|| convoy.status.and_then(|status| status.placement_decision.map(|decision| decision.policy_name)))?;
+    backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleat_endpoint(
@@ -4465,11 +4485,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         adapter.prepare_with_vcs(&copy_root, brief, &credential_env, vcs.as_ref()).await?;
                     }
                 }
+                let backend = self.state.daemon.resource_backend();
+                let fulfilment_grants = fulfilment_grants_for_terminal(&backend, context).await;
                 let plan = adapter.launch(&AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
                     brief: brief.clone(),
                     environment: credential_env.clone(),
+                    fulfilment_grants,
                 })?;
                 let crew_id = uuid::Uuid::new_v4().to_string();
                 let crew = flotilla_resources::CrewSessionStatus::builder()
@@ -4823,6 +4846,81 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[tokio::test]
+    async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
+        let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::HostAccountReach]);
+        let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::Platform("linux".to_string())]);
+        for (name, grants) in [("broad", broad.clone()), ("restricted", restricted.clone())] {
+            kinds
+                .create(&empty_meta(name), &FulfilmentKindSpec {
+                    host_ref: "host".to_string(),
+                    pool: "test".to_string(),
+                    grants,
+                    realisation: FulfilmentRealisation::HostDirect,
+                })
+                .await
+                .expect("fulfilment kind");
+        }
+        let decision = |kind: &str| {
+            PlacementDecision::builder()
+                .policy_name(kind.to_string())
+                .target_host(PlacementTargetHost {
+                    reference: CanonicalHostId::resolved("host".to_string()),
+                    display_name: "host".to_string(),
+                })
+                .build()
+        };
+        let pins = BTreeMap::from([
+            ("work".to_string(), flotilla_resources::VesselPlacementPin {
+                policy_ref: "snapshot-work".to_string(),
+                decision: decision("broad"),
+            }),
+            ("ops".to_string(), flotilla_resources::VesselPlacementPin {
+                policy_ref: "snapshot-ops".to_string(),
+                decision: decision("restricted"),
+            }),
+        ]);
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(
+                &InputMeta::builder()
+                    .name("demo".to_string())
+                    .annotations(BTreeMap::from([(
+                        flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
+                        serde_json::to_string(&pins).expect("pins serialize"),
+                    )]))
+                    .build(),
+                &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
+                placement_decision: Some(decision("broad")),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("convoy status");
+        backend
+            .using::<Vessel>(NAMESPACE)
+            .create(&empty_meta("demo-ops"), &VesselSpec {
+                convoy_ref: "demo".to_string(),
+                vessel_name: "ops".to_string(),
+                placement_policy_ref: "snapshot-ops".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("ops vessel");
+        let context = flotilla_resources::TerminalCrewContext {
+            namespace: NAMESPACE.to_string(),
+            convoy: "demo".to_string(),
+            vessel_ref: "demo-ops".to_string(),
+        };
+        assert_eq!(fulfilment_grants_for_terminal(&backend, &context).await, Some(restricted));
+    }
 
     #[test]
     fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {
@@ -8460,7 +8558,6 @@ mod tests {
                     .inputs(Vec::new())
                     .vessels(vec![VesselRequirement::builder()
                         .name("work".to_string())
-                        .stance(if docker { Stance::Contained } else { Stance::Trusted })
                         .crew(vec![CrewSpec::builder()
                             .role("coder".to_string())
                             .source(CrewSource::Tool { command: "true".to_string() })
@@ -8527,6 +8624,8 @@ mod tests {
         convoys
             .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
                 placement_decision: Some(PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
                     policy_name: policy_name.to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved(feta_host_ref.clone()),
@@ -9377,14 +9476,12 @@ mod tests {
     async fn startup_seeding_reconciles_existing_builtin_template_definition() {
         let backend = ResourceBackend::InMemory(Default::default());
         let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
-        let mut stale = flotilla_resources::single_agent_contained_workflow_spec();
-        stale.vessels[0].stance = Stance::Trusted;
+        let mut stale = flotilla_resources::single_agent_workflow_spec();
+        stale.vessels[0].crew[0].role = "obsolete".to_string();
+
         templates
             .create(
-                &empty_meta_with_labels(
-                    "single-agent-contained",
-                    BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())]),
-                ),
+                &empty_meta_with_labels("single-agent", BTreeMap::from([("example.com/preserved".to_string(), "true".to_string())])),
                 &stale,
             )
             .await
@@ -9404,16 +9501,16 @@ mod tests {
             reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
         }
 
-        let reconciled = templates.get("single-agent-contained").await.expect("template should remain");
-        assert_eq!(reconciled.spec, flotilla_resources::single_agent_contained_workflow_spec());
+        let reconciled = templates.get("single-agent").await.expect("template should remain");
+        assert_eq!(reconciled.spec, flotilla_resources::single_agent_workflow_spec());
         assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
         assert_eq!(reconciled.metadata.labels.get("example.com/preserved").map(String::as_str), Some("true"));
         let logs = String::from_utf8(log_output.lock().expect("log output lock should be healthy").clone()).expect("logs should be utf-8");
         assert!(logs.contains("stored spec diverged from code builtin; overwriting"), "missing overwrite warning: {logs}");
-        assert!(logs.contains("single-agent-contained"), "warning should name the template: {logs}");
+        assert!(logs.contains("single-agent"), "warning should name the template: {logs}");
 
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
-        let unchanged = templates.get("single-agent-contained").await.expect("template should remain");
+        let unchanged = templates.get("single-agent").await.expect("template should remain");
         assert_eq!(unchanged.metadata.resource_version, reconciled.metadata.resource_version);
     }
 
@@ -9422,19 +9519,18 @@ mod tests {
         let backend = ResourceBackend::InMemory(Default::default());
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("initial builtin reconciliation should succeed");
 
-        let deleted = flotilla_resources::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent-contained")
+        let deleted = flotilla_resources::delete_resource_kind(&backend, NAMESPACE, "workflowtemplates", "single-agent")
             .await
             .expect("raw delete should remove builtin");
-        assert_eq!(deleted.object.value["metadata"]["name"], "single-agent-contained");
+        assert_eq!(deleted.object.value["metadata"]["name"], "single-agent");
         assert!(matches!(
-            backend.definitions::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await,
+            backend.definitions::<WorkflowTemplate>(NAMESPACE).get("single-agent").await,
             Err(ResourceError::NotFound { .. })
         ));
 
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("level-triggered reconciliation should recreate builtin");
-        let recreated =
-            backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-contained").await.expect("builtin should be recreated");
-        assert_eq!(recreated.spec, flotilla_resources::single_agent_contained_workflow_spec());
+        let recreated = backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent").await.expect("builtin should be recreated");
+        assert_eq!(recreated.spec, flotilla_resources::single_agent_workflow_spec());
         assert_eq!(recreated.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
     }
 
@@ -9444,20 +9540,20 @@ mod tests {
         let backend = ResourceBackend::InMemory(Default::default());
         let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
         templates
-            .create(&empty_meta("single-agent-contained"), &flotilla_resources::single_agent_contained_workflow_spec())
+            .create(&empty_meta("single-agent"), &flotilla_resources::single_agent_workflow_spec())
             .await
             .expect("matching template create should succeed");
-        let existing = templates.get("single-agent-contained").await.expect("template should exist");
+        let existing = templates.get("single-agent").await.expect("template should exist");
 
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("startup reconciliation should succeed");
 
-        let labelled = templates.get("single-agent-contained").await.expect("template should remain");
+        let labelled = templates.get("single-agent").await.expect("template should remain");
         assert_ne!(labelled.metadata.resource_version, existing.metadata.resource_version);
         assert_eq!(labelled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
 
         reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("restart reconciliation should succeed");
 
-        let unchanged = templates.get("single-agent-contained").await.expect("template should remain");
+        let unchanged = templates.get("single-agent").await.expect("template should remain");
         assert_eq!(unchanged.metadata.resource_version, labelled.metadata.resource_version);
     }
 
@@ -9470,7 +9566,6 @@ mod tests {
         let shepherd =
             backend.using::<WorkflowTemplate>(NAMESPACE).get("single-agent-shepherd").await.expect("shepherd builtin should exist");
         assert_eq!(shepherd.spec, flotilla_resources::single_agent_shepherd_workflow_spec());
-        assert_eq!(shepherd.spec.vessels[0].stance, Stance::Trusted);
         assert_eq!(shepherd.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some(BUILTIN_MANAGED_BY_VALUE));
     }
 

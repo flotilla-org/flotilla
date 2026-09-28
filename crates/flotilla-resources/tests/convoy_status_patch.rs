@@ -21,7 +21,6 @@ fn sample_snapshot() -> WorkflowSnapshot {
         vessels: vec![
             VesselRequirement {
                 name: "implement".to_string(),
-                stance: Default::default(),
                 depends_on: Vec::new(),
                 repository_refs: None,
                 credential_refs: Default::default(),
@@ -29,6 +28,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 credential_permissions: Default::default(),
                 crew: vec![
                     CrewSpec {
+                        needs: Default::default(),
                         role: "coder".to_string(),
                         source: CrewSource::Agent {
                             selector: Selector::for_capability("code"),
@@ -39,6 +39,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                         completion_expectations: Vec::new(),
                     },
                     CrewSpec {
+                        needs: Default::default(),
                         role: "build".to_string(),
                         source: CrewSource::Tool { command: "cargo test".to_string() },
                         labels: BTreeMap::new(),
@@ -48,13 +49,13 @@ fn sample_snapshot() -> WorkflowSnapshot {
             },
             VesselRequirement {
                 name: "review".to_string(),
-                stance: Default::default(),
                 depends_on: vec!["implement".to_string()],
                 repository_refs: None,
                 credential_refs: Default::default(),
                 credential_scopes: Default::default(),
                 credential_permissions: Default::default(),
                 crew: vec![CrewSpec {
+                    needs: Default::default(),
                     role: "reviewer".to_string(),
                     source: CrewSource::Agent {
                         selector: Selector::for_capability("code-review"),
@@ -186,12 +187,16 @@ fn terminal_convoy_phase_clears_pending_brief() {
 #[test]
 fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     let first = PlacementDecision {
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
         policy_name: "host-direct-kiwi".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("kiwi-id"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
     };
     let second = PlacementDecision {
+        minimal_alternatives: Vec::new(),
+        escalation_reason: None,
         policy_name: "host-direct-feta".to_string(),
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-id"), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
@@ -480,7 +485,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         message: None,
         started_at: Some(ts(1)),
         finished_at: Some(ts(16)),
-        observed_workflow_ref: Some("single-agent-contained".to_string()),
+        observed_workflow_ref: Some("single-agent".to_string()),
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
         target_mismatches: Vec::new(),

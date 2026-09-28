@@ -34,9 +34,9 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, Artifact, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief,
+    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentKind, FulfilmentKindSpec,
+    Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta,
+    PlacementPolicy, PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief,
     TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WorkCompletionAuthority,
     WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
     HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
@@ -127,19 +127,29 @@ async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
 async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
     let host_ref = topology.follower.local_host_id().expect("placement host identity").to_string();
     let policies = topology.follower.resource_backend().using::<PlacementPolicy>(namespace);
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
     policies
-        .create(
-            &InputMeta::builder().name(policy_name.to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree })
-                .build(),
-        )
+        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy)
         .await
         .expect("placement host should register its local placement policy");
+    topology
+        .follower
+        .resource_backend()
+        .using::<FulfilmentKind>(namespace)
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
+        )
+        .await
+        .expect("placement host should register its fulfilment kind");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok() {
+            if topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok()
+                && topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1067,6 +1077,7 @@ async fn convoy_start_routes_to_placement_host_when_presentation_membership_is_s
                             .branch("fix/remote-work".to_string())
                             .workflow_ref("remote-workflow".to_string())
                             .placement_policy(placement_policy)
+                            .escalation_reason("remote host requested".to_string())
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
                     ),
@@ -1199,6 +1210,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                             .branch("fix/kiwi-to-feta".to_string())
                             .workflow_ref("remote-workflow".to_string())
                             .placement_policy(placement_policy)
+                            .escalation_reason("remote credentials required".to_string())
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
                     ),
@@ -1242,6 +1254,7 @@ async fn routed_convoy_start_enforces_placement_host_capacity_before_persistence
                             .name("remote-disk-hungry".to_string())
                             .branch("fix/remote-disk-hungry".to_string())
                             .placement_policy(placement_policy)
+                            .escalation_reason("remote capacity check".to_string())
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
                     ),
@@ -1305,26 +1318,33 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
         })
         .await
         .expect("mark remote Docker host ready without capacity");
+    let remote_policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            host_ref: "remote-docker-host".to_string(),
+            image: "crew:latest".to_string().into(),
+            pull_policy: Default::default(),
+            agent_adapters: BTreeSet::from(["codex".to_string()]),
+            default_cwd: None,
+            env: BTreeMap::new(),
+            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+        })
+        .build();
     daemon
         .resource_backend()
         .using::<PlacementPolicy>(namespace)
-        .create(
-            &InputMeta::builder().name("remote-docker".to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    host_ref: "remote-docker-host".to_string(),
-                    image: "crew:latest".to_string().into(),
-                    pull_policy: Default::default(),
-                    agent_adapters: BTreeSet::from(["codex".to_string()]),
-                    default_cwd: None,
-                    env: BTreeMap::new(),
-                    checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-                })
-                .build(),
-        )
+        .create(&InputMeta::builder().name("remote-docker".to_string()).build(), &remote_policy)
         .await
         .expect("create remote Docker placement");
+    daemon
+        .resource_backend()
+        .using::<FulfilmentKind>(namespace)
+        .create(
+            &InputMeta::builder().name("remote-docker".to_string()).build(),
+            &FulfilmentKindSpec::from_policy(&remote_policy, "linux").expect("kind"),
+        )
+        .await
+        .expect("remote Docker kind");
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -1337,6 +1357,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
                             .name("remote-docker-work".to_string())
                             .branch("fix/remote-docker-work".to_string())
                             .placement_policy("remote-docker".to_string())
+                            .escalation_reason("remote capacity check".to_string())
                             .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                             .build(),
                     ),

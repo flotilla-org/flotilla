@@ -4,7 +4,9 @@ A bootstrap repository may declare a Project in `project.yaml`:
 
 ```yaml
 name: example
-default_workflow: single-agent-contained
+default_workflow: single-agent
+role_needs:
+  coder: [platform:linux]
 members:
   - alias: app
     url: https://github.com/example/app
@@ -15,7 +17,17 @@ members:
 ```
 
 `name` is the Project resource name. `default_workflow` selects the workflow
-used when a dispatch does not specify one and defaults to `single-agent-contained`.
+used when a dispatch does not specify one and defaults to `single-agent`.
+`role_needs` adds standing capability needs to named workflow roles, including
+the Project's platform matrix. Each need is a string such as `platform:linux`,
+`gui_session`, `toolchain:rust`, or `harness:claude-code>=2.1.300`.
+Workflow roles may declare the same `needs` list. Admission adds Project needs,
+`needs:<capability>` issue labels, needs implied by `--agent adapter:model`, and
+repeatable `convoy start --need <capability>` arguments. It records the result
+in the workflow snapshot. `convoy explain` shows those role needs, the selected
+fulfilment kind, minimal alternatives, and any escalation. An operator can pin
+`--fulfilment <kind>`; a pin above the minimum requires
+`--escalation-reason <text>`.
 Every member has a project-scoped,
 human-writable `alias`, a canonical repository `url`, and a non-empty set of
 roles drawn from `code`, `ops`, and `knowledge`. A repository may have several
@@ -103,7 +115,6 @@ repos: [app]
 ---
 workflow: quartermaster
 placement: host-direct-feta
-stance: trusted
 presents-as: fleet
 ```
 
@@ -111,9 +122,9 @@ presents-as: fleet
 that host's resource-store root admits the standing convoy. An unknown or
 unreachable driver is reported as a `DriverAdmission` condition and never
 silently falls back. Without `driver`, admission falls back to the root holding
-the tracked bootstrap-repository checkout. `placement`, `stance`, and
-`presents-as` are optional. A stance preference
-overrides every vessel in the pinned workflow snapshot. `presents-as` is only
+the tracked bootstrap-repository checkout. `placement` and `presents-as` are
+optional. A pinned fulfilment above the minimum also needs
+`escalation-reason`. `presents-as` is only
 a presentation annotation; `fleet` has no special scope semantics. Fleet-level
 standing convoys are declared by convention in the fleet project.
 

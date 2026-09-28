@@ -28,6 +28,8 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
     convoys
         .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
             placement_decision: Some(PlacementDecision {
+                minimal_alternatives: Vec::new(),
+                escalation_reason: None,
                 policy_name: "host-direct-feta".to_string(),
                 target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-host"), display_name: "feta".to_string() },
                 refused_candidates: Vec::new(),
@@ -121,6 +123,8 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
     convoys
         .update_status("ssh-placement", &convoy.metadata.resource_version, &ConvoyStatus {
             placement_decision: Some(PlacementDecision {
+                minimal_alternatives: Vec::new(),
+                escalation_reason: None,
                 policy_name: "host-direct-ssh-host".to_string(),
                 target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("ssh-host"), display_name: "beaufort".to_string() },
                 refused_candidates: Vec::new(),

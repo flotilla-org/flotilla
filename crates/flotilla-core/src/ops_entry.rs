@@ -1,5 +1,5 @@
 use flotilla_protocol::AgentOverride;
-use flotilla_resources::{Stance, WorkflowTemplateSpec};
+use flotilla_resources::WorkflowTemplateSpec;
 use serde::Deserialize;
 
 pub const MATERIALIZED_PROJECT_ANNOTATION: &str = "flotilla.work/materialized-project";
@@ -45,7 +45,7 @@ pub struct EnsureEntry {
     pub driver: Option<String>,
     pub workflow: String,
     pub placement: Option<String>,
-    pub stance: Option<Stance>,
+    pub escalation_reason: Option<String>,
     pub presents_as: Option<String>,
     pub agent_overrides: Vec<AgentOverride>,
 }
@@ -56,8 +56,8 @@ struct EnsureBody {
     workflow: String,
     #[serde(default)]
     placement: Option<String>,
-    #[serde(default)]
-    stance: Option<Stance>,
+    #[serde(default, alias = "escalation-reason")]
+    escalation_reason: Option<String>,
     #[serde(default, alias = "presents-as")]
     presents_as: Option<String>,
     #[serde(default)]
@@ -139,12 +139,13 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
                 driver: frontmatter.driver.map(|value| required(value, "driver")).transpose()?,
                 workflow: body.workflow,
                 placement: body.placement,
-                stance: body.stance,
+                escalation_reason: body.escalation_reason,
                 presents_as: body.presents_as,
                 agent_overrides: body.agents.into_iter().map(|token| token.parse()).collect::<Result<Vec<_>, _>>()?,
             };
             body.workflow = required(body.workflow, "workflow")?;
             body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
+            body.escalation_reason = body.escalation_reason.map(|value| required(value, "escalation_reason")).transpose()?;
             body.presents_as = body.presents_as.map(|value| required(value, "presents_as")).transpose()?;
             OperationalEntryDefinition::Ensure(body)
         }
@@ -189,7 +190,7 @@ mod tests {
     #[test]
     fn parses_standing_convoy_ensure_preferences() {
         let entry = parse_operational_entry(
-            "---\nkind: ensure\nrole: quartermaster\ndriver: udder\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\nstance: trusted\npresents-as: fleet\n",
+            "---\nkind: ensure\nrole: quartermaster\ndriver: udder\nrepos: [project-map]\n---\nworkflow: quartermaster\nplacement: feta\npresents-as: fleet\n",
         )
         .expect("parse")
         .expect("entry");
@@ -200,7 +201,7 @@ mod tests {
                 driver: Some(driver),
                 workflow,
                 placement: Some(placement),
-                stance: Some(flotilla_resources::Stance::Trusted),
+                escalation_reason: None,
                 presents_as: Some(presents_as),
                 agent_overrides,
             }) if driver == "udder" && workflow == "quartermaster" && placement == "feta" && presents_as == "fleet" && agent_overrides.is_empty()
@@ -237,7 +238,7 @@ mod tests {
                 driver: None,
                 workflow,
                 placement: Some(placement),
-                stance: Some(flotilla_resources::Stance::Trusted),
+                escalation_reason: None,
                 presents_as: Some(presents_as),
                 agent_overrides,
             }) if workflow == "usage-observer"

@@ -122,7 +122,6 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "work".to_string(),
-                    stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
@@ -167,18 +166,11 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
 }
 
 #[tokio::test]
-async fn contained_requirement_rejects_host_direct_placement() {
+async fn host_direct_placement_is_not_refused_by_template_stance() {
     let backend = ResourceBackend::InMemory(Default::default());
-    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
-    let mut status = convoy.status.expect("convoy should have status");
-    status.workflow_snapshot.as_mut().expect("convoy should have workflow snapshot").vessels[0].stance = Stance::Contained;
-    backend
-        .clone()
-        .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-contained", &convoy.metadata.resource_version, &status)
-        .await
-        .expect("convoy status should update");
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
 
@@ -186,12 +178,7 @@ async fn contained_requirement_rejects_host_direct_placement() {
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
-    assert!(matches!(
-        outcome.patch,
-        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
-            if message.contains("requires contained stance") && message.contains("host-direct")
-    ));
-    assert!(outcome.actuations.is_empty());
+    assert!(!matches!(outcome.patch, Some(flotilla_resources::VesselStatusPatch::MarkFailed { .. })), "{:?}", outcome.patch);
 }
 
 #[tokio::test]
@@ -247,7 +234,6 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let mut status = convoy.status.clone().expect("convoy status");
     status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels.push(VesselRequirement {
         name: "review".to_string(),
-        stance: Stance::Trusted,
         depends_on: vec!["implement".to_string()],
         repository_refs: None,
         credential_refs: Default::default(),
@@ -507,7 +493,6 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
-                    stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
@@ -696,7 +681,6 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
-                    stance: Stance::Contained,
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
@@ -878,7 +862,6 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
-                    stance: Stance::Contained,
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
@@ -1012,7 +995,6 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
-                    stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: Some(vec![cleat.key()]),
                     credential_refs: Default::default(),
@@ -1119,8 +1101,8 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
 async fn contained_requirement_runs_in_contained_docker_placement() {
     let backend = ResourceBackend::InMemory(Default::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-docker-stance", "implement", REPO_URL, GIT_REF).await;
-    let mut status = convoy.status.expect("convoy should have status");
-    status.workflow_snapshot.as_mut().expect("convoy should have workflow snapshot").vessels[0].stance = Stance::Contained;
+    let status = convoy.status.expect("convoy should have status");
+
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
@@ -2383,7 +2365,6 @@ async fn create_convoy_with_labeled_processes(
                 vessels: vec![
                     VesselRequirement {
                         name: "implement".to_string(),
-                        stance: Default::default(),
                         depends_on: Vec::new(),
                         repository_refs: None,
                         credential_refs: Default::default(),
@@ -2396,7 +2377,6 @@ async fn create_convoy_with_labeled_processes(
                     },
                     VesselRequirement {
                         name: "review".to_string(),
-                        stance: Default::default(),
                         depends_on: vec!["implement".to_string()],
                         repository_refs: None,
                         credential_refs: BTreeSet::from(["github-app".to_string()]),
@@ -2708,7 +2688,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     let mut status = convoy.status.expect("convoy status");
     let requirement = &mut status.workflow_snapshot.as_mut().expect("snapshot").vessels[0];
     requirement.crew.clear();
-    requirement.stance = Stance::Contained;
+
     backend
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy", &convoy.metadata.resource_version, &status)

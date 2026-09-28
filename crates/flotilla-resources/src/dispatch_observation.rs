@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::IssueRef;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiPaths, NoStatusPatch, ReplicationClass, Resource, ResourceError, Stance};
+use crate::{ApiPaths, NoStatusPatch, ReplicationClass, Resource, ResourceError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchObservation;
@@ -37,7 +37,6 @@ pub struct DispatchObservationSpec {
     pub workflow_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
-    pub stance: Stance,
     pub ready_observed_at: DateTime<Utc>,
     pub dispatched_at: DateTime<Utc>,
     pub time_from_ready_seconds: u64,

@@ -755,6 +755,27 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     if let Some(message) = explanation.message.as_deref() {
         let _ = writeln!(output, "Message: {message}");
     }
+    for (role, needs) in &explanation.role_needs {
+        let _ = writeln!(output, "Needs for {role}: {}", if needs.is_empty() { "(none)".to_string() } else { needs.join(", ") });
+    }
+    let mut write_placement = |label: &str, placement: &flotilla_protocol::PlacementDecision| {
+        let _ = writeln!(output, "{label}: {} on {}", placement.policy_name, placement.target_host.display_name);
+        if !placement.minimal_alternatives.is_empty() {
+            let _ = writeln!(output, "Minimal alternatives: {}", placement.minimal_alternatives.join(", "));
+        }
+        if let Some(reason) = &placement.escalation_reason {
+            let _ = writeln!(output, "Escalation: {reason}");
+        }
+    };
+    if explanation.vessel_placements.is_empty() {
+        if let Some(placement) = &explanation.placement {
+            write_placement("Fulfilment", placement);
+        }
+    } else {
+        for (vessel, placement) in &explanation.vessel_placements {
+            write_placement(&format!("Fulfilment for {vessel}"), placement);
+        }
+    }
     if let Some(stalled) = &explanation.stalled {
         let _ = writeln!(output, "Stalled: {}", serde_json::to_string_pretty(stalled).expect("stall condition serializes"));
     }

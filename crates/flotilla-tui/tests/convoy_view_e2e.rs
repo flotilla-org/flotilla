@@ -195,7 +195,6 @@ async fn generated_table_action_completes_work() {
         turn_delivery: Default::default(),
         vessels: vec![VesselRequirement {
             name: "implement".into(),
-            stance: Default::default(),
             depends_on: vec![],
             repository_refs: None,
             credential_refs: Default::default(),

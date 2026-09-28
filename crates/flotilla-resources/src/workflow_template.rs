@@ -8,7 +8,9 @@ use flotilla_protocol::{LeafKind, LeafOperator};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{leaf::validate_leaf_literal, resource::define_resource, status_patch::NoStatusPatch, ReplicationClass, RepositoryKey};
+use crate::{
+    leaf::validate_leaf_literal, resource::define_resource, status_patch::NoStatusPatch, CapabilityNeed, ReplicationClass, RepositoryKey,
+};
 
 define_resource!(
     WorkflowTemplate,
@@ -200,11 +202,9 @@ pub struct InputDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
 pub struct VesselRequirement {
     pub name: String,
-    #[builder(default)]
-    #[serde(default)]
-    pub stance: Stance,
     #[builder(default)]
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -247,7 +247,7 @@ impl VesselRequirement {
     }
 }
 
-/// The minimum isolation guarantee required while a vessel runs.
+/// Observed runtime isolation level after a fulfilment kind is selected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Stance {
@@ -270,6 +270,9 @@ impl std::fmt::Display for Stance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewSpec {
     pub role: String,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub needs: BTreeSet<CapabilityNeed>,
     #[serde(flatten)]
     pub source: CrewSource,
     #[builder(default)]
@@ -322,33 +325,12 @@ impl Selector {
     }
 }
 
-pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
+pub fn single_agent_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
         .turn_delivery(standard_review_turn_delivery("work", "coder"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Contained)
-            .crew(vec![CrewSpec::builder()
-                .role("coder".to_string())
-                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
-                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
-                .build()])
-            .build()])
-        .build()
-}
-
-/// Single-agent coding workflow with explicit trusted host access.
-///
-/// This remains available for operators to select explicitly; ordinary
-/// project dispatch defaults to `single-agent-contained`.
-pub fn single_agent_trusted_workflow_spec() -> WorkflowTemplateSpec {
-    WorkflowTemplateSpec::builder()
-        .exit(ExitDeclaration::standard_table())
-        .turn_delivery(standard_review_turn_delivery("work", "coder"))
-        .vessels(vec![VesselRequirement::builder()
-            .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
@@ -364,7 +346,6 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
         .turn_delivery(standard_review_turn_delivery("work", "shepherd"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("shepherd".to_string())
                 .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
@@ -383,7 +364,6 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
         .exit(ExitDeclaration::standard_table())
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
@@ -403,7 +383,6 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
         .turn_delivery(standard_review_turn_delivery("work", "coder"))
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Contained)
             .crew(vec![
                 CrewSpec::builder()
                     .role("coder".to_string())

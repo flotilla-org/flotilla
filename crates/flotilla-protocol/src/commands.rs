@@ -11,7 +11,7 @@ use crate::{
         CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
         FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
-    AttachableSetId, IssueRef, PrincipalRef, RepoIdentity,
+    AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
 
 fn is_false(value: &bool) -> bool {
@@ -315,6 +315,12 @@ pub struct ConvoyExplanation {
     pub stalled: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub role_needs: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementDecision>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub vessel_placements: std::collections::BTreeMap<String, PlacementDecision>,
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,
@@ -485,6 +491,11 @@ pub struct ConvoyStartIntent {
     pub instruction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<String>,
     /// Dispatch-time agent requirement overrides, applied to the workflow
     /// snapshot's capability selectors at admission (`--agent`).
     #[builder(default)]

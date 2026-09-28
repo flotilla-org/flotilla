@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
-use flotilla_resources::{Convoy, ResourceObject, TerminalAttentionState, TerminalBrief};
+use flotilla_resources::{Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use toml_edit::{value, DocumentMut, Item, Table};
@@ -368,6 +368,8 @@ pub struct AgentLaunchRequest {
     pub model: Option<String>,
     pub brief: TerminalBrief,
     pub environment: TerminalEnvVars,
+    /// Grants of the selected fulfilment kind; standalone launches may omit it.
+    pub fulfilment_grants: Option<BTreeSet<FulfilmentGrant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -586,7 +588,13 @@ impl AdapterFlavor {
         }
     }
 
-    fn autonomy_args(&self) -> &'static [&'static str] {
+    fn autonomy_args(&self, grants: Option<&BTreeSet<FulfilmentGrant>>) -> &'static [&'static str] {
+        let may_run_unattended = grants.is_none_or(|grants| {
+            grants.contains(&FulfilmentGrant::HostAccountReach) || grants.contains(&FulfilmentGrant::Network("scoped".to_string()))
+        });
+        if !may_run_unattended {
+            return &[];
+        }
         match self {
             Self::ClaudeCode { .. } => &["--dangerously-skip-permissions"],
             Self::Codex { .. } => &["--dangerously-bypass-approvals-and-sandbox"],
@@ -618,7 +626,7 @@ struct ClaudeStateConfig {
 impl CliAgentAdapter {
     fn command(&self, request: &AgentLaunchRequest) -> String {
         let mut args = vec![Arg::Literal(self.binary.clone())];
-        args.extend(self.flavor.autonomy_args().iter().map(|arg| Arg::Literal((*arg).into())));
+        args.extend(self.flavor.autonomy_args(request.fulfilment_grants.as_ref()).iter().map(|arg| Arg::Literal((*arg).into())));
         if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
@@ -979,7 +987,7 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
     use flotilla_resources::{
-        single_agent_contained_workflow_spec, ClaimExit, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource,
+        single_agent_workflow_spec, ClaimExit, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource,
         ExitDeclaration, IssueSnapshot, ObjectMeta, RepositoryKey, ResourceObject, TerminalAttentionState, TerminalCrewContext,
         WorkflowSnapshot,
     };
@@ -1012,7 +1020,7 @@ mod tests {
 
     #[test]
     fn default_single_agent_brief_requires_pr_delivery_before_completion() {
-        let workflow = single_agent_contained_workflow_spec();
+        let workflow = single_agent_workflow_spec();
         let [vessel] = workflow.vessels.as_slice() else {
             panic!("default workflow should have one vessel");
         };
@@ -1572,7 +1580,13 @@ mod tests {
         let codex = registry.get("codex").expect("codex adapter");
         codex.prepare(&cwd, &brief).await.expect("prepare brief");
         let plan = codex
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone(), environment: Vec::new() })
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
+                role: "coder".into(),
+                model: None,
+                brief: brief.clone(),
+                environment: Vec::new(),
+            })
             .expect("codex launch plan");
         assert_eq!(
             plan.command,
@@ -1580,10 +1594,21 @@ mod tests {
         );
         assert!(!plan.command.contains("Implement the issue"));
         assert_eq!(plan.stance, "trusted-implicit");
+        let restricted = codex
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: Some(BTreeSet::from([flotilla_resources::FulfilmentGrant::Platform("linux".to_string())])),
+                role: "coder".into(),
+                model: None,
+                brief: brief.clone(),
+                environment: Vec::new(),
+            })
+            .expect("restricted launch plan");
+        assert!(!restricted.command.contains("--dangerously-bypass-approvals-and-sandbox"));
 
         let claude = registry.get("claude-code").expect("claude adapter");
         let plan = claude
             .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
                 role: "reviewer".into(),
                 model: Some("opus".into()),
                 brief: brief.clone(),
@@ -1601,6 +1626,7 @@ mod tests {
         // into the command line even if that boundary regressed.
         let plan = claude
             .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
                 role: "reviewer".into(),
                 model: Some("opus; touch /tmp/pwned".into()),
                 brief,
@@ -1620,7 +1646,7 @@ mod tests {
         let plan = registry
             .get("claude-code")
             .expect("claude adapter")
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief, environment: Vec::new() })
+            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
             .expect("launch plan");
 
         assert!(plan.command.starts_with("/x/y/claude "));
@@ -1655,7 +1681,13 @@ mod tests {
         // The launch command names this path relatively, so it must resolve
         // against the session's working directory.
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone(), environment: invocation_environment })
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
+                role: "coder".into(),
+                model: None,
+                brief: brief.clone(),
+                environment: invocation_environment,
+            })
             .expect("launch plan");
         assert!(plan.command.contains("--settings .flotilla/claude-settings.json"), "{}", plan.command);
         assert!(
@@ -1707,7 +1739,13 @@ mod tests {
 
         claude.prepare_with_environment(&workspace, &brief, &invocation_environment).await.expect("prepare contained Claude");
         let plan = claude
-            .launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief, environment: invocation_environment })
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
+                role: "coder".into(),
+                model: None,
+                brief,
+                environment: invocation_environment,
+            })
             .expect("contained launch plan");
 
         assert!(plan.env.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "redacted-test-token"));
@@ -1794,6 +1832,7 @@ mod tests {
             flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
         let plan = claude
             .launch(&AgentLaunchRequest {
+                fulfilment_grants: None,
                 role: "coder".into(),
                 model: None,
                 brief,

@@ -9,8 +9,8 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{
-    single_agent_contained_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
-    SqliteBackend, Stance, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
+    single_agent_workflow_spec, Convoy, ConvoyPhase, CrewSource, InMemoryBackend, InputMeta, PlacementPolicy, ResourceBackend,
+    SqliteBackend, WorkflowTemplate, MANAGED_BY_LABEL, ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -109,11 +109,10 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     assert_eq!(scratch.spec.vessels.len(), 1);
     assert_eq!(scratch.spec.vessels[0].name, "work");
 
-    let contained = templates.get("single-agent-contained").await.expect("contained template should be seeded");
-    assert_eq!(contained.spec.vessels.len(), 1);
-    assert_eq!(contained.spec.vessels[0].stance, Stance::Contained);
+    let single_agent = templates.get("single-agent").await.expect("single-agent template should be seeded");
+    assert_eq!(single_agent.spec.vessels.len(), 1);
     assert!(matches!(
-        contained.spec.vessels[0].crew.as_slice(),
+        single_agent.spec.vessels[0].crew.as_slice(),
         [crew]
             if crew.role == "coder"
                 && matches!(&crew.source, CrewSource::Agent { selector, .. } if selector.capability == "code")
@@ -122,7 +121,6 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     let interactive = templates.get("interactive-single").await.expect("interactive template should be seeded");
     assert_eq!(interactive.spec.vessels.len(), 1);
     assert_eq!(interactive.spec.vessels[0].name, "work");
-    assert_eq!(interactive.spec.vessels[0].stance, Stance::Trusted);
     assert!(matches!(
         interactive.spec.vessels[0].crew.as_slice(),
         [crew]
@@ -139,19 +137,20 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
 }
 
 #[tokio::test]
-async fn stale_builtin_is_reconciled_before_contained_dispatch() {
+async fn stale_builtin_is_reconciled_before_dispatch() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
-    let mut stale = single_agent_contained_workflow_spec();
-    stale.vessels[0].stance = Stance::Trusted;
+    let mut stale = single_agent_workflow_spec();
+    stale.vessels[0].crew[0].role = "obsolete".to_string();
+
     templates
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &stale)
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &stale)
         .await
         .expect("stale template should be created");
 
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon_with_backend(backend).await;
-    let reconciled = templates.get("single-agent-contained").await.expect("builtin should remain");
-    assert_eq!(reconciled.spec, single_agent_contained_workflow_spec());
+    let reconciled = templates.get("single-agent").await.expect("builtin should remain");
+    assert_eq!(reconciled.spec, single_agent_workflow_spec());
 
     let host_direct_policy = backend
         .using::<PlacementPolicy>("flotilla")
@@ -169,8 +168,8 @@ async fn stale_builtin_is_reconciled_before_contained_dispatch() {
         .execute(
             Command::builder()
                 .action(CommandAction::ConvoyCreate {
-                    name: "must-remain-contained".into(),
-                    workflow_ref: "single-agent-contained".into(),
+                    name: "explicit-host-direct".into(),
+                    workflow_ref: "single-agent".into(),
                     inputs: Vec::new(),
                     repository_url: None,
                     r#ref: None,
@@ -183,9 +182,9 @@ async fn stale_builtin_is_reconciled_before_contained_dispatch() {
         .await
         .expect("execute");
 
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::Error {
-        message: format!("contained workflow requires a docker placement policy, but {host_direct_policy} is not contained"),
-    });
+    assert!(
+        matches!(await_command_result(&mut rx, id).await, CommandValue::Error { message } if message.contains("agent adapter `codex`"))
+    );
 }
 
 #[tokio::test]

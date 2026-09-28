@@ -197,7 +197,7 @@ mod project_list_tests {
                     subpaths: vec![],
                 }])
                 .maybe_issue_source(Some(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }))
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .build()],
         };
 
@@ -211,7 +211,7 @@ mod project_list_tests {
                     "address": "project/flotilla/platform",
                     "repositories": [{"key": "repo-key", "slug": "flotilla-org/flotilla"}],
                     "issue_source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"},
-                    "default_workflow_ref": "single-agent-contained"
+                    "default_workflow_ref": "single-agent"
                 }]
             })
         );

@@ -111,7 +111,6 @@ pub async fn create_convoy_with_single_task(
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: task.to_string(),
-                    stance: Default::default(),
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),

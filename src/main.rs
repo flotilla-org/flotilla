@@ -2653,7 +2653,7 @@ mod tests {
                     })
                     .collect(),
             )
-            .default_workflow_ref("single-agent-contained".to_string())
+            .default_workflow_ref("single-agent".to_string())
             .build()
     }
 

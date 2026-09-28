@@ -38,7 +38,7 @@ use flotilla_resources::{
     Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus,
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation,
-    PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, Stance, StatusPatch,
+    PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, StatusPatch,
     TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
     VESSEL_REF_LABEL,
 };
@@ -400,7 +400,6 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
                 turn_delivery: Default::default(),
                 vessels: vec![VesselRequirement {
                     name: "implement".to_string(),
-                    stance: Stance::Trusted,
                     depends_on: Vec::new(),
                     repository_refs: None,
                     credential_refs: Default::default(),
