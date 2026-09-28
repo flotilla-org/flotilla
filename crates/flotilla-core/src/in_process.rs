@@ -2194,7 +2194,7 @@ fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &Projec
                     roles.push(AllocationRole {
                         crew: expanded,
                         hint: format!("{}[{platform}]", crew.role),
-                        repository_refs: vessel.repository_refs.clone(),
+                        repository_refs: vessel.repository_refs.clone().or_else(|| workflow.repository_refs.clone()),
                         depends_on: vessel.depends_on.clone(),
                         credential_signature: String::new(),
                     });
@@ -2203,7 +2203,7 @@ fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &Projec
                 roles.push(AllocationRole {
                     crew,
                     hint: vessel.name.clone(),
-                    repository_refs: vessel.repository_refs.clone(),
+                    repository_refs: vessel.repository_refs.clone().or_else(|| workflow.repository_refs.clone()),
                     depends_on: vessel.depends_on.clone(),
                     credential_signature: String::new(),
                 });
@@ -2355,7 +2355,31 @@ fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[AllocationRole])
     }
     workflow.vessels = vessels;
     workflow.allocation = allocation;
+    refresh_crossed_handoffs(workflow);
     Ok(())
+}
+
+fn refresh_crossed_handoffs(workflow: &mut WorkflowTemplateSpec) {
+    let mut crossed = BTreeMap::<String, BTreeSet<String>>::new();
+    for vessel in &workflow.vessels {
+        for dependency in &vessel.depends_on {
+            if dependency != &vessel.name {
+                crossed.entry(vessel.name.clone()).or_default().insert(format!("{dependency} -> {}", vessel.name));
+            }
+        }
+    }
+    for handoff in &workflow.handoffs {
+        for source in workflow.vessels.iter().filter(|vessel| vessel.crew.iter().any(|crew| crew.role == handoff.from)) {
+            for target in workflow.vessels.iter().filter(|vessel| vessel.crew.iter().any(|crew| crew.role == handoff.to)) {
+                if source.name != target.name {
+                    crossed.entry(target.name.clone()).or_default().insert(format!("{} -> {}", handoff.from, handoff.to));
+                }
+            }
+        }
+    }
+    for decision in &mut workflow.allocation {
+        decision.crossed_handoffs = crossed.remove(&decision.vessel).unwrap_or_default().into_iter().collect();
+    }
 }
 
 async fn allocation_credential_grants(
@@ -6410,6 +6434,7 @@ impl InProcessDaemon {
             .await?;
             result
         };
+        refresh_crossed_handoffs(&mut workflow);
         flotilla_resources::validate(&workflow).map_err(|errors| {
             format!("allocated workflow invalid: {}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
         })?;
@@ -8308,6 +8333,7 @@ impl InProcessDaemon {
             match entry.definition {
                 OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
                     outcomes.push(format!("{}: WorkflowTemplate/{} accepted", file.path, entry.name));
+                    spec.repository_refs = Some(targets.clone());
                     for vessel in &mut spec.vessels {
                         vessel.repository_refs = Some(targets.clone());
                     }

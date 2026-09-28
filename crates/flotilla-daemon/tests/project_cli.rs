@@ -600,7 +600,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     std::fs::create_dir(&misleading_directory).expect("create misleading directory");
     std::fs::write(
         misleading_directory.join("this-is-a-workflow.md"),
-        "---\nkind: workflow_template\nname: scoped\nrepos: [app]\n---\nvessels:\n  - name: work\n    crew:\n      - role: verify\n        command: cargo test\n",
+        "---\nkind: workflow_template\nname: scoped\nrepos: [app]\n---\nroles:\n  - role: verify\n    command: cargo test\n",
     )
     .expect("write scoped workflow");
     std::fs::write(
@@ -634,7 +634,8 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let scoped_name = materialized_workflow_name("demo", "scoped");
     let all_code_name = materialized_workflow_name("demo", "all-code");
     let scoped = workflows.get(&scoped_name).await.expect("scoped workflow");
-    assert_eq!(scoped.spec.vessels[0].repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
+    assert_eq!(scoped.spec.repository_refs.as_deref(), Some(std::slice::from_ref(&app.repo)));
+    assert!(scoped.spec.vessels.is_empty());
     assert_eq!(scoped.metadata.annotations.get(SOURCE_REPOSITORY_ANNOTATION), Some(&ops_spec.key().to_string()));
     assert_eq!(scoped.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(

@@ -2420,10 +2420,21 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
             .build()
     };
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
-        .vessels(vec![flotilla_resources::VesselRequirement::builder()
-            .name("work".to_string())
-            .crew(vec![crew("coder", "linux"), crew("verifier", "macos")])
-            .build()])
+        .vessels(vec![
+            flotilla_resources::VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![crew("coder", "linux"), crew("verifier", "macos")])
+                .build(),
+            flotilla_resources::VesselRequirement::builder()
+                .name("prepare".to_string())
+                .crew(vec![flotilla_resources::CrewSpec::builder()
+                    .role("planner".to_string())
+                    .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::HostAccountReach]))
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build(),
+        ])
+        .handoffs(vec![flotilla_resources::RoleHandoff { from: "planner".to_string(), to: "verifier".to_string() }])
         .build();
     backend
         .using::<WorkflowTemplate>("flotilla")
@@ -2435,9 +2446,14 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
     let admitted = admitted_convoy(&backend, "backtrack").await;
     let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
     let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
-    assert_eq!(snapshot.spec.vessels.len(), 2);
+    assert_eq!(snapshot.spec.vessels.len(), 3);
     assert!(snapshot.spec.vessels.iter().any(|vessel| vessel.name == "work[coder]"));
     assert!(snapshot.spec.vessels.iter().any(|vessel| vessel.name == "work[verifier]"));
+    assert!(snapshot
+        .spec
+        .allocation
+        .iter()
+        .any(|decision| { decision.vessel == "work[verifier]" && decision.crossed_handoffs == ["planner -> verifier"] }));
 }
 
 #[tokio::test]

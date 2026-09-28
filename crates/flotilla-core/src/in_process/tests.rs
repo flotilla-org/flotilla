@@ -74,9 +74,11 @@ fn platform_matrix_expands_into_named_vessels() {
         .source(CrewSource::Tool { command: "true".to_string() })
         .build();
     let mut workflow = WorkflowTemplateSpec::builder().roles(vec![verifier]).build();
+    workflow.repository_refs = Some(vec![RepositoryKey("scoped-repository".to_string())]);
     let roles = expand_allocation_roles(&mut workflow, &project).expect("expand matrix");
     assert_eq!(roles.iter().map(|role| role.hint.as_str()).collect::<Vec<_>>(), ["verify[macos]", "verify[windows]"]);
     assert_eq!(roles[0].crew.needs.iter().map(ToString::to_string).collect::<Vec<_>>(), ["platform:macos"]);
+    assert_eq!(roles[0].repository_refs, workflow.repository_refs);
 }
 
 #[test]

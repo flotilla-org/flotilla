@@ -36,6 +36,10 @@ pub struct WorkflowTemplateSpec {
     pub stall_nudges: IndexMap<String, StallNudgePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Vec<SupervisionTarget>>,
+    /// Default repository scope for role-authored workflows. Vessel hints may
+    /// narrow a role further during the transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_refs: Option<Vec<RepositoryKey>>,
     /// Roles are the authoring form. `vessels` remains a grouping hint for
     /// older templates until their declarations are migrated.
     #[builder(default)]
