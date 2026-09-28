@@ -4,4 +4,4 @@ metadata:
   name: fleet-crew
   namespace: flotilla
 spec:
-  image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a
+  image: forgejo.lab.flotilla.work/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b
