@@ -4,7 +4,7 @@ use chrono::Utc;
 use flotilla_protocol::{CanonicalHostId, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision, PlacementTargetHost};
 use flotilla_resources::{
     controller::Reconciler, Convoy, ConvoyReconciler, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, FulfilmentFacts, Host, HostSpec,
-    HostStatus, InMemoryBackend, InputMeta, ResourceBackend, StatusPatch, WorkflowTemplate,
+    HostStatus, InMemoryBackend, InputMeta, ResourceBackend, StallCause, StatusPatch, WorkflowTemplate,
 };
 
 #[tokio::test]
@@ -72,6 +72,9 @@ async fn convoy_waits_for_selected_minimal_kind_and_resumes_when_capacity_return
         .stalled
         .as_ref()
         .is_some_and(|stall| stall.evidence.contains("linux-docker") && stall.evidence.contains("no free vessel slots")));
+    let stall = status.stalled.as_mut().expect("capacity stall");
+    assert_eq!(stall.cause, Some(StallCause::Capacity));
+    stall.evidence = "capacity message with revised wording".to_string();
 
     let mut free = full;
     free.fulfilment_facts.get_mut("linux-docker").expect("facts").free_vessel_slots = Some(1);

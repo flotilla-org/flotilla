@@ -1476,7 +1476,7 @@ impl Quartermaster<'_> {
                 && !self
                     .needs
                     .iter()
-                    .any(|need| matches!(need, CapabilityNeed::Platform(platform) if grant == &FulfilmentGrant::Platform(platform.clone())))
+                    .any(|need| matches!(need, CapabilityNeed::Platform(need_platform) if grant == &FulfilmentGrant::Platform(need_platform.clone())))
         })
     }
 

@@ -35,7 +35,7 @@ use crate::{
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, InputMeta, InputValue,
     OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock,
     ThreeValue, TypedResolver,
-    ControllerRetry, Host, LeafMaker, RetryBackoff, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
+    ControllerRetry, Host, LeafMaker, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition,
 };
 
 #[async_trait]
@@ -820,7 +820,8 @@ impl Reconciler for ConvoyReconciler {
                     }),
                     evidence: evidence.clone(),
                     source: StallEvidenceSource::LeafEngine,
-                    began_at: prior.map_or(now, |stalled| stalled.began_at),
+                    cause: Some(StallCause::Capacity),
+                    began_at: prior.filter(|stalled| stalled.cause == Some(StallCause::Capacity)).map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
                     supervisor: None,
                     supervision_index: None,
@@ -830,7 +831,7 @@ impl Reconciler for ConvoyReconciler {
                 };
                 return ControllerReconcileOutcome {
                     patch: prior
-                        .filter(|stalled| stalled.evidence == *evidence)
+                        .filter(|stalled| stalled.cause == Some(StallCause::Capacity) && stalled.evidence == *evidence)
                         .is_none()
                         .then_some(ConvoyStatusPatch::SetStalled { condition: Some(condition) }),
                     actuations: Vec::new(),
@@ -838,7 +839,7 @@ impl Reconciler for ConvoyReconciler {
                     requeue_after: Some(std::time::Duration::from_secs(30)),
                 };
             }
-            if prior.is_some_and(|stalled| stalled.evidence.starts_with("capacity for fulfilment `")) {
+            if prior.is_some_and(|stalled| stalled.cause == Some(StallCause::Capacity)) {
                 return ControllerReconcileOutcome {
                     patch: Some(ConvoyStatusPatch::SetStalled { condition: None }),
                     actuations: Vec::new(),

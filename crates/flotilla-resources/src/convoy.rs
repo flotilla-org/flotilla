@@ -840,6 +840,14 @@ pub enum StallEvidenceSource {
     Crew,
 }
 
+/// Machine-readable cause for controller-owned waits. Previous-generation
+/// stored conditions omit it and remain decodable (ADR 0047).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallCause {
+    Capacity,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StallRung {
@@ -869,6 +877,8 @@ pub struct StalledCondition {
     pub maker: Option<LeafMaker>,
     pub evidence: String,
     pub source: StallEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<StallCause>,
     pub began_at: DateTime<Utc>,
     pub rung: StallRung,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1596,6 +1606,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     maker: Some(LeafMaker::Actor { vessel: vessel.clone(), role: role.clone() }),
                     evidence: message.clone(),
                     source: StallEvidenceSource::Crew,
+                    cause: None,
                     began_at: *at,
                     rung: StallRung::Operator,
                     supervisor: None,

@@ -76,7 +76,7 @@ pub use convoy::{
     ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim,
     CrewWorkPhase, CrewWorkState, DeclaredSubject, DiscoveredSubject, InputValue, InstantiatedExit, InstantiatedExitEntry,
     InstantiatedTurnDelivery, IssueSnapshot, LeafMaker, LifecycleMutation, PendingBrief, PlacementStatus, ReconcileOutcome,
-    SettlementEvaluation, SettlementMode, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition,
+    SettlementEvaluation, SettlementMode, StallCause, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition,
     SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
     TurnDeliveryStatus, UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
     PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
