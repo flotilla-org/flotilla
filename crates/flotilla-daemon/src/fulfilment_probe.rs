@@ -46,6 +46,10 @@ async fn run_in_realisation(
     .map_err(|_| format!("timed out probing {binary}"))?
 }
 
+fn harness_version(stdout: &str) -> String {
+    stdout.split_whitespace().find(|token| token.starts_with(|c: char| c.is_ascii_digit())).unwrap_or_default().to_string()
+}
+
 pub(crate) async fn probe_kind(
     spec: &FulfilmentKindSpec,
     image: Option<&str>,
@@ -103,7 +107,9 @@ pub(crate) async fn probe_kind(
         if !output.success {
             continue;
         }
-        let version = output.stdout.split_whitespace().next().unwrap_or_default().to_string();
+        // `claude --version` prints "2.1.283 (Claude Code)" and `codex --version`
+        // prints "codex-cli 0.157.1": take the first token that starts with a digit.
+        let version = harness_version(&output.stdout);
         if version.is_empty() {
             continue;
         }
@@ -144,6 +150,13 @@ pub(crate) async fn probe_kind(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn harness_version_takes_the_first_numeric_token() {
+        assert_eq!(super::harness_version("2.1.283 (Claude Code)\n"), "2.1.283");
+        assert_eq!(super::harness_version("codex-cli 0.157.1\n"), "0.157.1");
+        assert_eq!(super::harness_version("no version here"), "");
+    }
+
     use std::collections::BTreeSet;
 
     use flotilla_core::providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars};
