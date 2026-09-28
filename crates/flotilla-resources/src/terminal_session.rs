@@ -110,6 +110,10 @@ pub enum TerminalSessionSource {
 pub struct TerminalBrief {
     pub path: String,
     pub content: String,
+    /// Pinned body digest for a brief written at convoy admission. Older
+    /// terminal sessions retain their inline content for one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<String>,
     /// Additional checkout roots that receive the same durable brief. The
     /// session cwd still receives the canonical launch copy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

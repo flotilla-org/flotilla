@@ -1,19 +1,70 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use flotilla_core::in_process::BriefArtifactWriter;
 use flotilla_protocol::CallerCrew;
 use flotilla_resources::{
     artifact_record_name, Artifact, ArtifactSpec, Convoy, InputMeta, OwnerReference, Resource, ResourceBackend, ResourceError,
     ResourceObject, TerminalSession, TerminalSessionSource,
 };
 
-use crate::blob_store::{BlobDigest, BlobStore};
+use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_SUMMARY_BYTES: usize = 4096;
+
+pub struct SystemBriefArtifactWriter {
+    pub backend: ResourceBackend,
+    pub blobs: Arc<TieredBlobStore>,
+    pub retention_days: u64,
+}
+
+#[async_trait]
+impl BriefArtifactWriter for SystemBriefArtifactWriter {
+    async fn put_brief(&self, namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String> {
+        let digest = self.blobs.put(content).await?;
+        let name = artifact_record_name(convoy, role, "brief", subject);
+        let resolver = self.backend.using::<Artifact>(namespace);
+        let prior = match resolver.get(&name).await {
+            Ok(prior) => Some(prior),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let expires_at = i64::try_from(self.retention_days)
+            .ok()
+            .and_then(Duration::try_days)
+            .and_then(|duration| Utc::now().checked_add_signed(duration))
+            .ok_or_else(|| "brief retention is too large".to_string())?;
+        let spec = ArtifactSpec::builder()
+            .convoy(convoy.to_string())
+            .producer(role.to_string())
+            .kind("brief".to_string())
+            .subject(subject.to_string())
+            .digest(digest.as_str().to_string())
+            .size(content.len() as u64)
+            .media_type("text/markdown".to_string())
+            .expires_at(expires_at)
+            .pinned(prior.as_ref().is_some_and(|artifact| artifact.spec.pinned))
+            .build();
+        let owner = OwnerReference {
+            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
+            kind: Convoy::API_PATHS.kind.to_string(),
+            name: convoy.to_string(),
+            controller: false,
+        };
+        let meta = InputMeta::builder().name(name).owner_references(vec![owner]).build();
+        match prior {
+            Some(prior) => resolver.update(&meta, &prior.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?,
+            None => resolver.create(&meta, &spec).await.map_err(|error| error.to_string())?,
+        };
+        Ok(digest.as_str().to_string())
+    }
+}
 
 #[derive(Debug, bon::Builder)]
 pub struct ArtifactPutInput {
@@ -203,6 +254,42 @@ mod tests {
     use super::{ArtifactBody, *};
     use crate::blob_store::MemoryBlobStore;
 
+    #[tokio::test]
+    async fn brief_reprovisions_from_fleet_digest_after_convoy_reap() {
+        let home_dir = tempfile::tempdir().expect("home state");
+        let remote_dir = tempfile::tempdir().expect("remote state");
+        let fleet: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::default());
+        let home_blobs = Arc::new(TieredBlobStore::new(home_dir.path(), vec![("fleet".into(), Arc::clone(&fleet))]));
+        let remote_blobs = TieredBlobStore::new(remote_dir.path(), vec![("fleet".into(), fleet)]);
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let namespace = "flotilla";
+        let convoy = "convoy-cross-host";
+        backend
+            .using::<Convoy>(namespace)
+            .create(
+                &InputMeta::builder().name(convoy.to_string()).build(),
+                &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            )
+            .await
+            .expect("create convoy");
+        let writer = SystemBriefArtifactWriter { backend: backend.clone(), blobs: Arc::clone(&home_blobs), retention_days: 3650 };
+        let body = b"# crew brief\nExact bytes survive another host.\n";
+        let digest = writer.put_brief(namespace, convoy, "coder", convoy, body).await.expect("write admission brief");
+        let artifact = backend
+            .using::<Artifact>(namespace)
+            .get(&artifact_record_name(convoy, "coder", "brief", convoy))
+            .await
+            .expect("brief envelope");
+        assert_eq!(artifact.spec.subject, convoy);
+        assert_eq!(artifact.spec.digest, digest);
+        assert!(!artifact.metadata.owner_references[0].controller);
+        home_blobs.sync_once().await.expect("sync to fleet store");
+        backend.using::<Convoy>(namespace).delete(convoy).await.expect("reap convoy");
+        assert!(backend.using::<Artifact>(namespace).get(&artifact.metadata.name).await.is_ok());
+        let fetched = remote_blobs.get(&BlobDigest::parse(&digest).expect("valid digest")).await.expect("fetch on remote host");
+        assert_eq!(fetched.as_deref(), Some(body.as_slice()));
+    }
+
     fn input(subject: &str, summary: BTreeMap<String, serde_json::Value>, body: &[u8]) -> ArtifactPutInput {
         ArtifactPutInput::builder()
             .kind("review-round".to_string())
@@ -224,7 +311,7 @@ mod tests {
                     .role("coder".to_string())
                     .source(TerminalSessionSource::Agent {
                         selector: Selector::for_capability("coding"),
-                        brief: TerminalBrief { path: "brief.md".into(), content: String::new(), copies: vec![] },
+                        brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
                         context: Box::new(TerminalCrewContext {
                             namespace: namespace.into(),
                             convoy: "demo".into(),

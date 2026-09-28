@@ -1645,6 +1645,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
             source: TerminalSessionSource::Agent {
                 selector: Selector::for_capability("coding"),
                 brief: TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Finish the issue.".to_string(),
                     copies: Vec::new(),

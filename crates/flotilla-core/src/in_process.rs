@@ -57,7 +57,7 @@ use flotilla_resources::{
     DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind,
     FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
+    LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
@@ -2556,6 +2556,7 @@ pub struct InProcessDaemon {
     /// host is the admission authority, so this is the local transaction that
     /// enforces one live generation per `{project, role}`.
     convoy_admission: Mutex<()>,
+    brief_artifact_writer: RwLock<Option<Arc<dyn BriefArtifactWriter>>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -2613,6 +2614,12 @@ const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
 const ENSURE_HOLD_ATTENTION_PREFIX: &str = "ensure-attention-";
 const RECLAIM_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/reclaim-refusal-reason";
+pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
+
+#[async_trait]
+pub trait BriefArtifactWriter: Send + Sync {
+    async fn put_brief(&self, namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String>;
+}
 
 #[derive(Debug, Clone)]
 struct EnsureAdmissionRetry {
@@ -2947,6 +2954,7 @@ impl InProcessDaemon {
             ensure_reconciliation: Mutex::new(()),
             convoy_message_locks: Mutex::new(HashMap::new()),
             convoy_admission: Mutex::new(()),
+            brief_artifact_writer: RwLock::new(None),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -3038,6 +3046,10 @@ impl InProcessDaemon {
     /// federated convoy admission.
     pub fn set_admission_free_space_path(&self, path: PathBuf) {
         *self.admission_free_space_path.write().expect("admission free-space path lock poisoned") = path;
+    }
+
+    pub async fn set_brief_artifact_writer(&self, writer: Arc<dyn BriefArtifactWriter>) {
+        *self.brief_artifact_writer.write().await = Some(writer);
     }
 
     pub async fn admission_free_space_bytes(&self) -> Result<Option<u64>, String> {
@@ -6962,6 +6974,9 @@ impl InProcessDaemon {
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, &admission.workflow).await?;
         annotations.insert(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name);
+        if self.write_admission_briefs(namespace, &admission.name, &admission.spec, &admission.workflow).await? {
+            annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
+        }
         if let Some(placement) = &admission.placement_policy {
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
             let placement_name = prepared_snapshot_name("placement", &placement_value)?;
@@ -7073,6 +7088,9 @@ impl InProcessDaemon {
         let workflow_name = prepared_snapshot_name("workflow", &workflow_value)?;
         ensure_prepared_workflow_snapshot(&self.resource_backend, namespace, &workflow_name, workflow).await?;
         let mut annotations = BTreeMap::from([(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION.to_string(), workflow_name)]);
+        if self.write_admission_briefs(namespace, name, spec, workflow).await? {
+            annotations.insert(BRIEF_ARTIFACTS_ANNOTATION.to_string(), "true".to_string());
+        }
         if let Some(placement) = placement {
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
             let placement_name = prepared_snapshot_name("placement", &placement_value)?;
@@ -7083,6 +7101,119 @@ impl InProcessDaemon {
             annotations.extend(self.prepare_vessel_placement_annotations(namespace, vessel_placements).await?);
         }
         self.create_convoy_with_annotations(namespace, name, spec, placement_decision, dispatch_regard, annotations).await
+    }
+
+    async fn write_admission_briefs(
+        &self,
+        namespace: &str,
+        name: &str,
+        spec: &ConvoySpec,
+        workflow: &WorkflowTemplateSpec,
+    ) -> Result<bool, String> {
+        let Some(writer) = self.brief_artifact_writer.read().await.clone() else { return Ok(false) };
+        let mut annotations = BTreeMap::new();
+        if workflow.exit.is_none() {
+            annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());
+        }
+        let convoy = ResourceObject::<ResourceConvoy> {
+            metadata: ObjectMeta {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                resource_version: String::new(),
+                labels: BTreeMap::new(),
+                annotations,
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+                merge: None,
+            },
+            spec: spec.clone(),
+            status: None,
+        };
+        let templates = crate::agent_adapter::CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
+        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let tracked_roots = self.repository_keys_by_path.read().await.clone();
+        for requirement in &workflow.vessels {
+            let repository_refs = requirement
+                .repository_refs
+                .clone()
+                .unwrap_or_else(|| spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>());
+            let mut fork_stance = false;
+            let mut roots = Vec::new();
+            for repository_ref in &repository_refs {
+                let mut source_roots =
+                    tracked_roots.iter().filter(|(_, key)| *key == repository_ref).map(|(path, _)| path.clone()).collect::<Vec<_>>();
+                source_roots.sort();
+                roots.extend(source_roots);
+                if let Ok(repository) = repositories.get(&repository_ref.to_string()).await {
+                    fork_stance |= repository.spec.is_fork();
+                }
+                if let Some(checkout_ref) = spec.adopted_checkout_refs.get(repository_ref) {
+                    if let Ok(checkout) = checkouts.get(checkout_ref).await {
+                        if let Some(path) = checkout
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.path.clone())
+                            .or_else(|| checkout.spec.target_path().map(str::to_string))
+                        {
+                            roots.push(PathBuf::from(path));
+                        }
+                    }
+                }
+            }
+            roots.sort();
+            roots.dedup();
+            let members = requirement
+                .crew
+                .iter()
+                .enumerate()
+                .map(|(index, member)| crate::agent_adapter::CrewBriefMember {
+                    role: member.role.clone(),
+                    state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
+                    is_agent: matches!(member.source, CrewSource::Agent { .. }),
+                })
+                .collect::<Vec<_>>();
+            for process in &requirement.crew {
+                let CrewSource::Agent { prompt, brief_template, .. } = &process.source else { continue };
+                let assignment = match prompt.as_deref() {
+                    Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
+                    None if !spec.issues.is_empty() => crate::agent_adapter::CrewAssignment::CarriedIssue,
+                    None if spec.change_request.is_some() => crate::agent_adapter::CrewAssignment::CarriedChangeRequest,
+                    None => crate::agent_adapter::CrewAssignment::Unassigned,
+                };
+                let mut options = templates.render_options_with_fork_stance(
+                    brief_template.as_deref(),
+                    spec.project_ref.as_deref(),
+                    roots.clone(),
+                    fork_stance,
+                );
+                options.has_credential_scope = !requirement.credential_scopes.is_empty();
+                let context = TerminalCrewContext {
+                    namespace: namespace.to_string(),
+                    convoy: name.to_string(),
+                    vessel_ref: format!("{name}-{}", requirement.name),
+                };
+                let mut brief = crate::agent_adapter::build_convoy_crew_brief_with_options(
+                    &convoy,
+                    &context,
+                    &requirement.name,
+                    &process.role,
+                    assignment,
+                    &members,
+                    &options,
+                )?;
+                crate::agent_adapter::append_convoy_work_context(
+                    &mut brief.content,
+                    &convoy,
+                    &repository_refs,
+                    &requirement.credential_scopes,
+                );
+                writer.put_brief(namespace, name, &process.role, name, brief.content.as_bytes()).await?;
+            }
+        }
+        Ok(true)
     }
 
     async fn prepare_vessel_placement_annotations(
@@ -10186,7 +10317,14 @@ impl InProcessDaemon {
                                 fork_stance,
                             );
                     render_options.has_credential_scope = !task.credential_scopes.is_empty();
-                    let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
+                    let mut brief =
+                        handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
+                    if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
+                        let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
+                        brief.artifact_digest =
+                            Some(writer.put_brief(&context.namespace, &context.convoy, target, &subject, brief.content.as_bytes()).await?);
+                        brief.content.clear();
+                    }
                     let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);
                     sessions
                         .create(&terminal_meta, &flotilla_resources::TerminalSessionSpec {

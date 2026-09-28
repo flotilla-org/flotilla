@@ -678,6 +678,7 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
                     source: flotilla_resources::TerminalSessionSource::Agent {
                         selector: flotilla_resources::Selector::for_capability("coding"),
                         brief: flotilla_resources::TerminalBrief {
+                            artifact_digest: None,
                             path: ".flotilla/briefs/coder.md".to_string(),
                             content: "brief".to_string(),
                             copies: Vec::new(),
@@ -1000,6 +1001,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".into(),
                     content: "brief".into(),
                     copies: Vec::new(),
@@ -1078,6 +1080,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("review"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/reviewer.md".into(),
                     content: "brief".into(),
                     copies: Vec::new(),
@@ -1152,6 +1155,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("review"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/reviewer.md".into(),
                     content: "brief".into(),
                     copies: Vec::new(),
@@ -1274,6 +1278,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".into(),
                     content: "brief".into(),
                     copies: vec!["/workspace/repo-a".into()],

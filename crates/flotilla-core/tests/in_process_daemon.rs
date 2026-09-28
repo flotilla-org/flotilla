@@ -6664,6 +6664,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
                 .source(TerminalSessionSource::Agent {
                     selector: flotilla_resources::Selector::for_capability("coding"),
                     brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
                         path: ".flotilla/briefs/coder.md".to_string(),
                         content: "Initial turn".to_string(),
                         copies: Vec::new(),
@@ -6710,6 +6711,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
                 .source(TerminalSessionSource::Agent {
                     selector: flotilla_resources::Selector::for_capability("review"),
                     brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
                         path: ".flotilla/briefs/qa.md".to_string(),
                         content: "Initial turn".to_string(),
                         copies: Vec::new(),
@@ -6840,6 +6842,7 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
                 .source(TerminalSessionSource::Agent {
                     selector: flotilla_resources::Selector::for_capability("coding"),
                     brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
                         path: ".flotilla/briefs/coder.md".to_string(),
                         content: "Initial turn".to_string(),
                         copies: Vec::new(),
