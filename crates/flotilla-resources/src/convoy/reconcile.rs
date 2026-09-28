@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use flotilla_protocol::{Leaf, LeafAddress};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -27,9 +28,13 @@ use crate::{
     status_patch::StatusPatch,
     terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
-    workflow_template::{validate, visit_template_tokens, CrewSource, CrewSpec, ValidationError, WorkflowTemplate},
-    ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, InputMeta, InputValue, OwnerReference, PlacementStatus,
-    PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock, ThreeValue, TypedResolver,
+    workflow_template::{
+        validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ValidationError,
+        WorkflowTemplate,
+    },
+    Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, InputMeta, InputValue,
+    OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock,
+    ThreeValue, TypedResolver,
 };
 
 #[async_trait]
@@ -230,6 +235,7 @@ pub enum UnmetSettlementExpectation {
     MissingChangeRequestBinding { vessel: String, role: String },
     StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
     ChangeRequestConditionFalse { record: String, value: Option<String> },
+    CompletionConditionUnsatisfied { subject: String, field_path: String, value: Option<String> },
     InvalidCondition { subject: String, message: String },
     MissingObservedRef { reference: String },
     StaleObservedRef { reference: String, observed_at: String },
@@ -242,7 +248,6 @@ pub enum UnmetSettlementExpectation {
 pub struct CrewCompletionClaim<'a> {
     pub vessel: &'a str,
     pub role: &'a str,
-    pub decision_ledger_ref: Option<&'a str>,
 }
 
 pub fn evaluate_crew_completion(
@@ -250,10 +255,11 @@ pub fn evaluate_crew_completion(
     claim: CrewCompletionClaim<'_>,
     checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
     change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Result<Vec<UnmetSettlementExpectation>, String> {
-    let CrewCompletionClaim { vessel, role, decision_ledger_ref } = claim;
+    let CrewCompletionClaim { vessel, role } = claim;
     let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
         return Ok(Vec::new());
     };
@@ -264,65 +270,103 @@ pub fn evaluate_crew_completion(
         .and_then(|requirement| requirement.crew.iter().find(|candidate| candidate.role == role))
         .ok_or_else(|| format!("workflow has no crew role `{vessel}/{role}`"))?;
     let mut unmet = Vec::new();
-    for expectation in &crew.completion_expectations {
+    for expectation in &crew.completion_conditions {
         match expectation {
-            crate::CrewCompletionExpectation::DecisionLedger => {
-                if decision_ledger_ref.is_none() {
-                    unmet.push(UnmetSettlementExpectation::MissingDecisionLedger { vessel: vessel.to_string(), role: role.to_string() });
+            crate::CrewCompletionExpectation::Condition(condition) => {
+                let result =
+                    evaluate_declared_completion_condition(convoy, condition, checkouts, change_requests, artifacts, stale_after, now)?;
+                if let Some((subject, field_path, value)) = result {
+                    unmet.push(UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value });
                 }
             }
-            crate::CrewCompletionExpectation::ChangeRequestReady => {
-                if expected_checkout_refs(convoy)?.is_empty() && convoy.spec.change_request.is_none() {
-                    continue;
-                }
-                let leaves = expected_change_request_leaves(convoy, checkouts)?;
-                let names = leaves
-                    .iter()
-                    .filter_map(|leaf| match &leaf.address {
-                        flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } => {
-                            Some(crate::change_request_record_name(service, scope, *number))
-                        }
-                        _ => None,
-                    })
-                    .collect::<BTreeSet<_>>();
-                if names.is_empty() {
-                    unmet.push(UnmetSettlementExpectation::MissingChangeRequestBinding {
-                        vessel: vessel.to_string(),
-                        role: role.to_string(),
-                    });
-                }
-                for name in names {
-                    match change_requests.get(&name) {
-                        None => unmet.push(UnmetSettlementExpectation::MissingChangeRequest { record: name }),
-                        Some(record) => {
-                            let Some(status) = record.status.as_ref() else {
-                                unmet.push(UnmetSettlementExpectation::ChangeRequestNotReady {
-                                    record: name,
-                                    detail: "change request has no observation".to_string(),
-                                });
-                                continue;
-                            };
-                            let fresh = |observed_at| now.signed_duration_since(observed_at).to_std().is_ok_and(|age| age <= stale_after);
-                            let merged = status.state.value == Some(crate::ObservedChangeRequestState::Merged);
-                            let detail = if !fresh(status.state.observed_at) || (!merged && !fresh(status.checks.observed_at)) {
-                                Some("change request observation is stale".to_string())
-                            } else if !merged && status.state.value != Some(crate::ObservedChangeRequestState::Open) {
-                                Some(format!("PR not ready (state: {:?})", status.state.value))
-                            } else if !merged && status.checks.value != Some(crate::ObservedChecks::Pass) {
-                                Some(format!("PR checks have not passed ({:?})", status.checks.value))
-                            } else {
-                                None
-                            };
-                            if let Some(detail) = detail {
-                                unmet.push(UnmetSettlementExpectation::ChangeRequestNotReady { record: name, detail });
-                            }
-                        }
-                    }
-                }
+            crate::CrewCompletionExpectation::Legacy(_) => {
+                return Err("legacy completion expectation was not normalized on decode".to_string());
             }
         }
     }
     Ok(unmet)
+}
+
+fn evaluate_declared_completion_condition(
+    convoy: &ResourceObject<Convoy>,
+    condition: &CompletionCondition,
+    checkouts: &BTreeMap<String, ResourceObject<Checkout>>,
+    change_requests: &BTreeMap<String, ResourceObject<ChangeRequest>>,
+    artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
+    stale_after: std::time::Duration,
+    now: DateTime<Utc>,
+) -> Result<Option<(String, String, Option<String>)>, String> {
+    let change_request_leaves = || expected_change_request_leaves(convoy, checkouts);
+    let evaluate = |leaf: Leaf, subject: Option<&dyn crate::LeafSubject>| -> Result<Option<(String, String, Option<String>)>, String> {
+        let result = crate::evaluate_leaf(&leaf, subject, None)?;
+        Ok((result.result != ThreeValue::True)
+            .then(|| (leaf.address.to_string(), leaf.field_path, result.value.map(|value| value.to_string()))))
+    };
+    match condition {
+        CompletionCondition::Artifact { producer, kind, about, field_path, operator, literal } => {
+            let subject = match about {
+                ArtifactSubjectBinding::Convoy => convoy.metadata.name.clone(),
+                ArtifactSubjectBinding::ChangeRequestHead => {
+                    let leaves = change_request_leaves()?;
+                    let Some(leaf) = leaves.first() else {
+                        return Err("head-bound artifact condition requires exactly one change request".to_string());
+                    };
+                    if leaves.iter().any(|candidate| candidate.address != leaf.address) {
+                        return Err("head-bound artifact condition requires exactly one change request".to_string());
+                    }
+                    let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+                        return Err("expected change request leaf has another subject".to_string());
+                    };
+                    let name = crate::change_request_record_name(service, scope, *number);
+                    let head = change_requests.get(&name).and_then(|record| record.status.as_ref()).and_then(|status| {
+                        now.signed_duration_since(status.head_sha.observed_at)
+                            .to_std()
+                            .ok()
+                            .filter(|age| *age <= stale_after)
+                            .and(status.head_sha.value.as_ref())
+                    });
+                    let Some(head) = head else {
+                        return Ok(Some((format!("cr/{name}"), ".head-sha".to_string(), None)));
+                    };
+                    head.clone()
+                }
+            };
+            let address =
+                LeafAddress::Artifact { convoy: convoy.metadata.name.clone(), producer: producer.clone(), kind: kind.clone(), subject };
+            let name = crate::artifact_record_name(&convoy.metadata.name, producer, kind, match &address {
+                LeafAddress::Artifact { subject, .. } => subject,
+                _ => unreachable!(),
+            });
+            let leaf = Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
+            let subject = artifacts.get(&name).map(ArtifactLeafSubject);
+            evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))
+        }
+        CompletionCondition::ChangeRequest { field_path, operator, literal, optional_when_absent } => {
+            let leaves = change_request_leaves()?;
+            if leaves.is_empty()
+                && *optional_when_absent
+                && expected_checkout_refs(convoy)?.is_empty()
+                && convoy.spec.change_request.is_none()
+            {
+                return Ok(None);
+            }
+            if leaves.is_empty() {
+                return Ok(Some(("cr/unbound".to_string(), field_path.clone(), None)));
+            }
+            for expected in leaves {
+                let LeafAddress::ChangeRequest { service, scope, number } = &expected.address else { continue };
+                let name = crate::change_request_record_name(service, scope, *number);
+                let subject =
+                    change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
+                let leaf =
+                    Leaf { address: expected.address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
+                if let Some(unmet) = evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))? {
+                    return Ok(Some(unmet));
+                }
+            }
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -51,6 +51,7 @@ pub enum LeafAddress {
     ChangeRequest { service: String, scope: String, number: u64 },
     Issue { service: String, scope: String, number: u64 },
     Usage { provider: String, account: String },
+    Artifact { convoy: String, producer: String, kind: String, subject: String },
 }
 
 impl LeafAddress {
@@ -62,6 +63,7 @@ impl LeafAddress {
             Self::ChangeRequest { .. } => LeafKind::ChangeRequest,
             Self::Issue { .. } => LeafKind::Issue,
             Self::Usage { .. } => LeafKind::Usage,
+            Self::Artifact { .. } => LeafKind::Artifact,
         }
     }
 }
@@ -88,8 +90,18 @@ impl FromStr for LeafAddress {
             ["usage", provider, account] if !provider.is_empty() && !account.is_empty() => {
                 Ok(Self::Usage { provider: (*provider).to_string(), account: (*account).to_string() })
             }
+            ["artifact", convoy, producer, kind, subject @ ..]
+                if !convoy.is_empty() && !producer.is_empty() && !kind.is_empty() && !subject.is_empty() =>
+            {
+                Ok(Self::Artifact {
+                    convoy: (*convoy).to_string(),
+                    producer: (*producer).to_string(),
+                    kind: (*kind).to_string(),
+                    subject: subject.join("/"),
+                })
+            }
             _ => Err(format!(
-                "invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, work/<convoy>/<work>, cr/<service>/<scope>/<number>, or usage/<provider>/<account>"
+                "invalid leaf address `{value}`; expected convoy/<name>, vessel/<name>, work/<convoy>/<work>, cr/<service>/<scope>/<number>, issue/<service>/<scope>/<number>, usage/<provider>/<account>, or artifact/<convoy>/<producer>/<kind>/<subject>"
             )),
         }
     }
@@ -104,6 +116,7 @@ impl fmt::Display for LeafAddress {
             Self::ChangeRequest { service, scope, number } => write!(f, "cr/{service}/{scope}/{number}"),
             Self::Issue { service, scope, number } => write!(f, "issue/{service}/{scope}/{number}"),
             Self::Usage { provider, account } => write!(f, "usage/{provider}/{account}"),
+            Self::Artifact { convoy, producer, kind, subject } => write!(f, "artifact/{convoy}/{producer}/{kind}/{subject}"),
         }
     }
 }
@@ -117,6 +130,7 @@ pub enum LeafKind {
     ChangeRequest,
     Issue,
     Usage,
+    Artifact,
 }
 
 impl fmt::Display for LeafKind {
@@ -128,6 +142,7 @@ impl fmt::Display for LeafKind {
             Self::ChangeRequest => "cr",
             Self::Issue => "issue",
             Self::Usage => "usage",
+            Self::Artifact => "artifact",
         })
     }
 }

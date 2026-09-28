@@ -7245,7 +7245,7 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         )
         .await
         .expect_err("refuse completion without a ledger");
-    assert!(error.contains("post the decision ledger comment and pass its URL with `--decision-ledger-ref`"), "{error}");
+    assert!(error.contains("decision-ledger") && error.contains(".exists"), "{error}");
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
     assert_eq!(status, before);

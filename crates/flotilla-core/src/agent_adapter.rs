@@ -1097,9 +1097,8 @@ mod tests {
         assert!(content.contains("**Choice:**"));
         assert!(content.contains("**Alternative:**"));
         assert!(content.contains("**If asking were free:**"));
-        assert!(content.contains("No decisions beyond the brief."));
-        assert!(content.contains("--decision-ledger-ref '<comment URL>'"));
-        assert!(content.contains("A completion without this pointer is refused"));
+        assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
+        assert!(content.contains("A completion without this artifact is refused"));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
         insta::assert_snapshot!("dispatched_crew_brief", content);

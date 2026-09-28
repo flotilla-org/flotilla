@@ -39,8 +39,8 @@ pub struct CrewNoun {
     /// Machine-readable settlement answer declared by the brief
     #[arg(long)]
     pub disposition: Option<String>,
-    /// URL of the PR comment containing this claim's decision ledger
-    #[arg(long = "decision-ledger-ref")]
+    /// Previous-generation completion pointer; accepted only for pinned legacy snapshots.
+    #[arg(long = "decision-ledger-ref", hide = true)]
     pub decision_ledger_ref: Option<String>,
     /// Admit a ledger-less completion as the connected operator principal
     #[arg(long)]

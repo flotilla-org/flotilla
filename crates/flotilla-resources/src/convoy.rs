@@ -256,6 +256,7 @@ pub struct InstantiatedTurnDelivery {
 pub fn instantiate_turn_delivery(
     convoy: &crate::ResourceObject<Convoy>,
     checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+    observed_change_requests: &BTreeMap<String, crate::ResourceObject<crate::ChangeRequest>>,
     forges: &[crate::ForgeSpec],
 ) -> Result<Vec<InstantiatedTurnDelivery>, String> {
     let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) else {
@@ -271,9 +272,31 @@ pub fn instantiate_turn_delivery(
         .turn_delivery
         .iter()
         .flat_map(|(source, rule)| {
-            let subjects = match rule.on.subject {
+            let subjects = match &rule.on.subject {
                 SubjectVariable::ChangeRequest => change_requests.clone(),
                 SubjectVariable::Issue => issues.clone(),
+                SubjectVariable::Artifact { producer, kind, about } => match about {
+                    crate::ArtifactSubjectBinding::Convoy => vec![LeafAddress::Artifact {
+                        convoy: convoy.metadata.name.clone(),
+                        producer: producer.clone(),
+                        kind: kind.clone(),
+                        subject: convoy.metadata.name.clone(),
+                    }],
+                    crate::ArtifactSubjectBinding::ChangeRequestHead => change_requests
+                        .iter()
+                        .filter_map(|address| {
+                            let LeafAddress::ChangeRequest { service, scope, number } = address else { return None };
+                            let name = crate::change_request_record_name(service, scope, *number);
+                            let subject = observed_change_requests.get(&name)?.status.as_ref()?.head_sha.value.clone()?;
+                            Some(LeafAddress::Artifact {
+                                convoy: convoy.metadata.name.clone(),
+                                producer: producer.clone(),
+                                kind: kind.clone(),
+                                subject,
+                            })
+                        })
+                        .collect(),
+                },
             };
             subjects.into_iter().map(move |address| InstantiatedTurnDelivery {
                 source: source.clone(),

@@ -10,14 +10,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
-    actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, external_patches, instantiate_exit, instantiate_turn_delivery,
-    select_convoy_children, ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, Convoy, ConvoyAttention, ConvoyLeafSubject,
-    ConvoyPhase, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung,
-    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, external_patches,
+    instantiate_exit, instantiate_turn_delivery, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest,
+    ChangeRequestLeafSubject, Checkout, CheckoutSpec, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase, Forge, HoldAct,
+    InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
+    StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
+    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -43,7 +44,7 @@ impl IssueObservationSource for UnavailableIssues {
 pub enum LeafWatcher {
     WaitCaller { connection_id: uuid::Uuid },
     ReconcilerWake { convoy: String },
-    TurnDelivery { convoy: String, source: String, rule: TurnDeliveryRule },
+    TurnDelivery { convoy: String, source: String, rule: Box<TurnDeliveryRule> },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -339,6 +340,7 @@ impl LeafSubscriptionTable {
         let change_requests = self.inner.backend.including_replicas::<ChangeRequest>(&row.namespace);
         let usages = self.inner.backend.including_replicas::<Usage>(&row.namespace);
         let issues = self.inner.backend.including_replicas::<Issue>(&row.namespace);
+        let artifacts = self.inner.backend.including_replicas::<Artifact>(&row.namespace);
         // Open watches before taking the level-triggered snapshots. Writes
         // racing the lists are then buffered by the streams and replayed by
         // the loop instead of falling through a list-then-watch gap.
@@ -347,11 +349,13 @@ impl LeafSubscriptionTable {
         let mut change_request_watch = change_requests.watch().await.map_err(|error| error.to_string())?;
         let mut usage_watch = usages.watch().await.map_err(|error| error.to_string())?;
         let mut issue_watch = issues.watch().await.map_err(|error| error.to_string())?;
+        let mut artifact_watch = artifacts.watch().await.map_err(|error| error.to_string())?;
         let convoy_list = convoys.list().await.map_err(|error| error.to_string())?;
         let vessel_list = vessels.list().await.map_err(|error| error.to_string())?;
         let change_request_list = change_requests.list().await.map_err(|error| error.to_string())?;
         let usage_list = usages.list().await.map_err(|error| error.to_string())?;
         let issue_list = issues.list().await.map_err(|error| error.to_string())?;
+        let artifact_list = artifacts.list().await.map_err(|error| error.to_string())?;
         let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -369,16 +373,23 @@ impl LeafSubscriptionTable {
 
         let mut issue_sources = issue_sources(issue_list);
         let mut issue_objects = freshest_issues(&issue_sources);
+        let mut artifact_objects = artifact_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
+            objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
+            objects
+        });
         let staleness = LeafObservationStaleness { change_request: self.change_request_stale_after(), issue: self.issue_stale_after() };
 
         let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
         if let Some(fire) = evaluate_row(
             &current_row,
-            &convoy_objects,
-            &vessel_objects,
-            &change_request_objects,
-            &usage_objects,
-            &issue_objects,
+            &LeafSubjects {
+                convoys: &convoy_objects,
+                vessels: &vessel_objects,
+                change_requests: &change_request_objects,
+                usages: &usage_objects,
+                issues: &issue_objects,
+                artifacts: &artifact_objects,
+            },
             staleness,
         )? {
             self.fire(row.id, fire).await;
@@ -440,15 +451,22 @@ impl LeafSubscriptionTable {
                     let event = event.ok_or_else(|| "usage resource watch closed".to_string())?.map_err(|error| error.to_string())?;
                     apply_read_event(event, &mut usage_objects);
                 }
+                event = artifact_watch.next() => {
+                    let event = event.ok_or_else(|| "artifact resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    apply_read_event(event, &mut artifact_objects);
+                }
             }
             let current_row = self.inner.rows.lock().await.get(&row.id).cloned().unwrap_or_else(|| row.clone());
             if let Some(fire) = evaluate_row(
                 &current_row,
-                &convoy_objects,
-                &vessel_objects,
-                &change_request_objects,
-                &usage_objects,
-                &issue_objects,
+                &LeafSubjects {
+                    convoys: &convoy_objects,
+                    vessels: &vessel_objects,
+                    change_requests: &change_request_objects,
+                    usages: &usage_objects,
+                    issues: &issue_objects,
+                    artifacts: &artifact_objects,
+                },
                 staleness,
             )? {
                 self.fire(row.id, fire).await;
@@ -585,6 +603,73 @@ impl LeafSubscriptionTable {
                     })
                     .unwrap_or_default();
                 (format!("{}@{}", leaf.address, updated_at.to_rfc3339()), evidence_at, brief)
+            }
+            LeafAddress::Artifact { convoy: artifact_convoy, producer, kind, subject } => {
+                if matches!(&rule.on.subject, flotilla_resources::SubjectVariable::Artifact {
+                    about: flotilla_resources::ArtifactSubjectBinding::ChangeRequestHead,
+                    ..
+                }) {
+                    let checkout_sources =
+                        self.inner.backend.including_replicas::<Checkout>(&namespace).list().await.map_err(|error| error.to_string())?;
+                    let checkouts = select_convoy_children(&convoy, &checkout_sources.items);
+                    let leaves = expected_change_request_leaves(&convoy, &checkouts)?;
+                    let mut bound_to_current_head = false;
+                    for candidate in leaves {
+                        let LeafAddress::ChangeRequest { service, scope, number } = candidate.address else { continue };
+                        let name = flotilla_resources::change_request_record_name(&service, &scope, number);
+                        let record = self.inner.backend.including_replicas::<ChangeRequest>(&namespace).get(&name).await;
+                        if record.ok().and_then(|record| record.object.status.and_then(|status| status.head_sha.value)).as_deref()
+                            == Some(subject.as_str())
+                        {
+                            bound_to_current_head = true;
+                            break;
+                        }
+                    }
+                    if !bound_to_current_head {
+                        return Ok(());
+                    }
+                }
+                let name = flotilla_resources::artifact_record_name(artifact_convoy, producer, kind, subject);
+                let artifact = self
+                    .inner
+                    .backend
+                    .including_replicas::<Artifact>(&namespace)
+                    .get(&name)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .object;
+                let bound_leaf = Leaf {
+                    address: LeafAddress::Artifact {
+                        convoy: artifact_convoy.clone(),
+                        producer: producer.clone(),
+                        kind: kind.clone(),
+                        subject: subject.clone(),
+                    },
+                    ..leaf.clone()
+                };
+                if evaluate_leaf(&bound_leaf, Some(&ArtifactLeafSubject(&artifact)), None)?.result != ThreeValue::True {
+                    return Ok(());
+                }
+                let evidence_at = artifact.spec.recorded_at.unwrap_or(artifact.metadata.creation_timestamp);
+                let observation = format!(
+                    "- Artifact: `{name}`\n- Subject: `{subject}`\n- Digest: `{}`\n- Summary: `{}`\n",
+                    artifact.spec.digest,
+                    serde_json::to_string(&artifact.spec.summary).map_err(|error| error.to_string())?
+                );
+                let brief = claim_at
+                    .map(|claim_at| {
+                        compose_subject_turn_brief(
+                            &convoy,
+                            source,
+                            rule,
+                            leaf,
+                            &observation,
+                            claim_at,
+                            claim.and_then(|claim| claim.decision_ledger_ref.as_deref()),
+                        )
+                    })
+                    .unwrap_or_default();
+                (format!("{subject}@{}", artifact.spec.digest), evidence_at, brief)
             }
             _ => return Err("turn-delivery leaf is not externally observed".into()),
         };
@@ -1297,6 +1382,14 @@ impl ReconcilerWake {
         let listed_convoys = convoys.list().await.map_err(|error| error.to_string())?;
         let mut convoy_watch = convoys.watch(WatchStart::resuming_from(&listed_convoys)).await.map_err(|error| error.to_string())?;
         let mut checkout_watch = checkouts.watch().await.map_err(|error| error.to_string())?;
+        let mut change_request_watch = self
+            .subscriptions
+            .inner
+            .backend
+            .including_replicas::<ChangeRequest>(&namespace)
+            .watch()
+            .await
+            .map_err(|error| error.to_string())?;
         let mut vessel_watch =
             self.subscriptions.inner.backend.including_replicas::<Vessel>(&namespace).watch().await.map_err(|error| error.to_string())?;
         let mut forge_watch =
@@ -1329,6 +1422,10 @@ impl ReconcilerWake {
                 }
                 event = checkout_watch.next() => {
                     event.ok_or_else(|| "reconciler wake checkout watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    self.sync_rows(&namespace, &convoy_objects).await?;
+                }
+                event = change_request_watch.next() => {
+                    event.ok_or_else(|| "reconciler wake change request watch closed".to_string())?.map_err(|error| error.to_string())?;
                     self.sync_rows(&namespace, &convoy_objects).await?;
                 }
                 event = vessel_watch.next() => {
@@ -1375,6 +1472,16 @@ impl ReconcilerWake {
             .await
             .map_err(|error| error.to_string())?
             .items;
+        let change_request_list = self
+            .subscriptions
+            .inner
+            .backend
+            .including_replicas::<ChangeRequest>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed_change_requests =
+            freshest_change_requests(&change_request_sources(change_request_list)).into_iter().collect::<BTreeMap<_, _>>();
         let vessel_sources =
             self.subscriptions.inner.backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let mut desired = Vec::<LeafSubscriptionRow>::new();
@@ -1470,7 +1577,7 @@ impl ReconcilerWake {
                                     && requirement
                                         .crew
                                         .iter()
-                                        .any(|member| member.role == *role && !member.completion_expectations.is_empty())
+                                        .any(|member| member.role == *role && !member.completion_conditions.is_empty())
                             })
                         });
                         if !owes_claim {
@@ -1543,7 +1650,7 @@ impl ReconcilerWake {
                 }
             }
             let status = convoy.status.as_ref().expect("parked convoy has status");
-            for delivery in instantiate_turn_delivery(convoy, &checkouts, &forges)? {
+            for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
                 let Some(claim_at) = status
                     .crew_work
                     .get(&delivery.rule.to.vessel)
@@ -1552,6 +1659,11 @@ impl ReconcilerWake {
                 else {
                     continue;
                 };
+                let maker = if delivery.leaf.address.kind() == flotilla_protocol::LeafKind::Artifact {
+                    LeafMaker::Observed { refresher: "artifact".into(), external_party: "crew".into() }
+                } else {
+                    LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() }
+                };
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.to_string(),
@@ -1559,9 +1671,9 @@ impl ReconcilerWake {
                     watcher: LeafWatcher::TurnDelivery {
                         convoy: convoy.metadata.name.clone(),
                         source: delivery.source.clone(),
-                        rule: delivery.rule.clone(),
+                        rule: Box::new(delivery.rule.clone()),
                     },
-                    maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                    maker,
                     freshness_demand: Some(claim_at),
                     created_at: Utc::now(),
                     episode_key: EpisodeKeyFields {
@@ -1778,15 +1890,21 @@ struct LeafObservationStaleness {
     issue: std::time::Duration,
 }
 
+struct LeafSubjects<'a> {
+    convoys: &'a HashMap<String, ResourceObject<Convoy>>,
+    vessels: &'a HashMap<String, ResourceObject<Vessel>>,
+    change_requests: &'a HashMap<String, ResourceObject<ChangeRequest>>,
+    usages: &'a HashMap<String, ResourceObject<Usage>>,
+    issues: &'a HashMap<String, ResourceObject<Issue>>,
+    artifacts: &'a HashMap<String, ResourceObject<Artifact>>,
+}
+
 fn evaluate_row(
     row: &LeafSubscriptionRow,
-    convoys: &HashMap<String, ResourceObject<Convoy>>,
-    vessels: &HashMap<String, ResourceObject<Vessel>>,
-    change_requests: &HashMap<String, ResourceObject<ChangeRequest>>,
-    usages: &HashMap<String, ResourceObject<Usage>>,
-    issues: &HashMap<String, ResourceObject<Issue>>,
+    subjects: &LeafSubjects<'_>,
     staleness: LeafObservationStaleness,
 ) -> Result<Option<LeafFire>, String> {
+    let LeafSubjects { convoys, vessels, change_requests, usages, issues, artifacts } = subjects;
     let require_all = matches!(row.watcher, LeafWatcher::ReconcilerWake { .. });
     let mut matched = None;
     for leaf in &row.leaves {
@@ -1822,6 +1940,11 @@ fn evaluate_row(
             LeafAddress::Usage { provider, account } => {
                 let name = flotilla_resources::usage_record_name(provider, account);
                 let subject = usages.get(&name).map(UsageLeafSubject);
+                evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
+            }
+            LeafAddress::Artifact { convoy, producer, kind, subject } => {
+                let name = flotilla_resources::artifact_record_name(convoy, producer, kind, subject);
+                let subject = artifacts.get(&name).map(ArtifactLeafSubject);
                 evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn flotilla_resources::LeafSubject), row.freshness_demand)?
             }
         };
@@ -2207,6 +2330,42 @@ mod tests {
         let stale_id = table.subscribe_wait(connection_id, stale).await.expect("subscribe stale claim leaf");
         assert!(tokio::time::timeout(Duration::from_millis(40), events.recv()).await.is_err(), "stale evidence must remain unknown");
         assert!(table.rows().await.iter().any(|row| row.id == stale_id));
+
+        let recorded_at = Utc::now();
+        let artifact_address = LeafAddress::Artifact {
+            convoy: "demo".to_string(),
+            producer: "reviewer".to_string(),
+            kind: "review-round".to_string(),
+            subject: "head-X".to_string(),
+        };
+        let artifact_wait = WaitSubscriptionRequest {
+            namespace: "flotilla".to_string(),
+            leaves: vec![leaf(artifact_address.clone(), ".summary.disposition", "approve")],
+            freshness_demand: Some(recorded_at - chrono::Duration::seconds(1)),
+        };
+        let artifact_id = table.subscribe_wait(connection_id, artifact_wait).await.expect("subscribe artifact leaf");
+        let name = flotilla_resources::artifact_record_name("demo", "reviewer", "review-round", "head-X");
+        backend
+            .using::<Artifact>("flotilla")
+            .create(
+                &InputMeta::builder().name(name).build(),
+                &flotilla_resources::ArtifactSpec::builder()
+                    .convoy("demo".to_string())
+                    .producer("reviewer".to_string())
+                    .kind("review-round".to_string())
+                    .subject("head-X".to_string())
+                    .summary(BTreeMap::from([("disposition".to_string(), serde_json::json!("approve"))]))
+                    .digest("test".to_string())
+                    .size(1)
+                    .media_type("text/plain".to_string())
+                    .recorded_at(recorded_at)
+                    .expires_at(recorded_at + chrono::Duration::days(1))
+                    .build(),
+            )
+            .await
+            .expect("publish artifact");
+        assert_eq!(receive_fire(&mut events, artifact_id).await.leaf.address, artifact_address);
+
         table.unsubscribe_connection(connection_id).await;
         assert!(table.rows().await.is_empty(), "connection teardown must remove WaitCaller rows");
     }
@@ -2509,7 +2668,11 @@ mod tests {
             id: subscription_id,
             namespace: "flotilla".to_string(),
             leaves: vec![leaf.clone()],
-            watcher: LeafWatcher::TurnDelivery { convoy: "wake-turn".to_string(), source: source.to_string(), rule: rule.clone() },
+            watcher: LeafWatcher::TurnDelivery {
+                convoy: "wake-turn".to_string(),
+                source: source.to_string(),
+                rule: Box::new(rule.clone()),
+            },
             maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
             freshness_demand: Some(base),
             created_at: base,
@@ -3756,7 +3919,7 @@ mod tests {
             id: subscription_id,
             namespace: "flotilla".into(),
             leaves: vec![leaf.clone()],
-            watcher: LeafWatcher::TurnDelivery { convoy: "issue-turn".into(), source: "issue".into(), rule: rule.clone() },
+            watcher: LeafWatcher::TurnDelivery { convoy: "issue-turn".into(), source: "issue".into(), rule: Box::new(rule.clone()) },
             maker: LeafMaker::Observed { refresher: "issue".into(), external_party: "forge".into() },
             freshness_demand: Some(claim_at),
             created_at: claim_at,

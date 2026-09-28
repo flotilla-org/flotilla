@@ -10,7 +10,7 @@ If a stall names you as supervisor, use `flotilla crew supervise --convoy <sourc
 {% block crew %}{% for member in members %}- `{{ member.role }}`: {{ member.state }}
 {% endfor %}{% endblock %}
 {% block operating_instructions %}Run `flotilla crew list` for current crew state.
-Only this top-level crew session may run `flotilla crew` or `flotilla convoy` verbs. Background delegates and sub-agents must never run those verbs. {% if is_standing %}After all delegated work has returned, record any decisions on the relevant issue and yield at the turn boundary; this standing convoy remains active.{% else %}After all delegated work has returned, this top-level session posts the decision ledger and only then completes the crew work.{% endif %}
+Only this top-level crew session may run `flotilla crew` or `flotilla convoy` verbs. Background delegates and sub-agents must never run those verbs. {% if is_standing %}After all delegated work has returned, record any decisions on the relevant issue and yield at the turn boundary; this standing convoy remains active.{% else %}After all delegated work has returned, this top-level session submits the decision ledger artifact and only then completes the crew work.{% endif %}
 Clone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.
 For a GitHub destination, use only the injected `gh` token-file wrapper with `$GITHUB_TOKEN_FILE` or an injected `GH_TOKEN` for GitHub API operations. Before checking PR/CI status or delivering, verify that `$GITHUB_TOKEN_FILE` names a nonempty file or `GH_TOKEN` is set, and that `gh auth status` succeeds. Never use unauthenticated or anonymous GitHub API requests or ambient human credentials. {% if is_standing %}If the injected GitHub credentials are missing or rejected, report the blockage to the operator and yield at the turn boundary.{% else %}If the injected GitHub credentials are missing or rejected, fail the assignment with `flotilla crew fail --message '...'` instead of proceeding anonymously.{% endif %}
 {% if has_credential_scope %}Before enacting repository changes, compare the destination with `Minted credential repository scope` in `## Work context`. {% if is_standing %}If the enactment repository is outside that scope, park the verified commit, report the mismatch to the operator, and yield at the turn boundary so the work can be redispatched under the owning project; do not discover the mismatch by attempting a push.{% else %}If the enactment repository is outside that scope, park the verified commit and report the mismatch with `flotilla crew fail --message '...'` so the work can be redispatched under the owning project; do not discover the mismatch by attempting a push.{% endif %}
@@ -19,14 +19,14 @@ For a GitHub destination, use only the injected `gh` token-file wrapper with `$G
 
 ## Decision ledger
 
-{% if is_standing %}Record decisions as ruling comments on the relevant issue when they are made. Each ruling comment must end with an `ADR carry:` line naming where the decision will be durably recorded. Yield at the turn boundary after the task; the standing convoy does not file a settlement claim.{% else %}At settlement-claim time, post a PR comment headed `## Decision ledger` that reports every decision you made where this brief was silent, ordered least-confident first. Use one numbered entry per decision with exactly these fields:
+{% if is_standing %}Record decisions as ruling comments on the relevant issue when they are made. Each ruling comment must end with an `ADR carry:` line naming where the decision will be durably recorded. Yield at the turn boundary after the task; the standing convoy does not file a settlement claim.{% else %}At settlement-claim time, write a file headed `## Decision ledger` that reports every decision you made where this brief was silent, ordered least-confident first. Include at least one numbered entry, with exactly these fields:
 
 - **Brief silence:** where the brief was silent
 - **Choice:** what you chose
 - **Alternative:** the alternative you considered
 - **If asking were free:** what you would have asked
 
-If there were no such decisions, post the heading followed by `No decisions beyond the brief.`. Pass the durable comment URL with `flotilla crew complete --decision-ledger-ref '<comment URL>' ...`. A completion without this pointer is refused; only an operator may override it with `--force`. Do not create a ledger file in the repository.{% endif %}
+Run `flotilla artifact put --kind decision-ledger <path>`; the daemon reads and validates the file, and projects a PR comment when a change request is bound. Keep the file outside the repository. Then run `flotilla crew complete ...`. A completion without this artifact is refused; only an operator may override it with `--force`.{% endif %}
 
 ## Assignment
 

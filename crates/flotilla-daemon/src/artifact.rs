@@ -17,6 +17,50 @@ use crate::blob_store::{BlobDigest, BlobStore, TieredBlobStore};
 
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 const MAX_SUMMARY_BYTES: usize = 4096;
+const MAX_DECISION_LEDGER_BYTES: usize = 32 * 1024;
+
+pub(crate) fn validate_decision_ledger(body: &[u8]) -> Result<(), String> {
+    if body.is_empty() {
+        return Err("decision ledger is empty".to_string());
+    }
+    if body.len() > MAX_DECISION_LEDGER_BYTES {
+        return Err(format!("decision ledger exceeds {MAX_DECISION_LEDGER_BYTES} bytes"));
+    }
+    let text = std::str::from_utf8(body).map_err(|_| "decision ledger must be UTF-8".to_string())?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    if lines.next() != Some("## Decision ledger") {
+        return Err("decision ledger must start with `## Decision ledger`".to_string());
+    }
+    let mut entries = 0;
+    while let Some(line) = lines.next() {
+        entries += 1;
+        let prefix = format!("{entries}. **Brief silence:** ");
+        if !line.starts_with(&prefix) || line[prefix.len()..].trim().is_empty() {
+            return Err(format!("decision ledger entry {entries} must start with `**Brief silence:**`"));
+        }
+        for field in ["Choice", "Alternative", "If asking were free"] {
+            let prefix = format!("- **{field}:** ");
+            let value = lines.next().ok_or_else(|| format!("decision ledger entry {entries} is missing `{field}`"))?;
+            if !value.starts_with(&prefix) || value[prefix.len()..].trim().is_empty() {
+                return Err(format!("decision ledger entry {entries} needs a nonempty `{field}` field"));
+            }
+        }
+    }
+    if entries == 0 {
+        return Err("decision ledger needs at least one numbered entry".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn read_decision_ledger(path: &Path) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path).map_err(|error| format!("stat decision ledger: {error}"))?.len();
+    if size > MAX_DECISION_LEDGER_BYTES as u64 {
+        return Err(format!("decision ledger exceeds {MAX_DECISION_LEDGER_BYTES} bytes"));
+    }
+    let body = std::fs::read(path).map_err(|error| format!("read decision ledger: {error}"))?;
+    validate_decision_ledger(&body)?;
+    Ok(body)
+}
 
 pub struct SystemBriefArtifactWriter {
     pub backend: ResourceBackend,
@@ -120,11 +164,22 @@ impl ArtifactService<'_> {
         if input.kind.is_empty() || input.subject.is_empty() || input.media_type.is_empty() {
             return Err("artifact kind, subject, and media type must be nonempty".into());
         }
+        if input.kind == "decision-ledger" && input.subject != caller.convoy {
+            return Err("decision ledger subject must be its convoy".into());
+        }
         if input.summary.values().any(|value| !value.is_string() && !value.is_number() && !value.is_boolean()) {
             return Err("artifact summary values must be string, number, or boolean scalars".into());
         }
         if serde_json::to_vec(&input.summary).map_err(|error| error.to_string())?.len() > MAX_SUMMARY_BYTES {
             return Err("artifact summary exceeds 4096 bytes".into());
+        }
+        if input.kind == "decision-ledger" {
+            match &input.body {
+                ArtifactBody::Bytes(bytes) => validate_decision_ledger(bytes)?,
+                ArtifactBody::File(path) => {
+                    read_decision_ledger(path)?;
+                }
+            }
         }
         let (digest, size) = match &input.body {
             ArtifactBody::Bytes(bytes) => (self.blobs.put(bytes).await?, bytes.len() as u64),
@@ -151,6 +206,7 @@ impl ArtifactService<'_> {
             .digest(digest.as_str().to_string())
             .size(size)
             .media_type(input.media_type)
+            .recorded_at(Utc::now())
             .expires_at(expires_at)
             .pinned(prior.as_ref().is_some_and(|object| object.spec.pinned))
             .build();
@@ -288,6 +344,20 @@ mod tests {
         assert!(backend.using::<Artifact>(namespace).get(&artifact.metadata.name).await.is_ok());
         let fetched = remote_blobs.get(&BlobDigest::parse(&digest).expect("valid digest")).await.expect("fetch on remote host");
         assert_eq!(fetched.as_deref(), Some(body.as_slice()));
+    }
+
+    #[test]
+    fn decision_ledger_requires_a_complete_entry_and_bounded_content() {
+        let valid = b"## Decision ledger\n\n1. **Brief silence:** The output name\n- **Choice:** report.md\n- **Alternative:** output.md\n- **If asking were free:** Which name?\n";
+        assert!(validate_decision_ledger(valid).is_ok());
+        assert!(validate_decision_ledger(b"/tmp/ledger.md").is_err());
+        assert!(validate_decision_ledger(b"## Decision ledger\nNo decisions beyond the brief.\n").is_err());
+        assert!(validate_decision_ledger(&vec![b'x'; MAX_DECISION_LEDGER_BYTES + 1]).is_err());
+        let file = tempfile::NamedTempFile::new().expect("ledger file");
+        std::fs::write(file.path(), valid).expect("write ledger");
+        assert_eq!(read_decision_ledger(file.path()).expect("daemon reads body"), valid);
+        std::fs::write(file.path(), b"/tmp/ledger.md").expect("write path text");
+        assert!(read_decision_ledger(file.path()).is_err());
     }
 
     fn input(subject: &str, summary: BTreeMap<String, serde_json::Value>, body: &[u8]) -> ArtifactPutInput {

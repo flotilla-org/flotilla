@@ -265,7 +265,7 @@ enum ArtifactSubCommand {
         #[arg(long)]
         kind: String,
         #[arg(long)]
-        about: String,
+        about: Option<String>,
         #[arg(long = "summary", value_parser = parse_artifact_summary)]
         summary: Vec<(String, serde_json::Value)>,
         file: PathBuf,
@@ -1335,6 +1335,9 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
     .map_err(|error| color_eyre::eyre::eyre!(error))?;
     match command {
         ArtifactSubCommand::Put { kind, about, summary, file } => {
+            if about.is_none() && kind != "decision-ledger" {
+                return Err(color_eyre::eyre::eyre!("--about is required except for decision-ledger"));
+            }
             let source_path = tokio::fs::canonicalize(&file).await?;
             let media_type = match file.extension().and_then(|value| value.to_str()).unwrap_or("") {
                 "json" => "application/json",
@@ -1345,7 +1348,7 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
             };
             let summary = summary.into_iter().collect();
             let (address, digest) = daemon
-                .artifact_put(kind, about, summary, media_type.to_string(), source_path)
+                .artifact_put(kind, about.unwrap_or_default(), summary, media_type.to_string(), source_path)
                 .await
                 .map_err(|error| color_eyre::eyre::eyre!(error))?;
             match format {
@@ -3394,6 +3397,9 @@ mod tests {
             Some(SubCommand::Artifact { command: ArtifactSubCommand::Put { summary, .. } })
                 if summary == vec![("approved".to_string(), serde_json::json!(true))]
         ));
+        let ledger = Cli::try_parse_from(["flotilla", "artifact", "put", "--kind", "decision-ledger", "ledger.md"])
+            .expect("ledger put parses without an explicit subject");
+        assert!(matches!(ledger.command, Some(SubCommand::Artifact { command: ArtifactSubCommand::Put { about: None, .. } })));
         assert!(Cli::try_parse_from([
             "flotilla",
             "artifact",

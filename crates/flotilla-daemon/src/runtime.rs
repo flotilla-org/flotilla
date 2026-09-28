@@ -12366,7 +12366,11 @@ mod tests {
                         .crew(vec![
                             CrewSpec::builder()
                                 .role("coder".to_string())
-                                .completion_expectations(vec![flotilla_resources::CrewCompletionExpectation::DecisionLedger])
+                                .completion_conditions(vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
+                                    "coder",
+                                    "decision-ledger",
+                                    flotilla_resources::ArtifactSubjectBinding::Convoy,
+                                )])
                                 .source(CrewSource::Agent {
                                     selector: Selector::for_capability("coding"),
                                     prompt: Some(
@@ -12509,9 +12513,8 @@ mod tests {
             )
             .await
             .expect("dispatch refused completion");
-        assert_eq!(wait_for_command_result(&mut rx, refused_complete_id).await, CommandValue::Error {
-            message: "crew completion expectations unmet: crew/implement/coder: post the decision ledger comment and pass its URL with `--decision-ledger-ref`".to_string(),
-        });
+        assert!(matches!(wait_for_command_result(&mut rx, refused_complete_id).await,
+            CommandValue::Error { message } if message.contains("decision-ledger") && message.contains(".exists")));
         let after_refusal =
             convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
         assert_eq!(after_refusal, initial_status, "refused completion must not mutate convoy status");
@@ -12521,6 +12524,29 @@ mod tests {
             "refused completion must leave the crew session alive"
         );
 
+        let ledger_name = flotilla_resources::artifact_record_name(&crew_record, "coder", "decision-ledger", &crew_record);
+        backend
+            .using::<flotilla_resources::Artifact>(NAMESPACE)
+            .create(
+                &empty_meta(&ledger_name),
+                &flotilla_resources::ArtifactSpec::builder()
+                    .convoy(crew_record.clone())
+                    .producer("coder".to_string())
+                    .kind("decision-ledger".to_string())
+                    .subject(crew_record.clone())
+                    .summary(BTreeMap::from([(
+                        "comment_url".to_string(),
+                        serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-coder"),
+                    )]))
+                    .digest("test-ledger-digest".to_string())
+                    .size(1)
+                    .media_type("text/markdown".to_string())
+                    .expires_at(Utc::now() + chrono::Duration::days(1))
+                    .build(),
+            )
+            .await
+            .expect("publish coder ledger artifact");
+
         let mut rx = daemon.subscribe();
         let coder_complete_id = daemon
             .execute(
@@ -12529,7 +12555,7 @@ mod tests {
                         context: crew_context.clone(),
                         message: Some("implementation ready".to_string()),
                         disposition: None,
-                        decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-coder".to_string()),
+                        decision_ledger_ref: None,
                         force: false,
                     })
                     .build(),
@@ -12756,6 +12782,19 @@ mod tests {
         };
         assert!(flotilla_protocol::arg::flatten(args, 0).contains(&format!("attach --take {}", revived_coder.metadata.name)));
 
+        let ledgers = backend.using::<flotilla_resources::Artifact>(NAMESPACE);
+        let prior_ledger = ledgers.get(&ledger_name).await.expect("coder ledger");
+        let mut revised_ledger = prior_ledger.spec.clone();
+        revised_ledger.digest = "test-ledger-revision".to_string();
+        revised_ledger.summary.insert(
+            "comment_url".to_string(),
+            serde_json::json!("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-recomplete"),
+        );
+        ledgers
+            .update(&empty_meta(&ledger_name), &prior_ledger.metadata.resource_version, &revised_ledger)
+            .await
+            .expect("publish revised coder ledger");
+
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon
             .execute(
@@ -12764,7 +12803,7 @@ mod tests {
                         context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
                         message: Some("review findings addressed".to_string()),
                         disposition: None,
-                        decision_ledger_ref: Some("https://github.com/flotilla-org/flotilla/pull/1875#issuecomment-recomplete".to_string()),
+                        decision_ledger_ref: None,
                         force: false,
                     })
                     .build(),
