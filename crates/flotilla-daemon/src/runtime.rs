@@ -2,10 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex, Weak,
-    },
+    sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 
@@ -55,9 +52,12 @@ use flotilla_resources::{
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
-use futures::{FutureExt, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::json;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -352,6 +352,7 @@ struct DaemonHealthIdentity {
 struct RuntimeHealth {
     failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
     restart_history_dir: Option<Arc<PathBuf>>,
+    fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
 }
 
 impl RuntimeHealth {
@@ -587,6 +588,7 @@ impl DaemonRuntime {
         }
 
         let mut tasks = vec![
+            spawn_local_fulfilment_probe_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), runtime_health.clone()),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
             spawn_blob_sync_status_task(
@@ -600,7 +602,7 @@ impl DaemonRuntime {
                 options.namespace.clone(),
                 profile.clone(),
                 Arc::new(Some(Arc::clone(&credential_store))),
-                health,
+                health.clone(),
                 runtime_health.clone(),
                 options.heartbeat_interval,
             ),
@@ -636,6 +638,7 @@ impl DaemonRuntime {
             tasks.push(crate::event_relay::spawn(Arc::clone(&daemon), relay, config.state_dir().as_path().to_path_buf())?);
         }
         for ssh in &ssh_profiles {
+            tasks.push(spawn_ssh_fulfilment_probe_task(Arc::clone(&daemon), options.namespace.clone(), ssh.clone()));
             let daemon = Arc::clone(&daemon);
             let namespace = options.namespace.clone();
             let ssh = ssh.clone();
@@ -858,7 +861,7 @@ struct AgentlessSshProfile {
     destination: String,
     env_bag: EnvironmentBag,
     runner: Arc<dyn CommandRunner>,
-    facts_probed_this_process: Arc<AtomicBool>,
+    fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
 }
 
 struct BagEnvVars<'a>(&'a EnvironmentBag);
@@ -920,7 +923,7 @@ async fn discover_agentless_ssh_profile(
         destination,
         env_bag: direct.env_bag,
         runner: direct.runner,
-        facts_probed_this_process: Arc::new(AtomicBool::new(false)),
+        fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
     })
 }
 
@@ -1034,27 +1037,7 @@ async fn apply_agentless_ssh_observation(
         let platform = agentless_platform(ssh.runner.as_ref()).await;
         migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     }
-    let fulfilment_facts = if probe_succeeded {
-        let previous_facts = if ssh.facts_probed_this_process.load(Ordering::Acquire) {
-            host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
-        } else {
-            BTreeMap::new()
-        };
-        let facts = observe_fulfilment_facts(
-            &daemon.resource_backend(),
-            namespace,
-            &profile.host_id,
-            &profile.available_pools,
-            &previous_facts,
-            ssh.runner.as_ref(),
-            &BagEnvVars(&ssh.env_bag),
-        )
-        .await?;
-        ssh.facts_probed_this_process.store(true, Ordering::Release);
-        facts
-    } else {
-        BTreeMap::new()
-    };
+    let fulfilment_facts = if probe_succeeded { ssh.fulfilment_facts.read().await.clone() } else { BTreeMap::new() };
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
@@ -2191,7 +2174,7 @@ async fn observe_fulfilment_facts(
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?;
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
-    let mut facts = BTreeMap::new();
+    let mut probes = FuturesUnordered::new();
     for kind in kinds.items {
         if kind.spec.host_ref != host_ref || kind.metadata.deletion_timestamp.is_some() {
             continue;
@@ -2207,25 +2190,41 @@ async fn observe_fulfilment_facts(
             FulfilmentRealisation::HostDirect => None,
         };
         let pool_available = available_pools.contains(&kind.spec.pool);
+        let name = kind.metadata.name;
         let current = previous
-            .get(&kind.metadata.name)
-            .filter(|prior| prior.image == image && prior.free_vessel_slots == (!pool_available).then_some(0));
-        let observed = match current {
-            Some(current) => current.clone(),
-            None => match tokio::time::timeout(
-                Duration::from_secs(45),
-                crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env),
-            )
-            .await
-            {
-                Ok(observed) => observed,
-                Err(_) => {
-                    warn!(kind = %kind.metadata.name, "fulfilment fact probe exceeded total deadline");
-                    continue;
+            .get(&name)
+            .filter(|prior| {
+                prior.image == image
+                    && prior.free_vessel_slots == (!pool_available).then_some(0)
+                    && Utc::now().signed_duration_since(prior.observed_at).to_std().is_ok_and(|age| age < Duration::from_secs(300))
+            })
+            .cloned();
+        probes.push(async move {
+            let observed = match current {
+                Some(current) => Some(current),
+                None => tokio::time::timeout(
+                    Duration::from_secs(45),
+                    crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env),
+                )
+                .await
+                .ok(),
+            };
+            (name, observed)
+        });
+    }
+    let mut facts = BTreeMap::new();
+    while let Some((name, observed)) = probes.next().await {
+        match observed {
+            Some(observed) => {
+                facts.insert(name, observed);
+            }
+            None => {
+                warn!(kind = %name, "fulfilment fact probe exceeded total deadline");
+                if let Some(previous) = previous.get(&name) {
+                    facts.insert(name, previous.clone());
                 }
-            },
-        };
-        facts.insert(kind.metadata.name, observed);
+            }
+        }
     }
     Ok(facts)
 }
@@ -2293,6 +2292,86 @@ fn spawn_sleep_inhibitor_task(
             async move { sleep_inhibitor::run(convoys, vessels, hosts, host_id).await }
         })
         .await;
+    })
+}
+
+const FULFILMENT_CHANGE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+fn spawn_local_fulfilment_probe_task(
+    daemon: Arc<InProcessDaemon>,
+    namespace: String,
+    profile: LocalProvisioningProfile,
+    runtime_health: RuntimeHealth,
+) -> JoinHandle<()> {
+    spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        let profile = profile.clone();
+        let runtime_health = runtime_health.clone();
+        async move {
+            let discovery = daemon.discovery_runtime();
+            let previous = runtime_health.fulfilment_facts.read().await.clone();
+            match observe_fulfilment_facts(
+                &daemon.resource_backend(),
+                &namespace,
+                &profile.host_id,
+                &profile.available_pools,
+                &previous,
+                discovery.runner.as_ref(),
+                discovery.env.as_ref(),
+            )
+            .await
+            {
+                Ok(facts) if facts != previous => {
+                    *runtime_health.fulfilment_facts.write().await = facts.clone();
+                    let hosts = daemon.resource_backend().using::<Host>(&namespace);
+                    if let Err(error) =
+                        flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::FulfilmentFacts { facts }).await
+                    {
+                        warn!(%error, "failed to publish observed fulfilment facts");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "failed to observe local fulfilment facts"),
+            }
+        }
+    })
+}
+
+fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: String, ssh: AgentlessSshProfile) -> JoinHandle<()> {
+    spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        let ssh = ssh.clone();
+        async move {
+            let previous = ssh.fulfilment_facts.read().await.clone();
+            match observe_fulfilment_facts(
+                &daemon.resource_backend(),
+                &namespace,
+                &ssh.provisioning.host_id,
+                &ssh.provisioning.available_pools,
+                &previous,
+                ssh.runner.as_ref(),
+                &BagEnvVars(&ssh.env_bag),
+            )
+            .await
+            {
+                Ok(facts) if facts != previous => {
+                    *ssh.fulfilment_facts.write().await = facts.clone();
+                    let hosts = daemon.resource_backend().using::<Host>(&namespace);
+                    if let Err(error) =
+                        flotilla_resources::apply_status_patch(&hosts, &ssh.provisioning.host_id, &HostStatusPatch::FulfilmentFacts {
+                            facts,
+                        })
+                        .await
+                    {
+                        warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warn!(host = %ssh.provisioning.host_id, %error, "failed to observe SSH fulfilment facts"),
+            }
+        }
     })
 }
 
@@ -2854,23 +2933,7 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
-    let discovery = daemon.discovery_runtime();
-    let previous_facts = host
-        .status
-        .as_ref()
-        .filter(|status| status.daemon_started_at == Some(health.started_at))
-        .map(|status| status.fulfilment_facts.clone())
-        .unwrap_or_default();
-    let fulfilment_facts = observe_fulfilment_facts(
-        &backend,
-        namespace,
-        &profile.host_id,
-        &profile.available_pools,
-        &previous_facts,
-        discovery.runner.as_ref(),
-        discovery.env.as_ref(),
-    )
-    .await?;
+    let fulfilment_facts = runtime_health.fulfilment_facts.read().await.clone();
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
@@ -5880,7 +5943,7 @@ mod tests {
                 .with(EnvironmentAssertion::env_var("FLOTILLA_PROBE_MODELS", ""))
                 .with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
             runner,
-            facts_probed_this_process: Arc::new(AtomicBool::new(false)),
+            fulfilment_facts: Arc::new(RwLock::new(BTreeMap::new())),
         };
         register_agentless_ssh_resources(&daemon.resource_backend(), NAMESPACE, &local_host_id, &profile)
             .await
@@ -11153,6 +11216,144 @@ mod tests {
         })
         .await
         .expect("timed out waiting for command result")
+    }
+
+    #[tokio::test]
+    async fn spawned_fulfilment_probe_task_publishes_facts_after_heartbeat() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"probe-task-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile = manual_profile(&host_id, false);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+        let kind_name = "host-direct-probe-task";
+        daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta(kind_name),
+                &FulfilmentKindSpec::builder()
+                    .host_ref(host_id.clone())
+                    .pool("passthrough".to_string())
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("fulfilment kind");
+        let runtime_health = RuntimeHealth::default();
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &test_health_identity(), &runtime_health)
+            .await
+            .expect("first heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        assert!(hosts.get(&host_id).await.expect("host").status.expect("status").fulfilment_facts.is_empty());
+
+        let task = spawn_local_fulfilment_probe_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, runtime_health.clone());
+        wait_until_with_timeout(Duration::from_secs(5), || {
+            let hosts = hosts.clone();
+            let host_id = host_id.clone();
+            async move {
+                hosts
+                    .get(&host_id)
+                    .await
+                    .ok()
+                    .and_then(|host| host.status)
+                    .is_some_and(|status| status.fulfilment_facts.contains_key(kind_name))
+            }
+        })
+        .await;
+        assert!(runtime_health.fulfilment_facts.read().await.contains_key(kind_name));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_wait_for_fulfilment_probe_and_publishes_later_facts() {
+        struct GatedProbeRunner {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for GatedProbeRunner {
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                false
+            }
+            async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+                Err("unused".to_string())
+            }
+
+            async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+                if cmd == "rustc" {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    Ok(CommandOutput { stdout: "rustc 1.94.1".to_string(), stderr: String::new(), success: true })
+                } else {
+                    Err("tool unavailable".to_string())
+                }
+            }
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"async-facts-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile = manual_profile(&host_id, false);
+        ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration");
+        daemon
+            .resource_backend()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta("host-direct-async-facts-test"),
+                &FulfilmentKindSpec::builder()
+                    .host_ref(host_id.clone())
+                    .pool("passthrough".to_string())
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("fulfilment kind");
+        let health = test_health_identity();
+        let runtime_health = RuntimeHealth::default();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let backend = daemon.resource_backend();
+        let probe_host = host_id.clone();
+        let probe_pools = profile.available_pools.clone();
+        let probe_runner = GatedProbeRunner { entered: Arc::clone(&entered), release: Arc::clone(&release) };
+        let probe = tokio::spawn(async move {
+            observe_fulfilment_facts(
+                &backend,
+                NAMESPACE,
+                &probe_host,
+                &probe_pools,
+                &BTreeMap::new(),
+                &probe_runner,
+                &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+            )
+            .await
+            .expect("probe facts")
+        });
+        entered.notified().await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health),
+        )
+        .await
+        .expect("heartbeat must not wait for probe")
+        .expect("publish heartbeat");
+        let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
+        let status = hosts.get(&host_id).await.expect("host").status.expect("status");
+        assert!(status.ready);
+        assert_eq!(status.daemon_generation, health.generation);
+        assert!(status.fulfilment_facts.is_empty());
+
+        release.notify_one();
+        *runtime_health.fulfilment_facts.write().await = probe.await.expect("probe task");
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
+            .await
+            .expect("publish observed facts");
+        let status = hosts.get(&host_id).await.expect("host").status.expect("status");
+        assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
     }
 
     #[tokio::test]

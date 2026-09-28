@@ -123,6 +123,8 @@ pub struct FulfilmentFacts {
     pub free_vessel_slots: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_present: Option<bool>,
     pub observed_at: DateTime<Utc>,
 }
 
@@ -269,6 +271,9 @@ pub enum HostStatusPatch {
     BlobSync {
         status: flotilla_protocol::BlobSyncStatus,
     },
+    FulfilmentFacts {
+        facts: BTreeMap<String, FulfilmentFacts>,
+    },
     Heartbeat {
         capabilities: BTreeMap<String, serde_json::Value>,
         heartbeat_at: DateTime<Utc>,
@@ -289,6 +294,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
     fn apply(&self, status: &mut HostStatus) {
         match self {
             Self::BlobSync { status: sync } => status.blob_sync = Some(sync.clone()),
+            Self::FulfilmentFacts { facts } => status.fulfilment_facts.clone_from(facts),
             Self::Heartbeat {
                 capabilities,
                 heartbeat_at,

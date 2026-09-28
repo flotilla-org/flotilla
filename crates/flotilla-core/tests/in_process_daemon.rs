@@ -2147,6 +2147,60 @@ async fn start_capability_convoy(daemon: &InProcessDaemon, name: &str, configure
 }
 
 #[tokio::test]
+async fn capability_admission_names_unobserved_kind_facts() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-unobserved", "unobserved", 100, BTreeSet::from(["codex".to_string()])).await;
+
+    let result = start_capability_convoy(&daemon, "unobserved-harness", |intent| {
+        intent.needs.push("harness:claude-code>=2.1.300".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("facts not yet observed for kind host-direct-unobserved")),
+        "{result:?}"
+    );
+    let structurally_refused = start_capability_convoy(&daemon, "unobserved-and-wrong-platform", |intent| {
+        intent.needs.push("harness:claude-code>=2.1.300".to_string());
+        intent.needs.push("platform:windows".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&structurally_refused, CommandValue::Error { message } if message.contains("uncovered `platform:windows`") && !message.contains("facts not yet observed")),
+        "{structurally_refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_selector_admission_names_unobserved_kind_facts() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(
+        &backend,
+        "host-direct-model-unknown",
+        "model-unknown",
+        100,
+        BTreeSet::from(["claude-code".to_string()]),
+    )
+    .await;
+
+    let result = start_capability_convoy(&daemon, "model-not-yet-observed", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("preview".to_string()),
+        });
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("facts not yet observed for kind") && message.contains("host-direct-model-unknown")),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
@@ -5306,6 +5360,18 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     });
     let host_ref = daemon.local_host_id().expect("local host id").to_string();
     create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
+    let host = hosts.get(&host_ref).await.expect("governor host");
+    let mut status = host.status.expect("governor host status");
+    status.fulfilment_facts.insert("governor-host".to_string(), FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".to_string(), HarnessFacts {
+            version: "1.0.0".to_string(),
+            models: BTreeMap::from([("fable".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
+        })]),
+        observed_at: chrono::Utc::now(),
+        ..Default::default()
+    });
+    hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("publish governor model facts");
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("migrated ensure admits");
     let admitted = admitted_convoy(&daemon.resource_backend(), "governor").await;
     assert_eq!(admitted.spec.repositories.len(), 1);
