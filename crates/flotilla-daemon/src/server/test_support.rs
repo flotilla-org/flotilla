@@ -6,7 +6,7 @@ use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
     CommandCaller, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
 };
-use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, Stance, WorkflowTemplate};
+use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use super::{build_remote_command_router, spawn_peer_networking_runtime};
@@ -24,8 +24,8 @@ pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str
 }
 
 pub async fn seed_trusted_remote_convoy_project(daemon: &InProcessDaemon, namespace: &str) {
-    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
-    workflow.vessels[0].stance = Stance::Trusted;
+    let workflow = flotilla_resources::single_agent_workflow_spec();
+
     let backend = daemon.resource_backend();
     backend
         .clone()

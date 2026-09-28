@@ -28,8 +28,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout, CheckoutSpec, Convoy, ConvoyEnsure, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project,
-    ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, Stance,
-    WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL,
+    ProjectRepositoryRole, ProjectSpec, Repository, RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend, WorkflowTemplate,
+    WorkflowTemplateSpec, MANAGED_BY_LABEL,
 };
 use tracing::instrument::WithSubscriber;
 
@@ -257,7 +257,7 @@ async fn replicated_remote_declaration_resolution_preserves_existing_mirror_proj
                 .build(),
             &ProjectSpec::builder()
                 .display_name("flotilla".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(mirror_key).build()])
                 .build(),
         )
@@ -376,7 +376,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "flotilla".to_string(), members: 1 }
     );
     let flotilla = backend.using::<Project>("flotilla").get("flotilla").await.expect("flotilla project");
-    assert_eq!(flotilla.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(flotilla.spec.default_workflow_ref, "single-agent");
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(
         flotilla.spec.repositories[0].roles,
@@ -387,7 +387,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
 
     std::fs::write(
         tmp.path().join("project.yaml"),
-        "name: split\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: split\ndefault_workflow: single-agent\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("write declaration");
     assert_eq!(
@@ -396,7 +396,7 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "split".to_string(), members: 2 }
     );
     let split = backend.using::<Project>("flotilla").get("split").await.expect("split project");
-    assert_eq!(split.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(split.spec.default_workflow_ref, "single-agent");
     assert_eq!(split.spec.repositories.iter().map(|member| member.alias.as_deref()).collect::<Vec<_>>(), vec![
         Some("app"),
         Some("operations")
@@ -441,7 +441,7 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectApply {
             name: "flotilla".to_string(),
             spec_yaml: format!(
-                "display_name: overwritten\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {registered_repo}\n"
+                "display_name: overwritten\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {registered_repo}\n"
             ),
         })
         .await,
@@ -548,7 +548,7 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
     *commit.write().expect("commit lock should not be poisoned") = "commit-two".to_string();
     std::fs::write(
         &declaration_path,
-        "name: demo\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
+        "name: demo\ndefault_workflow: single-agent\nmembers:\n  - alias: app\n    url: https://github.com/example/app-renamed\n    roles: [code, knowledge]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n",
     )
     .expect("update declaration");
     assert_eq!(
@@ -563,7 +563,7 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
     assert_eq!(refreshed.spec.display_name, "demo");
-    assert_eq!(refreshed.spec.default_workflow_ref, "single-agent-trusted");
+    assert_eq!(refreshed.spec.default_workflow_ref, "single-agent");
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");
     let renamed = RepositorySpec::remote("https://github.com/example/app-renamed").expect("renamed repository");
     assert_eq!(app.repo, renamed.key(), "the current declaration is authoritative for its alias binding");
@@ -616,7 +616,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let ensure_path = tmp.path().join("quartermaster.entry");
     std::fs::write(
         &ensure_path,
-        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\n",
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\npresents-as: fleet\n",
     )
     .expect("write standing convoy ensure");
 
@@ -654,7 +654,6 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     assert_eq!(ensure.spec.role, "quartermaster");
     assert_eq!(ensure.spec.workflow_ref, "all-code");
     assert_eq!(ensure.spec.repositories, vec![operations.repo.clone()]);
-    assert_eq!(ensure.spec.stance, Some(Stance::Trusted));
     assert!(ensure.spec.agent_overrides.is_empty());
     assert_eq!(ensure.metadata.annotations.get(SOURCE_COMMIT_ANNOTATION).map(String::as_str), Some("ops-commit"));
     assert_eq!(ensure.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("fleet"));
@@ -690,7 +689,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         .expect("drift workflow");
     std::fs::write(
         &ensure_path,
-        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\nstance: trusted\npresents-as: fleet\nagents: [quartermaster=claude-code:claude-fable-5-1]\n",
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\npresents-as: fleet\nagents: [quartermaster=claude-code:claude-fable-5-1]\n",
     )
     .expect("declare agent override");
     assert_eq!(
@@ -806,7 +805,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
             &InputMeta::builder().name("replicated".to_string()).annotations(annotations).build(),
             &ProjectSpec::builder()
                 .display_name("replicated".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![
                     flotilla_resources::ProjectRepositorySpec {
                         repo: app.key(),
@@ -972,7 +971,7 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
     .expect("write declaration");
     std::fs::write(
         tmp.path().join("invalid-ensure.entry"),
-        "---\nkind: ensure\nrole: finite-work\nrepos: [app]\n---\nworkflow: single-agent-trusted\n",
+        "---\nkind: ensure\nrole: finite-work\nrepos: [app]\n---\nworkflow: single-agent\n",
     )
     .expect("write ensure entry");
 
@@ -984,7 +983,7 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
     assert!(
         matches!(&result, CommandValue::Error { message }
             if message.contains("invalid-ensure.entry")
-                && message.contains("single-agent-trusted")
+                && message.contains("single-agent")
                 && message.contains("exit declaration")),
         "unexpected command result: {result:?}"
     );
@@ -1019,7 +1018,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
     let projects = backend.definitions::<Project>("flotilla");
     let user_spec = ProjectSpec::builder()
         .display_name("My Tracked Repository".to_string())
-        .default_workflow_ref("single-agent-contained".to_string())
+        .default_workflow_ref("single-agent".to_string())
         .issue_source_bindings(vec![IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }.into()])
         .repositories(vec![flotilla_resources::ProjectRepositorySpec {
             repo: repository_key,
@@ -1090,7 +1089,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
                 .build(),
             &ProjectSpec::builder()
                 .display_name("flotilla-lab".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(mirror.key()).build()])
                 .build(),
         )
@@ -1162,7 +1161,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
             &InputMeta::builder().name("tracked".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("tracked".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
                     repo: repository_key,
                     alias: None,
@@ -1214,7 +1213,7 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
             &InputMeta::builder().name("github-com-flotilla-org-andamento".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("andamento".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -1343,7 +1342,7 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
             &InputMeta::builder().name("a-remote-name".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("a-remote-name".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
                 .build(),
         )
@@ -1532,7 +1531,7 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     .action(CommandAction::ProjectApply {
                 name: "presentation".into(),
                 spec_yaml: format!(
-                    "display_name: Presentation\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {local_key}\n  - repo: {second_key}\n"
+                    "display_name: Presentation\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {local_key}\n  - repo: {second_key}\n"
                 ),
             })
     .build())
@@ -1586,6 +1585,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
     let custom_spec = flotilla_resources::ProjectSpec {
+        role_needs: Default::default(),
         display_name: "Shared product".to_string(),
         default_workflow_ref: "custom-workflow".to_string(),
         supervision: None,
@@ -1613,6 +1613,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
     for (name, repo_ref) in [("shared", "first-repository"), ("github-com-org-b-shared", "second-repository")] {
         projects
             .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
+                role_needs: Default::default(),
                 display_name: name.to_string(),
                 default_workflow_ref: "custom-workflow".to_string(),
                 supervision: None,
@@ -1655,7 +1656,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(checkouts.items.len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         repo: repository_key,
         alias: None,
@@ -1710,7 +1711,7 @@ async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_h
                 &InputMeta::builder().name("view-only".to_string()).build(),
                 &ProjectSpec::builder()
                     .display_name("view-only".to_string())
-                    .default_workflow_ref("single-agent-trusted".to_string())
+                    .default_workflow_ref("single-agent".to_string())
                     .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(key).build()])
                     .build(),
             )
@@ -1887,7 +1888,7 @@ async fn project_apply_normalizes_typed_multi_repo_definition() {
     let mut rx = daemon.subscribe();
     let yaml = r#"
 display_name: Cross-Project Demo
-default_workflow_ref: single-agent-contained
+default_workflow_ref: single-agent
 repositories:
   - repo: b
     subpath: ./services/api
@@ -1921,7 +1922,7 @@ async fn project_apply_preserves_existing_metadata() {
                 .build(),
             &ProjectSpec::builder()
                 .display_name("Before".to_string())
-                .default_workflow_ref("single-agent-trusted".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
                     repo: RepositoryKey("repository".to_string()),
                     alias: None,
@@ -1936,7 +1937,7 @@ async fn project_apply_preserves_existing_metadata() {
     let mut rx = daemon.subscribe();
     let yaml = r#"
 display_name: After
-default_workflow_ref: single-agent-trusted
+default_workflow_ref: single-agent
 issue_source_bindings:
   - source:
       service: https://linear.app
@@ -2026,8 +2027,7 @@ async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
             Command::builder()
                 .action(CommandAction::ProjectApply {
                     name: "waiting".into(),
-                    spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n"
-                        .into(),
+                    spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: missing\n".into(),
                 })
                 .build(),
         )

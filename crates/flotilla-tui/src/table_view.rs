@@ -1570,6 +1570,8 @@ mod tests {
     #[test]
     fn convoy_and_vessel_details_render_placement_decisions_with_refusals() {
         let decision = flotilla_protocol::PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
             policy_name: "host-direct-kiwi".into(),
             target_host: flotilla_protocol::PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),

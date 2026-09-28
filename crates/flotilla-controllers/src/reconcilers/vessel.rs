@@ -276,7 +276,9 @@ impl Reconciler for VesselReconciler {
             Err(ResourceError::NotFound { .. }) => return Ok(VesselPrepared::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
             Err(err) => return Err(err),
         };
-        let placement_decision = convoy.status.as_ref().and_then(|status| status.placement_decision.clone());
+        let placement_decision = flotilla_resources::vessel_placement_pin(&convoy, &obj.spec.vessel_name)
+            .map(|pin| pin.decision)
+            .or_else(|| convoy.status.as_ref().and_then(|status| status.placement_decision.clone()));
         if self.local_host_ref.as_ref().zip(placement_decision.as_ref()).is_some_and(|(local_host_ref, decision)| {
             &decision.target_host.reference != local_host_ref && !self.additional_host_refs.contains(&decision.target_host.reference)
         }) {
@@ -320,16 +322,6 @@ impl Reconciler for VesselReconciler {
             Err(message) => return Ok(VesselPrepared::failed(message)),
         };
         let effective_stance = strategy.effective_stance();
-        if effective_stance < requirement.stance {
-            return Ok(VesselPrepared::failed(format!(
-                "vessel {} requires {} stance, but placement policy {} uses {} placement with effective {} stance",
-                obj.spec.vessel_name,
-                requirement.stance,
-                placement_policy.metadata.name,
-                strategy.description(),
-                effective_stance,
-            )));
-        }
 
         let repository_refs = requirement
             .repository_refs
@@ -1027,7 +1019,7 @@ impl Reconciler for VesselReconciler {
                 image,
                 checkout_refs,
                 terminal_session_refs: terminal_refs,
-                requested_stance: requirement.stance,
+                requested_stance: effective_stance,
                 effective_stance,
             },
             actuations,
@@ -1290,14 +1282,6 @@ impl PlacementStrategy {
         }
     }
 
-    fn description(&self) -> &'static str {
-        match self {
-            Self::HostDirect { .. } => "host-direct",
-            Self::DockerWorktreeOnHostAndMount { .. } => "docker-worktree",
-            Self::DockerFreshCloneInContainer { .. } => "docker-fresh-clone",
-        }
-    }
-
     fn host_ref(&self) -> &str {
         match self {
             Self::HostDirect { host_ref, .. }
@@ -1403,6 +1387,8 @@ mod tests {
     #[test]
     fn waiting_message_replaces_the_structured_host_direct_environment_name() {
         let decision = PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
             policy_name: "host-direct-test".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("01HXYZ"),
@@ -1433,6 +1419,8 @@ mod tests {
             })
             .build();
         let decision = PlacementDecision {
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
             policy_name: "host-direct-udder".to_string(),
             target_host: PlacementTargetHost {
                 reference: flotilla_protocol::CanonicalHostId::resolved("1c8df992"),

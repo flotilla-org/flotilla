@@ -96,9 +96,15 @@ pub enum ConvoyVerb {
         /// Human free-text appended to the crew Brief
         #[arg(long)]
         instruction: Option<String>,
-        /// PlacementPolicy resource to use for vessel provisioning
-        #[arg(long = "placement-policy")]
+        /// Pin a fulfilment kind for vessel provisioning
+        #[arg(long = "fulfilment")]
         placement_policy: Option<String>,
+        /// Add a capability need (repeatable)
+        #[arg(long = "need")]
+        needs: Vec<String>,
+        /// Reason for a pin above the least privileged alternatives
+        #[arg(long = "escalation-reason")]
+        escalation_reason: Option<String>,
         /// Agent harness override (repeatable): --agent [capability=]adapter[:model].
         /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
         #[arg(long = "agent", value_parser = parse_agent_override)]
@@ -127,8 +133,8 @@ pub enum ConvoyVerb {
         /// Project this convoy belongs to (metadata grouping)
         #[arg(long = "project")]
         project_ref: Option<String>,
-        /// PlacementPolicy resource to use for vessel provisioning
-        #[arg(long = "placement-policy")]
+        /// Pin a fulfilment kind for vessel provisioning
+        #[arg(long = "fulfilment")]
         placement_policy: Option<String>,
         /// Existing local checkout/worktree to adopt as the convoy vessel
         #[arg(long = "adopt-checkout")]
@@ -290,6 +296,8 @@ impl ConvoyNoun {
                 inputs,
                 instruction,
                 placement_policy,
+                needs,
+                escalation_reason,
                 agent_overrides,
                 no_attach,
                 attach,
@@ -336,6 +344,8 @@ impl ConvoyNoun {
                                 inputs,
                                 instruction,
                                 placement_policy,
+                                needs,
+                                escalation_reason,
                                 agent_overrides,
                                 auto_attach: match (attach, no_attach) {
                                     (true, false) => ConvoyAutoAttach::Always,
@@ -370,6 +380,8 @@ impl ConvoyNoun {
                                     inputs,
                                     instruction: None,
                                     placement_policy,
+                                    needs: Vec::new(),
+                                    escalation_reason: None,
                                     agent_overrides: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
                                 }),
@@ -462,6 +474,8 @@ impl std::fmt::Display for ConvoyNoun {
                 inputs,
                 instruction,
                 placement_policy,
+                needs,
+                escalation_reason,
                 agent_overrides,
                 no_attach,
                 attach,
@@ -495,7 +509,13 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --instruction {}", quote_value(instruction))?;
                 }
                 if let Some(placement_policy) = placement_policy {
-                    write!(f, " --placement-policy {}", quote_value(placement_policy))?;
+                    write!(f, " --fulfilment {}", quote_value(placement_policy))?;
+                }
+                for need in needs {
+                    write!(f, " --need {}", quote_value(need))?;
+                }
+                if let Some(reason) = escalation_reason {
+                    write!(f, " --escalation-reason {}", quote_value(reason))?;
                 }
                 for choice in agent_overrides {
                     let model = choice.model.as_ref().map(|model| format!(":{model}")).unwrap_or_default();
@@ -523,7 +543,7 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --project {}", quote_value(project))?;
                 }
                 if let Some(placement_policy) = placement_policy {
-                    write!(f, " --placement-policy {}", quote_value(placement_policy))?;
+                    write!(f, " --fulfilment {}", quote_value(placement_policy))?;
                 }
                 if let Some(adopted_checkout) = adopted_checkout {
                     write!(f, " --adopt-checkout {}", quote_value(&adopted_checkout.display().to_string()))?;
@@ -685,6 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn start_resolves_capability_additions_and_a_recorded_pin() {
+        let resolved = parse(&[
+            "convoy",
+            "start",
+            "--project",
+            "flotilla",
+            "--need",
+            "platform:windows",
+            "--fulfilment",
+            "host-direct-windows",
+            "--escalation-reason",
+            "desktop verification",
+        ])
+        .resolve()
+        .expect("resolve");
+        let Resolved::NeedsContext { command: Command { action: CommandAction::ConvoyStart { intent }, .. }, .. } = resolved else {
+            panic!("start resolves to a convoy start intent");
+        };
+        assert_eq!(intent.needs, ["platform:windows"]);
+        assert_eq!(intent.placement_policy.as_deref(), Some("host-direct-windows"));
+        assert_eq!(intent.escalation_reason.as_deref(), Some("desktop verification"));
+    }
+
+    #[test]
     fn round_trip_resume() {
         assert_round_trip::<ConvoyNoun>(&[
             "convoy",
@@ -722,7 +766,7 @@ mod tests {
             "--branch",
             "fix/repair-widget-admission",
             "--workflow",
-            "single-agent-contained",
+            "single-agent",
             "--instruction",
             "Preserve the public API.",
             "--no-attach",
@@ -743,10 +787,12 @@ mod tests {
                     })],
                     name: Some("repair-widget-admission".into()),
                     branch: Some("fix/repair-widget-admission".into()),
-                    workflow_ref: Some("single-agent-contained".into()),
+                    workflow_ref: Some("single-agent".into()),
                     inputs: vec![],
                     instruction: Some("Preserve the public API.".into()),
                     placement_policy: None,
+                    needs: Vec::new(),
+                    escalation_reason: None,
                     agent_overrides: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -776,6 +822,8 @@ mod tests {
                     inputs: vec![],
                     instruction: None,
                     placement_policy: None,
+                    needs: Vec::new(),
+                    escalation_reason: None,
                     agent_overrides: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -803,6 +851,8 @@ mod tests {
                     inputs: vec![],
                     instruction: None,
                     placement_policy: None,
+                    needs: Vec::new(),
+                    escalation_reason: None,
                     agent_overrides: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
@@ -839,6 +889,8 @@ mod tests {
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
+                    needs: Vec::new(),
+                    escalation_reason: None,
                     agent_overrides: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
@@ -932,19 +984,10 @@ mod tests {
 
     #[test]
     fn project_backed_legacy_create_collapses_into_start_admission() {
-        let resolved = parse(&[
-            "convoy",
-            "project-work",
-            "create",
-            "--template",
-            "single-agent-contained",
-            "--project",
-            "widgets",
-            "--ref",
-            "fix/widgets",
-        ])
-        .resolve()
-        .expect("resolve");
+        let resolved =
+            parse(&["convoy", "project-work", "create", "--template", "single-agent", "--project", "widgets", "--ref", "fix/widgets"])
+                .resolve()
+                .expect("resolve");
 
         let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
         assert_eq!(command.action, CommandAction::ConvoyStart {
@@ -955,10 +998,12 @@ mod tests {
                 issues: Vec::new(),
                 name: Some("project-work".into()),
                 branch: Some("fix/widgets".into()),
-                workflow_ref: Some("single-agent-contained".into()),
+                workflow_ref: Some("single-agent".into()),
                 inputs: Vec::new(),
                 instruction: None,
                 placement_policy: None,
+                needs: Vec::new(),
+                escalation_reason: None,
                 agent_overrides: Vec::new(),
                 auto_attach: ConvoyAutoAttach::Never,
             }),
@@ -967,7 +1012,7 @@ mod tests {
 
     #[test]
     fn convoy_create_with_placement_policy_resolves() {
-        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--placement-policy", "host-direct-local"])
+        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--fulfilment", "host-direct-local"])
             .resolve()
             .expect("resolve");
         crate::test_utils::assert_needs_context(
@@ -1031,7 +1076,7 @@ mod tests {
             "https://example.com/repo.git",
             "--ref",
             "main",
-            "--placement-policy",
+            "--fulfilment",
             "host-direct-local",
             "--adopt-checkout",
             "/tmp/repo",

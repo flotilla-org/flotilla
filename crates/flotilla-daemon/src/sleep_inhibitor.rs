@@ -633,7 +633,7 @@ mod tests {
         ConvoySpec {
             role: String::new(),
             generation: 1,
-            workflow_ref: "single-agent-contained".to_string(),
+            workflow_ref: "single-agent".to_string(),
             dispatching_principal_ref: PrincipalRef::default(),
             inputs: BTreeMap::new(),
             placement_policy: None,
@@ -658,6 +658,8 @@ mod tests {
             .update_status(name, &created.metadata.resource_version, &ConvoyStatus {
                 phase,
                 placement_decision: target_host.map(|host| PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
                     policy_name: "test-policy".to_string(),
                     target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
                     refused_candidates: vec![],
@@ -823,6 +825,8 @@ mod tests {
             .update_status("lagging", &lagging.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 placement_decision: Some(PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
                     policy_name: "test-policy".to_string(),
                     target_host: PlacementTargetHost {
                         reference: CanonicalHostId::resolved("other-host"),

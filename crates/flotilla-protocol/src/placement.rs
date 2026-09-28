@@ -64,6 +64,11 @@ pub struct PlacementDecision {
     pub target_host: PlacementTargetHost,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimal_alternatives: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_candidates: Vec<PlacementRefusal>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

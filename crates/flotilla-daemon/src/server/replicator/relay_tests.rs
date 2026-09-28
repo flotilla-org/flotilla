@@ -5,7 +5,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyStartIntent, DaemonEvent, HostName};
 use flotilla_resources::{
-    single_agent_trusted_workflow_spec, Convoy, CrewSource, HttpBackend, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend,
+    single_agent_workflow_spec, Convoy, CrewSource, HttpBackend, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend,
     ResourceObject, ResourceProvenance, SqliteBackend, WorkflowTemplate, WorkflowTemplateSpec, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 use flotilla_test_support::TestSocketDir;
@@ -144,7 +144,7 @@ async fn governor_relay_contract(storage: TestBackend) {
         .expect("create admission project");
     assert!(matches!(admit_governor(udder).await, CommandValue::Error { message } if message.contains("workflow template governor")));
 
-    let mut workflow = single_agent_trusted_workflow_spec();
+    let mut workflow = single_agent_workflow_spec();
     workflow.exit = None;
     // No processes are launched: this tests admission independently of adapters.
     workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "true".to_string() };

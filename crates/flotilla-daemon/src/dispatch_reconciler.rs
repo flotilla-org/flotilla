@@ -240,8 +240,8 @@ impl DispatchReconciler {
                     Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
-                let workflow = match workflows.get(pinned_workflow_ref(convoy)).await {
-                    Ok(workflow) => workflow,
+                match workflows.get(pinned_workflow_ref(convoy)).await {
+                    Ok(_) => {}
                     Err(error) => {
                         warn!(
                             project = %project.metadata.name,
@@ -252,8 +252,8 @@ impl DispatchReconciler {
                         );
                         continue;
                     }
-                };
-                let stance = workflow.spec.vessels.iter().map(|vessel| vessel.stance).max().unwrap_or_default();
+                }
+                let stance = flotilla_resources::Stance::Trusted;
                 let dispatched_at = convoy.metadata.creation_timestamp;
                 let time_from_ready_seconds =
                     dispatched_at.signed_duration_since(queue_entry.ready_observed_at).num_seconds().max(0) as u64;
@@ -398,8 +398,7 @@ mod tests {
 
     use flotilla_protocol::IssueSource;
     use flotilla_resources::{
-        single_agent_contained_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, Stance,
-        VirtualClock,
+        single_agent_workflow_spec, ConvoyIssue, ConvoySpec, InputValue, IssueSnapshot, ProjectSpec, RepositoryKey, Stance, VirtualClock,
     };
 
     use super::*;
@@ -479,6 +478,7 @@ mod tests {
             .clone()
             .using::<Project>(NAMESPACE)
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
+                role_needs: Default::default(),
                 display_name: "Widgets".to_string(),
                 default_workflow_ref: "implement".to_string(),
                 supervision: None,
@@ -583,7 +583,7 @@ mod tests {
         let workflow_authority = ResourceBackend::InMemory(Default::default()).with_local_root(workflow_root.clone());
         workflow_authority
             .definitions::<WorkflowTemplate>(NAMESPACE)
-            .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_contained_workflow_spec())
+            .apply(&InputMeta::builder().name("review-and-fix".to_string()).build(), &single_agent_workflow_spec())
             .await
             .expect("workflow");
         backend
@@ -642,7 +642,7 @@ mod tests {
         assert_eq!(observation.issue, ready.reference);
         assert_eq!(observation.workflow_ref, "review-and-fix");
         assert_eq!(observation.placement_policy.as_deref(), Some("docker-local"));
-        assert_eq!(observation.stance, Stance::Contained);
+        assert_eq!(observation.stance, Stance::Trusted);
         assert_eq!(
             observation.time_from_ready_seconds,
             observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64

@@ -7,7 +7,9 @@ use chrono::{DateTime, Utc};
 pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, ReplicaReadResolver, ReplicationClass, Repository, RepositoryKey};
+use crate::{
+    resource::define_resource, status_patch::StatusPatch, CapabilityNeed, ReplicaReadResolver, ReplicationClass, Repository, RepositoryKey,
+};
 
 define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
 
@@ -17,6 +19,10 @@ pub const DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS: u64 = 3600;
 pub struct ProjectSpec {
     pub display_name: String,
     pub default_workflow_ref: String,
+    /// Standing additions to each workflow role's capability needs.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Vec<crate::SupervisionTarget>>,
     #[builder(default)]
@@ -488,6 +494,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
+            role_needs: BTreeMap::new(),
             supervision: None,
             issue_source_bindings: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
             repositories: vec![ProjectRepositorySpec {
@@ -519,6 +526,7 @@ mod tests {
         let spec = ProjectSpec {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
+            role_needs: BTreeMap::new(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             repositories: vec![member("ghostty"), member("ghostty-ops")],

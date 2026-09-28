@@ -81,11 +81,15 @@ impl VesselPlacementProjector {
             let Some(convoy) = convoys_by_origin.get(&(origin_root.clone(), source.object.spec.convoy_ref.clone())) else {
                 continue;
             };
-            let target_host = convoy
-                .status
-                .as_ref()
-                .and_then(|status| status.placement_decision.as_ref())
-                .map(|decision| decision.target_host.reference.clone());
+            let target_host = flotilla_resources::vessel_placement_pin(convoy, &source.object.spec.vessel_name)
+                .map(|pin| pin.decision.target_host.reference)
+                .or_else(|| {
+                    convoy
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.placement_decision.as_ref())
+                        .map(|decision| decision.target_host.reference.clone())
+                });
             let Some(target_host) = target_host.filter(|host| host == &self.local_host_ref || self.additional_host_refs.contains(host))
             else {
                 continue;

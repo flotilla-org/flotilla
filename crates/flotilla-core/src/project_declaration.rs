@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_resources::{canonicalize_repo_url, ProjectRepositoryRole};
+use flotilla_resources::{canonicalize_repo_url, CapabilityNeed, ProjectRepositoryRole};
 use serde::Deserialize;
 
 pub const DECLARATION_FILE: &str = "project.yaml";
@@ -14,6 +14,8 @@ pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration
 pub struct ProjectDeclaration {
     pub name: String,
     pub default_workflow: Option<String>,
+    #[serde(default)]
+    pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
     pub members: Vec<ProjectDeclarationMember>,
 }
 
@@ -58,6 +60,8 @@ fn required(value: String, field: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_resources::CapabilityNeed;
+
     use super::{parse_project_declaration, ProjectRepositoryRole};
 
     #[test]
@@ -73,10 +77,22 @@ mod tests {
     #[test]
     fn parses_optional_default_workflow() {
         let declaration = parse_project_declaration(
-            "name: flotilla\ndefault_workflow: single-agent-trusted\nmembers:\n  - alias: flotilla\n    url: https://github.com/flotilla-org/flotilla.git\n    roles: [code]\n",
+            "name: flotilla\ndefault_workflow: single-agent\nmembers:\n  - alias: flotilla\n    url: https://github.com/flotilla-org/flotilla.git\n    roles: [code]\n",
         )
         .expect("declaration");
-        assert_eq!(declaration.default_workflow.as_deref(), Some("single-agent-trusted"));
+        assert_eq!(declaration.default_workflow.as_deref(), Some("single-agent"));
+    }
+
+    #[test]
+    fn parses_project_role_capability_needs() {
+        let declaration = parse_project_declaration(
+            "name: flotilla\nrole_needs:\n  coder: [platform:linux, toolchain:rust]\nmembers:\n  - alias: flotilla\n    url: https://github.com/flotilla-org/flotilla\n    roles: [code]\n",
+        )
+        .expect("declaration");
+        assert_eq!(
+            declaration.role_needs["coder"],
+            [CapabilityNeed::Platform("linux".to_string()), CapabilityNeed::Toolchain("rust".to_string())].into()
+        );
     }
 
     #[test]

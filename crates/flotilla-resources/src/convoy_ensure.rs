@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     checkout::ConditionValue, resource::define_resource, status_patch::StatusPatch, ControllerRetry, LeafMaker, ReplicationClass,
-    RepositoryKey, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition, Stance,
+    RepositoryKey, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
 };
 
 pub const DRIVER_ADMISSION_CONDITION_TYPE: &str = "DriverAdmission";
@@ -33,7 +33,7 @@ pub struct ConvoyEnsureSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stance: Option<Stance>,
+    pub escalation_reason: Option<String>,
     pub repositories: Vec<RepositoryKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presents_as: Option<String>,

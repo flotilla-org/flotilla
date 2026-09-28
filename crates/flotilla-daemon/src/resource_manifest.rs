@@ -1089,13 +1089,13 @@ mod tests {
         // #1736 owns selecting exactly one reconciler per manifest source. Model
         // that contract here by constructing only the declared root's loop.
         let current_dir = tempfile::tempdir().expect("current manifest dir");
-        write(&current_dir.path().join("project.json"), &project_manifest("single-agent-contained", true));
+        write(&current_dir.path().join("project.json"), &project_manifest("single-agent", true));
 
         let current = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("current-root"));
         let stale = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("stale-root"));
         let mut current_reconciler = ResourceManifestReconciler::new(current.clone(), NAMESPACE, current_dir.path());
         current_reconciler.reconcile_once().await.expect("current creation");
-        let stale_document = serde_json::from_str(&project_manifest("single-agent-trusted", false)).expect("stale manifest document");
+        let stale_document = serde_json::from_str(&project_manifest("single-agent", false)).expect("stale manifest document");
         apply_manifest_resource_document(&stale, NAMESPACE, stale_document).await.expect("seed pre-existing divergent peer state");
 
         current
@@ -1127,7 +1127,7 @@ mod tests {
         }
 
         let project = stale.definitions::<Project>(NAMESPACE).get("andamento").await.expect("merged project");
-        assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+        assert_eq!(project.spec.default_workflow_ref, "single-agent");
         assert_eq!(project.spec.repositories[0].alias.as_deref(), Some("andamento"));
         assert_eq!(project.spec.repositories[0].roles.len(), 3);
         let writer = project

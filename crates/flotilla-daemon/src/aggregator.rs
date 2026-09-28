@@ -2229,8 +2229,11 @@ impl Aggregator {
         state: Option<&WorkState>,
         stalled: Option<&StalledCondition>,
     ) -> VesselRow {
-        let requested_stance = definition.stance.to_string();
         let placement = state.and_then(|state| state.placement.as_ref());
+        let requested_stance = placement
+            .and_then(|placement| placement.fields.get("requested_stance"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let placement_decision = placement
             .and_then(|placement| placement.fields.get("placement_decision"))
             .and_then(|value| serde_json::from_value(value.clone()).ok());
@@ -2259,7 +2262,7 @@ impl Aggregator {
                 CrewMemberSummary {
                     role: process.role.clone(),
                     command_preview,
-                    requested_stance: Some(requested_stance.clone()),
+                    requested_stance: requested_stance.clone(),
                     effective_stance: effective_stance.clone(),
                 }
             })
@@ -2333,7 +2336,7 @@ impl Aggregator {
                             .or_else(|| state.and_then(|state| state.message.clone()))
                     }),
             )
-            .requested_stance(requested_stance)
+            .maybe_requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
             .maybe_image_ref(image_ref)
             .maybe_image_digest(image_digest)
@@ -2555,8 +2558,8 @@ mod tests {
         BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition,
         EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus,
         PresentationPhase, PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource,
-        RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource,
-        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
+        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -5263,7 +5266,6 @@ mod tests {
         let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
         let status = convoy.status.as_mut().expect("convoy status");
         let definition = &mut status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0];
-        definition.stance = Stance::WorkspaceWrite;
         definition
             .crew
             .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "cargo test".to_string() }).build());

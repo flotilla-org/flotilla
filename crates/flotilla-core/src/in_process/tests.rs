@@ -7,7 +7,7 @@ use flotilla_resources::{
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
     EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentFacts,
     FulfilmentKindSpec, HarnessFacts, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, RepositoryStatus, Selector, Stance,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, RepositoryStatus, Selector,
     TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
@@ -953,7 +953,7 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     let driver_root = NodeId::new("snapshot-driver");
     let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
     let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
-    let spec = flotilla_resources::single_agent_contained_workflow_spec();
+    let spec = flotilla_resources::single_agent_workflow_spec();
     let name = prepared_snapshot_name("workflow", &serde_json::to_value(&spec).expect("serialize workflow")).expect("snapshot name");
 
     ensure_prepared_workflow_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
@@ -1286,7 +1286,6 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     let repository = RepositoryKey("github.com-flotilla-org-flotilla".to_string());
     let requirement = VesselRequirement::builder()
         .name("work".to_string())
-        .stance(Stance::Contained)
         .credential_refs(BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]))
         .credential_scopes(BTreeMap::from([
             ("claude-max".to_string(), BTreeSet::from([repository.clone()])),
@@ -2020,7 +2019,6 @@ async fn standing_ensure_fixture_for(
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(Stance::Trusted)
                     .repository_refs(vec![repository_key.clone()])
                     .crew(Vec::new())
                     .build()])
@@ -2047,7 +2045,7 @@ async fn standing_ensure_fixture_for(
                     driver_ref: None,
                     workflow_ref: "quartermaster".to_string(),
                     placement_policy: None,
-                    stance: Some(Stance::Trusted),
+                    escalation_reason: None,
                     repositories: vec![repository_key],
                     presents_as: Some("fleet".to_string()),
                     agent_overrides: Vec::new(),
@@ -2151,7 +2149,6 @@ async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: V
     let ensures = backend.using::<ConvoyEnsure>("flotilla");
     let mut ensure = ensures.get("quartermaster").await.expect("standing ensure");
     ensure.spec.placement_policy = Some("standing-agent".to_string());
-    ensure.spec.stance = Some(Stance::Contained);
     ensure.spec.agent_overrides = overrides;
     ensures
         .update(&InputMeta::from(&ensure.metadata), &ensure.metadata.resource_version, &ensure.spec)
@@ -2972,7 +2969,6 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(Stance::Trusted)
                     .repository_refs(vec![repository_key.clone()])
                     .crew(Vec::new())
                     .build()])
@@ -2998,7 +2994,7 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
                 driver_ref: Some(driver_ref),
                 workflow_ref: "cross-root-workflow".to_string(),
                 placement_policy: None,
-                stance: Some(Stance::Trusted),
+                escalation_reason: None,
                 repositories: vec![repository_key.clone()],
                 presents_as: None,
                 agent_overrides: Vec::new(),
@@ -3458,7 +3454,6 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(Stance::Trusted)
                     .repository_refs(vec![repository_key])
                     .crew(Vec::new())
                     .build()])
@@ -3663,6 +3658,8 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                minimal_alternatives: Vec::new(),
+                escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
                 target_host: PlacementTargetHost {
                     reference: flotilla_protocol::CanonicalHostId::resolved(host_id),
@@ -3746,6 +3743,8 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
         .check_remote_placement_free_space_floor(
             "flotilla",
             Some(&PlacementDecision {
+                minimal_alternatives: Vec::new(),
+                escalation_reason: None,
                 policy_name: "self-targeted".to_string(),
                 target_host: target,
                 refused_candidates: Vec::new(),
@@ -3805,7 +3804,6 @@ async fn default_remote_placement_routes_before_admission() {
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(Stance::Trusted)
                     .crew(vec![CrewSpec::builder()
                         .role("governor".to_string())
                         .source(CrewSource::Agent {
@@ -3874,7 +3872,6 @@ async fn default_remote_placement_routes_before_admission() {
             &backend.definitions::<Project>("flotilla").get("andamento").await.expect("project").spec,
             &[],
             &intent,
-            None,
         )
         .await
         .expect("resolve admission workflow");
@@ -4085,7 +4082,6 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
     let trusted = WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![flotilla_resources::CrewSpec::builder()
                 .role("shell".to_string())
                 .source(flotilla_resources::CrewSource::Tool { command: "sh".to_string() })
@@ -4117,11 +4113,11 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
         .await
         .expect("synthetic Docker policy for SSH host");
 
-    let contained = flotilla_resources::single_agent_contained_workflow_spec();
-    let refused = default_convoy_placement_policy(&backend, "flotilla", None, &[], &contained, None)
+    let agent_workflow = flotilla_resources::single_agent_workflow_spec();
+    let refused = default_convoy_placement_policy(&backend, "flotilla", None, &[], &agent_workflow, None)
         .await
-        .expect_err("host-direct only host cannot place contained crew");
-    assert!(refused.contains("agentless SSH host"), "{refused}");
+        .expect_err("agentless SSH host cannot run a local agent adapter");
+    assert!(refused.contains("agent adapter `codex`"), "{refused}");
 
     backend.using::<PlacementPolicy>("flotilla").delete("docker-ssh-host").await.expect("remove synthetic Docker policy");
 
@@ -4136,9 +4132,7 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
 }
 
 fn trusted_codex_workflow() -> WorkflowTemplateSpec {
-    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
-    workflow.vessels[0].stance = Stance::Trusted;
-    workflow
+    flotilla_resources::single_agent_workflow_spec()
 }
 
 #[tokio::test]
@@ -4177,7 +4171,6 @@ async fn default_placement_refuses_unknown_host_without_blocking_tool_workflow()
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
         .vessels(vec![flotilla_resources::VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![flotilla_resources::CrewSpec::builder()
                 .role("watcher".to_string())
                 .source(flotilla_resources::CrewSource::Tool { command: "tail -f log".to_string() })
@@ -4484,7 +4477,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
     create_docker_placement(&backend, "docker-kiwi", "kiwi", BTreeSet::new()).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let workflow = WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
 
     for (docker, os, missing) in [(false, "macos", "docker capability"), (true, "macos", "Linux host capability")] {
@@ -4571,7 +4564,7 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
             .await
             .expect("grant");
     }
-    let resolve = |role: &str, stance: Stance, repository: &RepositorySpec| {
+    let resolve = |role: &str, repository: &RepositorySpec| {
         let role = role.to_string();
         let repository = repository.clone();
         let backend = backend.clone();
@@ -4579,7 +4572,6 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
             let mut workflow = WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .stance(stance)
                     .crew(vec![CrewSpec::builder().role(role).source(CrewSource::Tool { command: "true".to_string() }).build()])
                     .build()])
                 .build();
@@ -4597,17 +4589,17 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
             workflow.vessels.remove(0)
         }
     };
-    let contained = resolve("coder", Stance::Contained, &own).await;
-    let direct = resolve("coder", Stance::Trusted, &own).await;
+    let contained = resolve("coder", &own).await;
+    let direct = resolve("coder", &own).await;
     assert_eq!(contained.credential_refs, direct.credential_refs);
     assert_eq!(contained.credential_permissions, direct.credential_permissions);
     assert_eq!(
         contained.credential_permissions["github-app"],
         BTreeMap::from([("contents".to_string(), "write".to_string()), ("actions".to_string(), "read".to_string()),])
     );
-    let reviewer = resolve("reviewer", Stance::Contained, &own).await;
+    let reviewer = resolve("reviewer", &own).await;
     assert_eq!(reviewer.credential_permissions["github-app"], BTreeMap::from([("contents".to_string(), "read".to_string())]));
-    let fork_coder = resolve("coder", Stance::Contained, &fork).await;
+    let fork_coder = resolve("coder", &fork).await;
     assert!(fork_coder.credential_refs.is_empty());
 }
 
@@ -4628,7 +4620,6 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Contained)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .source(CrewSource::Agent {
@@ -4647,10 +4638,7 @@ async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() 
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
         .await
         .expect_err("contained Claude must not reach interactive login without OAuth");
-    assert_eq!(
-        error,
-        "contained agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it"
-    );
+    assert_eq!(error, "agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it");
 
     backend
         .clone()
@@ -4706,14 +4694,13 @@ async fn docker_placement_selects_credentials_for_the_effective_contained_stance
     create_docker_placement(&backend, "docker-crew", "host-a", BTreeSet::from(["github-crew-pr".to_string()])).await;
     let placement = backend.using::<PlacementPolicy>("flotilla").get("docker-crew").await.expect("get Docker placement");
     let mut workflow = WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Trusted).crew(Vec::new()).build()])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
 
     resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut workflow)
         .await
         .expect("resolve credentials against effective stance");
 
-    assert_eq!(workflow.vessels[0].stance, Stance::Trusted, "requested stance remains part of the workflow contract");
     assert_eq!(workflow.vessels[0].credential_refs, BTreeSet::from(["github-crew-pr".to_string()]));
     validate_workflow_credentials(&backend, "flotilla", &workflow, Some(&placement))
         .await
@@ -4735,7 +4722,7 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
         .await
         .expect("create GitHub credential declaration");
     let workflow = WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
 
     backend
@@ -4752,7 +4739,7 @@ async fn project_grant_entitlement_is_independent_of_vessel_stance() {
         .expect("create project grant");
 
     let mut host_direct = workflow.clone();
-    host_direct.vessels[0].stance = Stance::Trusted;
+
     resolve_workflow_credentials(&backend, "flotilla", Some("flotilla"), &[], &mut host_direct).await.expect("resolve host-direct grant");
 
     let mut contained = workflow;
@@ -4816,7 +4803,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
         .await
         .expect("create feta placement");
     let mut workflow = WorkflowTemplateSpec::builder()
-        .vessels(vec![VesselRequirement::builder().name("work".to_string()).stance(Stance::Contained).crew(Vec::new()).build()])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()])
         .build();
     workflow.vessels[0].credential_refs = BTreeSet::from(["claude-max".to_string()]);
 
@@ -4851,7 +4838,6 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .source(CrewSource::Agent {
@@ -4870,7 +4856,7 @@ async fn trusted_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     let error = validate_workflow_credentials(&backend, "flotilla", &without_grant, None)
         .await
         .expect_err("trusted Claude must not reach ambient login without delivered OAuth");
-    assert_eq!(error, "trusted agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it");
+    assert_eq!(error, "agent adapter `claude-code` requires credential `claude-max`, but no matching CredentialGrant selected it");
 
     backend
         .clone()
@@ -4910,14 +4896,13 @@ async fn ambient_only_adapter_is_refused_when_the_host_login_expired() {
     let workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Trusted)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .source(CrewSource::Agent { selector: Selector::for_capability("ambient-only"), prompt: None, brief_template: None })
                 .build()])
             .build()])
         .build();
-    create_docker_placement(&backend, "ambient-host", "host-a", BTreeSet::new()).await;
+    create_host_direct_placement(&backend, "ambient-host", "host-a", BTreeSet::new()).await;
     let placement = backend.using::<PlacementPolicy>("flotilla").get("ambient-host").await.expect("get placement");
     let expired = CredentialExpiry::builder().refresh_expires_at("2020-02-01T00:00:00Z".parse().expect("timestamp")).build();
     set_host_credential_expiry(
@@ -4963,7 +4948,6 @@ async fn dispatch_against_an_expired_credential_is_refused_with_the_credential_a
     let mut workflow = WorkflowTemplateSpec::builder()
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
-            .stance(Stance::Contained)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
                 .source(CrewSource::Agent {

@@ -73,25 +73,21 @@ routing remains part of the federation work tracked in #1188.
    lives in comments or your head does not count: crews read bodies. After
    any grill, split, or re-scope, rewrite the body *before* dispatching or
    marking anything ready.
-2. Pick placement deliberately:
+2. Declare any needs the issue did not capture; admission picks the minimal covering fulfilment kind:
    ```sh
-   flotilla resource list placementpolicy   # find policy names
-   flotilla convoy start --project <proj> --issue <N> \
-       --placement-policy <policy> --no-attach
+   flotilla convoy start --project <proj> --issue <N> --no-attach
    ```
-   Weigh marginal cost: owned-idle sandboxes first, subscription-included
-   cloud agents next, metered last; reserve scarce platform capacity
-   (mac/GUI/Windows) for work that genuinely names it. Check the target host
-   has the agent adapters the workflow needs.
+   Use `--need <capability>` for a dispatch-specific constraint. To pin a
+   broader kind, pass `--fulfilment <kind> --escalation-reason <reason>`.
 3. Pick the harness when the default is wrong. Workflows name capabilities,
    not harnesses; `--agent [capability=]adapter[:model]` binds one for this
    dispatch and is repeatable, with the bare form applying to `code`:
    ```sh
    flotilla convoy start --project <proj> --issue <N> \
-       --placement-policy <policy> --agent claude-code:opus --no-attach
+       --agent claude-code:opus --no-attach
 
    flotilla convoy start --project <proj> --issue <N> \
-       --placement-policy <policy> --agent claude-code:sonnet \
+       --agent claude-code:sonnet \
        --agent review=codex --no-attach
    ```
    This is the budget lever: when one subscription's weekly window is spent,

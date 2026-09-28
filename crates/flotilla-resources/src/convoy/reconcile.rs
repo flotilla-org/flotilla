@@ -952,7 +952,6 @@ fn bootstrap_outcome(
             .iter()
             .map(|vessel| VesselRequirement {
                 name: vessel.name.clone(),
-                stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
                 repository_refs: vessel.repository_refs.clone(),
                 credential_refs: vessel.credential_refs.clone(),
@@ -1491,7 +1490,9 @@ fn extract_actuations(_convoy: &ResourceObject<Convoy>) -> Vec<Actuation> {
 }
 
 fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
-    let placement_policy_ref = pinned_placement_ref(convoy)?.to_string();
+    let placement_policy_ref = crate::vessel_placement_pin(convoy, vessel)
+        .map(|pin| pin.policy_ref)
+        .or_else(|| pinned_placement_ref(convoy).map(str::to_string))?;
     let requirement = convoy.status.as_ref()?.workflow_snapshot.as_ref()?.vessels.iter().find(|requirement| requirement.name == vessel)?;
     let repository_refs = requirement
         .repository_refs

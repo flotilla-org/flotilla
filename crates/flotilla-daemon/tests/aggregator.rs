@@ -94,7 +94,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
             &InputMeta::builder().name("widgets".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("Widgets".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
                 .build(),
         )
@@ -370,7 +370,7 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
             &InputMeta::builder().name("widgets".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("Widgets".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key).build()])
                 .build(),
         )
@@ -535,7 +535,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
             &InputMeta::builder().name("flotilla".to_string()).build(),
             &ProjectSpec::builder()
                 .display_name("Flotilla".to_string())
-                .default_workflow_ref("single-agent-contained".to_string())
+                .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
                 .build(),
         )

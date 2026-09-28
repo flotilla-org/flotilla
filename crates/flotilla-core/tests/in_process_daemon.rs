@@ -49,17 +49,18 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
-    single_agent_contained_workflow_spec, single_agent_shepherd_workflow_spec, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase,
-    CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceBackend,
-    ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TypedResolver,
-    WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    single_agent_shepherd_workflow_spec, single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
+    HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
+    LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
+    RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -868,6 +869,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .resource_backend()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Missing repository".into(),
             default_workflow_ref: "wf".into(),
             supervision: None,
@@ -1681,26 +1683,33 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
     status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
     hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("publish test placement host capacity");
+    let policy = PlacementPolicySpec::builder()
+        .pool("passthrough".to_string())
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            host_ref: "host-test".into(),
+            image: image.into(),
+            pull_policy: Default::default(),
+            agent_adapters,
+            default_cwd: Some("/workspace".into()),
+            env: Default::default(),
+            checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
+        })
+        .build();
     backend
         .clone()
         .using::<PlacementPolicy>("flotilla")
-        .create(
-            &InputMeta::builder().name("docker-test".to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
-                    host_ref: "host-test".into(),
-                    image: image.into(),
-                    pull_policy: Default::default(),
-                    agent_adapters,
-                    default_cwd: Some("/workspace".into()),
-                    env: Default::default(),
-                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
-                })
-                .build(),
-        )
+        .create(&InputMeta::builder().name("docker-test".to_string()).build(), &policy)
         .await
         .expect("contained policy create");
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name("docker-test".to_string()).build(),
+            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("docker kind"),
+        )
+        .await
+        .expect("docker kind create");
 }
 
 async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_source_bindings: Option<IssueSource>) {
@@ -1714,7 +1723,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
         .await
         .expect("workflow create");
     create_test_contained_policy(backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
@@ -1722,8 +1731,9 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: issue_source_bindings.into_iter().map(Into::into).collect(),
             dispatch_policy: None,
@@ -1755,9 +1765,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    for (name, workflow) in
-        [("single-agent-contained", single_agent_contained_workflow_spec()), ("implement-review", implement_review_workflow_spec())]
-    {
+    for (name, workflow) in [("single-agent", single_agent_workflow_spec()), ("implement-review", implement_review_workflow_spec())] {
         backend
             .clone()
             .using::<WorkflowTemplate>("flotilla")
@@ -1800,8 +1808,9 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Zellij".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
                 .source(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() })
@@ -1834,15 +1843,17 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: Some("docker-test".into()),
+                    needs: Vec::new(),
+                    escalation_reason: None,
                     agent_overrides: Vec::new(),
                     auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             })
             .build()
     };
-    let rejected_id = daemon.execute(start("reviewless", "single-agent-contained")).await.expect("dispatch command");
+    let rejected_id = daemon.execute(start("reviewless", "single-agent")).await.expect("dispatch command");
     assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
-        message: "workflow single-agent-contained not permitted for fork-stance repository — use implement-review".to_string()
+        message: "workflow single-agent not permitted for fork-stance repository — use implement-review".to_string()
     });
 
     let repositories = backend.clone().using::<Repository>("flotilla");
@@ -1855,7 +1866,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         )
         .await
         .expect("explicit reviewless override");
-    let overridden_id = daemon.execute(start("overridden", "single-agent-contained")).await.expect("override dispatch command");
+    let overridden_id = daemon.execute(start("overridden", "single-agent")).await.expect("override dispatch command");
     assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
         name: "overridden@zellij".into(),
         attach_plan: None,
@@ -1927,8 +1938,9 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".to_string(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: "single-agent".to_string(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -1959,6 +1971,8 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2091,26 +2105,226 @@ async fn create_test_host_direct_policy(
         })
         .await
         .expect("host status update");
+    let policy = PlacementPolicySpec::builder()
+        .pool("passthrough".to_string())
+        .priority(priority)
+        .host_direct(HostDirectPlacementPolicySpec {
+            host_ref: host_ref.to_string(),
+            checkout: HostDirectPlacementPolicyCheckout::Worktree,
+        })
+        .build();
     backend
         .clone()
         .using::<PlacementPolicy>("flotilla")
-        .create(
-            &InputMeta::builder().name(policy_name.to_string()).build(),
-            &PlacementPolicySpec::builder()
-                .pool("passthrough".to_string())
-                .priority(priority)
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_ref.to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
+        .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy)
         .await
         .expect("host-direct policy create");
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("direct kind"),
+        )
+        .await
+        .expect("host-direct kind create");
+}
+
+async fn start_capability_convoy(daemon: &InProcessDaemon, name: &str, configure: impl FnOnce(&mut ConvoyStartIntent)) -> CommandValue {
+    let mut intent = ConvoyStartIntent::builder()
+        .project_ref("flotilla".to_string())
+        .name(name.to_string())
+        .branch(format!("work/{name}"))
+        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+        .build();
+    configure(&mut intent);
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command::builder().action(CommandAction::ConvoyStart { intent: Box::new(intent) }).build())
+        .await
+        .expect("dispatch capability convoy");
+    recv_command_finished(&mut events, command_id).await
 }
 
 #[tokio::test]
-async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledgement() {
+async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-linux", "direct-linux", 100, BTreeSet::from(["codex".to_string()])).await;
+
+    let docs = start_capability_convoy(&daemon, "docs-only", |_| {}).await;
+    assert!(matches!(docs, CommandValue::ConvoyStarted { .. }), "{docs:?}");
+    let docs = admitted_convoy(&backend, "docs-only").await;
+    assert_eq!(docs.status.expect("admitted status").placement_decision.expect("placement").policy_name, "docker-test");
+
+    let refused = start_capability_convoy(&daemon, "pinned-without-reason", |intent| {
+        intent.placement_policy = Some("host-direct-linux".to_string());
+    })
+    .await;
+    assert!(
+        matches!(refused, CommandValue::Error { message } if message.contains("--escalation-reason") && message.contains("docker-test"))
+    );
+
+    let escalated = start_capability_convoy(&daemon, "pinned-with-reason", |intent| {
+        intent.placement_policy = Some("host-direct-linux".to_string());
+        intent.escalation_reason = Some("operator needs host tools".to_string());
+    })
+    .await;
+    assert!(matches!(escalated, CommandValue::ConvoyStarted { .. }), "{escalated:?}");
+    let escalated = admitted_convoy(&backend, "pinned-with-reason").await;
+    let decision = escalated.status.expect("admitted status").placement_decision.expect("placement");
+    assert_eq!(decision.policy_name, "host-direct-linux");
+    assert_eq!(decision.minimal_alternatives, ["docker-test"]);
+    assert_eq!(decision.escalation_reason.as_deref(), Some("operator needs host tools"));
+}
+
+#[tokio::test]
+async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-tools", "direct-tools", 0, BTreeSet::new()).await;
+    let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            flotilla_resources::VesselRequirement::builder()
+                .name("docs".to_string())
+                .crew(vec![flotilla_resources::CrewSpec::builder()
+                    .role("writer".to_string())
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build(),
+            flotilla_resources::VesselRequirement::builder()
+                .name("tools".to_string())
+                .crew(vec![flotilla_resources::CrewSpec::builder()
+                    .role("operator".to_string())
+                    .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::HostAccountReach]))
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build(),
+        ])
+        .build();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("mixed-needs".to_string()).build(), &workflow)
+        .await
+        .expect("workflow");
+
+    let result = start_capability_convoy(&daemon, "mixed-needs", |intent| {
+        intent.workflow_ref = Some("mixed-needs".to_string());
+    })
+    .await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "mixed-needs").await;
+    let docs = flotilla_resources::vessel_placement_pin(&admitted, "docs").expect("docs pin");
+    let tools = flotilla_resources::vessel_placement_pin(&admitted, "tools").expect("tools pin");
+    assert_eq!(docs.decision.policy_name, "docker-test");
+    assert_eq!(tools.decision.policy_name, "host-direct-tools");
+    assert_ne!(docs.policy_ref, tools.policy_ref);
+}
+
+#[tokio::test]
+async fn requested_model_derives_harness_need_and_selects_host_direct() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-model", "direct-model", 0, BTreeSet::from(["claude-code".to_string()])).await;
+    backend
+        .clone()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("Claude credential");
+    backend
+        .clone()
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &InputMeta::builder().name("claude-work".to_string()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(CredentialGrantSelector::builder().projects(BTreeSet::from(["flotilla".to_string()])).build())
+                .credentials(BTreeSet::from(["claude-max".to_string()]))
+                .build(),
+        )
+        .await
+        .expect("Claude grant");
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.get("direct-model").await.expect("model host");
+    let mut status = host.status.expect("host status");
+    status.fulfilment_facts.insert("host-direct-model".to_string(), FulfilmentFacts {
+        harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
+            version: "2.1.300".to_string(),
+            models: BTreeMap::from([("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
+        })]),
+        observed_at: chrono::Utc::now(),
+        ..Default::default()
+    });
+    status.capabilities.insert(HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"]));
+    hosts.update_status("direct-model", &host.metadata.resource_version, &status).await.expect("publish model facts");
+
+    let result = start_capability_convoy(&daemon, "model-driven", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("preview".to_string()),
+        });
+    })
+    .await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "model-driven").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("workflow snapshot");
+    let status = admitted.status.expect("admitted status");
+    assert_eq!(status.placement_decision.expect("placement").policy_name, "host-direct-model");
+    let needs = &snapshot.spec.vessels[0].crew[0].needs;
+    assert!(needs.contains(&flotilla_resources::CapabilityNeed::Harness {
+        adapter: "claude-code".to_string(),
+        minimum_version: "2.1.300".to_string(),
+    }));
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "model-driven".to_string() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain query");
+    let CommandValue::ConvoyExplanation(explanation) = result else {
+        panic!("explanation should be available after admission: {result:?}");
+    };
+    assert!(explanation.role_needs.values().flatten().any(|need| need == "harness:claude-code>=2.1.300"));
+    assert_eq!(explanation.vessel_placements["work"].policy_name, "host-direct-model");
+}
+
+#[tokio::test]
+async fn issue_platform_need_refuses_without_a_covering_kind() {
+    let source = IssueSource { service: "https://github.com".to_string(), scope: "flotilla-org/flotilla".to_string() };
+    let reference = IssueRef { source: source.clone(), id: "2142".to_string() };
+    let mut issue = TestIssue::new("Windows-only bug").id("2142").with_labels(vec!["needs:platform:windows".to_string()]).build();
+    issue.reference = reference.clone();
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    create_test_convoy_project(&daemon.resource_backend(), Some(source)).await;
+    let result = start_capability_convoy(&daemon, "windows-bug", |intent| {
+        intent.issues.push(IssueSelector::Reference(reference));
+    })
+    .await;
+    assert!(
+        matches!(result, CommandValue::Error { message } if message.contains("platform:windows") && message.contains("no fulfilment kind"))
+    );
+}
+
+#[tokio::test]
+async fn host_direct_convoy_start_uses_minimal_available_kind() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -2126,20 +2340,21 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
         .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
         .await
         .expect("repository create");
-    let mut workflow = single_agent_contained_workflow_spec();
-    workflow.vessels[0].stance = Stance::Trusted;
+    let workflow = single_agent_workflow_spec();
+
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-trusted".to_string()).build(), &workflow)
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &workflow)
         .await
         .expect("workflow create");
     backend
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-trusted".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -2173,6 +2388,8 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2183,13 +2400,7 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
         .expect("start command accepted");
 
     let implicit_result = recv_command_finished(&mut events, implicit_command_id).await;
-    let CommandValue::Error { message } = implicit_result else {
-        panic!("expected implicit trusted dispatch to be rejected, got {implicit_result:?}");
-    };
-    assert!(message.contains("trusted host-direct placement `host-direct-b-remote` on `remote-host`"));
-    assert!(message.contains("inherit ambient human credentials"));
-    assert!(message.contains("operator's forge identity"));
-    assert!(message.contains("--workflow single-agent-trusted"));
+    assert_eq!(implicit_result, CommandValue::ConvoyStarted { name: "local-default@flotilla".into(), attach_plan: None, binding: None });
 
     let command_id = daemon
         .execute(
@@ -2200,12 +2411,14 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
                         project_ref: "flotilla".into(),
                         change_request: None,
                         issues: Vec::new(),
-                        name: Some("local-default".into()),
-                        branch: Some("fix/local-default".into()),
-                        workflow_ref: Some("single-agent-trusted".into()),
+                        name: Some("explicit-default".into()),
+                        branch: Some("fix/explicit-default".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2226,17 +2439,16 @@ async fn trusted_host_direct_convoy_start_requires_explicit_workflow_acknowledge
     })
     .await
     .expect("start command should finish");
-    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default@flotilla".into(), attach_plan: None, binding: None });
-    let convoy = admitted_convoy(&backend, "local-default").await;
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "explicit-default@flotilla".into(), attach_plan: None, binding: None });
+    let convoy = admitted_convoy(&backend, "explicit-default").await;
     assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-b-remote"));
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
     assert_eq!(decision.policy_name, "host-direct-b-remote");
-    assert_eq!(decision.refused_candidates.len(), 1);
-    assert_eq!(decision.refused_candidates[0].policy_name, "host-direct-a-empty");
+    assert!(decision.refused_candidates.is_empty());
     assert_eq!(decision.viable_not_selected.len(), 1);
     assert_eq!(decision.viable_not_selected[0].policy_name, "host-direct-z-local");
-    assert_eq!(decision.viable_not_selected[0].reason, "priority -100 is lower than selected policy `host-direct-b-remote` priority 100");
+    assert_eq!(decision.viable_not_selected[0].reason, "minimal alternative");
 }
 
 #[tokio::test]
@@ -2255,7 +2467,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
         .await
         .expect("workflow create");
     create_test_contained_policy(&backend, "ubuntu:24.04", BTreeSet::new()).await;
@@ -2263,8 +2475,9 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -2295,6 +2508,8 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: Some("docker-test".into()),
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2315,10 +2530,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     .await
     .expect("start command should finish");
 
-    assert_eq!(result, CommandValue::Error {
-        message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
-            .to_string()
-    });
+    assert!(matches!(result, CommandValue::Error { message } if message.contains("workflow requires agent adapter `codex`")));
     assert!(matches!(
         backend.using::<ResourceConvoy>("flotilla").get("missing-adapter").await,
         Err(flotilla_resources::ResourceError::NotFound { .. })
@@ -2329,7 +2541,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
             Command::builder()
                 .action(CommandAction::ConvoyCreate {
                     name: "missing-adapter-legacy".into(),
-                    workflow_ref: "single-agent-contained".into(),
+                    workflow_ref: "single-agent".into(),
                     inputs: Vec::new(),
                     repository_url: None,
                     r#ref: Some("fix/missing-adapter-legacy".into()),
@@ -2379,7 +2591,7 @@ async fn convoy_start_accepts_project_list_identifier() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
         .await
         .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
@@ -2387,8 +2599,9 @@ async fn convoy_start_accepts_project_list_identifier() {
         .clone()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -2431,6 +2644,8 @@ async fn convoy_start_accepts_project_list_identifier() {
                             inputs: Vec::new(),
                             instruction: None,
                             placement_policy: None,
+                            needs: Vec::new(),
+                            escalation_reason: None,
                             agent_overrides: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
@@ -2472,6 +2687,8 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2524,7 +2741,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
         .await
         .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
@@ -2532,8 +2749,9 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: vec![flotilla_resources::IssueSourceBindingSpec::builder()
                 .source(reference.source.clone())
@@ -2572,10 +2790,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: vec![IssueSelector::Alias { alias: "planning".into(), id: reference.id.clone() }],
                         name: Some("issue-732".into()),
                         branch: Some("fix/issue-732".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: vec![("review".into(), "required".into())],
                         instruction: Some("Keep the snapshot durable.".into()),
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2599,7 +2819,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732@flotilla".into(), attach_plan: None, binding: None });
     let persisted = admitted_convoy(&backend, "issue-732").await;
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
-    assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
+    assert_eq!(persisted.spec.workflow_ref, "single-agent");
     assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
@@ -2654,10 +2874,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                             issues: vec![IssueSelector::Reference(issue_ref)],
                             name: Some(name.into()),
                             branch: Some(format!("fix/{name}")),
-                            workflow_ref: Some("single-agent-contained".into()),
+                            workflow_ref: Some("single-agent".into()),
                             inputs: Vec::new(),
                             instruction: None,
                             placement_policy: None,
+                            needs: Vec::new(),
+                            escalation_reason: None,
                             agent_overrides: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
@@ -2688,10 +2910,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: vec![IssueSelector::Id(reference.id.clone())],
                         name: Some("ambiguous-issue".into()),
                         branch: Some("fix/ambiguous-issue".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2715,10 +2939,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: Vec::new(),
                         name: Some("default-regard".into()),
                         branch: Some("fix/default-regard".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
@@ -2758,10 +2984,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         ],
                         name: Some("batch-732-733".into()),
                         branch: Some("fix/batch-732-733".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: Some("Fix both issues in one convoy.".into()),
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2807,6 +3035,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2839,6 +3069,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
             supervision: None,
@@ -2883,10 +3114,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: Vec::new(),
                         name: Some("explicit-workflow".into()),
                         branch: Some("fix/explicit-workflow".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2923,10 +3156,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: Vec::new(),
                         name: Some("wrong-namespace".into()),
                         branch: Some("fix/wrong-namespace".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -2963,10 +3198,12 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         issues: Vec::new(),
                         name: Some("invalid-branch".into()),
                         branch: Some("bad branch".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3012,7 +3249,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .create(&InputMeta::builder().name("single-agent".to_string()).build(), &single_agent_workflow_spec())
         .await
         .expect("workflow create");
     create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
@@ -3020,8 +3257,9 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "Flotilla".into(),
-            default_workflow_ref: "single-agent-contained".into(),
+            default_workflow_ref: "single-agent".into(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -3052,6 +3290,8 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                         inputs: Vec::new(),
                         instruction: Some("Implement the admission snapshot.".into()),
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
@@ -3236,6 +3476,8 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                                 inputs: Vec::new(),
                                 instruction: None,
                                 placement_policy: None,
+                                needs: Vec::new(),
+                                escalation_reason: None,
                                 agent_overrides: Vec::new(),
                                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                             }),
@@ -3300,6 +3542,8 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 inputs: Vec::new(),
                 instruction: Some("Implement issue 782".into()),
                 placement_policy: None,
+                needs: Vec::new(),
+                escalation_reason: None,
                 agent_overrides: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
@@ -3387,10 +3631,12 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                         issues: Vec::new(),
                         name: Some("bootstrap-failure".into()),
                         branch: Some("fix/bootstrap-failure".into()),
-                        workflow_ref: Some("single-agent-contained".into()),
+                        workflow_ref: Some("single-agent".into()),
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
+                        needs: Vec::new(),
+                        escalation_reason: None,
                         agent_overrides: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
                     }),
@@ -3412,7 +3658,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
     .await
     .expect("convoy should be persisted");
 
-    let workflow = single_agent_contained_workflow_spec();
+    let workflow = single_agent_workflow_spec();
     apply_status_patch(
         &convoys,
         &record_name,
@@ -3424,7 +3670,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                 turn_delivery: workflow.turn_delivery,
                 vessels: workflow.vessels,
             },
-            "single-agent-contained".into(),
+            "single-agent".into(),
             BTreeMap::new(),
             BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
             BTreeMap::new(),
@@ -4718,8 +4964,9 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let projects = daemon.resource_backend().using::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "repo suite".to_string(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: "single-agent".to_string(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -4885,8 +5132,9 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let projects = daemon.resource_backend().definitions::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "ghostty".to_string(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: "single-agent".to_string(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
@@ -5052,8 +5300,9 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .resource_backend()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            role_needs: Default::default(),
             display_name: "ghostty".to_string(),
-            default_workflow_ref: "single-agent-contained".to_string(),
+            default_workflow_ref: "single-agent".to_string(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
