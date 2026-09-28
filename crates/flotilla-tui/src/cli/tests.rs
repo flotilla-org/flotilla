@@ -57,6 +57,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         phase: "Landing".into(),
         message: Some("waiting for review evidence".into()),
         role_needs: Default::default(),
+        allocation: Vec::new(),
         vessel_placements: Default::default(),
         placement: None,
         evidence_ttl_seconds: 30,

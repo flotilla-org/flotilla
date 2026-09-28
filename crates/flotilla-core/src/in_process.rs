@@ -47,28 +47,28 @@ use flotilla_resources::{
     external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec, patch_resource_annotation,
     repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, BoundChangeRequest,
-    CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, AllocationDecision,
+    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
-    CrewCompletionPending, CrewSource, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind,
-    DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind,
-    FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    CrewCompletionPending, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
+    DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge,
+    ForgeKind, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus,
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
     LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, SettlementMode, SystemClock, TerminalAttentionState, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch,
-    TurnDeliveryRung, UnmetSettlementExpectation, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
-    GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL, MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_REF_LABEL,
+    ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, RoleHandoff, SettlementMode, SupervisionTarget, SystemClock,
+    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus,
+    TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, VesselRequirement, WatchEvent, WatchStart,
+    WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION,
+    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
+    MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -2142,6 +2142,275 @@ struct ConvoyAdmission {
     placement_decision: Option<PlacementDecision>,
     #[builder(default)]
     vessel_placements: BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>,
+}
+
+#[derive(Clone)]
+struct AllocationRole {
+    crew: CrewSpec,
+    hint: String,
+    repository_refs: Option<Vec<RepositoryKey>>,
+    depends_on: Vec<String>,
+    credential_signature: String,
+}
+
+fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, project: &ProjectSpec) -> Result<Vec<AllocationRole>, String> {
+    let mut roles = Vec::new();
+    let authored = if workflow.roles.is_empty() {
+        workflow.vessels.clone()
+    } else {
+        workflow
+            .roles
+            .iter()
+            .map(|crew| {
+                workflow.vessels.iter().find(|hint| hint.crew.iter().any(|member| member.role == crew.role)).map_or_else(
+                    || VesselRequirement::builder().name(crew.role.clone()).crew(vec![crew.clone()]).build(),
+                    |hint| VesselRequirement { crew: vec![crew.clone()], ..hint.clone() },
+                )
+            })
+            .collect()
+    };
+    for vessel in authored {
+        for crew in vessel.crew {
+            let matrix = crew.needs.contains(&CapabilityNeed::Platform("$matrix".to_string()))
+                || project.role_needs.get(&crew.role).is_some_and(|needs| needs.contains(&CapabilityNeed::Platform("$matrix".to_string())));
+            if matrix {
+                if project.platform_matrix.is_empty() {
+                    return Err(format!("role `{}` needs platform:$matrix but Project has no platform_matrix", crew.role));
+                }
+                let mut seen = BTreeSet::new();
+                for platform in &project.platform_matrix {
+                    let need = format!("platform:{platform}").parse::<CapabilityNeed>()?;
+                    if !seen.insert(platform) {
+                        continue;
+                    }
+                    let mut expanded = crew.clone();
+                    expanded.needs.remove(&CapabilityNeed::Platform("$matrix".to_string()));
+                    expanded.needs.insert(need);
+                    if let Some(standing) = project.role_needs.get(&crew.role) {
+                        expanded
+                            .needs
+                            .extend(standing.iter().filter(|need| **need != CapabilityNeed::Platform("$matrix".to_string())).cloned());
+                    }
+                    roles.push(AllocationRole {
+                        crew: expanded,
+                        hint: format!("{}[{platform}]", crew.role),
+                        repository_refs: vessel.repository_refs.clone(),
+                        depends_on: vessel.depends_on.clone(),
+                        credential_signature: String::new(),
+                    });
+                }
+            } else {
+                roles.push(AllocationRole {
+                    crew,
+                    hint: vessel.name.clone(),
+                    repository_refs: vessel.repository_refs.clone(),
+                    depends_on: vessel.depends_on.clone(),
+                    credential_signature: String::new(),
+                });
+            }
+        }
+    }
+    workflow.roles.clear();
+    workflow.vessels = roles
+        .iter()
+        .map(|role| {
+            VesselRequirement::builder()
+                .name(role.hint.clone())
+                .crew(vec![role.crew.clone()])
+                .maybe_repository_refs(role.repository_refs.clone())
+                .build()
+        })
+        .collect();
+    Ok(roles)
+}
+
+fn allocate_roles(workflow: &mut WorkflowTemplateSpec, roles: &[AllocationRole]) -> Result<(), String> {
+    let mut groups: Vec<Vec<&AllocationRole>> = Vec::new();
+    for role in roles {
+        let group = groups.iter_mut().find(|group| {
+            let first = group[0];
+            (first.crew.needs == role.crew.needs
+                || (first.hint == role.hint
+                    && first.crew.needs.iter().any(|need| role.crew.needs.iter().any(|other| need.conflicts_with(other)))))
+                && first.credential_signature == role.credential_signature
+                && first.repository_refs == role.repository_refs
+                && !group.iter().any(|other| other.crew.role == role.crew.role)
+        });
+        if let Some(group) = group {
+            group.push(role);
+        } else {
+            groups.push(vec![role]);
+        }
+    }
+    let mut used_names = BTreeSet::new();
+    let mut vessels = Vec::new();
+    let mut allocation = Vec::new();
+    let mut hint_to_vessels = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut role_to_vessels = BTreeMap::<String, BTreeSet<String>>::new();
+    for group in &groups {
+        let shared_hint = group.iter().all(|role| role.hint == group[0].hint);
+        let mut name = if shared_hint { group[0].hint.clone() } else { group[0].crew.role.clone() };
+        if used_names.contains(&name) {
+            let base = name.clone();
+            let mut index = 2;
+            while used_names.contains(&name) {
+                name = format!("{base}-{index}");
+                index += 1;
+            }
+        }
+        used_names.insert(name.clone());
+        for role in group {
+            hint_to_vessels.entry(role.hint.clone()).or_default().insert(name.clone());
+            role_to_vessels.entry(role.crew.role.clone()).or_default().insert(name.clone());
+        }
+        vessels.push(
+            VesselRequirement::builder()
+                .name(name.clone())
+                .crew(group.iter().map(|role| role.crew.clone()).collect())
+                .maybe_repository_refs(group[0].repository_refs.clone())
+                .build(),
+        );
+        allocation.push(AllocationDecision {
+            vessel: name,
+            roles: group.iter().map(|role| role.crew.role.clone()).collect(),
+            reason: if group.len() > 1 && group.iter().any(|role| role.crew.needs != group[0].crew.needs) {
+                "legacy grouping hint retained for placement; split if its needs cannot be covered".to_string()
+            } else if group.len() > 1 {
+                "equal needs and credential grants; sharing reduces vessel and handoff cost".to_string()
+            } else {
+                "separate needs, credential grants, or platform matrix".to_string()
+            },
+            crossed_handoffs: Vec::new(),
+        });
+    }
+    let mut add_edge = |from: &str, to: &str, label: &str| {
+        if from == to {
+            return;
+        }
+        if let Some(vessel) = vessels.iter_mut().find(|vessel| vessel.name == to) {
+            if !vessel.depends_on.iter().any(|dependency| dependency == from) {
+                vessel.depends_on.push(from.to_string());
+            }
+        }
+        if let Some(decision) = allocation.iter_mut().find(|decision| decision.vessel == to) {
+            decision.crossed_handoffs.push(label.to_string());
+        }
+    };
+    for role in roles {
+        for dependency in &role.depends_on {
+            if let (Some(from), Some(to)) = (hint_to_vessels.get(dependency), hint_to_vessels.get(&role.hint)) {
+                for from in from {
+                    for to in to {
+                        add_edge(from, to, &format!("{dependency} -> {}", role.hint));
+                    }
+                }
+            }
+        }
+    }
+    for RoleHandoff { from, to } in &workflow.handoffs {
+        let sources = role_to_vessels.get(from).ok_or_else(|| format!("handoff source role `{from}` is absent"))?;
+        let targets = role_to_vessels.get(to).ok_or_else(|| format!("handoff target role `{to}` is absent"))?;
+        for source in sources {
+            for target in targets {
+                if source != target {
+                    if let Some(decision) = allocation.iter_mut().find(|decision| decision.vessel == *target) {
+                        decision.crossed_handoffs.push(format!("{from} -> {to}"));
+                    }
+                }
+            }
+        }
+    }
+    for rule in workflow.turn_delivery.values_mut() {
+        if let Some(names) = role_to_vessels.get(&rule.to.role) {
+            if let Some(name) = names.iter().find(|name| *name == &rule.to.vessel).or_else(|| names.iter().next()) {
+                rule.to.vessel = name.clone();
+            }
+        }
+    }
+    if let Some(targets) = &mut workflow.supervision {
+        *targets = targets
+            .iter()
+            .flat_map(|target| match target {
+                SupervisionTarget::ConvoyCrew { role, .. } => role_to_vessels
+                    .get(role)
+                    .into_iter()
+                    .flat_map(|names| names.iter())
+                    .map(|name| SupervisionTarget::ConvoyCrew { vessel: name.clone(), role: role.clone() })
+                    .collect::<Vec<_>>(),
+                _ => vec![target.clone()],
+            })
+            .collect();
+    }
+    let nudges = std::mem::take(&mut workflow.stall_nudges);
+    for (address, policy) in nudges {
+        if let Some((_, role)) = address.split_once('/') {
+            if let Some(names) = role_to_vessels.get(role) {
+                for name in names {
+                    workflow.stall_nudges.insert(format!("{name}/{role}"), policy.clone());
+                }
+                continue;
+            }
+        }
+        workflow.stall_nudges.insert(address, policy);
+    }
+    workflow.vessels = vessels;
+    workflow.allocation = allocation;
+    Ok(())
+}
+
+async fn allocation_credential_grants(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: &str,
+    repositories: &[ConvoyRepositorySpec],
+    vessels: &[VesselRequirement],
+) -> Result<Vec<BTreeSet<String>>, String> {
+    let grants = backend
+        .including_replicas::<CredentialGrant>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list credential grants: {error}"))?;
+    let repository_trust = backend
+        .including_replicas::<Repository>(namespace)
+        .list()
+        .await
+        .map_err(|error| format!("list repositories for credential grants: {error}"))?
+        .items
+        .into_iter()
+        .map(|source| {
+            (
+                RepositoryKey(source.object.metadata.name),
+                if source.object.spec.is_fork() { RepositoryTrust::Fork } else { RepositoryTrust::Own },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let all_repositories = repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<BTreeSet<_>>();
+    vessels
+        .iter()
+        .map(|vessel| {
+            let keys = vessel
+                .repository_refs
+                .as_ref()
+                .map(|keys| keys.iter().cloned().collect::<BTreeSet<_>>())
+                .unwrap_or_else(|| all_repositories.clone());
+            let trust = keys
+                .iter()
+                .map(|key| {
+                    repository_trust
+                        .get(key)
+                        .copied()
+                        .map(|trust| (key.clone(), trust))
+                        .ok_or_else(|| format!("repository `{key}` unavailable for credential grant selection"))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            Ok(grants
+                .items
+                .iter()
+                .filter(|source| source.object.spec.selector.matches(Some(project_ref), &trust, &vessel.crew[0].role))
+                .map(|source| source.object.metadata.name.clone())
+                .collect())
+        })
+        .collect()
 }
 
 fn convoy_record_name() -> String {
@@ -4828,6 +5097,7 @@ async fn ensure_repository_and_default_project_workflow(
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
+        platform_matrix: Vec::new(),
         display_name,
         default_workflow_ref: "single-agent".to_string(),
         role_needs: BTreeMap::new(),
@@ -5686,7 +5956,7 @@ impl InProcessDaemon {
             for crew in &mut vessel.crew {
                 crew.needs.extend(common.iter().cloned());
                 if let Some(standing) = project.role_needs.get(&crew.role) {
-                    crew.needs.extend(standing.iter().cloned());
+                    crew.needs.extend(standing.iter().filter(|need| **need != CapabilityNeed::Platform("$matrix".to_string())).cloned());
                 }
                 if let CrewSource::Agent { selector, .. } = &crew.source {
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
@@ -5951,7 +6221,24 @@ impl InProcessDaemon {
         }
         let (workflow_ref, mut workflow) =
             self.resolve_convoy_admission_workflow(namespace, project_ref, &project.spec, &repositories_snapshot, intent).await?;
+        let mut allocation_roles = expand_allocation_roles(&mut workflow, &project.spec)?;
         self.compose_convoy_needs(namespace, &project.spec, &issues, intent, &mut workflow).await?;
+        let grant_sets =
+            allocation_credential_grants(&self.resource_backend, namespace, project_ref, &repositories_snapshot, &workflow.vessels).await?;
+        for ((role, vessel), grant_set) in allocation_roles.iter_mut().zip(&workflow.vessels).zip(grant_sets) {
+            role.crew = vessel.crew[0].clone();
+            let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
+            resolve_workflow_credentials(&self.resource_backend, namespace, Some(project_ref), &repositories_snapshot, &mut one).await?;
+            let resolved = &one.vessels[0];
+            role.credential_signature = serde_json::to_string(&(
+                grant_set,
+                &resolved.credential_refs,
+                &resolved.credential_scopes,
+                &resolved.credential_permissions,
+            ))
+            .map_err(|error| error.to_string())?;
+        }
+        allocate_roles(&mut workflow, &allocation_roles)?;
         if intent.placement_policy.is_none() && intent.escalation_reason.is_some() {
             return Err("--escalation-reason requires --fulfilment".to_string());
         }
@@ -6004,12 +6291,83 @@ impl InProcessDaemon {
             .is_empty();
         let (placement, minimal_alternatives) = if has_kinds && !workflow.vessels.is_empty() {
             let mut first = None;
-            let workflow_base = workflow.clone();
-            for vessel in &mut workflow.vessels {
+            let mut index = 0;
+            while index < workflow.vessels.len() {
+                let vessel = workflow.vessels[index].clone();
                 let needs = vessel.crew.iter().flat_map(|crew| crew.needs.iter().cloned()).collect::<BTreeSet<_>>();
-                let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow_base.clone() };
+                let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
                 let (resolution, alternatives) =
-                    self.resolve_capability_placement(namespace, project_ref, &repositories_snapshot, &one, &needs, intent).await?;
+                    match self.resolve_capability_placement(namespace, project_ref, &repositories_snapshot, &one, &needs, intent).await {
+                        Ok(result) => result,
+                        Err(error) if vessel.crew.len() > 1 => {
+                            let split = vessel
+                                .crew
+                                .iter()
+                                .map(|crew| VesselRequirement {
+                                    name: format!("{}[{}]", vessel.name, crew.role),
+                                    crew: vec![crew.clone()],
+                                    ..vessel.clone()
+                                })
+                                .collect::<Vec<_>>();
+                            let split_names = split.iter().map(|part| part.name.clone()).collect::<Vec<_>>();
+                            for other in &mut workflow.vessels {
+                                if other.depends_on.iter().any(|dependency| dependency == &vessel.name) {
+                                    other.depends_on.retain(|dependency| dependency != &vessel.name);
+                                    other.depends_on.extend(split_names.iter().cloned());
+                                }
+                            }
+                            for rule in workflow.turn_delivery.values_mut() {
+                                if rule.to.vessel == vessel.name {
+                                    if let Some(part) = split.iter().find(|part| part.crew[0].role == rule.to.role) {
+                                        rule.to.vessel = part.name.clone();
+                                    }
+                                }
+                            }
+                            for part in &split {
+                                if let Some(policy) = workflow.stall_nudges.shift_remove(&format!("{}/{}", vessel.name, part.crew[0].role))
+                                {
+                                    workflow.stall_nudges.insert(format!("{}/{}", part.name, part.crew[0].role), policy);
+                                }
+                            }
+                            if let Some(targets) = &mut workflow.supervision {
+                                for target in targets {
+                                    if let SupervisionTarget::ConvoyCrew { vessel: target_vessel, role } = target {
+                                        if *target_vessel == vessel.name {
+                                            if let Some(part) = split.iter().find(|part| part.crew[0].role == *role) {
+                                                *target_vessel = part.name.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            workflow.vessels.splice(index..=index, split.clone());
+                            workflow.allocation.retain(|decision| decision.vessel != vessel.name);
+                            workflow.allocation.extend(split.iter().map(|part| AllocationDecision {
+                                vessel: part.name.clone(),
+                                roles: vec![part.crew[0].role.clone()],
+                                reason: format!("split after placement could not cover union: {error}"),
+                                crossed_handoffs: Vec::new(),
+                            }));
+                            for handoff in &workflow.handoffs {
+                                if let (Some(_source), Some(target)) = (
+                                    split.iter().find(|part| part.crew[0].role == handoff.from),
+                                    split.iter().find(|part| part.crew[0].role == handoff.to),
+                                ) {
+                                    if let Some(decision) = workflow.allocation.iter_mut().find(|decision| decision.vessel == target.name) {
+                                        decision.crossed_handoffs.push(format!("{} -> {}", handoff.from, handoff.to));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "no fulfilment covers role `{}` need {}: {error}",
+                                vessel.crew[0].role,
+                                needs.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ")
+                            ));
+                        }
+                    };
                 resolve_and_validate_workflow_credentials(
                     &self.resource_backend,
                     namespace,
@@ -6019,7 +6377,7 @@ impl InProcessDaemon {
                     &mut one,
                 )
                 .await?;
-                *vessel = one.vessels.remove(0);
+                workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
                     let decision = PlacementDecision {
                         minimal_alternatives: alternatives.clone(),
@@ -6034,6 +6392,7 @@ impl InProcessDaemon {
                 if first.is_none() {
                     first = Some((resolution, alternatives));
                 }
+                index += 1;
             }
             first.expect("nonempty vessels")
         } else {
@@ -6051,6 +6410,9 @@ impl InProcessDaemon {
             .await?;
             result
         };
+        flotilla_resources::validate(&workflow).map_err(|errors| {
+            format!("allocated workflow invalid: {}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
+        })?;
         let placement_policy = placement.selected.as_ref().map(|placement| placement.metadata.name.clone());
         let placement_decision = match placement.selected.as_ref() {
             Some(selected) => Some(PlacementDecision {
@@ -7580,6 +7942,7 @@ impl InProcessDaemon {
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent".to_string()),
             role_needs: declaration.role_needs,
+            platform_matrix: declaration.platform_matrix,
             supervision: existing_project.as_ref().and_then(|project| project.spec.supervision.clone()),
             issue_source_bindings: Vec::new(),
             repositories: members,
@@ -7961,7 +8324,7 @@ impl InProcessDaemon {
                             (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
                         ]))
                         .build();
-                    if workflows.insert(entry.name.clone(), (meta, spec)).is_some() {
+                    if workflows.insert(entry.name.clone(), (meta, *spec)).is_some() {
                         return Err(format!("duplicate materialized WorkflowTemplate `{}`", entry.name));
                     }
                 }
@@ -13053,16 +13416,19 @@ impl InProcessDaemon {
                 at: mutation.at.to_rfc3339(),
             })
             .collect();
-        let role_vessels = if let Some(snapshot) = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) {
-            snapshot.vessels.clone()
-        } else {
-            self.resource_backend
-                .including_replicas::<WorkflowTemplate>(&namespace)
-                .get(flotilla_resources::pinned_workflow_ref(&convoy))
-                .await
-                .map(|template| template.object.spec.vessels)
-                .unwrap_or_default()
-        };
+        let pinned_workflow = self
+            .resource_backend
+            .including_replicas::<WorkflowTemplate>(&namespace)
+            .get(flotilla_resources::pinned_workflow_ref(&convoy))
+            .await
+            .ok();
+        let role_vessels = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .map(|snapshot| snapshot.vessels.clone())
+            .or_else(|| pinned_workflow.as_ref().map(|workflow| workflow.object.spec.vessels.clone()))
+            .unwrap_or_default();
 
         Ok(ConvoyExplanation {
             namespace,
@@ -13072,6 +13438,17 @@ impl InProcessDaemon {
                 .iter()
                 .flat_map(|vessel| vessel.crew.iter().map(move |crew| (format!("{}/{}", vessel.name, crew.role), crew)))
                 .map(|(role, crew)| (role, crew.needs.iter().map(ToString::to_string).collect()))
+                .collect(),
+            allocation: pinned_workflow
+                .as_ref()
+                .into_iter()
+                .flat_map(|workflow| &workflow.object.spec.allocation)
+                .map(|decision| flotilla_protocol::commands::ExplainedAllocation {
+                    vessel: decision.vessel.clone(),
+                    roles: decision.roles.clone(),
+                    reason: decision.reason.clone(),
+                    crossed_handoffs: decision.crossed_handoffs.clone(),
+                })
                 .collect(),
             placement: convoy.status.as_ref().and_then(|status| status.placement_decision.clone()),
             vessel_placements: convoy

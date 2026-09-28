@@ -317,6 +317,8 @@ pub struct ConvoyExplanation {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub role_needs: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocation: Vec<ExplainedAllocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -335,6 +337,14 @@ pub struct ConvoyExplanation {
     pub recent_events: Vec<ExplainedEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedAllocation {
+    pub vessel: String,
+    pub roles: Vec<String>,
+    pub reason: String,
+    pub crossed_handoffs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -59,7 +59,7 @@ impl FromStr for CapabilityNeed {
             "container_runtime" => Ok(Self::ContainerRuntime),
             _ if parameter("platform:").is_some() => {
                 let platform = parameter("platform:").expect("checked above");
-                if !matches!(platform.as_str(), "linux" | "macos" | "windows") {
+                if !matches!(platform.as_str(), "linux" | "macos" | "windows" | "$matrix") {
                     return Err(format!("unknown platform capability `{platform}`"));
                 }
                 Ok(Self::Platform(platform))

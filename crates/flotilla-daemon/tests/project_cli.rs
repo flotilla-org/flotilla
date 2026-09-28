@@ -1585,6 +1585,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
     let custom_spec = flotilla_resources::ProjectSpec {
+        platform_matrix: Vec::new(),
         role_needs: Default::default(),
         display_name: "Shared product".to_string(),
         default_workflow_ref: "custom-workflow".to_string(),
@@ -1613,6 +1614,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
     for (name, repo_ref) in [("shared", "first-repository"), ("github-com-org-b-shared", "second-repository")] {
         projects
             .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
+                platform_matrix: Vec::new(),
                 role_needs: Default::default(),
                 display_name: name.to_string(),
                 default_workflow_ref: "custom-workflow".to_string(),

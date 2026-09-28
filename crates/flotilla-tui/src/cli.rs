@@ -758,6 +758,12 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     for (role, needs) in &explanation.role_needs {
         let _ = writeln!(output, "Needs for {role}: {}", if needs.is_empty() { "(none)".to_string() } else { needs.join(", ") });
     }
+    for decision in &explanation.allocation {
+        let _ = writeln!(output, "Allocation for {}: {} ({})", decision.vessel, decision.roles.join(", "), decision.reason);
+        for handoff in &decision.crossed_handoffs {
+            let _ = writeln!(output, "  Artifact handoff: {handoff}");
+        }
+    }
     let mut write_placement = |label: &str, placement: &flotilla_protocol::PlacementDecision| {
         let _ = writeln!(output, "{label}: {} on {}", placement.policy_name, placement.target_host.display_name);
         if !placement.minimal_alternatives.is_empty() {

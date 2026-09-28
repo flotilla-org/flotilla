@@ -35,7 +35,7 @@ pub struct OperationalEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationalEntryDefinition {
-    WorkflowTemplate(WorkflowTemplateSpec),
+    WorkflowTemplate(Box<WorkflowTemplateSpec>),
     VerificationCommand { command: String },
     Ensure(EnsureEntry),
 }
@@ -125,9 +125,9 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
         })
         .transpose()?;
     let definition = match frontmatter.kind {
-        EntryKind::WorkflowTemplate => OperationalEntryDefinition::WorkflowTemplate(
+        EntryKind::WorkflowTemplate => OperationalEntryDefinition::WorkflowTemplate(Box::new(
             serde_yml::from_str(body).map_err(|error| format!("invalid workflow template `{name}`: {error}"))?,
-        ),
+        )),
         EntryKind::VerificationCommand => {
             let body: VerificationCommandBody =
                 serde_yml::from_str(body).map_err(|error| format!("invalid verification command `{name}`: {error}"))?;

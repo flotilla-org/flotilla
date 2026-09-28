@@ -36,7 +36,36 @@ pub struct WorkflowTemplateSpec {
     pub stall_nudges: IndexMap<String, StallNudgePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Vec<SupervisionTarget>>,
+    /// Roles are the authoring form. `vessels` remains a grouping hint for
+    /// older templates until their declarations are migrated.
+    #[builder(default)]
+    #[serde(default)]
+    pub roles: Vec<CrewSpec>,
+    #[builder(default)]
+    #[serde(default)]
+    pub handoffs: Vec<RoleHandoff>,
+    #[builder(default)]
+    #[serde(default)]
     pub vessels: Vec<VesselRequirement>,
+    /// Frozen allocation decisions in prepared admission workflow snapshots.
+    #[builder(default)]
+    #[serde(default)]
+    pub allocation: Vec<AllocationDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationDecision {
+    pub vessel: String,
+    pub roles: Vec<String>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crossed_handoffs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleHandoff {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,6 +624,20 @@ pub(crate) struct TemplateToken<'a> {
 }
 
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
+    let authored;
+    let spec = if spec.vessels.is_empty() && !spec.roles.is_empty() {
+        authored = WorkflowTemplateSpec {
+            vessels: spec
+                .roles
+                .iter()
+                .map(|role| VesselRequirement::builder().name(role.role.clone()).crew(vec![role.clone()]).build())
+                .collect(),
+            ..spec.clone()
+        };
+        &authored
+    } else {
+        spec
+    };
     let mut errors = Vec::new();
     validate_exit(spec, &mut errors);
     let declared_inputs = collect_inputs(spec, &mut errors);
