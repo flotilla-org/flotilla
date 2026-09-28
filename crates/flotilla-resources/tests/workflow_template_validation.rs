@@ -663,7 +663,10 @@ fn parser_round_trip_preserves_sample_workflow() {
 }
 
 #[test]
-fn parser_rejects_vessel_stance() {
+fn parser_accepts_and_drops_pre_adr_0046_vessel_stance() {
+    // Stored templates, frozen workflow snapshots, and the snapshot inside every
+    // convoy status were written with a vessel `stance`; they must keep decoding
+    // (ADR 0046 removed the field). It is dropped and never written back.
     let yaml = r#"
 vessels:
   - name: trusted
@@ -676,8 +679,9 @@ vessels:
     stance: contained
     crew: []
 "#;
-    let error = serde_yml::from_str::<WorkflowTemplateSpec>(yaml).expect_err("stance is no longer a template field");
-    assert!(error.to_string().contains("stance"));
+    let spec = serde_yml::from_str::<WorkflowTemplateSpec>(yaml).expect("pre-ADR-0046 stance still decodes");
+    assert_eq!(spec.vessels.iter().map(|vessel| vessel.name.as_str()).collect::<Vec<_>>(), ["trusted", "workspace", "contained"]);
+    assert!(!serde_yml::to_string(&spec).expect("serialize spec").contains("stance"), "stance must not be written back");
 }
 
 #[test]

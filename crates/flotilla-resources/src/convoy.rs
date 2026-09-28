@@ -678,6 +678,9 @@ fn clear_pending_brief_for(status: &mut ConvoyStatus, vessel: &str, role: &str) 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TurnDeliveryEpisode {
+    /// Stored as `head_sha` before issue subjects generalised the revision
+    /// (#2135); the alias keeps those convoy records decodable.
+    #[serde(alias = "head_sha")]
     pub subject_revision: String,
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
