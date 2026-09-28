@@ -4380,6 +4380,28 @@ async fn deliver_and_confirm(
     }
 }
 
+/// A terminal context names the Vessel resource, while admission pins use its
+/// within-convoy name. Resolve that identity before looking up agent grants.
+async fn fulfilment_grants_for_terminal(
+    backend: &ResourceBackend,
+    context: &flotilla_resources::TerminalCrewContext,
+) -> Option<BTreeSet<flotilla_resources::FulfilmentGrant>> {
+    let convoy = backend.including_replicas::<Convoy>(&context.namespace).get(&context.convoy).await.ok()?.object;
+    let vessel_name = backend
+        .including_replicas::<Vessel>(&context.namespace)
+        .get(&context.vessel_ref)
+        .await
+        .ok()
+        .map(|source| source.object.spec.vessel_name)
+        .or_else(|| context.vessel_ref.strip_prefix(&format!("{}-", context.convoy)).map(str::to_string));
+    let selected_kind = vessel_name
+        .as_deref()
+        .and_then(|name| flotilla_resources::vessel_placement_pin(&convoy, name))
+        .map(|pin| pin.decision.policy_name)
+        .or_else(|| convoy.status.and_then(|status| status.placement_decision.map(|decision| decision.policy_name)))?;
+    backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleat_endpoint(
@@ -4464,19 +4486,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     }
                 }
                 let backend = self.state.daemon.resource_backend();
-                let selected_kind =
-                    backend.including_replicas::<Convoy>(&context.namespace).get(&context.convoy).await.ok().and_then(|source| {
-                        source.object.status.and_then(|status| status.placement_decision.map(|decision| decision.policy_name))
-                    });
-                let fulfilment_grants = match selected_kind {
-                    Some(name) => backend
-                        .including_replicas::<FulfilmentKind>(&context.namespace)
-                        .get(&name)
-                        .await
-                        .ok()
-                        .map(|source| source.object.spec.grants),
-                    None => None,
-                };
+                let fulfilment_grants = fulfilment_grants_for_terminal(&backend, context).await;
                 let plan = adapter.launch(&AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
@@ -4836,6 +4846,81 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[tokio::test]
+    async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
+        let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::HostAccountReach]);
+        let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::Platform("linux".to_string())]);
+        for (name, grants) in [("broad", broad.clone()), ("restricted", restricted.clone())] {
+            kinds
+                .create(&empty_meta(name), &FulfilmentKindSpec {
+                    host_ref: "host".to_string(),
+                    pool: "test".to_string(),
+                    grants,
+                    realisation: FulfilmentRealisation::HostDirect,
+                })
+                .await
+                .expect("fulfilment kind");
+        }
+        let decision = |kind: &str| {
+            PlacementDecision::builder()
+                .policy_name(kind.to_string())
+                .target_host(PlacementTargetHost {
+                    reference: CanonicalHostId::resolved("host".to_string()),
+                    display_name: "host".to_string(),
+                })
+                .build()
+        };
+        let pins = BTreeMap::from([
+            ("work".to_string(), flotilla_resources::VesselPlacementPin {
+                policy_ref: "snapshot-work".to_string(),
+                decision: decision("broad"),
+            }),
+            ("ops".to_string(), flotilla_resources::VesselPlacementPin {
+                policy_ref: "snapshot-ops".to_string(),
+                decision: decision("restricted"),
+            }),
+        ]);
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(
+                &InputMeta::builder()
+                    .name("demo".to_string())
+                    .annotations(BTreeMap::from([(
+                        flotilla_resources::VESSEL_PLACEMENTS_ANNOTATION.to_string(),
+                        serde_json::to_string(&pins).expect("pins serialize"),
+                    )]))
+                    .build(),
+                &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
+                placement_decision: Some(decision("broad")),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("convoy status");
+        backend
+            .using::<Vessel>(NAMESPACE)
+            .create(&empty_meta("demo-ops"), &VesselSpec {
+                convoy_ref: "demo".to_string(),
+                vessel_name: "ops".to_string(),
+                placement_policy_ref: "snapshot-ops".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("ops vessel");
+        let context = flotilla_resources::TerminalCrewContext {
+            namespace: NAMESPACE.to_string(),
+            convoy: "demo".to_string(),
+            vessel_ref: "demo-ops".to_string(),
+        };
+        assert_eq!(fulfilment_grants_for_terminal(&backend, &context).await, Some(restricted));
+    }
 
     #[test]
     fn live_github_scope_expands_only_project_grants_without_explicit_repositories() {

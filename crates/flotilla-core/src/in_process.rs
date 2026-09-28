@@ -6052,7 +6052,9 @@ impl InProcessDaemon {
     ) -> Result<(String, String), String> {
         self.check_local_free_space_floor().await?;
         let mut admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
-        self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
+        if admission.vessel_placements.is_empty() {
+            self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
+        }
         for (_, decision) in admission.vessel_placements.values() {
             self.check_remote_placement_free_space_floor(namespace, Some(decision)).await?;
         }
@@ -6849,7 +6851,9 @@ impl InProcessDaemon {
             )
             .await?;
         self.check_local_free_space_floor().await?;
-        self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
+        if admission.vessel_placements.is_empty() {
+            self.check_remote_placement_free_space_floor(namespace, admission.placement_decision.as_ref()).await?;
+        }
         for (_, decision) in admission.vessel_placements.values() {
             self.check_remote_placement_free_space_floor(namespace, Some(decision)).await?;
         }
