@@ -5701,15 +5701,25 @@ impl InProcessDaemon {
                             .reduce(
                                 |minimum, version| if flotilla_resources::version_at_least(minimum, version) { version } else { minimum },
                             );
+                        // Only an explicit rejection refuses. Model acceptance is often
+                        // unobservable (credential-less probe containers, harnesses with
+                        // no model probe), and unknown must not read as "rejected".
+                        let observed_harnesses = hosts
+                            .items
+                            .iter()
+                            .flat_map(|host| host.object.status.as_ref().into_iter())
+                            .flat_map(|status| status.fulfilment_facts.values())
+                            .filter_map(|facts| facts.harnesses.get(adapter))
+                            .collect::<Vec<_>>();
+                        let rejected_everywhere = !observed_harnesses.is_empty()
+                            && observed_harnesses.iter().all(|harness| harness.models.get(model).is_some_and(|model| !model.usable));
                         if let Some(minimum) = minimum {
                             crew.needs.insert(CapabilityNeed::Harness { adapter: adapter.clone(), minimum_version: minimum.to_string() });
-                        } else if hosts.items.iter().any(|host| {
-                            host.object
-                                .status
-                                .as_ref()
-                                .is_some_and(|status| status.fulfilment_facts.values().any(|facts| facts.harnesses.contains_key(adapter)))
-                        }) {
+                        } else if rejected_everywhere {
                             return Err(format!("no observed {adapter} harness accepts model {model}"));
+                        } else if !observed_harnesses.is_empty() {
+                            // Acceptance is unknown on at least one observed harness:
+                            // admit without a version floor.
                         } else {
                             let kinds = self
                                 .resource_backend

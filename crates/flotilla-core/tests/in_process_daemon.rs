@@ -2350,7 +2350,10 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     status.fulfilment_facts.insert("host-direct-model".to_string(), FulfilmentFacts {
         harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
             version: "2.1.300".to_string(),
-            models: BTreeMap::from([("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
+            models: BTreeMap::from([
+                ("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe }),
+                ("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
+            ]),
         })]),
         observed_at: chrono::Utc::now(),
         ..Default::default()
@@ -2402,6 +2405,17 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     assert!(
         matches!(refused, CommandValue::Error { message } if message.contains("no observed claude-code harness accepts model unavailable"))
     );
+    // A model the harness has no fact about is unknown, not rejected: admit
+    // without a version floor.
+    let admitted = start_capability_convoy(&daemon, "model-unknown", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("unprobed".to_string()),
+        });
+    })
+    .await;
+    assert!(!matches!(admitted, CommandValue::Error { .. }), "unknown model acceptance must not refuse: {admitted:?}");
 }
 
 #[tokio::test]
