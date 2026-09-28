@@ -78,6 +78,13 @@ make_generation() {
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
     printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$generation" "$generation" "$name" "$name" "$generation" >"$bundle/bin/$name"
+    if [[ "$name" == flotilla ]]; then
+      cat >>"$bundle/bin/$name" <<EOF
+if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && "\${5:-}" == --from-daemon && "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then
+  exit 1
+fi
+EOF
+    fi
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -653,6 +660,14 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
   || fail 'handoff failure switched current'
 "$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --json fleet >/dev/null \
   || fail 'handoff failure did not leave the old generation restartable'
+
+if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_installer "$generation_two" >"$test_root/validation.out" 2>&1; then
+  fail 'candidate with incompatible stored records was installed'
+fi
+grep -Fq 'cannot decode the running daemon' "$test_root/validation.out" \
+  || fail 'candidate validation failure was not reported'
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
+  || fail 'candidate validation failure switched current'
 
 if DAEMON_RUNNING=1 STOP_FAIL=1 run_installer "$generation_two" >"$test_root/daemon.out" 2>&1; then
   fail 'daemon stop refusal was ignored'

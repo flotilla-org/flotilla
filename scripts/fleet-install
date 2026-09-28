@@ -932,6 +932,11 @@ activate_staged_generation() {
   [[ -d "$release" ]] || die "staged generation is missing: $generation"
   [[ -f "$release/.generation.json" ]] || die "staged generation has no verified generation metadata: $generation"
   verify_installed_release "$release" "$release/.generation.json"
+  if [[ -n "$(current_generation)" ]]; then
+    printf 'fleet-install: validating live stored records with candidate generation %s\n' "$generation"
+    "$release/bin/flotilla" --socket "$DAEMON_SOCKET" resource validate --from-daemon \
+      || die "candidate generation $generation cannot decode the running daemon's stored records"
+  fi
   # Verification is the only activation step that needs this process's work
   # directory. Release it before service mutation so interruption cannot leak
   # staging state while the detached health watchdog completes recovery.

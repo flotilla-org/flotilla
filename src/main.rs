@@ -386,10 +386,17 @@ enum ResourceSubCommand {
     List(ResourceListArgs),
     /// Create or update a raw resource document
     Apply(ResourceApplyArgs),
-    /// Validate resource documents offline against this binary's schema
+    /// Validate resource documents against this binary's schema
     Validate {
         /// Resource document or directory containing JSON/YAML manifests
-        path: PathBuf,
+        #[arg(required_unless_present = "from_daemon", conflicts_with = "from_daemon")]
+        path: Option<PathBuf>,
+        /// Validate the running daemon's stored records using this binary's schema
+        #[arg(long)]
+        from_daemon: bool,
+        /// Read a peer's forwarded resource socket instead of the local daemon
+        #[arg(long, requires = "from_daemon")]
+        host: Option<String>,
     },
     /// Make the manifest overwrite a drifted live spec
     Sync(ResourceManifestResolutionArgs),
@@ -1568,7 +1575,22 @@ async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     match command {
-        ResourceSubCommand::Validate { path } => resource_validate::validate_path(&path),
+        ResourceSubCommand::Validate { path, from_daemon, host } => {
+            if from_daemon {
+                let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+                let socket = if let Some(host) = host {
+                    if host.is_empty() || host.contains(['/', '\\', '\0']) || host == "." || host == ".." {
+                        return Err(color_eyre::eyre::eyre!("invalid peer host name: {host}"));
+                    }
+                    paths.state_dir.join("peers").join(format!("{host}.sock"))
+                } else {
+                    paths.socket_path
+                };
+                resource_validate::validate_daemon(&socket).await
+            } else {
+                resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"))
+            }
+        }
         ResourceSubCommand::List(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;

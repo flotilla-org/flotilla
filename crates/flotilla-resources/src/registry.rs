@@ -710,8 +710,8 @@ pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceE
     dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
 }
 
-/// Check a manifest document against the same registered spec types used by
-/// application, without contacting a backend or mutating any resource.
+/// Decode a complete resource document against this binary's registered types.
+/// Manifests without a status remain valid inputs.
 pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError> {
     let decoded: DynamicApplyDocument = serde_path_to_error::deserialize(document.clone().into_deserializer())
         .map_err(|error| ResourceError::decode(format!("decode resource document at {}: {error}", error.path())))?;
@@ -724,7 +724,11 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
     if version != expected {
         return Err(ResourceError::decode(format!("apiVersion: expected {expected}, got {version}")));
     }
-    dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))
+    dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))?;
+    if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
+        dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
+    }
+    Ok(())
 }
 
 /// Decode both persisted halves of a resource without applying current write validation.

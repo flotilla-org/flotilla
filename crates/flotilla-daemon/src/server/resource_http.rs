@@ -4,7 +4,7 @@ use flotilla_resources::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, list_resource_kind_replica_sources, watch_resource_kind, watch_resource_kind_from,
     watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch, ResourceBackend, ResourceError,
-    WatchStart,
+    WatchStart, REGISTERED_RESOURCE_KINDS,
 };
 use futures::StreamExt;
 use tokio::{
@@ -38,6 +38,14 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    if path == "/apis/flotilla.work/v1" {
+        return write_json(
+            &mut stream,
+            200,
+            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>() }),
+        )
+        .await;
+    }
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     let (namespace, kind, name) = match segments.as_slice() {
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind] => (*namespace, *kind, None),
