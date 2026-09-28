@@ -4,7 +4,17 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
 
 ## Development Phase
 
-We are in a **no backwards compatibility** phase. Protocol types, snapshot formats, config file formats, and wire formats can all change freely without migration logic or deprecation paths.
+**Wire formats change freely; stored data stays decodable for one generation** (ADR 0047).
+
+- **Wire and protocol**: protocol types, socket messages, peer envelopes, and replication wire formats change freely. There are no multi-version peers or deprecation windows, because the fleet rolls as a unit and the fingerprint handshake refuses mismatched peers.
+- **Stored data (N→N+1)**: each generation must decode everything the previous generation stored:
+  - resource specs **and statuses**, including embedded structures such as a convoy's frozen workflow snapshot;
+  - manifests in project-map and ops repositories;
+  - daemon config.
+
+  Write only the new shape. For a rename add a serde `alias`, for a new field a `default`, and for a retired field a deserialize-only record type that accepts and drops it (see `VesselRequirement`'s `stance`). Comment each shim with when it can be removed (one roll later). There is still no migration framework.
+- **Out-of-repo manifests**: stay compatible, or ship the project-map/ops manifest update in the same roll.
+- **Enforcement**: `cargo test` decodes a golden corpus of real stored records (#2169). If it fails, fix the decoder with an alias, default, or record type. **Never regenerate the corpus to make a PR pass**; it is refreshed only after a fleet roll. Before each roll, the candidate decodes every host's live store (#2167).
 
 ### Plane-A freeze (transition in progress)
 
