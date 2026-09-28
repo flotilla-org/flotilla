@@ -2353,7 +2353,18 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
             models: BTreeMap::from([
                 ("preview".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe }),
                 ("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
+                ("mixed".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe }),
             ]),
+        })]),
+        observed_at: chrono::Utc::now(),
+        ..Default::default()
+    });
+    // A second observed harness that rejects `unavailable` but has no verdict
+    // on `mixed`, so `mixed` is rejected by only some observed harnesses.
+    status.fulfilment_facts.insert("unprobed-model-kind".to_string(), FulfilmentFacts {
+        harnesses: BTreeMap::from([("claude-code".to_string(), HarnessFacts {
+            version: "2.1.300".to_string(),
+            models: BTreeMap::from([("unavailable".to_string(), ModelFact { usable: false, source: ModelFactSource::Probe })]),
         })]),
         observed_at: chrono::Utc::now(),
         ..Default::default()
@@ -2416,6 +2427,17 @@ async fn requested_model_derives_harness_need_and_selects_host_direct() {
     })
     .await;
     assert!(!matches!(admitted, CommandValue::Error { .. }), "unknown model acceptance must not refuse: {admitted:?}");
+    // Refuse only when every observed harness explicitly rejects: one rejection
+    // plus one unknown verdict admits.
+    let admitted = start_capability_convoy(&daemon, "model-mixed", |intent| {
+        intent.agent_overrides.push(flotilla_protocol::AgentOverride {
+            capability: "code".to_string(),
+            adapter: "claude-code".to_string(),
+            model: Some("mixed".to_string()),
+        });
+    })
+    .await;
+    assert!(!matches!(admitted, CommandValue::Error { .. }), "a partial rejection must not refuse: {admitted:?}");
 }
 
 #[tokio::test]
