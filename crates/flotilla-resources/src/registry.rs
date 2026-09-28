@@ -727,6 +727,31 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
     dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))
 }
 
+/// Decode both persisted halves of a resource without applying current write validation.
+/// The stored-record corpus uses this to enforce N→N+1 read compatibility.
+pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceError> {
+    let kind = document.get("kind").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("kind: missing or non-string"))?;
+    let registered = lookup_resource_kind(kind)?;
+    let version =
+        document.get("apiVersion").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("apiVersion: missing or non-string"))?;
+    let expected = dispatch_resource_kind!(registered.resource, api_version_typed());
+    if version != expected {
+        return Err(ResourceError::decode(format!("apiVersion: expected {expected}, got {version}")));
+    }
+    let spec = document.get("spec").ok_or_else(|| ResourceError::decode("spec: missing"))?;
+    dispatch_resource_kind!(registered.resource, validate_typed_spec(spec))?;
+    if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
+        dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
+    }
+    Ok(())
+}
+
+fn decode_typed_status<T: Resource>(status: &Value) -> Result<(), ResourceError> {
+    serde_path_to_error::deserialize::<_, T::Status>(status.clone().into_deserializer())
+        .map(|_| ())
+        .map_err(|error| ResourceError::decode(format!("status.{}: {error}", error.path())))
+}
+
 fn validate_typed_spec<T: Resource>(spec: &Value) -> Result<(), ResourceError> {
     serde_path_to_error::deserialize::<_, T::Spec>(spec.clone().into_deserializer())
         .map(|_| ())

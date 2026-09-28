@@ -1,0 +1,208 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "flotilla",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "repo": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "ghostty",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "alias": "ghostty-ops",
+          "repo": "8ppvcu8o4fgn3d801cbkgffut33f8d3p4fbmm7smrfltgs2r7mtg",
+          "roles": [
+            "ops",
+            "knowledge"
+          ]
+        },
+        {
+          "alias": "ghostty-issues",
+          "repo": "989g8o500dffd9gtlvf4t7penc7immtrcu5jf87ihf9soisr2p60",
+          "roles": [
+            "knowledge"
+          ]
+        },
+        {
+          "alias": "ghostty",
+          "repo": "mf4j6hdb2bco8202bfera47nphf3r8asjhc61e1a4suu1sbshel0",
+          "roles": [
+            "code"
+          ]
+        }
+      ]
+    },
+    "status": {
+      "operational_entries": {
+        "message": "[redacted]",
+        "ready": true
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "katzensteg",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "alias": "katzensteg-ops",
+          "default_branch": "main",
+          "repo": "i3vjvo88jmt7o2lo6kkqng2tatc9ugivoehg5b4q2ug0aas0dr6g",
+          "roles": [
+            "ops",
+            "knowledge"
+          ]
+        },
+        {
+          "alias": "pi",
+          "repo": "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "katzensteg",
+          "repo": "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+          "roles": [
+            "code"
+          ]
+        }
+      ]
+    },
+    "status": {
+      "operational_entries": {
+        "message": "[redacted]",
+        "ready": false
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "porthole",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "alias": "jackstay",
+          "repo": "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "spyglass",
+          "repo": "7fnn840ge3ls64p4pud0jkpan6tpo4cr6f30hhbq5pnedmmqegsg",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "luchs",
+          "repo": "e0i3hu3i6n5cb0g99dbvk0f44ji85t6st9048q3h1oqvuhvn16a0",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "porthole-ops",
+          "repo": "i3tbfqjm85h62i8l1hvob4s3h285242hqnv7n0ouiaalt6mt4kh0",
+          "roles": [
+            "ops",
+            "knowledge"
+          ]
+        },
+        {
+          "alias": "porthole",
+          "repo": "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+          "roles": [
+            "code"
+          ]
+        }
+      ]
+    },
+    "status": {
+      "operational_entries": {
+        "message": "[redacted]",
+        "ready": true
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "wheelhouse",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "alias": "andamento",
+          "repo": "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "cleat",
+          "repo": "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+          "roles": [
+            "code"
+          ]
+        },
+        {
+          "alias": "wheelhouse",
+          "repo": "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+          "roles": [
+            "code",
+            "ops",
+            "knowledge"
+          ]
+        }
+      ]
+    },
+    "status": {
+      "operational_entries": {
+        "message": "[redacted]",
+        "ready": true
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Project",
+    "spec": {
+      "default_workflow_ref": "single-agent-contained",
+      "dispatch_policy": null,
+      "display_name": "zellij",
+      "issue_source_bindings": [],
+      "repositories": [
+        {
+          "repo": "0augrgqshq6rbvnojrc5oapelurkqg2n79hv6g85huktk86luh20"
+        }
+      ]
+    }
+  }
+]

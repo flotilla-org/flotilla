@@ -1,0 +1,98 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ConvoyEnsure",
+    "spec": {
+      "agent_overrides": [
+        {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      ],
+      "driver_ref": "host-1",
+      "placement_policy": "docker-crew-image-host-1",
+      "project_ref": "katzensteg",
+      "repositories": [
+        "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+        "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+        "i3vjvo88jmt7o2lo6kkqng2tatc9ugivoehg5b4q2ug0aas0dr6g"
+      ],
+      "role": "governor",
+      "workflow_ref": "governor"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ConvoyEnsure",
+    "spec": {
+      "agent_overrides": [
+        {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      ],
+      "driver_ref": "host-3",
+      "placement_policy": "docker-crew-image-host-3",
+      "project_ref": "wheelhouse",
+      "repositories": [
+        "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+        "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+      ],
+      "role": "governor",
+      "workflow_ref": "wheelhouse-governor"
+    },
+    "status": {
+      "strikes": 0
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ConvoyEnsure",
+    "spec": {
+      "agent_overrides": [
+        {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      ],
+      "driver_ref": "host-1",
+      "placement_policy": "docker-crew-image-host-1",
+      "project_ref": "porthole",
+      "repositories": [
+        "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+        "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+        "i3tbfqjm85h62i8l1hvob4s3h285242hqnv7n0ouiaalt6mt4kh0"
+      ],
+      "role": "governor",
+      "workflow_ref": "governor"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "ConvoyEnsure",
+    "spec": {
+      "agent_overrides": [
+        {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      ],
+      "driver_ref": "host-3",
+      "placement_policy": "docker-crew-image-host-3",
+      "project_ref": "ghostty",
+      "repositories": [
+        "mf4j6hdb2bco8202bfera47nphf3r8asjhc61e1a4suu1sbshel0",
+        "8ppvcu8o4fgn3d801cbkgffut33f8d3p4fbmm7smrfltgs2r7mtg"
+      ],
+      "role": "governor",
+      "workflow_ref": "governor"
+    },
+    "status": {
+      "strikes": 0
+    }
+  }
+]

@@ -1,0 +1,1188 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "mf4j6hdb2bco8202bfera47nphf3r8asjhc61e1a4suu1sbshel0",
+            "8ppvcu8o4fgn3d801cbkgffut33f8d3p4fbmm7smrfltgs2r7mtg"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            },
+            {
+              "brief_template": "diff-review",
+              "completion_expectations": [
+                "decision-ledger"
+              ],
+              "prompt": null,
+              "role": "reviewer",
+              "selector": {
+                "capability": "code-review"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "brief_template": "interactive-session",
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+            "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+            "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [
+        {
+          "description": "[redacted]",
+          "name": "topic"
+        }
+      ],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "command": "[redacted]",
+              "role": "shell"
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "shepherd",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "shepherd",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "brief_template": "shepherd",
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "shepherd",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+            "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "capability": "governor"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+            "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "github-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "lab-forgejo-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ]
+          },
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "adapter": "codex",
+                "capability": "code",
+                "model": "gpt-6-sol"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+              "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0"
+            ],
+            "github-crew-pr": [
+              "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+              "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0"
+            ],
+            "lab-forgejo-crew-pr": [
+              "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+              "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0"
+            ]
+          },
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "adapter": "claude-code",
+                "capability": "governor",
+                "model": "claude-fable-5-1"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+            "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+              "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg"
+            ],
+            "github-crew-pr": [
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+              "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg"
+            ],
+            "lab-forgejo-crew-pr": [
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+            ]
+          },
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "adapter": "claude-code",
+                "capability": "governor",
+                "model": "claude-fable-5-1"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+            "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_permissions": {
+            "github-crew-pr": {
+              "actions": "write",
+              "checks": "read",
+              "contents": "write",
+              "issues": "write",
+              "pull_requests": "write"
+            }
+          },
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "github-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "lab-forgejo-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ]
+          },
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "adapter": "codex",
+                "capability": "code",
+                "model": "gpt-6-sol"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "shepherd",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "shepherd",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g",
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+              "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg"
+            ],
+            "github-crew-pr": [
+              "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g",
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+              "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg"
+            ],
+            "lab-forgejo-crew-pr": [
+              "18bgq9qrinlfemovt24qr753ipaqh21avh9rgl4vr1hkm0ianq7g",
+              "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0"
+            ]
+          },
+          "crew": [
+            {
+              "brief_template": "shepherd",
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "shepherd",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "capability": "code"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_permissions": {
+            "github-crew-pr": {
+              "actions": "write",
+              "checks": "read",
+              "contents": "write",
+              "issues": "write",
+              "pull_requests": "write"
+            }
+          },
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "github-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "lab-forgejo-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ]
+          },
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "adapter": "claude-code",
+                "capability": "code",
+                "model": "claude-opus-5-5"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "inputs": [],
+      "vessels": [
+        {
+          "credential_refs": [
+            "claude-max",
+            "github-rjwittams-crew",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+              "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0"
+            ],
+            "github-rjwittams-crew": [
+              "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+              "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0"
+            ],
+            "lab-forgejo-crew-pr": [
+              "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+              "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0"
+            ]
+          },
+          "crew": [
+            {
+              "prompt": "[redacted]",
+              "role": "governor",
+              "selector": {
+                "adapter": "claude-code",
+                "capability": "governor",
+                "model": "claude-fable-5-1"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "govern",
+          "repository_refs": [
+            "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+            "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_permissions": {
+            "github-crew-pr": {
+              "actions": "write",
+              "checks": "read",
+              "contents": "write",
+              "issues": "write",
+              "pull_requests": "write"
+            }
+          },
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "github-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "lab-forgejo-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ]
+          },
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "adapter": "codex",
+                "capability": "code",
+                "model": "gpt-6-sol"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "WorkflowTemplate",
+    "spec": {
+      "exit": {
+        "closed-unmerged": "$cr.state == closed",
+        "merged": "$cr.state == merged"
+      },
+      "inputs": [],
+      "turn_delivery": {
+        "actionable-review": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.review.actionable-at-head == true",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        },
+        "conflicting": {
+          "brief": "[redacted]",
+          "hold": {
+            "body": "[redacted]",
+            "kind": "change-request-comment"
+          },
+          "on": "$cr.mergeable == conflicting",
+          "to": {
+            "role": "coder",
+            "vessel": "work"
+          }
+        }
+      },
+      "vessels": [
+        {
+          "credential_permissions": {
+            "github-crew-pr": {
+              "actions": "write",
+              "checks": "read",
+              "contents": "write",
+              "issues": "write",
+              "pull_requests": "write"
+            }
+          },
+          "credential_refs": [
+            "claude-max",
+            "github-crew-pr",
+            "lab-forgejo-crew-pr"
+          ],
+          "credential_scopes": {
+            "claude-max": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "github-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ],
+            "lab-forgejo-crew-pr": [
+              "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g"
+            ]
+          },
+          "crew": [
+            {
+              "completion_expectations": [
+                "decision-ledger",
+                "change-request-ready"
+              ],
+              "prompt": null,
+              "role": "coder",
+              "selector": {
+                "adapter": "codex",
+                "capability": "code",
+                "model": "gpt-6-sol"
+              }
+            }
+          ],
+          "depends_on": [],
+          "name": "work"
+        }
+      ]
+    }
+  }
+]
