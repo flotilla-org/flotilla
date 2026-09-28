@@ -7111,6 +7111,21 @@ impl InProcessDaemon {
         workflow: &WorkflowTemplateSpec,
     ) -> Result<bool, String> {
         let Some(writer) = self.brief_artifact_writer.read().await.clone() else { return Ok(false) };
+        // Admission brief addresses use (convoy, role, "brief", convoy). Role
+        // reuse across vessels would replace a different vessel's body.
+        let mut agent_roles = BTreeMap::<&str, &str>::new();
+        for vessel in &workflow.vessels {
+            for process in &vessel.crew {
+                if matches!(process.source, CrewSource::Agent { .. }) {
+                    if let Some(previous) = agent_roles.insert(&process.role, &vessel.name) {
+                        return Err(format!(
+                            "agent role `{}` occurs in vessels `{previous}` and `{}`; brief artifact addresses require convoy-wide unique roles",
+                            process.role, vessel.name
+                        ));
+                    }
+                }
+            }
+        }
         let mut annotations = BTreeMap::new();
         if workflow.exit.is_none() {
             annotations.insert(crate::ops_entry::ENSURED_FROM_ANNOTATION.to_string(), "standing".to_string());

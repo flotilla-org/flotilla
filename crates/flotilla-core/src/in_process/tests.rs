@@ -2276,6 +2276,29 @@ async fn standing_readmission_writes_a_new_brief_artifact() {
 }
 
 #[tokio::test]
+async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_briefs() {
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
+    let writer = Arc::new(RecordingBriefArtifacts::default());
+    daemon.set_brief_artifact_writer(writer.clone()).await;
+    let agent = || {
+        CrewSpec::builder()
+            .role("coder".to_string())
+            .source(CrewSource::Agent { selector: Selector::for_capability("coding"), prompt: None, brief_template: None })
+            .build()
+    };
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            VesselRequirement::builder().name("implement".to_string()).crew(vec![agent()]).build(),
+            VesselRequirement::builder().name("verify".to_string()).crew(vec![agent()]).build(),
+        ])
+        .build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    let error = daemon.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
+    assert!(error.contains("agent role `coder` occurs in vessels `implement` and `verify`"), "{error}");
+    assert!(writer.writes.lock().await.is_empty(), "admission must not publish a partial set of briefs");
+}
+
+#[tokio::test]
 async fn standing_ensure_holds_after_three_failed_generations_and_resumes_when_attention_is_cleared() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
