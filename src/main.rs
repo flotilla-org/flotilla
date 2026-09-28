@@ -1586,7 +1586,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket).await
+                resource_validate::validate_daemon(&socket).await.map(|_| ())
             } else {
                 resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"))
             }
@@ -3044,6 +3044,29 @@ mod tests {
                 })
             }) if kind == "terminalsessions" && name == "session-a" && namespace == "flotilla"
         ));
+    }
+
+    #[test]
+    fn resource_validate_cli_requires_one_source_and_qualifies_peer_hosts() {
+        let file = Cli::try_parse_from(["flotilla", "resource", "validate", "resource.yaml"]).expect("path validation should parse");
+        assert!(matches!(
+            file.command,
+            Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: Some(_), from_daemon: false, host: None } })
+        ));
+        let daemon = Cli::try_parse_from(["flotilla", "resource", "validate", "--from-daemon", "--host", "feta"])
+            .expect("peer validation should parse");
+        assert!(
+            matches!(daemon.command, Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: true, host: Some(host) } }) if host == "feta")
+        );
+        for args in [vec!["flotilla", "resource", "validate"], vec!["flotilla", "resource", "validate", "--host", "feta"], vec![
+            "flotilla",
+            "resource",
+            "validate",
+            "--from-daemon",
+            "resource.yaml",
+        ]] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

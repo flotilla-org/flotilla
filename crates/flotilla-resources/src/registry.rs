@@ -278,6 +278,20 @@ macro_rules! dispatch_resource_kind {
     };
 }
 
+/// Inventory every namespace with an authored or replicated record, by kind.
+pub async fn registered_resource_namespaces(backend: &ResourceBackend) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+    let mut namespaces = BTreeMap::new();
+    for registered in REGISTERED_RESOURCE_KINDS {
+        let found = dispatch_resource_kind!(registered.resource, stored_namespaces_typed(backend).await)?;
+        namespaces.insert(registered.plural.to_string(), found);
+    }
+    Ok(namespaces)
+}
+
+async fn stored_namespaces_typed<T: Resource>(backend: &ResourceBackend) -> Result<Vec<String>, ResourceError> {
+    backend.stored_namespaces::<T>().await
+}
+
 /// Dynamic apply uses the ownership-aware path for enrolled kinds. Enrolling
 /// another resource changes one dispatch arm rather than adding a one-off
 /// apply function or branch.

@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use flotilla_resources::{
     get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas, list_resource_kind,
-    list_resource_kind_including_replicas, list_resource_kind_replica_sources, watch_resource_kind, watch_resource_kind_from,
-    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch, ResourceBackend, ResourceError,
-    WatchStart, REGISTERED_RESOURCE_KINDS,
+    list_resource_kind_including_replicas, list_resource_kind_replica_sources, registered_resource_namespaces, watch_resource_kind,
+    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceWatch,
+    ResourceBackend, ResourceError, WatchStart, REGISTERED_RESOURCE_KINDS,
 };
 use futures::StreamExt;
 use tokio::{
@@ -39,10 +39,14 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     if path == "/apis/flotilla.work/v1" {
+        let namespaces = match registered_resource_namespaces(&backend).await {
+            Ok(namespaces) => namespaces,
+            Err(error) => return write_resource_error(&mut stream, error).await,
+        };
         return write_json(
             &mut stream,
             200,
-            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>() }),
+            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
         )
         .await;
     }

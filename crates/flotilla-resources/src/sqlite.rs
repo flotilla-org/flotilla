@@ -113,6 +113,26 @@ impl SqliteBackend {
         .await
     }
 
+    pub(crate) async fn stored_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        let group = T::API_PATHS.group.to_string();
+        let version = T::API_PATHS.version.to_string();
+        let kind = T::API_PATHS.kind.to_string();
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT namespace FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3
+                     UNION SELECT namespace FROM replica_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3
+                     ORDER BY namespace",
+                )
+                .map_err(|error| Self::map_sqlite(error, "prepare stored namespace list"))?;
+            let rows = statement
+                .query_map(params![group, version, kind], |row| row.get::<_, String>(0))
+                .map_err(|error| Self::map_sqlite(error, "query stored namespace list"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| Self::map_sqlite(error, "read stored namespace list"))
+        })
+        .await
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
         Self::open_with_event_retention(path, EventRetention::default())
     }

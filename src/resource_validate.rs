@@ -7,59 +7,81 @@ use serde_json::Value;
 
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
-pub async fn validate_daemon(socket: &Path) -> Result<()> {
+pub async fn validate_daemon(socket: &Path) -> Result<usize> {
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
     let base = "http://flotilla.local";
     let discovery = client.get(format!("{base}/apis/flotilla.work/v1")).send().await?;
     let discovered = discovery.status().is_success();
-    let kinds = if discovered {
+    let kind_namespaces = if discovered {
         let document: Value = discovery.json().await?;
-        document
+        let kinds = document
             .get("kinds")
             .and_then(Value::as_array)
             .ok_or_else(|| eyre!("daemon kind discovery response has no kinds array"))?
             .iter()
             .map(|kind| kind.as_str().map(str::to_string).ok_or_else(|| eyre!("daemon kind discovery contains a non-string kind")))
+            .collect::<Result<Vec<_>>>()?;
+        let namespaces = document
+            .get("namespaces")
+            .and_then(Value::as_object)
+            .ok_or_else(|| eyre!("daemon kind discovery response has no namespace inventory"))?;
+        kinds
+            .into_iter()
+            .map(|kind| {
+                let found = namespaces
+                    .get(&kind)
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| eyre!("daemon kind discovery has no namespaces for {kind}"))?
+                    .iter()
+                    .map(|namespace| namespace.as_str().map(str::to_string).ok_or_else(|| eyre!("invalid namespace for {kind}")))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((kind, found))
+            })
             .collect::<Result<Vec<_>>>()?
     } else if discovery.status() == reqwest::StatusCode::NOT_FOUND {
-        // Previous-generation daemons predate discovery. Probe the candidate's
-        // registry; unknown new kinds return 400 and are skipped below.
-        REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural.to_string()).collect()
+        // Previous-generation daemons predate discovery. All daemon-managed
+        // records in that generation use the default namespace.
+        REGISTERED_RESOURCE_KINDS.iter().map(|kind| (kind.plural.to_string(), vec!["flotilla".to_string()])).collect()
     } else {
         return Err(eyre!("daemon kind discovery failed: {}", discovery.status()));
     };
 
     let mut failed = false;
     let mut count = 0;
-    for kind in kinds {
+    for (kind, namespaces) in kind_namespaces {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
-        let url = format!("{base}/apis/flotilla.work/v1/namespaces/flotilla/{kind}{query}");
-        let response = client.get(url).send().await.map_err(|error| eyre!("list {kind}: {error}"))?;
-        if response.status() == reqwest::StatusCode::BAD_REQUEST && !discovered {
-            let message = response.text().await?;
-            if message.contains("unknown resource kind") {
-                // A candidate may know a kind that the old daemon does not serve.
+        for namespace in namespaces {
+            if namespace.is_empty() || namespace.contains(['/', '?', '#']) {
+                return Err(eyre!("daemon kind discovery returned invalid namespace {namespace:?} for {kind}"));
+            }
+            let label = format!("{namespace}/{kind}");
+            let url = format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
+            let response = client.get(url).send().await.map_err(|error| eyre!("list {label}: {error}"))?;
+            if response.status() == reqwest::StatusCode::BAD_REQUEST && !discovered {
+                let message = response.text().await?;
+                if message.contains("unknown resource kind") {
+                    // A candidate may know a kind that the old daemon does not serve.
+                    continue;
+                }
+                eprintln!("{label}: daemon list failed: {message}");
+                failed = true;
                 continue;
             }
-            eprintln!("{kind}: daemon list failed: {message}");
-            failed = true;
-            continue;
-        }
-        if !response.status().is_success() {
-            eprintln!("{kind}: daemon list failed: {}", response.text().await?);
-            failed = true;
-            continue;
-        }
-        let document: Value = response.json().await.map_err(|error| eyre!("decode {kind} list: {error}"))?;
-        let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{kind}: daemon list has no items array"))?;
-        for item in items {
-            count += 1;
-            let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
-            let label = format!("{kind}/{name}");
-            if let Err(error) = validate_resource_document(item) {
-                eprintln!("{label}: {error}");
+            if !response.status().is_success() {
+                eprintln!("{label}: daemon list failed: {}", response.text().await?);
                 failed = true;
+                continue;
+            }
+            let document: Value = response.json().await.map_err(|error| eyre!("decode {label} list: {error}"))?;
+            let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
+            for item in items {
+                count += 1;
+                let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
+                if let Err(error) = validate_resource_document(item) {
+                    eprintln!("{label}/{name}: {error}");
+                    failed = true;
+                }
             }
         }
     }
@@ -67,7 +89,7 @@ pub async fn validate_daemon(socket: &Path) -> Result<()> {
         Err(eyre!("resource validation failed after checking {count} stored records"))
     } else {
         println!("validated {count} stored records");
-        Ok(())
+        Ok(count)
     }
 }
 
@@ -160,6 +182,7 @@ mod tests {
 
     use flotilla_core::{config::ConfigStore, providers::discovery::test_support::fake_discovery};
     use flotilla_daemon::server::DaemonServer;
+    use flotilla_protocol::NodeId;
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
 
     use super::{collect_files, parse_documents, validate_daemon};
@@ -235,6 +258,29 @@ mod tests {
             )
             .await
             .expect("create convoy");
+        backend
+            .using::<Project>("ops")
+            .create(
+                &InputMeta::builder().name("ops-project".to_string()).build(),
+                &ProjectSpec::builder().display_name("Ops".to_string()).default_workflow_ref("default".to_string()).build(),
+            )
+            .await
+            .expect("create project outside default namespace");
+        let replicas = backend.using::<Convoy>("replicas");
+        replicas
+            .create(
+                &InputMeta::builder().name("replica-only".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("default".to_string()).build(),
+            )
+            .await
+            .expect("create replica source");
+        let source = replicas.list().await.expect("list replica source");
+        backend
+            .replica_writer::<Convoy>(NodeId::new("other-root"), "replicas")
+            .replace(&source, chrono::Utc::now())
+            .await
+            .expect("write replica source");
+        replicas.delete("replica-only").await.expect("remove local replica source");
         let task = tokio::spawn(async move { server.run().await });
         for _ in 0..100 {
             if socket.exists() {
@@ -242,7 +288,8 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        validate_daemon(&socket).await.expect("candidate decodes all served kinds");
+        let checked = validate_daemon(&socket).await.expect("candidate decodes all served kinds and namespaces");
+        assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
     }

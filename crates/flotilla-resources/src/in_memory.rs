@@ -188,6 +188,18 @@ impl InMemoryBackend {
         Ok(namespaces)
     }
 
+    pub(crate) async fn stored_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        let mut namespaces = self.local_namespaces_typed::<T>().await?.into_iter().collect::<std::collections::BTreeSet<_>>();
+        let replicas = self.replicas.lock().await;
+        for ((_, key), partition) in &replicas.partitions {
+            if key.0 == T::API_PATHS.group && key.1 == T::API_PATHS.version && key.2 == T::API_PATHS.plural && !partition.objects.is_empty()
+            {
+                namespaces.insert(key.3.clone());
+            }
+        }
+        Ok(namespaces.into_iter().collect())
+    }
+
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
