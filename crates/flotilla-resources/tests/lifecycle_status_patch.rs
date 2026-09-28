@@ -1113,3 +1113,20 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
         assert_eq!(after.finished_at, Some(ts(30)), "{} must record the new settled outcome time", case.name);
     }
 }
+
+#[test]
+fn turn_delivery_episodes_stored_before_2135_decode_their_head_sha_as_subject_revision() {
+    let episode = TurnDeliveryEpisode::builder()
+        .subject_revision("00cef2657a7c900ba85f851088333035b106faba".to_string())
+        .evidence_at(ts(20))
+        .judged_claim_at(ts(10))
+        .outcome(TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) })
+        .build();
+    let mut stored = serde_json::to_value(&episode).expect("serialize episode");
+    let revision = stored.as_object_mut().expect("episode object").remove("subject_revision").expect("subject_revision written");
+    stored["head_sha"] = revision;
+
+    let decoded: TurnDeliveryEpisode = serde_json::from_value(stored).expect("pre-#2135 episode decodes");
+    assert_eq!(decoded, episode);
+    assert!(serde_json::to_value(&decoded).expect("serialize").get("head_sha").is_none(), "the old name is never written back");
+}

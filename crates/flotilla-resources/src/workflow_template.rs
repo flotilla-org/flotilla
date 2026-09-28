@@ -202,7 +202,7 @@ pub struct InputDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "VesselRequirementRecord")]
 pub struct VesselRequirement {
     pub name: String,
     #[builder(default)]
@@ -220,6 +220,44 @@ pub struct VesselRequirement {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credential_permissions: BTreeMap<String, BTreeMap<String, String>>,
     pub crew: Vec<CrewSpec>,
+}
+
+/// The accepted stored form of a [`VesselRequirement`]. Unknown fields are
+/// refused, except `stance`: records written before ADR 0046 (stored
+/// templates, frozen workflow snapshots, and the snapshot inside every convoy
+/// status) still carry it. It is accepted and dropped, and never serialized,
+/// so a record loses it on its next write.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VesselRequirementRecord {
+    name: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    repository_refs: Option<Vec<RepositoryKey>>,
+    #[serde(default)]
+    credential_refs: BTreeSet<String>,
+    #[serde(default)]
+    credential_scopes: BTreeMap<String, BTreeSet<RepositoryKey>>,
+    #[serde(default)]
+    credential_permissions: BTreeMap<String, BTreeMap<String, String>>,
+    crew: Vec<CrewSpec>,
+    #[serde(default, rename = "stance")]
+    _legacy_stance: Option<serde::de::IgnoredAny>,
+}
+
+impl From<VesselRequirementRecord> for VesselRequirement {
+    fn from(record: VesselRequirementRecord) -> Self {
+        Self {
+            name: record.name,
+            depends_on: record.depends_on,
+            repository_refs: record.repository_refs,
+            credential_refs: record.credential_refs,
+            credential_scopes: record.credential_scopes,
+            credential_permissions: record.credential_permissions,
+            crew: record.crew,
+        }
+    }
 }
 
 impl VesselRequirement {
@@ -890,6 +928,27 @@ mod tests {
 
     fn agent(capability: &str) -> CrewSource {
         CrewSource::Agent { selector: Selector::for_capability(capability.to_string()), prompt: None, brief_template: None }
+    }
+
+    #[test]
+    fn pre_adr_0046_vessel_stance_is_accepted_and_dropped() {
+        let written =
+            serde_json::to_value(VesselRequirement::builder().name("work".to_string()).crew(vec![crew("coder", agent("code"))]).build())
+                .expect("serialize vessel");
+        let mut stored = written.clone();
+        stored["stance"] = serde_json::json!("contained");
+
+        let vessel: VesselRequirement = serde_json::from_value(stored).expect("pre-ADR-0046 vessel decodes");
+        let rewritten = serde_json::to_value(&vessel).expect("serialize vessel");
+        assert!(rewritten.get("stance").is_none(), "stance must not be written back: {rewritten}");
+        assert_eq!(rewritten, written);
+    }
+
+    #[test]
+    fn unknown_vessel_fields_other_than_legacy_stance_are_refused() {
+        let mut typo = serde_json::to_value(VesselRequirement::builder().name("work".to_string()).crew(vec![]).build()).expect("serialize");
+        typo["neds"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<VesselRequirement>(typo).is_err());
     }
 
     #[test]
