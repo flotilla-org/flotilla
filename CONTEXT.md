@@ -681,6 +681,13 @@ Workflows may override it. Supervisors act only through verbs and never
 transition phases. A crew member's `crew stall` enters the ladder directly.
 _Avoid_: Escalation policy, on-call.
 
+**Convoy Subject**:
+A source-scoped external thing a convoy relates to: a change request, an issue, or later others. It is identified by `(kind, service, scope, id)`, forge-relative, and carries a typed relationship: works_on, produces, adopts, supersedes or references (ADR 0049). Declared subjects are in convoy spec; discovered ones are in status, with their sources. There are three reference forms:
+- **internal canonical**: the leaf address, for storage;
+- **external canonical**: the forge URL, for copying and hand-off;
+- **short**: `repo#n` for an issue, `repo!n` for a change request.
+_Avoid_: The convoy's PR (there may be several, across repositories).
+
 **Park Depth**:
 Where on the vessel-is-a-cache spectrum a parked vessel sits: warm process →
 suspended vessel → no vessel, logs archived (ADR 0028). Depth changes
