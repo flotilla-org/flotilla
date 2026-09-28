@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -957,6 +957,92 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
             r#"{"github-app":["github.com-flotilla-org-flotilla"]}"#,
         ),
     ]);
+}
+
+#[derive(Default)]
+struct BriefGateRuntime {
+    available: AtomicBool,
+    launches: AtomicUsize,
+}
+
+#[async_trait]
+impl TerminalRuntime for BriefGateRuntime {
+    async fn brief_ready(&self, _spec: &TerminalSessionSpec) -> Result<bool, String> {
+        Ok(self.available.load(Ordering::SeqCst))
+    }
+
+    async fn ensure_session(
+        &self,
+        name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
+        Ok(TerminalRuntimeState {
+            session_id: name.to_string(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "codex".into(),
+            delivered_message_id: None,
+        })
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn digest_backed_session_waits_for_blob_then_launches() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    create_ready_environment(&backend, "env-a").await;
+    let session = backend
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("term-brief".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "demo".to_string()),
+                    (VESSEL_REF_LABEL.to_string(), "demo-work".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: ".flotilla/briefs/coder.md".into(),
+                        content: String::new(),
+                        artifact_digest: Some("a".repeat(64)),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: None,
+                },
+                cwd: "/workspace".into(),
+                pool: "cleat".into(),
+            },
+        )
+        .await
+        .expect("terminal");
+    let runtime = Arc::new(BriefGateRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let waiting = reconciler.prepare(&session).await.expect("wait for blob");
+    let outcome = reconciler.reconcile(&session, &waiting, Utc::now());
+    assert!(outcome.patch.is_none());
+    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));
+    assert_eq!(runtime.launches.load(Ordering::SeqCst), 0);
+    runtime.available.store(true, Ordering::SeqCst);
+    let available = reconciler.prepare(&session).await.expect("blob fetched");
+    assert!(reconciler.reconcile(&session, &available, Utc::now()).patch.is_some());
+    assert_eq!(runtime.launches.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Default)]

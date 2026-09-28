@@ -10574,6 +10574,7 @@ impl InProcessDaemon {
             }
             TurnDeliverySessionPlan::RestartFresh => {
                 brief.content = request.brief.clone();
+                brief.artifact_digest = None;
                 *message = None;
             }
         }

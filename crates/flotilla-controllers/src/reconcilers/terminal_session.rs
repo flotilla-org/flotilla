@@ -229,6 +229,7 @@ enum TerminalOwnerState {
 pub enum TerminalPrepared {
     None,
     Waiting,
+    BriefWaiting,
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     MessageDeliveryPending,
@@ -351,7 +352,7 @@ where
             return Ok(TerminalPrepared::Waiting);
         }
         if !self.runtime.brief_ready(&obj.spec).await.map_err(ResourceError::other)? {
-            return Ok(TerminalPrepared::Waiting);
+            return Ok(TerminalPrepared::BriefWaiting);
         }
 
         let mut tags = [
@@ -412,6 +413,7 @@ where
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }
                 TerminalPrepared::Waiting
+                | TerminalPrepared::BriefWaiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::CleatEndpoint(_)
@@ -504,7 +506,7 @@ where
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
             outcome.requeue_after = Some(Duration::from_millis(200));
-        } else if matches!(prepared, TerminalPrepared::Waiting) {
+        } else if matches!(prepared, TerminalPrepared::BriefWaiting) {
             outcome.requeue_after = Some(Duration::from_secs(5));
         }
         outcome

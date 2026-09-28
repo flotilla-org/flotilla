@@ -564,6 +564,43 @@ async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() 
 }
 
 #[tokio::test]
+async fn fresh_turn_replaces_the_old_brief_digest() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let mut spec = session.spec.clone();
+    let TerminalSessionSource::Agent { brief, .. } = &mut spec.source else { panic!("agent session") };
+    brief.artifact_digest = Some("a".repeat(64));
+    brief.content.clear();
+    let session = sessions
+        .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
+        .await
+        .expect("digest-backed session");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Stopped,
+            ..Default::default()
+        })
+        .await
+        .expect("stopped session");
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("resume-staging".to_string())
+        .source("review".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .brief("fresh turn".to_string())
+        .subject_revision("next-head".to_string())
+        .build();
+    daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
+    let session = sessions.get("resume-staging-session").await.expect("updated session");
+    let TerminalSessionSource::Agent { brief, .. } = session.spec.source else { panic!("agent session") };
+    assert_eq!(brief.content, "fresh turn");
+    assert_eq!(brief.artifact_digest, None);
+}
+
+#[tokio::test]
 async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_rung() {
     for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
         let temp = tempfile::tempdir().expect("tempdir");
