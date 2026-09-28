@@ -772,6 +772,24 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         if let Some(reason) = &placement.escalation_reason {
             let _ = writeln!(output, "Escalation: {reason}");
         }
+        if let Some(allocation) = &placement.allocation {
+            for candidate in &allocation.candidates {
+                let _ = writeln!(
+                    output,
+                    "  {} on {}: cost {}, ready {}, sleep until {}, free slots {}, reserved {}, minimal {}, available {}{}",
+                    candidate.kind,
+                    candidate.host,
+                    candidate.cost_class,
+                    candidate.host_ready,
+                    candidate.sleeping_until.map_or_else(|| "none".to_string(), |until| until.to_rfc3339()),
+                    candidate.free_vessel_slots.map_or_else(|| "unbounded".to_string(), |slots| slots.to_string()),
+                    candidate.reserved_for_platform,
+                    candidate.minimal,
+                    candidate.available,
+                    if candidate.kind == allocation.chosen_kind { " (chosen)" } else { "" },
+                );
+            }
+        }
     };
     if explanation.vessel_placements.is_empty() {
         if let Some(placement) = &explanation.placement {

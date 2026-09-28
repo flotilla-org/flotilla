@@ -253,6 +253,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("01HXYZ"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
+        allocation: None,
     };
 
     VesselStatusPatch::MarkProvisioning {
@@ -275,6 +276,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
             target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("other"), display_name: "feta".to_string() },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
+            allocation: None,
         }),
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),

@@ -73,4 +73,27 @@ pub struct PlacementDecision {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub viable_not_selected: Vec<PlacementViableCandidate>,
+    /// Live inputs and the allocation judgement frozen at admission.
+    /// Absent in previous-generation records (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<FulfilmentAllocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentAllocation {
+    pub chosen_kind: String,
+    pub candidates: Vec<FulfilmentAllocationCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FulfilmentAllocationCandidate {
+    pub kind: String,
+    pub host: String,
+    pub cost_class: String,
+    pub host_ready: bool,
+    pub sleeping_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub free_vessel_slots: Option<u32>,
+    pub reserved_for_platform: bool,
+    pub minimal: bool,
+    pub available: bool,
 }

@@ -193,6 +193,7 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("kiwi-id"), display_name: "kiwi".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
+        allocation: None,
     };
     let second = PlacementDecision {
         minimal_alternatives: Vec::new(),
@@ -201,6 +202,7 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
         target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-id"), display_name: "feta".to_string() },
         refused_candidates: Vec::new(),
         viable_not_selected: Vec::new(),
+        allocation: None,
     };
     let mut status =
         ConvoyStatus { phase: ConvoyPhase::Active, observed_workflow_ref: Some("scratch".to_string()), ..ConvoyStatus::default() };

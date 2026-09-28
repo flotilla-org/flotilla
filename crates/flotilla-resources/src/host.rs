@@ -93,6 +93,10 @@ pub struct HostStatus {
     pub heartbeat_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub ready: bool,
+    /// A host may be reachable while its scheduled sleep prevents admission.
+    /// Absent in previous-generation records (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleeping_until: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_store: Option<ResourceStoreDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

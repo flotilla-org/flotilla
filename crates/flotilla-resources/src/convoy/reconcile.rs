@@ -35,6 +35,7 @@ use crate::{
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, DefinitionResolver, InputMeta, InputValue,
     OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError, SystemClock,
     ThreeValue, TypedResolver,
+    ControllerRetry, Host, LeafMaker, RetryBackoff, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
 };
 
 #[async_trait]
@@ -82,6 +83,7 @@ pub struct ConvoyReconciler {
     checkouts: Option<TypedResolver<Checkout>>,
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    hosts: Option<ReplicaReadResolver<Host>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
     clock: Arc<dyn Clock>,
@@ -98,6 +100,7 @@ pub struct ConvoyPrepared {
     exit_disposition: Option<String>,
     settlement_attention: Option<crate::ConvoyAttention>,
     reclaim_eligible: bool,
+    capacity_wait: Option<String>,
 }
 
 impl ConvoyReconciler {
@@ -111,6 +114,7 @@ impl ConvoyReconciler {
             checkouts: None,
             federated_checkouts: None,
             change_requests: None,
+            hosts: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
@@ -121,6 +125,11 @@ impl ConvoyReconciler {
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
         self.vessels = Some(vessels);
+        self
+    }
+
+    pub fn with_hosts(mut self, hosts: ReplicaReadResolver<Host>) -> Self {
+        self.hosts = Some(hosts);
         self
     }
 
@@ -633,6 +642,60 @@ impl Reconciler for ConvoyReconciler {
     type Prepared = ConvoyPrepared;
 
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let capacity_wait = if obj
+            .status
+            .as_ref()
+            .is_none_or(|status| status.provisioning.is_none_or(|state| state == super::ConvoyProvisioningState::NotStarted))
+        {
+            match &self.hosts {
+                Some(hosts) => {
+                    let mut decisions =
+                        obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
+                    let vessel_pins = obj
+                        .metadata
+                        .annotations
+                        .get(super::VESSEL_PLACEMENTS_ANNOTATION)
+                        .and_then(|encoded| serde_json::from_str::<BTreeMap<String, super::VesselPlacementPin>>(encoded).ok())
+                        .unwrap_or_default();
+                    decisions.extend(vessel_pins.values().map(|pin| &pin.decision));
+                    let mut wait = None;
+                    for allocation in decisions.into_iter().filter_map(|decision| decision.allocation.as_ref()) {
+                        let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
+                            continue;
+                        };
+                        let host = match hosts.get(&selected.host).await {
+                            Ok(host) => Some(host.object),
+                            Err(ResourceError::NotFound { .. }) => None,
+                            Err(error) => return Err(error),
+                        };
+                        let status = host.and_then(|host| host.status).map(|mut status| {
+                            status.apply_heartbeat_readiness(self.clock.now());
+                            status
+                        });
+                        let sleeping =
+                            status.as_ref().and_then(|status| status.sleeping_until).is_some_and(|until| until > self.clock.now());
+                        let slots = status
+                            .as_ref()
+                            .and_then(|status| status.fulfilment_facts.get(&selected.kind))
+                            .and_then(|facts| facts.free_vessel_slots);
+                        if status.as_ref().is_none_or(|status| !status.ready) || sleeping || slots == Some(0) {
+                            wait = Some(format!(
+                                "capacity for fulfilment `{}` on host `{}` is unavailable{}{}",
+                                selected.kind,
+                                selected.host,
+                                if sleeping { " (sleeping)" } else { "" },
+                                if slots == Some(0) { " (no free vessel slots)" } else { "" }
+                            ));
+                            break;
+                        }
+                    }
+                    wait
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let template = if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() {
             None
         } else {
@@ -722,7 +785,16 @@ impl Reconciler for ConvoyReconciler {
         } else {
             false
         };
-        Ok(ConvoyPrepared { template, vessels, presentations, checkouts, exit_disposition, settlement_attention, reclaim_eligible })
+        Ok(ConvoyPrepared {
+            template,
+            vessels,
+            presentations,
+            checkouts,
+            exit_disposition,
+            settlement_attention,
+            reclaim_eligible,
+            capacity_wait,
+        })
     }
 
     fn reconcile(
@@ -731,6 +803,50 @@ impl Reconciler for ConvoyReconciler {
         prepared: &Self::Prepared,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
+        if !obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
+            if let Some(evidence) = &prepared.capacity_wait {
+                let retry = ControllerRetry::retryable(None, now, RetryBackoff {
+                    initial: std::time::Duration::from_secs(30),
+                    maximum: std::time::Duration::from_secs(30),
+                });
+                let condition = StalledCondition {
+                    leaves: Vec::new(),
+                    maker: Some(LeafMaker::Controller {
+                        resource_kind: "Convoy".to_string(),
+                        name: None,
+                        retry,
+                        ceiling: RetryCeiling::default(),
+                    }),
+                    evidence: evidence.clone(),
+                    source: StallEvidenceSource::LeafEngine,
+                    began_at: prior.map_or(now, |stalled| stalled.began_at),
+                    rung: StallRung::Operator,
+                    supervisor: None,
+                    supervision_index: None,
+                    supervision_exhausted: false,
+                    reason: None,
+                    nudge_history: Vec::new(),
+                };
+                return ControllerReconcileOutcome {
+                    patch: prior
+                        .filter(|stalled| stalled.evidence == *evidence)
+                        .is_none()
+                        .then_some(ConvoyStatusPatch::SetStalled { condition: Some(condition) }),
+                    actuations: Vec::new(),
+                    events: Vec::new(),
+                    requeue_after: Some(std::time::Duration::from_secs(30)),
+                };
+            }
+            if prior.is_some_and(|stalled| stalled.evidence.starts_with("capacity for fulfilment `")) {
+                return ControllerReconcileOutcome {
+                    patch: Some(ConvoyStatusPatch::SetStalled { condition: None }),
+                    actuations: Vec::new(),
+                    events: Vec::new(),
+                    requeue_after: None,
+                };
+            }
+        }
         let mut outcome = reconcile_internal(
             obj,
             prepared.template.as_ref(),

@@ -2272,6 +2272,33 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
 }
 
 #[tokio::test]
+async fn capability_admission_queues_on_sleeping_minimal_host() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-sleeping", "sleeping-host", 0, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("sleeping-host").await.expect("host");
+    let mut status = host.status.expect("host status");
+    status.ready = false;
+    status.sleeping_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    hosts.update_status("sleeping-host", &host.metadata.resource_version, &status).await.expect("sleeping host");
+
+    let result = start_capability_convoy(&daemon, "sleeping-capacity", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+    })
+    .await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let convoy = admitted_convoy(&backend, "sleeping-capacity").await;
+    let decision = convoy.status.expect("status").placement_decision.expect("placement");
+    assert_eq!(decision.policy_name, "host-direct-sleeping");
+    let allocation = decision.allocation.expect("frozen allocation");
+    let selected = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("candidate");
+    assert!(!selected.available);
+    assert!(selected.sleeping_until.is_some());
+}
+
+#[tokio::test]
 async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();

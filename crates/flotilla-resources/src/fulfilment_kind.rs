@@ -153,11 +153,25 @@ pub fn version_at_least(actual: &str, required: &str) -> bool {
 pub struct FulfilmentKindSpec {
     pub host_ref: String,
     pub pool: String,
+    /// Billing class used after the least-privilege cut. Old records default
+    /// to owned capacity for the N to N+1 stored-data window (ADR 0047).
+    #[serde(default)]
+    #[builder(default)]
+    pub cost_class: FulfilmentCostClass,
     #[builder(default)]
     #[serde(default)]
     pub grants: BTreeSet<FulfilmentGrant>,
     #[serde(flatten)]
     pub realisation: FulfilmentRealisation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FulfilmentCostClass {
+    #[default]
+    OwnedIdle,
+    SubscriptionIncluded,
+    Metered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +202,6 @@ impl FulfilmentKindSpec {
             }
             _ => return Err("placement policy must define exactly one realisation".to_string()),
         };
-        Ok(Self { host_ref, pool: policy.pool.clone(), grants, realisation })
+        Ok(Self { host_ref, pool: policy.pool.clone(), cost_class: FulfilmentCostClass::default(), grants, realisation })
     }
 }

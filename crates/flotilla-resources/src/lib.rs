@@ -104,7 +104,7 @@ pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DE
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
-pub use fulfilment_kind::{FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
+pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
     canonical_host_id, CachedModelProbe, CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec,
     HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,

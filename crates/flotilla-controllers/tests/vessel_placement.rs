@@ -34,6 +34,7 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
                 target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-host"), display_name: "feta".to_string() },
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
+                allocation: None,
             }),
             ..ConvoyStatus::default()
         })
@@ -129,6 +130,7 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
                 target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("ssh-host"), display_name: "beaufort".to_string() },
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
+                allocation: None,
             }),
             ..ConvoyStatus::default()
         })

@@ -1424,6 +1424,7 @@ mod tests {
             },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
+            allocation: None,
         };
 
         assert_eq!(
@@ -1456,6 +1457,7 @@ mod tests {
             },
             refused_candidates: Vec::new(),
             viable_not_selected: Vec::new(),
+            allocation: None,
         };
         let mut strategy = placement_strategy(&policy).expect("host-direct policy should produce a placement strategy");
 
