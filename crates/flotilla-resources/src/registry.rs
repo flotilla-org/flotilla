@@ -740,7 +740,7 @@ pub fn decode_stored_resource_document(document: &Value) -> Result<(), ResourceE
     }
     let spec = document.get("spec").ok_or_else(|| ResourceError::decode("spec: missing"))?;
     dispatch_resource_kind!(registered.resource, validate_typed_spec(spec))?;
-    if let Some(status) = document.get("status") {
+    if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
         dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
     }
     Ok(())
