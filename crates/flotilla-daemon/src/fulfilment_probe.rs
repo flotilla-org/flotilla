@@ -54,6 +54,21 @@ pub(crate) async fn probe_kind(
     env: &dyn EnvVars,
 ) -> FulfilmentFacts {
     let mut facts = FulfilmentFacts { image: image.map(ToString::to_string), observed_at: Utc::now(), ..FulfilmentFacts::default() };
+    if matches!(spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) {
+        let Some(image) = image else { return facts };
+        let present = tokio::time::timeout(
+            Duration::from_secs(15),
+            runner.run_output("docker", &["image", "inspect", image], Path::new("/"), &ChannelLabel::Default),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|output| output.success);
+        facts.image_present = present;
+        if present != Some(true) {
+            return facts;
+        }
+    }
     if matches!(spec.realisation, FulfilmentRealisation::HostDirect) {
         facts.gui_session_logged_in = env.get("DISPLAY").is_some() || env.get("WAYLAND_DISPLAY").is_some();
         if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::Platform("macos".to_string())) {
@@ -146,10 +161,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_image_is_a_fact_and_does_not_pull() {
+        let runner = DiscoveryMockRunner::builder().build();
+        let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
+        let facts = probe_kind(&docker_kind(), Some("crew:missing"), true, &runner, &env).await;
+        assert_eq!(facts.image.as_deref(), Some("crew:missing"));
+        assert_eq!(facts.image_present, Some(false));
+        assert!(facts.harnesses.is_empty());
+    }
+
+    #[tokio::test]
     async fn image_and_host_versions_probe_different_model_availability() {
         let model = "claude-new-model";
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", model), ("DISPLAY", ":0")]);
         let image = DiscoveryMockRunner::builder()
+            .on_run("docker", &["image", "inspect", "crew:test"], Ok("[]".into()))
             .on_run("docker", &["run", "--rm", "--pull=never", "crew:test", "claude", "--version"], Ok("2.1.280 (Claude Code)".into()))
             .on_run(
                 "docker",

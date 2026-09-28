@@ -5710,6 +5710,20 @@ impl InProcessDaemon {
                                 .is_some_and(|status| status.fulfilment_facts.values().any(|facts| facts.harnesses.contains_key(adapter)))
                         }) {
                             return Err(format!("no observed {adapter} harness accepts model {model}"));
+                        } else {
+                            let kinds = self
+                                .resource_backend
+                                .including_replicas::<FulfilmentKind>(namespace)
+                                .list()
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let names = kinds.items.iter().map(|kind| kind.object.metadata.name.as_str()).collect::<Vec<_>>();
+                            if !names.is_empty() {
+                                return Err(format!(
+                                    "facts not yet observed for kind {} (needed for {adapter} model {model})",
+                                    names.join(", ")
+                                ));
+                            }
                         }
                     }
                 }
@@ -5762,6 +5776,14 @@ impl InProcessDaemon {
             let host = hosts.items.iter().find(|host| host.object.metadata.name == kind.spec.host_ref);
             let facts =
                 host.and_then(|host| host.object.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            if facts.is_none()
+                && needs
+                    .iter()
+                    .any(|need| matches!(need, CapabilityNeed::GuiSession | CapabilityNeed::Toolchain(_) | CapabilityNeed::Harness { .. }))
+            {
+                rejected.push(format!("{}: facts not yet observed for kind {}", kind.metadata.name, kind.metadata.name));
+                continue;
+            }
             let missing = needs.iter().filter(|need| !need.covered_by(&kind.spec.grants, facts)).collect::<Vec<_>>();
             if !missing.is_empty() {
                 rejected.push(format!(
