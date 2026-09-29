@@ -67,8 +67,12 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yml = "0.0.12"
+reqwest = { workspace = true, features = ["json"] }
 toml_edit = "0.22"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 humantime = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }

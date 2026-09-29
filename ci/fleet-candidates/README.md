@@ -138,6 +138,27 @@ install -m 0600 /path/to/fleet-reader-token \
 
 `~/.local/bin` must be the first Flotilla/Cleat location in `PATH`; the
 installer refuses to leave an older binary shadowing its stable launchers.
+
+Before the first `fleet-install` on any host, run the **promoted candidate's**
+`bin/flotilla` against each running fleet host, after promotion and before
+activation. For example, on each host with the candidate unpacked at
+`/path/to/candidate`:
+
+```sh
+/path/to/candidate/bin/flotilla resource validate --from-daemon
+```
+
+`--host <configured-peer-name>` checks a peer over its forwarded JSON resource
+socket when that connection is available. Any validation failure aborts the
+roll; fix the candidate's stored-data decoder and promote a new generation.
+The check reads all kinds and every local or replicated source across stored
+namespaces, including statuses. The installer repeats the local check with the staged candidate
+before switching the current generation, so an overlooked failure stops that
+host's install. The daemon must be running for an upgrade. The first generation
+with kind discovery falls back to probing its own registered kinds in the
+default `flotilla` namespace when reading an older daemon, which did not expose
+namespace discovery.
+
 Pulls are operator initiated and never move a fleet-wide desired-state pin:
 
 ```sh

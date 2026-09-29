@@ -68,6 +68,15 @@ impl ResourceBackend {
         }
     }
 
+    /// Namespaces containing a local or replicated source of this kind.
+    pub async fn stored_namespaces<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
+        match self {
+            Self::InMemory(backend) => backend.stored_namespaces_typed::<T>().await,
+            Self::Sqlite(backend) => backend.stored_namespaces_typed::<T>().await,
+            Self::Http(_) => Err(ResourceError::invalid("HTTP backends cannot enumerate stored resource namespaces")),
+        }
+    }
+
     pub fn definitions<T: Resource>(&self, namespace: &str) -> DefinitionResolver<T> {
         DefinitionResolver::new(self.clone(), namespace.to_string())
     }

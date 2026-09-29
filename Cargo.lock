@@ -1161,6 +1161,7 @@ dependencies = [
  "humantime",
  "libc",
  "ratatui",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "serde_yml",

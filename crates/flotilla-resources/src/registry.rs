@@ -278,6 +278,20 @@ macro_rules! dispatch_resource_kind {
     };
 }
 
+/// Inventory every namespace with an authored or replicated record, by kind.
+pub async fn registered_resource_namespaces(backend: &ResourceBackend) -> Result<BTreeMap<String, Vec<String>>, ResourceError> {
+    let mut namespaces = BTreeMap::new();
+    for registered in REGISTERED_RESOURCE_KINDS {
+        let found = dispatch_resource_kind!(registered.resource, stored_namespaces_typed(backend).await)?;
+        namespaces.insert(registered.plural.to_string(), found);
+    }
+    Ok(namespaces)
+}
+
+async fn stored_namespaces_typed<T: Resource>(backend: &ResourceBackend) -> Result<Vec<String>, ResourceError> {
+    backend.stored_namespaces::<T>().await
+}
+
 /// Dynamic apply uses the ownership-aware path for enrolled kinds. Enrolling
 /// another resource changes one dispatch arm rather than adding a one-off
 /// apply function or branch.
@@ -710,8 +724,8 @@ pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceE
     dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
 }
 
-/// Check a manifest document against the same registered spec types used by
-/// application, without contacting a backend or mutating any resource.
+/// Decode a complete resource document against this binary's registered types.
+/// Manifests without a status remain valid inputs.
 pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError> {
     let decoded: DynamicApplyDocument = serde_path_to_error::deserialize(document.clone().into_deserializer())
         .map_err(|error| ResourceError::decode(format!("decode resource document at {}: {error}", error.path())))?;
@@ -724,7 +738,11 @@ pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError>
     if version != expected {
         return Err(ResourceError::decode(format!("apiVersion: expected {expected}, got {version}")));
     }
-    dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))
+    dispatch_resource_kind!(registered.resource, validate_typed_spec(&decoded.spec))?;
+    if let Some(status) = document.get("status").filter(|status| !status.is_null()) {
+        dispatch_resource_kind!(registered.resource, decode_typed_status(status))?;
+    }
+    Ok(())
 }
 
 /// Decode both persisted halves of a resource without applying current write validation.
