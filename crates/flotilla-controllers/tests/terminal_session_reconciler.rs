@@ -169,6 +169,77 @@ async fn dead_generation_is_lost_then_recreated() {
     assert_eq!(runtime.deliveries.lock().expect("deliveries").as_slice(), ["PR #2185 is conflicting; rebase and rerun the gates"]);
 }
 
+#[derive(Default)]
+struct BrieflyMissingRuntime {
+    probes: AtomicUsize,
+}
+
+#[async_trait]
+impl TerminalRuntime for BrieflyMissingRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("a revived session must not be launched again")
+    }
+
+    async fn session_liveness(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        Ok(if self.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+            TerminalLiveness::Lost("session absent from list".into())
+        } else {
+            TerminalLiveness::Running
+        })
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("create session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "session-a".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let running = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running");
+    let runtime = Arc::new(BrieflyMissingRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let prepared = reconciler.prepare(&running).await.expect("first probe");
+    let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
+    outcome.patch.expect("lost patch").apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Lost);
+    let lost = sessions.update_status("term-a", &running.metadata.resource_version, &status).await.expect("persist loss");
+    let prepared = reconciler.prepare(&lost).await.expect("recheck");
+    let outcome = reconciler.reconcile(&lost, &prepared, Utc::now());
+    outcome.patch.expect("revived patch").apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Running);
+    assert_eq!(status.session_id.as_deref(), Some("session-a"));
+    assert_eq!(status.stopped_at, None);
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     let backend = ResourceBackend::InMemory(Default::default());

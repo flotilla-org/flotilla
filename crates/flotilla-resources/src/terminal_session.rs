@@ -361,6 +361,7 @@ pub enum TerminalSessionStatusPatch {
         reason: String,
         lost_at: DateTime<Utc>,
     },
+    MarkRevived,
     MarkFailed {
         message: String,
         stopped_at: Option<DateTime<Utc>>,
@@ -442,6 +443,12 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.degraded = None;
                 status.attention = None;
                 status.occupancy = TerminalOccupancy::Unknown;
+            }
+            Self::MarkRevived => {
+                status.phase = TerminalSessionPhase::Running;
+                status.stopped_at = None;
+                status.inner_command_status = Some(InnerCommandStatus::Running);
+                status.message = None;
             }
             Self::MarkFailed { message, stopped_at } => {
                 status.phase = TerminalSessionPhase::Failed;

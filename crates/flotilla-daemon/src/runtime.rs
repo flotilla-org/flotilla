@@ -4634,6 +4634,18 @@ async fn fulfilment_grants_for_terminal(
     backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
 }
 
+fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: TerminalSessionLiveness) -> TerminalLiveness {
+    match liveness {
+        TerminalSessionLiveness::Running => TerminalLiveness::Running,
+        TerminalSessionLiveness::Stopped => TerminalLiveness::Stopped,
+        TerminalSessionLiveness::Absent if matches!(source, TerminalSessionSource::Agent { .. }) => {
+            TerminalLiveness::Lost("cleat agent session is absent from its daemon".into())
+        }
+        TerminalSessionLiveness::Absent => TerminalLiveness::Stopped,
+        TerminalSessionLiveness::Lost(reason) => TerminalLiveness::Lost(reason),
+    }
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn brief_ready(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
@@ -4769,6 +4781,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
+        // A dead generation may retain a recording with the old ID. Keep that
+        // recording for recovery and launch into the current generation under
+        // a fresh ID so cleat cannot resolve the name ambiguously.
         let session_id = if is_agent_session && matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
             format!("{name}-{}", uuid::Uuid::new_v4())
         } else {
@@ -4791,12 +4806,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
         let pool = self.pool_for_spec(spec)?;
-        Ok(match pool.session_liveness(session_id).await? {
-            TerminalSessionLiveness::Running => TerminalLiveness::Running,
-            TerminalSessionLiveness::Stopped => TerminalLiveness::Stopped,
-            TerminalSessionLiveness::Absent => TerminalLiveness::Lost("cleat session is absent from its daemon".into()),
-            TerminalSessionLiveness::Lost(reason) => TerminalLiveness::Lost(reason),
-        })
+        Ok(terminal_liveness_for_source(&spec.source, pool.session_liveness(session_id).await?))
     }
 
     async fn observe_attention(
@@ -5105,6 +5115,16 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[test]
+    fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
+        let tool = TerminalSessionSource::Tool { command: "cargo test".into() };
+        assert_eq!(terminal_liveness_for_source(&tool, TerminalSessionLiveness::Absent), TerminalLiveness::Stopped);
+        assert_eq!(
+            terminal_liveness_for_source(&tool, TerminalSessionLiveness::Lost("daemon generation is dead".into())),
+            TerminalLiveness::Lost("daemon generation is dead".into())
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {

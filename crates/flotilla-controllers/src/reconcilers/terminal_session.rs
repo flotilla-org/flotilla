@@ -65,6 +65,8 @@ pub enum TerminalLiveness {
     Lost(String),
 }
 
+const LOST_RECHECK_AFTER: Duration = Duration::from_secs(5);
+
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
     async fn brief_ready(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
@@ -246,6 +248,7 @@ pub enum TerminalPrepared {
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
     Lost(String),
+    Revived,
     RecoverLost,
     CleatEndpoint(Option<flotilla_protocol::result_set::CleatEndpoint>),
     Attention(TerminalObservation),
@@ -367,12 +370,21 @@ where
             return Ok(TerminalPrepared::None);
         }
         if phase == TerminalSessionPhase::Lost {
+            if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
+                if self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? == TerminalLiveness::Running {
+                    return Ok(TerminalPrepared::Revived);
+                }
+            }
             let lost_at = obj.status.as_ref().and_then(|status| status.stopped_at);
-            return Ok(if lost_at.is_some_and(|at| Utc::now().signed_duration_since(at) >= chrono::Duration::seconds(5)) {
-                TerminalPrepared::RecoverLost
-            } else {
-                TerminalPrepared::None
-            });
+            return Ok(
+                if lost_at.is_some_and(|at| {
+                    Utc::now().signed_duration_since(at) >= chrono::Duration::from_std(LOST_RECHECK_AFTER).expect("duration fits")
+                }) {
+                    TerminalPrepared::RecoverLost
+                } else {
+                    TerminalPrepared::None
+                },
+            );
         }
         if phase != TerminalSessionPhase::Starting {
             return Ok(TerminalPrepared::None);
@@ -451,6 +463,7 @@ where
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::Lost(_)
+                | TerminalPrepared::Revived
                 | TerminalPrepared::RecoverLost
                 | TerminalPrepared::CleatEndpoint(_)
                 | TerminalPrepared::MessageDelivered(_)
@@ -469,11 +482,8 @@ where
                     message: None,
                 })
             }
-            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Lost(_)) => {
-                let TerminalPrepared::Lost(reason) = prepared else { unreachable!("matched above") };
-                Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now })
-            }
             TerminalSessionPhase::Running => match prepared {
+                TerminalPrepared::Lost(reason) => Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now }),
                 TerminalPrepared::CleatEndpoint(endpoint) => {
                     Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
                 }
@@ -522,6 +532,7 @@ where
                 }),
                 _ => None,
             },
+            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Revived) => Some(TerminalSessionStatusPatch::MarkRevived),
             TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::RecoverLost) => {
                 Some(TerminalSessionStatusPatch::MarkStarting)
             }
@@ -540,8 +551,9 @@ where
             TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
-            TerminalPrepared::Lost(_) => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
-            TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
+            TerminalPrepared::Lost(_) | TerminalPrepared::AttentionStale => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
             _ if matches!(phase, TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
@@ -553,7 +565,7 @@ where
         } else if (phase == TerminalSessionPhase::Lost && matches!(prepared, TerminalPrepared::None))
             || matches!(prepared, TerminalPrepared::BriefWaiting)
         {
-            outcome.requeue_after = Some(Duration::from_secs(5));
+            outcome.requeue_after = Some(LOST_RECHECK_AFTER);
         }
         outcome
     }

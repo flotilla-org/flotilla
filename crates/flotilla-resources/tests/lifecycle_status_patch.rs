@@ -109,6 +109,7 @@ define_patch_kinds! {
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
     TerminalMarkLost => DUPLICATE,
+    TerminalMarkRevived => CONTINUATION,
     TerminalMarkFailed => DUPLICATE,
     TerminalMarkReconcileDegraded => NONE,
     TerminalClearReconcileDegraded => NONE,
@@ -170,6 +171,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
         TerminalSessionStatusPatch::MarkLost { .. } => PatchKind::TerminalMarkLost,
+        TerminalSessionStatusPatch::MarkRevived => PatchKind::TerminalMarkRevived,
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
@@ -953,6 +955,22 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "terminal session revived after a false loss",
+            kind: PatchKind::TerminalMarkRevived,
+            exercise: || {
+                let mut status = TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Lost,
+                    started_at: Some(ts(10)),
+                    stopped_at: Some(ts(20)),
+                    ..TerminalSessionStatus::default()
+                };
+                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+                apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkRevived);
+                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+                (before, after)
             },
         },
     ];
