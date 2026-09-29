@@ -44,15 +44,15 @@ use flotilla_resources::{
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity,
     FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
-    InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
-    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
+    InputDefinition, InputMeta, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass,
+    Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
     TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec,
     AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
-use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{
     sync::{Mutex, RwLock},
@@ -595,7 +595,13 @@ impl DaemonRuntime {
         }
 
         let mut tasks = vec![
-            spawn_local_fulfilment_probe_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), runtime_health.clone()),
+            spawn_local_fulfilment_probe_task(
+                Arc::clone(&daemon),
+                options.namespace.clone(),
+                profile.clone(),
+                runtime_health.clone(),
+                config.state_dir().as_path().join("probe-cwd"),
+            ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
             spawn_blob_sync_status_task(
@@ -1045,7 +1051,16 @@ async fn apply_agentless_ssh_observation(
         let platform = agentless_platform(ssh.runner.as_ref()).await;
         migrate_live_placement_policies(&daemon.resource_backend(), namespace, &profile.host_id, &platform).await?;
     }
-    let fulfilment_facts = if probe_succeeded { ssh.fulfilment_facts.read().await.clone() } else { BTreeMap::new() };
+    let fulfilment_facts = if probe_succeeded {
+        let observed = ssh.fulfilment_facts.read().await.clone();
+        if observed.is_empty() {
+            host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+        } else {
+            observed
+        }
+    } else {
+        BTreeMap::new()
+    };
     let status = HostStatus {
         capabilities: BTreeMap::from([
             (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
@@ -1058,6 +1073,7 @@ async fn apply_agentless_ssh_observation(
             (OWNING_DAEMON_CAPABILITY.to_string(), json!(daemon.local_host_id().map(|id| id.to_string()))),
         ]),
         fulfilment_facts,
+        model_probes: host.status.as_ref().map(|status| status.model_probes.clone()).unwrap_or_default(),
         // This timestamp is the owning daemon's last successful SSH probe,
         // never a heartbeat emitted by a daemon on the target host.
         heartbeat_at: probe_succeeded.then(Utc::now),
@@ -2178,18 +2194,25 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
     Ok(())
 }
 
+struct FulfilmentProbeContext<'a> {
+    runner: &'a dyn CommandRunner,
+    env: &'a dyn EnvVars,
+    scratch: &'a Path,
+}
+
 async fn observe_fulfilment_facts(
     backend: &ResourceBackend,
     namespace: &str,
     host_ref: &str,
     available_pools: &[String],
     previous: &BTreeMap<String, FulfilmentFacts>,
-    runner: &dyn CommandRunner,
-    env: &dyn EnvVars,
+    probe: FulfilmentProbeContext<'_>,
+    model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?;
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
-    let mut probes = FuturesUnordered::new();
+    let mut facts = BTreeMap::new();
+    // Probe serially: all kinds on one host share the same model cache and budget.
     for kind in kinds.items {
         if kind.spec.host_ref != host_ref || kind.metadata.deletion_timestamp.is_some() {
             continue;
@@ -2214,31 +2237,27 @@ async fn observe_fulfilment_facts(
                     && Utc::now().signed_duration_since(prior.observed_at).to_std().is_ok_and(|age| age < Duration::from_secs(300))
             })
             .cloned();
-        probes.push(async move {
-            let observed = match current {
-                Some(current) => Some(current),
-                None => tokio::time::timeout(
-                    Duration::from_secs(45),
-                    crate::fulfilment_probe::probe_kind(&kind.spec, image.as_deref(), pool_available, runner, env),
-                )
-                .await
-                .ok(),
-            };
-            (name, observed)
-        });
-    }
-    let mut facts = BTreeMap::new();
-    while let Some((name, observed)) = probes.next().await {
-        match observed {
-            Some(observed) => {
-                facts.insert(name, observed);
-            }
-            None => {
-                warn!(kind = %name, "fulfilment fact probe exceeded total deadline");
-                if let Some(previous) = previous.get(&name) {
-                    facts.insert(name, previous.clone());
-                }
-            }
+        let observed = match current {
+            Some(current) => Some(current),
+            None => tokio::time::timeout(
+                Duration::from_secs(300),
+                crate::fulfilment_probe::probe_kind(
+                    &kind.spec,
+                    image.as_deref(),
+                    pool_available,
+                    probe.runner,
+                    probe.env,
+                    probe.scratch,
+                    model_probes,
+                ),
+            )
+            .await
+            .ok(),
+        };
+        if let Some(observed) = observed.or_else(|| previous.get(&name).cloned()) {
+            facts.insert(name, observed);
+        } else {
+            warn!(kind = %name, "fulfilment fact probe exceeded total deadline");
         }
     }
     Ok(facts)
@@ -2317,31 +2336,39 @@ fn spawn_local_fulfilment_probe_task(
     namespace: String,
     profile: LocalProvisioningProfile,
     runtime_health: RuntimeHealth,
+    scratch: PathBuf,
 ) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();
         let runtime_health = runtime_health.clone();
+        let scratch = scratch.clone();
         async move {
             let discovery = daemon.discovery_runtime();
-            let previous = runtime_health.fulfilment_facts.read().await.clone();
+            let hosts = daemon.resource_backend().using::<Host>(&namespace);
+            let status = hosts.get(&profile.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
+            let previous = status.fulfilment_facts;
+            let mut model_probes = status.model_probes.clone();
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
                 &profile.host_id,
                 &profile.available_pools,
                 &previous,
-                discovery.runner.as_ref(),
-                discovery.env.as_ref(),
+                FulfilmentProbeContext { runner: discovery.runner.as_ref(), env: discovery.env.as_ref(), scratch: &scratch },
+                &mut model_probes,
             )
             .await
             {
-                Ok(facts) if facts != previous => {
+                Ok(facts) if facts != previous || model_probes != status.model_probes => {
                     *runtime_health.fulfilment_facts.write().await = facts.clone();
-                    let hosts = daemon.resource_backend().using::<Host>(&namespace);
                     if let Err(error) =
-                        flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::FulfilmentFacts { facts }).await
+                        flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::FulfilmentFacts {
+                            facts,
+                            model_probes,
+                        })
+                        .await
                     {
                         warn!(%error, "failed to publish observed fulfilment facts");
                     }
@@ -2359,24 +2386,34 @@ fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: Stri
         let namespace = namespace.clone();
         let ssh = ssh.clone();
         async move {
-            let previous = ssh.fulfilment_facts.read().await.clone();
+            let hosts = daemon.resource_backend().using::<Host>(&namespace);
+            let status = hosts.get(&ssh.provisioning.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
+            let previous = status.fulfilment_facts;
+            let mut model_probes = status.model_probes.clone();
+            let scratch = match ssh.runner.writable_config_base(None, Path::new("/tmp")).await {
+                Ok(base) => base.join("probe-cwd"),
+                Err(error) => {
+                    warn!(%error, "cannot select SSH probe directory");
+                    return;
+                }
+            };
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
                 &ssh.provisioning.host_id,
                 &ssh.provisioning.available_pools,
                 &previous,
-                ssh.runner.as_ref(),
-                &BagEnvVars(&ssh.env_bag),
+                FulfilmentProbeContext { runner: ssh.runner.as_ref(), env: &BagEnvVars(&ssh.env_bag), scratch: &scratch },
+                &mut model_probes,
             )
             .await
             {
-                Ok(facts) if facts != previous => {
+                Ok(facts) if facts != previous || model_probes != status.model_probes => {
                     *ssh.fulfilment_facts.write().await = facts.clone();
-                    let hosts = daemon.resource_backend().using::<Host>(&namespace);
                     if let Err(error) =
                         flotilla_resources::apply_status_patch(&hosts, &ssh.provisioning.host_id, &HostStatusPatch::FulfilmentFacts {
                             facts,
+                            model_probes,
                         })
                         .await
                     {
@@ -2948,7 +2985,12 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
-    let fulfilment_facts = runtime_health.fulfilment_facts.read().await.clone();
+    let observed_facts = runtime_health.fulfilment_facts.read().await.clone();
+    let fulfilment_facts = if observed_facts.is_empty() {
+        host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
+    } else {
+        observed_facts
+    };
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
@@ -2973,6 +3015,7 @@ async fn apply_host_heartbeat_with_credentials(
     let status = HostStatus {
         capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
         fulfilment_facts,
+        model_probes: host.status.as_ref().map(|status| status.model_probes.clone()).unwrap_or_default(),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: !conditions.iter().any(HostCondition::blocks_readiness),
@@ -11279,7 +11322,13 @@ mod tests {
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
         assert!(hosts.get(&host_id).await.expect("host").status.expect("status").fulfilment_facts.is_empty());
 
-        let task = spawn_local_fulfilment_probe_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, runtime_health.clone());
+        let task = spawn_local_fulfilment_probe_task(
+            Arc::clone(&daemon),
+            NAMESPACE.to_string(),
+            profile,
+            runtime_health.clone(),
+            temp.path().join("probe-cwd"),
+        );
         wait_until_with_timeout(Duration::from_secs(5), || {
             let hosts = hosts.clone();
             let host_id = host_id.clone();
@@ -11315,7 +11364,9 @@ mod tests {
             }
 
             async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-                if cmd == "rustc" {
+                if cmd == "mkdir" {
+                    Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+                } else if cmd == "rustc" {
                     self.entered.notify_one();
                     self.release.notified().await;
                     Ok(CommandOutput { stdout: "rustc 1.94.1".to_string(), stderr: String::new(), success: true })
@@ -11359,8 +11410,12 @@ mod tests {
                 &probe_host,
                 &probe_pools,
                 &BTreeMap::new(),
-                &probe_runner,
-                &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+                FulfilmentProbeContext {
+                    runner: &probe_runner,
+                    env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+                    scratch: Path::new("/tmp/flotilla-probe-test"),
+                },
+                &mut ModelProbeState::default(),
             )
             .await
             .expect("probe facts")
