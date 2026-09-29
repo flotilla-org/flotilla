@@ -394,11 +394,12 @@ fn default_skill_source_paths() -> Vec<String> {
 #[derive(Debug, Clone)]
 struct SkillBundle {
     source: Option<PathBuf>,
+    staging_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SkillBundle {
     fn new(source: Option<PathBuf>) -> Self {
-        Self { source }
+        Self { source, staging_lock: Arc::new(tokio::sync::Mutex::new(())) }
     }
 
     async fn prepare(&self) -> Result<AgentMaterialDelivery, String> {
@@ -456,6 +457,10 @@ impl SkillBundle {
         source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
+        // All stagings through this registry share the same cache and may also
+        // target the same config home. A process-owned lock is released on
+        // cancellation, so a killed staging cannot strand later work.
+        let _staging_guard = self.staging_lock.lock().await;
         if adapters.is_empty() {
             return remove_source_token_files(source_token_files, runner).await;
         }
@@ -809,6 +814,15 @@ case "$1" in
     while [ "$1" = -c ]; do shift 2; done
     test "$1" = fetch
     printf '%s\n' fetch >>"$FLOTILLA_TEST_FETCH_LOG"
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.transient" ]; then
+      rm "$FLOTILLA_TEST_FETCH_LOG.transient"
+      echo 'fatal: temporary network failure' >&2
+      exit 75
+    fi
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.fail" ]; then
+      printf 'fatal: credential %s rejected by remote\n' "$(cat "$GITHUB_TOKEN_FILE")" >&2
+      exit 75
+    fi
     eval "revision=\${$#}"
     printf '%s' "$revision" >"$checkout/.git/FETCH_HEAD"
     ;;
@@ -1142,15 +1156,14 @@ esac
             r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
         )
         .expect("write manifest");
-        let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "test-token").expect("write token");
-        let tokens = BTreeMap::from([("private-skills".to_string(), token_file)]);
         let results = futures::future::join_all((0..4).map(|index| {
             let destination = runner.config_base.join(format!("claude-{index}"));
             let required = required.clone();
             let registry = Arc::clone(&registry);
             let runner = Arc::clone(&runner);
-            let tokens = tokens.clone();
+            let token_file = temp.path().join(format!("source-{index}.token"));
+            std::fs::write(&token_file, "test-token").expect("write token");
+            let tokens = BTreeMap::from([("private-skills".to_string(), token_file)]);
             tokio::spawn(async move {
                 registry
                     .stage_skills(
@@ -1167,6 +1180,60 @@ esac
         assert!(results.iter().all(|result| result.as_ref().is_ok_and(Result::is_ok)), "concurrent staging failed: {results:?}");
         let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake fetch log");
         assert_eq!(fetches.lines().count(), 1, "one fetch for the pinned source");
+        for index in 0..4 {
+            assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
+        }
+        let error = registry
+            .stage_skills(
+                "crew-without-private-credential",
+                &required,
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("unauthorized").to_string_lossy().into_owned())],
+                &BTreeMap::new(),
+                &*runner,
+            )
+            .await
+            .expect_err("private cache must still require a credential");
+        assert!(error.contains("credential private-skills is unavailable"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn transient_skill_fetch_retries_and_failure_redacts_credential() {
+        for should_recover in [true, false] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let registry = registry(temp.path());
+            let runner = promisor_runner(temp.path());
+            let skills = registry.skills.source.as_ref().expect("generation source");
+            std::fs::write(
+                skills.join(SKILL_BUNDLE_MANIFEST),
+                r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+            )
+            .expect("write manifest");
+            let token_file = temp.path().join("source.token");
+            std::fs::write(&token_file, "secret-for-redaction").expect("write token");
+            let marker = if should_recover { "fetches.transient" } else { "fetches.fail" };
+            std::fs::write(temp.path().join(marker), "").expect("write fake fetch marker");
+            let result = registry
+                .stage_skills(
+                    "crew-private",
+                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                    &runner,
+                )
+                .await;
+            let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake fetch log");
+            if should_recover {
+                result.expect("second fetch should recover");
+                assert_eq!(fetches.lines().count(), 2);
+            } else {
+                let error = result.expect_err("persistent fetch failure should surface");
+                assert_eq!(fetches.lines().count(), 3, "retry ceiling must be bounded");
+                assert!(error.contains("command: git -C"), "missing Git command: {error}");
+                assert!(error.contains("exit code: 75"), "missing Git exit code: {error}");
+                assert!(error.contains("[redacted credential-bearing git stderr line]"), "missing redacted stderr: {error}");
+                assert!(!error.contains("secret-for-redaction"), "credential leaked into status: {error}");
+            }
+        }
     }
 
     #[tokio::test]

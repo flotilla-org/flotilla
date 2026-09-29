@@ -15,16 +15,15 @@ cleanup_tokens=$3
 cache_root=$4
 shift 4
 export GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+umask 077
 staged="${destination}.flotilla-staging.$$"
 sources="${destination}.flotilla-sources.$$"
 token_files=
 succeeded=false
-lock=
 cache_tmp=
 cleanup() {
   rm -rf "$staged" "$sources"
   if [ -n "$cache_tmp" ]; then rm -rf "$cache_tmp"; fi
-  if [ -n "$lock" ]; then rmdir "$lock" 2>/dev/null || true; fi
   if [ "$cleanup_tokens" = true ] || [ "$succeeded" != true ]; then
     for token_file in $token_files; do rm -f "$token_file"; done
   fi
@@ -60,17 +59,11 @@ while [ "$#" -gt 0 ]; do
     path_count=$((path_count - 1))
   done
   if [ -n "$token_file" ]; then token_files="$token_files $token_file"; fi
+  if [ -n "$credential" ] && { [ -z "$token_file" ] || [ ! -s "$token_file" ]; }; then
+    echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
+    exit 1
+  fi
   cache="$cache_root/$name-$revision"
-  lock="$cache.lock"
-  waits=0
-  until mkdir "$lock" 2>/dev/null; do
-    waits=$((waits + 1))
-    if [ "$waits" -ge 200 ]; then
-      echo "${diagnostic_prefix}skill source $name cache lock timed out at pinned revision $revision" >&2
-      exit 1
-    fi
-    sleep 0.1
-  done
   if [ -f "$cache/.flotilla-ready" ] && [ "$(cat "$cache/.flotilla-repository")" = "$repository" ] && cmp -s "$paths_file" "$cache/.flotilla-paths"; then
     cp -R "$cache" "$checkout"
   else
@@ -122,8 +115,6 @@ while [ "$#" -gt 0 ]; do
     cache_tmp=
     if [ -n "$token_file" ]; then unset GITHUB_TOKEN_FILE; fi
   fi
-  rmdir "$lock"
-  lock=
   while IFS= read -r path; do
     if [ ! -d "$checkout/$path" ]; then
       echo "${diagnostic_prefix}skill source $name declared path $path is missing at pinned revision $revision" >&2
