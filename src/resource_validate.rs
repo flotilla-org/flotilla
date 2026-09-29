@@ -184,6 +184,7 @@ mod tests {
     use flotilla_daemon::server::DaemonServer;
     use flotilla_protocol::NodeId;
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
+    use flotilla_test_support::TestSocketDir;
 
     use super::{collect_files, parse_documents, validate_daemon};
 
@@ -237,7 +238,8 @@ mod tests {
         std::fs::create_dir_all(root.join("config")).expect("create daemon directory");
         std::fs::write(root.join("config/daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon identity");
         let config = Arc::new(ConfigStore::with_base(root.join("config")));
-        let socket = root.join("daemon.sock");
+        let socket_dir = TestSocketDir::new();
+        let socket = socket_dir.socket_path("daemon.sock");
         let server = DaemonServer::new(vec![], config, fake_discovery(false), socket.clone(), Duration::from_secs(30))
             .await
             .expect("build in-process daemon server");

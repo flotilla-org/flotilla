@@ -1157,6 +1157,7 @@ dependencies = [
  "flotilla-manifest",
  "flotilla-protocol",
  "flotilla-resources",
+ "flotilla-test-support",
  "flotilla-tui",
  "humantime",
  "libc",
