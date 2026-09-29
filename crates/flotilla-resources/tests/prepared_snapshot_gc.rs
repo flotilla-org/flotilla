@@ -86,6 +86,7 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
         .await
         .expect("author placement snapshot");
     create_convoy(&remote, "remote-convoy", workflow_name, placement_name).await.expect("remote convoy");
+    create_convoy(&author, "remote-convoy", workflow_name, placement_name).await.expect("same-named local convoy being deleted");
     let replica = author.replica_writer::<Convoy>(NodeId::new("remote"), "flotilla");
     replica
         .replace(&remote.using::<Convoy>("flotilla").list().await.expect("remote convoys"), Utc::now())
@@ -93,7 +94,7 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
         .expect("replicate remote convoy");
 
     let collector = PreparedSnapshotGarbageCollector::new(author.clone(), "flotilla");
-    let retained = collector.collect(None).await.expect("collect with remote reference");
+    let retained = collector.collect(Some("remote-convoy")).await.expect("collect while same-named local convoy is deleting");
     assert_eq!(retained.workflows_deleted, 0);
     assert_eq!(retained.placements_deleted, 0);
 
@@ -102,7 +103,7 @@ async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
         .replace(&remote.using::<Convoy>("flotilla").list().await.expect("empty remote convoys"), Utc::now())
         .await
         .expect("replicate removal");
-    let collected = collector.collect(None).await.expect("collect after remote release");
+    let collected = collector.collect(Some("remote-convoy")).await.expect("collect after remote release");
     assert_eq!(collected.workflows_deleted, 1);
     assert_eq!(collected.placements_deleted, 1);
 }

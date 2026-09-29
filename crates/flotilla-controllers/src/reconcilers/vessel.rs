@@ -1460,7 +1460,7 @@ mod tests {
     use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::{
         Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
-        PlacementPolicySpec, ResourceBackend, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
+        PlacementPolicySpec, ResourceBackend, ResourceError, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
         PREPARED_SNAPSHOT_LABEL,
     };
 
@@ -1499,6 +1499,14 @@ mod tests {
             )
             .await
             .expect("author snapshot");
+        author
+            .using::<PlacementPolicy>("flotilla")
+            .create(
+                &InputMeta::builder().name("ordinary-policy".to_string()).build(),
+                &PlacementPolicySpec::builder().pool("cleat".to_string()).build(),
+            )
+            .await
+            .expect("author ordinary policy");
         driver
             .replica_writer::<PlacementPolicy>(NodeId::new("author"), "flotilla")
             .replace(&author.using::<PlacementPolicy>("flotilla").list().await.expect("author policies"), chrono::Utc::now())
@@ -1525,6 +1533,7 @@ mod tests {
                 reconciler.placement_dependency(&vessel, snapshot_name).await.expect("resolve shared snapshot").spec.pool,
                 "passthrough"
             );
+            assert!(matches!(reconciler.placement_dependency(&vessel, "ordinary-policy").await, Err(ResourceError::NotFound { .. })));
         }
     }
 
