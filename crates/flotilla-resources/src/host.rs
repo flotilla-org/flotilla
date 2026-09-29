@@ -80,6 +80,10 @@ pub struct HostStatus {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[builder(default)]
     pub fulfilment_facts: BTreeMap<String, FulfilmentFacts>,
+    /// Durable cache and rate accounting for real-request model probes.
+    #[serde(default, skip_serializing_if = "ModelProbeState::is_empty")]
+    #[builder(default)]
+    pub model_probes: ModelProbeState,
     /// Last adapter inventory that did not regress from the preceding
     /// generation. A regressed generation retains this baseline so another
     /// restart cannot silently absorb the loss.
@@ -110,6 +114,31 @@ pub struct HostStatus {
     #[serde(default)]
     #[builder(default)]
     pub sleep_inhibition: SleepInhibitionHealth,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelProbeState {
+    #[serde(default)]
+    pub entries: BTreeMap<String, CachedModelProbe>,
+    #[serde(default)]
+    pub window_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub requests_in_window: u32,
+    #[serde(default)]
+    pub total_requests: u64,
+}
+
+impl ModelProbeState {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.window_started_at.is_none() && self.requests_in_window == 0 && self.total_requests == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedModelProbe {
+    pub observed_at: DateTime<Utc>,
+    /// None records an inconclusive request so it cannot be retried on every refresh.
+    pub fact: Option<ModelFact>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,6 +302,7 @@ pub enum HostStatusPatch {
     },
     FulfilmentFacts {
         facts: BTreeMap<String, FulfilmentFacts>,
+        model_probes: ModelProbeState,
     },
     Heartbeat {
         capabilities: BTreeMap<String, serde_json::Value>,
@@ -294,7 +324,10 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
     fn apply(&self, status: &mut HostStatus) {
         match self {
             Self::BlobSync { status: sync } => status.blob_sync = Some(sync.clone()),
-            Self::FulfilmentFacts { facts } => status.fulfilment_facts.clone_from(facts),
+            Self::FulfilmentFacts { facts, model_probes } => {
+                status.fulfilment_facts.clone_from(facts);
+                status.model_probes.clone_from(model_probes);
+            }
             Self::Heartbeat {
                 capabilities,
                 heartbeat_at,
