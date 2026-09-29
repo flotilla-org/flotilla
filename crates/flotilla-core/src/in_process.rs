@@ -6809,6 +6809,22 @@ impl InProcessDaemon {
     }
 
     async fn start_ensured_convoy(&self, namespace: &str, ensure: &ResourceObject<ConvoyEnsure>) -> Result<String, String> {
+        let repositories = self.resource_backend.clone().including_replicas::<Repository>(namespace);
+        for key in &ensure.spec.repositories {
+            match repositories.get(&key.to_string()).await {
+                Ok(repository) => {
+                    self.resolve_forge_identity(repository.object.spec).await?;
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        // The forge sweep may rewrite both Project membership and this ensure.
+        let ensure = match self.resource_backend.clone().including_replicas::<ConvoyEnsure>(namespace).get(&ensure.metadata.name).await {
+            Ok(updated) => updated.object,
+            Err(ResourceError::NotFound { .. }) => ensure.clone(),
+            Err(error) => return Err(error.to_string()),
+        };
         let intent = flotilla_protocol::ConvoyStartIntent::builder()
             .namespace(namespace.to_string())
             .project_ref(ensure.spec.project_ref.clone())

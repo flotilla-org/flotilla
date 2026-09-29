@@ -5638,19 +5638,13 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
     daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
     let forge = lab_forge_spec();
-    daemon
-        .resource_backend()
-        .definitions::<Forge>("flotilla")
-        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
-        .await
-        .expect("declare forge");
-
     let front = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops").expect("front spec");
     let ssh = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops")
         .expect("ssh host spec")
         .with_allow_reviewless_workflows(true);
+    let alias = RepositorySpec::remote("https://forgejo-manchego/robert/ghostty-ops").expect("host alias spec");
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
-    for spec in [&front, &ssh] {
+    for spec in [&front, &ssh, &alias] {
         repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("legacy Repository");
     }
     let projects = daemon.resource_backend().definitions::<Project>("flotilla");
@@ -5669,10 +5663,17 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                     alias: None,
                     roles: [ProjectRepositoryRole::Code].into(),
                     subpath: None,
-                    default_branch: None,
+                    default_branch: Some("main".to_string()),
                 },
                 ProjectRepositorySpec {
                     repo: ssh.key(),
+                    alias: None,
+                    roles: [ProjectRepositoryRole::Ops].into(),
+                    subpath: None,
+                    default_branch: Some("main".to_string()),
+                },
+                ProjectRepositorySpec {
+                    repo: alias.key(),
                     alias: None,
                     roles: [ProjectRepositoryRole::Ops].into(),
                     subpath: None,
@@ -5702,7 +5703,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                 .project_ref("ghostty".to_string())
                 .role("governor".to_string())
                 .workflow_ref("governor".to_string())
-                .repositories(vec![front.key(), ssh.key()])
+                .repositories(vec![front.key(), ssh.key(), alias.key()])
                 .agent_overrides(overrides.clone())
                 .build(),
         )
@@ -5715,7 +5716,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
             &WorkflowTemplateSpec::builder()
                 .vessels(vec![VesselRequirement::builder()
                     .name("work".to_string())
-                    .repository_refs(vec![front.key(), ssh.key()])
+                    .repository_refs(vec![front.key(), ssh.key(), alias.key()])
                     .crew(vec![CrewSpec::builder()
                         .role("governor".to_string())
                         .source(CrewSource::Agent { selector: Selector::for_capability("governor"), prompt: None, brief_template: None })
@@ -5754,13 +5755,53 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .await
         .expect("legacy grant");
 
+    let expected = front.clone().on_forge(&forge).expect("canonical forge identity").key();
+    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
+    let host = hosts.get(&host_ref).await.expect("governor host");
+    let mut status = host.status.expect("governor host status");
+    status.fulfilment_facts.insert("governor-host".to_string(), FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".to_string(), HarnessFacts {
+            version: "1.0.0".to_string(),
+            models: BTreeMap::from([("fable".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
+        })]),
+        observed_at: chrono::Utc::now(),
+        ..Default::default()
+    });
+    hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("publish governor model facts");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("pre-sweep ensure admits");
+    let first = admitted_convoy(&daemon.resource_backend(), "governor").await;
+    assert!(first.spec.repositories.iter().any(|repository| repository.repo_ref == alias.key()));
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    convoys
+        .update_status(&first.metadata.name, &first.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("first generation fails");
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
+        .await
+        .expect("declare forge after first admission");
+    daemon.reconcile_convoy_ensure_now("flotilla", "governor", daemon.as_ref()).await.expect("ensure re-admits after forge sweep");
+    let renewed = ensures.get("governor").await.expect("migrated ensure");
+    let successor = convoys.get(&renewed.status.expect("ensure status").convoy_ref.expect("successor")).await.expect("second generation");
+    assert_eq!(successor.spec.generation, 2);
+    assert_eq!(successor.spec.repositories.len(), 1);
+    assert_eq!(successor.spec.repositories[0].repo_ref, expected);
+
     let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve and sweep identities");
     assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
     let merged = repositories.get(&inspected.key().to_string()).await.expect("merged Repository");
     assert!(merged.spec.allows_reviewless_workflows());
-    assert_eq!(merged.spec.remotes().len(), 2);
+    assert_eq!(merged.spec.remotes().len(), 3);
     assert!(matches!(repositories.get(&front.key().to_string()).await, Err(ResourceError::NotFound { .. })));
     assert!(matches!(repositories.get(&ssh.key().to_string()).await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(repositories.get(&alias.key().to_string()).await, Err(ResourceError::NotFound { .. })));
     let project = projects.get("ghostty").await.expect("migrated project");
     assert_eq!(project.spec.repositories.len(), 1);
     assert_eq!(project.spec.repositories[0].repo, inspected.key());
@@ -5780,24 +5821,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         repository: inspected.key(),
         branch: "main".to_string()
     });
-    let host_ref = daemon.local_host_id().expect("local host id").to_string();
-    create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
-    let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
-    let host = hosts.get(&host_ref).await.expect("governor host");
-    let mut status = host.status.expect("governor host status");
-    status.fulfilment_facts.insert("governor-host".to_string(), FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".to_string(), HarnessFacts {
-            version: "1.0.0".to_string(),
-            models: BTreeMap::from([("fable".to_string(), ModelFact { usable: true, source: ModelFactSource::Probe })]),
-        })]),
-        observed_at: chrono::Utc::now(),
-        ..Default::default()
-    });
-    hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("publish governor model facts");
-    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("migrated ensure admits");
-    let admitted = admitted_convoy(&daemon.resource_backend(), "governor").await;
-    assert_eq!(admitted.spec.repositories.len(), 1);
-    assert_eq!(admitted.spec.repositories[0].repo_ref, inspected.key());
+    assert_eq!(successor.spec.repositories[0].repo_ref, inspected.key());
 
     let mut overlap = lab_forge_spec();
     overlap.forge_id = "other-lab".to_string();
