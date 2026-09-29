@@ -681,6 +681,14 @@ Workflows may override it. Supervisors act only through verbs and never
 transition phases. A crew member's `crew stall` enters the ladder directly.
 _Avoid_: Escalation policy, on-call.
 
+**Convoy Subject**:
+A source-scoped external thing a convoy relates to: a change request, an issue, or later others. It is identified by `(kind, service, scope, id)`, forge-relative, and carries a typed relationship: works_on, produces, adopts, supersedes or references (ADR 0049). Declared subjects are in convoy spec; discovered ones are in status, with their sources. There are three reference forms:
+- **internal canonical**: the leaf address, for storage;
+- **external canonical**: the forge URL, for copying and hand-off;
+- **short**: `repo#n` for an issue, `repo!n` for a change request.
+_Avoid_: The convoy's PR (there may be several, across repositories).
+
+||||||| f2008365
 **ManifestRoot**:
 The resource that owns reconciliation of one declared manifest root, such as project-map on kiwi (ADR 0048). Its **spec** holds operator intent: per-document suspend, and sync/adopt requests as tokens. Its **status** holds the controller's judgement per document: applied, refused, drifted or suspended, with the reason and hashes. Its home is the host whose checkout it reads, and it replicates read-only. Managed objects carry only provenance annotations (source, path, revision, baseline hash).
 _Avoid_: Manifest annotations as state; refusal flag.
