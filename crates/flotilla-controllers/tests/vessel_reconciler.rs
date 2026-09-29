@@ -153,7 +153,7 @@ async fn secondary_watches_map_checkout_events_by_convoy_only() {
         .await
         .expect("stale vessel-labeled checkout should create");
 
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+    let (sender, mut receiver) = flotilla_resources::controller::WorkQueueSender::channel();
     let handles = VesselReconciler::secondary_watches()
         .into_iter()
         .map(|watch| tokio::spawn(watch.spawn(backend.clone(), NAMESPACE.to_string(), sender.clone())))

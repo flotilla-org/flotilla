@@ -10,19 +10,21 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
-    actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, external_patches,
-    instantiate_exit, instantiate_turn_delivery, produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject,
-    ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject,
-    ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject,
-    ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge,
-    StallRung, StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource,
-    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode,
-    TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart,
-    WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    actor_obligation, admit_leaf,
+    controller::{SecondaryWatch, WorkQueueSender},
+    evaluate_leaf, expected_change_request_leaves, external_patches, instantiate_exit, instantiate_turn_delivery,
+    produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Checkout,
+    CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit,
+    Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, StatusPatch,
+    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage,
+    UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, Mutex},
     task::JoinHandle,
 };
 
@@ -834,7 +836,7 @@ impl SecondaryWatch for ReconcilerWake {
         self: Box<Self>,
         _backend: ResourceBackend,
         namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move { self.run(namespace, sender).await.map_err(ResourceError::other) })
     }
@@ -1447,7 +1449,7 @@ impl ReconcilerWake {
         Ok(())
     }
 
-    async fn run(&self, namespace: String, sender: mpsc::Sender<String>) -> Result<(), String> {
+    async fn run(&self, namespace: String, sender: WorkQueueSender) -> Result<(), String> {
         let convoys = self.subscriptions.inner.backend.clone().using::<Convoy>(&namespace);
         let checkouts = self.subscriptions.inner.backend.including_replicas::<Checkout>(&namespace);
         let listed_convoys = convoys.list().await.map_err(|error| error.to_string())?;

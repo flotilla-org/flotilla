@@ -639,7 +639,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         })
         .await
         .expect("governor working");
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     let patch = convoy_external_patches::mark_crew_stalled(
         "resume-staging".to_string(),
@@ -1044,7 +1044,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             source: TerminalAttentionSource::Hook,
         });
         sessions.update_status("resume-staging-session", &session.metadata.resource_version, &session_status).await.expect("idle session");
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
         let watcher = daemon.reconciler_wake_watch();
         let task = tokio::spawn(watcher.spawn(backend.clone(), "flotilla".to_string(), tx));
         let expected_rung = if limit == 0 { StallRung::Operator } else { StallRung::Nudge };
@@ -1871,7 +1871,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
         .expect("claim-time observation");
     assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1918,7 +1918,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     .expect("supervision escalation");
     assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
     task.abort();
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     let restarted = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -5706,7 +5706,7 @@ async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile
         backend.clone(),
     )
     .await;
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+    let (sender, mut receiver) = flotilla_resources::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let watch_backend = backend.clone();
     let task = tokio::spawn(async move {
@@ -6186,7 +6186,7 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
         replica.clone(),
     )
     .await;
-    let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+    let (sender, _receiver) = flotilla_resources::controller::WorkQueueSender::channel();
     let watch = daemon.reconciler_wake_watch();
     let replica_check = replica.clone();
     let task = tokio::spawn(async move { watch.spawn(replica.clone(), "flotilla".into(), sender).await.expect("replica watch") });
