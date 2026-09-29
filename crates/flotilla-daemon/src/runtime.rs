@@ -12679,7 +12679,12 @@ mod tests {
             CommandValue::Error { message } if message.contains("decision-ledger") && message.contains(".exists")));
         let after_refusal =
             convoys.get(&crew_record).await.expect("crew convoy after refusal").status.expect("convoy status after refusal");
-        assert_eq!(after_refusal, initial_status, "refused completion must not mutate convoy status");
+        assert_eq!(after_refusal.phase, initial_status.phase);
+        assert_eq!(after_refusal.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+        assert!(after_refusal.crew_work["implement"]["coder"]
+            .completion_refusal
+            .as_ref()
+            .is_some_and(|refusal| { refusal.consecutive_count == 1 && refusal.expectation.contains("decision-ledger") }));
         assert_eq!(
             terminals.get(&coder.metadata.name).await.expect("coder session after refusal").status.expect("coder session status").phase,
             TerminalSessionPhase::Running,

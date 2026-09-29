@@ -10496,29 +10496,26 @@ impl InProcessDaemon {
             return Ok(flotilla_protocol::CommandValue::Ok);
         }
         if forced_by.is_none() && !existing_claim_is_admitted {
+            // Include the candidate claim while deriving PR subjects. Accepted
+            // claims persist this message, so later settlement derives the
+            // same leaves from the stored crew work.
+            let mut claim_convoy = convoy.clone();
+            if let Some(work) = claim_convoy
+                .status
+                .as_mut()
+                .and_then(|status| status.crew_work.get_mut(&context.vessel))
+                .and_then(|crew| crew.get_mut(&context.caller_role))
+            {
+                work.phase = CrewWorkPhase::Done;
+                work.message = message.clone();
+            }
             let checkout_sources =
                 self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
             let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
-            let requires_ready_change_request = convoy
-                .status
-                .as_ref()
-                .and_then(|status| status.workflow_snapshot.as_ref())
-                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
-                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
-                .is_some_and(|crew| {
-                    crew.completion_conditions.iter().any(|condition| {
-                        matches!(
-                            condition,
-                            flotilla_resources::CrewCompletionExpectation::Condition(
-                                flotilla_resources::CompletionCondition::ChangeRequest { .. }
-                            )
-                        )
-                    })
-                });
             let mut observation_errors = Vec::new();
-            if requires_ready_change_request && (!expected_checkout_refs(&convoy)?.is_empty() || convoy.spec.change_request.is_some()) {
+            {
                 let mut subjects = BTreeSet::new();
-                for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
+                for leaf in expected_change_request_leaves(&claim_convoy, &checkouts)? {
                     if let Some(subject) = crate::change_request_observer::ChangeRequestRef::from_address(namespace, &leaf.address) {
                         subjects.insert((subject.service, subject.scope, subject.number));
                     }
@@ -10527,7 +10524,7 @@ impl InProcessDaemon {
                     let subject =
                         crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                     if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
-                        observation_errors.push(format!("cannot verify change request readiness: {error}"));
+                        observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
                     }
                 }
             }
@@ -10558,7 +10555,7 @@ impl InProcessDaemon {
                 }
             }
             let unmet = evaluate_crew_completion(
-                &convoy,
+                &claim_convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
                 &checkouts,
                 &change_requests,
@@ -10573,7 +10570,16 @@ impl InProcessDaemon {
                     .map(|expectation| format!("{}: {}", expectation.subject, expectation.detail))
                     .collect::<Vec<_>>();
                 reasons.extend(observation_errors);
-                return Err(format!("crew completion expectations unmet: {}", reasons.join("; ")));
+                let expectation = reasons.join("; ");
+                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RefuseCrewCompletion {
+                    vessel: context.vessel.clone(),
+                    role: context.caller_role.clone(),
+                    expectation: expectation.clone(),
+                    message: message.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+                return Err(format!("crew completion expectations unmet: {expectation}"));
             }
         }
         if let Some(pending) = convoy

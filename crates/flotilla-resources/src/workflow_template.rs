@@ -84,6 +84,11 @@ pub enum SupervisionTarget {
 #[serde(deny_unknown_fields)]
 pub struct StallNudgePolicy {
     pub max_per_episode: u32,
+    /// Repeated claims with the same unmet expectation escalate at this count.
+    /// The default for previous-generation snapshots is two. The default shim
+    /// can be removed one fleet roll after this field lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_refusals: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

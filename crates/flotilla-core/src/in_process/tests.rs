@@ -10,7 +10,7 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, RepositoryStatus, Selector,
     TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VirtualClock, WorkflowTemplateSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement, VesselSpec, VirtualClock, WorkflowTemplateSpec,
     AGENT_ADAPTERS_CAPABILITY, AUTHORITY_LABEL, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
@@ -1033,7 +1033,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             .as_mut()
             .expect("workflow")
             .stall_nudges
-            .insert("work/coder".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: limit });
+            .insert("work/coder".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None });
         convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("resume-staging-session").await.expect("session");
@@ -1520,6 +1520,7 @@ struct BatchedObservationRunner {
     block_one: std::sync::atomic::AtomicBool,
     one_started: tokio::sync::Notify,
     release_one: tokio::sync::Notify,
+    conflicting: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -1568,7 +1569,8 @@ impl CommandRunner for BatchedObservationRunner {
                     format!("pr{number}"),
                     serde_json::json!({
                         "state": "OPEN", "isDraft": false, "headRefOid": "abc", "reviewDecision": null,
-                        "mergeable": "MERGEABLE", "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}
+                        "mergeable": if self.conflicting.load(std::sync::atomic::Ordering::SeqCst) { "CONFLICTING" } else { "MERGEABLE" },
+                        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}
                     }),
                 ))
             })
@@ -1593,6 +1595,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
+        conflicting: std::sync::atomic::AtomicBool::new(false),
     });
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"batch-observation-test\"\n").expect("daemon config");
@@ -1685,6 +1688,250 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         .expect_err("second repository remains rate limited");
     runner.release_one.notify_one();
     blocked.await.expect("first observation task").expect("first repository resumes");
+}
+
+#[tokio::test]
+async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates() {
+    #[derive(Default)]
+    struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
+    #[async_trait]
+    impl crate::leaf_engine::TurnDeliveryActuator for DeliveredTurns {
+        async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<flotilla_resources::TurnDeliveryRung, String> {
+            self.0.lock().expect("turns").push(request.clone());
+            Ok(flotilla_resources::TurnDeliveryRung::WarmSession)
+        }
+
+        async fn hold(&self, _: &crate::leaf_engine::TurnDeliveryRequest, _: &flotilla_resources::HoldAct, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"refused-claim-test\"\n").expect("daemon config");
+    let runner = Arc::new(BatchedObservationRunner {
+        calls: std::sync::Mutex::new(Vec::new()),
+        rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        block_one: std::sync::atomic::AtomicBool::new(false),
+        one_started: tokio::sync::Notify::new(),
+        release_one: tokio::sync::Notify::new(),
+        conflicting: std::sync::atomic::AtomicBool::new(true),
+    });
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("gh discovery");
+    let turns = Arc::new(DeliveredTurns::default());
+    daemon.leaf_subscriptions.set_turn_delivery_actuator(turns.clone()).await;
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let repository_key = repository.key();
+    backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &test_meta("refused-claim"),
+            &ConvoySpec::builder()
+                .workflow_ref("implement-review".to_string())
+                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(repository_key)
+                    .source_ref("2205/escalate".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("convoy");
+    let ready = flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::ChangeRequest {
+        field_path: ".ready".to_string(),
+        operator: flotilla_protocol::LeafOperator::Equal,
+        literal: "true".to_string(),
+        optional_when_absent: false,
+    });
+    let coder = CrewSpec::builder()
+        .role("coder".to_string())
+        .source(CrewSource::Tool { command: "test".to_string() })
+        .completion_conditions(vec![ready])
+        .build();
+    let bosun = CrewSpec::builder().role("bosun".to_string()).source(CrewSource::Tool { command: "test".to_string() }).build();
+    convoys
+        .update_status("refused-claim", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
+                supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
+                    vessel: "work".to_string(),
+                    role: "bosun".to_string(),
+                }]),
+                exit: None,
+                turn_delivery: indexmap::IndexMap::from([(
+                    "conflicting".to_string(),
+                    flotilla_resources::TurnDeliveryRule::builder()
+                        .on("$cr.mergeable == conflicting".parse().expect("conflict leaf"))
+                        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
+                        .brief(
+                            "Rebase onto the current base branch and file a fresh settlement claim; the previous claim is superseded."
+                                .to_string(),
+                        )
+                        .hold(flotilla_resources::HoldAct::ChangeRequestComment { body: "paused".to_string() })
+                        .build(),
+                )]),
+                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],
+            }),
+            work: BTreeMap::from([(
+                "work".to_string(),
+                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([
+                    ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                    ("bosun".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                ]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("active status");
+    backend
+        .using::<Vessel>("flotilla")
+        .create(&test_meta("refused-claim-vessel"), &VesselSpec {
+            convoy_ref: "refused-claim".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "test".to_string(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("vessel");
+    let session = backend
+        .clone()
+        .using::<ResourceTerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("refused-claim-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "refused-claim".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: "brief.md".to_string(),
+                        content: "work".to_string(),
+                        copies: vec![],
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "refused-claim".to_string(),
+                        vessel_ref: "refused-claim-vessel".to_string(),
+                    }),
+                    message: None,
+                },
+                cwd: "/repo".to_string(),
+                pool: "passthrough".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    backend
+        .using::<ResourceTerminalSession>("flotilla")
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("idle session");
+    let context = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some("refused-claim".to_string()),
+        vessel_ref: Some("refused-claim-vessel".to_string()),
+        role: Some("coder".to_string()),
+    };
+    let claim = || {
+        daemon.crew_complete_with_disposition_internal(
+            &context,
+            Some("https://github.com/flotilla-org/flotilla/pull/2200".to_string()),
+            None,
+            Some("https://github.com/flotilla-org/flotilla/pull/2200#issuecomment-1".to_string()),
+        )
+    };
+    let first = claim().await.expect_err("conflicting PR must refuse claim");
+    assert!(first.contains("cr/github.com/flotilla-org/flotilla/2200") && first.contains(".ready"), "{first}");
+    let observed = backend
+        .using::<ResourceChangeRequest>("flotilla")
+        .get(&change_request_record_name("github.com", "flotilla-org/flotilla", 2200))
+        .await
+        .expect("claim-time observation");
+    assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if turns.0.lock().expect("turns").iter().any(|request| {
+                request.source == "stall-nudge-1" && request.brief.contains("PR #2200 is conflicting") && request.brief.contains(".ready")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refusal nudge");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if turns
+                .0
+                .lock()
+                .expect("turns")
+                .iter()
+                .any(|request| request.source == "conflicting" && request.brief.contains("PR #2200 is conflicting"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active conflict delivery");
+    let second = claim().await.expect_err("same conflicting PR must refuse again");
+    assert_eq!(second, first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+            if status.stalled.as_ref().is_some_and(|stall| {
+                stall.rung == flotilla_resources::StallRung::Bosun && stall.evidence.contains("settlement claim refused 2 times")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervision escalation");
+    assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
+    task.abort();
 }
 
 #[test]

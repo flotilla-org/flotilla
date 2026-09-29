@@ -13,12 +13,12 @@ use flotilla_resources::{
     actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, external_patches,
     instantiate_exit, instantiate_turn_delivery, produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject,
     ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject,
-    ConvoyPhase, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung,
-    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject,
+    ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge,
+    StallRung, StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode,
+    TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart,
+    WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -137,6 +137,16 @@ fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
     let LeafAddress::Work { work, .. } = &leaf.address else { return None };
     let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
     Some((work, role))
+}
+
+fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
+    status
+        .workflow_snapshot
+        .as_ref()
+        .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
+        .and_then(|policy| policy.max_refusals)
+        .unwrap_or(2)
+        .max(1)
 }
 
 impl LeafSubscriptionTable {
@@ -529,6 +539,11 @@ impl LeafSubscriptionTable {
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
+        let active_conflict = status.phase == ConvoyPhase::Active
+            && claim_at.is_none()
+            && leaf.field_path == ".mergeable"
+            && leaf.operator == LeafOperator::Equal
+            && leaf.literal == "conflicting";
         let (subject_revision, evidence_at, brief) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
@@ -551,19 +566,24 @@ impl LeafSubscriptionTable {
                     ".mergeable" => cr.mergeable.observed_at,
                     _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
                 };
-                let brief = claim_at
-                    .map(|claim_at| {
-                        compose_change_request_turn_brief(
-                            &convoy,
-                            source,
-                            rule,
-                            leaf,
-                            cr,
-                            claim_at,
-                            claim.and_then(|claim| claim.decision_ledger_ref.as_deref()),
-                        )
-                    })
-                    .unwrap_or_default();
+                let brief = if active_conflict {
+                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.",
+                        rule.brief.replace("; the previous claim is superseded.", "."))
+                } else {
+                    claim_at
+                        .map(|claim_at| {
+                            compose_change_request_turn_brief(
+                                &convoy,
+                                source,
+                                rule,
+                                leaf,
+                                cr,
+                                claim_at,
+                                claim.and_then(|claim| claim.decision_ledger_ref.as_deref()),
+                            )
+                        })
+                        .unwrap_or_default()
+                };
                 (head_sha, evidence_at, brief)
             }
             LeafAddress::Issue { service, scope, number } => {
@@ -681,9 +701,10 @@ impl LeafSubscriptionTable {
         {
             return Ok(());
         }
-        let claim_at =
-            claim_at.ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
-        if evidence_at <= claim_at {
+        let judged_at = claim_at
+            .or_else(|| active_conflict.then(|| status.started_at.unwrap_or(convoy.metadata.creation_timestamp)))
+            .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
+        if !active_conflict && evidence_at <= judged_at {
             return Ok(());
         }
 
@@ -709,7 +730,7 @@ impl LeafSubscriptionTable {
                 TurnDeliveryEpisode {
                     subject_revision: subject_revision.clone(),
                     evidence_at,
-                    judged_claim_at: claim_at,
+                    judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
                     sender: request.sender.clone(),
                 },
@@ -723,7 +744,7 @@ impl LeafSubscriptionTable {
                 TurnDeliveryEpisode {
                     subject_revision: subject_revision.clone(),
                     evidence_at,
-                    judged_claim_at: claim_at,
+                    judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Delivered { rung, delivered_at: now },
                     sender: request.sender.clone(),
                 },
@@ -882,6 +903,7 @@ impl ReconcilerWake {
             }
             let convoy_rows = rows.iter().filter(|row| {
                 row.namespace == namespace
+                    && (status.phase != ConvoyPhase::Active || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
             let mut unable = None;
@@ -1183,6 +1205,9 @@ impl ReconcilerWake {
                     }
                 }
                 if let (Some(LeafMaker::Actor { vessel, role }), Some(row)) = (&condition.maker, unable.as_ref().map(|(row, _, _)| *row)) {
+                    let refusal =
+                        status.crew_work.get(vessel).and_then(|crew| crew.get(role)).and_then(|work| work.completion_refusal.as_ref());
+                    let refusal_escalated = refusal.is_some_and(|refusal| refusal.consecutive_count >= refusal_limit(status, vessel, role));
                     let session = selected_sessions.values().find(|session| {
                         session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
                     });
@@ -1192,7 +1217,14 @@ impl ReconcilerWake {
                         .and_then(|status| status.attention.as_ref())
                         .filter(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
                         .map(|attention| attention.as_of);
-                    if let Some(idle_at) = idle_at.filter(|_| declared.is_none()) {
+                    if refusal_escalated {
+                        condition.rung = StallRung::Operator;
+                        condition.evidence = format!(
+                            "settlement claim refused {} times: {}",
+                            refusal.expect("checked above").consecutive_count,
+                            refusal.expect("checked above").expectation
+                        );
+                    } else if let Some(idle_at) = idle_at.filter(|_| declared.is_none()) {
                         let limit = status
                             .workflow_snapshot
                             .as_ref()
@@ -1208,7 +1240,30 @@ impl ReconcilerWake {
                             condition.rung = StallRung::Nudge;
                             if new_idle {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                                let brief = actor_obligation(leaf)?;
+                                let brief = if let Some(refusal) = refusal {
+                                    let conflict = observations.iter().find_map(|source| {
+                                        ((refusal.expectation.contains(&format!(
+                                            "cr/{}/{}/{}",
+                                            source.object.spec.service, source.object.spec.scope, source.object.spec.number
+                                        )) || refusal.expectation.contains(&source.object.metadata.name))
+                                            && source.object.status.as_ref().is_some_and(|status| {
+                                                status.mergeable.value == Some(flotilla_resources::ObservedMergeability::Conflicting)
+                                            }))
+                                        .then_some(source.object.spec.number)
+                                    });
+                                    let remedy = if let Some(number) = conflict {
+                                        format!("PR #{number} is conflicting: rebase onto the current base branch, rerun the gates, push, then `flotilla crew complete`.")
+                                    } else if refusal.expectation.contains("no federated observation")
+                                        || refusal.expectation.contains("could not observe PR")
+                                    {
+                                        "The PR has no observation yet: check the PR URL and forge access, then run `flotilla crew complete` again.".to_string()
+                                    } else {
+                                        "Resolve the unmet expectation, then run `flotilla crew complete` again.".to_string()
+                                    };
+                                    format!("Your settlement claim was refused: {}. {remedy}", refusal.expectation)
+                                } else {
+                                    actor_obligation(leaf)?
+                                };
                                 let request = TurnDeliveryRequest::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(convoy.metadata.name.clone())
@@ -1234,6 +1289,9 @@ impl ReconcilerWake {
                 }
                 let needs_supervisor = matches!(condition.maker, Some(LeafMaker::Supervisor { .. }))
                     || condition.source == StallEvidenceSource::Crew
+                    || matches!(&condition.maker, Some(LeafMaker::Actor { vessel, role }) if status.crew_work.get(vessel)
+                        .and_then(|crew| crew.get(role)).and_then(|work| work.completion_refusal.as_ref())
+                        .is_some_and(|refusal| refusal.consecutive_count >= refusal_limit(status, vessel, role)))
                     || condition.evidence == "NeedsInput"
                     || (condition.rung == StallRung::Operator && !condition.nudge_history.is_empty())
                     || (condition.rung == StallRung::Operator
@@ -1672,6 +1730,28 @@ impl ReconcilerWake {
                             episode_key: EpisodeKeyFields::default(),
                         });
                     }
+                }
+                for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
+                    if delivery.leaf.field_path != ".mergeable"
+                        || delivery.leaf.operator != LeafOperator::Equal
+                        || delivery.leaf.literal != "conflicting"
+                    {
+                        continue;
+                    }
+                    desired.push(LeafSubscriptionRow {
+                        id: uuid::Uuid::nil(),
+                        namespace: namespace.to_string(),
+                        leaves: vec![delivery.leaf],
+                        watcher: LeafWatcher::TurnDelivery {
+                            convoy: convoy.metadata.name.clone(),
+                            source: delivery.source,
+                            rule: Box::new(delivery.rule),
+                        },
+                        maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+                        freshness_demand: None,
+                        created_at: Utc::now(),
+                        episode_key: EpisodeKeyFields::default(),
+                    });
                 }
                 continue;
             }

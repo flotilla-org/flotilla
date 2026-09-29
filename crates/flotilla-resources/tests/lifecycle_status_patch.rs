@@ -88,6 +88,7 @@ define_patch_kinds! {
     ConvoyMarkWorkCancelled => DUPLICATE,
     ConvoyMarkConvoyAbandoned => DUPLICATE,
     ConvoyMarkCrewCompleted => DUPLICATE_RESETTLEMENT,
+    ConvoyRefuseCrewCompletion => NONE,
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyMarkCrewStalled => NONE,
     ConvoyHandoffCrewWork => CONTINUATION,
@@ -145,6 +146,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
         ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
+        ConvoyStatusPatch::RefuseCrewCompletion { .. } => PatchKind::ConvoyRefuseCrewCompletion,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::MarkCrewStalled { .. } => PatchKind::ConvoyMarkCrewStalled,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
@@ -255,6 +257,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         completion_override: None,
         completed_while_crew_active: false,
         claim_evidence: None,
+        completion_refusal: None,
     }
 }
 

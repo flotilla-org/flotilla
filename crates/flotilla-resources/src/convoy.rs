@@ -344,6 +344,24 @@ pub fn expected_change_request_leaves(
             subjects.push(address);
         }
     }
+    if let Some(status) = &convoy.status {
+        for work in status.crew_work.values().flat_map(BTreeMap::values) {
+            let message = if work.phase == CrewWorkPhase::Done {
+                work.message.as_deref()
+            } else {
+                work.completion_refusal.as_ref().and_then(|refusal| refusal.message.as_deref())
+            };
+            let Some(message) = message else { continue };
+            for repository in &convoy.spec.repositories {
+                if let Some(id) = change_request_id_from_completion_message(message, &repository.url) {
+                    let address = change_request_address(&repository.url, &id)?;
+                    if !subjects.contains(&address) {
+                        subjects.push(address);
+                    }
+                }
+            }
+        }
+    }
 
     let declared = convoy.spec.declared_subjects()?;
     let discovered = convoy.status.iter().flat_map(|status| &status.subjects);
@@ -379,6 +397,17 @@ pub fn expected_change_request_leaves(
             })
         })
         .collect())
+}
+
+pub fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
+    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
+    ["pull", "pulls"].into_iter().find_map(|segment| {
+        let prefix = format!("{repository_url}/{segment}/");
+        message.match_indices(&prefix).find_map(|(start, _)| {
+            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
+            (!id.is_empty()).then_some(id)
+        })
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1132,6 +1161,18 @@ pub struct CrewWorkState {
     /// producers migrate onto the evidence-backed protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_evidence: Option<SettlementClaimEvidence>,
+    /// Last refused settlement claim. The default decodes previous-generation
+    /// statuses and can be removed one fleet roll after this field lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_refusal: Option<CrewCompletionRefusal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewCompletionRefusal {
+    pub expectation: String,
+    pub consecutive_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1265,6 +1306,12 @@ pub enum ConvoyStatusPatch {
         decision_ledger_ref: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
+    },
+    RefuseCrewCompletion {
+        vessel: String,
+        role: String,
+        expectation: String,
+        message: Option<String>,
     },
     MarkCrewFailed {
         vessel: String,
@@ -1553,6 +1600,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 forced_by,
             } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.completion_refusal = None;
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Done
                         || disposition.as_ref().is_some_and(|disposition| state.disposition.as_ref() != Some(disposition))
@@ -1582,6 +1630,28 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 clear_stall_for_crew(status, vessel, role);
                 enter_landing_if_completion_claims_settled(status);
+            }
+            Self::RefuseCrewCompletion { vessel, role, expectation, message } => {
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    let new_expectation = state.completion_refusal.as_ref().is_none_or(|prior| prior.expectation != *expectation);
+                    let consecutive_count = state
+                        .completion_refusal
+                        .as_ref()
+                        .filter(|prior| prior.expectation == *expectation)
+                        .map_or(1, |prior| prior.consecutive_count.saturating_add(1));
+                    state.completion_refusal =
+                        Some(CrewCompletionRefusal { expectation: expectation.clone(), consecutive_count, message: message.clone() });
+                    if new_expectation
+                        && status.stalled.as_ref().is_some_and(|stalled| {
+                            stalled.leaves.iter().any(|leaf| {
+                                matches!(&leaf.address, LeafAddress::Work { work, .. } if work == vessel)
+                                    && leaf.field_path == format!(".crew.{role}.phase")
+                            })
+                        })
+                    {
+                        status.stalled = None;
+                    }
+                }
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {

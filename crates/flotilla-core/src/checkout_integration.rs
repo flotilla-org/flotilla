@@ -95,22 +95,11 @@ pub fn convoy_change_request_id_for_checkout(convoy: &ResourceObject<Convoy>, ch
         .flat_map(BTreeMap::values)
         .filter(|work| work.phase == CrewWorkPhase::Done)
         .filter_map(|work| {
-            let id = change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
+            let id = flotilla_resources::change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
             Some((work.finished_at, id))
         })
         .max_by_key(|(finished_at, _)| *finished_at)
         .map(|(_, id)| id)
-}
-
-pub(crate) fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
-    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
-    ["pull", "pulls"].into_iter().find_map(|segment| {
-        let prefix = format!("{repository_url}/{segment}/");
-        message.match_indices(&prefix).find_map(|(start, _)| {
-            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
-            (!id.is_empty()).then_some(id)
-        })
-    })
 }
 
 /// Extract forge PR references carried by a crew claim or ledger text.

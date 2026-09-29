@@ -93,6 +93,9 @@ spec:
                       max_per_episode:
                         type: integer
                         minimum: 0
+                      max_refusals:
+                        type: integer
+                        minimum: 1
                 supervision:
                   type: array
                   items:

@@ -7340,7 +7340,12 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
     assert!(error.contains("decision-ledger") && error.contains(".exists"), "{error}");
 
     let status = convoys.get("missing-ledger").await.expect("read convoy").status.expect("convoy status");
-    assert_eq!(status, before);
+    assert_eq!(status.phase, before.phase);
+    assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+    assert!(status.crew_work["work"]["coder"]
+        .completion_refusal
+        .as_ref()
+        .is_some_and(|refusal| { refusal.consecutive_count == 1 && refusal.expectation.contains("decision-ledger") }));
 
     let operator = flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() };
     let mut events = daemon.subscribe();

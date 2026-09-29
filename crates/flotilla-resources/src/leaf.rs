@@ -411,7 +411,7 @@ impl ChangeRequestLeafSubject<'_> {
                 if status.state.value == Some(crate::ObservedChangeRequestState::Merged) {
                     status.state.observed_at
                 } else {
-                    status.state.observed_at.min(status.checks.observed_at)
+                    status.state.observed_at.min(status.checks.observed_at).min(status.mergeable.observed_at)
                 }
             }
             _ => return None,
@@ -440,7 +440,8 @@ impl LeafSubject for ChangeRequestLeafSubject<'_> {
                 let merged = status.state.value == Some(crate::ObservedChangeRequestState::Merged);
                 let open = status.state.value == Some(crate::ObservedChangeRequestState::Open);
                 let checks_pass = status.checks.value == Some(crate::ObservedChecks::Pass);
-                (merged || (open && checks_pass)).to_string()
+                let mergeable = status.mergeable.value == Some(crate::ObservedMergeability::Mergeable);
+                (merged || (open && checks_pass && mergeable)).to_string()
             }
             ".state" => match status.state.value? {
                 crate::ObservedChangeRequestState::Open => "open".to_string(),
