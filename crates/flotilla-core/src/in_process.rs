@@ -44,31 +44,31 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, capped_github_app_permissions,
     change_request_address, change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository,
     evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
-    external_patches as convoy_external_patches, get_resource_kind_including_replicas, list_resource_kind,
-    list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec, patch_resource_annotation,
-    repository_display_labels, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
-    watch_resource_kind_from, watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, AllocationDecision,
-    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas, list_resource_kind,
+    list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec, repository_display_labels,
+    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
     CrewCompletionPending, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
-    DemandKind, DemandSpec, DemandState, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge,
-    ForgeKind, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus,
-    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable,
-    LandingCredentialScope, LifecycleAuthority, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
+    DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding,
+    Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
-    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, RoleHandoff, SettlementMode, SupervisionTarget, SystemClock,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatus,
-    TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel, VesselRequirement, WatchEvent, WatchStart,
-    WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
-    MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
+    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, RoleHandoff, SettlementMode,
+    SupervisionTarget, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, UnmetSettlementExpectation, Vessel,
+    VesselRequirement, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS,
+    MANAGED_BY_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -9462,6 +9462,22 @@ impl InProcessDaemon {
             }
         }
 
+        let mut manifest_needs_by_host = HashMap::<HostName, usize>::new();
+        let manifest_roots =
+            self.resource_backend.clone().including_replicas::<ManifestRoot>(&namespace).list().await.map_err(|error| error.to_string())?;
+        for root in manifest_roots.items {
+            let Some(host) = host_refs.get(&root.object.spec.host) else { continue };
+            if root
+                .object
+                .status
+                .as_ref()
+                .and_then(|status| status.stalled.as_ref())
+                .is_some_and(|stalled| stalled.maker.is_none() || stalled.rung == flotilla_resources::StallRung::Operator)
+            {
+                *manifest_needs_by_host.entry(host.clone()).or_default() += 1;
+            }
+        }
+
         let mut fulfilments_by_host = HashMap::<HostName, Vec<FulfilmentRow>>::new();
         for kind in self.fulfilment_list_internal().await?.kinds {
             if let Some(host_name) = host_refs.get(&kind.host_ref) {
@@ -9534,7 +9550,8 @@ impl InProcessDaemon {
                         row_host == &host && matches!(state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
                     })
                     .count(),
-                needs_you: surface_by_convoy.iter().filter(|((row_host, _), state)| row_host == &host && state.needs_attention()).count(),
+                needs_you: surface_by_convoy.iter().filter(|((row_host, _), state)| row_host == &host && state.needs_attention()).count()
+                    + manifest_needs_by_host.get(&host).copied().unwrap_or_default(),
             };
             let degraded_conditions = status
                 .into_iter()
@@ -12127,26 +12144,15 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution } = &command.action {
+        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } =
+            &command.action
+        {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let resolution = match resolution {
-                flotilla_protocol::ManifestResolution::Sync => "sync",
-                flotilla_protocol::ManifestResolution::Adopt => "adopt",
-            };
-            let result =
-                match patch_resource_annotation(&self.resource_backend, namespace, kind, name, MANIFEST_RESOLUTION_ANNOTATION, resolution)
-                    .await
-                {
-                    Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                        kind: applied.kind,
-                        plural: applied.plural,
-                        namespace: applied.namespace,
-                        value: applied.value,
-                        replica_origin: None,
-                    })),
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                };
-            self.finish_context_free_command(id, empty_identity, result);
+            let result = request_manifest_resolution(&self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
+            self.finish_context_free_command(id, empty_identity, match result {
+                Ok(root) => CommandValue::ResourceObject(Box::new(root)),
+                Err(error) => CommandValue::Error { message: error },
+            });
             return Ok(id);
         }
 
@@ -14135,4 +14141,85 @@ impl DaemonHandle for InProcessDaemon {
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
         Ok(self.host_registry.get_topology().await)
     }
+}
+
+async fn request_manifest_resolution(
+    backend: &ResourceBackend,
+    namespace: &str,
+    kind: &str,
+    name: &str,
+    action: flotilla_protocol::ManifestResolution,
+    requested_by: &str,
+) -> Result<ResourceJsonResponse, String> {
+    let object = get_resource_kind(backend, namespace, kind, name).await.map_err(|error| error.to_string())?;
+    let annotations = object
+        .value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("annotations"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("{kind}/{name} has no manifest provenance"))?;
+    let root = annotations
+        .get("flotilla.work/manifest-reconciler-root")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{kind}/{name} has no manifest root"))?;
+    let path = annotations
+        .get("flotilla.work/manifest-path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{kind}/{name} has no manifest path"))?;
+    let key = DocumentKey { path: path.to_string(), kind: object.kind, namespace: namespace.to_string(), name: name.to_string() };
+    let roots = backend.using::<ManifestRoot>(namespace);
+    // One-roll compatibility: older provenance named the host rather than the
+    // materialized ManifestRoot. Resolve that host together with its source.
+    // Host config declares one source today; remove this fallback after one roll.
+    let root_name = match roots.get(root).await {
+        Ok(_) => root.to_string(),
+        Err(ResourceError::NotFound { .. }) => {
+            let source = annotations
+                .get("flotilla.work/manifest-source")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{kind}/{name} has no manifest source"))?;
+            let matching = roots
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|candidate| candidate.spec.host == root && candidate.spec.source == source)
+                .map(|candidate| candidate.metadata.name)
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [name] => name.clone(),
+                [] => return Err(format!("ManifestRoot for {kind}/{name} is no longer declared")),
+                _ => return Err(format!("ManifestRoot for {kind}/{name} is ambiguous")),
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let action = match action {
+        flotilla_protocol::ManifestResolution::Sync => ResolutionAction::Sync,
+        flotilla_protocol::ManifestResolution::Adopt => ResolutionAction::Adopt,
+    };
+    for _ in 0..3 {
+        let existing = roots.get(&root_name).await.map_err(|error| error.to_string())?;
+        let mut spec = existing.spec;
+        spec.resolutions.insert(key.clone(), Resolution {
+            action,
+            token: uuid::Uuid::new_v4().to_string(),
+            requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
+        });
+        match roots.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await {
+            Ok(updated) => {
+                return Ok(ResourceJsonResponse {
+                    kind: "ManifestRoot".to_string(),
+                    plural: "manifestroots".to_string(),
+                    namespace: namespace.to_string(),
+                    value: serde_json::to_value(updated).map_err(|error| error.to_string())?,
+                    replica_origin: None,
+                })
+            }
+            Err(ResourceError::Conflict { .. }) => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("ManifestRoot spec conflict retry budget exhausted".to_string())
 }

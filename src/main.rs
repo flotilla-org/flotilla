@@ -195,6 +195,11 @@ enum SubCommand {
         #[command(subcommand)]
         command: ResourceSubCommand,
     },
+    /// Inspect manifest document reconciliation
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestSubCommand,
+    },
     /// Store and retrieve crew artifacts
     Artifact {
         #[command(subcommand)]
@@ -377,6 +382,18 @@ enum HooksSubCommand {
         /// Remove from local project settings
         #[arg(long)]
         local: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ManifestSubCommand {
+    /// List document states for all roots or one root
+    Status {
+        root: Option<String>,
+        #[arg(long, default_value = "flotilla")]
+        namespace: String,
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -743,6 +760,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
+        Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
         Some(SubCommand::Events { namespace, host, local_only }) => {
             run_resource_command(
@@ -1575,6 +1593,78 @@ async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
     }
 }
 
+async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let ManifestSubCommand::Status { root, namespace, host } = command;
+    let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
+    let daemon = connect_daemon(cli).await?;
+    let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
+        .list(
+            flotilla_client::resource::ResourceListRequest::builder()
+                .kind("manifestroots".to_string())
+                .namespace(namespace)
+                .maybe_node_id(node_id)
+                .include_replicas(true)
+                .build(),
+        )
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let mut rows = Vec::new();
+    let mut found = false;
+    for record in response.records {
+        let Some(object) = record.object else { continue };
+        let name = object["metadata"]["name"].as_str().unwrap_or_default();
+        if root.as_deref().is_some_and(|root| root != name) {
+            continue;
+        }
+        found = true;
+        let spec: flotilla_resources::ManifestRootSpec =
+            serde_json::from_value(object["spec"].clone()).map_err(|error| color_eyre::eyre::eyre!("decode ManifestRoot spec: {error}"))?;
+        let status: flotilla_resources::ManifestRootStatus = object
+            .get("status")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| color_eyre::eyre::eyre!("decode ManifestRoot status: {error}"))?
+            .unwrap_or_default();
+        for (key, state) in status.documents {
+            let pending_resolution =
+                spec.resolutions.get(&key).filter(|resolution| state.resolved_token.as_deref() != Some(resolution.token.as_str()));
+            rows.push(serde_json::json!({
+                "root": name,
+                "document": {"path": key.path, "kind": key.kind, "namespace": key.namespace, "name": key.name},
+                "state": state,
+                "pending_resolution": pending_resolution.map(|resolution| &resolution.action),
+            }));
+        }
+    }
+    if root.is_some() && !found {
+        return Err(color_eyre::eyre::eyre!("ManifestRoot {} not found", root.unwrap_or_default()));
+    }
+    if format == OutputFormat::Json {
+        println!("{}", flotilla_protocol::output::json_pretty(&rows));
+    } else {
+        for row in rows {
+            let key = &row["document"];
+            let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
+            let reason = row["state"]["reason"].as_str().unwrap_or("");
+            let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
+            println!(
+                "{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
+                row["root"].as_str().unwrap_or_default(),
+                key["path"].as_str().unwrap_or_default(),
+                key["kind"].as_str().unwrap_or_default(),
+                key["namespace"].as_str().unwrap_or_default(),
+                key["name"].as_str().unwrap_or_default(),
+                phase,
+                pending,
+                reason
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     match command {
@@ -1798,13 +1888,23 @@ async fn run_manifest_resolution(
     format: OutputFormat,
 ) -> Result<()> {
     let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+    let principal =
+        cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref())
+            .principal_ref;
+    let requested_by = format!("{}/{}", principal.namespace, principal.name);
     run_control_command(
         cli,
         Command {
             node_id,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ResourceManifestResolve { namespace: args.namespace, kind: args.kind, name: args.name, resolution },
+            action: CommandAction::ResourceManifestResolve {
+                namespace: args.namespace,
+                kind: args.kind,
+                name: args.name,
+                resolution,
+                requested_by,
+            },
         },
         format,
     )
@@ -2898,6 +2998,14 @@ mod tests {
             super::ls_crew_scope(None, false, |key| (key == "FLOTILLA_CONVOY").then(|| "convoy-1".to_string())),
             (None, Some("convoy-1".to_string()))
         );
+    }
+
+    #[test]
+    fn cli_parses_manifest_status() {
+        let cli = Cli::try_parse_from(["flotilla", "manifest", "status", "manifest-123"]).expect("manifest status should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Manifest {
+            command: super::ManifestSubCommand::Status { root: Some(root), namespace, host: None }
+        }) if root == "manifest-123" && namespace == "flotilla"));
     }
 
     #[test]

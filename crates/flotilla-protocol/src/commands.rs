@@ -846,6 +846,8 @@ pub enum CommandAction {
         kind: String,
         name: String,
         resolution: ManifestResolution,
+        #[serde(default)]
+        requested_by: String,
     },
     ResourceReconcileNow {
         namespace: String,
