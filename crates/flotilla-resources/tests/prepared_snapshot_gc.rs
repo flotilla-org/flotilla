@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use chrono::Utc;
+use flotilla_protocol::NodeId;
 use flotilla_resources::{
     Convoy, ConvoySpec, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, PreparedSnapshotGarbageCollector,
     ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec, PLACEMENT_SNAPSHOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
@@ -65,6 +67,44 @@ async fn shared_snapshots_are_collected_only_after_the_last_convoy_releases_them
         Err(ResourceError::NotFound { .. })
     ));
     assert!(matches!(backend.using::<PlacementPolicy>("flotilla").get(placement_name).await, Err(ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn replicated_convoy_keeps_an_authored_snapshot_alive() {
+    let author = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("author"));
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote"));
+    let workflow_name = "workflow-snapshot-012345abcdef";
+    let placement_name = "placement-snapshot-012345abcdef";
+    author
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&prepared_meta(workflow_name, WORKFLOW_SNAPSHOT_KIND), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+        .await
+        .expect("author workflow snapshot");
+    author
+        .using::<PlacementPolicy>("flotilla")
+        .create(&prepared_meta(placement_name, PLACEMENT_SNAPSHOT_KIND), &PlacementPolicySpec::builder().pool("remote".to_string()).build())
+        .await
+        .expect("author placement snapshot");
+    create_convoy(&remote, "remote-convoy", workflow_name, placement_name).await.expect("remote convoy");
+    let replica = author.replica_writer::<Convoy>(NodeId::new("remote"), "flotilla");
+    replica
+        .replace(&remote.using::<Convoy>("flotilla").list().await.expect("remote convoys"), Utc::now())
+        .await
+        .expect("replicate remote convoy");
+
+    let collector = PreparedSnapshotGarbageCollector::new(author.clone(), "flotilla");
+    let retained = collector.collect(None).await.expect("collect with remote reference");
+    assert_eq!(retained.workflows_deleted, 0);
+    assert_eq!(retained.placements_deleted, 0);
+
+    remote.using::<Convoy>("flotilla").delete("remote-convoy").await.expect("remove remote convoy");
+    replica
+        .replace(&remote.using::<Convoy>("flotilla").list().await.expect("empty remote convoys"), Utc::now())
+        .await
+        .expect("replicate removal");
+    let collected = collector.collect(None).await.expect("collect after remote release");
+    assert_eq!(collected.workflows_deleted, 1);
+    assert_eq!(collected.placements_deleted, 1);
 }
 
 #[tokio::test]

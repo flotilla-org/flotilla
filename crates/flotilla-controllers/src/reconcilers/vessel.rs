@@ -20,15 +20,16 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
-    CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy,
-    DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
-    TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, VESSEL_REF_LABEL,
+    is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
+    CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
+    FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
+    OwnerReference, PlacementPolicy, PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
+    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -135,6 +136,27 @@ impl VesselReconciler {
             })
             .map(|source| source.object)
             .ok_or_else(|| ResourceError::not_found(name))
+    }
+
+    async fn placement_dependency(
+        &self,
+        vessel: &ResourceObject<Vessel>,
+        name: &str,
+    ) -> Result<ResourceObject<PlacementPolicy>, ResourceError> {
+        match Self::dependency(&self.placement_policies, self.federated_placement_policies.as_ref(), vessel, name).await {
+            Err(ResourceError::NotFound { .. }) => {
+                let Some(federated) = &self.federated_placement_policies else {
+                    return Err(ResourceError::not_found(name));
+                };
+                let source = federated.get(name).await?;
+                if is_prepared_snapshot(name, &source.object.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
+                    Ok(source.object)
+                } else {
+                    Err(ResourceError::not_found(name))
+                }
+            }
+            result => result,
+        }
     }
 
     fn missing_host_local_environment(&self, environment_ref: &str, placement_host_ref: &str) -> String {
@@ -324,14 +346,7 @@ impl Reconciler for VesselReconciler {
         }) {
             return Ok(VesselPrepared::none());
         }
-        let placement_policy = match Self::dependency(
-            &self.placement_policies,
-            self.federated_placement_policies.as_ref(),
-            obj,
-            &obj.spec.placement_policy_ref,
-        )
-        .await
-        {
+        let placement_policy = match self.placement_dependency(obj, &obj.spec.placement_policy_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
                 return Ok(VesselPrepared::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
@@ -1442,10 +1457,11 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use flotilla_protocol::{PlacementDecision, PlacementTargetHost};
+    use flotilla_protocol::{NodeId, PlacementDecision, PlacementTargetHost};
     use flotilla_resources::{
-        Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicySpec,
-        ResourceBackend,
+        Convoy, ConvoySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
+        PlacementPolicySpec, ResourceBackend, Vessel, VesselSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, PLACEMENT_SNAPSHOT_KIND,
+        PREPARED_SNAPSHOT_LABEL,
     };
 
     use super::{
@@ -1464,6 +1480,51 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn vessel_resolves_prepared_placement_snapshot_from_a_third_origin() {
+        let author = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("author"));
+        let driver = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("driver"));
+        let snapshot_name = "placement-snapshot-012345abcdef";
+        author
+            .using::<PlacementPolicy>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name(snapshot_name.to_string())
+                    .labels(BTreeMap::from([(PREPARED_SNAPSHOT_LABEL.to_string(), PLACEMENT_SNAPSHOT_KIND.to_string())]))
+                    .build(),
+                &PlacementPolicySpec::builder().pool("passthrough".to_string()).build(),
+            )
+            .await
+            .expect("author snapshot");
+        driver
+            .replica_writer::<PlacementPolicy>(NodeId::new("author"), "flotilla")
+            .replace(&author.using::<PlacementPolicy>("flotilla").list().await.expect("author policies"), chrono::Utc::now())
+            .await
+            .expect("replicate snapshot");
+        let reconciler = VesselReconciler::new(driver.clone(), "flotilla")
+            .with_federated_dependencies(&driver, flotilla_protocol::CanonicalHostId::resolved("driver-host"));
+        for (name, origin) in [("local-vessel", None), ("remote-vessel", Some("convoy-origin"))] {
+            let mut meta = InputMeta::builder().name(name.to_string()).build();
+            if let Some(origin) = origin {
+                meta.annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), origin.to_string());
+            }
+            let vessel = driver
+                .using::<Vessel>("flotilla")
+                .create(&meta, &VesselSpec {
+                    convoy_ref: "convoy".to_string(),
+                    vessel_name: "work".to_string(),
+                    placement_policy_ref: snapshot_name.to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                })
+                .await
+                .expect("vessel");
+            assert_eq!(
+                reconciler.placement_dependency(&vessel, snapshot_name).await.expect("resolve shared snapshot").spec.pool,
+                "passthrough"
+            );
         }
     }
 

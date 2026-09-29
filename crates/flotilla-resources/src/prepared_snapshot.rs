@@ -41,10 +41,11 @@ impl PreparedSnapshotGarbageCollector {
     /// `excluding_convoy` is used by the convoy finalizer: the deleting convoy
     /// still exists until its finalizer returns, but no longer retains a claim.
     pub async fn collect(&self, excluding_convoy: Option<&str>) -> Result<PreparedSnapshotGcResult, ResourceError> {
-        let convoys = self.backend.clone().using::<Convoy>(&self.namespace).list().await?;
+        let convoys = self.backend.including_replicas::<Convoy>(&self.namespace).list().await?;
         let mut workflow_refs = BTreeSet::new();
         let mut placement_refs = BTreeSet::new();
-        for convoy in convoys.items {
+        for source in convoys.items {
+            let convoy = source.object;
             if excluding_convoy.is_some_and(|excluded| convoy.metadata.name == excluded) {
                 continue;
             }

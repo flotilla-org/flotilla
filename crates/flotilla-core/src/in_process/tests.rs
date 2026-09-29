@@ -1349,6 +1349,27 @@ async fn prepared_placement_snapshot_reuses_an_identical_replica() {
 }
 
 #[tokio::test]
+async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
+    let home_root = NodeId::new("snapshot-home");
+    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("snapshot-driver"));
+    let name = "placement-snapshot-collision";
+    let authored = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
+    let requested = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
+    home.using::<PlacementPolicy>("flotilla").create(&test_meta(name), &authored).await.expect("author snapshot on home");
+    driver
+        .replica_writer::<PlacementPolicy>(home_root, "flotilla")
+        .replace(&home.using::<PlacementPolicy>("flotilla").list().await.expect("home placement log"), Utc::now())
+        .await
+        .expect("replicate snapshot to driver");
+
+    let error =
+        ensure_prepared_placement_snapshot(&driver, "flotilla", name, &requested).await.expect_err("mismatched replica must be refused");
+    assert_eq!(error, format!("prepared placement snapshot {name} already exists with different contents"));
+    assert!(driver.using::<PlacementPolicy>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+}
+
+#[tokio::test]
 async fn two_origins_admit_identical_placements_without_authorship_collision() {
     let (first, first_backend, _first_clock, _first_temp) = standing_ensure_fixture_for("feta", true).await;
     let (second, second_backend, _second_clock, _second_temp) = standing_ensure_fixture_for("udder", true).await;
