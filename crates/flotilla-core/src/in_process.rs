@@ -4977,6 +4977,13 @@ impl InProcessDaemon {
         let context = self.convoy_reference_context(namespace, &convoy).await?;
         let subject = context.parse(reference)?;
         if let Some(relationship) = relationship {
+            // Produced and adopted PRs participate in settlement. Reject a
+            // mistyped repository instead of adding an unobservable terminal leaf.
+            if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                && !context.repositories.iter().any(|repository| repository.source == subject.source)
+            {
+                return Err(format!("change request `{reference}` is outside this convoy's repositories"));
+            }
             apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
                 subjects: vec![(subject, relationship)],
                 source: flotilla_resources::SubjectDiscoverySource::Operator,

@@ -2029,9 +2029,13 @@ mod subject_tests {
         status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, now);
         status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, later);
         status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Claim, later);
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Relay, now);
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Relay, later);
         assert_eq!(status.subjects.len(), 1);
-        assert_eq!(status.subjects[0].sources.len(), 2);
+        assert_eq!(status.subjects[0].sources.len(), 3);
         assert_eq!(status.subjects[0].sources[0].at, later);
+        assert_eq!(status.subjects[0].sources[2].source, SubjectDiscoverySource::Relay);
+        assert_eq!(status.subjects[0].sources[2].at, later);
         status.unlink_subject(&subject);
         status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, later);
         assert!(status.subjects.is_empty());

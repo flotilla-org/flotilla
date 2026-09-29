@@ -102,7 +102,8 @@ impl Subject {
             .map(|repo| repo.web_base.as_str())
             .or_else(|| (self.source.service == "github.com").then_some("https://github.com"))?;
         let path = match self.kind {
-            SubjectKind::ChangeRequest => "pull",
+            SubjectKind::ChangeRequest if self.source.service == "github.com" => "pull",
+            SubjectKind::ChangeRequest => "pulls",
             SubjectKind::Issue => "issues",
         };
         Some(format!("{}/{}/{}/{}", base.trim_end_matches('/'), self.source.scope, path, self.id))
@@ -147,10 +148,22 @@ impl ReferenceContext {
         }
         if value.starts_with("https://") || value.starts_with("http://") {
             let url = url::Url::parse(value).map_err(|error| format!("invalid subject URL `{value}`: {error}"))?;
-            let base = format!("{}://{}", url.scheme(), url.host_str().ok_or_else(|| format!("invalid subject URL `{value}`"))?);
-            let root = self.repositories.iter().filter(|entry| value.starts_with(&entry.web_base)).max_by_key(|entry| entry.web_base.len());
+            url.host_str().ok_or_else(|| format!("invalid subject URL `{value}`"))?;
+            let root = self
+                .repositories
+                .iter()
+                .filter(|entry| {
+                    let Ok(root) = url::Url::parse(&entry.web_base) else { return false };
+                    let prefix = root.path().trim_end_matches('/');
+                    url.scheme() == root.scheme()
+                        && url.host_str() == root.host_str()
+                        && url.port_or_known_default() == root.port_or_known_default()
+                        && url.path().strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                })
+                .max_by_key(|entry| entry.web_base.len());
             let path = if let Some(root) = root {
-                url.path().strip_prefix(root.web_base.strip_prefix(&base).unwrap_or("")).unwrap_or(url.path())
+                let root_path = url::Url::parse(&root.web_base).map_err(|error| error.to_string())?;
+                url.path().strip_prefix(root_path.path().trim_end_matches('/')).unwrap_or(url.path())
             } else {
                 url.path()
             };
@@ -162,10 +175,10 @@ impl ReferenceContext {
                 _ => return Err(format!("invalid subject URL `{value}`")),
             };
             let scope = format!("{owner}/{repo}");
-            let service = self
-                .repositories
-                .iter()
-                .find(|entry| entry.source.scope == scope && (entry.web_base == base || entry.web_base.starts_with(&format!("{base}/"))))
+            let service = root
+                .and_then(|matched_root| {
+                    self.repositories.iter().find(|entry| entry.web_base == matched_root.web_base && entry.source.scope == scope)
+                })
                 .map_or_else(|| url.host_str().unwrap_or_default().to_string(), |entry| entry.source.service.clone());
             return Self::subject(kind, IssueSource { service, scope }, id);
         }
@@ -237,6 +250,14 @@ mod tests {
         let owner_repo = ReferenceContext::default().parse("flotilla-org/cleat#281").expect("owner/repo issue");
         assert_eq!(owner_repo.short(&ReferenceContext::default()), "flotilla-org/cleat#281");
         assert_eq!(
+            context.parse("cleat!281").expect("GitHub PR").url(&context).as_deref(),
+            Some("https://github.com/flotilla-org/cleat/pull/281")
+        );
+        assert_eq!(
+            context.parse("project-map!12").expect("Forgejo PR").url(&context).as_deref(),
+            Some("https://forge.example/robert/project-map/pulls/12")
+        );
+        assert_eq!(
             context.parse("https://forge.example/robert/project-map/pulls/12").expect("Forgejo URL").short(&context),
             "project-map!12"
         );
@@ -266,7 +287,29 @@ mod tests {
         let github = context.parse("wheelhouse/cleat!12").expect("project-qualified reference");
         assert_eq!(github.short(&context), "wheelhouse/cleat!12");
         let forgejo = context.parse("lab:robert/cleat!12").expect("forge-qualified reference");
+        assert_eq!(forgejo.url(&context).as_deref(), Some("https://forge.example/team/robert/cleat/pulls/12"));
         assert_eq!(context.parse(&forgejo.url(&context).expect("Forgejo URL with path prefix")), Ok(forgejo.clone()));
         assert_eq!(context.parse(&forgejo.short(&context)), Ok(forgejo));
+        let other_host = context.parse("https://github.community/flotilla-org/cleat/pull/12").expect("different host");
+        assert_eq!(other_host.source.service, "github.community");
+    }
+
+    #[test]
+    fn same_project_alias_collision_falls_back_to_owner_and_repo() {
+        let context = ReferenceContext {
+            repositories: ["one/cleat", "two/cleat"]
+                .into_iter()
+                .map(|scope| RepositoryAlias {
+                    project: Some("wheelhouse".into()),
+                    alias: "cleat".into(),
+                    source: IssueSource { service: "github.com".into(), scope: scope.into() },
+                    web_base: "https://github.com".into(),
+                    forge_alias: None,
+                })
+                .collect(),
+        };
+        let subject = context.parse("one/cleat!12").expect("owner/repo reference");
+        assert_eq!(subject.short(&context), "one/cleat!12");
+        assert_eq!(context.parse(&subject.short(&context)), Ok(subject));
     }
 }

@@ -1093,6 +1093,21 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     .expect("claim discovery");
     let conflicted = convoys.get("multi-repo").await.expect("conflicted convoy");
     assert_eq!(flotilla_resources::produced_subject_conflicts(&conflicted).len(), 1);
+    assert!(daemon
+        .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
+        .await
+        .expect_err("unknown GitHub repository must be rejected")
+        .contains("outside this convoy's repositories"));
+    assert!(daemon
+        .link_convoy_subject(
+            "flotilla",
+            "multi-repo",
+            "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",
+            Some(flotilla_protocol::Relationship::Produces)
+        )
+        .await
+        .expect_err("foreign Forgejo repository must be rejected")
+        .contains("outside this convoy's repositories"));
     daemon
         .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
         .await
