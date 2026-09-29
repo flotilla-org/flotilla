@@ -2764,29 +2764,33 @@ impl InProcessDaemon {
     }
 
     async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+        let namespace = self.provisioning_namespace().await;
+        self.resolve_forge_identity_in(&namespace, spec).await
+    }
+
+    async fn resolve_forge_identity_in(&self, namespace: &str, spec: RepositorySpec) -> Result<RepositorySpec, String> {
         let Some(remote) = spec.live_remote() else {
             return Ok(spec);
         };
-        let namespace = self.provisioning_namespace().await;
-        let Some(forge) = forge_for_remote(&self.resource_backend, &namespace, remote).await? else { return Ok(spec) };
+        let Some(forge) = forge_for_remote(&self.resource_backend, namespace, remote).await? else { return Ok(spec) };
         let resolved = spec.on_forge(&forge)?;
-        self.sweep_split_forge_repositories(&resolved, &forge).await
+        self.sweep_split_forge_repositories(namespace, &resolved, &forge).await
     }
 
     async fn sweep_split_forge_repositories(
         &self,
+        namespace: &str,
         observed: &RepositorySpec,
         forge: &flotilla_resources::ForgeSpec,
     ) -> Result<RepositorySpec, String> {
-        let namespace = self.provisioning_namespace().await;
-        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
         let target_key = observed.key();
         let mut merged = observed.clone();
         let mut old_sources = Vec::new();
         let mut old_local = Vec::new();
         let mut replacements = BTreeSet::new();
         let sources =
-            self.resource_backend.clone().including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+            self.resource_backend.clone().including_replicas::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
         for source in sources.items {
             let repository = source.object;
             let Ok(normalized) = repository.spec.clone().on_forge(forge) else { continue };
@@ -2829,7 +2833,7 @@ impl InProcessDaemon {
                 }
             }
         }
-        let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
+        let projects = self.resource_backend.clone().definitions::<Project>(namespace);
         let mut project_updates = Vec::new();
         for project in projects.list().await.map_err(|error| error.to_string())? {
             let mut spec = project.spec.clone();
@@ -2880,7 +2884,7 @@ impl InProcessDaemon {
                 project_updates.push((meta, spec));
             }
         }
-        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
+        let ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(namespace);
         let mut ensure_updates = Vec::new();
         for ensure in ensures.list().await.map_err(|error| error.to_string())? {
             let mut spec = ensure.spec.clone();
@@ -2891,7 +2895,7 @@ impl InProcessDaemon {
                 ensure_updates.push((meta, spec));
             }
         }
-        let templates = self.resource_backend.clone().definitions::<WorkflowTemplate>(&namespace);
+        let templates = self.resource_backend.clone().definitions::<WorkflowTemplate>(namespace);
         let mut template_updates = Vec::new();
         for template in templates.list().await.map_err(|error| error.to_string())? {
             let mut spec = template.spec.clone();
@@ -2909,7 +2913,7 @@ impl InProcessDaemon {
                 template_updates.push((meta, spec));
             }
         }
-        let grants = self.resource_backend.clone().definitions::<CredentialGrant>(&namespace);
+        let grants = self.resource_backend.clone().definitions::<CredentialGrant>(namespace);
         let mut grant_updates = Vec::new();
         for grant in grants.list().await.map_err(|error| error.to_string())? {
             let mut spec = grant.spec.clone();
@@ -2955,7 +2959,7 @@ impl InProcessDaemon {
             grants.apply(&meta, &spec).await.map_err(|error| error.to_string())?;
         }
         let durable_checkouts =
-            self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
+            self.resource_backend.clone().using::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
         for source in old_local {
             let key = RepositoryKey(source.metadata.name.clone());
             if durable_checkouts.items.iter().any(|checkout| checkout.spec.repo_ref() == &key) {
@@ -2963,7 +2967,7 @@ impl InProcessDaemon {
                 meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), target_name.clone());
                 repositories.update(&meta, &source.metadata.resource_version, &source.spec).await.map_err(|error| error.to_string())?;
             } else {
-                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, &key)
+                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, namespace, &key)
                     .await
                     .map_err(|error| error.to_string())?;
                 repositories.delete(&source.metadata.name).await.map_err(|error| error.to_string())?;
@@ -6813,7 +6817,9 @@ impl InProcessDaemon {
         for key in &ensure.spec.repositories {
             match repositories.get(&key.to_string()).await {
                 Ok(repository) => {
-                    self.resolve_forge_identity(repository.object.spec).await?;
+                    self.resolve_forge_identity_in(namespace, repository.object.spec)
+                        .await
+                        .map_err(|error| format!("repository {key}: {error}"))?;
                 }
                 Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(error.to_string()),
