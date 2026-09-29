@@ -36,6 +36,7 @@ pub mod regard_lifecycle;
 pub(crate) mod repo_state;
 pub mod repository_inspection;
 pub mod resolve;
+mod resource_explain;
 pub mod salience;
 mod scoped_store;
 mod standing_roles;
