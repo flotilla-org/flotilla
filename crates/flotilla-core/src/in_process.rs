@@ -24,23 +24,23 @@ pub use attach::ResolvedAttach;
 use attach::{AttachResolver, CachedFleetRows};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flotilla_protocol::{
-    arg::{flatten, Arg},
+    arg::Arg,
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::{HostId, QualifiedPath},
-    result_set::{CheckoutRow, ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
+    result_set::{CheckoutRow, ConvoyChangeRequest, Rows},
     AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, Command, CommandAction, CommandValue,
-    ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
-    CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, ExplainedArtifact,
-    ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring,
-    ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow,
-    FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel,
-    FulfilmentRow, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress,
-    ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost,
-    PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan,
-    ResourceCursor, ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse,
-    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
+    DispatchQueueRow, EntryOp, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery,
+    ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork,
+    ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentHarness,
+    FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse,
+    StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -66,8 +66,8 @@ use flotilla_resources::{
     Resolution, ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, RoleHandoff,
     SettlementMode, SupervisionTarget, SystemClock, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatus, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel, VesselRequirement, WatchEvent,
-    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity,
+    TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, Vessel, VesselRequirement, WatchEvent, WatchStart,
+    WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION,
     CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE, GENERATION_LABEL, HEARTBEAT_READY_TTL_SECS, MANAGED_BY_LABEL,
     PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -86,11 +86,16 @@ use crate::{
         change_request_subjects_from_claim, checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout,
         inspect_checkout_integration, inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
-    config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
+    config::{ConfigStore, StaticEnvironmentConfig},
     daemon::{DaemonHandle, QuerySubscription},
     environment_manager::EnvironmentManager,
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
+    fleet::{
+        accumulate_fleet_health_counts, crew_attention, fleet_observation_agreement, format_resource_replication_failures,
+        host_credential_attention, join_replica_errors, replica_staleness, FleetService, ResourceReplicationFailure,
+        SshFleetReplicaTransport, FLEET_REPLICA_FRESH_SECS,
+    },
     hop_chain::{
         environment::DockerEnvironmentHopResolver, remote::ssh_resolver_from_config, resolver::HopResolver,
         terminal::NoopTerminalHopResolver, Hop, HopPlan, ResolutionContext,
@@ -490,32 +495,6 @@ fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
 }
 
-fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
-    match phase {
-        Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
-        Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
-        Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
-        Some(ResourceTerminalSessionPhase::Failed) => "failed".to_string(),
-    }
-}
-
-fn crew_attention(status: Option<&TerminalSessionStatus>, now: DateTime<Utc>) -> Option<CrewAttention> {
-    let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.reason == "DeliveryUnconfirmed") {
-        return Some(CrewAttention::DeliveryUnconfirmed);
-    }
-    let attention = status.attention.as_ref()?;
-    if attention.is_stale_at(now) {
-        return Some(CrewAttention::Unobservable);
-    }
-    Some(match attention.state {
-        TerminalAttentionState::Working => CrewAttention::Working,
-        TerminalAttentionState::NeedsInput => CrewAttention::NeedsInput,
-        TerminalAttentionState::Idle => CrewAttention::Idle,
-        TerminalAttentionState::Unobservable => CrewAttention::Unobservable,
-    })
-}
-
 fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDemand>, convoy: &str, vessel: &str) -> Option<String> {
     if demand.spec.originating_work_ref.name != convoy
         || demand.metadata.annotations.get("flotilla.work/credential-refresh-vessel").is_none_or(|name| name != vessel)
@@ -527,302 +506,6 @@ fn credential_refresh_alert_for_vessel(demand: &ResourceObject<ResourceDemand>, 
         return None;
     }
     demand.metadata.annotations.get("flotilla.work/credential-refresh-reason").cloned()
-}
-
-fn convoy_state_label(row: &ConvoyRow) -> String {
-    match row.message.as_deref().filter(|message| !message.trim().is_empty()) {
-        Some(message) => format!("{}: {message}", row.phase),
-        None => row.phase.to_string(),
-    }
-}
-
-fn append_crewless_convoy_rows(
-    rows: &mut Vec<FleetListRow>,
-    target_namespace: &str,
-    result_sets: &[ResultSet],
-    host: &HostName,
-    staleness: FleetStaleness,
-) {
-    let mut convoys_with_crew: HashSet<String> = rows.iter().filter_map(|row| row.convoy_ref.clone()).collect();
-    for result_set in result_sets {
-        let Rows::Convoys { rows: convoys, .. } = &result_set.rows else { continue };
-        for row in convoys {
-            if row.resource.namespace != target_namespace {
-                continue;
-            }
-            if !convoys_with_crew.insert(row.resource.name.clone()) {
-                continue;
-            }
-            let display = row.project_ref.as_ref().map_or_else(|| row.name.clone(), |project| format!("{} @ {project}", row.name));
-            rows.push(
-                FleetListRow::builder()
-                    .convoy(display)
-                    .convoy_ref(row.resource.name.clone())
-                    .vessel("-")
-                    .crew("-")
-                    .crew_state(convoy_state_label(row))
-                    .surface_state(row.surface_state)
-                    .host(host.clone())
-                    .maybe_placement_decision(row.placement_decision.clone())
-                    .namespace(target_namespace)
-                    .staleness(staleness.clone())
-                    .build(),
-            );
-        }
-    }
-}
-
-fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
-    environment
-        .spec
-        .host_direct
-        .as_ref()
-        .map(|spec| spec.host_ref.as_str())
-        .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
-}
-
-fn ssh_destination(remote: &RemoteHostConfig) -> String {
-    crate::config::ssh_destination(&remote.hostname, remote.user.as_deref())
-}
-
-fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<String> {
-    let mut args = vec![
-        "-T".to_string(),
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        format!("ConnectTimeout={}", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()),
-        "-o".to_string(),
-        "ConnectionAttempts=1".to_string(),
-    ];
-    if multiplex {
-        args.extend([
-            "-o".to_string(),
-            "ControlMaster=auto".to_string(),
-            "-o".to_string(),
-            "ControlPath=/tmp/flotilla-ssh-%C".to_string(),
-            "-o".to_string(),
-            "ControlPersist=60".to_string(),
-        ]);
-    }
-    args.push(ssh_destination(remote));
-    let snapshot_command = vec![
-        Arg::Literal("cd".to_string()),
-        Arg::Quoted("/".to_string()),
-        Arg::Literal("&&".to_string()),
-        Arg::Literal("exec".to_string()),
-        Arg::Literal("flotilla".to_string()),
-        Arg::Literal("--json".to_string()),
-        Arg::Quoted("replica-snapshot".to_string()),
-    ];
-    let login_wrapper = vec![
-        Arg::Literal("${SHELL:-/bin/sh}".to_string()),
-        Arg::Literal("-l".to_string()),
-        Arg::Literal("-c".to_string()),
-        Arg::NestedCommand(snapshot_command),
-    ];
-    args.push(flatten(&login_wrapper, 0));
-    args
-}
-
-fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> FleetStaleness {
-    if let Some(message) = &entry.last_error {
-        return FleetStaleness::Unreachable { last_sync: entry.last_sync, message: message.clone() };
-    }
-    let Some(last_sync) = entry.last_sync else {
-        return FleetStaleness::Unreachable { last_sync: None, message: "replica has never synced".to_string() };
-    };
-    if now.signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS {
-        FleetStaleness::Stale { last_sync }
-    } else {
-        FleetStaleness::Fresh { last_sync }
-    }
-}
-
-fn accumulate_fleet_health_counts(counts: &mut HashMap<HostName, (usize, HashSet<String>)>, rows: &[FleetListRow]) {
-    for row in rows {
-        let (crew_count, convoys) = counts.entry(row.host.clone()).or_default();
-        if row.crew != "-" {
-            *crew_count += 1;
-        }
-        if row.convoy != "-" {
-            convoys.insert(row.convoy.clone());
-        }
-    }
-}
-
-/// One attention entry per expired or near-expiry credential scope on a host,
-/// derived from the `credential_expiry` capability its heartbeat publishes.
-fn host_credential_attention(
-    status: &ResourceHostStatus,
-    now: DateTime<Utc>,
-    warning_window: chrono::Duration,
-) -> Vec<CredentialAttention> {
-    let Ok(expiry) = status.credential_expiry() else {
-        return vec![CredentialAttention {
-            severity: CredentialAttentionSeverity::Unreadable,
-            message: "credential expiry capability is unreadable".to_string(),
-        }];
-    };
-    let mut attention = Vec::new();
-    for (scope, entry) in expiry {
-        let label = if scope == flotilla_resources::AMBIENT_CLAUDE_CREDENTIAL_SCOPE {
-            "ambient claude login".to_string()
-        } else {
-            format!("credential `{scope}`")
-        };
-        if let Some(expired_at) = entry.expired_at(now) {
-            attention.push(CredentialAttention {
-                severity: CredentialAttentionSeverity::Expired,
-                message: format!("{label} expired on {}", expired_at.format("%Y-%m-%d")),
-            });
-        } else if let Some(expires_at) = entry.expires_within(now, warning_window) {
-            attention.push(CredentialAttention {
-                severity: CredentialAttentionSeverity::Expiring,
-                message: format!("{label} expires on {}", expires_at.format("%Y-%m-%d")),
-            });
-        }
-    }
-    attention
-}
-
-fn fleet_observation_agreement(
-    link: &PeerConnectionState,
-    heartbeat_at: Option<DateTime<Utc>>,
-    heartbeat_fresh: bool,
-    daemon_generation: Option<&str>,
-    replica_generation: Option<&str>,
-    is_local: bool,
-) -> FleetObservationAgreement {
-    if is_local {
-        return FleetObservationAgreement::Agree;
-    }
-    let generation_disagrees = matches!((daemon_generation, replica_generation), (Some(daemon), Some(replica)) if daemon != replica);
-    let link_disagrees = match link {
-        PeerConnectionState::Connected => !heartbeat_fresh,
-        PeerConnectionState::Disconnected | PeerConnectionState::Rejected { .. } => heartbeat_fresh,
-        PeerConnectionState::Connecting | PeerConnectionState::Reconnecting => false,
-    };
-    if generation_disagrees || link_disagrees {
-        FleetObservationAgreement::Disagree
-    } else if heartbeat_at.is_none()
-        || matches!(link, PeerConnectionState::Connecting | PeerConnectionState::Reconnecting)
-        || daemon_generation.is_none()
-        || replica_generation.is_none()
-    {
-        FleetObservationAgreement::Unknown
-    } else {
-        FleetObservationAgreement::Agree
-    }
-}
-
-fn format_resource_replication_failures(failures: &[ResourceReplicationFailure]) -> Option<String> {
-    if failures.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "resource replication failed: {}",
-        failures.iter().map(|failure| format!("{}: {}", failure.kind, failure.message)).collect::<Vec<_>>().join("; ")
-    ))
-}
-
-fn join_replica_errors(first: Option<&str>, second: Option<&str>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (Some(message), None) | (None, Some(message)) => Some(message.to_string()),
-        (None, None) => None,
-    }
-}
-
-#[derive(Debug, Default)]
-struct ReplicaParseDiagnostics {
-    skipped_records: usize,
-    first_error: Option<String>,
-}
-
-impl ReplicaParseDiagnostics {
-    fn record_skip(&mut self, path: impl std::fmt::Display, error: impl std::fmt::Display) {
-        self.record_skips(1, path, error);
-    }
-
-    fn record_skips(&mut self, count: usize, path: impl std::fmt::Display, error: impl std::fmt::Display) {
-        self.skipped_records += count;
-        self.first_error.get_or_insert_with(|| format!("{path}: {error}"));
-    }
-}
-
-#[derive(Debug)]
-struct ParsedFleetReplicaSnapshot {
-    snapshot: FleetReplicaSnapshot,
-    diagnostics: ReplicaParseDiagnostics,
-}
-
-fn result_set_records_mut(result_set: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
-    result_set.get_mut("rows")?.get_mut("rows")?.get_mut("rows")?.as_array_mut()
-}
-
-fn retain_parseable_result_set_records(
-    result_set: &mut serde_json::Value,
-    result_set_index: usize,
-    diagnostics: &mut ReplicaParseDiagnostics,
-) -> bool {
-    let Some(records) = result_set_records_mut(result_set) else {
-        return match serde_json::from_value::<ResultSet>(result_set.clone()) {
-            Ok(_) => true,
-            Err(error) => {
-                diagnostics.record_skip(format_args!("result_sets[{result_set_index}]"), error);
-                false
-            }
-        };
-    };
-    let records = std::mem::take(records);
-
-    let envelope = result_set.clone();
-    if let Err(error) = serde_json::from_value::<ResultSet>(envelope.clone()) {
-        diagnostics.record_skips(records.len().max(1), format_args!("result_sets[{result_set_index}]"), error);
-        return false;
-    }
-
-    let mut retained = Vec::with_capacity(records.len());
-    for (record_index, record) in records.into_iter().enumerate() {
-        let mut candidate = envelope.clone();
-        result_set_records_mut(&mut candidate).expect("validated result set has a row array").push(record.clone());
-        match serde_json::from_value::<ResultSet>(candidate) {
-            Ok(_) => retained.push(record),
-            Err(error) => {
-                diagnostics.record_skip(format_args!("result_sets[{result_set_index}].rows[{record_index}]"), error);
-            }
-        }
-    }
-    *result_set_records_mut(result_set).expect("validated result set has a row array") = retained;
-    true
-}
-
-fn parse_fleet_replica_snapshot(input: &str) -> Result<ParsedFleetReplicaSnapshot, String> {
-    let mut value: serde_json::Value = serde_json::from_str(input).map_err(|error| format!("replica snapshot parse failed: {error}"))?;
-    let mut diagnostics = ReplicaParseDiagnostics::default();
-
-    if let Some(rows) = value.get_mut("rows").and_then(serde_json::Value::as_array_mut) {
-        let records = std::mem::take(rows);
-        for (index, record) in records.into_iter().enumerate() {
-            match serde_json::from_value::<FleetListRow>(record.clone()) {
-                Ok(_) => rows.push(record),
-                Err(error) => diagnostics.record_skip(format_args!("rows[{index}]"), error),
-            }
-        }
-    }
-
-    if let Some(result_sets) = value.get_mut("result_sets").and_then(serde_json::Value::as_array_mut) {
-        let records = std::mem::take(result_sets);
-        for (index, mut record) in records.into_iter().enumerate() {
-            if retain_parseable_result_set_records(&mut record, index, &mut diagnostics) {
-                result_sets.push(record);
-            }
-        }
-    }
-
-    let snapshot = serde_json::from_value(value).map_err(|error| format!("replica snapshot parse failed outside a record: {error}"))?;
-    Ok(ParsedFleetReplicaSnapshot { snapshot, diagnostics })
 }
 
 fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
@@ -1033,7 +716,7 @@ async fn canonical_placement_host_ref(
     canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
 }
 
-fn canonical_placement_host_ref_from_sources(
+pub(crate) fn canonical_placement_host_ref_from_sources(
     hosts: &[ReadResourceObject<ResourceHost>],
     host_ref: &str,
 ) -> Result<Option<PlacementTargetHost>, String> {
@@ -1380,23 +1063,6 @@ async fn discover_repo_for_environment(
         &host_scoped,
     )
     .await)
-}
-
-#[derive(Debug, Clone)]
-struct FleetReplicaCacheEntry {
-    rows: Vec<FleetListRow>,
-    result_sets: Vec<ResultSet>,
-    last_sync: Option<DateTime<Utc>>,
-    generation: Option<String>,
-    skipped_records: usize,
-    first_parse_error: Option<String>,
-    last_error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResourceReplicationFailure {
-    kind: String,
-    message: String,
 }
 
 const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
@@ -2485,9 +2151,7 @@ pub struct InProcessDaemon {
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: std::sync::RwLock<String>,
-    fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
-    fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
-    resource_replication_failures: RwLock<HashMap<NodeId, BTreeMap<String, String>>>,
+    fleet: FleetService,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
     work_credential_reconciler: RwLock<Option<Arc<dyn WorkCredentialReconciler>>>,
@@ -2516,8 +2180,6 @@ enum RepositoryRefreshFailurePolicy {
     Strict,
 }
 
-const FLEET_REPLICA_FRESH_SECS: i64 = 90;
-const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const ENSURE_BACKOFF_RESET_AFTER: ChronoDuration = ChronoDuration::minutes(10);
 const ENSURE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const ENSURE_ESCALATION_AFTER: ChronoDuration = ChronoDuration::minutes(15);
@@ -2812,7 +2474,6 @@ impl InProcessDaemon {
         )
         .await;
 
-        let (fleet_replica_tx, _) = broadcast::channel(32);
         let observer_daemon = Arc::new(OnceLock::new());
         let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(Arc::clone(&observer_daemon)));
         let change_request_refresher = crate::change_request_observer::ChangeRequestRefresher::new(
@@ -2836,11 +2497,13 @@ impl InProcessDaemon {
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_tx.clone(), change_request_refresher, issue_refresher);
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
+        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let aggregator_projection_state = AggregatorProjectionState::new();
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx: event_tx.clone(),
-            config,
+            config: Arc::clone(&config),
             next_command_id: AtomicU64::new(1),
             node_id: local_node_id.clone(),
             host_name: host_name.clone(),
@@ -2853,7 +2516,7 @@ impl InProcessDaemon {
                 local_host_summary,
             ),
             local_environment_id,
-            environment_manager,
+            environment_manager: Arc::clone(&environment_manager),
             discovery,
             checkout_vcs: Mutex::new(checkout_vcs),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
@@ -2869,14 +2532,20 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             clock: Arc::clone(&clock),
             regard_lifecycle: RegardLifecycle::new(resource_backend.clone(), clock, ChronoDuration::seconds(DEFAULT_REGARD_DECAY_SECONDS)),
-            resource_backend,
-            observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
+            resource_backend: resource_backend.clone(),
+            observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Mutex::new(()),
-            aggregator_projection_state: AggregatorProjectionState::new(),
+            aggregator_projection_state: aggregator_projection_state.clone(),
             provisioning_namespace: std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
-            fleet_replica_cache: RwLock::new(HashMap::new()),
-            fleet_replica_tx,
-            resource_replication_failures: RwLock::new(HashMap::new()),
+            fleet: FleetService::new(
+                Arc::clone(&config),
+                resource_backend.clone(),
+                observed_resource_backend.clone(),
+                aggregator_projection_state.clone(),
+                host_name.clone(),
+                Some(CanonicalHostId::resolved(environment_manager.local_host_id().as_str())),
+                Arc::new(SshFleetReplicaTransport),
+            ),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
             work_credential_reconciler: RwLock::new(None),
@@ -3617,21 +3286,11 @@ impl InProcessDaemon {
     }
 
     pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<Vec<FleetReplicaSnapshot>> {
-        self.fleet_replica_tx.subscribe()
+        self.fleet.subscribe()
     }
 
     pub async fn cached_fleet_replica_snapshots(&self) -> Vec<FleetReplicaSnapshot> {
-        self.fleet_replica_cache
-            .read()
-            .await
-            .iter()
-            .map(|(host, entry)| FleetReplicaSnapshot {
-                host: host.clone(),
-                generation: entry.generation.clone(),
-                rows: entry.rows.clone(),
-                result_sets: entry.result_sets.clone(),
-            })
-            .collect()
+        self.fleet.cached_snapshots().await
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -3938,22 +3597,15 @@ impl InProcessDaemon {
     }
 
     pub async fn begin_peer_resource_replication(&self, peer: &NodeId) {
-        self.resource_replication_failures.write().await.remove(peer);
+        self.fleet.begin_peer_resource_replication(peer).await;
     }
 
     pub async fn report_resource_replication_failure(&self, peer: &NodeId, kind: &str, message: &str) {
-        self.resource_replication_failures.write().await.entry(peer.clone()).or_default().insert(kind.to_string(), message.to_string());
+        self.fleet.report_resource_replication_failure(peer, kind, message).await;
     }
 
     pub async fn report_resource_replication_healthy(&self, peer: &NodeId, kind: &str) {
-        let mut failures = self.resource_replication_failures.write().await;
-        let Some(peer_failures) = failures.get_mut(peer) else {
-            return;
-        };
-        peer_failures.remove(kind);
-        if peer_failures.is_empty() {
-            failures.remove(peer);
-        }
+        self.fleet.report_resource_replication_healthy(peer, kind).await;
     }
 
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
@@ -9365,10 +9017,10 @@ impl InProcessDaemon {
                 fulfilments_by_host.entry(host_name.clone()).or_default().push(kind);
             }
         }
-        let (local_rows, _) = self.local_fleet_rows(&namespace).await?;
+        let (local_rows, _) = self.fleet.rows(&namespace).await?;
         let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
         accumulate_fleet_health_counts(&mut counts, &local_rows);
-        let replicas = self.fleet_replica_cache.read().await;
+        let replicas = self.fleet.health().await;
         let mut surface_by_convoy = HashMap::new();
         for row in local_rows.iter().chain(replicas.values().flat_map(|entry| entry.rows.iter())) {
             let Some(convoy) = &row.convoy_ref else { continue };
@@ -9553,14 +9205,14 @@ impl InProcessDaemon {
 
     pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
         let namespace = self.provisioning_namespace().await;
-        let (rows, generation) = self.local_fleet_rows(&namespace).await?;
+        let (rows, generation) = self.fleet.rows(&namespace).await?;
         let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, result_sets })
     }
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
         let namespace = self.provisioning_namespace().await;
-        let (mut rows, _generation) = self.local_fleet_rows(&namespace).await?;
+        let (mut rows, _generation) = self.fleet.rows(&namespace).await?;
         let mut replicas = Vec::new();
         let now = Utc::now();
         let configured_hosts = self
@@ -9568,7 +9220,7 @@ impl InProcessDaemon {
             .load_hosts()
             .map(|hosts| hosts.hosts.into_iter().filter(|(_, host)| !host.agentless_ssh).collect::<HashMap<_, _>>())
             .unwrap_or_default();
-        let failures = self.resource_replication_failures.read().await.clone();
+        let failures = self.fleet.replication_failures().await;
         let mut replication_failures_by_host = HashMap::<HostName, Vec<ResourceReplicationFailure>>::new();
         for (peer, peer_failures) in failures {
             let host = self.host_registry.host_name_for_node(&peer).await.unwrap_or_else(|| HostName::new(peer.as_str()));
@@ -9577,7 +9229,7 @@ impl InProcessDaemon {
                 .or_default()
                 .extend(peer_failures.into_iter().map(|(kind, message)| ResourceReplicationFailure { kind, message }));
         }
-        let cache = self.fleet_replica_cache.read().await;
+        let cache = self.fleet.health().await;
 
         for (label, remote) in configured_hosts {
             let host = HostName::new(remote.expected_host_name);
@@ -11115,219 +10767,8 @@ impl InProcessDaemon {
     }
 
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
-        let hosts = self.config.load_hosts()?;
         let namespace = self.provisioning_namespace().await;
-        let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
-        let configured: HashSet<_> = hosts
-            .hosts
-            .values()
-            .filter(|remote| !remote.agentless_ssh)
-            .map(|remote| HostName::new(remote.expected_host_name.clone()))
-            .collect();
-        {
-            let mut cache = self.fleet_replica_cache.write().await;
-            cache.retain(|host, _| configured.contains(host));
-        }
-        for (label, remote) in &hosts.hosts {
-            if remote.agentless_ssh {
-                continue;
-            }
-            let host = HostName::new(remote.expected_host_name.clone());
-            let multiplex = hosts.resolved_ssh_multiplex(label);
-            let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
-            match result {
-                Ok(parsed) => {
-                    let now = Utc::now();
-                    let diagnostics = parsed.diagnostics;
-                    let snapshot = parsed.snapshot;
-                    let snapshot_host = snapshot.host;
-                    let generation = snapshot.generation;
-                    let result_sets = snapshot.result_sets.clone();
-                    let staleness = FleetStaleness::Fresh { last_sync: now };
-                    let mut rows: Vec<_> = snapshot
-                        .rows
-                        .into_iter()
-                        .map(|mut row| {
-                            row.host = snapshot_host.clone();
-                            row.staleness = staleness.clone();
-                            row
-                        })
-                        .collect();
-                    // Replica rows from current daemons already include crewless rows via local_fleet_rows.
-                    // Keep result-set rows as a secondary source for direct snapshots; existing rows win.
-                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.result_sets, &snapshot_host, staleness);
-                    self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
-                        rows,
-                        result_sets,
-                        last_sync: Some(now),
-                        generation,
-                        skipped_records: diagnostics.skipped_records,
-                        first_parse_error: diagnostics.first_error,
-                        last_error: None,
-                    });
-                }
-                Err(message) => {
-                    let mut cache = self.fleet_replica_cache.write().await;
-                    cache.entry(host).and_modify(|entry| entry.last_error = Some(message.clone())).or_insert_with(|| {
-                        FleetReplicaCacheEntry {
-                            rows: Vec::new(),
-                            result_sets: Vec::new(),
-                            last_sync: None,
-                            generation: None,
-                            skipped_records: 0,
-                            first_parse_error: None,
-                            last_error: Some(message),
-                        }
-                    });
-                }
-            }
-        }
-        let _ = self.fleet_replica_tx.send(self.cached_fleet_replica_snapshots().await);
-        Ok(())
-    }
-
-    async fn fetch_fleet_replica_snapshot(
-        &self,
-        remote: &RemoteHostConfig,
-        multiplex: bool,
-        runner: Arc<dyn CommandRunner>,
-    ) -> Result<ParsedFleetReplicaSnapshot, String> {
-        let args = fleet_replica_ssh_args(remote, multiplex);
-        let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let output = tokio::time::timeout(
-            FLEET_REPLICA_REFRESH_TIMEOUT,
-            runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Default),
-        )
-        .await
-        .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
-        .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
-        if !output.success {
-            let message = if output.stderr.trim().is_empty() { output.stdout.trim() } else { output.stderr.trim() };
-            return Err(format!("replica snapshot command failed: {message}"));
-        }
-        parse_fleet_replica_snapshot(output.stdout.trim())
-    }
-
-    async fn local_fleet_rows(&self, namespace: &str) -> Result<(Vec<FleetListRow>, Option<String>), String> {
-        let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
-        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
-        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let observed_checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
-
-        let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
-        let host_sources =
-            self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
-        let observed_generation = observed_checkouts.list().await.map_err(|err| err.to_string())?.generation;
-        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
-        let placement_by_convoy = result_sets
-            .iter()
-            .filter_map(|result_set| result_set.rows.as_convoys())
-            .flatten()
-            .filter_map(|convoy| {
-                convoy
-                    .placement_decision
-                    .clone()
-                    .map(|decision| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), decision))
-            })
-            .collect::<HashMap<_, _>>();
-        let surface_by_convoy = result_sets
-            .iter()
-            .filter_map(|result_set| result_set.rows.as_convoys())
-            .flatten()
-            .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.surface_state))
-            .collect::<HashMap<_, _>>();
-        let environment_map: HashMap<_, _> = environments
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items
-            .into_iter()
-            .map(|environment| (environment.metadata.name.clone(), environment))
-            .collect();
-        let convoy_items = convoys.list().await.map_err(|err| err.to_string())?.items;
-        let convoy_addresses = convoy_items
-            .iter()
-            .map(|convoy| {
-                let address = convoy
-                    .spec
-                    .project_ref
-                    .as_ref()
-                    .map_or_else(|| convoy.spec.role.clone(), |project| format!("{} @ {project}", convoy.spec.role));
-                (convoy.metadata.name.clone(), address)
-            })
-            .collect::<HashMap<_, _>>();
-        let mut authority_by_convoy = HashMap::new();
-        for checkout in checkouts.list().await.map_err(|err| err.to_string())?.items {
-            let Some(convoy) = checkout.metadata.labels.get(CONVOY_LABEL).cloned() else {
-                continue;
-            };
-            let authority = checkout
-                .metadata
-                .lifecycle_authority()
-                .map_err(|err| err.to_string())?
-                .map(|authority| authority.as_label_value().to_string());
-            if authority.is_some() {
-                authority_by_convoy.insert(convoy, authority);
-            }
-        }
-
-        let mut rows = Vec::new();
-        for session in session_list.items {
-            let labels = &session.metadata.labels;
-            let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
-            let task = labels.get(VESSEL_LABEL).cloned();
-            let role = labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
-            let crew = match task.as_ref() {
-                Some(task) => format!("{task}/{role}"),
-                None => role.clone(),
-            };
-            let attention = crew_attention(session.status.as_ref(), Utc::now());
-            let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
-            let host = if let Some(host_ref) =
-                environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
-            {
-                canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
-                    || {
-                        if self.canonical_local_host_id().is_some_and(|local| local.as_str() == host_ref) {
-                            self.host_name.clone()
-                        } else {
-                            HostName::new(host_ref)
-                        }
-                    },
-                    |target| self.host_name_for_canonical_ref(&target.reference),
-                )
-            } else {
-                self.host_name.clone()
-            };
-            rows.push(
-                FleetListRow::builder()
-                    .convoy(convoy_addresses.get(&convoy).cloned().unwrap_or_else(|| convoy.clone()))
-                    .maybe_convoy_ref((convoy != "-").then_some(convoy.clone()))
-                    .vessel(session.spec.env_ref.clone())
-                    .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
-                    .crew(crew)
-                    .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
-                    .surface_state(surface_by_convoy.get(&convoy_key).copied().unwrap_or_default())
-                    .maybe_attention(attention)
-                    .host(host)
-                    .maybe_placement_decision(placement_by_convoy.get(&convoy_key).cloned())
-                    .namespace(session.metadata.namespace.clone())
-                    .session(session.metadata.name.clone())
-                    .staleness(FleetStaleness::Local)
-                    .build(),
-            );
-        }
-        append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
-        rows.sort_by(|left, right| {
-            (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
-                &right.convoy,
-                right.host.as_str(),
-                &right.vessel,
-                &right.crew,
-            ))
-        });
-        Ok((rows, observed_generation))
+        self.fleet.refresh_once(&namespace, self.local_command_runner()).await
     }
 
     fn attach_resolver(&self) -> AttachResolver<'_> {
@@ -11342,7 +10783,7 @@ impl InProcessDaemon {
             local_environment_id: &self.local_environment_id,
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
-            fleet_rows: Box::new(CachedFleetRows { config: &self.config, cache: &self.fleet_replica_cache }),
+            fleet_rows: Box::new(CachedFleetRows { fleet: &self.fleet }),
             repository_keys_by_path: &self.repository_keys_by_path,
             path_identities: &self.path_identities,
             repos: &self.repos,
@@ -11416,14 +10857,6 @@ impl InProcessDaemon {
 
     fn canonical_local_host_id(&self) -> Option<CanonicalHostId> {
         self.local_host_id().map(|host_id| CanonicalHostId::resolved(host_id.as_str()))
-    }
-
-    fn host_name_for_canonical_ref(&self, canonical_ref: &CanonicalHostId) -> HostName {
-        if self.canonical_local_host_id().as_ref() == Some(canonical_ref) {
-            self.host_name.clone()
-        } else {
-            HostName::new(canonical_ref.as_str())
-        }
     }
 
     async fn refresh_local_host_summary(&self) -> HostSummary {

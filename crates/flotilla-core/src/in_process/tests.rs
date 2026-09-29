@@ -4127,34 +4127,6 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
     assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.unwrap().restart_count, 7);
 }
 
-#[test]
-fn crew_attention_keeps_monitoring_distinct_from_lifecycle_state() {
-    let now = Utc::now();
-    let mut status = ResourceTerminalSessionStatus {
-        phase: ResourceTerminalSessionPhase::Running,
-        attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Screen }),
-        ..Default::default()
-    };
-
-    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Idle));
-
-    status.degraded = Some(flotilla_resources::TerminalSessionDegradedCondition {
-        reason: "DeliveryUnconfirmed".to_string(),
-        message: "composer retained delivery".to_string(),
-        message_id: Some("handoff-1".to_string()),
-        consecutive_failures: 1,
-        observed_at: now,
-    });
-    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
-    status.degraded = None;
-
-    status.attention.as_mut().expect("attention").as_of = now - TerminalAttention::FRESH_FOR;
-    assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::Unobservable));
-
-    status.phase = ResourceTerminalSessionPhase::Stopped;
-    assert_eq!(crew_attention(Some(&status), now), None);
-}
-
 #[tokio::test]
 async fn credential_alerts_match_the_exact_convoy_and_vessel() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
