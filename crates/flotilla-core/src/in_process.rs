@@ -4515,11 +4515,13 @@ async fn ensure_prepared_placement_snapshot(
     name: &str,
     spec: &PlacementPolicySpec,
 ) -> Result<(), String> {
-    let policies = backend.clone().using::<PlacementPolicy>(namespace);
+    let policies = backend.including_replicas::<PlacementPolicy>(namespace);
     match policies.get(name).await {
-        Ok(existing) if existing.spec == *spec => Ok(()),
+        Ok(existing) if existing.object.spec == *spec => Ok(()),
         Ok(_) => Err(format!("prepared placement snapshot {name} already exists with different contents")),
-        Err(ResourceError::NotFound { .. }) => policies
+        Err(ResourceError::NotFound { .. }) => backend
+            .clone()
+            .using::<PlacementPolicy>(namespace)
             .create(
                 &InputMeta::builder()
                     .name(name.to_string())

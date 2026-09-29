@@ -1329,6 +1329,74 @@ async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
 }
 
 #[tokio::test]
+async fn prepared_placement_snapshot_reuses_an_identical_replica() {
+    let home_root = NodeId::new("snapshot-home");
+    let driver_root = NodeId::new("snapshot-driver");
+    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(home_root.clone());
+    let driver = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver_root);
+    let spec = PlacementPolicySpec::builder().pool("passthrough".to_string()).build();
+    let name = prepared_snapshot_name("placement", &serde_json::to_value(&spec).expect("serialize placement")).expect("snapshot name");
+
+    ensure_prepared_placement_snapshot(&home, "flotilla", &name, &spec).await.expect("author snapshot on home");
+    driver
+        .replica_writer::<PlacementPolicy>(home_root, "flotilla")
+        .replace(&home.using::<PlacementPolicy>("flotilla").list().await.expect("home placement log"), Utc::now())
+        .await
+        .expect("replicate snapshot to driver");
+
+    ensure_prepared_placement_snapshot(&driver, "flotilla", &name, &spec).await.expect("reuse identical replicated snapshot");
+    assert!(driver.using::<PlacementPolicy>("flotilla").list().await.expect("driver local placement log").items.is_empty());
+}
+
+#[tokio::test]
+async fn two_origins_admit_identical_placements_without_authorship_collision() {
+    let (first, first_backend, _first_clock, _first_temp) = standing_ensure_fixture_for("feta", true).await;
+    let (second, second_backend, _second_clock, _second_temp) = standing_ensure_fixture_for("udder", true).await;
+    for backend in [&first_backend, &second_backend] {
+        configure_standing_ensure_agent(backend, Vec::new()).await;
+    }
+
+    first.reconcile_convoy_ensures_once("flotilla").await.expect("first origin admits convoy");
+    let first_store = first.resource_backend();
+    let second_store = second.resource_backend();
+    let first_snapshot = first_store
+        .using::<PlacementPolicy>("flotilla")
+        .list()
+        .await
+        .expect("first placement policies")
+        .items
+        .into_iter()
+        .find(|policy| policy.metadata.name.starts_with("placement-snapshot-"))
+        .expect("first placement snapshot");
+    let first_root = first.node_id().clone();
+    let mut snapshots = first_store.using::<PlacementPolicy>("flotilla").list().await.expect("first placement log");
+    snapshots.items.retain(|policy| policy.metadata.name == first_snapshot.metadata.name);
+    second_store
+        .replica_writer::<PlacementPolicy>(first_root, "flotilla")
+        .replace(&snapshots, Utc::now())
+        .await
+        .expect("replicate first origin's placement policies");
+
+    second.reconcile_convoy_ensures_once("flotilla").await.expect("second origin admits same placement");
+    let second_convoy = second_store.using::<ResourceConvoy>("flotilla").list().await.expect("second convoys").items;
+    assert_eq!(second_convoy.len(), 1);
+    assert_eq!(
+        second_convoy[0].metadata.annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION),
+        Some(&first_snapshot.metadata.name)
+    );
+    assert!(!second_store
+        .using::<PlacementPolicy>("flotilla")
+        .list()
+        .await
+        .expect("second local placements")
+        .items
+        .iter()
+        .any(|policy| policy.metadata.name == first_snapshot.metadata.name));
+    assert!(flotilla_resources::home_bound_authorship_collisions(&first_store, "flotilla").await.expect("first diagnostics").is_empty());
+    assert!(flotilla_resources::home_bound_authorship_collisions(&second_store, "flotilla").await.expect("second diagnostics").is_empty());
+}
+
+#[tokio::test]
 async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push_failure() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-test\"\n").expect("daemon config");
