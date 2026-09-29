@@ -3,7 +3,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::Duration,
 };
 
@@ -186,8 +189,38 @@ pub trait SecondaryWatch: Send + Sync {
         self: Box<Self>,
         backend: ResourceBackend,
         namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>>;
+}
+
+/// Nonblocking, deduplicating producer for a controller's work queue.
+/// A name remains queued until the controller starts processing it.
+#[derive(Clone)]
+pub struct WorkQueueSender {
+    sender: mpsc::UnboundedSender<String>,
+    queued: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl WorkQueueSender {
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender, queued: Arc::new(StdMutex::new(HashSet::new())) }, receiver)
+    }
+
+    pub async fn send(&self, name: String) -> Result<(), mpsc::error::SendError<String>> {
+        let mut queued = self.queued.lock().expect("controller work queue lock poisoned");
+        if queued.insert(name.clone()) {
+            if let Err(error) = self.sender.send(name.clone()) {
+                queued.remove(&name);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn start(&self, name: &str) {
+        self.queued.lock().expect("controller work queue lock poisoned").remove(name);
+    }
 }
 
 impl<P: Resource> Clone for Box<dyn SecondaryWatch<Primary = P>> {
@@ -205,7 +238,7 @@ pub struct LabelMappedWatch<W: Resource, P: Resource> {
 impl<W: Resource, P: Resource> LabelMappedWatch<W, P> {
     async fn enqueue_from_object(
         label_key: &'static str,
-        sender: &mpsc::Sender<String>,
+        sender: &WorkQueueSender,
         object: &ResourceObject<W>,
     ) -> Result<(), ResourceError> {
         if let Some(primary) = object.metadata.labels.get(label_key) {
@@ -229,7 +262,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
         self: Box<Self>,
         backend: ResourceBackend,
         namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let resolver = backend.using::<W>(&namespace);
@@ -270,7 +303,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let listed = self.resolver.list().await?;
@@ -309,7 +342,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for ReplicaLabelMappedWatch<W, P> 
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let mut watch = self.resolver.watch().await?;
@@ -338,7 +371,7 @@ pub struct ReplicaConvoyCheckoutWatch {
 }
 
 impl ReplicaConvoyCheckoutWatch {
-    async fn enqueue_checkouts(sender: &mpsc::Sender<String>, convoy: &ResourceObject<crate::Convoy>) -> Result<(), ResourceError> {
+    async fn enqueue_checkouts(sender: &WorkQueueSender, convoy: &ResourceObject<crate::Convoy>) -> Result<(), ResourceError> {
         for checkout_name in crate::expected_checkout_refs(convoy).unwrap_or_default() {
             sender
                 .send(checkout_name)
@@ -360,7 +393,7 @@ impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let mut watch = self.resolver.watch().await?;
@@ -391,7 +424,7 @@ pub struct LabelJoinWatch<W: Resource, P: Resource> {
 impl<W: Resource, P: Resource> LabelJoinWatch<W, P> {
     async fn enqueue_matching_primaries(
         label_key: &'static str,
-        sender: &mpsc::Sender<String>,
+        sender: &WorkQueueSender,
         watched: &ResourceObject<W>,
         primaries: &TypedResolver<P>,
     ) -> Result<(), ResourceError> {
@@ -421,7 +454,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
         self: Box<Self>,
         backend: ResourceBackend,
         namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let watched = backend.clone().using::<W>(&namespace);
@@ -568,7 +601,7 @@ impl<R: Reconciler> ControllerLoop<R> {
 
     fn spawn_primary_watch(
         primary: TypedResolver<R::Resource>,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
@@ -615,7 +648,7 @@ impl<R: Reconciler> ControllerLoop<R> {
         watch: Box<dyn SecondaryWatch<Primary = R::Resource>>,
         backend: ResourceBackend,
         namespace: String,
-        sender: mpsc::Sender<String>,
+        sender: WorkQueueSender,
         watch_exited: mpsc::UnboundedSender<WatchExited>,
         restart_backoff: Option<Duration>,
     ) -> JoinHandle<()> {
@@ -628,7 +661,7 @@ impl<R: Reconciler> ControllerLoop<R> {
         })
     }
 
-    async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &mpsc::Sender<String>) -> Result<(), ResourceError> {
+    async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<(), ResourceError> {
         let listed = primary.list().await?;
         for object in listed.items {
             sender
@@ -650,8 +683,23 @@ impl<R: Reconciler> ControllerLoop<R> {
     where
         <R::Resource as Resource>::Status: Default,
     {
+        self.run_with_optional_heartbeat(None).await
+    }
+
+    /// Exposes progress of the loop itself to an independent watchdog.
+    pub async fn run_with_heartbeat(self, heartbeat: Arc<AtomicU64>) -> Result<(), ResourceError>
+    where
+        <R::Resource as Resource>::Status: Default,
+    {
+        self.run_with_optional_heartbeat(Some(heartbeat)).await
+    }
+
+    async fn run_with_optional_heartbeat(self, heartbeat: Option<Arc<AtomicU64>>) -> Result<(), ResourceError>
+    where
+        <R::Resource as Resource>::Status: Default,
+    {
         let ControllerLoop { primary, secondaries, reconciler, resync_interval, backend } = self;
-        let (sender, mut receiver) = mpsc::channel::<String>(128);
+        let (sender, mut receiver) = WorkQueueSender::channel();
         let (watch_exited_tx, mut watch_exited_rx) = mpsc::unbounded_channel();
         let _primary_watch = Self::spawn_primary_watch(primary.clone(), sender.clone(), watch_exited_tx.clone(), None);
         let secondary_templates = secondaries;
@@ -677,7 +725,11 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut object_failures = BTreeMap::<String, ObjectFailure>::new();
 
         loop {
+            if let Some(heartbeat) = &heartbeat {
+                heartbeat.fetch_add(1, Ordering::Relaxed);
+            }
             if let Some(name) = pending.pop_front() {
+                sender.start(&name);
                 let object = match primary.get(&name).await {
                     Ok(object) => object,
                     Err(ResourceError::NotFound { .. }) => {
@@ -889,9 +941,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                         return Ok(());
                     };
                     while let Ok(next) = receiver.try_recv() {
-                        if next != name {
-                            pending.push_back(next);
-                        }
+                        pending.push_back(next);
                     }
                     pending.push_front(name);
                 }

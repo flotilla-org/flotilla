@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, Weak,
+    },
     time::Duration,
 };
 
@@ -380,6 +383,22 @@ impl RuntimeHealth {
             .observed_at(Utc::now())
             .build();
         self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
+    }
+
+    fn report_controller_loop_stall(&self, name: &str, elapsed: Duration) {
+        let condition_type = format!("ControllerLoop/{name}");
+        let condition = HostCondition::builder()
+            .condition_type(condition_type.clone())
+            .value(ConditionValue::False)
+            .reason("HeartbeatStale")
+            .message(format!("{name} controller loop made no progress for {elapsed:?}"))
+            .observed_at(Utc::now())
+            .build();
+        self.failures.lock().expect("runtime health lock poisoned").insert(condition_type, condition);
+    }
+
+    fn clear_controller_loop_stall(&self, name: &str) {
+        self.failures.lock().expect("runtime health lock poisoned").remove(&format!("ControllerLoop/{name}"));
     }
 
     fn report_projection_parity(&self, condition: Option<HostCondition>) {
@@ -3290,6 +3309,7 @@ fn spawn_controller_loops(
     macro_rules! controller {
         ($primary:ty, $make_parts:expr) => {{
             let make_parts = $make_parts;
+            let loop_health = runtime_health.clone();
             spawn_resource_controller::<$primary, _, _>(
                 backend.clone(),
                 namespace_string.clone(),
@@ -3304,7 +3324,20 @@ fn spawn_controller_loops(
                         resync_interval: controller_resync_interval,
                         backend,
                     };
-                    async move { controller.run().await }
+                    let heartbeat = Arc::new(AtomicU64::new(0));
+                    let health = loop_health.clone();
+                    async move {
+                        let watchdog = spawn_controller_loop_watchdog(
+                            <$primary>::API_PATHS.kind,
+                            Arc::clone(&heartbeat),
+                            controller_resync_interval,
+                            health.clone(),
+                        );
+                        let result = controller.run_with_heartbeat(heartbeat).await;
+                        watchdog.abort();
+                        health.clear_controller_loop_stall(<$primary>::API_PATHS.kind);
+                        result
+                    }
                 },
             )
         }};
@@ -3482,6 +3515,31 @@ fn spawn_controller_loops(
             }
         }),
     ]
+}
+
+fn spawn_controller_loop_watchdog(
+    name: &'static str,
+    heartbeat: Arc<AtomicU64>,
+    interval: Duration,
+    health: RuntimeHealth,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        let mut last_value = heartbeat.load(Ordering::Relaxed);
+        let mut last_progress = tokio::time::Instant::now();
+        loop {
+            ticker.tick().await;
+            let value = heartbeat.load(Ordering::Relaxed);
+            if value != last_value {
+                last_value = value;
+                last_progress = tokio::time::Instant::now();
+                health.clear_controller_loop_stall(name);
+            } else if last_progress.elapsed() >= interval.saturating_mul(2) {
+                health.report_controller_loop_stall(name, last_progress.elapsed());
+            }
+        }
+    })
 }
 
 fn spawn_aggregator_task(
@@ -5042,6 +5100,24 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {
+        let health = RuntimeHealth::default();
+        let heartbeat = Arc::new(AtomicU64::new(1));
+        let watchdog = spawn_controller_loop_watchdog("TestPrimary", Arc::clone(&heartbeat), Duration::from_millis(10), health.clone());
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(health.conditions().await.iter().any(|condition| condition.condition_type == "ControllerLoop/TestPrimary"));
+        heartbeat.fetch_add(1, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(!health.conditions().await.iter().any(|condition| condition.condition_type == "ControllerLoop/TestPrimary"));
+        watchdog.abort();
+    }
 
     #[tokio::test]
     async fn agent_launch_reads_grants_from_its_own_vessel_pin() {

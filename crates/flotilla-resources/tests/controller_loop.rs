@@ -19,10 +19,7 @@ use flotilla_resources::{
     VesselSpec,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    sync::{mpsc, Notify},
-    time::timeout,
-};
+use tokio::{sync::Notify, time::timeout};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrimaryResource;
@@ -421,7 +418,7 @@ impl flotilla_resources::controller::SecondaryWatch for RestartingSecondaryWatch
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        _sender: mpsc::Sender<String>,
+        _sender: flotilla_resources::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             self.spawns.fetch_add(1, Ordering::SeqCst);
@@ -448,7 +445,7 @@ impl flotilla_resources::controller::SecondaryWatch for ExpiringSecondaryWatch {
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        _sender: mpsc::Sender<String>,
+        _sender: flotilla_resources::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
             let spawn = self.spawns.fetch_add(1, Ordering::SeqCst);
@@ -465,6 +462,72 @@ impl flotilla_resources::controller::SecondaryWatch for ExpiringSecondaryWatch {
 #[derive(Clone)]
 struct FailingSecondaryWatch;
 
+#[derive(Clone)]
+struct FloodingSecondaryWatch {
+    sent: Arc<AtomicUsize>,
+}
+
+impl flotilla_resources::controller::SecondaryWatch for FloodingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: flotilla_resources::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            loop {
+                sender.send("alpha".to_string()).await.map_err(|_| ResourceError::other("queue closed"))?;
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BlockingFirstReconciler {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    first: Arc<AtomicBool>,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for BlockingFirstReconciler {
+    type Resource = PrimaryResource;
+    type Prepared = ();
+
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if obj.metadata.name == "alpha" && self.first.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _: &Self::Prepared,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
 impl flotilla_resources::controller::SecondaryWatch for FailingSecondaryWatch {
     type Primary = PrimaryResource;
 
@@ -476,7 +539,7 @@ impl flotilla_resources::controller::SecondaryWatch for FailingSecondaryWatch {
         self: Box<Self>,
         _backend: ResourceBackend,
         _namespace: String,
-        _sender: mpsc::Sender<String>,
+        _sender: flotilla_resources::controller::WorkQueueSender,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async { Err(ResourceError::other("secondary watch failed")) })
     }
@@ -886,6 +949,65 @@ async fn duplicate_secondary_events_for_the_same_primary_are_deduped_per_burst()
     assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["alpha".to_string()]);
 
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("create alpha");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let sent = Arc::new(AtomicUsize::new(0));
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    let waiting = entered.notified();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: vec![Box::new(FloodingSecondaryWatch { sent: Arc::clone(&sent) })],
+            reconciler: BlockingFirstReconciler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: Arc::new(AtomicBool::new(true)),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_millis(10),
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(1), waiting).await.expect("alpha should enter prepare");
+    timeout(Duration::from_secs(1), async {
+        while sent.load(Ordering::SeqCst) < 128 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary flood should fill the queue");
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "one".to_string() }).await.expect("create beta");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    release.notify_one();
+    timeout(Duration::from_secs(1), async {
+        while !reconciled.lock().expect("reconciled lock").contains(&"beta".to_string()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resync and beta must keep progressing under a hot alpha watch");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn work_queue_enqueues_each_name_only_once() {
+    let (sender, mut receiver) = flotilla_resources::controller::WorkQueueSender::channel();
+    for _ in 0..256 {
+        sender.send("alpha".to_string()).await.expect("enqueue alpha");
+    }
+    sender.send("beta".to_string()).await.expect("enqueue beta");
+    assert_eq!(receiver.try_recv().expect("alpha queued"), "alpha");
+    assert_eq!(receiver.try_recv().expect("beta queued"), "beta");
+    assert!(receiver.try_recv().is_err(), "duplicate alpha must not occupy queue space");
 }
 
 #[tokio::test]
