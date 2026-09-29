@@ -1,0 +1,27 @@
+Store a crew artifact from a file path. The daemon reads the file; pass a path, not inline content.
+
+Kinds: explainer (change explanation), decision-ledger (choices and alternatives), review-round (one review verdict), brief (handoff context), review-bundle (durable review evidence), recording, test-report, raw-test-output (bulky, short-retention evidence).
+
+Prefer Markdown for prose; self-contained HTML is also supported. --about names the exact subject, such as a commit or review round. --summary records small scalar facts for workflow conditions; keep detailed prose in the file.
+
+Usage: flotilla artifact put [OPTIONS] --kind <KIND> --about <ABOUT> <FILE>
+
+Arguments:
+  <FILE>
+
+
+Options:
+      --kind <KIND>
+
+
+      --about <ABOUT>
+
+
+      --summary <SUMMARY>
+
+
+      --json
+          Output as JSON instead of human-readable text
+
+  -h, --help
+          Print help (see a summary with '-h')

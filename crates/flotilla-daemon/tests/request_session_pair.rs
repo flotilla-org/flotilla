@@ -604,7 +604,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     let source = workspace.path().join("source.bin");
     let destination = workspace.path().join("result.bin");
     tokio::fs::write(&source, &bytes).await.expect("write crew source");
-    let (address, digest) = topology
+    let (address, digest, view_url) = topology
         .client
         .artifact_put(
             "review-round".into(),
@@ -615,7 +615,11 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         )
         .await
         .expect("put through dispatcher and remote home");
-    assert_eq!(topology.client.artifact_get(digest.clone(), destination.clone()).await.expect("get local body"), bytes.len() as u64);
+    assert_eq!(view_url, None);
+    assert_eq!(
+        topology.client.artifact_get(digest.clone(), destination.clone()).await.expect("get local body"),
+        (bytes.len() as u64, None)
+    );
     assert_eq!(tokio::fs::read(&destination).await.expect("read crew destination"), bytes);
     assert!(leader.resource_backend().using::<Artifact>(namespace).list().await.expect("leader artifacts").items.is_empty());
     let home_artifacts = follower.resource_backend().using::<Artifact>(namespace).list().await.expect("home artifacts");
@@ -627,7 +631,10 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .replace(&home_artifacts, Utc::now())
         .await
         .expect("deliver envelope replica");
-    assert_eq!(topology.client.artifact_get(address.clone(), destination.clone()).await.expect("get by address"), bytes.len() as u64);
+    assert_eq!(
+        topology.client.artifact_get(address.clone(), destination.clone()).await.expect("get by address"),
+        (bytes.len() as u64, None)
+    );
     assert_eq!(tokio::fs::read(&destination).await.expect("read crew destination"), bytes);
     assert_eq!(
         topology.client.artifact_list(Some(convoy.into()), Some("review-round".into()), None).await.expect("list artifacts").len(),

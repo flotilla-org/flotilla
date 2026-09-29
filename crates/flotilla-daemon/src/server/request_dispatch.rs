@@ -243,23 +243,33 @@ impl<'a> RequestDispatcher<'a> {
                             .await
                             .map_err(|_| "artifact home command timed out".to_string())??;
                             match result {
-                                CommandValue::ResourceObject(_) => {
-                                    Ok(Response::ArtifactPut { address: format!("artifact/{name}"), digest })
-                                }
+                                CommandValue::ResourceObject(_) => Ok(Response::ArtifactPut {
+                                    address: format!("artifact/{name}"),
+                                    view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
+                                    digest,
+                                }),
                                 CommandValue::Error { message } => Err(message),
                                 other => Err(format!("unexpected artifact home result: {other:?}")),
                             }
                         }
                         Some(_) => {
                             let object = service.put(caller, input, &settings.artifact_retention_days).await?;
-                            Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
+                            Ok(Response::ArtifactPut {
+                                address: format!("artifact/{}", object.metadata.name),
+                                view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
+                                digest: object.spec.digest,
+                            })
                         }
                         None => {
                             if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
                                 return Err("convoy home is unavailable for artifact put".to_string());
                             }
                             let object = service.put(caller, input, &settings.artifact_retention_days).await?;
-                            Ok(Response::ArtifactPut { address: format!("artifact/{}", object.metadata.name), digest: object.spec.digest })
+                            Ok(Response::ArtifactPut {
+                                address: format!("artifact/{}", object.metadata.name),
+                                view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
+                                digest: object.spec.digest,
+                            })
                         }
                     }
                 })
@@ -277,6 +287,16 @@ impl<'a> RequestDispatcher<'a> {
                     let namespace = self.daemon.provisioning_namespace().await;
                     let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
                     let session = service.caller_session(caller).await?;
+                    let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
+                    let artifact = service.artifact_for_reference(&reference).await?;
+                    let view_url = artifact
+                        .as_ref()
+                        .and_then(|artifact| flotilla_core::config::artifact_view_url(&artifact.spec, &stores))
+                        .or_else(|| {
+                            crate::blob_store::BlobDigest::parse(&reference)
+                                .ok()
+                                .and_then(|digest| flotilla_core::config::artifact_view_url_for_digest(digest.as_str(), &stores))
+                        });
                     let runner = self
                         .daemon
                         .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
@@ -285,7 +305,7 @@ impl<'a> RequestDispatcher<'a> {
                     let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
                     let size = service.get_to_file(&reference, temporary.path()).await?;
                     runner.write_file_from(temporary.path(), &destination_path).await?;
-                    Ok::<_, String>(Response::ArtifactGet { size })
+                    Ok::<_, String>(Response::ArtifactGet { size, view_url })
                 })
                 .await;
                 match result {
@@ -300,9 +320,16 @@ impl<'a> RequestDispatcher<'a> {
                     let namespace = self.daemon.provisioning_namespace().await;
                     let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
                     let items = service.list(convoy.as_deref(), kind.as_deref(), subject.as_deref()).await?;
+                    let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
                     let items = items
                         .into_iter()
-                        .map(|item| serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string()))
+                        .map(|item| {
+                            let mut value = serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string())?;
+                            if let Some(url) = flotilla_core::config::artifact_view_url(&item.spec, &stores) {
+                                value["view_url"] = serde_json::Value::String(url);
+                            }
+                            Ok::<_, String>(value)
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok::<_, String>(Response::ArtifactList { items })
                 })

@@ -261,6 +261,10 @@ enum SubCommand {
 
 #[derive(clap::Subcommand)]
 enum ArtifactSubCommand {
+    /// Store a crew artifact from a file the daemon can read
+    #[command(
+        long_about = "Store a crew artifact from a file path. The daemon reads the file; pass a path, not inline content.\n\nKinds: explainer (change explanation), decision-ledger (choices and alternatives), review-round (one review verdict), brief (handoff context), review-bundle (durable review evidence), recording, test-report, raw-test-output (bulky, short-retention evidence).\n\nPrefer Markdown for prose; self-contained HTML is also supported. --about names the exact subject, such as a commit or review round. --summary records small scalar facts for workflow conditions; keep detailed prose in the file."
+    )]
     Put {
         #[arg(long)]
         kind: String,
@@ -1342,27 +1346,51 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
             let media_type = match file.extension().and_then(|value| value.to_str()).unwrap_or("") {
                 "json" => "application/json",
                 "md" => "text/markdown",
+                "html" | "htm" => "text/html",
                 "txt" | "log" => "text/plain",
                 "yaml" | "yml" => "application/yaml",
                 _ => "application/octet-stream",
             };
             let summary = summary.into_iter().collect();
-            let (address, digest) = daemon
+            let (address, digest, view_url) = daemon
                 .artifact_put(kind, about.unwrap_or_default(), summary, media_type.to_string(), source_path)
                 .await
                 .map_err(|error| color_eyre::eyre::eyre!(error))?;
             match format {
-                OutputFormat::Json => println!("{}", serde_json::json!({"address": address, "digest": digest})),
-                OutputFormat::Human => println!("{address}\n{digest}"),
+                OutputFormat::Json => {
+                    let mut value = serde_json::json!({"address": address, "digest": digest});
+                    if let Some(url) = view_url {
+                        value["view_url"] = url.into();
+                    }
+                    println!("{value}");
+                }
+                OutputFormat::Human => {
+                    println!("{address}\n{digest}");
+                    if let Some(url) = view_url {
+                        println!("{url}");
+                    }
+                }
             }
         }
         ArtifactSubCommand::Get { reference, output } => {
             let path = output.unwrap_or_else(|| PathBuf::from(reference.rsplit('/').next().unwrap_or(&reference)));
             let destination = if path.is_absolute() { path.clone() } else { std::env::current_dir()?.join(&path) };
-            let size = daemon.artifact_get(reference.clone(), destination).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
+            let (size, view_url) =
+                daemon.artifact_get(reference.clone(), destination).await.map_err(|error| color_eyre::eyre::eyre!(error))?;
             match format {
-                OutputFormat::Json => println!("{}", serde_json::json!({"path": path, "size": size})),
-                OutputFormat::Human => println!("{}", path.display()),
+                OutputFormat::Json => {
+                    let mut value = serde_json::json!({"path": path, "size": size, "address": reference});
+                    if let Some(url) = view_url {
+                        value["view_url"] = url.into();
+                    }
+                    println!("{value}");
+                }
+                OutputFormat::Human => {
+                    println!("{}\n{reference}", path.display());
+                    if let Some(url) = view_url {
+                        println!("{url}");
+                    }
+                }
             }
         }
         ArtifactSubCommand::List { convoy, kind, about } => {
@@ -1372,13 +1400,14 @@ async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: Ou
                 OutputFormat::Human => {
                     for item in items {
                         println!(
-                            "artifact/{}\t{}\t{}\t{}\t{}\t{}",
+                            "artifact/{}\t{}\t{}\t{}\t{}\t{}\t{}",
                             item["metadata"]["name"].as_str().unwrap_or("?"),
                             item["spec"]["convoy"].as_str().unwrap_or("?"),
                             item["spec"]["producer"].as_str().unwrap_or("?"),
                             item["spec"]["kind"].as_str().unwrap_or("?"),
                             item["spec"]["subject"].as_str().unwrap_or("?"),
                             item["spec"]["digest"].as_str().unwrap_or("?"),
+                            item["view_url"].as_str().unwrap_or(""),
                         );
                     }
                 }
@@ -3413,6 +3442,13 @@ mod tests {
             "brief.md"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn artifact_put_help_snapshot() {
+        let help = Cli::try_parse_from(["flotilla", "artifact", "put", "--help"]).err().expect("help exits parsing").to_string();
+        let normalized = help.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") + "\n";
+        assert_eq!(normalized, include_str!("../tests/snapshots/artifact_put_help.txt"));
     }
 
     #[test]

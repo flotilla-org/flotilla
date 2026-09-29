@@ -811,6 +811,21 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    output.push_str("\nArtifacts:\n");
+    if explanation.artifacts.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        for artifact in &explanation.artifacts {
+            let _ = writeln!(
+                output,
+                "  - {}: {}{}",
+                artifact.kind,
+                artifact.address,
+                artifact.view_url.as_ref().map_or_else(String::new, |url| format!(" {url}"))
+            );
+        }
+    }
+
     output.push_str("\nDecision ledgers:\n");
     if explanation.decision_ledgers.is_empty() {
         output.push_str("  (no settlement claims)\n");

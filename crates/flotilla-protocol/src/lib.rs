@@ -161,11 +161,11 @@ pub(crate) mod test_helpers {
 pub use commands::{
     AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
     CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction,
-    EvidenceFreshness, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger,
-    ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork,
-    ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector,
-    ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
-    ResourceRecordType, StallReason, StepStatus,
+    EvidenceFreshness, ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery,
+    ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription,
+    ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace,
+    RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, StallReason, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
@@ -377,9 +377,13 @@ pub enum Response {
     ArtifactPut {
         address: String,
         digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_url: Option<String>,
     },
     ArtifactGet {
         size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_url: Option<String>,
     },
     ArtifactList {
         items: Vec<serde_json::Value>,

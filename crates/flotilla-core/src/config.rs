@@ -385,6 +385,58 @@ pub struct BlobStoreConfig {
     pub credential_file: PathBuf,
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// Public viewer root, including the bucket and object prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_base_url: Option<String>,
+}
+
+/// The external form of an artifact. Keep URL construction here so callers do
+/// not depend on the current S3 object layout.
+pub fn artifact_view_url(artifact: &flotilla_resources::ArtifactSpec, stores: &[BlobStoreConfig]) -> Option<String> {
+    artifact_view_url_for_digest(&artifact.digest, stores)
+}
+
+/// Used when a caller has a digest reference before its artifact envelope arrives.
+pub fn artifact_view_url_for_digest(digest: &str, stores: &[BlobStoreConfig]) -> Option<String> {
+    stores.iter().find_map(|store| {
+        let base = store.view_base_url.as_deref()?;
+        let url = url::Url::parse(base).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Some(format!("{}/{}", base.trim_end_matches('/'), digest))
+    })
+}
+
+#[cfg(test)]
+mod artifact_view_url_tests {
+    use super::*;
+
+    #[test]
+    fn configured_view_url_and_absent_url() {
+        let artifact = flotilla_resources::ArtifactSpec::builder()
+            .convoy("convoy".into())
+            .producer("coder".into())
+            .kind("explainer".into())
+            .subject("head".into())
+            .digest("abc123".into())
+            .size(1)
+            .media_type("text/markdown".into())
+            .expires_at(chrono::Utc::now())
+            .build();
+        let mut store = BlobStoreConfig {
+            endpoint: "https://storage.example.test".into(),
+            bucket: "artifacts".into(),
+            region: "us-east-1".into(),
+            prefix: "fleet".into(),
+            credential_file: "credentials.json".into(),
+            allow_insecure_http: false,
+            view_base_url: None,
+        };
+        assert_eq!(artifact_view_url(&artifact, &[store.clone()]), None);
+        store.view_base_url = Some("https://artifacts.example.test/artifacts/fleet/".into());
+        assert_eq!(artifact_view_url(&artifact, &[store]), Some("https://artifacts.example.test/artifacts/fleet/abc123".into()));
+    }
 }
 
 fn default_blob_store_region() -> String {

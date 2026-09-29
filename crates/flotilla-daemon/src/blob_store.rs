@@ -48,6 +48,9 @@ impl BlobDigest {
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String>;
+    async fn put_with_media_type(&self, bytes: &[u8], _media_type: &str) -> Result<BlobDigest, String> {
+        self.put(bytes).await
+    }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String>;
     async fn has(&self, digest: &BlobDigest) -> Result<bool, String>;
     async fn delete(&self, digest: &BlobDigest) -> Result<(), String>;
@@ -55,6 +58,11 @@ pub trait BlobStore: Send + Sync {
     async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
         let bytes = tokio::fs::read(path).await.map_err(|error| error.to_string())?;
         let digest = self.put(&bytes).await?;
+        Ok((digest, bytes.len() as u64))
+    }
+    async fn put_file_with_media_type(&self, path: &Path, media_type: &str) -> Result<(BlobDigest, u64), String> {
+        let bytes = tokio::fs::read(path).await.map_err(|error| error.to_string())?;
+        let digest = self.put_with_media_type(&bytes, media_type).await?;
         Ok((digest, bytes.len() as u64))
     }
 
@@ -425,6 +433,16 @@ impl BlobStore for S3BlobStore {
         Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
         Ok(digest)
     }
+    async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
+        let digest = BlobDigest::of(bytes);
+        let mut request = self.signed_request(reqwest::Method::PUT, &digest, Some(bytes))?;
+        request
+            .headers_mut()
+            .insert(reqwest::header::CONTENT_TYPE, media_type.parse().map_err(|error| format!("invalid media type: {error}"))?);
+        let response = self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await?;
+        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
+        Ok(digest)
+    }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
         let response = self.request(reqwest::Method::GET, digest, None).await?;
         if response.status() == http::StatusCode::NOT_FOUND {
@@ -469,6 +487,7 @@ pub struct TieredBlobStore {
     local: Arc<LocalBlobStore>,
     fleet: Vec<FleetTarget>,
     markers: PathBuf,
+    media_types: PathBuf,
     wake: Notify,
     inventory: Mutex<SyncInventory>,
     sync_lock: Mutex<()>,
@@ -503,6 +522,7 @@ impl TieredBlobStore {
             local: Arc::new(LocalBlobStore::new(state_dir)),
             fleet,
             markers: state_dir.join("blob-sync"),
+            media_types: state_dir.join("blob-media-types"),
             wake: Notify::new(),
             inventory: Mutex::new(SyncInventory::default()),
             sync_lock: Mutex::new(()),
@@ -521,6 +541,29 @@ impl TieredBlobStore {
     }
     fn marker(&self, id: &str, digest: &BlobDigest) -> PathBuf {
         self.markers.join(id).join(digest.as_str())
+    }
+    async fn record_media_type(&self, digest: &BlobDigest, media_type: &str) -> Result<(), String> {
+        tokio::fs::create_dir_all(&self.media_types).await.map_err(|error| error.to_string())?;
+        let path = self.media_types.join(digest.as_str());
+        if tokio::fs::try_exists(&path).await.map_err(|error| error.to_string())? {
+            return Ok(());
+        }
+        let temp = self.media_types.join(format!(".{}-{}.tmp", digest.as_str(), uuid::Uuid::new_v4()));
+        let result = async {
+            use tokio::io::AsyncWriteExt;
+            let mut file =
+                tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await.map_err(|error| error.to_string())?;
+            file.write_all(media_type.as_bytes()).await.map_err(|error| error.to_string())?;
+            file.sync_all().await.map_err(|error| error.to_string())?;
+            match tokio::fs::hard_link(&temp, &path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        .await;
+        let _ = tokio::fs::remove_file(temp).await;
+        result
     }
     pub async fn status(&self) -> BlobSyncStatus {
         self.inventory.lock().await.status()
@@ -569,6 +612,7 @@ impl TieredBlobStore {
                 if let Err(error) = self.local.delete(&digest).await {
                     failures.push(format!("local {}: {error}", digest.as_str()));
                 } else {
+                    let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
                     let mut inventory = self.inventory.lock().await;
                     inventory.known.remove(&digest);
                     inventory.pending.remove(&digest);
@@ -626,7 +670,15 @@ impl TieredBlobStore {
                 let result = async {
                     let bytes = self.local.get(&digest).await?.ok_or_else(|| format!("local blob {} disappeared", digest.0))?;
                     if !target.store.has(&digest).await? {
-                        let remote_digest = target.store.put(&bytes).await?;
+                        let media_type = match tokio::fs::read_to_string(self.media_types.join(digest.as_str())).await {
+                            Ok(media_type) => Some(media_type),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(error) => return Err(format!("read blob media type: {error}")),
+                        };
+                        let remote_digest = match media_type.as_deref() {
+                            Some(media_type) if !media_type.is_empty() => target.store.put_with_media_type(&bytes, media_type).await?,
+                            _ => target.store.put(&bytes).await?,
+                        };
                         if remote_digest != digest {
                             return Err("fleet store returned wrong digest".into());
                         }
@@ -710,8 +762,23 @@ impl BlobStore for TieredBlobStore {
         Ok(digest)
     }
 
+    async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
+        let digest = BlobDigest::of(bytes);
+        self.record_media_type(&digest, media_type).await?;
+        self.put(bytes).await
+    }
+
     async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
         let (digest, size) = digest_file(path).await?;
+        let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
+        self.local.write_file(&digest, path).await?;
+        self.queue_new(&digest, was_present, None).await;
+        Ok((digest, size))
+    }
+
+    async fn put_file_with_media_type(&self, path: &Path, media_type: &str) -> Result<(BlobDigest, u64), String> {
+        let (digest, size) = digest_file(path).await?;
+        self.record_media_type(&digest, media_type).await?;
         let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
         self.local.write_file(&digest, path).await?;
         self.queue_new(&digest, was_present, None).await;
@@ -792,6 +859,7 @@ impl BlobStore for TieredBlobStore {
     }
     async fn delete(&self, digest: &BlobDigest) -> Result<(), String> {
         self.local.delete(digest).await?;
+        let _ = tokio::fs::remove_file(self.media_types.join(digest.as_str())).await;
         {
             let mut inventory = self.inventory.lock().await;
             inventory.known.remove(digest);
@@ -822,6 +890,7 @@ mod tests {
             prefix: String::new(),
             credential_file: PathBuf::from("missing-credentials.json"),
             allow_insecure_http,
+            view_base_url: None,
         };
         for endpoint in ["http://localhost:9000", "http://127.25.1.2:9000", "http://[::1]:9000"] {
             assert!(validate_config_transport(&config(endpoint, false)).is_ok(), "{endpoint}");
@@ -851,6 +920,45 @@ mod tests {
         assert_eq!(tiered.sync_once().await.expect("sync").pending_count, 0);
         tiered.put(b"concurrent duplicate").await.expect("repeat put");
         assert_eq!(tiered.status().await.pending_count, 0);
+    }
+
+    struct TypedFleet {
+        inner: MemoryBlobStore,
+        media_types: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BlobStore for TypedFleet {
+        async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
+            self.inner.put(bytes).await
+        }
+        async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
+            self.media_types.lock().await.push(media_type.to_string());
+            self.inner.put(bytes).await
+        }
+        async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
+            self.inner.get(digest).await
+        }
+        async fn has(&self, digest: &BlobDigest) -> Result<bool, String> {
+            self.inner.has(digest).await
+        }
+        async fn delete(&self, digest: &BlobDigest) -> Result<(), String> {
+            self.inner.delete(digest).await
+        }
+    }
+
+    #[tokio::test]
+    async fn tiered_store_preserves_first_media_type_across_restart() {
+        let state = tempfile::tempdir().expect("state dir");
+        let fleet = Arc::new(TypedFleet { inner: MemoryBlobStore::default(), media_types: Mutex::new(Vec::new()) });
+        let first = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        let digest = first.put_with_media_type(b"# Explainer", "text/markdown").await.expect("put");
+        first.put_with_media_type(b"# Explainer", "text/plain").await.expect("deduplicated put");
+        drop(first);
+        let restarted = TieredBlobStore::new(state.path(), vec![("fleet".into(), fleet.clone())]);
+        restarted.sync_once().await.expect("sync");
+        assert!(fleet.has(&digest).await.expect("fleet copy"));
+        assert_eq!(*fleet.media_types.lock().await, vec!["text/markdown"]);
     }
 
     #[tokio::test]
@@ -961,6 +1069,25 @@ mod tests {
     }
 
     struct FixedBodyHttp(Vec<u8>);
+
+    struct AssertContentTypeHttp;
+
+    #[async_trait]
+    impl HttpClient for AssertContentTypeHttp {
+        async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            assert_eq!(request.method(), reqwest::Method::PUT);
+            assert_eq!(request.headers().get(reqwest::header::CONTENT_TYPE).expect("content type"), "text/markdown");
+            http::Response::builder().status(http::StatusCode::OK).body(bytes::Bytes::new()).map_err(|error| error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_put_uses_artifact_media_type() {
+        let credentials = S3Credentials { access_key_id: "access".into(), secret_access_key: "secret".into(), session_token: None };
+        let store =
+            S3BlobStore::new("https://example.test", "artifacts", "fleet", credentials, Arc::new(AssertContentTypeHttp)).expect("S3 store");
+        assert_eq!(store.put_with_media_type(b"# Explainer", "text/markdown").await.expect("put"), BlobDigest::of(b"# Explainer"));
+    }
 
     #[async_trait]
     impl HttpClient for FixedBodyHttp {

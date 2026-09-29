@@ -24,10 +24,10 @@ fn artifact_requests_carry_paths_without_body_bytes() {
         matches!(serde_json::from_value::<Request>(encoded).expect("decode request"), Request::ArtifactPut { source_path, .. } if source_path == std::path::Path::new("/crew/report.bin"))
     );
 
-    let response = Response::ArtifactGet { size: 4 };
+    let response = Response::ArtifactGet { size: 4, view_url: None };
     let encoded = serde_json::to_value(&response).expect("serialize response");
     assert!(encoded["data"].get("body").is_none());
-    assert!(matches!(serde_json::from_value::<Response>(encoded).expect("decode response"), Response::ArtifactGet { size: 4 }));
+    assert!(matches!(serde_json::from_value::<Response>(encoded).expect("decode response"), Response::ArtifactGet { size: 4, .. }));
 }
 
 #[test]

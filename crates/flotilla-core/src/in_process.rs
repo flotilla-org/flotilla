@@ -27,8 +27,8 @@ use flotilla_protocol::{
     AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, Command, CommandAction, CommandValue,
     ConvoyDispatchRegard, ConvoyExplanation, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext,
     CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse, DispatchQueueRow, EntryOp, EnvironmentId, EvidenceFreshness,
-    ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
-    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger,
+    ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
     FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
     HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal,
@@ -13654,6 +13654,24 @@ impl InProcessDaemon {
             .or_else(|| pinned_workflow.as_ref().map(|workflow| workflow.object.spec.vessels.clone()))
             .unwrap_or_default();
 
+        let stores = self.config.load_daemon_config()?.blob_stores;
+        let mut artifacts = self
+            .resource_backend
+            .including_replicas::<flotilla_resources::Artifact>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .filter(|item| item.object.spec.convoy == convoy.metadata.name)
+            .map(|item| ExplainedArtifact {
+                kind: item.object.spec.kind.clone(),
+                address: format!("artifact/{}", item.object.metadata.name),
+                view_url: crate::config::artifact_view_url(&item.object.spec, &stores),
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
+
         Ok(ConvoyExplanation {
             namespace,
             convoy: name.to_string(),
@@ -13698,6 +13716,7 @@ impl InProcessDaemon {
             crew_deliveries,
             unclaimed_work,
             decision_ledgers,
+            artifacts,
             settlement,
             recent_events,
             lifecycle_mutations,
