@@ -5568,7 +5568,13 @@ impl InProcessDaemon {
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
         for mut kind in kinds {
-            let canonical_kind_host = flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref)?;
+            let canonical_kind_host = match flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref) {
+                Ok(host) => host,
+                Err(error) => {
+                    rejected.push(format!("{}: {error}", kind.metadata.name));
+                    continue;
+                }
+            };
             let host = hosts.iter().find(|host| canonical_kind_host.as_ref().is_some_and(|id| host.metadata.name == id.as_str()));
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
@@ -5611,15 +5617,22 @@ impl InProcessDaemon {
             {
                 Ok(placement) => {
                     let policy = placement.selected.as_ref().expect("pinned placement has a policy");
-                    let realization_matches = match (&kind.spec.realisation, &policy.spec.docker_per_vessel, &policy.spec.host_direct) {
+                    let policy_host_ref = match (&kind.spec.realisation, &policy.spec.docker_per_vessel, &policy.spec.host_direct) {
                         (flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. }, Some(docker), None) => {
-                            flotilla_resources::canonical_host_id(hosts.iter(), &docker.host_ref)? == canonical_kind_host
+                            Some(docker.host_ref.as_str())
                         }
-                        (flotilla_resources::FulfilmentRealisation::HostDirect, None, Some(direct)) => {
-                            flotilla_resources::canonical_host_id(hosts.iter(), &direct.host_ref)? == canonical_kind_host
-                        }
-                        _ => false,
+                        (flotilla_resources::FulfilmentRealisation::HostDirect, None, Some(direct)) => Some(direct.host_ref.as_str()),
+                        _ => None,
                     };
+                    let policy_host = match policy_host_ref.map(|host_ref| flotilla_resources::canonical_host_id(hosts.iter(), host_ref)) {
+                        Some(Ok(host)) => host,
+                        Some(Err(error)) => {
+                            rejected.push(format!("{}: {error}", kind.metadata.name));
+                            continue;
+                        }
+                        None => None,
+                    };
+                    let realization_matches = policy_host_ref.is_some() && policy_host == canonical_kind_host;
                     if !realization_matches {
                         rejected
                             .push(format!("{}: fulfilment kind and placement policy disagree on host or realisation", kind.metadata.name));

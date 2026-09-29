@@ -2190,7 +2190,13 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             .map(|strategy| strategy.host_ref.as_str())
             .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
         let Some(policy_host) = policy_host else { continue };
-        let canonical = canonical_host_id(&hosts.items, policy_host)?.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string());
+        let canonical = match canonical_host_id(&hosts.items, policy_host) {
+            Ok(id) => id.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string()),
+            Err(error) => {
+                warn!(policy = %policy.metadata.name, %policy_host, %error, "skipping ambiguous placement policy host");
+                continue;
+            }
+        };
         if canonical != host_ref {
             continue;
         }
@@ -2199,13 +2205,23 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             // matching snapshot policy is the proof of origin for cleanup;
             // leave the policy itself for existing convoy references.
             match kinds.get(&policy.metadata.name).await {
-                Ok(kind)
-                    if canonical_host_id(&hosts.items, &kind.spec.host_ref)?.is_some_and(|id| id.as_str() == host_ref)
-                        || kind.spec.host_ref == host_ref =>
-                {
-                    kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
+                Ok(kind) => {
+                    let matches = if kind.spec.host_ref == host_ref {
+                        true
+                    } else {
+                        match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+                            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+                            Err(error) => {
+                                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous snapshot kind host");
+                                false
+                            }
+                        }
+                    };
+                    if matches {
+                        kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
+                    }
                 }
-                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(format!("inspect snapshot fulfilment kind: {error}")),
             }
             continue;
@@ -2272,7 +2288,14 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
         if kind.metadata.deletion_timestamp.is_some() || kind.spec.host_ref == host_ref {
             continue;
         }
-        if canonical_host_id(&hosts.items, &kind.spec.host_ref)?.is_some_and(|id| id.as_str() == host_ref) {
+        let matches = match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+            Err(error) => {
+                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind host");
+                continue;
+            }
+        };
+        if matches {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds
@@ -2303,10 +2326,21 @@ async fn observe_fulfilment_facts(
     let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
     let mut kinds = Vec::new();
     for kind in all_kinds {
-        if kind.metadata.deletion_timestamp.is_none()
-            && (kind.spec.host_ref == host_ref
-                || canonical_host_id(&hosts.items, &kind.spec.host_ref)?.is_some_and(|id| id.as_str() == host_ref))
-        {
+        if kind.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let matches = if kind.spec.host_ref == host_ref {
+            true
+        } else {
+            match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+                Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+                Err(error) => {
+                    warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind during fact observation");
+                    continue;
+                }
+            }
+        };
+        if matches {
             kinds.push(kind);
         }
     }
@@ -11856,7 +11890,23 @@ mod tests {
             .create(&empty_meta(host_id), &HostSpec { display_name: "udder".into(), connection: Default::default() })
             .await
             .expect("seed host");
+        for name in ["collision-a", "collision-b"] {
+            backend
+                .clone()
+                .using::<Host>(NAMESPACE)
+                .create(&empty_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default() })
+                .await
+                .expect("seed ambiguous host");
+        }
         let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let ambiguous_policy = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "collision".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        policies.create(&empty_meta("a-collision"), &ambiguous_policy).await.expect("seed ambiguous policy");
         let spec = PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .host_direct(HostDirectPlacementPolicySpec {
@@ -11865,6 +11915,19 @@ mod tests {
             })
             .build();
         policies.create(&empty_meta("host-direct-udder"), &spec).await.expect("seed legacy policy");
+        let docker_spec = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: "udder".to_string(),
+                image: "crew:test".into(),
+                pull_policy: Default::default(),
+                agent_adapters: BTreeSet::new(),
+                default_cwd: None,
+                env: BTreeMap::new(),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            })
+            .build();
+        policies.create(&empty_meta("docker-udder"), &docker_spec).await.expect("seed legacy docker policy");
         let legacy_kind = FulfilmentKindSpec::from_policy(&spec, "linux").expect("valid legacy policy");
         backend
             .clone()
@@ -11878,6 +11941,15 @@ mod tests {
             .create(&empty_meta("orphan-udder"), &legacy_kind)
             .await
             .expect("seed standalone legacy kind");
+        backend
+            .clone()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta("a-collision"),
+                &FulfilmentKindSpec::from_policy(&ambiguous_policy, "linux").expect("valid ambiguous policy"),
+            )
+            .await
+            .expect("seed ambiguous kind");
         let previous =
             BTreeMap::from([("host-direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
         let runner = DiscoveryMockRunner::builder().build();
@@ -11897,6 +11969,7 @@ mod tests {
         .await
         .expect("observe legacy kind");
         assert!(facts.contains_key("host-direct-udder"), "display-name kind must receive host facts");
+        assert!(!facts.contains_key("a-collision"), "ambiguous kind must not block healthy facts");
 
         migrate_live_placement_policies(&backend, NAMESPACE, host_id, "linux").await.expect("migrate policy");
 
@@ -11906,6 +11979,16 @@ mod tests {
         assert_eq!(kind.spec.host_ref, host_id);
         let orphan = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("orphan-udder").await.expect("orphan kind exists");
         assert_eq!(orphan.spec.host_ref, host_id);
+        let docker = policies.get("docker-udder").await.expect("docker policy remains");
+        assert_eq!(docker.spec.docker_per_vessel.expect("docker policy").host_ref, host_id);
+        assert_eq!(
+            backend.clone().using::<FulfilmentKind>(NAMESPACE).get("docker-udder").await.expect("docker kind").spec.host_ref,
+            host_id
+        );
+        assert_eq!(
+            policies.get("a-collision").await.expect("ambiguous policy remains").spec.host_direct.expect("direct").host_ref,
+            "collision"
+        );
     }
 
     #[tokio::test]

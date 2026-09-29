@@ -4128,6 +4128,27 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         })
         .await
         .expect("host facts");
+    for name in ["collision-a", "collision-b"] {
+        hosts
+            .create(&test_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default() })
+            .await
+            .expect("ambiguous host");
+    }
+    placement_policy(&backend, "a-collision", "collision").await;
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &test_meta("a-collision"),
+            &FulfilmentKindSpec::builder()
+                .host_ref("collision".to_string())
+                .pool("passthrough".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::GuiSession]))
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("ambiguous kind");
     placement_policy(&backend, "udder-kind", "udder").await;
     backend
         .clone()
