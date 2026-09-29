@@ -1445,6 +1445,7 @@ mod tests {
                 r#ref: Some("fix/batch".to_string()),
                 project_ref: None,
                 adopted_checkout_refs: BTreeMap::new(),
+                subjects: Vec::new(),
                 issues: vec![issue("809", "First issue", "First issue body."), issue("810", "Second issue", "Second issue body.")],
                 change_request: Some(flotilla_resources::BoundChangeRequest {
                     id: "1071".to_string(),

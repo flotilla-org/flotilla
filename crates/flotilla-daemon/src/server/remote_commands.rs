@@ -31,6 +31,8 @@ use crate::{
 fn command_action_name(command: &Command) -> &'static str {
     match &command.action {
         CommandAction::ConvoyDelete { .. } => "convoy_delete",
+        CommandAction::ConvoyLink { .. } => "convoy_link",
+        CommandAction::ConvoyUnlink { .. } => "convoy_unlink",
         CommandAction::ConvoyAbandon { .. } => "convoy_abandon",
         CommandAction::ConvoyResume { .. } => "convoy_resume",
         CommandAction::CrewComplete { .. } => "crew_complete",
@@ -48,6 +50,8 @@ fn command_action_name(command: &Command) -> &'static str {
 fn command_subject(action: &CommandAction) -> String {
     match action {
         CommandAction::ConvoyDelete { namespace, name, .. }
+        | CommandAction::ConvoyLink { namespace, name, .. }
+        | CommandAction::ConvoyUnlink { namespace, name, .. }
         | CommandAction::ConvoyAbandon { namespace, name, .. }
         | CommandAction::ConvoyResume { namespace, name, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
@@ -292,6 +296,8 @@ impl RemoteCommandRouter {
                     CommandAction::ConvoyStart { .. }
                         | CommandAction::ConvoyCreate { .. }
                         | CommandAction::ConvoyDelete { .. }
+                        | CommandAction::ConvoyLink { .. }
+                        | CommandAction::ConvoyUnlink { .. }
                         | CommandAction::ConvoyAbandon { .. }
                         | CommandAction::ConvoyResume { .. }
                         | CommandAction::ConvoyWithdrawPendingBrief { .. }

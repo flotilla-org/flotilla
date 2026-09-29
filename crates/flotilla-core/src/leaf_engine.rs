@@ -11,14 +11,14 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     actor_obligation, admit_leaf, controller::SecondaryWatch, evaluate_leaf, expected_change_request_leaves, external_patches,
-    instantiate_exit, instantiate_turn_delivery, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest,
-    ChangeRequestLeafSubject, Checkout, CheckoutSpec, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase, Forge, HoldAct,
-    InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition,
-    StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
-    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    instantiate_exit, instantiate_turn_delivery, produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject,
+    ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject,
+    ConvoyPhase, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent,
+    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung,
+    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -1493,6 +1493,44 @@ impl ReconcilerWake {
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
             let mut controller_rows = HashSet::<(String, String)>::new();
+            let conflicts = produced_subject_conflicts(convoy);
+            if !conflicts.is_empty() {
+                let details = conflicts
+                    .into_iter()
+                    .map(|(left, right)| {
+                        let left_ref = left.internal().unwrap_or_else(|_| left.id.clone());
+                        let right_ref = right.internal().unwrap_or_else(|_| right.id.clone());
+                        format!("{left_ref} and {right_ref}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let created_at = convoy.metadata.creation_timestamp;
+                // One standing row carries all subject conflicts until the convoy lands.
+                desired.push(LeafSubscriptionRow {
+                    id: uuid::Uuid::nil(),
+                    namespace: namespace.to_string(),
+                    leaves: vec![Leaf {
+                        address: LeafAddress::Convoy { name: convoy.metadata.name.clone() },
+                        field_path: ".status.phase".into(),
+                        operator: LeafOperator::Equal,
+                        literal: "Landed".into(),
+                    }],
+                    watcher: LeafWatcher::ReconcilerWake { convoy: convoy.metadata.name.clone() },
+                    maker: LeafMaker::Controller {
+                        resource_kind: "ConvoySubjects".into(),
+                        name: Some(convoy.metadata.name.clone()),
+                        retry: ControllerRetry::terminal(
+                            None,
+                            created_at,
+                            format!("conflicting produced change requests {details}; link one as supersedes or unlink one"),
+                        ),
+                        ceiling: RetryCeiling::default(),
+                    },
+                    freshness_demand: None,
+                    created_at,
+                    episode_key: EpisodeKeyFields::default(),
+                });
+            }
             let checkouts = select_convoy_children(convoy, &checkout_sources);
             for checkout in checkouts.values() {
                 let CheckoutSpec::Worktree(spec) = &checkout.spec else { continue };

@@ -27,6 +27,7 @@ fn workflow_template_spec() -> WorkflowTemplateSpec {
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     ConvoySpec {
+        subjects: Vec::new(),
         role: String::new(),
         generation: 1,
         workflow_ref: workflow_ref.to_string(),

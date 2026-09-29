@@ -186,6 +186,8 @@ pub struct ConvoySummary {
     pub project_ref: Option<String>,
     #[builder(default)]
     pub issues: Vec<wire::ConvoyIssueRow>,
+    #[builder(default)]
+    pub subjects: Vec<wire::ConvoySubjectRow>,
     pub change_request: Option<wire::ConvoyChangeRequest>,
     pub vessels: Vec<VesselSummary>,
     pub started_at: Option<Timestamp>,
@@ -214,6 +216,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             repo_hint: row.repo.clone(),
             project_ref: row.project_ref.clone(),
             issues: row.issues.clone(),
+            subjects: row.subjects.clone(),
             change_request: row.change_request.clone(),
             vessels: row.vessels.iter().map(|vessel| vessel_summary(row, vessel)).collect(),
             started_at: row.started_at,

@@ -8790,6 +8790,7 @@ mod tests {
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
             .create(&empty_meta("remote-placement"), &ConvoySpec {
+                subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,
                 workflow_ref: workflow_name.to_string(),
@@ -11120,6 +11121,7 @@ mod tests {
                     ]))
                     .build(),
                 &ConvoySpec {
+                    subjects: Vec::new(),
                     role: "convoy-a".to_string(),
                     generation: 1,
                     workflow_ref: "wf-a".to_string(),

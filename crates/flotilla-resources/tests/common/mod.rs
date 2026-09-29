@@ -95,6 +95,8 @@ pub fn convoy_spec(workflow_ref: &str) -> RealConvoySpec {
 
 pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus {
     RealConvoyStatus {
+        unlinked_subjects: Vec::new(),
+        subjects: Vec::new(),
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -205,6 +207,7 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
 
 pub fn valid_convoy_spec() -> RealConvoySpec {
     RealConvoySpec {
+        subjects: Vec::new(),
         role: String::new(),
         generation: 1,
         workflow_ref: "review-and-fix".to_string(),
@@ -319,6 +322,8 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     ]);
 
     RealConvoyStatus {
+        unlinked_subjects: Vec::new(),
+        subjects: Vec::new(),
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -423,6 +428,8 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let crew_work = BTreeMap::from([("implement".to_string(), BTreeMap::new()), ("review".to_string(), BTreeMap::new())]);
 
     RealConvoyStatus {
+        unlinked_subjects: Vec::new(),
+        subjects: Vec::new(),
         stalled: None,
         provisioning: None,
         placement_decision: None,

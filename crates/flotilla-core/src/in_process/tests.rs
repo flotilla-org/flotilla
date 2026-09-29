@@ -1017,7 +1017,11 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         daemon.resolve_convoy_change_request(std::slice::from_ref(&repository_key), "governor", None).await.expect("resolve Forgejo PR");
     assert_eq!(
         resolved,
-        Some(ConvoyChangeRequest { id: "17".to_string(), status: flotilla_protocol::ChangeRequestStatus::Open, repository_key })
+        Some(ConvoyChangeRequest {
+            id: "17".to_string(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key: repository_key.clone(),
+        })
     );
     let resolved =
         daemon.resolve_convoy_change_request(std::slice::from_ref(&remote_key), "governor", None).await.expect("resolve remote by host");
@@ -1029,6 +1033,87 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
             repository_key: remote_key
         })
     );
+
+    let second_url = "https://forgejo.lab.flotilla.work/robert/other";
+    let second_repository = RepositorySpec::remote(second_url).expect("second repository").on_forge(&forge).expect("forge identity");
+    let second_key = second_repository.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&test_meta(&second_key.to_string()), &second_repository)
+        .await
+        .expect("second repository");
+    let convoy_spec = ConvoySpec::builder()
+        .workflow_ref("workflow".to_string())
+        .repositories(vec![
+            ConvoyRepositorySpec {
+                url: "https://forgejo.lab.flotilla.work/robert/ghostty-ops".into(),
+                repo_ref: repository_key.clone(),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "ghostty-ops".into(),
+                subpaths: Vec::new(),
+            },
+            ConvoyRepositorySpec {
+                url: second_url.into(),
+                repo_ref: second_key,
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "other".into(),
+                subpaths: Vec::new(),
+            },
+        ])
+        .r#ref("governor".to_string())
+        .build();
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    convoys.create(&test_meta("multi-repo"), &convoy_spec).await.expect("convoy");
+    daemon.discover_convoy_branch_subjects("flotilla", "multi-repo", "governor").await.expect("branch discovery");
+    let convoy = convoys.get("multi-repo").await.expect("convoy after discovery");
+    assert_eq!(convoy.status.as_ref().expect("status").subjects.len(), 2);
+    assert!(convoy
+        .status
+        .as_ref()
+        .expect("status")
+        .subjects
+        .iter()
+        .all(|entry| entry.relationship == flotilla_protocol::Relationship::Produces));
+
+    let claim = crate::checkout_integration::change_request_subjects_from_claim(
+        "https://forgejo.lab.flotilla.work/robert/ghostty-ops/pulls/18",
+        &convoy.spec.repositories,
+        &[forge],
+    );
+    assert_eq!(claim.len(), 1);
+    flotilla_resources::apply_status_patch(&convoys, "multi-repo", &ConvoyStatusPatch::DiscoverSubjects {
+        subjects: vec![(claim[0].clone(), flotilla_protocol::Relationship::Produces)],
+        source: flotilla_resources::SubjectDiscoverySource::Claim,
+        at: Utc::now(),
+    })
+    .await
+    .expect("claim discovery");
+    let conflicted = convoys.get("multi-repo").await.expect("conflicted convoy");
+    assert_eq!(flotilla_resources::produced_subject_conflicts(&conflicted).len(), 1);
+    assert!(daemon
+        .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
+        .await
+        .expect_err("unknown GitHub repository must be rejected")
+        .contains("outside this convoy's repositories"));
+    assert!(daemon
+        .link_convoy_subject(
+            "flotilla",
+            "multi-repo",
+            "https://forgejo.lab.flotilla.work/robert/foreign/pulls/12",
+            Some(flotilla_protocol::Relationship::Produces)
+        )
+        .await
+        .expect_err("foreign Forgejo repository must be rejected")
+        .contains("outside this convoy's repositories"));
+    daemon
+        .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
+        .await
+        .expect("operator resolution");
+    let resolved = convoys.get("multi-repo").await.expect("resolved convoy");
+    assert!(flotilla_resources::produced_subject_conflicts(&resolved).is_empty());
 }
 
 #[test]
@@ -1338,7 +1423,17 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         let repository_key = repository.key();
         backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
         for id in ids {
-            let mut spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+            let mut spec = ConvoySpec::builder()
+                .workflow_ref("test".to_string())
+                .repositories(vec![ConvoyRepositorySpec {
+                    url: format!("{scheme}://github.com/{scope}"),
+                    repo_ref: repository_key.clone(),
+                    source_ref: "main".into(),
+                    target_ref: "main".into(),
+                    workspace_slug: scope.replace('/', "-"),
+                    subpaths: Vec::new(),
+                }])
+                .build();
             spec.change_request =
                 Some(BoundChangeRequest { id: id.to_string(), repository_ref: repository_key.clone(), title: format!("PR {id}") });
             backend.using::<ResourceConvoy>("flotilla").create(&test_meta(&format!("convoy-{id}")), &spec).await.expect("convoy");
@@ -1362,7 +1457,17 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
         .expect("first repository")
         .spec
         .key();
-    let mut spec = ConvoySpec::builder().workflow_ref("test".to_string()).build();
+    let mut spec = ConvoySpec::builder()
+        .workflow_ref("test".to_string())
+        .repositories(vec![ConvoyRepositorySpec {
+            url: "http://github.com/team/one".into(),
+            repo_ref: repository_key.clone(),
+            source_ref: "main".into(),
+            target_ref: "main".into(),
+            workspace_slug: "team-one".into(),
+            subpaths: Vec::new(),
+        }])
+        .build();
     spec.change_request = Some(BoundChangeRequest { id: "6".into(), repository_ref: repository_key, title: "PR 6".into() });
     backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-6"), &spec).await.expect("new convoy");
     daemon.change_request_observation_source.observe(first).await.expect("expanded batch");

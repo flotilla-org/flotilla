@@ -671,6 +671,19 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "is_false")]
         force: bool,
     },
+    ConvoyLink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        reference: String,
+        relationship: crate::Relationship,
+    },
+    ConvoyUnlink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        reference: String,
+    },
     ConvoyAbandon {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
@@ -944,6 +957,8 @@ impl Command {
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
+            CommandAction::ConvoyLink { .. } => "Linking convoy subject...",
+            CommandAction::ConvoyUnlink { .. } => "Unlinking convoy subject...",
             CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
             CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::ConvoyWithdrawPendingBrief { .. } => "Withdrawing pending convoy brief...",

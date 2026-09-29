@@ -42,8 +42,8 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, bound_change_request_record_name, capped_github_app_permissions,
-    change_request_address, change_request_record_name, controller::delete_lifecycle_owned_matching, ensure_repository,
-    evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
+    change_request_address, change_request_address_with_forges, change_request_record_name, controller::delete_lifecycle_owned_matching,
+    ensure_repository, evaluate_crew_completion, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
     external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas, list_resource_kind,
     list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec, repository_display_labels,
     resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
@@ -81,8 +81,8 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef},
     checkout_integration::{
-        checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
-        inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
+        change_request_subjects_from_claim, checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout,
+        inspect_checkout_integration, inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     daemon::{DaemonHandle, QuerySubscription},
@@ -4068,7 +4068,64 @@ impl InProcessDaemon {
     }
 
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
-        self.leaf_subscriptions.refresh_change_request_hint(hint).await
+        self.leaf_subscriptions.refresh_change_request_hint(hint).await?;
+        if hint.kind != flotilla_relay_protocol::SubjectKind::ChangeRequest {
+            return Ok(());
+        }
+        let subject = flotilla_protocol::ReferenceContext::default().parse(&hint.to_string())?;
+        let namespace = self.provisioning_namespace().await;
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+        for convoy in convoys.list().await.map_err(|error| error.to_string())?.items {
+            let matches_repository = convoy.spec.repositories.iter().any(|repository| {
+                change_request_address_with_forges(&repository.url, "1", &forges).ok().is_some_and(|address| {
+                    matches!(address, flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. }
+                        if service == subject.source.service && scope == subject.source.scope)
+                })
+            });
+            if !matches_repository {
+                continue;
+            }
+            if let Some(branch) = convoy.spec.r#ref.as_deref() {
+                if let Err(error) = self.discover_convoy_branch_subjects(&namespace, &convoy.metadata.name, branch).await {
+                    tracing::warn!(convoy = %convoy.metadata.name, %error, "relay hint branch discovery failed");
+                }
+            }
+            let refreshed = convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
+            let relationships = refreshed
+                .spec
+                .declared_subjects()?
+                .into_iter()
+                .filter(|entry| entry.subject == subject)
+                .map(|entry| entry.relationship)
+                .chain(
+                    refreshed
+                        .status
+                        .iter()
+                        .flat_map(|status| &status.subjects)
+                        .filter(|entry| entry.subject == subject)
+                        .map(|entry| entry.relationship),
+                )
+                .collect::<BTreeSet<_>>();
+            if !relationships.is_empty() {
+                apply_resource_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::DiscoverSubjects {
+                    subjects: relationships.into_iter().map(|relationship| (subject.clone(), relationship)).collect(),
+                    source: flotilla_resources::SubjectDiscoverySource::Relay,
+                    at: self.clock.now(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
@@ -4384,6 +4441,8 @@ impl InProcessDaemon {
     ) -> Result<Option<ExistingConvoyTarget>, String> {
         let (namespace, name) = match action {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyLink { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name }
@@ -4811,6 +4870,136 @@ impl InProcessDaemon {
             }
         }
         Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
+    }
+
+    /// Persist every branch-matching PR across the convoy's repositories.
+    /// Successful lookups are written even when another repository lookup fails;
+    /// the first error is returned after those writes.
+    pub async fn discover_convoy_branch_subjects(&self, namespace: &str, convoy_name: &str, branch: &str) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let mut subjects = Vec::new();
+        let mut errors = Vec::new();
+        for repository in &convoy.spec.repositories {
+            match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
+                Ok(Some(request)) => {
+                    let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
+                    if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
+                        subjects.push((subject, flotilla_protocol::Relationship::Produces));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => errors.push(error),
+            }
+        }
+        if !subjects.is_empty() {
+            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
+                subjects,
+                source: flotilla_resources::SubjectDiscoverySource::Branch,
+                at: self.clock.now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn convoy_reference_context(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<ResourceConvoy>,
+    ) -> Result<flotilla_protocol::ReferenceContext, String> {
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let project = if let Some(project_ref) = &convoy.spec.project_ref {
+            self.resource_backend.including_replicas::<Project>(namespace).get(project_ref).await.ok().map(|project| project.object)
+        } else {
+            None
+        };
+        let repositories = convoy
+            .spec
+            .repositories
+            .iter()
+            .filter_map(|repository| {
+                let address = change_request_address_with_forges(&repository.url, "1", &forges).ok()?;
+                let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
+                let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
+                let web_base = forges
+                    .iter()
+                    .find(|forge| forge.forge_id == service)
+                    .map(|forge| forge.https_url.clone())
+                    .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
+                let alias = project
+                    .as_ref()
+                    .and_then(|project| project.spec.repositories.iter().find(|candidate| candidate.repo == repository.repo_ref))
+                    .and_then(|repository| repository.alias.clone())
+                    .unwrap_or_else(|| scope.rsplit('/').next().unwrap_or(&scope).to_string());
+                Some(flotilla_protocol::RepositoryAlias {
+                    project: convoy.spec.project_ref.clone(),
+                    alias,
+                    source: flotilla_protocol::IssueSource { service: service.clone(), scope },
+                    web_base,
+                    forge_alias: (service != "github.com").then_some(service),
+                })
+            })
+            .collect();
+        Ok(flotilla_protocol::ReferenceContext { repositories })
+    }
+
+    pub async fn link_convoy_subject(
+        &self,
+        namespace: &str,
+        convoy_name: &str,
+        reference: &str,
+        relationship: Option<flotilla_protocol::Relationship>,
+    ) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let context = self.convoy_reference_context(namespace, &convoy).await?;
+        let subject = context.parse(reference)?;
+        if let Some(relationship) = relationship {
+            // Produced and adopted PRs participate in settlement. Reject a
+            // mistyped repository instead of adding an unobservable terminal leaf.
+            if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                && !context.repositories.iter().any(|repository| repository.source == subject.source)
+            {
+                return Err(format!("change request `{reference}` is outside this convoy's repositories"));
+            }
+            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
+                subjects: vec![(subject, relationship)],
+                source: flotilla_resources::SubjectDiscoverySource::Operator,
+                at: self.clock.now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        } else {
+            if convoy.spec.subjects.iter().any(|entry| entry.subject == subject) {
+                return Err("declared convoy subjects cannot be unlinked; change the convoy spec".to_string());
+            }
+            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::UnlinkSubject { subject })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Resolve the first change request whose head matches a convoy branch
@@ -6492,6 +6681,7 @@ impl InProcessDaemon {
             r#ref: Some(branch),
             project_ref: Some(project_ref.to_string()),
             adopted_checkout_refs: BTreeMap::new(),
+            subjects: Vec::new(),
             issues,
             change_request: change_request.map(|change_request| change_request.binding),
             instruction: intent.instruction.clone(),
@@ -10081,8 +10271,34 @@ impl InProcessDaemon {
                 && status.attention.as_ref().is_none_or(|attention| attention.state != TerminalAttentionState::Idle)
         });
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        let mut convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let claim_subjects = message
+            .as_deref()
+            .into_iter()
+            .flat_map(|text| change_request_subjects_from_claim(text, &convoy.spec.repositories, &forges))
+            .collect::<BTreeSet<_>>();
         ensure_crew_work_is_defined(&convoy, &context)?;
+        // Discovery is evidence, independent of whether this completion claim
+        // passes validation. Record it first so a newly named PR can satisfy
+        // readiness; the parser admits only this convoy's repositories.
+        if !claim_subjects.is_empty() {
+            convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
+                subjects: claim_subjects.iter().cloned().map(|subject| (subject, flotilla_protocol::Relationship::Produces)).collect(),
+                source: flotilla_resources::SubjectDiscoverySource::Claim,
+                at: self.clock.now(),
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        }
         let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
         let projected_ledger_ref =
             match self.resource_backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&ledger_name).await {
@@ -12464,6 +12680,41 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = match namespace {
+                Some(namespace) => namespace.clone(),
+                None => self.provisioning_namespace().await,
+            };
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => self.link_convoy_subject(&namespace, &record_name, reference, Some(*relationship)).await,
+                Err(error) => Err(error),
+            };
+            self.finish_context_free_command(
+                id,
+                empty_identity,
+                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
+            );
+            return Ok(id);
+        }
+        if let flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = match namespace {
+                Some(namespace) => namespace.clone(),
+                None => self.provisioning_namespace().await,
+            };
+            let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
+                Ok(record_name) => self.link_convoy_subject(&namespace, &record_name, reference, None).await,
+                Err(error) => Err(error),
+            };
+            self.finish_context_free_command(
+                id,
+                empty_identity,
+                result.map_or_else(|message| flotilla_protocol::CommandValue::Error { message }, |()| flotilla_protocol::CommandValue::Ok),
+            );
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
@@ -12925,6 +13176,7 @@ impl InProcessDaemon {
                 r#ref,
                 project_ref: project_ref.clone(),
                 adopted_checkout_refs,
+                subjects: Vec::new(),
                 issues: Vec::new(),
                 change_request: None,
                 instruction: None,

@@ -113,6 +113,55 @@ pub(crate) fn change_request_id_from_completion_message(message: &str, repositor
     })
 }
 
+/// Extract forge PR references carried by a crew claim or ledger text.
+/// Only repositories admitted to this convoy may become produced subjects.
+pub fn change_request_subjects_from_claim(
+    message: &str,
+    repositories: &[flotilla_resources::ConvoyRepositorySpec],
+    forges: &[flotilla_resources::ForgeSpec],
+) -> Vec<flotilla_protocol::Subject> {
+    let context = flotilla_protocol::ReferenceContext {
+        repositories: repositories
+            .iter()
+            .filter_map(|repository| {
+                let address = flotilla_resources::change_request_address_with_forges(&repository.url, "1", forges).ok()?;
+                let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
+                let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
+                let web_base = forges
+                    .iter()
+                    .find(|forge| forge.forge_id == service)
+                    .map(|forge| forge.https_url.clone())
+                    .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
+                let forge_alias = (service != "github.com").then(|| service.clone());
+                Some(flotilla_protocol::RepositoryAlias {
+                    project: None,
+                    alias: scope.rsplit('/').next()?.to_string(),
+                    source: flotilla_protocol::provider_data::IssueSource { service, scope },
+                    web_base,
+                    forge_alias,
+                })
+            })
+            .collect(),
+    };
+    let mut found = Vec::new();
+    for (start, _) in message.match_indices("https://").chain(message.match_indices("http://")) {
+        let tail = &message[start..];
+        let end = tail
+            .find(|character: char| character.is_whitespace() || matches!(character, ')' | ']' | '>' | '"' | '\''))
+            .unwrap_or(tail.len());
+        let reference = tail[..end].trim_end_matches(['.', ',', ';', ':']);
+        if let Ok(subject) = context.parse(reference) {
+            if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                && context.repositories.iter().any(|repository| repository.source == subject.source)
+                && !found.contains(&subject)
+            {
+                found.push(subject);
+            }
+        }
+    }
+    found
+}
+
 /// Inspect a checkout without claiming that a checkout-ref lookup covers its
 /// owning convoy. An absent change request therefore cannot produce Landed.
 pub async fn inspect_checkout_integration(
@@ -414,6 +463,42 @@ mod tests {
         providers::{testing::MockRunner, vcs::git_worktree::GitWorktreeStrategy},
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
+
+    #[test]
+    fn claim_links_a_pr_from_a_different_branch_and_forge() {
+        let repositories = vec![flotilla_resources::ConvoyRepositorySpec {
+            url: "https://forge.example/team/robert/project-map".into(),
+            repo_ref: flotilla_protocol::RepositoryKey("project-map".into()),
+            source_ref: "main".into(),
+            target_ref: "main".into(),
+            workspace_slug: "project-map".into(),
+            subpaths: Vec::new(),
+        }];
+        let forge = flotilla_resources::ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(flotilla_resources::ForgeKind::Forgejo)
+            .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
+            .https_url("https://forge.example/team".into())
+            .git_ssh_host("forge.example".into())
+            .build();
+        let subjects = change_request_subjects_from_claim(
+            "Published from another branch: [PR](https://forge.example/team/robert/project-map/pulls/12).",
+            &repositories,
+            &[forge],
+        );
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].internal().expect("internal reference"), "cr/lab/robert/project-map/12");
+        let subjects = change_request_subjects_from_claim("https://forge.example/team/other/repository/pulls/13", &repositories, &[
+            flotilla_resources::ForgeSpec::builder()
+                .forge_id("lab".into())
+                .kind(flotilla_resources::ForgeKind::Forgejo)
+                .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
+                .https_url("https://forge.example/team".into())
+                .git_ssh_host("forge.example".into())
+                .build(),
+        ]);
+        assert!(subjects.is_empty(), "a claim cannot produce a PR in an unadmitted repository");
+    }
 
     fn test_vcs(runner: Arc<MockRunner>) -> FlotillaVcs {
         FlotillaVcs::new(

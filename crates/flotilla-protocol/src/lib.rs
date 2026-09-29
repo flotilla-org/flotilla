@@ -22,6 +22,7 @@ pub mod resource_ref;
 pub mod result_set;
 pub mod snapshot;
 pub mod step;
+pub mod subject;
 pub mod view_address;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -44,6 +45,7 @@ pub use placement::{CanonicalHostId, PlacementDecision, PlacementRefusal, Placem
 pub use provisioning_target::ProvisioningTarget;
 pub use repository::{RepositoryKey, UNKNOWN_REPOSITORY_LABEL};
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
+pub use subject::{ReferenceContext, Relationship, RepositoryAlias, Subject, SubjectKind};
 pub use view_address::ViewAddress;
 
 /// Stable mesh identity for a daemon node.
