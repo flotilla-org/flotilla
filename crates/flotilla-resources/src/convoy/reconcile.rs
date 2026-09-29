@@ -663,8 +663,17 @@ impl Reconciler for ConvoyReconciler {
                         let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
                             continue;
                         };
-                        let canonical = crate::canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host)
-                            .map_err(ResourceError::decode)?;
+                        let canonical =
+                            match crate::canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
+                                Ok(canonical) => canonical,
+                                Err(error) => {
+                                    wait = Some(format!(
+                                        "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
+                                        selected.kind, selected.host
+                                    ));
+                                    break;
+                                }
+                            };
                         let host = canonical.and_then(|id| {
                             available_hosts
                                 .items

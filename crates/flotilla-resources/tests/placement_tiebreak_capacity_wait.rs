@@ -90,4 +90,17 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
     let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
     let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
     assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::SetStalled { condition: None })));
+
+    hosts
+        .create(&InputMeta::builder().name("another-host-id".to_string()).build(), &HostSpec {
+            display_name: "feta".to_string(),
+            connection: Default::default(),
+        })
+        .await
+        .expect("second host with same display name");
+    let prepared = reconciler.prepare(&convoy).await.expect("ambiguous host waits instead of failing prepare");
+    let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
+    let mut status = convoy.status.expect("convoy status");
+    outcome.patch.expect("ambiguity stall patch").apply(&mut status);
+    assert!(status.stalled.as_ref().is_some_and(|stall| stall.evidence.contains("ambiguous")));
 }
