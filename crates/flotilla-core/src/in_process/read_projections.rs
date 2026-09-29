@@ -2,6 +2,8 @@
 
 use super::*;
 
+/// Projects resource and fleet state supplied by the daemon and FleetService.
+/// Host refresh stays with the daemon; FleetService gathers local and replica rows.
 pub(super) struct ReadProjections<'a> {
     pub(super) backend: &'a ResourceBackend,
     pub(super) config: &'a ConfigStore,

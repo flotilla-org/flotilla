@@ -73,6 +73,7 @@ use flotilla_resources::{
     PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
+use read_projections::credential_refresh_alert_for_vessel;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -358,7 +359,6 @@ fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
 mod read_projections;
 #[cfg(test)]
 mod tests;
-use read_projections::credential_refresh_alert_for_vessel;
 
 #[derive(Default)]
 struct StaticEnvVars {
