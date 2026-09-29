@@ -90,6 +90,7 @@ use crate::{
     config::{ConfigStore, StaticEnvironmentConfig},
     daemon::{DaemonHandle, QuerySubscription},
     environment_manager::EnvironmentManager,
+    event_sink::{BroadcastEventSink, EventSink},
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
     fleet::{
@@ -2083,6 +2084,7 @@ pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
     event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     config: Arc<ConfigStore>,
     next_command_id: AtomicU64,
     node_id: NodeId,
@@ -2335,6 +2337,7 @@ impl InProcessDaemon {
         use crate::providers::discovery::DiscoveryResult;
 
         let (event_tx, _) = broadcast::channel(256);
+        let event_sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(event_tx.clone()));
         let mut repos: HashMap<flotilla_protocol::RepoIdentity, RepoState> = HashMap::new();
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
@@ -2484,7 +2487,7 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
         }
         let leaf_subscriptions =
-            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_tx.clone(), change_request_refresher, issue_refresher);
+            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher);
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
         let aggregator_projection_state = AggregatorProjectionState::new();
@@ -2492,6 +2495,7 @@ impl InProcessDaemon {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx: event_tx.clone(),
+            event_sink: event_sink.clone(),
             config: Arc::clone(&config),
             next_command_id: AtomicU64::new(1),
             node_id: local_node_id.clone(),
@@ -2527,6 +2531,7 @@ impl InProcessDaemon {
             aggregator_projection_state: aggregator_projection_state.clone(),
             provisioning_namespace: std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet: FleetService::new(
+                event_sink.clone(),
                 Arc::clone(&config),
                 resource_backend.clone(),
                 observed_resource_backend.clone(),
@@ -8779,6 +8784,7 @@ impl InProcessDaemon {
 
     fn read_projections(&self) -> read_projections::ReadProjections<'_> {
         read_projections::ReadProjections {
+            _event_sink: self.event_sink.clone(),
             backend: &self.resource_backend,
             config: &self.config,
             host_registry: &self.host_registry,
@@ -10284,6 +10290,7 @@ impl InProcessDaemon {
 
     fn attach_resolver(&self) -> AttachResolver<'_> {
         AttachResolver {
+            _event_sink: self.event_sink.clone(),
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             aggregator_projection_state: &self.aggregator_projection_state,
@@ -10679,6 +10686,7 @@ impl InProcessDaemon {
 
             let backend = self.resource_backend.clone();
             let event_tx = self.event_tx.clone();
+            let event_sink = self.event_sink.clone();
             let active_ref = Arc::clone(&self.active_commands);
             tokio::spawn(async move {
                 let result = run_resource_watch_command(
@@ -10693,7 +10701,7 @@ impl InProcessDaemon {
                         .command_id(id)
                         .node_id(command_node_id.clone())
                         .repo_identity(repo_identity.clone())
-                        .event_tx(event_tx.clone())
+                        .event_sink(event_sink)
                         .token(token)
                         .build(),
                 )
@@ -11696,6 +11704,7 @@ impl InProcessDaemon {
         let runner = Arc::clone(&self.discovery.runner);
         let env = Arc::clone(&self.discovery.env);
         let event_tx = self.event_tx.clone();
+        let event_sink = self.event_sink.clone();
         let (repo_identity, registry) = {
             let repos = self.repos.read().await;
             let identity =
@@ -11795,7 +11804,7 @@ impl InProcessDaemon {
                         repo_identity.clone(),
                         ExecutionEnvironmentPath::new(&repo_path),
                         token,
-                        event_tx.clone(),
+                        event_sink,
                         &resolver,
                         remote_executor.as_ref(),
                     )

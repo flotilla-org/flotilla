@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
 use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig},
+    event_sink::EventSink,
     in_process::canonical_placement_host_ref_from_sources,
     providers::{ChannelLabel, CommandRunner},
 };
@@ -70,6 +71,7 @@ impl FleetReplicaTransport for SshFleetReplicaTransport {
 }
 
 pub(crate) struct FleetService {
+    _event_sink: Arc<dyn EventSink>,
     config: Arc<ConfigStore>,
     resource_backend: ResourceBackend,
     observed_resource_backend: ResourceBackend,
@@ -83,7 +85,9 @@ pub(crate) struct FleetService {
 }
 
 impl FleetService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        event_sink: Arc<dyn EventSink>,
         config: Arc<ConfigStore>,
         resource_backend: ResourceBackend,
         observed_resource_backend: ResourceBackend,
@@ -94,6 +98,7 @@ impl FleetService {
     ) -> Self {
         let (fleet_replica_tx, _) = broadcast::channel(32);
         Self {
+            _event_sink: event_sink,
             config,
             resource_backend,
             observed_resource_backend,
@@ -821,6 +826,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("hosts.toml"), "[hosts.remote]\nhostname = 'remote.example'\n").expect("host config");
         let service = FleetService::new(
+            Arc::new(crate::event_sink::RecordingEventSink::default()),
             Arc::new(ConfigStore::with_base(temp.path())),
             ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()),
             ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::observed()),

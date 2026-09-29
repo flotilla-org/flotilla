@@ -1,6 +1,6 @@
 //! Resource watch and explain projections.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
@@ -12,8 +12,9 @@ use flotilla_resources::{
     ConditionValue, IntegrationCondition, ResourceBackend, ResourceError, ResourceProvenance, UnmetSettlementExpectation, WatchStart,
 };
 use futures::StreamExt;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+
+use crate::event_sink::EventSink;
 
 #[derive(bon::Builder)]
 pub(crate) struct ResourceWatchCommandContext {
@@ -27,7 +28,7 @@ pub(crate) struct ResourceWatchCommandContext {
     command_id: u64,
     node_id: NodeId,
     repo_identity: RepoIdentity,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     token: CancellationToken,
 }
 
@@ -73,7 +74,7 @@ pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandCont
             return CommandValue::Cancelled;
         }
         send_resource_watch_event(
-            &context.event_tx,
+            &context.event_sink,
             context.command_id,
             &context.node_id,
             &context.repo_identity,
@@ -81,7 +82,7 @@ pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandCont
         );
     }
     send_resource_watch_event(
-        &context.event_tx,
+        &context.event_sink,
         context.command_id,
         &context.node_id,
         &context.repo_identity,
@@ -110,7 +111,7 @@ pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandCont
                         };
                         if resource_record_matches_name(&record, context.name.as_deref()) {
                             send_resource_watch_event(
-                                &context.event_tx,
+                                &context.event_sink,
                                 context.command_id,
                                 &context.node_id,
                                 &context.repo_identity,
@@ -133,7 +134,7 @@ pub(crate) async fn run_resource_watch_command(context: ResourceWatchCommandCont
 }
 
 fn send_resource_watch_event(
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
     command_id: u64,
     node_id: &NodeId,
     repo_identity: &RepoIdentity,
@@ -144,7 +145,7 @@ fn send_resource_watch_event(
         response.records.first().map(|record| format!("{:?}", record.record_type)).unwrap_or_else(|| "CURRENT".to_string()),
         response.resource_kind
     );
-    let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+    event_sink.emit(DaemonEvent::CommandStepUpdate {
         command_id,
         node_id: node_id.clone(),
         repo_identity: repo_identity.clone(),

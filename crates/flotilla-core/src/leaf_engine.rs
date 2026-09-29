@@ -30,6 +30,7 @@ use tokio::{
 
 use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
+    event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
 };
 
@@ -115,7 +116,7 @@ pub struct LeafSubscriptionTable {
 
 struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
     unable_since: Mutex<HashMap<uuid::Uuid, (UnableEvidenceKey, DateTime<Utc>)>>,
@@ -158,33 +159,33 @@ fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
 }
 
 impl LeafSubscriptionTable {
-    pub fn new(backend: ResourceBackend, event_tx: broadcast::Sender<DaemonEvent>, change_requests: ChangeRequestRefresher) -> Self {
-        Self::with_episode_limit(backend, event_tx, change_requests, 3)
+    pub fn new(backend: ResourceBackend, event_sink: impl EventSink + 'static, change_requests: ChangeRequestRefresher) -> Self {
+        Self::with_episode_limit(backend, event_sink, change_requests, 3)
     }
 
     pub fn with_episode_limit(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: impl EventSink + 'static,
         change_requests: ChangeRequestRefresher,
         episode_limit: u32,
     ) -> Self {
         let issues =
             IssueRefresher::new(backend.clone(), "unavailable".into(), Arc::new(UnavailableIssues), IssueRefreshCadence::default());
-        Self::with_issues_and_episode_limit(backend, event_tx, change_requests, issues, episode_limit)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, episode_limit)
     }
 
     pub fn with_issues(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: impl EventSink + 'static,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
     ) -> Self {
-        Self::with_issues_and_episode_limit(backend, event_tx, change_requests, issues, 3)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, 3)
     }
 
     fn with_issues_and_episode_limit(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: impl EventSink + 'static,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
         episode_limit: u32,
@@ -193,7 +194,7 @@ impl LeafSubscriptionTable {
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
-                event_tx,
+                event_sink: Arc::new(event_sink),
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),
                 unable_since: Mutex::new(HashMap::new()),
@@ -507,7 +508,7 @@ impl LeafSubscriptionTable {
         match watcher {
             Some(LeafWatcher::WaitCaller { connection_id }) => {
                 fire.watcher_id = connection_id;
-                let _ = self.inner.event_tx.send(DaemonEvent::LeafFired(fire));
+                self.inner.event_sink.emit(DaemonEvent::LeafFired(fire));
                 self.finish(subscription_id).await;
             }
             Some(LeafWatcher::ReconcilerWake { convoy }) => {

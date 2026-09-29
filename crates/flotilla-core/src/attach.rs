@@ -23,6 +23,7 @@ impl FleetRowsSource for CachedFleetRows<'_> {
 }
 
 pub(super) struct AttachResolver<'a> {
+    pub(super) _event_sink: Arc<dyn crate::event_sink::EventSink>,
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,

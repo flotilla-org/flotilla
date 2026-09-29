@@ -5,11 +5,10 @@ use std::{
 
 use flotilla_protocol::{CommandValue, DaemonEvent, NodeId, RepoIdentity, StepStatus};
 pub use flotilla_protocol::{Step, StepAction, StepExecutionContext, StepOutcome};
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::path_context::ExecutionEnvironmentPath;
+use crate::{event_sink::EventSink, path_context::ExecutionEnvironmentPath};
 
 /// Resolves symbolic step actions into outcomes.
 #[async_trait::async_trait]
@@ -102,11 +101,11 @@ pub async fn run_step_plan(
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: impl EventSink + 'static,
     resolver: &dyn StepResolver,
 ) -> CommandValue {
     let remote_executor = UnsupportedRemoteStepExecutor;
-    run_step_plan_with_remote_executor(plan, command_id, local_host, repo_identity, repo, cancel, event_tx, resolver, &remote_executor)
+    run_step_plan_with_remote_executor(plan, command_id, local_host, repo_identity, repo, cancel, event_sink, resolver, &remote_executor)
         .await
 }
 
@@ -119,10 +118,11 @@ pub async fn run_step_plan_with_remote_executor(
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: impl EventSink + 'static,
     resolver: &dyn StepResolver,
     remote_executor: &dyn RemoteStepExecutor,
 ) -> CommandValue {
+    let event_sink: Arc<dyn EventSink> = Arc::new(event_sink);
     let step_count = plan.steps.len();
     info!(%command_id, %step_count, %local_host, "running step plan");
     let mut outcomes: Vec<StepOutcome> = Vec::new();
@@ -140,7 +140,7 @@ pub async fn run_step_plan_with_remote_executor(
 
         if step_target == local_host {
             emit_step_update(
-                &event_tx,
+                &event_sink,
                 command_id,
                 local_host.clone(),
                 repo_identity.clone(),
@@ -166,7 +166,7 @@ pub async fn run_step_plan_with_remote_executor(
                         _ => StepStatus::Succeeded,
                     };
                     emit_step_update(
-                        &event_tx,
+                        &event_sink,
                         command_id,
                         local_host.clone(),
                         repo_identity.clone(),
@@ -180,7 +180,7 @@ pub async fn run_step_plan_with_remote_executor(
                 }
                 Err(e) => {
                     emit_step_update(
-                        &event_tx,
+                        &event_sink,
                         command_id,
                         local_host.clone(),
                         repo_identity.clone(),
@@ -216,7 +216,7 @@ pub async fn run_step_plan_with_remote_executor(
                     repo: Some(repo.clone()),
                     step_offset: segment_start,
                     step_count,
-                    event_tx: event_tx.clone(),
+                    event_sink: event_sink.clone(),
                     state: Mutex::new(RemoteProgressState::default()),
                 });
                 let request = RemoteStepBatchRequest {
@@ -253,7 +253,7 @@ pub async fn run_step_plan_with_remote_executor(
                     Err(e) => {
                         if let Some(failure) = progress_sink.synthesized_failure(e.clone()) {
                             emit_step_update(
-                                &event_tx,
+                                &event_sink,
                                 command_id,
                                 target_host.clone(),
                                 repo_identity.clone(),
@@ -284,7 +284,7 @@ pub async fn run_step_plan_with_remote_executor(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_step_update(
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
     command_id: u64,
     host: NodeId,
     repo_identity: RepoIdentity,
@@ -295,7 +295,7 @@ fn emit_step_update(
     status: StepStatus,
 ) {
     debug!(%command_id, %host, step_index, step_count, %description, ?status, "emit_step_update");
-    let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+    event_sink.emit(DaemonEvent::CommandStepUpdate {
         command_id,
         node_id: host,
         repo_identity,
@@ -322,7 +322,7 @@ struct EventForwardingProgressSink {
     repo: Option<ExecutionEnvironmentPath>,
     step_offset: usize,
     step_count: usize,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     state: Mutex<RemoteProgressState>,
 }
 
@@ -365,7 +365,7 @@ impl RemoteStepProgressSink for EventForwardingProgressSink {
             }
         }
         emit_step_update(
-            &self.event_tx,
+            &self.event_sink,
             self.command_id,
             self.host.clone(),
             self.repo_identity.clone(),

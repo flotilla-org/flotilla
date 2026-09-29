@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use flotilla_protocol::qualified_path::{HostId, QualifiedPath};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use super::*;
 
@@ -773,7 +773,7 @@ async fn remote_progress_omits_repo_path_when_batch_context_missing() {
         repo: None,
         step_offset: 0,
         step_count: 1,
-        event_tx: tx,
+        event_sink: Arc::new(tx),
         state: std::sync::Mutex::new(RemoteProgressState::default()),
     };
 

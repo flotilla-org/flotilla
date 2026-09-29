@@ -5,6 +5,7 @@ use super::*;
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
 pub(super) struct ReadProjections<'a> {
+    pub(super) _event_sink: Arc<dyn crate::event_sink::EventSink>,
     pub(super) backend: &'a ResourceBackend,
     pub(super) config: &'a ConfigStore,
     pub(super) host_registry: &'a crate::host_registry::HostRegistry,

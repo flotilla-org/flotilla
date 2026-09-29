@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod data;
 pub mod demand_lifecycle;
 pub mod environment_manager;
+pub mod event_sink;
 pub mod executor;
 pub(crate) mod fleet;
 pub mod hop_chain;
