@@ -71,6 +71,7 @@ impl FleetReplicaTransport for SshFleetReplicaTransport {
 }
 
 pub(crate) struct FleetService {
+    // Retained for federation events introduced by later slices.
     _event_sink: Arc<dyn EventSink>,
     config: Arc<ConfigStore>,
     resource_backend: ResourceBackend,

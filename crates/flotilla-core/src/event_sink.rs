@@ -26,8 +26,9 @@ impl EventSink for BroadcastEventSink {
     }
 }
 
-// Allows existing callers that create a broadcast channel for tests to use the
-// same publishing port without changing their subscription setup.
+// Existing unit tests can keep their broadcast subscriptions while exercising
+// the new publishing port.
+#[cfg(test)]
 impl EventSink for broadcast::Sender<DaemonEvent> {
     fn emit(&self, event: DaemonEvent) {
         let _ = self.send(event);

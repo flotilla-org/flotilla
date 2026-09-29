@@ -4,6 +4,7 @@ use flotilla_protocol::qualified_path::{HostId, QualifiedPath};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use super::*;
+use crate::event_sink::RecordingEventSink;
 
 struct TestResolver {
     outcomes: std::sync::Mutex<Vec<Result<StepOutcome, String>>>,
@@ -137,6 +138,34 @@ async fn all_steps_succeed() {
         events.push(evt);
     }
     assert_eq!(events.len(), 4);
+}
+
+#[tokio::test]
+async fn step_progress_is_recorded_through_injected_sink() {
+    let sink = Arc::new(RecordingEventSink::default());
+    let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed)]);
+    let result = run_step_plan(
+        StepPlan::new(vec![make_step("step-a")]),
+        7,
+        local_node(),
+        RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        ExecutionEnvironmentPath::new("/repo"),
+        CancellationToken::new(),
+        sink.clone(),
+        &resolver,
+    )
+    .await;
+
+    assert_eq!(result, CommandValue::Ok);
+    let statuses = sink
+        .events()
+        .into_iter()
+        .map(|event| match event {
+            DaemonEvent::CommandStepUpdate { command_id: 7, status, .. } => status,
+            other => panic!("unexpected event: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, [StepStatus::Started, StepStatus::Succeeded]);
 }
 
 #[tokio::test]
