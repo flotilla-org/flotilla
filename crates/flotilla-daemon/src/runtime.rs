@@ -4783,8 +4783,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
         // A dead generation may retain a recording with the old ID. Keep that
         // recording for recovery and launch into the current generation under
-        // a fresh ID so cleat cannot resolve the name ambiguously.
-        let session_id = if is_agent_session && matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
+        // a fresh ID so cleat cannot resolve the name ambiguously. #2254
+        // tracks retention and cleanup of old-generation recordings.
+        let session_id = if matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
             format!("{name}-{}", uuid::Uuid::new_v4())
         } else {
             name.to_string()
