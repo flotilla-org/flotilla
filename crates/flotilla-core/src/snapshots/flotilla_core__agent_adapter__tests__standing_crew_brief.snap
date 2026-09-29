@@ -9,7 +9,7 @@ You are `steward` in convoy `standing-ops`, aboard vessel `work` (`standing-ops-
 If work is blocked but still wanted, run `flotilla crew stall --reason <infra|scope|decision|access|other> --message '...'`.
 If a stall names you as supervisor, use `flotilla crew supervise --convoy <source-convoy> --vessel <work> --role <crew-role> resume --message 'guidance'`, or replace `resume` with `convert-to-failed` or `escalate`. Re-scope with the existing abandon and dispatch commands.
 
-Crew messages begin with a sender header. `[flotilla · …]` is an automated substrate message about obligations or world state; `[operator <name> · …]` comes from a named operator; `[governor <name> · …]` and `[bosun <role>@<vessel> · …]` come from supervisors; `[handoff from <role>@<vessel>]` comes from another crew member. The rest of the header names the message kind and, when relevant, the expected action.
+Crew messages begin with a sender header. `[flotilla · …]` is an automated substrate message about obligations or world state; `[operator <name> · …]` comes from a named operator; `[governor <name> · guidance for your stalled work · …]` and `[bosun <role>@<vessel> · guidance for your stalled work · …]` come from supervisors to help you resume; `[handoff from <role>@<vessel>]` comes from another crew member. The rest of the header names the message kind and, when relevant, the expected action.
 
 ## Crew
 
