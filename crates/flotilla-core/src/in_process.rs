@@ -5567,8 +5567,12 @@ impl InProcessDaemon {
         }
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
-        for kind in kinds {
-            let host = hosts.iter().find(|host| host.metadata.name == kind.spec.host_ref);
+        for mut kind in kinds {
+            let canonical_kind_host = flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref)?;
+            let host = hosts.iter().find(|host| canonical_kind_host.as_ref().is_some_and(|id| host.metadata.name == id.as_str()));
+            if let Some(canonical_kind_host) = &canonical_kind_host {
+                kind.spec.host_ref = canonical_kind_host.to_string();
+            }
             let facts = host.and_then(|host| host.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
             let structurally_missing = needs
                 .iter()
@@ -5609,10 +5613,10 @@ impl InProcessDaemon {
                     let policy = placement.selected.as_ref().expect("pinned placement has a policy");
                     let realization_matches = match (&kind.spec.realisation, &policy.spec.docker_per_vessel, &policy.spec.host_direct) {
                         (flotilla_resources::FulfilmentRealisation::DockerPerVessel { .. }, Some(docker), None) => {
-                            docker.host_ref == kind.spec.host_ref
+                            flotilla_resources::canonical_host_id(hosts.iter(), &docker.host_ref)? == canonical_kind_host
                         }
                         (flotilla_resources::FulfilmentRealisation::HostDirect, None, Some(direct)) => {
-                            direct.host_ref == kind.spec.host_ref
+                            flotilla_resources::canonical_host_id(hosts.iter(), &direct.host_ref)? == canonical_kind_host
                         }
                         _ => false,
                     };

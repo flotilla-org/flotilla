@@ -2000,7 +2000,7 @@ fn replace_host_ids(value: &mut serde_json::Value, names: &std::collections::Has
     match value {
         serde_json::Value::String(text) => {
             if let Some(display_name) = names.get(text) {
-                *text = display_name.clone();
+                *text = format!("{display_name} ({text})");
             }
         }
         serde_json::Value::Array(values) => {
@@ -3218,8 +3218,8 @@ mod tests {
         });
         replace_host_ids(&mut value, &std::collections::HashMap::from([("01HXYZ".to_string(), "kiwi".to_string())]));
 
-        assert_eq!(value["spec"]["host_ref"], "kiwi");
-        assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi");
+        assert_eq!(value["spec"]["host_ref"], "kiwi (01HXYZ)");
+        assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi (01HXYZ)");
         assert_eq!(value["metadata"]["name"], "host-direct-01HXYZ");
     }
 

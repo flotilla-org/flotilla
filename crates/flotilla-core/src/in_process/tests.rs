@@ -4099,6 +4099,68 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
 }
 
 #[tokio::test]
+async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"canonical-admission-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("udder"),
+        backend.clone(),
+    )
+    .await;
+    let host_id = daemon.local_host_id().expect("host id").to_string();
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host =
+        hosts.create(&test_meta(&host_id), &HostSpec { display_name: "udder".into(), connection: Default::default() }).await.expect("host");
+    hosts
+        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            fulfilment_facts: BTreeMap::from([("udder-kind".into(), FulfilmentFacts {
+                gui_session_logged_in: true,
+                observed_at: Utc::now(),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        })
+        .await
+        .expect("host facts");
+    placement_policy(&backend, "udder-kind", "udder").await;
+    backend
+        .clone()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &test_meta("udder-kind"),
+            &FulfilmentKindSpec::builder()
+                .host_ref("udder".to_string())
+                .pool("passthrough".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::GuiSession]))
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+        )
+        .await
+        .expect("legacy kind");
+
+    let (placement, _) = daemon
+        .resolve_capability_placement(
+            "flotilla",
+            "project",
+            &[],
+            &WorkflowTemplateSpec::builder().vessels(Vec::new()).build(),
+            &BTreeSet::from([CapabilityNeed::GuiSession]),
+            &flotilla_protocol::ConvoyStartIntent::builder().project_ref("project".to_string()).build(),
+        )
+        .await
+        .expect("display-name kind should admit");
+    let allocation = placement.allocation.expect("allocation");
+    assert_eq!(allocation.candidates[0].host, host_id);
+    assert!(allocation.candidates[0].host_ready);
+}
+
+#[tokio::test]
 async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"fulfilment-join\"\n").expect("daemon config");
