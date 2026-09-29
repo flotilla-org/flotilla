@@ -1180,6 +1180,19 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
     let mut status = TerminalSessionStatus::default();
     patch.apply(&mut status);
     assert_eq!(status.delivered_message_id.as_deref(), Some("fresh-turn-message"));
+
+    let runtime_with_older_delivery =
+        flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Running(TerminalRuntimeState {
+            session_id: "cleat-session".into(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "codex".into(),
+            delivered_message_id: Some("older-message".into()),
+        });
+    let patch = reconciler.reconcile(&session, &runtime_with_older_delivery, Utc::now()).patch.expect("running patch");
+    patch.apply(&mut status);
+    assert_eq!(status.delivered_message_id.as_deref(), Some("fresh-turn-message"));
 }
 
 #[async_trait]

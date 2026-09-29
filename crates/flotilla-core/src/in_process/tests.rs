@@ -708,7 +708,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         panic!("governor guidance should be queued")
     };
     assert_eq!(guidance.sender, CrewMessageSender::Governor { name: "governor".to_string() });
-    assert!(guidance.text.starts_with("[governor governor · supervise the stalled crew]"));
+    assert!(guidance.text.starts_with("[governor governor · guidance for your stalled work · reply by running `crew complete`]"));
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
         .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {

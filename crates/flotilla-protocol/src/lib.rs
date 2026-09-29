@@ -166,6 +166,7 @@ impl CrewMessageSender {
 pub enum CrewMessageDelivery {
     #[default]
     Queued,
+    /// The framed message text is also the agent's launch brief, so startup delivered it.
     LaunchBrief,
 }
 

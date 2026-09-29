@@ -2,6 +2,6 @@
 source: crates/flotilla-core/src/in_process/tests.rs
 expression: "frame_crew_message(&sender, \"Example message.\")"
 ---
-[bosun reviewer@implement · supervise the stalled crew]
+[bosun reviewer@implement · guidance for your stalled work · reply by running `crew complete`]
 
 Example message.

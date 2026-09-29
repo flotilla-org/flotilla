@@ -2101,8 +2101,12 @@ fn crew_message_header(sender: &CrewMessageSender) -> String {
             "operator {} · follow-up brief · reply by running `crew complete`",
             principal.as_ref().map_or_else(|| "(unattributed)".to_string(), |principal| safe_header_value(&principal.name))
         ),
-        CrewMessageSender::Governor { name } => format!("governor {} · supervise the stalled crew", safe_header_value(name)),
-        CrewMessageSender::Bosun { name } => format!("bosun {} · supervise the stalled crew", safe_header_value(name)),
+        CrewMessageSender::Governor { name } => {
+            format!("governor {} · guidance for your stalled work · reply by running `crew complete`", safe_header_value(name))
+        }
+        CrewMessageSender::Bosun { name } => {
+            format!("bosun {} · guidance for your stalled work · reply by running `crew complete`", safe_header_value(name))
+        }
         CrewMessageSender::Handoff { from } => format!("handoff from {}", safe_header_value(from)),
     }
 }

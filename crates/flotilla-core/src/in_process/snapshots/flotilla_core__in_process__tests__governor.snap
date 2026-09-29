@@ -2,6 +2,6 @@
 source: crates/flotilla-core/src/in_process/tests.rs
 expression: "frame_crew_message(&sender, \"Example message.\")"
 ---
-[governor wheelhouse · supervise the stalled crew]
+[governor wheelhouse · guidance for your stalled work · reply by running `crew complete`]
 
 Example message.
