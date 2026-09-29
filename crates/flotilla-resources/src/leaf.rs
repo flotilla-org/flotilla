@@ -411,7 +411,7 @@ impl ChangeRequestLeafSubject<'_> {
                 if status.state.value == Some(crate::ObservedChangeRequestState::Merged) {
                     status.state.observed_at
                 } else {
-                    status.state.observed_at.min(status.checks.observed_at).min(status.mergeable.observed_at)
+                    status.state.observed_at.min(status.checks.observed_at)
                 }
             }
             _ => return None,
@@ -440,7 +440,7 @@ impl LeafSubject for ChangeRequestLeafSubject<'_> {
                 let merged = status.state.value == Some(crate::ObservedChangeRequestState::Merged);
                 let open = status.state.value == Some(crate::ObservedChangeRequestState::Open);
                 let checks_pass = status.checks.value == Some(crate::ObservedChecks::Pass);
-                let mergeable = status.mergeable.value == Some(crate::ObservedMergeability::Mergeable);
+                let mergeable = status.mergeable.value != Some(crate::ObservedMergeability::Conflicting);
                 (merged || (open && checks_pass && mergeable)).to_string()
             }
             ".state" => match status.state.value? {
@@ -589,6 +589,55 @@ mod tests {
             literal: "merged".to_string(),
         };
         assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::Unknown);
+    }
+
+    #[test]
+    fn ready_pr_with_unknown_mergeability_remains_ready_but_conflict_does_not() {
+        let observed_at = "2026-08-03T20:00:00Z".parse().expect("time");
+        let object = ResourceObject::<ChangeRequest> {
+            metadata: crate::ObjectMeta {
+                name: "cr".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: Default::default(),
+                annotations: Default::default(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: observed_at,
+                merge: None,
+            },
+            spec: crate::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("flotilla-org/flotilla".to_string())
+                .number(1363)
+                .observing_authority("feta".to_string())
+                .build(),
+            status: Some(crate::ChangeRequestStatus {
+                state: crate::Observation::known(crate::ObservedChangeRequestState::Open, observed_at),
+                head_sha: crate::Observation::known("abc".to_string(), observed_at),
+                checks: crate::Observation::known(crate::ObservedChecks::Pass, observed_at),
+                review: crate::ChangeRequestReviewObservation { actionable_at_head: crate::Observation::known(false, observed_at) },
+                mergeable: crate::Observation::unknown(DateTime::<Utc>::MIN_UTC),
+            }),
+        };
+        let leaf = Leaf {
+            address: LeafAddress::ChangeRequest {
+                service: "github.com".to_string(),
+                scope: "flotilla-org/flotilla".to_string(),
+                number: 1363,
+            },
+            field_path: ".ready".to_string(),
+            operator: LeafOperator::Equal,
+            literal: "true".to_string(),
+        };
+        let subject = ChangeRequestLeafSubject { change_request: &object, now: observed_at, stale_after: Duration::from_secs(180) };
+        assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::True);
+        let mut conflicting = object;
+        conflicting.status.as_mut().expect("status").mergeable =
+            crate::Observation::known(crate::ObservedMergeability::Conflicting, observed_at);
+        let subject = ChangeRequestLeafSubject { change_request: &conflicting, now: observed_at, stale_after: Duration::from_secs(180) };
+        assert_eq!(evaluate_leaf(&leaf, Some(&subject), None).expect("evaluate").result, ThreeValue::False);
     }
 
     #[test]

@@ -139,13 +139,19 @@ fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
     Some((work, role))
 }
 
+const DEFAULT_REFUSAL_LIMIT: u32 = 2;
+
+fn is_conflict_probe(leaf: &Leaf) -> bool {
+    leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
+}
+
 fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
     status
         .workflow_snapshot
         .as_ref()
         .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
         .and_then(|policy| policy.max_refusals)
-        .unwrap_or(2)
+        .unwrap_or(DEFAULT_REFUSAL_LIMIT)
         .max(1)
 }
 
@@ -539,11 +545,7 @@ impl LeafSubscriptionTable {
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
-        let active_conflict = status.phase == ConvoyPhase::Active
-            && claim_at.is_none()
-            && leaf.field_path == ".mergeable"
-            && leaf.operator == LeafOperator::Equal
-            && leaf.literal == "conflicting";
+        let active_conflict = status.phase == ConvoyPhase::Active && claim_at.is_none() && is_conflict_probe(leaf);
         let (subject_revision, evidence_at, brief) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
@@ -567,8 +569,7 @@ impl LeafSubscriptionTable {
                     _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
                 };
                 let brief = if active_conflict {
-                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.",
-                        rule.brief.replace("; the previous claim is superseded.", "."))
+                    format!("PR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.")
                 } else {
                     claim_at
                         .map(|claim_at| {
@@ -1221,8 +1222,8 @@ impl ReconcilerWake {
                         condition.rung = StallRung::Operator;
                         condition.evidence = format!(
                             "settlement claim refused {} times: {}",
-                            refusal.expect("checked above").consecutive_count,
-                            refusal.expect("checked above").expectation
+                            refusal.map_or(0, |refusal| refusal.consecutive_count),
+                            refusal.map_or("", |refusal| refusal.expectation.as_str())
                         );
                     } else if let Some(idle_at) = idle_at.filter(|_| declared.is_none()) {
                         let limit = status
@@ -1732,10 +1733,7 @@ impl ReconcilerWake {
                     }
                 }
                 for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
-                    if delivery.leaf.field_path != ".mergeable"
-                        || delivery.leaf.operator != LeafOperator::Equal
-                        || delivery.leaf.literal != "conflicting"
-                    {
+                    if !is_conflict_probe(&delivery.leaf) {
                         continue;
                     }
                     desired.push(LeafSubscriptionRow {

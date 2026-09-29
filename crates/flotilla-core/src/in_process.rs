@@ -10512,8 +10512,26 @@ impl InProcessDaemon {
             let checkout_sources =
                 self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
             let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
+            let requires_change_request = convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
+                .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
+                .is_some_and(|crew| {
+                    crew.completion_conditions.iter().any(|condition| {
+                        matches!(
+                            condition,
+                            flotilla_resources::CrewCompletionExpectation::Condition(
+                                flotilla_resources::CompletionCondition::ChangeRequest { .. }
+                            ) | flotilla_resources::CrewCompletionExpectation::Legacy(
+                                flotilla_resources::LegacyCompletionExpectation::ChangeRequestReady
+                            )
+                        )
+                    })
+                });
             let mut observation_errors = Vec::new();
-            {
+            if requires_change_request {
                 let mut subjects = BTreeSet::new();
                 for leaf in expected_change_request_leaves(&claim_convoy, &checkouts)? {
                     if let Some(subject) = crate::change_request_observer::ChangeRequestRef::from_address(namespace, &leaf.address) {

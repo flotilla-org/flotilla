@@ -1932,6 +1932,15 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     .expect("supervision escalation");
     assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
     task.abort();
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let restarted = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        turns.0.lock().expect("turns").iter().filter(|request| request.source == "conflicting").count(),
+        1,
+        "a persisted turn episode prevents duplicate Active conflict delivery after restart"
+    );
+    restarted.abort();
 }
 
 #[test]
