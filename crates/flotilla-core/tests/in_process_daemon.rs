@@ -6847,6 +6847,7 @@ async fn convoy_resume_queues_a_brief_while_crew_is_working() {
     assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["content"], "Check the edge case");
     assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["vessel"], "work");
     assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["role"], "coder");
+    assert_eq!(status["turn_deliveries"]["operator"]["pending_brief"]["sender"]["kind"], "operator-resume");
 
     let outcome = daemon
         .convoy_resume_internal("flotilla", "busy-convoy", "Use the newer instruction", Some("work"), Some("coder"))
@@ -7071,12 +7072,14 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
         panic!("review session should remain agent-backed")
     };
-    assert_eq!(review_message.expect("queued review delivery").text, "Start the review");
+    let review_message = review_message.expect("queued review delivery");
+    assert!(matches!(review_message.sender, flotilla_resources::CrewMessageSender::OperatorResume { .. }));
+    assert_eq!(review_message.text, "[operator (unattributed) · via convoy resume]\n\nStart the review");
     let coder_session = sessions.get("idle-coder-session").await.expect("read queued coder session");
     let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
         panic!("coder session should remain agent-backed")
     };
-    assert_eq!(coder_message.expect("queued coder delivery").text, "Start the next turn");
+    assert_eq!(coder_message.expect("queued coder delivery").text, "[operator (unattributed) · via convoy resume]\n\nStart the next turn");
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
@@ -7186,7 +7189,10 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     assert_eq!(status.crew_work["work"]["coder"].superseded_claims[0].disposition.as_deref(), Some("satisfied"));
     let session = sessions.get("coder-session").await.expect("read crew session");
     let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("crew session should be agent-backed") };
-    let message = message.expect("next turn message").text;
+    let message = message.expect("next turn message");
+    assert!(matches!(message.sender, flotilla_resources::CrewMessageSender::OperatorFollowUp { .. }));
+    let message = message.text;
+    assert!(message.starts_with("[operator (unattributed) · follow-up brief · reply by running `crew complete`]"), "{message}");
     assert!(message.contains("run `flotilla crew complete` again"), "{message}");
     assert!(message.ends_with("Begin the follow-up turn"), "{message}");
     assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Begin the follow-up turn"));

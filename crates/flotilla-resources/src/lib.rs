@@ -182,10 +182,11 @@ pub use review_bundle::{
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
-    terminal_session_attach_target, CrewCompletionPending, CrewSessionStatus, InnerCommandStatus, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy,
-    TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
+    terminal_session_attach_target, CrewCompletionPending, CrewMessageDelivery, CrewMessageSender, CrewSessionStatus, InnerCommandStatus,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalOccupancy, TerminalSession, TerminalSessionAttachTarget, TerminalSessionDegradedCondition, TerminalSessionIdentity,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    TerminalSessionTag,
 };
 pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{

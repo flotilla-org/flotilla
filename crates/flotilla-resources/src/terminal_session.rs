@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -93,6 +94,10 @@ pub struct TerminalSessionSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// Sender attribution increased this pre-existing agent variant beyond the lint's
+// size threshold. Boxing its brief or message would churn controller and runtime
+// interfaces for a local layout optimization; the stored wire shape is unchanged.
+#[allow(clippy::large_enum_variant)]
 pub enum TerminalSessionSource {
     Tool {
         command: String,
@@ -132,6 +137,14 @@ pub struct TerminalCrewContext {
 pub struct TerminalCrewMessage {
     pub id: String,
     pub text: String,
+    /// Sender attribution for surfaces and audit. The default decodes records
+    /// written before sender framing; remove after the next fleet roll.
+    #[serde(default)]
+    pub sender: CrewMessageSender,
+    /// Decodes queued messages stored before launch-brief attribution; remove
+    /// after the next fleet roll.
+    #[serde(default)]
+    pub delivery: CrewMessageDelivery,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

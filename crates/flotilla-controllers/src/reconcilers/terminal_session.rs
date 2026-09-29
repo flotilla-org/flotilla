@@ -6,12 +6,12 @@ use flotilla_protocol::{CanonicalHostId, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
-    Convoy, ConvoyPhase, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta, LifecycleAuthority,
-    OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta,
+    LifecycleAuthority, OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -243,6 +243,15 @@ pub enum TerminalPrepared {
     Failed(String),
 }
 
+fn launch_brief_message_id(source: &TerminalSessionSource) -> Option<&str> {
+    match source {
+        TerminalSessionSource::Agent { message: Some(message), .. } if message.delivery == CrewMessageDelivery::LaunchBrief => {
+            Some(&message.id)
+        }
+        _ => None,
+    }
+}
+
 impl<R> Reconciler for TerminalSessionReconciler<R>
 where
     R: TerminalRuntime + 'static,
@@ -407,7 +416,11 @@ where
                     started_at: state.started_at,
                     crew: state.crew.clone(),
                     launch_command: state.launch_command.clone(),
-                    delivered_message_id: state.delivered_message_id.clone(),
+                    // The launch brief was already delivered on startup; its explicit
+                    // marker supersedes a runtime id from an earlier attempt.
+                    delivered_message_id: launch_brief_message_id(&obj.spec.source)
+                        .map(str::to_string)
+                        .or_else(|| state.delivered_message_id.clone()),
                 }),
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })

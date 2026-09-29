@@ -65,6 +65,7 @@ pub struct TurnDeliveryRequest {
     pub role: String,
     pub brief: String,
     pub subject_revision: String,
+    pub sender: flotilla_resources::CrewMessageSender,
 }
 
 #[async_trait]
@@ -694,6 +695,7 @@ impl LeafSubscriptionTable {
             .role(rule.to.role.clone())
             .brief(brief)
             .subject_revision(subject_revision.clone())
+            .sender(flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() })
             .build();
         let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
         let now = Utc::now();
@@ -709,6 +711,7 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: claim_at,
                     outcome: TurnDeliveryOutcome::Refused { reason: reason.clone(), refused_at: now, hold_executed: true },
+                    sender: request.sender.clone(),
                 },
                 ConvoyAttention { source: source.to_string(), reason, raised_at: now },
             )
@@ -722,6 +725,7 @@ impl LeafSubscriptionTable {
                     evidence_at,
                     judged_claim_at: claim_at,
                     outcome: TurnDeliveryOutcome::Delivered { rung, delivered_at: now },
+                    sender: request.sender.clone(),
                 },
                 rule.to.vessel.clone(),
                 rule.to.role.clone(),
@@ -1213,6 +1217,7 @@ impl ReconcilerWake {
                                     .role(role.clone())
                                     .brief(brief)
                                     .subject_revision(now.timestamp_micros().to_string())
+                                    .sender(flotilla_resources::CrewMessageSender::FlotillaNudge)
                                     .build();
                                 match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&request).await {
                                     Ok(_) => condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() }),
@@ -1323,6 +1328,11 @@ impl ReconcilerWake {
                                     .role(target_role.clone())
                                     .brief(brief)
                                     .subject_revision(condition.began_at.timestamp_micros().to_string())
+                                    .sender(flotilla_resources::CrewMessageSender::FlotillaEscalation {
+                                        from: stalled_source_actor(&condition)
+                                            .map(|(vessel, role)| format!("{role}@{vessel}"))
+                                            .unwrap_or_else(|| convoy.metadata.name.clone()),
+                                    })
                                     .build();
                                 if convoys.contains_key(&target_convoy) {
                                     if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await
@@ -2767,6 +2777,7 @@ mod tests {
         let status = convoys.get("wake-turn").await.expect("convoy").status.expect("status");
         let episodes = &status.turn_deliveries[source].episodes;
         assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
+        assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() });
         assert!(matches!(episodes[0].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, .. }));
         assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::FreshAgent, .. }));
         assert!(matches!(episodes[3].outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }));

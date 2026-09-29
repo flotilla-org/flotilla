@@ -923,6 +923,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                         evidence_at: ts(30),
                         judged_claim_at: ts(20),
                         outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(30) },
+                        sender: Default::default(),
                     },
                     vessel: "implement".to_string(),
                     role: "coder".to_string(),
