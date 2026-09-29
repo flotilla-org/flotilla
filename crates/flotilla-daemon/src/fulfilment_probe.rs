@@ -71,22 +71,35 @@ async fn credential_fingerprint(runner: &dyn CommandRunner, env: &dyn EnvVars, s
         .or_else(|| env.get("HOME").map(|home| format!("{home}/.claude/.credentials.json")));
     if let Some(path) = credential_path {
         hash_field(&mut hash, "credential_path", &path);
+        // A keychain-only login has no file identity here; the seven-day
+        // cache backstop eventually rechecks it even when env is unchanged.
         if let Ok(contents) = runner.run("cat", &[&path], scratch, &ChannelLabel::Default).await {
             let parsed = serde_json::from_str::<serde_json::Value>(&contents).ok();
             let oauth = parsed.as_ref().and_then(|value| value.get("claudeAiOauth"));
-            // Access and refresh tokens rotate during the same login. The
-            // refresh-chain expiry and account fields identify the login
-            // without turning ordinary token refresh into a new probe input.
+            // Prefer account identity: access tokens, refresh tokens and
+            // sometimes refresh-chain expiry rotate during one login.
+            let field = |name: &str| oauth.and_then(|oauth| oauth.get(name)).or_else(|| parsed.as_ref().and_then(|root| root.get(name)));
             let mut found_identity = false;
-            for name in ["accountUuid", "organizationUuid", "refreshTokenExpiresAt", "subscriptionType", "scopes"] {
-                if let Some(value) = oauth.and_then(|oauth| oauth.get(name)).or_else(|| parsed.as_ref().and_then(|root| root.get(name))) {
+            for name in ["accountUuid", "organizationUuid"] {
+                if let Some(value) = field(name) {
                     hash_field(&mut hash, name, &value.to_string());
                     found_identity = true;
                 }
             }
             if !found_identity {
-                // Older or unexpected credential shapes have no stable
-                // metadata; content hashing still detects replacement.
+                // Older credentials omit account IDs. Expiry and account
+                // properties are the best available identity; a rotating
+                // expiry can still cause a re-probe, bounded by the budget.
+                for name in ["refreshTokenExpiresAt", "subscriptionType", "scopes"] {
+                    if let Some(value) = field(name) {
+                        hash_field(&mut hash, name, &value.to_string());
+                        found_identity = true;
+                    }
+                }
+            }
+            if !found_identity {
+                // Unknown legacy shapes use content hashing so a replaced
+                // login remains observable under the request ceiling.
                 hash_field(&mut hash, "legacy_credentials", &contents);
             }
         }
@@ -206,7 +219,13 @@ pub(crate) async fn probe_kind(
         }
         let mut observed = HarnessFacts { version, models: BTreeMap::new() };
         if *harness == "claude-code" {
-            let credential = credential_fingerprint(runner, env, scratch).await;
+            let credential = match spec.realisation {
+                FulfilmentRealisation::HostDirect => credential_fingerprint(runner, env, scratch).await,
+                // Docker receives neither the host credential file nor host
+                // auth environment. The inspected image ID identifies its
+                // bundled credential and execution environment.
+                FulfilmentRealisation::DockerPerVessel { .. } => "image-contained".to_string(),
+            };
             for model in declared_models(env) {
                 let key =
                     format!("{harness}:{}:{}:{credential}:{model}", observed.version, image_digest.as_deref().or(image).unwrap_or("host"));
@@ -345,17 +364,12 @@ mod tests {
                 Ok("OK".into()),
             )
             .build();
-        let docker_facts = probe_kind(
-            &docker_kind(),
-            Some("crew:test"),
-            true,
-            &image,
-            &env,
-            Path::new("/tmp/flotilla-probe-test"),
-            &mut ModelProbeState::default(),
-        )
-        .await
-        .expect("probe succeeds");
+        let mut image_probes = ModelProbeState::default();
+        let docker_facts =
+            probe_kind(&docker_kind(), Some("crew:test"), true, &image, &env, Path::new("/tmp/flotilla-probe-test"), &mut image_probes)
+                .await
+                .expect("probe succeeds");
+        assert!(image_probes.entries.keys().any(|key| key.contains("sha256:image-a:image-contained")));
         let direct = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
             .pool("cleat".to_string())
@@ -523,12 +537,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_token_refresh_does_not_change_credential_identity() {
+    async fn account_identity_ignores_rotating_oauth_tokens_and_expiry() {
         let path = "/tmp/probe-home/.claude/.credentials.json";
         let runner = DiscoveryMockRunner::builder()
-            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"first","refreshToken":"old","refreshTokenExpiresAt":2000,"subscriptionType":"max"}}"#.into()))
-            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"second","refreshToken":"new","refreshTokenExpiresAt":2000,"subscriptionType":"max"}}"#.into()))
-            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"third","refreshToken":"other","refreshTokenExpiresAt":3000,"subscriptionType":"max"}}"#.into()))
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"first","refreshToken":"old","refreshTokenExpiresAt":2000,"subscriptionType":"max","accountUuid":"account-a"}}"#.into()))
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"second","refreshToken":"new","refreshTokenExpiresAt":3000,"subscriptionType":"max","accountUuid":"account-a"}}"#.into()))
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"third","refreshToken":"other","refreshTokenExpiresAt":3000,"subscriptionType":"max","accountUuid":"account-b"}}"#.into()))
             .build();
         let env = TestEnvVars::new([("HOME", "/tmp/probe-home")]);
         let scratch = Path::new("/tmp/flotilla-state/probe-cwd");
