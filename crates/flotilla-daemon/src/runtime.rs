@@ -37,12 +37,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, watch_resource_kind,
-    watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase,
-    CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler,
-    ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch, ForgeIdentity,
-    FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
+    canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, is_prepared_snapshot,
+    watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
+    Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState,
+    ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
+    ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
     InputDefinition, InputMeta, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
     RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
@@ -50,7 +50,7 @@ use flotilla_resources::{
     AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
     CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
+    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::json;
@@ -2128,18 +2128,31 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
         backend.clone().using::<flotilla_resources::PlacementPolicy>(namespace).list().await.map_err(|error| error.to_string())?;
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
     for policy in policies.items {
-        if policy.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        if policy.metadata.annotations.contains_key(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION) {
-            continue;
-        }
         let policy_host = policy
             .spec
             .host_direct
             .as_ref()
             .map(|strategy| strategy.host_ref.as_str())
             .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
+        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
+            if policy_host != Some(host_ref) {
+                continue;
+            }
+            // Earlier migrations created kinds under frozen policy names. A
+            // matching snapshot policy is the proof of origin for cleanup;
+            // leave the policy itself for existing convoy references.
+            match kinds.get(&policy.metadata.name).await {
+                Ok(kind) if kind.spec.host_ref == host_ref => {
+                    kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
+                }
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(format!("inspect snapshot fulfilment kind: {error}")),
+            }
+            continue;
+        }
+        if policy.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
         if policy_host != Some(host_ref) {
             continue;
         }
@@ -11612,16 +11625,34 @@ mod tests {
             }
             policies.create(&empty_meta(name), &spec).await.expect("seed local policy");
         }
+        let snapshot_name = "placement-snapshot-012345abcdef";
+        let snapshot_spec = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "kiwi".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
         policies
             .create(
                 &InputMeta::builder()
-                    .name("prepared-placement-snapshot".to_string())
-                    .annotations(BTreeMap::from([(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), "true".to_string())]))
+                    .name(snapshot_name.to_string())
+                    .labels(BTreeMap::from([(
+                        flotilla_resources::PREPARED_SNAPSHOT_LABEL.to_string(),
+                        flotilla_resources::PLACEMENT_SNAPSHOT_KIND.to_string(),
+                    )]))
                     .build(),
-                &PlacementPolicySpec::builder().pool("cleat".to_string()).build(),
+                &snapshot_spec,
             )
             .await
             .expect("seed frozen placement snapshot");
+        let kinds = backend.clone().using::<FulfilmentKind>(NAMESPACE);
+        kinds
+            .create(&empty_meta(snapshot_name), &FulfilmentKindSpec::from_policy(&snapshot_spec, "linux").expect("valid frozen policy"))
+            .await
+            .expect("seed previously migrated snapshot kind");
+        let legacy_snapshot = "old-convoy-remote-placement-012345abcdef";
+        policies.create(&empty_meta(legacy_snapshot), &snapshot_spec).await.expect("seed legacy snapshot without label");
         let mut invalid = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
         invalid.host_direct =
             Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
@@ -11638,8 +11669,10 @@ mod tests {
         for host in ["feta", "kiwi", "udder"] {
             migrate_live_placement_policies(&backend, NAMESPACE, host, "linux").await.expect("migrate host policies");
         }
-        let kinds = backend.using::<FulfilmentKind>(NAMESPACE).list().await.expect("list kinds").items;
+        let kinds = kinds.list().await.expect("list kinds").items;
         assert_eq!(kinds.len(), 5);
+        assert!(kinds.iter().all(|kind| kind.metadata.name != snapshot_name));
+        assert!(kinds.iter().all(|kind| kind.metadata.name != legacy_snapshot));
         for kind in kinds {
             assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string())));
             if kind.metadata.name.starts_with("docker-") {
@@ -11649,7 +11682,7 @@ mod tests {
                 assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::GuiSession));
             }
         }
-        assert_eq!(policies.list().await.expect("policies stay for A1 admission").items.len(), 7);
+        assert_eq!(policies.list().await.expect("policies and snapshots stay for A1 admission").items.len(), 8);
     }
 
     #[tokio::test]
