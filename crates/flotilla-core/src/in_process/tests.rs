@@ -1885,7 +1885,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
         .expect("claim-time observation");
     assert_eq!(observed.status.expect("status").mergeable.value, Some(flotilla_resources::ObservedMergeability::Conflicting));
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1932,7 +1932,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     .expect("supervision escalation");
     assert_eq!(turns.0.lock().expect("turns").iter().filter(|request| request.source.starts_with("stall-nudge")).count(), 1);
     task.abort();
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     let restarted = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(

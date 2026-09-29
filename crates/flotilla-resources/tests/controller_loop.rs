@@ -984,7 +984,7 @@ async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
         }
     })
     .await
-    .expect("secondary flood should fill the queue");
+    .expect("secondary flood should exceed the old queue capacity");
     primaries.create(&primary_meta("beta"), &PrimarySpec { value: "one".to_string() }).await.expect("create beta");
     tokio::time::sleep(Duration::from_millis(20)).await;
     release.notify_one();
@@ -995,6 +995,48 @@ async fn flooded_secondary_queue_does_not_block_resync_or_other_primaries() {
     })
     .await
     .expect("resync and beta must keep progressing under a hot alpha watch");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn event_during_reconcile_requeues_the_same_name() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("create alpha");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    let waiting = entered.notified();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: BlockingFirstReconciler {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: Arc::new(AtomicBool::new(true)),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(1), waiting).await.expect("alpha should enter prepare");
+    let alpha = primaries.get("alpha").await.expect("get alpha");
+    primaries
+        .update(&InputMeta::from(&alpha.metadata), &alpha.metadata.resource_version, &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("update alpha during reconcile");
+    release.notify_one();
+    timeout(Duration::from_secs(1), async {
+        while reconciled.lock().expect("reconciled lock").iter().filter(|name| *name == "alpha").count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alpha should reconcile again after its in-flight update");
     harness.shutdown().await;
 }
 

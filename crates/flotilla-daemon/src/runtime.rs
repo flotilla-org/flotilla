@@ -3517,6 +3517,7 @@ fn spawn_controller_loops(
     ]
 }
 
+/// A long reconcile also stalls other names, so it counts as missing loop progress.
 fn spawn_controller_loop_watchdog(
     name: &'static str,
     heartbeat: Arc<AtomicU64>,

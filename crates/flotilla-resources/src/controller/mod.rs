@@ -207,6 +207,7 @@ impl WorkQueueSender {
         (Self { sender, queued: Arc::new(StdMutex::new(HashSet::new())) }, receiver)
     }
 
+    /// Enqueue completes without suspension; the async signature keeps watch producers uniform.
     pub async fn send(&self, name: String) -> Result<(), mpsc::error::SendError<String>> {
         let mut queued = self.queued.lock().expect("controller work queue lock poisoned");
         if queued.insert(name.clone()) {
