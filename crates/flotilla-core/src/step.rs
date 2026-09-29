@@ -101,7 +101,7 @@ pub async fn run_step_plan(
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
-    event_sink: impl EventSink + 'static,
+    event_sink: Arc<dyn EventSink>,
     resolver: &dyn StepResolver,
 ) -> CommandValue {
     let remote_executor = UnsupportedRemoteStepExecutor;
@@ -118,11 +118,10 @@ pub async fn run_step_plan_with_remote_executor(
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
-    event_sink: impl EventSink + 'static,
+    event_sink: Arc<dyn EventSink>,
     resolver: &dyn StepResolver,
     remote_executor: &dyn RemoteStepExecutor,
 ) -> CommandValue {
-    let event_sink: Arc<dyn EventSink> = Arc::new(event_sink);
     let step_count = plan.steps.len();
     info!(%command_id, %step_count, %local_host, "running step plan");
     let mut outcomes: Vec<StepOutcome> = Vec::new();

@@ -126,7 +126,7 @@ async fn all_steps_succeed() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -181,7 +181,7 @@ async fn step_failure_stops_execution() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -202,7 +202,7 @@ async fn cancellation_before_step() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -247,7 +247,7 @@ async fn cancellation_during_running_step_returns_cancelled() {
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel2,
-            tx,
+            Arc::new(tx),
             &resolver,
         )
         .await
@@ -273,7 +273,7 @@ async fn skipped_step_continues() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -299,7 +299,7 @@ async fn completed_with_overrides_result() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -322,7 +322,7 @@ async fn empty_plan_returns_ok() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -342,7 +342,7 @@ async fn symbolic_step_action_succeeds() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -368,7 +368,7 @@ async fn produced_does_not_override_final_result() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -394,7 +394,7 @@ async fn later_failure_preserves_earlier_completed_with() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
     )
     .await;
@@ -448,7 +448,7 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &PriorAssertingResolver,
         &remote,
     )
@@ -508,7 +508,7 @@ async fn remote_failure_stops_execution() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &PanicResolver,
         &remote,
     )
@@ -566,7 +566,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &PanicResolver,
         &remote,
     )
@@ -627,7 +627,7 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
         &remote,
     )
@@ -707,7 +707,7 @@ async fn remote_error_does_not_duplicate_failed_progress() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &PanicResolver,
         &remote,
     )
@@ -772,7 +772,7 @@ async fn remote_progress_maps_to_global_step_indices() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        tx,
+        Arc::new(tx),
         &resolver,
         &remote,
     )
@@ -875,7 +875,7 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            tx,
+            Arc::new(tx),
             &PanicResolver,
             &remote_clone,
         )
@@ -938,7 +938,7 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            tx,
+            Arc::new(tx),
             &PanicResolver,
             &remote_clone,
         )
@@ -999,7 +999,7 @@ async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_wait
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            tx,
+            Arc::new(tx),
             &TestResolver::new(vec![]),
             &remote,
         )

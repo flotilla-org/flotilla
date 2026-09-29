@@ -1,6 +1,6 @@
 //! Event publication port for in-process services.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use flotilla_protocol::DaemonEvent;
 use tokio::sync::broadcast;
@@ -26,8 +26,8 @@ impl EventSink for BroadcastEventSink {
     }
 }
 
-// Existing unit tests can keep their broadcast subscriptions while exercising
-// the new publishing port.
+// Unit tests keep their existing broadcast subscriptions while injecting the
+// publishing port into leaf and step execution.
 #[cfg(test)]
 impl EventSink for broadcast::Sender<DaemonEvent> {
     fn emit(&self, event: DaemonEvent) {
@@ -50,12 +50,6 @@ impl RecordingEventSink {
 impl EventSink for RecordingEventSink {
     fn emit(&self, event: DaemonEvent) {
         self.events.lock().expect("recording event sink lock poisoned").push(event);
-    }
-}
-
-impl<T: EventSink + ?Sized> EventSink for Arc<T> {
-    fn emit(&self, event: DaemonEvent) {
-        (**self).emit(event);
     }
 }
 
