@@ -17,7 +17,7 @@ use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url, clone_key,
-    controller::{Actuation, Reconciler},
+    controller::{Actuation, ControllerLoop, Reconciler},
     ensure_repository, interactive_single_workflow_spec, patch_resource_annotation, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
@@ -36,6 +36,88 @@ const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
 const GIT_REF: &str = "feat/task-provisioning";
 const HOST_REF: &str = "01HXYZ";
+
+#[tokio::test]
+async fn landed_convoy_does_not_recreate_a_missing_checkout() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-landed", "implement", REPO_URL, GIT_REF).await;
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let mut status = convoy.status.expect("convoy status");
+    status.phase = ConvoyPhase::Landed;
+    convoys.update_status("convoy-landed", &convoy.metadata.resource_version, &status).await.expect("mark landed");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-landed", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-landed").await;
+    let vessel =
+        create_workspace(&backend, NAMESPACE, "convoy-landed-implement", "convoy-landed", "implement", "policy-landed", REPO_URL).await;
+
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let prepared = reconciler.prepare(&vessel).await.expect("landed vessel dependencies");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    assert!(outcome.actuations.is_empty(), "landed convoy still desires checkout provisioning");
+
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let mut harness = common::ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: vessels,
+            secondaries: VesselReconciler::secondary_watches(),
+            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    assert!(checkouts.list().await.expect("list checkouts").items.is_empty(), "landed convoy recreated its checkout");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-churn", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-churn", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/tmp/convoy-churn").await;
+    create_workspace(&backend, NAMESPACE, "convoy-churn-implement", "convoy-churn", "implement", "policy-churn", REPO_URL).await;
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let mut harness = common::ControllerLoopHarness::new(backend.clone());
+    harness.spawn(
+        ControllerLoop {
+            primary: vessels.clone(),
+            secondaries: VesselReconciler::secondary_watches(),
+            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+    harness
+        .wait_until(Duration::from_secs(2), || {
+            let checkouts = checkouts.clone();
+            async move { !checkouts.list().await.expect("list checkouts").items.is_empty() }
+        })
+        .await;
+    let checkout = checkouts.list().await.expect("list checkout").items.pop().expect("checkout was created");
+    checkouts.delete(&checkout.metadata.name).await.expect("sibling removed checkout");
+    harness
+        .wait_until(Duration::from_secs(2), || {
+            let vessels = vessels.clone();
+            async move {
+                vessels
+                    .get("convoy-churn-implement")
+                    .await
+                    .ok()
+                    .and_then(|vessel| vessel.status)
+                    .and_then(|status| status.message)
+                    .is_some_and(|message| message.contains("missing shortly after a create attempt"))
+            }
+        })
+        .await;
+    assert!(checkouts.list().await.expect("list checkouts after removal").items.is_empty());
+    harness.shutdown().await;
+}
 
 struct AlwaysEligible;
 

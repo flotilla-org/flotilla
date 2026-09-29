@@ -3876,6 +3876,104 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
 }
 
 #[tokio::test]
+async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_status_is_missing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repo_ref = RepositoryKey("repo-a".to_string());
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("landed-missing-status".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder()
+                .workflow_ref("implement-review".to_string())
+                .repositories(vec![flotilla_resources::ConvoyRepositorySpec::builder()
+                    .url("https://github.com/owner/repo".to_string())
+                    .repo_ref(repo_ref.clone())
+                    .source_ref("main".to_string())
+                    .target_ref("main".to_string())
+                    .workspace_slug("repo".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("create convoy");
+    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
+    status.discover_subject(
+        flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".to_string(), scope: "owner/repo".to_string() },
+            id: "42".to_string(),
+        },
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Claim,
+        chrono::Utc::now(),
+    );
+    status.work.insert("work".to_string(), WorkState {
+        phase: WorkPhase::Complete,
+        placement: Some(flotilla_resources::PlacementStatus {
+            fields: BTreeMap::from([(
+                "checkout_refs".to_string(),
+                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "missing-status".to_string())])),
+            )]),
+        }),
+        ..WorkState::builder().phase(WorkPhase::Complete).build()
+    });
+    let convoy = convoys.update_status("landed-missing-status", &convoy.metadata.resource_version, &status).await.expect("mark landed");
+    let checkout = backend
+        .clone()
+        .using::<ResourceCheckout>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("missing-status".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "landed-missing-status".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref,
+                env_ref: "host-direct-test".to_string(),
+                r#ref: "feature".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: temp.path().join("removed-worktree").display().to_string(),
+                clone_ref: "clone-test".to_string(),
+            }),
+        )
+        .await
+        .expect("create checkout without status");
+    let record_name = flotilla_resources::change_request_record_name("github.com", "owner/repo", 42);
+    let changes = backend.clone().using::<flotilla_resources::ChangeRequest>("flotilla");
+    let record = changes
+        .create(
+            &InputMeta::builder().name(record_name.clone()).build(),
+            &flotilla_resources::ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope("owner/repo".to_string())
+                .number(42)
+                .observing_authority("host-test".to_string())
+                .build(),
+        )
+        .await
+        .expect("create change request");
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false).await.is_err());
+    let now = chrono::Utc::now();
+    changes
+        .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, now),
+            head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
+            checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),
+            review: flotilla_resources::ChangeRequestReviewObservation {
+                actionable_at_head: flotilla_resources::Observation::known(false, now),
+            },
+            mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, now),
+        })
+        .await
+        .expect("mark change request merged");
+
+    daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[checkout], false).await.expect("merged change request permits reclaim");
+}
+
+#[tokio::test]
 async fn convoy_start_acknowledges_while_admission_is_in_flight() {
     let utility = Arc::new(SlowAiUtility::new());
     let discovery = slow_ai_discovery(Arc::clone(&utility));

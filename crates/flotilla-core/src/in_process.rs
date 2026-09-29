@@ -2328,6 +2328,43 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     }
 }
 
+fn associated_change_request_name_without_checkout_status(
+    convoy: &ResourceObject<ResourceConvoy>,
+    checkout: &ResourceObject<ResourceCheckout>,
+) -> Result<Option<String>, String> {
+    let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
+        return Ok(None);
+    };
+    if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout) {
+        let LeafAddress::ChangeRequest { service, scope, number } = change_request_address(&repository.url, &id)? else {
+            unreachable!("change_request_address always returns a change-request address")
+        };
+        return Ok(Some(change_request_record_name(&service, &scope, number)));
+    }
+
+    // A produced subject can retain PR identity after checkout status is gone.
+    // Require exactly one current PR for the repository if nothing singles one out.
+    let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(&repository.url, "1")? else {
+        unreachable!("change_request_address always returns a change-request address")
+    };
+    let names = expected_change_request_leaves(convoy, &BTreeMap::new())?
+        .into_iter()
+        .filter_map(|leaf| match leaf.address {
+            LeafAddress::ChangeRequest { service: candidate_service, scope: candidate_scope, number }
+                if candidate_service == service && candidate_scope == scope =>
+            {
+                Some(change_request_record_name(&service, &scope, number))
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if names.len() == 1 {
+        Ok(names.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingConvoyTarget {
     pub home: HostName,
@@ -10364,6 +10401,31 @@ impl InProcessDaemon {
             ));
         }
 
+        // A completed convoy can outlive its checkout observation. In
+        // particular, checkout cleanup may remove the worktree and a new
+        // short-lived record may have no status at all. The merged change
+        // request is durable integration evidence for that repository.
+        let merged_change_requests = if convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
+            && checkout_list.iter().any(|checkout| expected.contains(&checkout.metadata.name) && checkout.status.is_none())
+        {
+            let records = self
+                .resource_backend
+                .including_replicas::<ResourceChangeRequest>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            records
+                .items
+                .iter()
+                .filter(|record| {
+                    record.object.status.as_ref().and_then(|status| status.state.value) == Some(ObservedChangeRequestState::Merged)
+                })
+                .map(|record| record.object.metadata.name.clone())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+
         let mut refusals = Vec::new();
         for checkout in checkout_list
             .iter()
@@ -10372,6 +10434,11 @@ impl InProcessDaemon {
         {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
+                let merged_for_checkout = associated_change_request_name_without_checkout_status(convoy, checkout)?
+                    .is_some_and(|name| merged_change_requests.contains(&name));
+                if merged_for_checkout {
+                    continue;
+                }
                 refusals.push(format!("{}: integration evidence is missing", checkout.metadata.name));
                 continue;
             };
