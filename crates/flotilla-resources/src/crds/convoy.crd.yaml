@@ -220,6 +220,9 @@ spec:
                           max_per_episode:
                             type: integer
                             minimum: 0
+                          max_refusals:
+                            type: integer
+                            minimum: 1
                     supervision:
                       type: array
                       items:
@@ -340,3 +343,14 @@ spec:
                           format: date-time
                         message:
                           type: string
+                        completion_refusal:
+                          type: object
+                          required: [expectation, consecutive_count]
+                          properties:
+                            expectation:
+                              type: string
+                            consecutive_count:
+                              type: integer
+                              minimum: 1
+                            message:
+                              type: string

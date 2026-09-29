@@ -120,7 +120,9 @@ vessels:
     assert_eq!(spec.stall_nudges["work/coder"].max_per_episode, 0);
     assert!(serde_yml::to_string(&spec).expect("serialize").contains("max_per_episode: 0"));
     let mut invalid = spec;
-    invalid.stall_nudges.insert("work/reviewer".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: 1 });
+    invalid
+        .stall_nudges
+        .insert("work/reviewer".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: 1, max_refusals: None });
     assert!(validate(&invalid)
         .expect_err("unknown role")
         .iter()

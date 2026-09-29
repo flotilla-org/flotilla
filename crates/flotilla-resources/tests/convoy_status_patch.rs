@@ -943,3 +943,27 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(51)) }.apply(&mut status);
     assert_eq!(status.finished_at, Some(ts(50)));
 }
+
+#[test]
+fn refused_claims_count_only_identical_expectations_and_decode_old_work() {
+    let old_work: CrewWorkState = serde_json::from_str(r#"{"phase":"Working"}"#).expect("previous-generation crew work");
+    assert!(old_work.completion_refusal.is_none());
+    let old_policy: flotilla_resources::StallNudgePolicy =
+        serde_json::from_str(r#"{"max_per_episode":2}"#).expect("previous-generation stall nudge policy");
+    assert_eq!(old_policy.max_refusals, None);
+    let mut status = ConvoyStatus::default();
+    status.crew_work.insert("work".into(), BTreeMap::from([("coder".into(), old_work)]));
+    let refuse = |expectation: &str| ConvoyStatusPatch::RefuseCrewCompletion {
+        vessel: "work".into(),
+        role: "coder".into(),
+        expectation: expectation.into(),
+        message: Some("https://github.com/flotilla-org/flotilla/pull/2200".into()),
+    };
+    refuse("PR is conflicting").apply(&mut status);
+    refuse("PR is conflicting").apply(&mut status);
+    assert_eq!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").consecutive_count, 2);
+    refuse("PR observation missing").apply(&mut status);
+    let refusal = status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal");
+    assert_eq!(refusal.consecutive_count, 1);
+    assert_eq!(refusal.expectation, "PR observation missing");
+}
