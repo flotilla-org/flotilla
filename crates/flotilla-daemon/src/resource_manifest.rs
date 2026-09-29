@@ -16,7 +16,8 @@ use flotilla_core::vcs::Vcs;
 use flotilla_resources::{
     apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ControllerRetry, DocumentKey, DocumentPhase,
     DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ObjectEvent,
-    ResolutionAction, ResourceBackend, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition, MANAGED_BY_LABEL,
+    ResolutionAction, ResolutionOutcome, ResourceBackend, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
+    MANAGED_BY_LABEL,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -93,7 +94,7 @@ pub struct ResourceManifestReconciler {
     fixed_revision: Option<String>,
     vcs: Option<Arc<dyn Vcs>>,
     warned_unmanaged: HashSet<ObjectIdentity>,
-    warned_drift: HashSet<(ObjectIdentity, String, String)>,
+    warned_drift: HashSet<(ObjectIdentity, String, Option<String>)>,
     events: EventRecorder,
 }
 
@@ -241,11 +242,14 @@ impl ResourceManifestReconciler {
             if let Some(current_status) = &current.status {
                 for (key, state) in &mut status.documents {
                     if let Some(current_state) = current_status.documents.get(key) {
+                        // A concurrent pass may have claimed the current token
+                        // after this pass read status. Preserve that claim unless
+                        // this pass has its own terminal result for the token.
                         let current_token = current.spec.resolutions.get(key).map(|resolution| resolution.token.as_str());
                         if current_token.is_some()
                             && current_state.resolved_token.as_deref() == current_token
                             && (state.resolved_token != current_state.resolved_token
-                                || state.resolution_outcome.as_deref() == Some("started")
+                                || state.resolution_outcome == Some(ResolutionOutcome::Started)
                                 || state.resolution_outcome.is_none())
                         {
                             state.resolved_token.clone_from(&current_state.resolved_token);
@@ -277,7 +281,7 @@ impl ResourceManifestReconciler {
             }
             let mut state = previous.cloned().unwrap_or_else(|| document_state(DocumentPhase::Refused, None, None, None, None, None));
             state.resolved_token = Some(token.to_string());
-            state.resolution_outcome = Some("started".to_string());
+            state.resolution_outcome = Some(ResolutionOutcome::Started);
             status.documents.insert(key.clone(), state);
             match roots.update_status(&root_name, &root.metadata.resource_version, &status).await {
                 Ok(_) => return Ok(true),
@@ -368,8 +372,14 @@ impl ResourceManifestReconciler {
             }
         }
         status.documents = documents;
-        status.stalled = status.documents.iter().find(|(_, state)| state.phase == DocumentPhase::Refused).map(|(key, state)| {
-            let evidence = format!("{}: {}", key.path, state.reason.as_deref().unwrap_or("manifest document refused"));
+        let refusals = status
+            .documents
+            .iter()
+            .filter(|(_, state)| state.phase == DocumentPhase::Refused)
+            .map(|(key, state)| format!("{}: {}", key.path, state.reason.as_deref().unwrap_or("manifest document refused")))
+            .collect::<Vec<_>>();
+        status.stalled = (!refusals.is_empty()).then(|| {
+            let evidence = refusals.join("; ");
             let now = chrono::Utc::now();
             let retry = ControllerRetry::terminal(None, now, evidence.clone());
             StalledCondition {
@@ -423,6 +433,8 @@ impl ResourceManifestReconciler {
             .get(key)
             .filter(|resolution| previous.and_then(|state| state.resolved_token.as_deref()) != Some(resolution.token.as_str()));
         if spec.suspended.contains(key) {
+            // Suspension is persistent operator intent. A resolution remains
+            // pending until the operator removes this key from suspended.
             let live_hash =
                 existing.as_ref().map(|object| resource_document_spec_hash(object).map_err(|error| error.to_string())).transpose()?;
             let baseline = existing.as_ref().map(|object| string_map(object, "annotations")).transpose()?.and_then(|annotations| {
@@ -449,15 +461,18 @@ impl ResourceManifestReconciler {
         let baseline =
             annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).or_else(|| annotations.get(LAST_APPLIED_HASH_ANNOTATION)).cloned();
         let labels = string_map(&existing, "labels")?;
-        if let Some(resolution) = resolution {
+        if let Some(resolution) = resolution.filter(|resolution| {
+            resolution.action != ResolutionAction::Sync
+                || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
+        }) {
             if self.claim_resolution(key, &resolution.token, previous).await? {
-                let action_result: Result<&str, String> = async {
+                let action_result: Result<ResolutionOutcome, String> = async {
                     match resolution.action {
                         ResolutionAction::Sync => {
                             preserve_external_metadata(&mut document, &existing)?;
                             clear_manifest_state(&mut document)?;
                             self.apply_manifest_document(document).await.map_err(|error| format!("{identity}: {error}"))?;
-                            Ok("synced")
+                            Ok(ResolutionOutcome::Synced)
                         }
                         ResolutionAction::Adopt => {
                             // Re-read before changing the source file and verify the
@@ -489,7 +504,7 @@ impl ResourceManifestReconciler {
                             stamp_manifest_metadata(&mut adopted, &self.source, path, revision, &self.root_name(), &fresh_hash)?;
                             clear_manifest_state(&mut adopted)?;
                             self.apply_manifest_document(adopted).await.map_err(|error| format!("{identity}: {error}"))?;
-                            Ok("adopted")
+                            Ok(ResolutionOutcome::Adopted)
                         }
                     }
                 }
@@ -501,11 +516,11 @@ impl ResourceManifestReconciler {
                             .await
                             .map_err(|error| error.to_string())?;
                         let actual_hash = resource_document_spec_hash(&applied.value).map_err(|error| error.to_string())?;
-                        (DocumentPhase::Applied, None, outcome.to_string(), Some(actual_hash))
+                        (DocumentPhase::Applied, None, outcome, Some(actual_hash))
                     }
                     Err(error) => {
                         report.errors.push(ManifestDocumentError { path: path.to_path_buf(), reason: error.clone() });
-                        (DocumentPhase::Refused, Some(error.clone()), format!("failed: {error}"), Some(live_hash))
+                        (DocumentPhase::Refused, Some(error.clone()), ResolutionOutcome::Failed(error), Some(live_hash))
                     }
                 };
                 let effective_desired = if resolution.action == ResolutionAction::Adopt && phase == DocumentPhase::Applied {
@@ -575,7 +590,7 @@ impl ResourceManifestReconciler {
                 format!("{}: manifest-managed object has live drift", path.display()),
             )
             .await;
-            if self.warned_drift.insert((identity.clone(), live_hash.clone(), baseline.clone().unwrap_or_default())) {
+            if self.warned_drift.insert((identity.clone(), live_hash.clone(), baseline.clone())) {
                 warn!(object = %identity, live_digest = %live_hash, "manifest-managed object has live drift; refusing overwrite");
             }
             report.drifted += 1;
@@ -1374,12 +1389,14 @@ mod tests {
             .await
             .expect("hotfix");
         write(&path, &manifest("suspended", "new-manifest"));
+        set_resolution(&reconciler.backend, key("suspended"), ResolutionAction::Sync, "token-1").await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("suspended pass").unchanged, 1);
         assert_eq!(resolver.get("suspended").await.expect("policy").spec.pool, "hotfix");
         let root = test_root(&reconciler.backend).await;
-        assert_eq!(root.status.expect("status").documents[&key("suspended")].phase, DocumentPhase::Suspended);
+        let state = &root.status.expect("status").documents[&key("suspended")];
+        assert_eq!(state.phase, DocumentPhase::Suspended);
+        assert_eq!(state.resolved_token, None);
         set_suspended(&reconciler.backend, key("suspended"), false).await;
-        set_resolution(&reconciler.backend, key("suspended"), ResolutionAction::Sync, "token-1").await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("sync pass").updated, 1);
         assert_eq!(resolver.get("suspended").await.expect("policy").spec.pool, "new-manifest");
     }
@@ -1430,6 +1447,44 @@ mod tests {
         set_resolution(&reconciler.backend, key("sync-me"), ResolutionAction::Sync, "token-2").await;
         assert_eq!(reconciler.reconcile_once_for_test().await.expect("new token pass").updated, 1);
         assert_eq!(resolver.get("sync-me").await.expect("policy").spec.pool, "manifest");
+    }
+
+    #[tokio::test]
+    async fn claimed_resolution_is_not_replayed_after_reconciler_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join("policy.yaml"), &manifest("interrupted", "manifest"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<PlacementPolicy>(NAMESPACE);
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        reconciler.reconcile_once_for_test().await.expect("creation");
+        let applied = resolver.get("interrupted").await.expect("policy");
+        resolver
+            .update(
+                &InputMeta::from(&applied.metadata),
+                &applied.metadata.resource_version,
+                &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            )
+            .await
+            .expect("live edit");
+        reconciler.reconcile_once_for_test().await.expect("drift pass");
+        set_resolution(&backend, key("interrupted"), ResolutionAction::Sync, "token-1").await;
+        let root = test_root(&backend).await;
+        let status = root.status.expect("status");
+        let previous = &status.documents[&key("interrupted")];
+        assert!(reconciler.claim_resolution(&key("interrupted"), "token-1", Some(previous)).await.expect("claim"));
+
+        let mut restarted = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, dir.path());
+        assert_eq!(restarted.reconcile_once_for_test().await.expect("restart pass").drifted, 1);
+        assert_eq!(resolver.get("interrupted").await.expect("policy").spec.pool, "live");
+        let root = test_root(&backend).await;
+        let status = root.status.expect("status");
+        let state = &status.documents[&key("interrupted")];
+        assert_eq!(state.resolved_token.as_deref(), Some("token-1"));
+        assert_eq!(state.resolution_outcome, Some(ResolutionOutcome::Started));
+
+        set_resolution(&backend, key("interrupted"), ResolutionAction::Sync, "token-2").await;
+        assert_eq!(restarted.reconcile_once_for_test().await.expect("new token pass").updated, 1);
+        assert_eq!(resolver.get("interrupted").await.expect("policy").spec.pool, "manifest");
     }
 
     #[tokio::test]
@@ -1559,6 +1614,18 @@ mod tests {
         let status = test_root(&backend).await.status.expect("status");
         assert_eq!(status.documents[&key("unmanaged")].phase, DocumentPhase::Refused);
         assert!(status.stalled.expect("stall").evidence.contains("unmanaged"));
+
+        set_resolution(&backend, key("unmanaged"), ResolutionAction::Sync, "token-1").await;
+        let report = reconciler.reconcile_once_for_test().await.expect("unmanaged sync pass");
+        let still_unmanaged = backend.using::<PlacementPolicy>(NAMESPACE).get("unmanaged").await.expect("policy");
+        let root = test_root(&backend).await;
+        let status = root.status.expect("status");
+        let state = &status.documents[&key("unmanaged")];
+        assert_eq!(report.unmanaged, 1);
+        assert_eq!(still_unmanaged.spec.pool, "live");
+        assert_eq!(still_unmanaged.metadata.resource_version, object.metadata.resource_version);
+        assert_eq!(state.phase, DocumentPhase::Refused);
+        assert_eq!(state.resolved_token, None);
     }
 
     #[tokio::test]

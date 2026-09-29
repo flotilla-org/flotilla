@@ -1535,6 +1535,7 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
                     kind: "PlacementPolicy".to_string(),
                     name: "resolve-me".to_string(),
                     resolution: ManifestResolution::Sync,
+                    requested_by: "flotilla/implicit".to_string(),
                 })
                 .build(),
         )
@@ -1552,6 +1553,7 @@ async fn manifest_resolution_command_persists_a_root_spec_token() {
     assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "ManifestRoot"));
     assert_eq!(root.spec.resolutions[&key].action, flotilla_resources::ResolutionAction::Sync);
     assert!(!root.spec.resolutions[&key].token.is_empty());
+    assert_eq!(root.spec.resolutions[&key].requested_by, "flotilla/implicit");
     assert!(!stored.metadata.annotations.contains_key("flotilla.work/manifest-resolution"));
 }
 

@@ -90,7 +90,16 @@ pub struct DocumentState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution_outcome: Option<String>,
+    pub resolution_outcome: Option<ResolutionOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionOutcome {
+    Started,
+    Synced,
+    Adopted,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

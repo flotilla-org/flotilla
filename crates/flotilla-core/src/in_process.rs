@@ -12144,9 +12144,11 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution } = &command.action {
+        if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } =
+            &command.action
+        {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = request_manifest_resolution(&self.resource_backend, namespace, kind, name, *resolution).await;
+            let result = request_manifest_resolution(&self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
             self.finish_context_free_command(id, empty_identity, match result {
                 Ok(root) => CommandValue::ResourceObject(Box::new(root)),
                 Err(error) => CommandValue::Error { message: error },
@@ -14147,6 +14149,7 @@ async fn request_manifest_resolution(
     kind: &str,
     name: &str,
     action: flotilla_protocol::ManifestResolution,
+    requested_by: &str,
 ) -> Result<ResourceJsonResponse, String> {
     let object = get_resource_kind(backend, namespace, kind, name).await.map_err(|error| error.to_string())?;
     let annotations = object
@@ -14167,6 +14170,7 @@ async fn request_manifest_resolution(
     let roots = backend.using::<ManifestRoot>(namespace);
     // One-roll compatibility: older provenance named the host rather than the
     // materialized ManifestRoot. Resolve that host together with its source.
+    // Host config declares one source today; remove this fallback after one roll.
     let root_name = match roots.get(root).await {
         Ok(_) => root.to_string(),
         Err(ResourceError::NotFound { .. }) => {
@@ -14201,7 +14205,7 @@ async fn request_manifest_resolution(
         spec.resolutions.insert(key.clone(), Resolution {
             action,
             token: uuid::Uuid::new_v4().to_string(),
-            requested_by: "flotilla-cli".to_string(),
+            requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
         });
         match roots.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await {
             Ok(updated) => {

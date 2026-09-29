@@ -124,7 +124,7 @@ pub use leaf::{
 };
 pub use manifest_root::{
     DocumentKey, DocumentPhase, DocumentState, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ManifestRootStatusPatch, Resolution,
-    ResolutionAction,
+    ResolutionAction, ResolutionOutcome,
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{

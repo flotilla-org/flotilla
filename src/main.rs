@@ -1618,6 +1618,8 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
             continue;
         }
         found = true;
+        let spec: flotilla_resources::ManifestRootSpec =
+            serde_json::from_value(object["spec"].clone()).map_err(|error| color_eyre::eyre::eyre!("decode ManifestRoot spec: {error}"))?;
         let status: flotilla_resources::ManifestRootStatus = object
             .get("status")
             .filter(|value| !value.is_null())
@@ -1626,10 +1628,13 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
             .map_err(|error| color_eyre::eyre::eyre!("decode ManifestRoot status: {error}"))?
             .unwrap_or_default();
         for (key, state) in status.documents {
+            let pending_resolution =
+                spec.resolutions.get(&key).filter(|resolution| state.resolved_token.as_deref() != Some(resolution.token.as_str()));
             rows.push(serde_json::json!({
                 "root": name,
                 "document": {"path": key.path, "kind": key.kind, "namespace": key.namespace, "name": key.name},
                 "state": state,
+                "pending_resolution": pending_resolution.map(|resolution| &resolution.action),
             }));
         }
     }
@@ -1643,14 +1648,16 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
             let key = &row["document"];
             let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
             let reason = row["state"]["reason"].as_str().unwrap_or("");
+            let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
             println!(
-                "{}\t{}\t{}/{}/{}\t{}\t{}",
+                "{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
                 row["root"].as_str().unwrap_or_default(),
                 key["path"].as_str().unwrap_or_default(),
                 key["kind"].as_str().unwrap_or_default(),
                 key["namespace"].as_str().unwrap_or_default(),
                 key["name"].as_str().unwrap_or_default(),
                 phase,
+                pending,
                 reason
             );
         }
@@ -1881,13 +1888,23 @@ async fn run_manifest_resolution(
     format: OutputFormat,
 ) -> Result<()> {
     let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+    let principal =
+        cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref())
+            .principal_ref;
+    let requested_by = format!("{}/{}", principal.namespace, principal.name);
     run_control_command(
         cli,
         Command {
             node_id,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ResourceManifestResolve { namespace: args.namespace, kind: args.kind, name: args.name, resolution },
+            action: CommandAction::ResourceManifestResolve {
+                namespace: args.namespace,
+                kind: args.kind,
+                name: args.name,
+                resolution,
+                requested_by,
+            },
         },
         format,
     )
