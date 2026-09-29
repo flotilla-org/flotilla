@@ -65,7 +65,6 @@ pub struct TurnDeliveryRequest {
     pub role: String,
     pub brief: String,
     pub subject_revision: String,
-    #[builder(default)]
     pub sender: flotilla_resources::CrewMessageSender,
 }
 

@@ -838,6 +838,7 @@ async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() 
         .role("coder".to_string())
         .brief("continue".to_string())
         .subject_revision("new-head".to_string())
+        .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
         .build();
     daemon.deliver_standing_turn(&request).await.expect_err("stale session write");
     let status = backend.using::<ResourceConvoy>("flotilla").get("resume-staging").await.expect("convoy").status.expect("status");
