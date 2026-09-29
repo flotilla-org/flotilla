@@ -625,6 +625,9 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         provisioned_mounts: vec![
             ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
             ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
+            ProvisionedMount::new("/host/clone/.git", "/host/clone/.git", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/clone/.git/config", "/host/clone/.git/config", ProvisionedMountMode::Ro),
+            ProvisionedMount::new("/host/clone/.git/hooks", "/host/clone/.git/hooks", ProvisionedMountMode::Ro),
         ],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
@@ -642,6 +645,13 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
         "read-only reference mount should be passed to docker as :ro; args: {args:?}",
     );
+    for protected in ["config", "hooks"] {
+        let expected = format!("type=bind,source=/host/clone/.git/{protected},target=/host/clone/.git/{protected},readonly");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--mount", expected.as_str()]),
+            "protected Git mount must reject a missing source: {args:?}"
+        );
+    }
 }
 
 #[tokio::test]

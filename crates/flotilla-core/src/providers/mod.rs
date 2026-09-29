@@ -344,6 +344,15 @@ pub trait CommandRunner: Send + Sync {
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 
+impl ProcessCommandRunner {
+    async fn checked_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<tokio::process::Command, String> {
+        crate::vcs::guard_host_git_config_async(cmd, args, cwd).await?;
+        let mut command = tokio::process::Command::new(cmd);
+        command.args(args).current_dir(cwd);
+        Ok(command)
+    }
+}
+
 struct TokioCommandProcess {
     child: tokio::process::Child,
 }
@@ -366,14 +375,8 @@ impl CommandProcess for TokioCommandProcess {
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
+        let output =
+            Self::checked_command(cmd, args, cwd).await?.stdin(std::process::Stdio::null()).output().await.map_err(|e| e.to_string())?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
@@ -382,10 +385,8 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
+        let output = Self::checked_command(cmd, args, cwd)
+            .await?
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .output()
@@ -405,10 +406,8 @@ impl CommandRunner for ProcessCommandRunner {
         cwd: &Path,
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
-        let child = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
+        let child = Self::checked_command(cmd, args, cwd)
+            .await?
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -419,12 +418,10 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         use tokio::io::AsyncWriteExt;
 
-        let mut child = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -445,10 +442,8 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
-        let mut child = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -466,11 +461,9 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, source: &Path) -> Result<(), String> {
-        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         use tokio::io::AsyncWriteExt;
-        let mut child = tokio::process::Command::new(cmd)
-            .args(args)
-            .current_dir(cwd)
+        let mut child = Self::checked_command(cmd, args, cwd)
+            .await?
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())

@@ -33,12 +33,30 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
         return Ok(());
     }
     let mut directory = cwd.to_path_buf();
+    let mut explicit_git_dir = std::env::var_os("GIT_DIR").map(PathBuf::from);
     for pair in args.windows(2) {
         if pair[0] == "-C" {
             directory = if Path::new(pair[1]).is_absolute() { PathBuf::from(pair[1]) } else { directory.join(pair[1]) };
+        } else if pair[0] == "--git-dir" {
+            explicit_git_dir = Some(PathBuf::from(pair[1]));
         }
     }
-    let Some(git_entry) = directory.ancestors().map(|ancestor| ancestor.join(".git")).find(|path| path.exists()) else {
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--git-dir=") {
+            explicit_git_dir = Some(PathBuf::from(value));
+        }
+    }
+    let git_entry = if let Some(path) = explicit_git_dir {
+        if path.is_absolute() {
+            path
+        } else {
+            directory.join(path)
+        }
+    } else if let Some(path) = directory.ancestors().map(|ancestor| ancestor.join(".git")).find(|path| path.exists()) {
+        path
+    } else if directory.join("HEAD").exists() && directory.join("config").exists() {
+        directory.clone() // bare repository
+    } else {
         return Ok(());
     };
     let admin_dir = if git_entry.is_dir() {
@@ -78,24 +96,14 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
         }
         for key in output.stdout.split(|byte| *byte == 0).filter(|key| !key.is_empty()) {
             let key = String::from_utf8_lossy(key).to_ascii_lowercase();
-            let risky = key == "core.fsmonitor"
-                || key == "core.sshcommand"
-                || key == "core.hookspath"
-                || key == "include.path"
-                || key.starts_with("includeif.")
-                || key.starts_with("filter.")
-                || key.starts_with("credential.");
-            if risky {
-                // An explicit default hooks path is harmless; hosts have used
-                // it historically. Other paths may execute container code.
-                if key == "core.hookspath" && default_hooks_path(&config, &common_dir)? {
-                    continue;
-                }
-                tracing::error!(config = %config.display(), %key, "unsafe shared Git configuration; refusing Git operation");
-                return Err(format!("unsafe shared Git configuration {}: {key}", config.display()));
+            // An explicit absolute default hooks path is harmless; hosts have
+            // used it historically. Relative paths can point into a checkout.
+            if key == "core.hookspath" && default_hooks_path(&config, &common_dir)? {
+                continue;
             }
             if !allowed_shared_config_key(&key) {
-                tracing::warn!(config = %config.display(), %key, "unexpected shared Git configuration");
+                tracing::error!(config = %config.display(), %key, "unsafe shared Git configuration; refusing Git operation");
+                return Err(format!("unsafe shared Git configuration {}: {key}", config.display()));
             }
         }
     }
@@ -127,25 +135,91 @@ fn allowed_shared_config_key(key: &str) -> bool {
             | "core.ignorecase"
             | "core.precomposeunicode"
             | "core.worktree"
-            | "extensions.worktreeconfig"
             | "extensions.objectformat"
             | "user.name"
             | "user.email"
-    ) || key.starts_with("remote.")
-        || key.starts_with("branch.")
-        || key.starts_with("worktrunk.")
+            | "worktrunk.default-branch"
+    ) || ["url", "fetch", "pushurl", "push", "mirror", "prune", "tagopt"]
+        .iter()
+        .any(|suffix| key.starts_with("remote.") && key.ends_with(&format!(".{suffix}")))
+        || ["remote", "merge", "rebase", "pushremote", "flotilla.issues.issues"]
+            .iter()
+            .any(|suffix| key.starts_with("branch.") && key.ends_with(&format!(".{suffix}")))
+}
+
+pub(crate) async fn guard_host_git_config_async(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+    if cmd != "git" {
+        return Ok(());
+    }
+    let cmd = cmd.to_string();
+    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let cwd = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        guard_host_git_config(&cmd, &args, &cwd)
+    })
+    .await
+    .map_err(|error| format!("inspect shared Git config task failed: {error}"))?
 }
 
 #[cfg(test)]
 mod git_config_guard_tests {
     use super::*;
 
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git").args(args).current_dir(repo).output().expect("run Git fixture command");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn clean_repo_and_explicit_default_hooks_path_are_allowed() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        git(repo.path(), &["init", "-q"]);
+        guard_host_git_config("git", &["status"], repo.path()).expect("clean repository");
+        let hooks = repo.path().join(".git/hooks");
+        git(repo.path(), &["config", "core.hooksPath", hooks.to_str().expect("UTF-8 path")]);
+        guard_host_git_config("git", &["status"], repo.path()).expect("host's default hooks path");
+    }
+
+    #[test]
+    fn reject_other_executable_keys_and_writable_worktree_config_extension() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        git(repo.path(), &["init", "-q"]);
+        for key in ["alias.exploit", "core.editor", "diff.foo.textconv", "merge.foo.driver", "extensions.worktreeConfig"] {
+            let value = if key == "extensions.worktreeConfig" { "true" } else { "echo unsafe" };
+            git(repo.path(), &["config", key, value]);
+            let error = guard_host_git_config("git", &["status"], repo.path()).expect_err("unexpected key must be rejected");
+            assert!(error.to_ascii_lowercase().contains(&key.to_ascii_lowercase()), "{error}");
+            git(repo.path(), &["config", "--unset", key]);
+        }
+    }
+
+    #[test]
+    fn explicit_git_dir_and_worktree_config_are_inspected() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.name", "Tester"]);
+        git(repo.path(), &["config", "user.email", "tester@example.com"]);
+        git(repo.path(), &["commit", "--allow-empty", "-qm", "initial"]);
+        let worktree = repo.path().join("work");
+        git(repo.path(), &["worktree", "add", "-qb", "work", worktree.to_str().expect("UTF-8 path")]);
+        let admin = std::fs::read_to_string(worktree.join(".git")).expect("worktree pointer");
+        let admin = PathBuf::from(admin.trim().strip_prefix("gitdir: ").expect("gitdir pointer"));
+        std::fs::write(admin.join("config.worktree"), "[core]\n\tfsmonitor = true\n").expect("inject worktree config");
+        let error = guard_host_git_config("git", &["status"], &worktree).expect_err("worktree config drift");
+        assert!(error.contains("core.fsmonitor"));
+        let git_dir = repo.path().join(".git");
+        git(repo.path(), &["config", "core.fsmonitor", "true"]);
+        let error = guard_host_git_config("git", &["--git-dir", git_dir.to_str().expect("UTF-8 path"), "status"], Path::new("/"))
+            .expect_err("explicit git dir drift");
+        assert!(error.contains("core.fsmonitor"));
+    }
+
     #[tokio::test]
     async fn injected_fsmonitor_blocks_host_git_before_it_runs() {
         let repo = tempfile::tempdir().expect("temporary repository");
         let marker = repo.path().join("fsmonitor-ran");
-        let init = Command::new("git").args(["init", "-q"]).current_dir(repo.path()).output().expect("initialize repository");
-        assert!(init.status.success());
+        git(repo.path(), &["init", "-q"]);
         let config = Command::new("git")
             .args(["config", "core.fsmonitor", &format!("touch {}", marker.display())])
             .current_dir(repo.path())
