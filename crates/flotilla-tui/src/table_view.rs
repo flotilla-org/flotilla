@@ -1197,6 +1197,20 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     if let Some(change_request) = &row.change_request {
         fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
     }
+    if !row.subjects.is_empty() {
+        fields.push(DetailField {
+            label: "Subjects",
+            value: row
+                .subjects
+                .iter()
+                .map(|entry| {
+                    let reference = entry.url.as_deref().unwrap_or(&entry.short);
+                    format!("{} {reference}", entry.relationship.as_str().replace('_', " "))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+    }
     if !row.issues.is_empty() {
         fields.push(DetailField {
             label: "Issues",
@@ -1477,6 +1491,7 @@ mod tests {
             repo_hint: None,
             project_ref: Some("flotilla".into()),
             issues: Vec::new(),
+            subjects: Vec::new(),
             change_request: None,
             vessels,
             started_at: None,

@@ -1058,6 +1058,9 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub issues: Vec<ConvoyIssueRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub subjects: Vec<ConvoySubjectRow>,
     /// Shallow forge lookup for the explicitly bound change request, or for
     /// the convoy branch on legacy convoys. This is display/reference data,
     /// not a Flotilla-managed resource.
@@ -1076,6 +1079,16 @@ pub struct ConvoyIssueRow {
     pub reference: IssueRef,
     pub title: String,
     pub state: IssueState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoySubjectRow {
+    pub subject: crate::Subject,
+    pub relationship: crate::Relationship,
+    pub declared: bool,
+    pub short: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// The external change request currently associated with a convoy.

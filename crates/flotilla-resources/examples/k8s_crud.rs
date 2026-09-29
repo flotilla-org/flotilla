@@ -40,6 +40,7 @@ fn updated_workflow_spec() -> WorkflowTemplateSpec {
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     ConvoySpec {
+        subjects: Vec::new(),
         role: String::new(),
         generation: 1,
         workflow_ref: workflow_ref.to_string(),
@@ -122,6 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("updating convoy status");
     let updated_convoy = convoy_resolver
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
+            subjects: Vec::new(),
+            unlinked_subjects: Vec::new(),
             stalled: None,
             provisioning: None,
             placement_decision: None,

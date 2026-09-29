@@ -782,6 +782,7 @@ mod tests {
             repo_hint: None,
             project_ref: None,
             issues: Vec::new(),
+            subjects: Vec::new(),
             change_request: None,
             vessels: vessels
                 .iter()

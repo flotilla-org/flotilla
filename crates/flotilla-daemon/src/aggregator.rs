@@ -15,21 +15,21 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     result_set::{
-        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
-        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow,
-        SurfaceState, VesselRow, WorkPhase,
+        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, ConvoySubjectRow, CrewMemberSummary, IndependentRow,
+        ProjectRepositoriesRow, ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase,
+        StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
     ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason,
-    ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee, DemandState, Environment, Presentation, Project,
-    ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy, ReplicaReadResolver, Repository,
-    RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList, ResourceObject, ResourceProvenance, StallRung,
-    StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
-    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
-    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    api_version, change_request_address, produced_subject_conflicts, repository_display_labels, Checkout, CheckoutSpec, Convoy,
+    ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
+    DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy,
+    ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList,
+    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase,
+    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
@@ -147,6 +147,10 @@ pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
         branch: &str,
         change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String>;
+
+    async fn discover_branch_subjects(&self, _namespace: &str, _convoy: &str, _branch: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -158,6 +162,10 @@ impl ConvoyChangeRequestResolver for InProcessDaemon {
         change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
         self.resolve_convoy_change_request(repositories, branch, change_request_id).await
+    }
+
+    async fn discover_branch_subjects(&self, namespace: &str, convoy: &str, branch: &str) -> Result<(), String> {
+        self.discover_convoy_branch_subjects(namespace, convoy, branch).await
     }
 }
 
@@ -1089,6 +1097,11 @@ impl Aggregator {
             }
             Err(error) => {
                 tracing::warn!(convoy = %reference.name, %branch, %error, "failed to refresh convoy change request");
+            }
+        }
+        if let Some(resolver) = &self.change_request_resolver {
+            if let Err(error) = resolver.discover_branch_subjects(&reference.namespace, &reference.name, &branch).await {
+                tracing::warn!(convoy = %reference.name, %branch, %error, "failed to discover convoy branch subjects");
             }
         }
         self.rebuild_local_projection().await;
@@ -2123,6 +2136,63 @@ impl Aggregator {
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let change_request = self.convoy_change_requests.get(resource).cloned();
         let status = convoy.status.as_ref();
+        let subject_conflicts = produced_subject_conflicts(convoy);
+        let reference_context = flotilla_protocol::ReferenceContext {
+            repositories: convoy
+                .spec
+                .repositories
+                .iter()
+                .filter_map(|repository| {
+                    let (service, scope) = match self.repositories.get(&repository.repo_ref).map(|object| object.spec.identity()) {
+                        Some(ResourceRepositoryIdentity::Forge { forge_ref, owner, repo_name }) => {
+                            (forge_ref.clone(), format!("{owner}/{repo_name}"))
+                        }
+                        _ => {
+                            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } =
+                                change_request_address(&repository.url, "1").ok()?
+                            else {
+                                return None;
+                            };
+                            (service, scope)
+                        }
+                    };
+                    let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
+                    let web_base = canonical.strip_suffix(&format!("/{scope}"))?.to_string();
+                    let forge_alias = (service != "github.com").then(|| service.clone());
+                    Some(flotilla_protocol::RepositoryAlias {
+                        project: convoy.spec.project_ref.clone(),
+                        alias: scope.rsplit('/').next()?.to_string(),
+                        source: flotilla_protocol::IssueSource { service, scope },
+                        web_base,
+                        forge_alias,
+                    })
+                })
+                .collect(),
+        };
+        let mut subjects = convoy
+            .spec
+            .declared_subjects()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| ConvoySubjectRow {
+                url: entry.subject.url(&reference_context),
+                short: entry.subject.short(&reference_context),
+                subject: entry.subject,
+                relationship: entry.relationship,
+                declared: true,
+            })
+            .collect::<Vec<_>>();
+        for entry in status.into_iter().flat_map(|status| &status.subjects) {
+            if !subjects.iter().any(|existing| existing.subject == entry.subject && existing.relationship == entry.relationship) {
+                subjects.push(ConvoySubjectRow {
+                    url: entry.subject.url(&reference_context),
+                    short: entry.subject.short(&reference_context),
+                    subject: entry.subject.clone(),
+                    relationship: entry.relationship,
+                    declared: false,
+                });
+            }
+        }
         let phase = status.map(|status| status.phase).unwrap_or_default();
         let vessels: Vec<VesselRow> = status
             .and_then(|status| status.workflow_snapshot.as_ref())
@@ -2158,7 +2228,10 @@ impl Aggregator {
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
-        let surface_state = if attention_demand.is_some() || vessels.iter().any(|vessel| vessel.surface_state.needs_attention()) {
+        let surface_state = if !subject_conflicts.is_empty()
+            || attention_demand.is_some()
+            || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
+        {
             SurfaceState::NeedsYou
         } else if let Some(stalled) = status.and_then(|status| status.stalled.as_ref()) {
             stalled_surface_state(stalled)
@@ -2188,6 +2261,15 @@ impl Aggregator {
                             .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
                             .cloned()
                     })
+                    .or_else(|| {
+                        subject_conflicts.first().map(|(left, right)| {
+                            format!(
+                                "conflicting produced change requests {} and {}",
+                                left.short(&reference_context),
+                                right.short(&reference_context)
+                            )
+                        })
+                    })
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
             .maybe_disposition(status.and_then(|status| status.disposition.clone()))
@@ -2208,6 +2290,7 @@ impl Aggregator {
                     })
                     .collect(),
             )
+            .subjects(subjects)
             .maybe_change_request(change_request)
             .vessels(vessels)
             .surface_state(surface_state)
@@ -2816,6 +2899,48 @@ mod tests {
         let vessel = convoy.vessels.first().expect("vessel row");
         assert!(vessel.surface_state.needs_attention());
         assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
+    }
+
+    #[tokio::test]
+    async fn conflicting_produced_subjects_raise_attention_until_superseded() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        let now = Utc::now();
+        for number in [281, 282] {
+            convoy.status.as_mut().expect("status").discover_subject(
+                flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                    source: flotilla_protocol::provider_data::IssueSource {
+                        service: "github.com".into(),
+                        scope: "flotilla-org/flotilla".into(),
+                    },
+                    id: number.to_string(),
+                },
+                flotilla_protocol::Relationship::Produces,
+                flotilla_resources::SubjectDiscoverySource::Claim,
+                now,
+            );
+        }
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        let result = state.result_set().await;
+        let row = &result.rows.as_convoys().expect("convoys")[0];
+        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
+        let message = row.message.as_deref().expect("conflict message");
+        assert!(message.contains("281") && message.contains("282"), "{message}");
+
+        let replacement = convoy.status.as_ref().expect("status").subjects[1].subject.clone();
+        convoy.status.as_mut().expect("status").discover_subject(
+            replacement,
+            flotilla_protocol::Relationship::Supersedes,
+            flotilla_resources::SubjectDiscoverySource::Operator,
+            now,
+        );
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
+        let result = state.result_set().await;
+        let row = &result.rows.as_convoys().expect("convoys")[0];
+        assert_ne!(row.surface_state, SurfaceState::NeedsYou);
     }
 
     #[tokio::test]

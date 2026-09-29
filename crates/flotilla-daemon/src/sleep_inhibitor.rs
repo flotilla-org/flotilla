@@ -631,6 +631,7 @@ mod tests {
 
     fn convoy_spec() -> ConvoySpec {
         ConvoySpec {
+            subjects: Vec::new(),
             role: String::new(),
             generation: 1,
             workflow_ref: "single-agent".to_string(),

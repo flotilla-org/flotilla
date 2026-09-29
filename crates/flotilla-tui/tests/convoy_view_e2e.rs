@@ -44,6 +44,7 @@ fn convoy_meta(name: &str) -> InputMeta {
 
 fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
     ConvoySpec {
+        subjects: Vec::new(),
         role: role.to_string(),
         generation: 1,
         workflow_ref: workflow_ref.to_string(),

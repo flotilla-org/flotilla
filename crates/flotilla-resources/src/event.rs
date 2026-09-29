@@ -240,6 +240,7 @@ mod tests {
         let convoy = backend
             .using::<Convoy>("flotilla")
             .create(&InputMeta::builder().name("held-work".to_string()).build(), &ConvoySpec {
+                subjects: Vec::new(),
                 workflow_ref: "work".to_string(),
                 role: "held-work".to_string(),
                 generation: 1,

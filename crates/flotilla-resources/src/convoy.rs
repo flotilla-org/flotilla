@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 pub use flotilla_protocol::StallReason;
-use flotilla_protocol::{CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef};
-use serde::{Deserialize, Serialize};
+use flotilla_protocol::{
+    CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
+};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     resource::define_resource,
@@ -37,43 +39,33 @@ pub fn vessel_placement_pin(convoy: &ResourceObject<Convoy>, vessel: &str) -> Op
     serde_json::from_str::<BTreeMap<String, VesselPlacementPin>>(encoded).ok()?.remove(vessel)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
     /// Stable human-facing role within `project_ref`.
     #[builder(default)]
-    #[serde(default)]
     pub role: String,
     /// Monotonic incarnation number within `{project_ref, role}`.
     #[builder(default)]
-    #[serde(default)]
     pub generation: u64,
     #[builder(default)]
-    #[serde(default)]
     pub dispatching_principal_ref: PrincipalRef,
     #[builder(default)]
-    #[serde(default)]
     pub inputs: BTreeMap<String, InputValue>,
-    #[serde(default)]
     pub placement_policy: Option<String>,
     #[builder(default)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<ConvoyRepositorySpec>,
-    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
     /// The [`Project`](crate::Project) whose repository set was snapshotted at admission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ref: Option<String>,
     #[builder(default)]
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
     #[builder(default)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<DeclaredSubject>,
+    #[builder(default)]
     pub issues: Vec<ConvoyIssue>,
     /// Change request explicitly bound when the convoy was admitted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_request: Option<BoundChangeRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 }
 
@@ -87,6 +79,140 @@ impl ConvoySpec {
             return None;
         };
         Some(repository)
+    }
+}
+
+/// One-generation decoder for the pre-subject `issues` and `change_request`
+/// fields. Remove those two read-only fields after the next fleet roll.
+#[derive(Serialize, Deserialize)]
+struct ConvoySpecRecord {
+    workflow_ref: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    dispatching_principal_ref: PrincipalRef,
+    #[serde(default)]
+    inputs: BTreeMap<String, InputValue>,
+    #[serde(default)]
+    placement_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    repositories: Vec<ConvoyRepositorySpec>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    r#ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subjects: Vec<DeclaredSubject>,
+    #[serde(default, skip_serializing)]
+    issues: Vec<ConvoyIssue>,
+    #[serde(default, skip_serializing)]
+    change_request: Option<BoundChangeRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instruction: Option<String>,
+}
+
+impl ConvoySpec {
+    pub fn declared_subjects(&self) -> Result<Vec<DeclaredSubject>, String> {
+        let mut subjects = self.subjects.clone();
+        for issue in &self.issues {
+            let mut canonical = issue.reference.clone();
+            canonical.id = "1".to_string();
+            let LeafAddress::Issue { service, scope, .. } = issue_address(&canonical)? else {
+                unreachable!("issue_address always returns an issue address")
+            };
+            let subject = Subject {
+                kind: flotilla_protocol::SubjectKind::Issue,
+                source: flotilla_protocol::IssueSource { service, scope },
+                id: issue.reference.id.clone(),
+            };
+            if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == Relationship::WorksOn) {
+                subjects.push(DeclaredSubject {
+                    subject,
+                    relationship: Relationship::WorksOn,
+                    issue: Some(issue.clone()),
+                    change_request: None,
+                });
+            }
+        }
+        if let Some(bound) = &self.change_request {
+            let repository = self
+                .repositories
+                .iter()
+                .find(|repo| repo.repo_ref == bound.repository_ref)
+                .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
+            let subject =
+                Subject::from_leaf(&change_request_address(&repository.url, &bound.id)?).expect("change request address is a subject");
+            if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == Relationship::Adopts) {
+                subjects.push(DeclaredSubject {
+                    subject,
+                    relationship: Relationship::Adopts,
+                    issue: None,
+                    change_request: Some(bound.clone()),
+                });
+            }
+        }
+        Ok(subjects)
+    }
+}
+
+impl Serialize for ConvoySpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        ConvoySpecRecord {
+            workflow_ref: self.workflow_ref.clone(),
+            role: self.role.clone(),
+            generation: self.generation,
+            dispatching_principal_ref: self.dispatching_principal_ref.clone(),
+            inputs: self.inputs.clone(),
+            placement_policy: self.placement_policy.clone(),
+            repositories: self.repositories.clone(),
+            r#ref: self.r#ref.clone(),
+            project_ref: self.project_ref.clone(),
+            adopted_checkout_refs: self.adopted_checkout_refs.clone(),
+            subjects: self.declared_subjects().map_err(S::Error::custom)?,
+            issues: Vec::new(),
+            change_request: None,
+            instruction: self.instruction.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConvoySpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = ConvoySpecRecord::deserialize(deserializer)?;
+        let mut spec = Self {
+            workflow_ref: record.workflow_ref,
+            role: record.role,
+            generation: record.generation,
+            dispatching_principal_ref: record.dispatching_principal_ref,
+            inputs: record.inputs,
+            placement_policy: record.placement_policy,
+            repositories: record.repositories,
+            r#ref: record.r#ref,
+            project_ref: record.project_ref,
+            adopted_checkout_refs: record.adopted_checkout_refs,
+            subjects: record.subjects,
+            issues: record.issues,
+            change_request: record.change_request,
+            instruction: record.instruction,
+        };
+        for issue in spec.subjects.iter().filter_map(|entry| entry.issue.as_ref()) {
+            if !spec.issues.iter().any(|existing| existing.reference == issue.reference) {
+                spec.issues.push(issue.clone());
+            }
+        }
+        if spec.change_request.is_none() {
+            spec.change_request = spec.subjects.iter().find_map(|entry| entry.change_request.clone());
+        }
+        if spec.subjects.is_empty() && (!spec.issues.is_empty() || spec.change_request.is_some()) {
+            spec.subjects = spec.declared_subjects().map_err(D::Error::custom)?;
+        }
+        Ok(spec)
     }
 }
 
@@ -218,6 +344,29 @@ pub fn expected_change_request_leaves(
             subjects.push(address);
         }
     }
+
+    let declared = convoy.spec.declared_subjects()?;
+    let discovered = convoy.status.iter().flat_map(|status| &status.subjects);
+    let superseded = declared
+        .iter()
+        .filter(|entry| entry.relationship == Relationship::Supersedes)
+        .map(|entry| entry.subject.clone())
+        .chain(discovered.clone().filter(|entry| entry.relationship == Relationship::Supersedes).map(|entry| entry.subject.clone()))
+        .collect::<BTreeSet<_>>();
+    for (subject, relationship) in declared
+        .iter()
+        .map(|entry| (&entry.subject, entry.relationship))
+        .chain(discovered.map(|entry| (&entry.subject, entry.relationship)))
+    {
+        if !matches!(relationship, Relationship::Produces | Relationship::Adopts) || superseded.contains(subject) {
+            continue;
+        }
+        let address = subject.leaf()?;
+        if !subjects.contains(&address) {
+            subjects.push(address);
+        }
+    }
+    subjects.retain(|address| Subject::from_leaf(address).is_none_or(|subject| !superseded.contains(&subject)));
 
     Ok(subjects
         .into_iter()
@@ -420,6 +569,23 @@ pub fn change_request_address(repository_url: &str, id: &str) -> Result<LeafAddr
     Ok(LeafAddress::ChangeRequest { service: service.to_string(), scope: scope.to_string(), number })
 }
 
+pub fn change_request_address_with_forges(repository_url: &str, id: &str, forges: &[crate::ForgeSpec]) -> Result<LeafAddress, String> {
+    let mut matches = Vec::new();
+    for forge in forges {
+        if let Some(path) = forge.repository_path(repository_url)? {
+            matches.push((forge, path));
+        }
+    }
+    match matches.as_slice() {
+        [(forge, (owner, repo))] => {
+            let number = id.parse::<u64>().map_err(|_| format!("change request id `{id}` is not a numeric forge number"))?;
+            Ok(LeafAddress::ChangeRequest { service: forge.forge_id.clone(), scope: format!("{owner}/{repo}"), number })
+        }
+        [] => change_request_address(repository_url, id),
+        _ => Err(format!("repository {repository_url} matches multiple Forge definitions")),
+    }
+}
+
 pub fn pinned_workflow_ref(convoy: &crate::ResourceObject<Convoy>) -> &str {
     convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION).map(String::as_str).unwrap_or(&convoy.spec.workflow_ref)
 }
@@ -437,6 +603,113 @@ pub struct ConvoyIssue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_ref: Option<RepositoryKey>,
     pub snapshot: IssueSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredSubject {
+    pub subject: Subject,
+    pub relationship: Relationship,
+    /// Admission snapshot retained for carried-issue briefs and older readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<ConvoyIssue>,
+    /// Admission title and repository binding retained for adopted PR briefs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_request: Option<BoundChangeRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectDiscoverySource {
+    Branch,
+    Claim,
+    Relay,
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubjectDiscovery {
+    pub source: SubjectDiscoverySource,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredSubject {
+    pub subject: Subject,
+    pub relationship: Relationship,
+    pub sources: Vec<SubjectDiscovery>,
+}
+
+impl ConvoyStatus {
+    pub fn discover_subject(&mut self, subject: Subject, relationship: Relationship, source: SubjectDiscoverySource, at: DateTime<Utc>) {
+        if self.unlinked_subjects.contains(&subject) && source != SubjectDiscoverySource::Operator {
+            return;
+        }
+        if source == SubjectDiscoverySource::Operator {
+            self.unlinked_subjects.retain(|unlinked| unlinked != &subject);
+        }
+        if let Some(existing) = self.subjects.iter_mut().find(|entry| entry.subject == subject && entry.relationship == relationship) {
+            if let Some(evidence) = existing.sources.iter_mut().find(|evidence| evidence.source == source) {
+                evidence.at = at;
+            } else {
+                existing.sources.push(SubjectDiscovery { source, at });
+            }
+        } else {
+            self.subjects.push(DiscoveredSubject { subject, relationship, sources: vec![SubjectDiscovery { source, at }] });
+        }
+    }
+
+    pub fn unlink_subject(&mut self, subject: &Subject) {
+        self.subjects.retain(|entry| &entry.subject != subject);
+        if !self.unlinked_subjects.contains(subject) {
+            self.unlinked_subjects.push(subject.clone());
+        }
+    }
+}
+
+/// Conflicting produced PRs within one repository require an operator choice.
+pub fn produced_subject_conflicts(convoy: &ResourceObject<Convoy>) -> Vec<(Subject, Subject)> {
+    let mut produced = convoy
+        .spec
+        .subjects
+        .iter()
+        .filter(|entry| entry.relationship == Relationship::Produces)
+        .map(|entry| entry.subject.clone())
+        .chain(
+            convoy
+                .status
+                .iter()
+                .flat_map(|status| &status.subjects)
+                .filter(|entry| entry.relationship == Relationship::Produces)
+                .map(|entry| entry.subject.clone()),
+        )
+        .filter(|subject| subject.kind == flotilla_protocol::SubjectKind::ChangeRequest)
+        .collect::<Vec<_>>();
+    produced.sort();
+    produced.dedup();
+    let superseded = convoy
+        .spec
+        .subjects
+        .iter()
+        .filter(|entry| entry.relationship == Relationship::Supersedes)
+        .map(|entry| &entry.subject)
+        .chain(
+            convoy
+                .status
+                .iter()
+                .flat_map(|status| &status.subjects)
+                .filter(|entry| entry.relationship == Relationship::Supersedes)
+                .map(|entry| &entry.subject),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut conflicts = Vec::new();
+    for (index, left) in produced.iter().enumerate() {
+        for right in produced.iter().skip(index + 1) {
+            if left.source == right.source && !superseded.contains(left) && !superseded.contains(right) {
+                conflicts.push((left.clone(), right.clone()));
+            }
+        }
+    }
+    conflicts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -479,6 +752,10 @@ pub enum InputValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<DiscoveredSubject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unlinked_subjects: Vec<Subject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled: Option<StalledCondition>,
     /// Durable evidence of whether this convoy reached provisioning. An absent
@@ -868,6 +1145,14 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    DiscoverSubjects {
+        subjects: Vec<(Subject, Relationship)>,
+        source: SubjectDiscoverySource,
+        at: DateTime<Utc>,
+    },
+    UnlinkSubject {
+        subject: Subject,
+    },
     SetStalled {
         condition: Option<StalledCondition>,
     },
@@ -1036,6 +1321,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             return;
         }
         match self {
+            Self::DiscoverSubjects { subjects, source, at } => {
+                for (subject, relationship) in subjects {
+                    status.discover_subject(subject.clone(), *relationship, *source, *at);
+                }
+            }
+            Self::UnlinkSubject { subject } => status.unlink_subject(subject),
             Self::SetStalled { condition } => {
                 status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
             }
@@ -1678,5 +1969,74 @@ pub mod external_patches {
 
     pub fn refuse_turn_delivery(source: String, episode: TurnDeliveryEpisode, attention: ConvoyAttention) -> ConvoyStatusPatch {
         ConvoyStatusPatch::RefuseTurnDelivery { source, episode, attention }
+    }
+}
+
+#[cfg(test)]
+mod subject_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_subject_fields_decode_and_write_only_the_new_set() {
+        let old = serde_json::json!({
+            "workflow_ref": "interactive",
+            "repositories": [{
+                "url": "https://github.com/flotilla-org/flotilla",
+                "repo_ref": "github-flotilla",
+                "source_ref": "main",
+                "target_ref": "main",
+                "workspace_slug": "flotilla"
+            }],
+            "issues": [{
+                "reference": {"source": {"service": "github.com", "scope": "flotilla-org/flotilla"}, "id": "2182"},
+                "snapshot": {"title": "Convoy subjects", "state": "open", "as_of": "2026-09-29T00:00:00Z"}
+            }],
+            "change_request": {"id": "2184", "repository_ref": "github-flotilla", "title": "ADR 49"}
+        });
+        let spec: ConvoySpec = serde_json::from_value(old).expect("old convoy spec decodes");
+        assert_eq!(spec.subjects.len(), 2);
+        assert!(spec.subjects.iter().any(|entry| entry.relationship == Relationship::WorksOn));
+        assert!(spec.subjects.iter().any(|entry| entry.relationship == Relationship::Adopts));
+        let written = serde_json::to_value(&spec).expect("serialize new shape");
+        assert!(written.get("issues").is_none());
+        assert!(written.get("change_request").is_none());
+        let decoded: ConvoySpec = serde_json::from_value(written).expect("new convoy spec decodes");
+        assert_eq!(decoded.issues, spec.issues);
+        assert_eq!(decoded.change_request, spec.change_request);
+
+        let opaque = serde_json::json!({
+            "workflow_ref": "interactive",
+            "issues": [{
+                "reference": {"source": {"service": "tracker.example", "scope": "team/project"}, "id": "ABC-42"},
+                "snapshot": {"title": "Opaque issue", "state": "open", "as_of": "2026-09-29T00:00:00Z"}
+            }]
+        });
+        let spec: ConvoySpec = serde_json::from_value(opaque).expect("opaque prior-generation issue decodes");
+        assert_eq!(spec.subjects[0].subject.id, "ABC-42");
+        serde_json::to_value(spec).expect("opaque issue writes in new set");
+    }
+
+    #[test]
+    fn discovery_refreshes_sources_and_unlink_suppresses_refresh() {
+        let subject = Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/cleat".into() },
+            id: "281".into(),
+        };
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(1);
+        let mut status = ConvoyStatus::default();
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, now);
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, later);
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Claim, later);
+        assert_eq!(status.subjects.len(), 1);
+        assert_eq!(status.subjects[0].sources.len(), 2);
+        assert_eq!(status.subjects[0].sources[0].at, later);
+        status.unlink_subject(&subject);
+        status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Branch, later);
+        assert!(status.subjects.is_empty());
+        status.discover_subject(subject, Relationship::Supersedes, SubjectDiscoverySource::Operator, later);
+        assert_eq!(status.subjects.len(), 1);
+        assert!(status.unlinked_subjects.is_empty());
     }
 }

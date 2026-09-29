@@ -123,6 +123,9 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::DiscoverSubjects { .. } | ConvoyStatusPatch::UnlinkSubject { .. } => {
+            panic!("subject patches are outside this lifecycle contract")
+        }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
@@ -266,6 +269,8 @@ fn pending_brief() -> PendingBrief {
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        unlinked_subjects: Vec::new(),
+        subjects: Vec::new(),
         stalled: None,
         provisioning: None,
         placement_decision: None,

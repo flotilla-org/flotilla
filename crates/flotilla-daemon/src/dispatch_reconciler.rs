@@ -595,6 +595,7 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
+                subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,
                 workflow_ref: "review-and-fix".to_string(),
@@ -657,6 +658,7 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
+                subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,
                 workflow_ref: "deleted-workflow".to_string(),
