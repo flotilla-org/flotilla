@@ -97,7 +97,9 @@ impl Default for PrincipalRef {
     }
 }
 
-/// Structured attribution for text delivered into a crew session.
+/// Structured attribution for text delivered into a crew session. This wire
+/// type is also persisted in TerminalSession and Convoy records, so changes
+/// must preserve one generation of stored-data decoding (ADR 0047).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CrewMessageSender {
@@ -125,6 +127,38 @@ pub enum CrewMessageSender {
     Handoff {
         from: String,
     },
+}
+
+impl CrewMessageSender {
+    /// Compact identity and kind for line-oriented diagnostic output.
+    pub fn short_label(&self) -> String {
+        fn safe(value: &str) -> String {
+            value
+                .chars()
+                .map(
+                    |character| {
+                        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '@' | '.') {
+                            character
+                        } else {
+                            '_'
+                        }
+                    },
+                )
+                .collect()
+        }
+        match self {
+            Self::Unknown => "unknown".to_string(),
+            Self::FlotillaNudge => "flotilla/nudge".to_string(),
+            Self::FlotillaTurn { source } => format!("flotilla/turn:{}", safe(source)),
+            Self::FlotillaEscalation { from } => format!("flotilla/escalation:{}", safe(from)),
+            Self::OperatorResume { principal } | Self::OperatorFollowUp { principal } => {
+                format!("operator:{}", principal.as_ref().map_or_else(|| "unattributed".to_string(), |principal| safe(&principal.name)))
+            }
+            Self::Governor { name } => format!("governor:{}", safe(name)),
+            Self::Bosun { name } => format!("bosun:{}", safe(name)),
+            Self::Handoff { from } => format!("crew:{}", safe(from)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

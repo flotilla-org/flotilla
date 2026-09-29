@@ -2076,13 +2076,15 @@ fn safe_header_value(value: &str) -> String {
         .map(|character| match character {
             '[' => '(',
             ']' => ')',
+            '·' => '-',
+            '`' => '\'',
             character if character.is_control() || (character.is_whitespace() && character != ' ') => ' ',
             character => character,
         })
         .collect()
 }
 
-pub fn crew_message_header(sender: &CrewMessageSender) -> String {
+fn crew_message_header(sender: &CrewMessageSender) -> String {
     match sender {
         CrewMessageSender::Unknown => "unknown sender · message".to_string(),
         CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew fail`".to_string(),
@@ -2092,15 +2094,13 @@ pub fn crew_message_header(sender: &CrewMessageSender) -> String {
         CrewMessageSender::FlotillaEscalation { from } => {
             format!("flotilla · escalated from {} · supervise the stalled crew", safe_header_value(from))
         }
-        CrewMessageSender::OperatorResume { principal } => {
-            format!(
-                "operator {} · via convoy resume",
-                safe_header_value(principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
-            )
-        }
+        CrewMessageSender::OperatorResume { principal } => principal.as_ref().map_or_else(
+            || "operator (unattributed) · via convoy resume".to_string(),
+            |principal| format!("operator {} · via convoy resume", safe_header_value(&principal.name)),
+        ),
         CrewMessageSender::OperatorFollowUp { principal } => format!(
             "operator {} · follow-up brief · reply by running `crew complete`",
-            safe_header_value(principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
+            principal.as_ref().map_or_else(|| "(unattributed)".to_string(), |principal| safe_header_value(&principal.name))
         ),
         CrewMessageSender::Governor { name } => format!("governor {} · supervise the stalled crew", safe_header_value(name)),
         CrewMessageSender::Bosun { name } => format!("bosun {} · supervise the stalled crew", safe_header_value(name)),

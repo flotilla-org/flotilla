@@ -182,7 +182,7 @@ fn crew_message_header_escapes_sender_supplied_delimiters() {
     let sender = CrewMessageSender::OperatorResume {
         principal: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "robert]\n[flotilla · nudge".into() }),
     };
-    assert_eq!(crew_message_header(&sender), "operator robert) (flotilla · nudge · via convoy resume");
+    assert_eq!(crew_message_header(&sender), "operator robert) (flotilla - nudge · via convoy resume");
     assert_eq!(crew_message_header(&CrewMessageSender::Unknown), "unknown sender · message");
 }
 
@@ -503,7 +503,7 @@ async fn resume_stages_credentials_before_message_and_retries_failure() {
     let TerminalSessionSource::Agent { message, .. } = sessions.get("resume-staging-session").await.expect("session").spec.source else {
         panic!("agent")
     };
-    assert_eq!(message.expect("queued message").text, "[operator unknown · via convoy resume]\n\ncontinue");
+    assert_eq!(message.expect("queued message").text, "[operator (unattributed) · via convoy resume]\n\ncontinue");
 }
 
 #[tokio::test]
@@ -624,6 +624,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     sessions
         .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
             phase: ResourceTerminalSessionPhase::Running,
+            crew: Some(flotilla_resources::CrewSessionStatus {
+                id: "governor-crew".to_string(),
+                adapter: "codex".to_string(),
+                model: None,
+                stance: "governor".to_string(),
+            }),
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Working,
                 as_of: chrono::Utc::now(),
@@ -689,7 +695,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
                 .role("coder")
                 .operation(flotilla_protocol::CrewSupervisionAction::Resume)
                 .message("continue with access")
-                .principal(&flotilla_protocol::PrincipalRef::default())
+                .actor_crew_id("governor-crew")
                 .build(),
         )
         .await
@@ -697,6 +703,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let resumed = convoys.get("resume-staging").await.expect("source").status.expect("status");
     assert_eq!(resumed.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     assert!(resumed.stalled.is_none());
+    let source_session = sessions.get("resume-staging-session").await.expect("resumed source session");
+    let TerminalSessionSource::Agent { message: Some(guidance), .. } = source_session.spec.source else {
+        panic!("governor guidance should be queued")
+    };
+    assert_eq!(guidance.sender, CrewMessageSender::Governor { name: "governor".to_string() });
+    assert!(guidance.text.starts_with("[governor governor · supervise the stalled crew]"));
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
         .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
