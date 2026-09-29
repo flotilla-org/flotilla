@@ -194,6 +194,8 @@ view_base_url = "https://artifacts.example.com/flotilla-artifacts/installation-a
 `view_base_url` is optional. It is the public viewer root through the bucket
 and object prefix; the artifact digest is appended to it. Configure it only
 when that URL serves blobs to readers.
+Fleet sync is asynchronous, so a URL printed immediately after `artifact put`
+may return 404 until the blob reaches the configured store.
 
 Fleet endpoints require HTTPS by default. Plain HTTP is accepted for loopback
 hosts (`localhost`, `127.0.0.0/8`, or `::1`) to support local development. For a

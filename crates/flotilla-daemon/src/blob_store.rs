@@ -48,6 +48,8 @@ impl BlobDigest {
 #[async_trait]
 pub trait BlobStore: Send + Sync {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String>;
+    /// Stores without HTTP metadata (local and in-memory stores) may use the
+    /// default. Fleet stores that serve blobs must override it.
     async fn put_with_media_type(&self, bytes: &[u8], _media_type: &str) -> Result<BlobDigest, String> {
         self.put(bytes).await
     }
@@ -393,9 +395,27 @@ impl S3BlobStore {
             Err(format!("S3 returned HTTP {status}"))
         }
     }
+    async fn put_object(&self, bytes: &[u8], media_type: Option<&str>) -> Result<BlobDigest, String> {
+        let digest = BlobDigest::of(bytes);
+        let mut request = self.signed_request(reqwest::Method::PUT, &digest, Some(bytes))?;
+        if let Some(media_type) = media_type {
+            request
+                .headers_mut()
+                .insert(reqwest::header::CONTENT_TYPE, media_type.parse().map_err(|error| format!("invalid media type: {error}"))?);
+        }
+        let response = self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await?;
+        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
+        Ok(digest)
+    }
 }
 
 fn validate_config_transport(config: &BlobStoreConfig) -> Result<(), String> {
+    if let Some(base) = &config.view_base_url {
+        let url = Url::parse(base).map_err(|error| format!("invalid view_base_url for store {}: {error}", config.bucket))?;
+        if !matches!(url.scheme(), "http" | "https") || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!("view_base_url for store {} must be an HTTP URL without query or fragment", config.bucket));
+        }
+    }
     let endpoint = Url::parse(&config.endpoint).map_err(|error| format!("invalid S3 endpoint for store {}: {error}", config.bucket))?;
     if endpoint.scheme() != "http" {
         return Ok(());
@@ -428,20 +448,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[async_trait]
 impl BlobStore for S3BlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
-        let digest = BlobDigest::of(bytes);
-        let response = self.request(reqwest::Method::PUT, &digest, Some(bytes)).await?;
-        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
-        Ok(digest)
+        self.put_object(bytes, None).await
     }
     async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
-        let digest = BlobDigest::of(bytes);
-        let mut request = self.signed_request(reqwest::Method::PUT, &digest, Some(bytes))?;
-        request
-            .headers_mut()
-            .insert(reqwest::header::CONTENT_TYPE, media_type.parse().map_err(|error| format!("invalid media type: {error}"))?);
-        let response = self.http.execute(request, &ChannelLabel::Http("blob-store".into())).await?;
-        Self::check(response.status(), &[http::StatusCode::OK, http::StatusCode::CREATED])?;
-        Ok(digest)
+        self.put_object(bytes, Some(media_type)).await
     }
     async fn get(&self, digest: &BlobDigest) -> Result<Option<Vec<u8>>, String> {
         let response = self.request(reqwest::Method::GET, digest, None).await?;
@@ -590,9 +600,11 @@ impl TieredBlobStore {
         inventory.initialized = true;
         Ok(())
     }
-    async fn queue_new(&self, digest: &BlobDigest, was_present: bool, completed_target: Option<&str>) {
+    async fn queue_new(&self, digest: &BlobDigest, completed_target: Option<&str>) {
         let mut inventory = self.inventory.lock().await;
-        if !was_present && inventory.known.insert(digest.clone()) {
+        // A prior typed put may have failed after its local write and before
+        // queueing. Its retry must still schedule fleet sync.
+        if inventory.known.insert(digest.clone()) {
             let missing: HashSet<_> =
                 self.fleet.iter().filter(|target| Some(target.id.as_str()) != completed_target).map(|target| target.id.clone()).collect();
             if !missing.is_empty() {
@@ -756,32 +768,33 @@ async fn digest_file(path: &Path) -> Result<(BlobDigest, u64), String> {
 impl BlobStore for TieredBlobStore {
     async fn put(&self, bytes: &[u8]) -> Result<BlobDigest, String> {
         let digest = BlobDigest::of(bytes);
-        let was_present = self.local.has(&digest).await?;
         self.local.write_digest(&digest, bytes).await?;
-        self.queue_new(&digest, was_present, None).await;
+        self.queue_new(&digest, None).await;
         Ok(digest)
     }
 
     async fn put_with_media_type(&self, bytes: &[u8], media_type: &str) -> Result<BlobDigest, String> {
         let digest = BlobDigest::of(bytes);
+        self.local.write_digest(&digest, bytes).await?;
+        // The first successful metadata write fixes the type for subsequent
+        // deduplicated artifacts, whose declared media types may differ.
         self.record_media_type(&digest, media_type).await?;
-        self.put(bytes).await
+        self.queue_new(&digest, None).await;
+        Ok(digest)
     }
 
     async fn put_file(&self, path: &Path) -> Result<(BlobDigest, u64), String> {
         let (digest, size) = digest_file(path).await?;
-        let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
         self.local.write_file(&digest, path).await?;
-        self.queue_new(&digest, was_present, None).await;
+        self.queue_new(&digest, None).await;
         Ok((digest, size))
     }
 
     async fn put_file_with_media_type(&self, path: &Path, media_type: &str) -> Result<(BlobDigest, u64), String> {
         let (digest, size) = digest_file(path).await?;
-        self.record_media_type(&digest, media_type).await?;
-        let was_present = self.local.verified_file_size(&digest).await.ok().flatten().is_some();
         self.local.write_file(&digest, path).await?;
-        self.queue_new(&digest, was_present, None).await;
+        self.record_media_type(&digest, media_type).await?;
+        self.queue_new(&digest, None).await;
         Ok((digest, size))
     }
 
@@ -799,12 +812,11 @@ impl BlobStore for TieredBlobStore {
                         error = Some(format!("blob digest mismatch for {}", digest.as_str()));
                         continue;
                     }
-                    let was_present = self.local.verified_file_size(digest).await.ok().flatten().is_some();
                     self.local.write_file(digest, path).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
                     tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
-                    self.queue_new(digest, was_present, Some(&target.id)).await;
+                    self.queue_new(digest, Some(&target.id)).await;
                     return Ok(Some(size));
                 }
                 Ok(None) => {}
@@ -829,12 +841,11 @@ impl BlobStore for TieredBlobStore {
                         error = Some(failure);
                         continue;
                     }
-                    let was_present = self.local.has(digest).await?;
                     self.local.write_digest(digest, &bytes).await?;
                     let marker = self.marker(&target.id, digest);
                     tokio::fs::create_dir_all(marker.parent().expect("marker has parent")).await.map_err(|error| error.to_string())?;
                     tokio::fs::write(marker, b"").await.map_err(|error| error.to_string())?;
-                    self.queue_new(digest, was_present, Some(&target.id)).await;
+                    self.queue_new(digest, Some(&target.id)).await;
                     return Ok(Some(bytes));
                 }
                 Ok(None) => {}
@@ -901,6 +912,9 @@ mod tests {
             assert!(validate_config_transport(&config(endpoint, false)).expect_err(endpoint).contains("allow_insecure_http"));
             assert!(S3BlobStore::from_config(&config(endpoint, false)).err().expect(endpoint).contains("allow_insecure_http"));
         }
+        let mut invalid_view = config("https://storage.example.com", false);
+        invalid_view.view_base_url = Some("https://artifacts.example.test/fleet?token=secret".into());
+        assert!(validate_config_transport(&invalid_view).expect_err("reject viewer query").contains("view_base_url"));
     }
 
     #[tokio::test]
