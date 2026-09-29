@@ -920,6 +920,10 @@ pub struct PendingBrief {
     pub role: String,
     pub content: String,
     pub queued_at: DateTime<Utc>,
+    /// Decodes briefs queued before sender attribution; remove after the next fleet roll.
+    #[serde(default)]
+    #[builder(default)]
+    pub sender: crate::CrewMessageSender,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -996,6 +1000,10 @@ pub struct TurnDeliveryEpisode {
     pub evidence_at: DateTime<Utc>,
     pub judged_claim_at: DateTime<Utc>,
     pub outcome: TurnDeliveryOutcome,
+    /// Decodes episodes stored before sender attribution; remove after the next fleet roll.
+    #[serde(default)]
+    #[builder(default)]
+    pub sender: crate::CrewMessageSender,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

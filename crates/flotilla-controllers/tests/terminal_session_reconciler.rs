@@ -1133,6 +1133,54 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
 
 struct MissingTerminalRuntime;
 
+#[tokio::test]
+async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let text = "[flotilla · turn: conflicting]\n\nRebase the PR";
+    let session = sessions
+        .create(&meta("fresh-turn"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("code"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".into(),
+                    content: text.into(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-work".into(),
+                }),
+                message: Some(flotilla_resources::TerminalCrewMessage {
+                    id: "fresh-turn-message".into(),
+                    text: text.into(),
+                    sender: flotilla_resources::CrewMessageSender::FlotillaTurn { source: "conflicting".into() },
+                }),
+            },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("create fresh turn session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
+    let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Running(TerminalRuntimeState {
+        session_id: "cleat-session".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "codex".into(),
+        delivered_message_id: None,
+    });
+    let patch = reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("running patch");
+    let mut status = TerminalSessionStatus::default();
+    patch.apply(&mut status);
+    assert_eq!(status.delivered_message_id.as_deref(), Some("fresh-turn-message"));
+}
+
 #[async_trait]
 impl TerminalRuntime for MissingTerminalRuntime {
     async fn ensure_session(
@@ -1179,6 +1227,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
                 message: Some(flotilla_resources::TerminalCrewMessage {
                     id: "message-new".into(),
                     text: "Review the amended commit".into(),
+                    sender: Default::default(),
                 }),
             },
             cwd: "/workspace".to_string(),
@@ -1254,6 +1303,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
                 message: Some(flotilla_resources::TerminalCrewMessage {
                     id: "message-new".into(),
                     text: "Review the amended commit".into(),
+                    sender: Default::default(),
                 }),
             },
             cwd: "/workspace".to_string(),

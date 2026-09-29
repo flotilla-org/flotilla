@@ -53,9 +53,10 @@ use flotilla_resources::{
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
-    CrewCompletionPending, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
-    DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding,
-    Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
+    CrewCompletionPending, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
+    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
+    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct,
+    Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
@@ -2069,8 +2070,31 @@ async fn crew_brief_repo_roots(
     roots
 }
 
-fn pending_crew_message(text: &str) -> TerminalCrewMessage {
-    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
+fn crew_message_header(sender: &CrewMessageSender) -> String {
+    match sender {
+        CrewMessageSender::Unknown => "flotilla · message".to_string(),
+        CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew fail`".to_string(),
+        CrewMessageSender::FlotillaTurn { source } => format!("flotilla · turn: {source} · reply by running `crew complete`"),
+        CrewMessageSender::FlotillaEscalation { from } => format!("flotilla · escalated from {from} · supervise the stalled crew"),
+        CrewMessageSender::OperatorResume { principal } => {
+            format!("operator {} · via convoy resume", principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
+        }
+        CrewMessageSender::OperatorFollowUp { principal } => format!(
+            "operator {} · follow-up brief · reply by running `crew complete`",
+            principal.as_ref().map_or("unknown", |principal| principal.name.as_str())
+        ),
+        CrewMessageSender::Governor { name } => format!("governor {name} · supervise the stalled crew"),
+        CrewMessageSender::Bosun { name } => format!("bosun {name} · supervise the stalled crew"),
+        CrewMessageSender::Handoff { from } => format!("handoff from {from}"),
+    }
+}
+
+fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> String {
+    format!("[{}]\n\n{body}", crew_message_header(sender))
+}
+
+fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMessage {
+    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: frame_crew_message(&sender, body), sender }
 }
 
 fn ensure_crew_work_is_defined(
@@ -2105,10 +2129,6 @@ fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
     )
 }
 
-fn crew_handoff_message(context: &ResolvedCrewContext, message: &str) -> String {
-    format!("handoff from {}@{}\n\n{message}", context.caller_role, context.vessel)
-}
-
 fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flotilla_resources::VesselRequirement) -> InputMeta {
     if !requirement.credential_refs.is_empty() {
         meta.annotations.insert(
@@ -2134,13 +2154,14 @@ fn terminal_meta_with_vessel_credentials(mut meta: InputMeta, requirement: &flot
 async fn queue_pending_crew_message(
     sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    sender: CrewMessageSender,
     message: &str,
 ) -> Result<(), String> {
     let mut spec = existing.spec.clone();
     let TerminalSessionSource::Agent { message: pending, .. } = &mut spec.source else {
         return Err(format!("crew target `{}` is not an agent session", existing.spec.role));
     };
-    *pending = Some(pending_crew_message(message));
+    *pending = Some(pending_crew_message(sender, message));
     sessions
         .update(&input_meta_from_resource(existing), &existing.metadata.resource_version, &spec)
         .await
@@ -10540,7 +10561,11 @@ impl InProcessDaemon {
             let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
             let session = sessions.get(session_name).await.map_err(|err| err.to_string())?;
             let framed = format!("{}\n\n{}", flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION, pending.content);
-            queue_pending_crew_message(&sessions, &session, &framed).await?;
+            let sender = match &pending.sender {
+                CrewMessageSender::OperatorResume { principal } => CrewMessageSender::OperatorFollowUp { principal: principal.clone() },
+                other => other.clone(),
+            };
+            queue_pending_crew_message(&sessions, &session, sender, &framed).await?;
             apply_resource_status_patch(
                 &convoys,
                 convoy_name,
@@ -10671,7 +10696,19 @@ impl InProcessDaemon {
         }
         match action {
             flotilla_protocol::CrewSupervisionAction::Resume => {
-                self.convoy_resume_internal(namespace, convoy_name, message, Some(vessel), Some(role)).await?;
+                let sender = if actor_crew_id.is_some() {
+                    let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
+                    if stalled.rung == flotilla_resources::StallRung::Governor {
+                        CrewMessageSender::Governor { name: supervisor.convoy.clone() }
+                    } else if stalled.rung == flotilla_resources::StallRung::Bosun {
+                        CrewMessageSender::Bosun { name: format!("{}@{}", supervisor.role, supervisor.vessel) }
+                    } else {
+                        CrewMessageSender::Handoff { from: format!("{}@{}", supervisor.role, supervisor.vessel) }
+                    }
+                } else {
+                    CrewMessageSender::OperatorResume { principal: principal.cloned() }
+                };
+                self.convoy_resume_with_sender_internal(namespace, convoy_name, message, Some(vessel), Some(role), sender).await?;
             }
             flotilla_protocol::CrewSupervisionAction::Fail => {
                 apply_resource_status_patch(
@@ -11015,7 +11052,7 @@ impl InProcessDaemon {
             return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
         }
 
-        let delivered_message = crew_handoff_message(&context, message);
+        let sender = CrewMessageSender::Handoff { from: format!("{}@{}", context.caller_role, context.vessel) };
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
             .vessel_ref(context.vessel_ref.clone())
@@ -11086,10 +11123,10 @@ impl InProcessDaemon {
                 }
                 Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
                     Some(ResourceTerminalSessionPhase::Running) => {
-                        queue_pending_crew_message(&sessions, &existing, &delivered_message).await
+                        queue_pending_crew_message(&sessions, &existing, sender.clone(), message).await
                     }
                     Some(ResourceTerminalSessionPhase::Stopped) => {
-                        queue_pending_crew_message(&sessions, &existing, &delivered_message).await?;
+                        queue_pending_crew_message(&sessions, &existing, sender.clone(), message).await?;
                         apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
                             .await
                             .map(|_| ())
@@ -11099,7 +11136,7 @@ impl InProcessDaemon {
                         Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
                     }
                     Some(ResourceTerminalSessionPhase::Starting) | None => {
-                        queue_pending_crew_message(&sessions, &existing, &delivered_message).await
+                        queue_pending_crew_message(&sessions, &existing, sender.clone(), message).await
                     }
                 },
                 Err(ResourceError::NotFound { .. }) => {
@@ -11143,7 +11180,7 @@ impl InProcessDaemon {
                                     convoy: context.convoy.clone(),
                                     vessel_ref: context.vessel_ref.clone(),
                                 }),
-                                message: Some(pending_crew_message(&delivered_message)),
+                                message: Some(pending_crew_message(sender.clone(), message)),
                             },
                             cwd: anchor.spec.cwd,
                             pool: anchor.spec.pool,
@@ -11172,6 +11209,26 @@ impl InProcessDaemon {
         prompt: &str,
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
+    ) -> Result<ConvoyResumeOutcome, String> {
+        self.convoy_resume_with_sender_internal(
+            namespace,
+            name,
+            prompt,
+            requested_vessel,
+            requested_role,
+            CrewMessageSender::OperatorResume { principal: None },
+        )
+        .await
+    }
+
+    async fn convoy_resume_with_sender_internal(
+        &self,
+        namespace: &str,
+        name: &str,
+        prompt: &str,
+        requested_vessel: Option<&str>,
+        requested_role: Option<&str>,
+        sender: CrewMessageSender,
     ) -> Result<ConvoyResumeOutcome, String> {
         if prompt.trim().is_empty() {
             return Err("convoy resume requires a non-empty prompt".to_string());
@@ -11246,7 +11303,13 @@ impl InProcessDaemon {
                 &convoys,
                 name,
                 &convoy_external_patches::set_pending_brief(
-                    PendingBrief::builder().vessel(vessel).role(role).content(prompt.to_string()).queued_at(chrono::Utc::now()).build(),
+                    PendingBrief::builder()
+                        .vessel(vessel)
+                        .role(role)
+                        .content(prompt.to_string())
+                        .queued_at(chrono::Utc::now())
+                        .sender(sender)
+                        .build(),
                 ),
             )
             .await
@@ -11270,14 +11333,16 @@ impl InProcessDaemon {
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
             match session.status.as_ref().map(|status| status.phase) {
-                Some(ResourceTerminalSessionPhase::Running) => queue_pending_crew_message(&sessions, &session, prompt).await?,
+                Some(ResourceTerminalSessionPhase::Running) => {
+                    queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?
+                }
                 Some(ResourceTerminalSessionPhase::Stopped) => {
-                    queue_pending_crew_message(&sessions, &session, prompt).await?;
+                    queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?;
                     apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
                         .await
                         .map_err(|err| err.to_string())?;
                 }
-                _ => queue_pending_crew_message(&sessions, &session, prompt).await?,
+                _ => queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?,
             }
             Ok(())
         }
@@ -11342,7 +11407,8 @@ impl InProcessDaemon {
         };
         let delivery_message = TerminalCrewMessage {
             id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
-            text: request.brief.clone(),
+            text: frame_crew_message(&request.sender, &request.brief),
+            sender: request.sender.clone(),
         };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
@@ -11378,9 +11444,9 @@ impl InProcessDaemon {
                 *message = Some(delivery_message);
             }
             TurnDeliverySessionPlan::RestartFresh => {
-                brief.content = request.brief.clone();
+                brief.content = delivery_message.text.clone();
                 brief.artifact_digest = None;
-                *message = None;
+                *message = Some(delivery_message);
             }
         }
         if let Err(error) = sessions.update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec).await {
@@ -12680,7 +12746,17 @@ impl InProcessDaemon {
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
-                    match self.convoy_resume_internal(&namespace, &record_name, prompt, vessel.as_deref(), role.as_deref()).await {
+                    match self
+                        .convoy_resume_with_sender_internal(
+                            &namespace,
+                            &record_name,
+                            prompt,
+                            vessel.as_deref(),
+                            role.as_deref(),
+                            CrewMessageSender::OperatorResume { principal: dispatching_principal_ref.clone() },
+                        )
+                        .await
+                    {
                         Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
                             self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
                                 .await;
@@ -13993,6 +14069,10 @@ impl InProcessDaemon {
                 // field explicit so recorded rungs appear without inventing
                 // one from session liveness or message delivery.
                 last_delivery_rung: None,
+                sender: match &source.object.spec.source {
+                    TerminalSessionSource::Agent { message: Some(message), .. } => Some(crew_message_header(&message.sender)),
+                    _ => None,
+                },
                 delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
             })
             .collect::<Vec<_>>();

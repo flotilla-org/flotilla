@@ -93,6 +93,9 @@ pub struct TerminalSessionSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// The agent variant carries the durable brief and message inline so controllers
+// can clone and update either field without an extra allocation at each access.
+#[allow(clippy::large_enum_variant)]
 pub enum TerminalSessionSource {
     Tool {
         command: String,
@@ -132,6 +135,39 @@ pub struct TerminalCrewContext {
 pub struct TerminalCrewMessage {
     pub id: String,
     pub text: String,
+    /// Sender attribution for surfaces and audit. The default decodes records
+    /// written before sender framing; remove after the next fleet roll.
+    #[serde(default)]
+    pub sender: CrewMessageSender,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CrewMessageSender {
+    #[default]
+    Unknown,
+    FlotillaNudge,
+    FlotillaTurn {
+        source: String,
+    },
+    FlotillaEscalation {
+        from: String,
+    },
+    OperatorResume {
+        principal: Option<flotilla_protocol::PrincipalRef>,
+    },
+    OperatorFollowUp {
+        principal: Option<flotilla_protocol::PrincipalRef>,
+    },
+    Governor {
+        name: String,
+    },
+    Bosun {
+        name: String,
+    },
+    Handoff {
+        from: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -407,7 +407,17 @@ where
                     started_at: state.started_at,
                     crew: state.crew.clone(),
                     launch_command: state.launch_command.clone(),
-                    delivered_message_id: state.delivered_message_id.clone(),
+                    delivered_message_id: (match &obj.spec.source {
+                        // A fresh turn is launched with the framed message as its brief.
+                        // Mark that message delivered so it is not also sent to the live session.
+                        flotilla_resources::TerminalSessionSource::Agent { brief, message: Some(message), .. }
+                            if brief.content == message.text =>
+                        {
+                            Some(message.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| state.delivered_message_id.clone()),
                 }),
                 TerminalPrepared::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })

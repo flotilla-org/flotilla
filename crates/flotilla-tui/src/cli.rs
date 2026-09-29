@@ -952,11 +952,12 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         for delivery in &explanation.crew_deliveries {
             let _ = writeln!(
                 output,
-                "  - {} role={} last_rung={} delivered_message={}",
+                "  - {} role={} last_rung={} delivered_message={} sender={}",
                 delivery.session,
                 delivery.role,
                 delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
-                delivery.delivered_message_id.as_deref().unwrap_or("-")
+                delivery.delivered_message_id.as_deref().unwrap_or("-"),
+                delivery.sender.as_deref().unwrap_or("-")
             );
         }
     }

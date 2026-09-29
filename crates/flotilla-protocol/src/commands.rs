@@ -260,6 +260,8 @@ pub struct ExplainedCrewDelivery {
     pub last_delivery_rung: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

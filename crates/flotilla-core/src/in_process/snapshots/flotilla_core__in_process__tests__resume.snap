@@ -1,0 +1,7 @@
+---
+source: crates/flotilla-core/src/in_process/tests.rs
+expression: "frame_crew_message(&sender, \"Example message.\")"
+---
+[operator robert · via convoy resume]
+
+Example message.

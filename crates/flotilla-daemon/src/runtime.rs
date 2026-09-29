@@ -12772,7 +12772,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             async move {
                 pool.delivered.lock().await.iter().any(|(session, text, submit)| {
-                    session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
+                    session.ends_with("-reviewer") && text == "[handoff from coder@implement]\n\nReview commit abc123" && *submit
                 })
             }
         })
@@ -12808,7 +12808,7 @@ mod tests {
             let pool = Arc::clone(&pool);
             async move {
                 pool.delivered.lock().await.iter().any(|(session, text, submit)| {
-                    session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
+                    session.ends_with("-coder") && text == "[handoff from reviewer@implement]\n\nAddress the review findings" && *submit
                 })
             }
         })
