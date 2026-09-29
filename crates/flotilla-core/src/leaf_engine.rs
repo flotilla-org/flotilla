@@ -1242,6 +1242,7 @@ impl ReconcilerWake {
                             if new_idle {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
                                 let brief = if let Some(refusal) = refusal {
+                                    // These text matches are temporary until typed refusal causes land in #2211.
                                     let conflict = observations.iter().find_map(|source| {
                                         ((refusal.expectation.contains(&format!(
                                             "cr/{}/{}/{}",
