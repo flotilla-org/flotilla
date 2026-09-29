@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     path::PathBuf,
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -38,6 +39,7 @@ const ENV_LABEL: &str = "flotilla.work/env";
 const VESSEL_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(5);
 const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
+const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(bon::Builder)]
 pub struct VesselReconciler {
@@ -56,6 +58,9 @@ pub struct VesselReconciler {
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
     brief_templates: CrewBriefTemplateResolver,
+    #[builder(default)]
+    // A local backstop for rapid create/delete fights; it resets on restart.
+    recent_checkout_create_attempts: Mutex<BTreeMap<String, Instant>>,
 }
 
 impl VesselReconciler {
@@ -76,6 +81,7 @@ impl VesselReconciler {
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
             brief_templates: CrewBriefTemplateResolver::default(),
+            recent_checkout_create_attempts: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -191,6 +197,12 @@ enum PlannedPatch {
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
     },
+    CheckoutChurn {
+        observed_policy_ref: String,
+        observed_policy_version: String,
+        placement_decision: Option<PlacementDecision>,
+        message: String,
+    },
     Ready {
         placement_decision: Option<PlacementDecision>,
         environment_ref: String,
@@ -234,6 +246,23 @@ impl VesselPrepared {
     ) -> Self {
         let waiting_for = legible_waiting_for(waiting_for.into(), placement_decision.as_ref());
         Self { patch: provisioning_patch(placement_policy, placement_decision, waiting_for), actuations }
+    }
+
+    fn checkout_churn(
+        placement_policy: &ResourceObject<PlacementPolicy>,
+        placement_decision: Option<PlacementDecision>,
+        checkout_name: &str,
+        actuations: Vec<Actuation>,
+    ) -> Self {
+        Self {
+            patch: PlannedPatch::CheckoutChurn {
+                observed_policy_ref: placement_policy.metadata.name.clone(),
+                observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                placement_decision,
+                message: format!("checkout {checkout_name} is missing shortly after a create attempt; retrying after backoff"),
+            },
+            actuations,
+        }
     }
 
     fn provisioning_for_environment(
@@ -281,6 +310,12 @@ impl Reconciler for VesselReconciler {
             Err(ResourceError::NotFound { .. }) => return Ok(VesselPrepared::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
             Err(err) => return Err(err),
         };
+        // Convoy cleanup owns terminal vessels and their checkouts. A vessel
+        // awaiting finalization must not provision a child that checkout
+        // reconciliation will immediately collect again.
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Ok(VesselPrepared::none());
+        }
         let placement_decision = flotilla_resources::vessel_placement_pin(&convoy, &obj.spec.vessel_name)
             .map(|pin| pin.decision)
             .or_else(|| convoy.status.as_ref().and_then(|status| status.placement_decision.clone()));
@@ -646,6 +681,20 @@ impl Reconciler for VesselReconciler {
                     if adopted_checkout_ref.is_some() {
                         return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} not found")));
                     }
+                    let now = Instant::now();
+                    let mut recent = self.recent_checkout_create_attempts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    recent.retain(|_, created_at| now.duration_since(*created_at) < CHECKOUT_RECREATE_BACKOFF);
+                    if recent.contains_key(&checkout_name) {
+                        warn!(checkout = %checkout_name, convoy = %convoy.metadata.name, "checkout is missing shortly after a create attempt; backing off");
+                        return Ok(VesselPrepared::checkout_churn(
+                            &placement_policy,
+                            placement_decision.clone(),
+                            &checkout_name,
+                            actuations,
+                        ));
+                    }
+                    recent.insert(checkout_name.clone(), now);
+                    drop(recent);
                     let spec = match &strategy {
                         PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                             CheckoutSpec::Worktree(CheckoutWorktreeSpec {
@@ -1071,6 +1120,23 @@ impl Reconciler for VesselReconciler {
                     message: provisioning_stuck_message(obj, waiting_for, now),
                 })
             }
+            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message } => {
+                if obj
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.phase == VesselPhase::Provisioning && status.message.as_deref() == Some(message))
+                {
+                    None
+                } else {
+                    Some(VesselStatusPatch::MarkProvisioning {
+                        observed_policy_ref: observed_policy_ref.clone(),
+                        observed_policy_version: observed_policy_version.clone(),
+                        placement_decision: placement_decision.clone(),
+                        started_at: now,
+                        message: Some(message.clone()),
+                    })
+                }
+            }
             PlannedPatch::Ready {
                 placement_decision,
                 environment_ref,
@@ -1104,7 +1170,9 @@ impl Reconciler for VesselReconciler {
         };
 
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
-        if matches!(&prepared.patch, PlannedPatch::Provisioning { .. }) {
+        if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
+            outcome.requeue_after = Some(CHECKOUT_RECREATE_BACKOFF);
+        } else if matches!(&prepared.patch, PlannedPatch::Provisioning { .. }) {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
         } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
             outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
