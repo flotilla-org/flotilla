@@ -1,0 +1,271 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "image": {
+        "image_baseline_ref": "fleet-crew"
+      },
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+      "image": {
+        "image_baseline_ref": "fleet-crew"
+      },
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "b2aac222-c72f-458e-baa0-b089c52c16af",
+      "image": "ubuntu:24.04",
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+      "image": "ubuntu:24.04",
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "image": "ubuntu:24.04",
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "gui_session"
+        },
+        {
+          "kind": "network",
+          "value": "host"
+        },
+        {
+          "kind": "host_account_reach"
+        }
+      ],
+      "host_ref": "b2aac222-c72f-458e-baa0-b089c52c16af",
+      "pool": "cleat",
+      "realisation": "host_direct"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "macos"
+        },
+        {
+          "kind": "gui_session"
+        },
+        {
+          "kind": "network",
+          "value": "host"
+        },
+        {
+          "kind": "host_account_reach"
+        }
+      ],
+      "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+      "pool": "cleat",
+      "realisation": "host_direct"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "gui_session"
+        },
+        {
+          "kind": "network",
+          "value": "host"
+        },
+        {
+          "kind": "host_account_reach"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "pool": "cleat",
+      "realisation": "host_direct"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "macos"
+        },
+        {
+          "kind": "gui_session"
+        },
+        {
+          "kind": "network",
+          "value": "host"
+        },
+        {
+          "kind": "host_account_reach"
+        }
+      ],
+      "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+      "pool": "cleat",
+      "realisation": "host_direct"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "network",
+          "value": "scoped"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "pool": "cleat",
+      "realisation": "docker_per_vessel"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "FulfilmentKind",
+    "spec": {
+      "grants": [
+        {
+          "kind": "platform",
+          "value": "linux"
+        },
+        {
+          "kind": "gui_session"
+        },
+        {
+          "kind": "network",
+          "value": "host"
+        },
+        {
+          "kind": "host_account_reach"
+        }
+      ],
+      "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "pool": "cleat",
+      "realisation": "host_direct"
+    }
+  }
+]

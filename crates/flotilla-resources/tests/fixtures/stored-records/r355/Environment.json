@@ -1,0 +1,360 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-42817c9675d242f0bd666d7f9ad56265-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-6009d22bebfa4659a110852c1dc5a0ac-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-rjwittams-crew\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540\",\"tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0\"],\"github-rjwittams-crew\":[\"ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540\",\"tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0\"],\"lab-forgejo-crew-pr\":[\"ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540\",\"tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "claude-code"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern",
+      "image_digest": "sha256:3801f1d13acda2bf7d44acd92bdfe065eca7fc71854620dcbbd0e041d125184b",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg\",\"sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0\"],\"github-crew-pr\":[\"308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg\",\"sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0\"],\"lab-forgejo-crew-pr\":[\"308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg\",\"sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "claude-code"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-881c971cafea455a8afe81927da886cd-govern",
+      "image_digest": "sha256:3801f1d13acda2bf7d44acd92bdfe065eca7fc71854620dcbbd0e041d125184b",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-c50a16dbb38b4a83a4a27d999685675e-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-dea65ba206424208b603760447d7313c-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "docker": {
+        "declared_agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "env": {
+          "FLOTILLA_CREDENTIAL_PERMISSIONS": "{\"github-crew-pr\":{\"actions\":\"write\",\"checks\":\"read\",\"contents\":\"write\",\"issues\":\"write\",\"pull_requests\":\"write\"}}",
+          "FLOTILLA_CREDENTIAL_REFS": "[\"claude-max\",\"github-crew-pr\",\"lab-forgejo-crew-pr\"]",
+          "FLOTILLA_CREDENTIAL_SCOPES": "{\"claude-max\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"github-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"],\"lab-forgejo-crew-pr\":[\"vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g\"]}"
+        },
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "mounts": [
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/workspace"
+          },
+          {
+            "mode": "rw",
+            "source_path": "/masked/path",
+            "target_path": "/masked/path"
+          }
+        ],
+        "pull_policy": "always",
+        "required_agent_adapters": [
+          "codex"
+        ]
+      }
+    },
+    "status": {
+      "docker_container_id": "flotilla-env-env-convoy-e630959b488e409b8876bd278e131dea-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "phase": "Ready",
+      "ready": true
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Environment",
+    "spec": {
+      "host_direct": {
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "repo_default_dir": "/masked/path"
+      }
+    },
+    "status": {
+      "phase": "Ready",
+      "ready": true
+    }
+  }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Forge",
+    "spec": {
+      "forge_id": "lab",
+      "git_ssh_host": "host-9f9ddac6cd.example.invalid",
+      "hosts": [
+        "host-80c7a6d814.example.invalid",
+        "host-0b25cdc543.example.invalid",
+        "host-9f9ddac6cd.example.invalid"
+      ],
+      "https_url": "https://host-0b25cdc543.example.invalid",
+      "kind": "forgejo"
+    }
+  }
+]

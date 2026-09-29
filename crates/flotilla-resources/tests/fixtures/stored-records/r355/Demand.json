@@ -1,0 +1,22 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Demand",
+    "spec": {
+      "addressee": {
+        "kind": "principal",
+        "principal_ref": {
+          "name": "implicit",
+          "namespace": "flotilla"
+        }
+      },
+      "kind": "human_gate",
+      "originating_work_ref": {
+        "api_version": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "store-federation",
+        "namespace": "flotilla"
+      }
+    }
+  }
+]

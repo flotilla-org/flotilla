@@ -1,0 +1,551 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-26189bcabb03430db24993ebf5a14748-govern",
+      "pool": "cleat",
+      "role": "governor",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/masked/path",
+            "/masked/path"
+          ],
+          "path": ".flotilla/briefs/governor.md"
+        },
+        "context": {
+          "convoy": "convoy-26189bcabb03430db24993ebf5a14748",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-26189bcabb03430db24993ebf5a14748-govern"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:36.170585405Z",
+        "source": "screen",
+        "state": "idle"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-26189bcabb03430db24993ebf5a14748-govern-governor"
+      },
+      "crew": {
+        "adapter": "claude-code",
+        "id": "23d465c2-7b47-47c6-864b-c524245e7a9d",
+        "model": "claude-fable-5-1",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "occupied",
+      "phase": "Running",
+      "session_id": "terminal-convoy-26189bcabb03430db24993ebf5a14748-govern-governor",
+      "started_at": "2026-09-26T21:21:20.872120796Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-42817c9675d242f0bd666d7f9ad56265-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-42817c9675d242f0bd666d7f9ad56265",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-42817c9675d242f0bd666d7f9ad56265-work"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:04:14.808307463Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-42817c9675d242f0bd666d7f9ad56265-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "a0068363-b1ed-41dc-9c7c-8b8540d4e898",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-42817c9675d242f0bd666d7f9ad56265-work-coder",
+      "started_at": "2026-09-28T15:58:20.488243436Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern",
+      "pool": "cleat",
+      "role": "governor",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/masked/path",
+            "/masked/path"
+          ],
+          "path": ".flotilla/briefs/governor.md"
+        },
+        "context": {
+          "convoy": "convoy-44ce83f4440d49c1b2c06fb71fdd83e3",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:36.562360278Z",
+        "source": "screen",
+        "state": "idle"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern-governor"
+      },
+      "crew": {
+        "adapter": "claude-code",
+        "id": "dc60a1f7-a95d-4b1d-a957-0d642ecec6c2",
+        "model": "claude-fable-5-1",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "occupied",
+      "phase": "Running",
+      "session_id": "terminal-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern-governor",
+      "started_at": "2026-09-26T21:21:10.596278213Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-6009d22bebfa4659a110852c1dc5a0ac-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-6009d22bebfa4659a110852c1dc5a0ac-work"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:04:15.020127380Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-6009d22bebfa4659a110852c1dc5a0ac-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "a09b3fa4-3c4b-46bd-b9fe-0a4094c543c4",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-6009d22bebfa4659a110852c1dc5a0ac-work-coder",
+      "started_at": "2026-09-28T15:58:31.203466886Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern",
+      "pool": "cleat",
+      "role": "governor",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/masked/path",
+            "/masked/path"
+          ],
+          "path": ".flotilla/briefs/governor.md"
+        },
+        "context": {
+          "convoy": "convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:04:15.320295684Z",
+        "source": "screen",
+        "state": "idle"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern-governor"
+      },
+      "crew": {
+        "adapter": "claude-code",
+        "id": "f9d37723-7e3c-48cb-b83e-ed24b11b8b76",
+        "model": "claude-fable-5-1",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "occupied",
+      "phase": "Running",
+      "session_id": "terminal-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern-governor",
+      "started_at": "2026-09-26T21:53:56.226122163Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-881c971cafea455a8afe81927da886cd-govern",
+      "pool": "cleat",
+      "role": "governor",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/masked/path",
+            "/masked/path"
+          ],
+          "path": ".flotilla/briefs/governor.md"
+        },
+        "context": {
+          "convoy": "convoy-881c971cafea455a8afe81927da886cd",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-881c971cafea455a8afe81927da886cd-govern"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "claude-code",
+          "capability": "governor",
+          "model": "claude-fable-5-1"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:15.583217320Z",
+        "source": "screen",
+        "state": "idle"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-881c971cafea455a8afe81927da886cd-govern-governor"
+      },
+      "crew": {
+        "adapter": "claude-code",
+        "id": "727f39e6-9187-4c56-b7fd-086148332569",
+        "model": "claude-fable-5-1",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "occupied",
+      "phase": "Running",
+      "session_id": "terminal-convoy-881c971cafea455a8afe81927da886cd-govern-governor",
+      "started_at": "2026-09-26T21:06:40.916130975Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-b94ecf64b49a4cc99df14ccf9072f03a-work"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:15.790998281Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "ee504514-1460-4d5e-8ee2-9e03dab77c00",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work-coder",
+      "started_at": "2026-09-28T15:57:35.861907139Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-c50a16dbb38b4a83a4a27d999685675e-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-c50a16dbb38b4a83a4a27d999685675e-work"
+        },
+        "kind": "agent",
+        "message": {
+          "id": "turn-delivery:stall-nudge-1:1790611129600388",
+          "text": "You owe a settlement claim for work/coder: finish, then run `flotilla crew complete --decision-ledger-ref \u2026`, or `crew fail --message \u2026`."
+        },
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:15.993802874Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-c50a16dbb38b4a83a4a27d999685675e-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "02eb289c-f175-4716-8292-3cca86295165",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "delivered_message_id": "turn-delivery:stall-nudge-1:1790611129600388",
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-c50a16dbb38b4a83a4a27d999685675e-work-coder",
+      "started_at": "2026-09-28T15:58:41.125004640Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-dea65ba206424208b603760447d7313c-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-dea65ba206424208b603760447d7313c",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-dea65ba206424208b603760447d7313c-work"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:16.204528106Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-dea65ba206424208b603760447d7313c-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "f63075fb-7559-497f-a391-709918bd5bc8",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-dea65ba206424208b603760447d7313c-work-coder",
+      "started_at": "2026-09-28T15:58:00.845948373Z"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "TerminalSession",
+    "spec": {
+      "cwd": "/workspace",
+      "env_ref": "env-convoy-e630959b488e409b8876bd278e131dea-work",
+      "pool": "cleat",
+      "role": "coder",
+      "source": {
+        "brief": {
+          "content": "[redacted]",
+          "copies": [
+            "/workspace"
+          ],
+          "path": ".flotilla/briefs/coder.md"
+        },
+        "context": {
+          "convoy": "convoy-e630959b488e409b8876bd278e131dea",
+          "namespace": "flotilla",
+          "vessel_ref": "convoy-e630959b488e409b8876bd278e131dea-work"
+        },
+        "kind": "agent",
+        "selector": {
+          "adapter": "codex",
+          "capability": "code",
+          "model": "gpt-6-sol"
+        }
+      }
+    },
+    "status": {
+      "attention": {
+        "as_of": "2026-09-28T16:03:16.404939210Z",
+        "source": "screen",
+        "state": "working"
+      },
+      "cleat_endpoint": {
+        "daemon": "default@1",
+        "runtime_root": "/masked/path",
+        "session": "terminal-convoy-e630959b488e409b8876bd278e131dea-work-coder"
+      },
+      "crew": {
+        "adapter": "codex",
+        "id": "88ca485f-c043-4887-bc4e-728001f29704",
+        "model": "gpt-6-sol",
+        "stance": "trusted-implicit"
+      },
+      "inner_command_status": "Running",
+      "launch_command": "[redacted]",
+      "occupancy": "vacant",
+      "phase": "Running",
+      "session_id": "terminal-convoy-e630959b488e409b8876bd278e131dea-work-coder",
+      "started_at": "2026-09-28T15:57:49.006778973Z"
+    }
+  }
+]

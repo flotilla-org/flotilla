@@ -1,0 +1,2918 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 47706,
+      "expires_at": "2026-09-29T16:03:35.689586830Z",
+      "first_seen": "2026-08-26T11:33:48.652824467Z",
+      "last_seen": "2026-09-28T16:03:35.689586830Z",
+      "message": "[redacted]",
+      "reason": "CloneFailed",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Clone",
+        "name": "clone-79qvgvajqh47ghd0ip7dalkd0mnpn7c7durgk51hlu54ivl5vsf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 47706,
+      "expires_at": "2026-09-29T16:03:35.695948089Z",
+      "first_seen": "2026-08-26T11:33:48.674974255Z",
+      "last_seen": "2026-09-28T16:03:35.695948089Z",
+      "message": "[redacted]",
+      "reason": "CloneFailed",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Clone",
+        "name": "clone-eqp56lt1c0l2l666rp2je63l6aio5bvjupf7f1uc4d3ak9sn9ga0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1479,
+      "expires_at": "2026-09-29T16:03:53.553106Z",
+      "first_seen": "2026-09-27T15:25:55.838097Z",
+      "last_seen": "2026-09-28T16:03:53.553106Z",
+      "message": "[redacted]",
+      "reason": "CloneFailed",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Clone",
+        "name": "clone-qofqehg3lj683hic39paakt6rhsq4s35k86chqdkmmc4f33eqimg",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:23.914386191Z",
+      "first_seen": "2026-09-27T18:41:23.914386191Z",
+      "last_seen": "2026-09-27T18:41:23.914386191Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:11.081036701Z",
+      "first_seen": "2026-09-27T18:41:11.081036701Z",
+      "last_seen": "2026-09-27T18:41:11.081036701Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:24:53.262393308Z",
+      "first_seen": "2026-09-27T20:24:53.262393308Z",
+      "last_seen": "2026-09-27T20:24:53.262393308Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:11.088630272Z",
+      "first_seen": "2026-09-27T18:41:11.088630272Z",
+      "last_seen": "2026-09-27T18:41:11.088630272Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:39:50.019531880Z",
+      "first_seen": "2026-09-27T20:39:50.019531880Z",
+      "last_seen": "2026-09-27T20:39:50.019531880Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:23.908218140Z",
+      "first_seen": "2026-09-27T18:41:23.908218140Z",
+      "last_seen": "2026-09-27T18:41:23.908218140Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-029f52f7fa624333b3006de1b42ac7c9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:13:05.957703119Z",
+      "first_seen": "2026-09-27T21:13:05.957703119Z",
+      "last_seen": "2026-09-27T21:13:05.957703119Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-19bae6b94f4c4c888631db36dbebb607",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:12:50.411503996Z",
+      "first_seen": "2026-09-27T21:12:50.411503996Z",
+      "last_seen": "2026-09-27T21:12:50.411503996Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-19bae6b94f4c4c888631db36dbebb607",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:13:05.979109559Z",
+      "first_seen": "2026-09-27T21:13:05.979109559Z",
+      "last_seen": "2026-09-27T21:13:05.979109559Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-19bae6b94f4c4c888631db36dbebb607",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:12:50.398061241Z",
+      "first_seen": "2026-09-27T21:12:50.398061241Z",
+      "last_seen": "2026-09-27T21:12:50.398061241Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-19bae6b94f4c4c888631db36dbebb607",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:09:31.413067544Z",
+      "first_seen": "2026-09-27T23:09:31.413067544Z",
+      "last_seen": "2026-09-27T23:09:31.413067544Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:30.583085127Z",
+      "first_seen": "2026-09-27T20:45:30.583085127Z",
+      "last_seen": "2026-09-27T20:45:30.583085127Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:49:39.986926020Z",
+      "first_seen": "2026-09-27T23:49:39.986926020Z",
+      "last_seen": "2026-09-27T23:49:39.986926020Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:46.854631339Z",
+      "first_seen": "2026-09-27T20:45:46.854631339Z",
+      "last_seen": "2026-09-27T20:45:46.854631339Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:30.597121502Z",
+      "first_seen": "2026-09-27T20:45:30.597121502Z",
+      "last_seen": "2026-09-27T20:45:30.597121502Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:46.838842227Z",
+      "first_seen": "2026-09-27T20:45:46.838842227Z",
+      "last_seen": "2026-09-27T20:45:46.838842227Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1cbe9bee5b7b4de4ace54dc87f5245b9",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:29.150349028Z",
+      "first_seen": "2026-09-27T16:27:29.150349028Z",
+      "last_seen": "2026-09-27T16:27:29.150349028Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-1d30926c59fc495a906a3f4a89e97d72",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:39.944554467Z",
+      "first_seen": "2026-09-27T18:40:39.944554467Z",
+      "last_seen": "2026-09-27T18:40:39.944554467Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:39.950715986Z",
+      "first_seen": "2026-09-27T18:40:39.950715986Z",
+      "last_seen": "2026-09-27T18:40:39.950715986Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:16:43.632840799Z",
+      "first_seen": "2026-09-27T20:16:43.632840799Z",
+      "last_seen": "2026-09-27T20:16:43.632840799Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:53.120294105Z",
+      "first_seen": "2026-09-27T18:40:53.120294105Z",
+      "last_seen": "2026-09-27T18:40:53.120294105Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:53.113274391Z",
+      "first_seen": "2026-09-27T18:40:53.113274391Z",
+      "last_seen": "2026-09-27T18:40:53.113274391Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:16:43.602397190Z",
+      "first_seen": "2026-09-27T20:16:43.602397190Z",
+      "last_seen": "2026-09-27T20:16:43.602397190Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-310f06e447194d7199b4a5eafc4428dc",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:25.480085317Z",
+      "first_seen": "2026-09-27T18:40:25.480085317Z",
+      "last_seen": "2026-09-27T18:40:25.480085317Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:36.745403340Z",
+      "first_seen": "2026-09-27T18:40:36.745403340Z",
+      "last_seen": "2026-09-27T18:40:36.745403340Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:36.751136918Z",
+      "first_seen": "2026-09-27T18:40:36.751136918Z",
+      "last_seen": "2026-09-27T18:40:36.751136918Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.556967368Z",
+      "first_seen": "2026-09-27T22:27:27.556967368Z",
+      "last_seen": "2026-09-27T22:27:27.556967368Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:25.487359193Z",
+      "first_seen": "2026-09-27T18:40:25.487359193Z",
+      "last_seen": "2026-09-27T18:40:25.487359193Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:29.081055585Z",
+      "first_seen": "2026-09-27T22:27:29.081055585Z",
+      "last_seen": "2026-09-27T22:27:29.081055585Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3e986944ab0342af9502cae89ae021bb",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:58.240433802Z",
+      "first_seen": "2026-09-27T20:45:58.240433802Z",
+      "last_seen": "2026-09-27T20:45:58.240433802Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:58.229106264Z",
+      "first_seen": "2026-09-27T20:45:58.229106264Z",
+      "last_seen": "2026-09-27T20:45:58.229106264Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:41.506886990Z",
+      "first_seen": "2026-09-27T20:45:41.506886990Z",
+      "last_seen": "2026-09-27T20:45:41.506886990Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:30.100591923Z",
+      "first_seen": "2026-09-27T22:27:30.100591923Z",
+      "last_seen": "2026-09-27T22:27:30.100591923Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:41.552288777Z",
+      "first_seen": "2026-09-27T20:45:41.552288777Z",
+      "last_seen": "2026-09-27T20:45:41.552288777Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:07:55.177225706Z",
+      "first_seen": "2026-09-27T21:07:55.177225706Z",
+      "last_seen": "2026-09-27T21:07:55.177225706Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-3f5b843ad2c74ecca2607e556f21f428",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:20.498461172Z",
+      "first_seen": "2026-09-28T15:58:20.498461172Z",
+      "last_seen": "2026-09-28T15:58:20.498461172Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-42817c9675d242f0bd666d7f9ad56265",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:20.510061224Z",
+      "first_seen": "2026-09-28T15:58:20.510061224Z",
+      "last_seen": "2026-09-28T15:58:20.510061224Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-42817c9675d242f0bd666d7f9ad56265",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:06.056667325Z",
+      "first_seen": "2026-09-28T15:58:06.056667325Z",
+      "last_seen": "2026-09-28T15:58:06.056667325Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-42817c9675d242f0bd666d7f9ad56265",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:06.070698157Z",
+      "first_seen": "2026-09-28T15:58:06.070698157Z",
+      "last_seen": "2026-09-28T15:58:06.070698157Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-42817c9675d242f0bd666d7f9ad56265",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:31.222499754Z",
+      "first_seen": "2026-09-28T15:58:31.222499754Z",
+      "last_seen": "2026-09-28T15:58:31.222499754Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:31.214296250Z",
+      "first_seen": "2026-09-28T15:58:31.214296250Z",
+      "last_seen": "2026-09-28T15:58:31.214296250Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:18.410712192Z",
+      "first_seen": "2026-09-28T15:58:18.410712192Z",
+      "last_seen": "2026-09-28T15:58:18.410712192Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:18.403332868Z",
+      "first_seen": "2026-09-28T15:58:18.403332868Z",
+      "last_seen": "2026-09-28T15:58:18.403332868Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:11:46.007285756Z",
+      "first_seen": "2026-09-27T19:11:46.007285756Z",
+      "last_seen": "2026-09-27T19:11:46.007285756Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:25.591616571Z",
+      "first_seen": "2026-09-27T18:40:25.591616571Z",
+      "last_seen": "2026-09-27T18:40:25.591616571Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:13.487781985Z",
+      "first_seen": "2026-09-27T18:40:13.487781985Z",
+      "last_seen": "2026-09-27T18:40:13.487781985Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:25.597534599Z",
+      "first_seen": "2026-09-27T18:40:25.597534599Z",
+      "last_seen": "2026-09-27T18:40:25.597534599Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:14:17.929560405Z",
+      "first_seen": "2026-09-27T19:14:17.929560405Z",
+      "last_seen": "2026-09-27T19:14:17.929560405Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:13.481724142Z",
+      "first_seen": "2026-09-27T18:40:13.481724142Z",
+      "last_seen": "2026-09-27T18:40:13.481724142Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-6ef46cc0ddbc4b45801bc03615b09acf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:26:55.805626721Z",
+      "first_seen": "2026-09-27T16:26:55.805626721Z",
+      "last_seen": "2026-09-27T16:26:55.805626721Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T17:15:35.228568829Z",
+      "first_seen": "2026-09-27T17:15:35.228568829Z",
+      "last_seen": "2026-09-27T17:15:35.228568829Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:11.540181315Z",
+      "first_seen": "2026-09-27T16:27:11.540181315Z",
+      "last_seen": "2026-09-27T16:27:11.540181315Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:06:14.620041610Z",
+      "first_seen": "2026-09-27T18:06:14.620041610Z",
+      "last_seen": "2026-09-27T18:06:14.620041610Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:26:55.818885762Z",
+      "first_seen": "2026-09-27T16:26:55.818885762Z",
+      "last_seen": "2026-09-27T16:26:55.818885762Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:11.550443614Z",
+      "first_seen": "2026-09-27T16:27:11.550443614Z",
+      "last_seen": "2026-09-27T16:27:11.550443614Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-808503bfe5144d3bb9e9dc20c8adc530",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:35:43.407314610Z",
+      "first_seen": "2026-09-27T16:35:43.407314610Z",
+      "last_seen": "2026-09-27T16:35:43.407314610Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-81fd6e0983664c8489583775de6c97fa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:01:36.421887039Z",
+      "first_seen": "2026-09-27T18:01:36.421887039Z",
+      "last_seen": "2026-09-27T18:01:36.421887039Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-81fd6e0983664c8489583775de6c97fa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:14.463440661Z",
+      "first_seen": "2026-09-27T18:41:14.463440661Z",
+      "last_seen": "2026-09-27T18:41:14.463440661Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:00.767937777Z",
+      "first_seen": "2026-09-27T18:41:00.767937777Z",
+      "last_seen": "2026-09-27T18:41:00.767937777Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:19:27.879830332Z",
+      "first_seen": "2026-09-27T19:19:27.879830332Z",
+      "last_seen": "2026-09-27T19:19:27.879830332Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:16:49.556117196Z",
+      "first_seen": "2026-09-27T19:16:49.556117196Z",
+      "last_seen": "2026-09-27T19:16:49.556117196Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:00.785848236Z",
+      "first_seen": "2026-09-27T18:41:00.785848236Z",
+      "last_seen": "2026-09-27T18:41:00.785848236Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:14.457022156Z",
+      "first_seen": "2026-09-27T18:41:14.457022156Z",
+      "last_seen": "2026-09-27T18:41:14.457022156Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8317c0f6f2b9415893832934d7d9f822",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T12:01:15.550029270Z",
+      "first_seen": "2026-09-28T12:01:15.550029270Z",
+      "last_seen": "2026-09-28T12:01:15.550029270Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T11:07:34.258098720Z",
+      "first_seen": "2026-09-28T11:07:34.258098720Z",
+      "last_seen": "2026-09-28T11:07:34.258098720Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T12:01:04.913930055Z",
+      "first_seen": "2026-09-28T12:01:04.913930055Z",
+      "last_seen": "2026-09-28T12:01:04.913930055Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T11:07:47.858892771Z",
+      "first_seen": "2026-09-28T11:07:47.858892771Z",
+      "last_seen": "2026-09-28T11:07:47.858892771Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T11:07:47.852625509Z",
+      "first_seen": "2026-09-28T11:07:47.852625509Z",
+      "last_seen": "2026-09-28T11:07:47.852625509Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T11:07:34.265762348Z",
+      "first_seen": "2026-09-28T11:07:34.265762348Z",
+      "last_seen": "2026-09-28T11:07:34.265762348Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-85e52533e80740e08573c2b47294580d",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:14:52.730825881Z",
+      "first_seen": "2026-09-27T19:14:52.730825881Z",
+      "last_seen": "2026-09-27T19:14:52.730825881Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:15:07.754573485Z",
+      "first_seen": "2026-09-27T19:15:07.754573485Z",
+      "last_seen": "2026-09-27T19:15:07.754573485Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:14:52.693821882Z",
+      "first_seen": "2026-09-27T19:14:52.693821882Z",
+      "last_seen": "2026-09-27T19:14:52.693821882Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:58:00.474470762Z",
+      "first_seen": "2026-09-27T20:58:00.474470762Z",
+      "last_seen": "2026-09-27T20:58:00.474470762Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:03:43.527203147Z",
+      "first_seen": "2026-09-27T21:03:43.527203147Z",
+      "last_seen": "2026-09-27T21:03:43.527203147Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T19:15:07.787426126Z",
+      "first_seen": "2026-09-27T19:15:07.787426126Z",
+      "last_seen": "2026-09-27T19:15:07.787426126Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-8ad53520189448cd868c99842cdfdc5f",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:13.206242306Z",
+      "first_seen": "2026-09-27T20:46:13.206242306Z",
+      "last_seen": "2026-09-27T20:46:13.206242306Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:43:49.512215447Z",
+      "first_seen": "2026-09-27T22:43:49.512215447Z",
+      "last_seen": "2026-09-27T22:43:49.512215447Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:59.335235492Z",
+      "first_seen": "2026-09-27T20:45:59.335235492Z",
+      "last_seen": "2026-09-27T20:45:59.335235492Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:13.218972459Z",
+      "first_seen": "2026-09-27T20:46:13.218972459Z",
+      "last_seen": "2026-09-27T20:46:13.218972459Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.586560650Z",
+      "first_seen": "2026-09-27T22:27:27.586560650Z",
+      "last_seen": "2026-09-27T22:27:27.586560650Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:59.352429343Z",
+      "first_seen": "2026-09-27T20:45:59.352429343Z",
+      "last_seen": "2026-09-27T20:45:59.352429343Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-909911f8fe7f4a4e9af49b307ba67cf0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:07.992732252Z",
+      "first_seen": "2026-09-27T16:27:07.992732252Z",
+      "last_seen": "2026-09-27T16:27:07.992732252Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-a8d1ceef1ab542158a6528730b31a1b1",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:41:40.322372378Z",
+      "first_seen": "2026-09-27T20:41:40.322372378Z",
+      "last_seen": "2026-09-27T20:41:40.322372378Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:41:51.866017819Z",
+      "first_seen": "2026-09-27T20:41:51.866017819Z",
+      "last_seen": "2026-09-27T20:41:51.866017819Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:21:25.739281645Z",
+      "first_seen": "2026-09-27T23:21:25.739281645Z",
+      "last_seen": "2026-09-27T23:21:25.739281645Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:41:51.873770651Z",
+      "first_seen": "2026-09-27T20:41:51.873770651Z",
+      "last_seen": "2026-09-27T20:41:51.873770651Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:41:40.314607323Z",
+      "first_seen": "2026-09-27T20:41:40.314607323Z",
+      "last_seen": "2026-09-27T20:41:40.314607323Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:50:32.623767426Z",
+      "first_seen": "2026-09-27T23:50:32.623767426Z",
+      "last_seen": "2026-09-27T23:50:32.623767426Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b1a8d22fc5ca44ed834079459ad91d97",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:35.875423016Z",
+      "first_seen": "2026-09-28T15:57:35.875423016Z",
+      "last_seen": "2026-09-28T15:57:35.875423016Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:22.545696815Z",
+      "first_seen": "2026-09-28T15:57:22.545696815Z",
+      "last_seen": "2026-09-28T15:57:22.545696815Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:35.870914164Z",
+      "first_seen": "2026-09-28T15:57:35.870914164Z",
+      "last_seen": "2026-09-28T15:57:35.870914164Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:22.539625565Z",
+      "first_seen": "2026-09-28T15:57:22.539625565Z",
+      "last_seen": "2026-09-28T15:57:22.539625565Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:43:07.374072523Z",
+      "first_seen": "2026-09-27T22:43:07.374072523Z",
+      "last_seen": "2026-09-27T22:43:07.374072523Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:23.304301557Z",
+      "first_seen": "2026-09-27T20:46:23.304301557Z",
+      "last_seen": "2026-09-27T20:46:23.304301557Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:09.265287885Z",
+      "first_seen": "2026-09-27T20:46:09.265287885Z",
+      "last_seen": "2026-09-27T20:46:09.265287885Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.598198603Z",
+      "first_seen": "2026-09-27T22:27:27.598198603Z",
+      "last_seen": "2026-09-27T22:27:27.598198603Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:09.276901826Z",
+      "first_seen": "2026-09-27T20:46:09.276901826Z",
+      "last_seen": "2026-09-27T20:46:09.276901826Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:23.295587004Z",
+      "first_seen": "2026-09-27T20:46:23.295587004Z",
+      "last_seen": "2026-09-27T20:46:23.295587004Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-b97ff8361ab54858bf9bbf384eedf515",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.605592438Z",
+      "first_seen": "2026-09-27T22:27:27.605592438Z",
+      "last_seen": "2026-09-27T22:27:27.605592438Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:11:02.755904647Z",
+      "first_seen": "2026-09-27T21:11:02.755904647Z",
+      "last_seen": "2026-09-27T21:11:02.755904647Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.668379272Z",
+      "first_seen": "2026-09-27T22:27:27.668379272Z",
+      "last_seen": "2026-09-27T22:27:27.668379272Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T21:10:56.260359153Z",
+      "first_seen": "2026-09-27T21:10:56.260359153Z",
+      "last_seen": "2026-09-27T21:10:56.260359153Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.653856615Z",
+      "first_seen": "2026-09-27T22:27:27.653856615Z",
+      "last_seen": "2026-09-27T22:27:27.653856615Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:30.641972318Z",
+      "first_seen": "2026-09-27T22:27:30.641972318Z",
+      "last_seen": "2026-09-27T22:27:30.641972318Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c27d9560540a4c2db9aa6a00ad46676e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:28.788859369Z",
+      "first_seen": "2026-09-28T15:58:28.788859369Z",
+      "last_seen": "2026-09-28T15:58:28.788859369Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:41.134850522Z",
+      "first_seen": "2026-09-28T15:58:41.134850522Z",
+      "last_seen": "2026-09-28T15:58:41.134850522Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:28.796899394Z",
+      "first_seen": "2026-09-28T15:58:28.796899394Z",
+      "last_seen": "2026-09-28T15:58:28.796899394Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:41.141538889Z",
+      "first_seen": "2026-09-28T15:58:41.141538889Z",
+      "last_seen": "2026-09-28T15:58:41.141538889Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 2,
+      "expires_at": "2026-09-29T09:25:13.983183248Z",
+      "first_seen": "2026-09-28T01:28:28.258306308Z",
+      "last_seen": "2026-09-28T09:25:13.983183248Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:56:54.198523195Z",
+      "first_seen": "2026-09-27T23:56:54.198523195Z",
+      "last_seen": "2026-09-27T23:56:54.198523195Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T10:03:24.703834262Z",
+      "first_seen": "2026-09-28T10:03:24.703834262Z",
+      "last_seen": "2026-09-28T10:03:24.703834262Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:57:07.385652485Z",
+      "first_seen": "2026-09-27T23:57:07.385652485Z",
+      "last_seen": "2026-09-27T23:57:07.385652485Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:57:07.373726753Z",
+      "first_seen": "2026-09-27T23:57:07.373726753Z",
+      "last_seen": "2026-09-27T23:57:07.373726753Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:56:54.205258232Z",
+      "first_seen": "2026-09-27T23:56:54.205258232Z",
+      "last_seen": "2026-09-27T23:56:54.205258232Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-c8917eb574454e24a795706706a38e1c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:45.006835609Z",
+      "first_seen": "2026-09-27T20:46:45.006835609Z",
+      "last_seen": "2026-09-27T20:46:45.006835609Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dcc0403e2ab84557b8377604375009aa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:50.102464278Z",
+      "first_seen": "2026-09-27T20:46:50.102464278Z",
+      "last_seen": "2026-09-27T20:46:50.102464278Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dcc0403e2ab84557b8377604375009aa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:50.127474192Z",
+      "first_seen": "2026-09-27T20:46:50.127474192Z",
+      "last_seen": "2026-09-27T20:46:50.127474192Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dcc0403e2ab84557b8377604375009aa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:46:45.026864155Z",
+      "first_seen": "2026-09-27T20:46:45.026864155Z",
+      "last_seen": "2026-09-27T20:46:45.026864155Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dcc0403e2ab84557b8377604375009aa",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:00.856478960Z",
+      "first_seen": "2026-09-28T15:58:00.856478960Z",
+      "last_seen": "2026-09-28T15:58:00.856478960Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dea65ba206424208b603760447d7313c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:47.885852857Z",
+      "first_seen": "2026-09-28T15:57:47.885852857Z",
+      "last_seen": "2026-09-28T15:57:47.885852857Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dea65ba206424208b603760447d7313c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:58:00.864578187Z",
+      "first_seen": "2026-09-28T15:58:00.864578187Z",
+      "last_seen": "2026-09-28T15:58:00.864578187Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dea65ba206424208b603760447d7313c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:47.893257028Z",
+      "first_seen": "2026-09-28T15:57:47.893257028Z",
+      "last_seen": "2026-09-28T15:57:47.893257028Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-dea65ba206424208b603760447d7313c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T17:18:05.347597061Z",
+      "first_seen": "2026-09-27T17:18:05.347597061Z",
+      "last_seen": "2026-09-27T17:18:05.347597061Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:09.005448752Z",
+      "first_seen": "2026-09-27T16:27:09.005448752Z",
+      "last_seen": "2026-09-27T16:27:09.005448752Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:23.885212246Z",
+      "first_seen": "2026-09-27T16:27:23.885212246Z",
+      "last_seen": "2026-09-27T16:27:23.885212246Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:23.874445333Z",
+      "first_seen": "2026-09-27T16:27:23.874445333Z",
+      "last_seen": "2026-09-27T16:27:23.874445333Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:05:48.369513942Z",
+      "first_seen": "2026-09-27T18:05:48.369513942Z",
+      "last_seen": "2026-09-27T18:05:48.369513942Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T16:27:08.746449487Z",
+      "first_seen": "2026-09-27T16:27:08.746449487Z",
+      "last_seen": "2026-09-27T16:27:08.746449487Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e38c496b8bdd47169b52891da0d74136",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:36.700874886Z",
+      "first_seen": "2026-09-28T15:57:36.700874886Z",
+      "last_seen": "2026-09-28T15:57:36.700874886Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e630959b488e409b8876bd278e131dea",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:49.024594938Z",
+      "first_seen": "2026-09-28T15:57:49.024594938Z",
+      "last_seen": "2026-09-28T15:57:49.024594938Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e630959b488e409b8876bd278e131dea",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:49.018158909Z",
+      "first_seen": "2026-09-28T15:57:49.018158909Z",
+      "last_seen": "2026-09-28T15:57:49.018158909Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e630959b488e409b8876bd278e131dea",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T15:57:36.707521553Z",
+      "first_seen": "2026-09-28T15:57:36.707521553Z",
+      "last_seen": "2026-09-28T15:57:36.707521553Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e630959b488e409b8876bd278e131dea",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T09:11:56.383209332Z",
+      "first_seen": "2026-09-28T09:11:56.383209332Z",
+      "last_seen": "2026-09-28T09:11:56.383209332Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T09:28:01.747964736Z",
+      "first_seen": "2026-09-28T09:28:01.747964736Z",
+      "last_seen": "2026-09-28T09:28:01.747964736Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T09:12:29.005843557Z",
+      "first_seen": "2026-09-28T09:12:29.005843557Z",
+      "last_seen": "2026-09-28T09:12:29.005843557Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T09:11:56.393227149Z",
+      "first_seen": "2026-09-28T09:11:56.393227149Z",
+      "last_seen": "2026-09-28T09:11:56.393227149Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T10:03:45.691961203Z",
+      "first_seen": "2026-09-28T10:03:45.691961203Z",
+      "last_seen": "2026-09-28T10:03:45.691961203Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-29T09:12:29.014291063Z",
+      "first_seen": "2026-09-28T09:12:29.014291063Z",
+      "last_seen": "2026-09-28T09:12:29.014291063Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-e8a22c2958b24b6aa27b97f6703618f0",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:36.733208647Z",
+      "first_seen": "2026-09-27T20:45:36.733208647Z",
+      "last_seen": "2026-09-27T20:45:36.733208647Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:19.395793196Z",
+      "first_seen": "2026-09-27T20:45:19.395793196Z",
+      "last_seen": "2026-09-27T20:45:19.395793196Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:36.749484641Z",
+      "first_seen": "2026-09-27T20:45:36.749484641Z",
+      "last_seen": "2026-09-27T20:45:36.749484641Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.635747084Z",
+      "first_seen": "2026-09-27T22:27:27.635747084Z",
+      "last_seen": "2026-09-27T22:27:27.635747084Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:45:19.407423517Z",
+      "first_seen": "2026-09-27T20:45:19.407423517Z",
+      "last_seen": "2026-09-27T20:45:19.407423517Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:28.543203462Z",
+      "first_seen": "2026-09-27T22:27:28.543203462Z",
+      "last_seen": "2026-09-27T22:27:28.543203462Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-ea6d44884d11417f860b7f7ce91b84af",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:10:09.704110711Z",
+      "first_seen": "2026-09-27T18:10:09.704110711Z",
+      "last_seen": "2026-09-27T18:10:09.704110711Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f440f9b971244bfbb3b26448f9b51aaf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 2,
+      "expires_at": "2026-09-28T18:05:54.022384580Z",
+      "first_seen": "2026-09-27T17:11:45.101025316Z",
+      "last_seen": "2026-09-27T18:05:54.022384580Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f440f9b971244bfbb3b26448f9b51aaf",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:07:06.048598698Z",
+      "first_seen": "2026-09-27T23:07:06.048598698Z",
+      "last_seen": "2026-09-27T23:07:06.048598698Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:05.464766994Z",
+      "first_seen": "2026-09-27T18:41:05.464766994Z",
+      "last_seen": "2026-09-27T18:41:05.464766994Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:53.524211475Z",
+      "first_seen": "2026-09-27T18:40:53.524211475Z",
+      "last_seen": "2026-09-27T18:40:53.524211475Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:41:05.471321487Z",
+      "first_seen": "2026-09-27T18:41:05.471321487Z",
+      "last_seen": "2026-09-27T18:41:05.471321487Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T18:40:53.400600277Z",
+      "first_seen": "2026-09-27T18:40:53.400600277Z",
+      "last_seen": "2026-09-27T18:40:53.400600277Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:01:57.982578926Z",
+      "first_seen": "2026-09-27T23:01:57.982578926Z",
+      "last_seen": "2026-09-27T23:01:57.982578926Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f79eee29337445f5bdc90a75dc67ceae",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T23:06:02.590066952Z",
+      "first_seen": "2026-09-27T23:06:02.590066952Z",
+      "last_seen": "2026-09-27T23:06:02.590066952Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.706280030Z",
+      "first_seen": "2026-09-27T22:27:27.706280030Z",
+      "last_seen": "2026-09-27T22:27:27.706280030Z",
+      "message": "[redacted]",
+      "reason": "ConvoyPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:57:49.520780616Z",
+      "first_seen": "2026-09-27T22:57:49.520780616Z",
+      "last_seen": "2026-09-27T22:57:49.520780616Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:27:27.697979127Z",
+      "first_seen": "2026-09-27T22:27:27.697979127Z",
+      "last_seen": "2026-09-27T22:27:27.697979127Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:28:04.182698441Z",
+      "first_seen": "2026-09-27T22:28:04.182698441Z",
+      "last_seen": "2026-09-27T22:28:04.182698441Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T22:28:04.171834233Z",
+      "first_seen": "2026-09-27T22:28:04.171834233Z",
+      "last_seen": "2026-09-27T22:28:04.171834233Z",
+      "message": "[redacted]",
+      "reason": "ConvoyWorkPhaseChanged",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "Convoy",
+        "name": "convoy-f8c3076047f34d65adcb24c6ba4f120c",
+        "namespace": "flotilla"
+      }
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Event",
+    "spec": {
+      "count": 1,
+      "expires_at": "2026-09-28T20:16:43.716134580Z",
+      "first_seen": "2026-09-27T20:16:43.716134580Z",
+      "last_seen": "2026-09-27T20:16:43.716134580Z",
+      "message": "[redacted]",
+      "reason": "ReconcileFailed",
+      "regarding": {
+        "apiVersion": "flotilla.work/v1",
+        "kind": "TerminalSession",
+        "name": "terminal-convoy-310f06e447194d7199b4a5eafc4428dc-work-coder",
+        "namespace": "flotilla"
+      }
+    }
+  }
+]

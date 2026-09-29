@@ -1,0 +1,621 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-2ahp6532fllhr6v9g50l08susek4ucs7r9gkcf6t85e9qi9fskcg",
+      "env_ref": "host-direct-b2aac222-c72f-458e-baa0-b089c52c16af",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "mf4j6hdb2bco8202bfera47nphf3r8asjhc61e1a4suu1sbshel0",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "commit": "b7e56044dbe3265495f3578fa5764e3bb5a433f0",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:35.686878315+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:35.686878315+00:00",
+          "value": "true"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:35.686878315+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rbcnmc9l3cj5vuc12sm4hq8aepvr59m4ld749kp0d9o6ov08cs90",
+      "env_ref": "host-direct-b2aac222-c72f-458e-baa0-b089c52c16af",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "usa7v3nnmv8orcq2d0qdjetpj3cfrfbu1lpe2mfd9sa545hqn930",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "570d5dacd0de0a8c931e68bcc5331c7ea28f5eca",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:36.295210876+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:36.295210876+00:00",
+          "value": "unknown"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:36.295210876+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "1983/surface-states",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "dd3796db28b85723cacaa5c84081838e6ca78323",
+      "integration": {
+        "change_request": {
+          "id": "2133",
+          "mergeability": "unknown",
+          "observed_at": "2026-09-27T20:16:14.301090595+00:00",
+          "state": "merged",
+          "target_ref": "main"
+        },
+        "clean": {
+          "observed_at": "2026-09-27T20:16:14.301090595+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-27T20:16:14.301090595+00:00",
+          "value": "true"
+        },
+        "landed_evidence": {
+          "change_request_id": "2133",
+          "merged_at": "2026-09-27T19:49:44Z",
+          "target_ref": "main"
+        },
+        "pushed": {
+          "observed_at": "2026-09-27T20:16:14.301090595+00:00",
+          "value": "true"
+        }
+      },
+      "message": "[redacted]",
+      "path": "/masked/path",
+      "phase": "Failed"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "issue/2145-qm-tie-breaker-d",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:14.587377607+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:14.587377607+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:14.587377607+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-qt4n9of5jv7rvkkau818uufu83ln88lglnpvasticurhelegj3q0",
+      "env_ref": "host-direct-b2aac222-c72f-458e-baa0-b089c52c16af",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "commit": "0f23944cd5bd53564b837a29883b730abc608e44",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:36.352255137+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:36.352255137+00:00",
+          "value": "true"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:36.352255137+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-kkvlfen2nbpjf5s4vbnmniupm0oiqaft4opsqaj3e759hchmvpt0",
+      "env_ref": "host-direct-b2aac222-c72f-458e-baa0-b089c52c16af",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "commit": "1a62b040bd588030bd3b083b927fe1fa0f5c57ea",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:36.868944846+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:36.868944846+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:36.868944846+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "2167/pre-roll-check",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:15.032997041+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:15.032997041+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:15.032997041+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-4fnu2mobjuktd0nv3ifgtcb39v9g5fmjiip2ve6c10jkavqpiaf0",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "commit": "83c1897a60d388c0656bca053ae074569120ffd9",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:15.524340507+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:15.524340507+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:15.524340507+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-slfg7t1up070ougjvflnui2410mks6b4eq79nteg6ejf6b2volf0",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "commit": "f348a06294f12792858c083dac2bcc462988a3d3",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:15.899829251+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:15.899829251+00:00",
+          "value": "true"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:15.899829251+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-1m54qms0mf7egn8rco6uvsdfse8gmpqe5kj850pegejrin8to6o0",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "91156bfac2bc2f6df168c928b445c98e002f4950",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:16.272764963+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:16.272764963+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:16.272764963+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-3kiebck4pc2qu12bg1t7nv90j63j3r7srpk0pgpdg3mlagsth70g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "governor",
+      "repo_ref": "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "c6f3230c343c0bed52518c8fb51fd5b02687eb76",
+      "integration": {
+        "clean": {
+          "observed_at": "2026-09-28T16:03:16.709010968+00:00",
+          "value": "true"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:16.709010968+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:16.709010968+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "2092/brief-artifact",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.148235360+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.148235360+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:17.148235360+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "flotilla/stored-corpus",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.549139903+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.549139903+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:17.549139903+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "2143-allocation",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.968878559+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:17.968878559+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:17.968878559+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Checkout",
+    "spec": {
+      "base_ref": "main",
+      "clone_ref": "clone-rubn37dsjjauqq3ip99a3s4g29r3se7ogg0b7htm4gkago28be2g",
+      "env_ref": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+      "kind": "worktree",
+      "ref": "2093-artifact-completion",
+      "repo_ref": "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g",
+      "target_path": "/masked/path"
+    },
+    "status": {
+      "branch_provenance": "created_for_convoy",
+      "commit": "f2008365080e066b3191338e78681b1f02e6b838",
+      "integration": {
+        "clean": {
+          "details": [
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]",
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:18.440805179+00:00",
+          "value": "false"
+        },
+        "landed": {
+          "details": [
+            "[redacted]"
+          ],
+          "observed_at": "2026-09-28T16:03:18.440805179+00:00",
+          "value": "false"
+        },
+        "pushed": {
+          "observed_at": "2026-09-28T16:03:18.440805179+00:00",
+          "value": "true"
+        }
+      },
+      "path": "/masked/path",
+      "phase": "Ready"
+    }
+  }
+]

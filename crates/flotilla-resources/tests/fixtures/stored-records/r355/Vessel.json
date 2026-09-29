@@ -1,0 +1,682 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-26189bcabb03430db24993ebf5a14748",
+      "placement_policy_ref": "placement-snapshot-5048bdd84071",
+      "vessel_name": "govern"
+    },
+    "status": {
+      "checkout_refs": {
+        "mf4j6hdb2bco8202bfera47nphf3r8asjhc61e1a4suu1sbshel0": "checkout-convoy-26189bcabb03430db24993ebf5a14748-ghostty-90f0c5991b76",
+        "usa7v3nnmv8orcq2d0qdjetpj3cfrfbu1lpe2mfd9sa545hqn930": "checkout-convoy-26189bcabb03430db24993ebf5a14748-ghostty-ops-90f0c5991b76"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-26189bcabb03430db24993ebf5a14748-govern",
+      "image_digest": "sha256:8e6f4b80412afd2566738668221ed826aa64ddf9993cfce7569b613a46d72188",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "observed_policy_ref": "placement-snapshot-5048bdd84071",
+      "observed_policy_version": "79",
+      "phase": "Ready",
+      "placement_decision": {
+        "policy_name": "docker-crew-image-host-3",
+        "target_host": {
+          "display_name": "host-3",
+          "ref": "b2aac222-c72f-458e-baa0-b089c52c16af"
+        }
+      },
+      "ready_at": "2026-09-26T21:21:20.880726652Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-26T21:20:31.583216790Z",
+      "terminal_session_refs": [
+        "terminal-convoy-26189bcabb03430db24993ebf5a14748-govern-governor"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-42817c9675d242f0bd666d7f9ad56265",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-42817c9675d242f0bd666d7f9ad56265-c796f4ae0bb5"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-42817c9675d242f0bd666d7f9ad56265-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:58:20.491878876Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:58:06.077397625Z",
+      "terminal_session_refs": [
+        "terminal-convoy-42817c9675d242f0bd666d7f9ad56265-work-coder"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-44ce83f4440d49c1b2c06fb71fdd83e3",
+      "placement_policy_ref": "placement-snapshot-5048bdd84071",
+      "vessel_name": "govern"
+    },
+    "status": {
+      "checkout_refs": {
+        "oalv1ltv780b5o46r37c11aqgqt5knr94i4i571195pvhg08rvo0": "checkout-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-cleat-d7e360e4d840",
+        "rhff45bqumorv80383785bc0v8agb06424pi52up97bfu4ibgjlg": "checkout-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-wheelhouse-d7e360e4d840"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern",
+      "image_digest": "sha256:8e6f4b80412afd2566738668221ed826aa64ddf9993cfce7569b613a46d72188",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "observed_policy_ref": "placement-snapshot-5048bdd84071",
+      "observed_policy_version": "79",
+      "phase": "Ready",
+      "placement_decision": {
+        "policy_name": "docker-crew-image-host-3",
+        "target_host": {
+          "display_name": "host-3",
+          "ref": "b2aac222-c72f-458e-baa0-b089c52c16af"
+        }
+      },
+      "ready_at": "2026-09-26T21:21:10.617149468Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-26T21:20:31.448135997Z",
+      "terminal_session_refs": [
+        "terminal-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-govern-governor"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-6009d22bebfa4659a110852c1dc5a0ac",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-6009d22bebfa4659a110852c1dc5a0ac-5705ace1ac08"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-6009d22bebfa4659a110852c1dc5a0ac-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:58:31.209223540Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:58:18.416270251Z",
+      "terminal_session_refs": [
+        "terminal-convoy-6009d22bebfa4659a110852c1dc5a0ac-work-coder"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c",
+      "placement_policy_ref": "placement-snapshot-383beb7581c1",
+      "vessel_name": "govern"
+    },
+    "status": {
+      "checkout_refs": {
+        "ksctk092pqsipun06p48n8tsl5v4oi6k74qo974rvfk3iav07540": "checkout-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-pi-e3fbafa35382",
+        "tmmj7m5c9tl9pj9rm145fql40rpv36as9ojlpe813jqg0dle9rj0": "checkout-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-katzensteg-e3fbafa35382"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern",
+      "image_digest": "sha256:3801f1d13acda2bf7d44acd92bdfe065eca7fc71854620dcbbd0e041d125184b",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "observed_policy_ref": "placement-snapshot-383beb7581c1",
+      "observed_policy_version": "78",
+      "phase": "Ready",
+      "placement_decision": {
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        }
+      },
+      "ready_at": "2026-09-26T21:53:56.235874092Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-26T21:53:43.173195352Z",
+      "terminal_session_refs": [
+        "terminal-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-govern-governor"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-881c971cafea455a8afe81927da886cd",
+      "placement_policy_ref": "placement-snapshot-383beb7581c1",
+      "vessel_name": "govern"
+    },
+    "status": {
+      "checkout_refs": {
+        "308ku1mv2qf78844kmd82he978b0qbduvlgb3n49s5og71pufdpg": "checkout-convoy-881c971cafea455a8afe81927da886cd-jackstay-a79012c8d31b",
+        "sjbdjlbqjo79ppbg8ov0d38kjeb33fdv0ajh0ogkgnh11nreabl0": "checkout-convoy-881c971cafea455a8afe81927da886cd-porthole-a79012c8d31b"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-881c971cafea455a8afe81927da886cd-govern",
+      "image_digest": "sha256:3801f1d13acda2bf7d44acd92bdfe065eca7fc71854620dcbbd0e041d125184b",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+      "observed_policy_ref": "placement-snapshot-383beb7581c1",
+      "observed_policy_version": "78",
+      "phase": "Ready",
+      "placement_decision": {
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        }
+      },
+      "ready_at": "2026-09-26T21:06:40.921948714Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-26T21:06:25.783781180Z",
+      "terminal_session_refs": [
+        "terminal-convoy-881c971cafea455a8afe81927da886cd-govern-governor"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-b94ecf64b49a4cc99df14ccf9072f03a",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-b94ecf64b49a4cc99df14ccf9072f03a-28e6db5c7f51"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:57:35.865326741Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:57:22.550827895Z",
+      "terminal_session_refs": [
+        "terminal-convoy-b94ecf64b49a4cc99df14ccf9072f03a-work-coder"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-c50a16dbb38b4a83a4a27d999685675e",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-c50a16dbb38b4a83a4a27d999685675e-be5b7fba27c7"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-c50a16dbb38b4a83a4a27d999685675e-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:58:41.127677778Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:58:28.802266210Z",
+      "terminal_session_refs": [
+        "terminal-convoy-c50a16dbb38b4a83a4a27d999685675e-work-coder"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-dea65ba206424208b603760447d7313c",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-dea65ba206424208b603760447d7313c-121aea581a7f"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-dea65ba206424208b603760447d7313c-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:58:00.851496812Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:57:47.898856294Z",
+      "terminal_session_refs": [
+        "terminal-convoy-dea65ba206424208b603760447d7313c-work-coder"
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Vessel",
+    "spec": {
+      "convoy_ref": "convoy-e630959b488e409b8876bd278e131dea",
+      "placement_policy_ref": "placement-snapshot-7977e957d369",
+      "vessel_name": "work"
+    },
+    "status": {
+      "checkout_refs": {
+        "vai9mj0i3t74ih97frgn6dkudjeqq6nead5uo9rq165qduh9di7g": "checkout-convoy-e630959b488e409b8876bd278e131dea-325f2fd3c037"
+      },
+      "effective_stance": "contained",
+      "environment_ref": "env-convoy-e630959b488e409b8876bd278e131dea-work",
+      "image_digest": "sha256:b8a519834b47dd1c924a4a4c326f57792121736f3e27f095afccf5ff07fd4f6e",
+      "image_ref": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+      "observed_policy_ref": "placement-snapshot-7977e957d369",
+      "observed_policy_version": "82",
+      "phase": "Ready",
+      "placement_decision": {
+        "minimal_alternatives": [
+          "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+          "placement-snapshot-0c86eea7686f",
+          "placement-snapshot-383beb7581c1",
+          "placement-snapshot-7977e957d369"
+        ],
+        "policy_name": "docker-crew-image-host-1",
+        "target_host": {
+          "display_name": "host-1",
+          "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+        },
+        "viable_not_selected": [
+          {
+            "policy_name": "placement-snapshot-383beb7581c1",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-7977e957d369",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "host-direct-d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "host-direct-d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-0c86eea7686f",
+            "reason": "minimal alternative",
+            "target_host": {
+              "display_name": "host-2",
+              "ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+            }
+          },
+          {
+            "policy_name": "placement-snapshot-d53ef376dac0",
+            "reason": "grants a strict superset",
+            "target_host": {
+              "display_name": "host-1",
+              "ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+            }
+          }
+        ]
+      },
+      "ready_at": "2026-09-28T15:57:49.010720142Z",
+      "requested_stance": "contained",
+      "started_at": "2026-09-28T15:57:36.712644669Z",
+      "terminal_session_refs": [
+        "terminal-convoy-e630959b488e409b8876bd278e131dea-work-coder"
+      ]
+    }
+  }
+]

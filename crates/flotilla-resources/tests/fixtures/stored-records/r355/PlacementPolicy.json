@@ -1,0 +1,258 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": {
+          "image_baseline_ref": "fleet-crew"
+        },
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+        "image": {
+          "image_baseline_ref": "fleet-crew"
+        },
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "host-3",
+        "image": {
+          "image_baseline_ref": "fleet-crew"
+        },
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "b2aac222-c72f-458e-baa0-b089c52c16af",
+        "image": "ubuntu:24.04",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3",
+        "image": "ubuntu:24.04",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "ubuntu:24.04",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "host_direct": {
+        "checkout": "worktree",
+        "host_ref": "b2aac222-c72f-458e-baa0-b089c52c16af"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "host_direct": {
+        "checkout": "worktree",
+        "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "host_direct": {
+        "checkout": "worktree",
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "host_direct": {
+        "checkout": "worktree",
+        "host_ref": "d49f4c59-811f-44aa-a4ca-d4cac66cf2a3"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "host-3",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-26.22f6464c.596fd32a",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "docker_per_vessel": {
+        "agent_adapters": [
+          "claude-code",
+          "codex"
+        ],
+        "checkout": {
+          "worktree_on_host_and_mount": {
+            "mount_path": "/workspace"
+          }
+        },
+        "default_cwd": "/workspace",
+        "env": {},
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878",
+        "image": "host-0b25cdc543.example.invalid/image-builder/flotilla-crew:2026-09-27.2ab58676.dd20629b",
+        "pull_policy": "always"
+      },
+      "pool": "cleat"
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "PlacementPolicy",
+    "spec": {
+      "host_direct": {
+        "checkout": "worktree",
+        "host_ref": "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878"
+      },
+      "pool": "cleat"
+    }
+  }
+]

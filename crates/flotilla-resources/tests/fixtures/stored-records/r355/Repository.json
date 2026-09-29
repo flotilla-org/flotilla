@@ -1,0 +1,1038 @@
+[
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/zellij",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/zellij",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/zellij"
+      ],
+      "upstream": {
+        "relation": "fork",
+        "url": "https://github.com/zellij-org/zellij"
+      }
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/andamento",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/andamento",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/andamento",
+        "https://host-0b25cdc543.example.invalid/lab/andamento"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/andamento",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/andamento",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/andamento",
+        "https://host-0b25cdc543.example.invalid/lab/andamento"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/andamento",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/andamento",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/andamento",
+        "https://host-0b25cdc543.example.invalid/lab/andamento"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/jackstay",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/jackstay",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/jackstay"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-881c971cafea455a8afe81927da886cd-jackstay-a79012c8d31b",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/jackstay",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/jackstay",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/jackstay"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/porthole-ops",
+        "service_url": "https://host-9f9ddac6cd.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-9f9ddac6cd.example.invalid/robert/porthole-ops",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-9f9ddac6cd.example.invalid/robert/porthole-ops"
+      ]
+    },
+    "status": {}
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/spyglass",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/spyglass",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/spyglass"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/ghostty-ops",
+        "service_url": "https://host-0b25cdc543.example.invalid"
+      },
+      "identity": {
+        "forge_ref": "lab",
+        "kind": "forge",
+        "owner": "robert",
+        "repo_name": "ghostty-ops"
+      },
+      "remotes": [
+        "https://host-80c7a6d814.example.invalid/robert/ghostty-ops",
+        "https://host-0b25cdc543.example.invalid/robert/ghostty-ops",
+        "https://host-9f9ddac6cd.example.invalid/robert/ghostty-ops"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "fork-issues/ghostty",
+        "service_url": "https://host-0b25cdc543.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-0b25cdc543.example.invalid/fork-issues/ghostty",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-0b25cdc543.example.invalid/fork-issues/ghostty",
+        "https://host-0b25cdc543.example.invalid/robert/ghostty-ops"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/katzensteg-ops",
+        "service_url": "https://host-9f9ddac6cd.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-9f9ddac6cd.example.invalid/robert/katzensteg-ops",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-9f9ddac6cd.example.invalid/robert/katzensteg-ops"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "fork-issues/ghostty",
+        "service_url": "https://host-9f9ddac6cd.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-9f9ddac6cd.example.invalid/fork-issues/ghostty",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-9f9ddac6cd.example.invalid/fork-issues/ghostty"
+      ]
+    },
+    "status": {}
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/luchs",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/luchs",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/luchs"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/porthole-ops",
+        "service_url": "https://host-9f9ddac6cd.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-0b25cdc543.example.invalid/robert/porthole-ops",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-9f9ddac6cd.example.invalid/robert/porthole-ops",
+        "https://host-0b25cdc543.example.invalid/robert/porthole-ops"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/katzensteg-ops",
+        "service_url": "https://host-0b25cdc543.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-0b25cdc543.example.invalid/robert/katzensteg-ops",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-0b25cdc543.example.invalid/robert/katzensteg-ops"
+      ]
+    },
+    "status": {}
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/pi",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/pi",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/pi"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-pi-e3fbafa35382",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/pi",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/pi",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/pi"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/ghostty",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/ghostty",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/ghostty"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/ghostty",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/ghostty",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/ghostty"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "b2aac222-c72f-458e-baa0-b089c52c16af": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-26189bcabb03430db24993ebf5a14748-ghostty-90f0c5991b76",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/cleat",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/cleat",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/cleat",
+        "https://host-0b25cdc543.example.invalid/lab/cleat"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/cleat",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/cleat",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/cleat",
+        "https://host-0b25cdc543.example.invalid/lab/cleat"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/cleat",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/cleat",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/cleat",
+        "https://host-0b25cdc543.example.invalid/lab/cleat"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "b2aac222-c72f-458e-baa0-b089c52c16af": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-cleat-d7e360e4d840",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/wheelhouse",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/wheelhouse",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/wheelhouse"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/wheelhouse",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/wheelhouse",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/wheelhouse"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/wheelhouse",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/wheelhouse",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/wheelhouse"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "b2aac222-c72f-458e-baa0-b089c52c16af": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-44ce83f4440d49c1b2c06fb71fdd83e3-wheelhouse-d7e360e4d840",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/porthole",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/porthole",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/porthole"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-881c971cafea455a8afe81927da886cd-porthole-a79012c8d31b",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/porthole",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/porthole",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/porthole"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/katzensteg",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/katzensteg",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/katzensteg"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-6d6e3a5eccdb4beb88f7f665ae5d9f2c-katzensteg-e3fbafa35382",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "rjwittams/katzensteg",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/rjwittams/katzensteg",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/rjwittams/katzensteg"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "robert/ghostty-ops",
+        "service_url": "https://host-0b25cdc543.example.invalid"
+      },
+      "identity": {
+        "canonical_remote": "https://host-0b25cdc543.example.invalid/robert/ghostty-ops",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://host-0b25cdc543.example.invalid/robert/ghostty-ops"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "b2aac222-c72f-458e-baa0-b089c52c16af": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-26189bcabb03430db24993ebf5a14748-ghostty-ops-90f0c5991b76",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/flotilla",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/flotilla",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/flotilla",
+        "https://host-0b25cdc543.example.invalid/lab/flotilla"
+      ]
+    },
+    "status": {
+      "checkouts_by_host": {
+        "d783f8a7-6b6f-44a9-bd04-5e6e2d43f878": [
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-310f06e447194d7199b4a5eafc4428dc-6a8c9497512a",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-42817c9675d242f0bd666d7f9ad56265-c796f4ae0bb5",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-6009d22bebfa4659a110852c1dc5a0ac-5705ace1ac08",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-b94ecf64b49a4cc99df14ccf9072f03a-28e6db5c7f51",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-c50a16dbb38b4a83a4a27d999685675e-be5b7fba27c7",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-dea65ba206424208b603760447d7313c-121aea581a7f",
+            "kind": "worktree"
+          },
+          {
+            "authority": "managed",
+            "checkout_ref": "checkout-convoy-e630959b488e409b8876bd278e131dea-325f2fd3c037",
+            "kind": "worktree"
+          }
+        ]
+      },
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/flotilla",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/flotilla",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/flotilla",
+        "https://host-0b25cdc543.example.invalid/lab/flotilla"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "flotilla.work/v1",
+    "kind": "Repository",
+    "spec": {
+      "forge": {
+        "repository": "flotilla-org/flotilla",
+        "service_url": "https://github.com"
+      },
+      "identity": {
+        "canonical_remote": "https://github.com/flotilla-org/flotilla",
+        "kind": "remote"
+      },
+      "remotes": [
+        "https://github.com/flotilla-org/flotilla",
+        "https://host-0b25cdc543.example.invalid/lab/flotilla"
+      ]
+    },
+    "status": {
+      "default_branch": "main",
+      "default_branch_observations": [
+        {
+          "branch": "main",
+          "provenance": "remote_symbolic_head"
+        },
+        {
+          "branch": "main",
+          "provenance": "forge"
+        }
+      ]
+    }
+  }
+]
