@@ -408,10 +408,11 @@ where
                     crew: state.crew.clone(),
                     launch_command: state.launch_command.clone(),
                     delivered_message_id: (match &obj.spec.source {
-                        // A fresh turn is launched with the framed message as its brief.
-                        // Mark that message delivered so it is not also sent to the live session.
-                        flotilla_resources::TerminalSessionSource::Agent { brief, message: Some(message), .. }
-                            if brief.content == message.text =>
+                        // A fresh turn was launched with this message as its brief.
+                        // Its explicit delivery mode is authoritative over a runtime id
+                        // from an earlier attempt and prevents a second live-session send.
+                        flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. }
+                            if message.delivery == flotilla_resources::CrewMessageDelivery::LaunchBrief =>
                         {
                             Some(message.id.clone())
                         }

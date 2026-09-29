@@ -97,6 +97,44 @@ impl Default for PrincipalRef {
     }
 }
 
+/// Structured attribution for text delivered into a crew session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CrewMessageSender {
+    #[default]
+    Unknown,
+    FlotillaNudge,
+    FlotillaTurn {
+        source: String,
+    },
+    FlotillaEscalation {
+        from: String,
+    },
+    OperatorResume {
+        principal: Option<PrincipalRef>,
+    },
+    OperatorFollowUp {
+        principal: Option<PrincipalRef>,
+    },
+    Governor {
+        name: String,
+    },
+    Bosun {
+        name: String,
+    },
+    Handoff {
+        from: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CrewMessageDelivery {
+    #[default]
+    Queued,
+    LaunchBrief,
+}
+
 /// Auditable identity of a client that asked the daemon to mutate state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandCaller {

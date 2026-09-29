@@ -53,13 +53,13 @@ use flotilla_resources::{
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
-    CrewCompletionPending, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
-    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
-    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct,
-    Host as ResourceHost,
-    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    CrewCompletionPending, CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand,
+    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment,
+    EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind,
+    FulfilmentRealisation, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue,
+    IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority,
+    ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
     Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, RoleHandoff, SettlementMode,
@@ -2070,22 +2070,41 @@ async fn crew_brief_repo_roots(
     roots
 }
 
-fn crew_message_header(sender: &CrewMessageSender) -> String {
+fn safe_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '[' => '(',
+            ']' => ')',
+            character if character.is_control() || (character.is_whitespace() && character != ' ') => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+pub fn crew_message_header(sender: &CrewMessageSender) -> String {
     match sender {
-        CrewMessageSender::Unknown => "flotilla · message".to_string(),
+        CrewMessageSender::Unknown => "unknown sender · message".to_string(),
         CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew fail`".to_string(),
-        CrewMessageSender::FlotillaTurn { source } => format!("flotilla · turn: {source} · reply by running `crew complete`"),
-        CrewMessageSender::FlotillaEscalation { from } => format!("flotilla · escalated from {from} · supervise the stalled crew"),
+        CrewMessageSender::FlotillaTurn { source } => {
+            format!("flotilla · turn: {} · reply by running `crew complete`", safe_header_value(source))
+        }
+        CrewMessageSender::FlotillaEscalation { from } => {
+            format!("flotilla · escalated from {} · supervise the stalled crew", safe_header_value(from))
+        }
         CrewMessageSender::OperatorResume { principal } => {
-            format!("operator {} · via convoy resume", principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
+            format!(
+                "operator {} · via convoy resume",
+                safe_header_value(principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
+            )
         }
         CrewMessageSender::OperatorFollowUp { principal } => format!(
             "operator {} · follow-up brief · reply by running `crew complete`",
-            principal.as_ref().map_or("unknown", |principal| principal.name.as_str())
+            safe_header_value(principal.as_ref().map_or("unknown", |principal| principal.name.as_str()))
         ),
-        CrewMessageSender::Governor { name } => format!("governor {name} · supervise the stalled crew"),
-        CrewMessageSender::Bosun { name } => format!("bosun {name} · supervise the stalled crew"),
-        CrewMessageSender::Handoff { from } => format!("handoff from {from}"),
+        CrewMessageSender::Governor { name } => format!("governor {} · supervise the stalled crew", safe_header_value(name)),
+        CrewMessageSender::Bosun { name } => format!("bosun {} · supervise the stalled crew", safe_header_value(name)),
+        CrewMessageSender::Handoff { from } => format!("handoff from {}", safe_header_value(from)),
     }
 }
 
@@ -2094,7 +2113,12 @@ fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> String {
 }
 
 fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMessage {
-    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: frame_crew_message(&sender, body), sender }
+    TerminalCrewMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        text: frame_crew_message(&sender, body),
+        sender,
+        delivery: CrewMessageDelivery::Queued,
+    }
 }
 
 fn ensure_crew_work_is_defined(
@@ -10703,7 +10727,7 @@ impl InProcessDaemon {
                     } else if stalled.rung == flotilla_resources::StallRung::Bosun {
                         CrewMessageSender::Bosun { name: format!("{}@{}", supervisor.role, supervisor.vessel) }
                     } else {
-                        CrewMessageSender::Handoff { from: format!("{}@{}", supervisor.role, supervisor.vessel) }
+                        return Err("crew supervisor has no governor or Bosun rung".to_string());
                     }
                 } else {
                     CrewMessageSender::OperatorResume { principal: principal.cloned() }
@@ -11405,10 +11429,11 @@ impl InProcessDaemon {
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
         };
-        let delivery_message = TerminalCrewMessage {
+        let mut delivery_message = TerminalCrewMessage {
             id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
             text: frame_crew_message(&request.sender, &request.brief),
             sender: request.sender.clone(),
+            delivery: CrewMessageDelivery::Queued,
         };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
@@ -11444,6 +11469,7 @@ impl InProcessDaemon {
                 *message = Some(delivery_message);
             }
             TurnDeliverySessionPlan::RestartFresh => {
+                delivery_message.delivery = CrewMessageDelivery::LaunchBrief;
                 brief.content = delivery_message.text.clone();
                 brief.artifact_digest = None;
                 *message = Some(delivery_message);
@@ -14070,7 +14096,9 @@ impl InProcessDaemon {
                 // one from session liveness or message delivery.
                 last_delivery_rung: None,
                 sender: match &source.object.spec.source {
-                    TerminalSessionSource::Agent { message: Some(message), .. } => Some(crew_message_header(&message.sender)),
+                    TerminalSessionSource::Agent { message: Some(message), .. } if message.sender != CrewMessageSender::Unknown => {
+                        Some(message.sender.clone())
+                    }
                     _ => None,
                 },
                 delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),

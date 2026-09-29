@@ -957,7 +957,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 delivery.role,
                 delivery.last_delivery_rung.as_deref().unwrap_or("not recorded"),
                 delivery.delivered_message_id.as_deref().unwrap_or("-"),
-                delivery.sender.as_deref().unwrap_or("-")
+                delivery.sender.as_ref().map(flotilla_core::in_process::crew_message_header).unwrap_or_else(|| "-".to_string())
             );
         }
     }
