@@ -10287,6 +10287,9 @@ impl InProcessDaemon {
             .flat_map(|text| change_request_subjects_from_claim(text, &convoy.spec.repositories, &forges))
             .collect::<BTreeSet<_>>();
         ensure_crew_work_is_defined(&convoy, &context)?;
+        // Discovery is evidence, independent of whether this completion claim
+        // passes validation. Record it first so a newly named PR can satisfy
+        // readiness; the parser admits only this convoy's repositories.
         if !claim_subjects.is_empty() {
             convoy = apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
                 subjects: claim_subjects.iter().cloned().map(|subject| (subject, flotilla_protocol::Relationship::Produces)).collect(),
