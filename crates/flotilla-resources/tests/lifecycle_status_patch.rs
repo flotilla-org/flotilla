@@ -108,6 +108,7 @@ define_patch_kinds! {
     TerminalMarkCompletionPending => NONE,
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
+    TerminalMarkLost => DUPLICATE,
     TerminalMarkFailed => DUPLICATE,
     TerminalMarkReconcileDegraded => NONE,
     TerminalClearReconcileDegraded => NONE,
@@ -168,6 +169,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { .. } => PatchKind::TerminalMarkDeliveryUnconfirmed,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
+        TerminalSessionStatusPatch::MarkLost { .. } => PatchKind::TerminalMarkLost,
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
@@ -683,6 +685,23 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     inner_exit_code: Some(0),
                     message: None,
                 };
+                apply_and_replay(&mut status, &patch);
+                let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+                (before, after)
+            },
+        },
+        LifecycleCase {
+            name: "terminal lost",
+            kind: PatchKind::TerminalMarkLost,
+            exercise: || {
+                let mut status = TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Lost,
+                    started_at: Some(ts(10)),
+                    stopped_at: Some(ts(20)),
+                    ..TerminalSessionStatus::default()
+                };
+                let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
+                let patch = TerminalSessionStatusPatch::MarkLost { reason: "generation is dead".to_string(), lost_at: ts(30) };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 (before, after)

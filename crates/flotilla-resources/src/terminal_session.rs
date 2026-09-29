@@ -152,6 +152,7 @@ pub enum TerminalSessionPhase {
     #[default]
     Starting,
     Running,
+    Lost,
     Stopped,
     Failed,
 }
@@ -356,6 +357,10 @@ pub enum TerminalSessionStatusPatch {
         inner_exit_code: Option<i32>,
         message: Option<String>,
     },
+    MarkLost {
+        reason: String,
+        lost_at: DateTime<Utc>,
+    },
     MarkFailed {
         message: String,
         stopped_at: Option<DateTime<Utc>>,
@@ -426,6 +431,17 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     attention.state = TerminalAttentionState::Unobservable;
                     attention.as_of = *stopped_at;
                 }
+            }
+            Self::MarkLost { reason, lost_at } => {
+                status.phase = TerminalSessionPhase::Lost;
+                status.cleat_endpoint = None;
+                status.stopped_at.get_or_insert(*lost_at);
+                status.inner_command_status = None;
+                status.inner_exit_code = None;
+                status.message = Some(reason.clone());
+                status.degraded = None;
+                status.attention = None;
+                status.occupancy = TerminalOccupancy::Unknown;
             }
             Self::MarkFailed { message, stopped_at } => {
                 status.phase = TerminalSessionPhase::Failed;

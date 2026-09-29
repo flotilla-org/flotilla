@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint};
 use serde::Deserialize;
 
-use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag, TerminalSize};
+use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSessionTag, TerminalSize};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{run, CommandRunner},
@@ -27,6 +27,8 @@ struct SessionInfo {
     cmd: Option<String>,
     status: SessionStatus,
     screen_activity: Option<ScreenActivityWire>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +127,15 @@ impl CleatTerminalPool {
 
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
+    async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
+        let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
+        let sessions = Self::parse_list_output(&output)?;
+        Ok(match sessions.into_iter().find(|session| session.id == session_id) {
+            Some(SessionInfo { error: Some(reason), .. }) => TerminalSessionLiveness::Lost(reason),
+            Some(_) => TerminalSessionLiveness::Running,
+            None => TerminalSessionLiveness::Absent,
+        })
+    }
     async fn cleat_endpoint(&self, session_id: &str) -> Result<Option<CleatEndpoint>, String> {
         // Share one physical-daemon inventory across sessions reconciled in the
         // same burst. Expire it quickly so daemon turnover retracts stale facts.
@@ -163,6 +174,7 @@ impl TerminalPool for CleatTerminalPool {
         let sessions = Self::parse_list_output(&output)?;
         Ok(sessions
             .into_iter()
+            .filter(|session| session.error.is_none())
             .map(|session| {
                 let status = match session.status {
                     SessionStatus::Attached => flotilla_protocol::TerminalStatus::Running,
@@ -335,6 +347,18 @@ mod tests {
         assert!(sessions[1].command.is_none());
         assert_eq!(sessions[1].working_directory.as_ref().map(|p| p.as_path()), Some(Path::new("/other")));
         assert_eq!(sessions[1].screen_activity, Some(ScreenActivity::Stable));
+    }
+
+    #[tokio::test]
+    async fn dead_daemon_generation_is_not_a_live_session() {
+        let json = r#"[{"id":"sess-1","cwd":"/repo","cmd":"codex","status":"Detached","error":"daemon generation is dead; session is recreatable"}]"#;
+        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into()), Ok(json.into())])), "cleat");
+
+        assert_eq!(
+            pool.session_liveness("sess-1").await.expect("liveness"),
+            super::TerminalSessionLiveness::Lost("daemon generation is dead; session is recreatable".into())
+        );
+        assert!(pool.list_sessions().await.expect("list sessions").is_empty());
     }
 
     #[tokio::test]

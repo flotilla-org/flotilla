@@ -935,6 +935,10 @@ impl ReconcilerWake {
                                 && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
                                 && session.metadata.labels.get(ROLE_LABEL) == Some(role)
                         });
+                        let lost_reason = session
+                            .and_then(|session| session.status.as_ref())
+                            .filter(|status| status.phase == TerminalSessionPhase::Lost)
+                            .and_then(|status| status.message.as_deref());
                         let attention = session
                             .and_then(|session| session.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Running)
@@ -949,6 +953,9 @@ impl ReconcilerWake {
                                 status.crew_work[vessel][role].message.clone().unwrap_or_else(|| "crew stalled".into()),
                                 StallEvidenceSource::Crew,
                             ))
+                        } else if let Some(reason) = lost_reason {
+                            self.subscriptions.inner.unable_since.lock().await.remove(&row.id);
+                            Err((format!("session dead: {reason}"), StallEvidenceSource::Session))
                         } else {
                             match attention {
                                 Some(attention) if attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now) => {
@@ -2231,6 +2238,92 @@ mod tests {
         let convoys = backend.using::<Convoy>("flotilla");
         let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &convoy_spec()).await.expect("create convoy");
         convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("write convoy status");
+    }
+
+    #[tokio::test]
+    async fn lost_crew_session_stalls_with_dead_evidence_but_stale_busy_screen_does_not() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "test-host".into(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let wake = ReconcilerWake { subscriptions: LeafSubscriptionTable::new(backend.clone(), event_tx, refresher), _marker: PhantomData };
+        create_convoy(&backend, "delivery", ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await;
+        let terminal = backend.using::<TerminalSession>("flotilla");
+        let created = terminal
+            .create(
+                &InputMeta::builder()
+                    .name("terminal-delivery-work-coder".into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "delivery".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                        (ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &flotilla_resources::TerminalSessionSpec {
+                    env_ref: "env".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Tool { command: "codex".into() },
+                    cwd: "/workspace".into(),
+                    pool: "cleat".into(),
+                },
+            )
+            .await
+            .expect("create terminal");
+        let mut status = flotilla_resources::TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                source: TerminalAttentionSource::Screen,
+                as_of: Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1),
+            }),
+            ..Default::default()
+        };
+        let running = terminal.update_status(&created.metadata.name, &created.metadata.resource_version, &status).await.expect("running");
+        let leaf = Leaf {
+            address: LeafAddress::Work { convoy: "delivery".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: LeafOperator::Equal,
+            literal: "Done".into(),
+        };
+        let id = uuid::Uuid::new_v4();
+        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![leaf],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "delivery".into() },
+            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        });
+        let convoy = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy");
+        let objects = HashMap::from([("delivery".into(), convoy)]);
+        wake.judge_stalls("flotilla", &objects).await.expect("judge stale screen");
+        assert!(backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled.is_none());
+
+        flotilla_resources::TerminalSessionStatusPatch::MarkLost {
+            reason: "daemon generation is dead; session is recreatable".into(),
+            lost_at: Utc::now(),
+        }
+        .apply(&mut status);
+        terminal.update_status(&created.metadata.name, &running.metadata.resource_version, &status).await.expect("lost");
+        wake.judge_stalls("flotilla", &objects).await.expect("judge dead session");
+        let stalled = backend.using::<Convoy>("flotilla").get("delivery").await.expect("convoy").status.expect("status").stalled;
+        let stalled = stalled.expect("dead actor must stall");
+        assert!(stalled.evidence.contains("session dead: daemon generation is dead"));
+        assert_eq!(stalled.source, StallEvidenceSource::Session);
     }
 
     #[tokio::test]

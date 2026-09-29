@@ -19,7 +19,7 @@ pub use presentation::{
 };
 pub use repository::{ForgeDefaultBranchResolver, RepositoryReconciler};
 pub use terminal_session::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime,
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
 pub use vessel::{VesselPrepared, VesselReconciler};

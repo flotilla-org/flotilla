@@ -1097,7 +1097,7 @@ fn turn_delivery_session_plan(
     match phase {
         Some(ResourceTerminalSessionPhase::Running) => Ok(TurnDeliverySessionPlan::QueueWarm),
         Some(ResourceTerminalSessionPhase::Starting) | None => Ok(TurnDeliverySessionPlan::QueueFresh),
-        Some(ResourceTerminalSessionPhase::Stopped) => Ok(TurnDeliverySessionPlan::RestartFresh),
+        Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => Ok(TurnDeliverySessionPlan::RestartFresh),
         Some(ResourceTerminalSessionPhase::Failed) => {
             Err(format!("turn-delivery target {vessel}/{role} failed provisioning and cannot be restarted"))
         }
@@ -9056,6 +9056,7 @@ impl InProcessDaemon {
                 let state = match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
                     Some(ResourceTerminalSessionPhase::Starting) => "starting",
                     Some(ResourceTerminalSessionPhase::Running) => "active",
+                    Some(ResourceTerminalSessionPhase::Lost) => "lost",
                     Some(ResourceTerminalSessionPhase::Stopped) => "stopped",
                     Some(ResourceTerminalSessionPhase::Failed) => "failed",
                     None if matches!(process.source, CrewSource::Agent { .. }) => "latent",
@@ -9888,7 +9889,7 @@ impl InProcessDaemon {
                     Some(ResourceTerminalSessionPhase::Running) => {
                         queue_pending_crew_message(&sessions, &existing, sender.clone(), message).await
                     }
-                    Some(ResourceTerminalSessionPhase::Stopped) => {
+                    Some(ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost) => {
                         queue_pending_crew_message(&sessions, &existing, sender.clone(), message).await?;
                         apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
                             .await

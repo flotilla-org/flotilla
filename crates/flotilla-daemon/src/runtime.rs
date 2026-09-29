@@ -15,7 +15,7 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
     PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
-    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
     TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
@@ -34,7 +34,7 @@ use flotilla_core::{
         discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
-        terminal::{ScreenActivity, TerminalPool, TerminalSize},
+        terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
 };
@@ -4769,13 +4769,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
-        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == name) {
-            pool.kill_session(name).await?;
+        let session_id = if is_agent_session && matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
+            format!("{name}-{}", uuid::Uuid::new_v4())
+        } else {
+            name.to_string()
+        };
+        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == session_id) {
+            pool.kill_session(&session_id).await?;
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
-        pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
+        pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
         Ok(TerminalRuntimeState::builder()
-            .session_id(name.to_string())
+            .session_id(session_id)
             .maybe_pid(None)
             .started_at(Utc::now())
             .maybe_crew(crew)
@@ -4784,13 +4789,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .build())
     }
 
-    async fn session_is_running(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
         let pool = self.pool_for_spec(spec)?;
-        if !pool.tracks_session_liveness() {
-            return Ok(true);
-        }
-        let running = pool.list_sessions().await?.iter().any(|session| session.session_name == session_id);
-        Ok(running)
+        Ok(match pool.session_liveness(session_id).await? {
+            TerminalSessionLiveness::Running => TerminalLiveness::Running,
+            TerminalSessionLiveness::Stopped => TerminalLiveness::Stopped,
+            TerminalSessionLiveness::Absent => TerminalLiveness::Lost("cleat session is absent from its daemon".into()),
+            TerminalSessionLiveness::Lost(reason) => TerminalLiveness::Lost(reason),
+        })
     }
 
     async fn observe_attention(
