@@ -961,7 +961,7 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use flotilla_resources::{CrewWorkState, DispatchQueueEntry, ProjectStatus, TerminalAttention, TerminalAttentionSource};
+    use flotilla_resources::{CrewWorkState, DispatchQueueEntry, ProjectStatus};
 
     use super::*;
 
