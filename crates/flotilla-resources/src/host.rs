@@ -81,7 +81,7 @@ pub struct HostStatus {
     #[builder(default)]
     pub fulfilment_facts: BTreeMap<String, FulfilmentFacts>,
     /// Durable cache and rate accounting for real-request model probes.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ModelProbeState::is_empty")]
     #[builder(default)]
     pub model_probes: ModelProbeState,
     /// Last adapter inventory that did not regress from the preceding
@@ -126,6 +126,12 @@ pub struct ModelProbeState {
     pub requests_in_window: u32,
     #[serde(default)]
     pub total_requests: u64,
+}
+
+impl ModelProbeState {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.window_started_at.is_none() && self.requests_in_window == 0 && self.total_requests == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

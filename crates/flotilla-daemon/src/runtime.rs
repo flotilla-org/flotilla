@@ -2212,6 +2212,7 @@ async fn observe_fulfilment_facts(
     let kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?;
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
     let mut facts = BTreeMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     // Probe serially: all kinds on one host share the same model cache and budget.
     for kind in kinds.items {
         if kind.spec.host_ref != host_ref || kind.metadata.deletion_timestamp.is_some() {
@@ -2239,8 +2240,8 @@ async fn observe_fulfilment_facts(
             .cloned();
         let observed = match current {
             Some(current) => Some(current),
-            None => tokio::time::timeout(
-                Duration::from_secs(300),
+            None => match tokio::time::timeout_at(
+                deadline,
                 crate::fulfilment_probe::probe_kind(
                     &kind.spec,
                     image.as_deref(),
@@ -2252,12 +2253,20 @@ async fn observe_fulfilment_facts(
                 ),
             )
             .await
-            .ok(),
+            {
+                Ok(Ok(observed)) => Some(observed),
+                Ok(Err(error)) => {
+                    warn!(kind = %name, %error, "fulfilment fact probe failed");
+                    None
+                }
+                Err(_) => {
+                    warn!(kind = %name, "fulfilment fact probe exceeded pass deadline");
+                    None
+                }
+            },
         };
         if let Some(observed) = observed.or_else(|| previous.get(&name).cloned()) {
             facts.insert(name, observed);
-        } else {
-            warn!(kind = %name, "fulfilment fact probe exceeded total deadline");
         }
     }
     Ok(facts)
@@ -11441,6 +11450,38 @@ mod tests {
             .expect("publish observed facts");
         let status = hosts.get(&host_id).await.expect("host").status.expect("status");
         assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
+
+        let mut model_probes = ModelProbeState { total_requests: 2, ..ModelProbeState::default() };
+        flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::FulfilmentFacts {
+            facts: status.fulfilment_facts.clone(),
+            model_probes: model_probes.clone(),
+        })
+        .await
+        .expect("publish model probe count");
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
+            .await
+            .expect("heartbeat preserves model probe count");
+        assert_eq!(hosts.get(&host_id).await.expect("host").status.expect("status").model_probes.total_requests, 2);
+
+        let mut previous = status.fulfilment_facts;
+        previous.get_mut("host-direct-async-facts-test").expect("prior fact").observed_at = Utc::now() - chrono::Duration::minutes(10);
+        let failing_runner = DiscoveryMockRunner::builder().build();
+        let after_failure = observe_fulfilment_facts(
+            &daemon.resource_backend(),
+            NAMESPACE,
+            &host_id,
+            &profile.available_pools,
+            &previous,
+            FulfilmentProbeContext {
+                runner: &failing_runner,
+                env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+                scratch: Path::new("/tmp/flotilla-probe-test"),
+            },
+            &mut model_probes,
+        )
+        .await
+        .expect("observation retains prior facts");
+        assert_eq!(after_failure, previous);
     }
 
     #[tokio::test]

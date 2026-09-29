@@ -52,11 +52,17 @@ async fn run_in_realisation(
     .map_err(|_| format!("timed out probing {binary}"))?
 }
 
+fn hash_field(hash: &mut Sha256, name: &str, value: &str) {
+    hash.update((name.len() as u64).to_be_bytes());
+    hash.update(name.as_bytes());
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value.as_bytes());
+}
+
 async fn credential_fingerprint(runner: &dyn CommandRunner, env: &dyn EnvVars, scratch: &Path) -> String {
     let mut hash = Sha256::new();
     for name in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"] {
-        hash.update(name.as_bytes());
-        hash.update(env.get(name).unwrap_or_default().as_bytes());
+        hash_field(&mut hash, name, &env.get(name).unwrap_or_default());
     }
     let credential_path = env
         .get("CLAUDE_CONFIG_DIR")
@@ -64,8 +70,25 @@ async fn credential_fingerprint(runner: &dyn CommandRunner, env: &dyn EnvVars, s
         .map(|dir| format!("{dir}/.credentials.json"))
         .or_else(|| env.get("HOME").map(|home| format!("{home}/.claude/.credentials.json")));
     if let Some(path) = credential_path {
+        hash_field(&mut hash, "credential_path", &path);
         if let Ok(contents) = runner.run("cat", &[&path], scratch, &ChannelLabel::Default).await {
-            hash.update(contents.as_bytes());
+            let parsed = serde_json::from_str::<serde_json::Value>(&contents).ok();
+            let oauth = parsed.as_ref().and_then(|value| value.get("claudeAiOauth"));
+            // Access and refresh tokens rotate during the same login. The
+            // refresh-chain expiry and account fields identify the login
+            // without turning ordinary token refresh into a new probe input.
+            let mut found_identity = false;
+            for name in ["accountUuid", "organizationUuid", "refreshTokenExpiresAt", "subscriptionType", "scopes"] {
+                if let Some(value) = oauth.and_then(|oauth| oauth.get(name)).or_else(|| parsed.as_ref().and_then(|root| root.get(name))) {
+                    hash_field(&mut hash, name, &value.to_string());
+                    found_identity = true;
+                }
+            }
+            if !found_identity {
+                // Older or unexpected credential shapes have no stable
+                // metadata; content hashing still detects replacement.
+                hash_field(&mut hash, "legacy_credentials", &contents);
+            }
         }
     }
     format!("{:x}", hash.finalize())
@@ -108,23 +131,23 @@ pub(crate) async fn probe_kind(
     env: &dyn EnvVars,
     scratch: &Path,
     model_probes: &mut ModelProbeState,
-) -> FulfilmentFacts {
+) -> Result<FulfilmentFacts, String> {
     let mut facts = FulfilmentFacts { image: image.map(ToString::to_string), observed_at: Utc::now(), ..FulfilmentFacts::default() };
     // This daemon-owned directory has no checkout. Never let a harness
     // discover a project from the root or the operator's home directory.
     let scratch_name = scratch.to_string_lossy();
     let Some(parent) = scratch.parent().filter(|parent| *parent != Path::new("/") && *parent != Path::new("")) else {
-        return facts;
+        return Err("probe scratch directory must have a non-root parent".to_string());
     };
     if env.get("HOME").is_some_and(|home| scratch == Path::new(&home)) {
-        return facts;
+        return Err("probe scratch directory must not be HOME".to_string());
     }
     if !runner.run_output("mkdir", &["-p", &scratch_name], parent, &ChannelLabel::Default).await.is_ok_and(|output| output.success) {
-        return facts;
+        return Err(format!("cannot create probe scratch directory {}", scratch.display()));
     }
     let mut image_digest = None;
     if matches!(spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) {
-        let Some(image) = image else { return facts };
+        let Some(image) = image else { return Ok(facts) };
         let inspected = tokio::time::timeout(
             Duration::from_secs(15),
             runner.run_output("docker", &["image", "inspect", image], scratch, &ChannelLabel::Default),
@@ -137,7 +160,7 @@ pub(crate) async fn probe_kind(
             serde_json::from_str::<serde_json::Value>(&output.stdout).ok()?.get(0)?.get("Id")?.as_str().map(ToString::to_string)
         });
         if facts.image_present != Some(true) {
-            return facts;
+            return Ok(facts);
         }
     }
     if matches!(spec.realisation, FulfilmentRealisation::HostDirect) {
@@ -225,7 +248,7 @@ pub(crate) async fn probe_kind(
         }
         facts.harnesses.insert((*harness).to_string(), observed);
     }
-    facts
+    Ok(facts)
 }
 
 #[cfg(test)]
@@ -267,7 +290,8 @@ mod tests {
             Path::new("/tmp/flotilla-probe-test"),
             &mut ModelProbeState::default(),
         )
-        .await;
+        .await
+        .expect("probe succeeds");
         assert_eq!(facts.image.as_deref(), Some("crew:missing"));
         assert_eq!(facts.image_present, Some(false));
         assert!(facts.harnesses.is_empty());
@@ -330,14 +354,17 @@ mod tests {
             Path::new("/tmp/flotilla-probe-test"),
             &mut ModelProbeState::default(),
         )
-        .await;
+        .await
+        .expect("probe succeeds");
         let direct = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
             .pool("cleat".to_string())
             .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let host_facts =
-            probe_kind(&direct, None, true, &host, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default()).await;
+            probe_kind(&direct, None, true, &host, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
+                .await
+                .expect("probe succeeds");
         assert_eq!(docker_facts.harnesses["claude-code"].version, "2.1.280");
         assert!(!docker_facts.harnesses["claude-code"].models[model].usable);
         assert_eq!(host_facts.harnesses["claude-code"].version, "2.1.282");
@@ -369,11 +396,13 @@ mod tests {
         assert!(
             probe_kind(&spec, None, true, &logged_in, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
                 .await
+                .expect("probe succeeds")
                 .gui_session_logged_in
         );
         assert!(
             !probe_kind(&spec, None, true, &logged_out, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
                 .await
+                .expect("probe succeeds")
                 .gui_session_logged_in
         );
     }
@@ -430,15 +459,15 @@ mod tests {
             .build();
         let scratch = Path::new("/tmp/flotilla-test-state/probe-cwd");
         let mut state = ModelProbeState::default();
-        let first = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await;
+        let first = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await.expect("probe succeeds");
         assert_eq!(first.harnesses["claude-code"].models.len(), 2);
         assert_eq!(state.total_requests, 2);
         state = serde_json::from_str(&serde_json::to_string(&state).expect("encode cache")).expect("restore cache");
-        let second = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await;
+        let second = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await.expect("probe succeeds");
         assert_eq!(second.harnesses["claude-code"].models.len(), 2);
         assert_eq!(state.total_requests, 2);
         *runner.version.lock().expect("version lock") = "2.1.283 (Claude Code)".into();
-        let changed = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await;
+        let changed = probe_kind(&spec, None, true, &runner, &env, scratch, &mut state).await.expect("probe succeeds");
         assert_eq!(changed.harnesses["claude-code"].models.len(), 2);
         assert_eq!(state.total_requests, 4);
         {
@@ -449,7 +478,7 @@ mod tests {
             assert!(runner.harness_cwds.lock().expect("cwd lock").iter().all(|cwd| cwd == scratch));
         }
         let changed_credential = TestEnvVars::new([("ANTHROPIC_API_KEY", "credential-b")]);
-        probe_kind(&spec, None, true, &runner, &changed_credential, scratch, &mut state).await;
+        probe_kind(&spec, None, true, &runner, &changed_credential, scratch, &mut state).await.expect("probe succeeds");
         assert_eq!(state.total_requests, 6);
         let restored: ModelProbeState = serde_json::from_str(&serde_json::to_string(&state).expect("encode cache")).expect("decode cache");
         assert_eq!(restored, state);
@@ -467,9 +496,64 @@ mod tests {
         let mut state = ModelProbeState::default();
         for version in 0..20 {
             *runner.version.lock().expect("version lock") = format!("2.1.{version} (Claude Code)");
-            probe_kind(&spec, None, true, &runner, &env, Path::new("/tmp/flotilla-test-state/probe-cwd"), &mut state).await;
+            probe_kind(&spec, None, true, &runner, &env, Path::new("/tmp/flotilla-test-state/probe-cwd"), &mut state)
+                .await
+                .expect("probe succeeds");
         }
         assert_eq!(state.total_requests, MAX_MODEL_REQUESTS_PER_DAY as u64);
         assert_eq!(runner.model_requests.lock().expect("requests lock").len(), MAX_MODEL_REQUESTS_PER_DAY as usize);
+    }
+    #[tokio::test]
+    async fn scratch_failure_never_launches_a_harness() {
+        let runner = CountingRunner::default();
+        let env = TestEnvVars::new([("HOME", "/tmp/operator-home")]);
+        let spec = FulfilmentKindSpec::builder()
+            .host_ref("kiwi".to_string())
+            .pool("cleat".to_string())
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        for scratch in [Path::new("/"), Path::new("/tmp/operator-home")] {
+            assert!(probe_kind(&spec, None, true, &runner, &env, scratch, &mut ModelProbeState::default()).await.is_err());
+        }
+        let missing = DiscoveryMockRunner::builder().build();
+        assert!(probe_kind(&spec, None, true, &missing, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
+            .await
+            .is_err());
+        assert!(runner.harness_cwds.lock().expect("cwd lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn oauth_token_refresh_does_not_change_credential_identity() {
+        let path = "/tmp/probe-home/.claude/.credentials.json";
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"first","refreshToken":"old","refreshTokenExpiresAt":2000,"subscriptionType":"max"}}"#.into()))
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"second","refreshToken":"new","refreshTokenExpiresAt":2000,"subscriptionType":"max"}}"#.into()))
+            .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"third","refreshToken":"other","refreshTokenExpiresAt":3000,"subscriptionType":"max"}}"#.into()))
+            .build();
+        let env = TestEnvVars::new([("HOME", "/tmp/probe-home")]);
+        let scratch = Path::new("/tmp/flotilla-state/probe-cwd");
+        let first = credential_fingerprint(&runner, &env, scratch).await;
+        let refreshed = credential_fingerprint(&runner, &env, scratch).await;
+        let changed = credential_fingerprint(&runner, &env, scratch).await;
+        assert_eq!(first, refreshed);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn budget_window_and_cache_backstop_are_bounded() {
+        let now = Utc::now();
+        let mut state = ModelProbeState::default();
+        assert_eq!(cached_or_budgeted_model(&mut state, "first", now), None);
+        state.entries.get_mut("first").expect("reservation").fact = Some(ModelFact { usable: true, source: ModelFactSource::Probe });
+        assert_eq!(
+            cached_or_budgeted_model(&mut state, "first", now + chrono::Duration::days(6)),
+            Some(Some(ModelFact { usable: true, source: ModelFactSource::Probe }))
+        );
+        assert_eq!(cached_or_budgeted_model(&mut state, "first", now + chrono::Duration::days(7)), None);
+        state.requests_in_window = MAX_MODEL_REQUESTS_PER_DAY;
+        state.window_started_at = Some(now + chrono::Duration::days(7));
+        assert_eq!(cached_or_budgeted_model(&mut state, "blocked", now + chrono::Duration::days(7)), Some(None));
+        assert_eq!(cached_or_budgeted_model(&mut state, "blocked", now + chrono::Duration::days(8)), None);
+        assert_eq!(state.requests_in_window, 1);
     }
 }
