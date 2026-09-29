@@ -2209,15 +2209,19 @@ async fn observe_fulfilment_facts(
     probe: FulfilmentProbeContext<'_>,
     model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
-    let kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?;
+    let mut kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    kinds.retain(|kind| kind.spec.host_ref == host_ref && kind.metadata.deletion_timestamp.is_none());
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
     let mut facts = BTreeMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-    // Probe serially: all kinds on one host share the same model cache and budget.
-    for kind in kinds.items {
-        if kind.spec.host_ref != host_ref || kind.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
+    // Model requests share a host budget, so kinds run serially. Rotate the
+    // starting kind each pass: a persistently slow kind must not always take
+    // the first slice of the host-wide deadline.
+    if !kinds.is_empty() {
+        let offset = (Utc::now().timestamp() as usize / FULFILMENT_CHANGE_CHECK_INTERVAL.as_secs() as usize) % kinds.len();
+        kinds.rotate_left(offset);
+    }
+    for kind in kinds {
         let image = match &kind.spec.realisation {
             FulfilmentRealisation::DockerPerVessel { image } => match image.resolve(&baselines).await {
                 Ok(image) => Some(image),
@@ -2241,7 +2245,7 @@ async fn observe_fulfilment_facts(
         let observed = match current {
             Some(current) => Some(current),
             None => match tokio::time::timeout_at(
-                deadline,
+                deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
                 crate::fulfilment_probe::probe_kind(
                     &kind.spec,
                     image.as_deref(),

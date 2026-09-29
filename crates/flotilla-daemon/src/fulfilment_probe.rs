@@ -16,6 +16,7 @@ const HARNESSES: &[(&str, &str)] = &[("claude-code", "claude"), ("codex", "codex
 /// A hard host-wide ceiling, persisted in Host status across daemon restarts.
 const MAX_MODEL_REQUESTS_PER_DAY: u32 = 8;
 const MODEL_CACHE_MAX_AGE: chrono::Duration = chrono::Duration::days(7);
+const INCONCLUSIVE_CACHE_MAX_AGE: chrono::Duration = chrono::Duration::days(2);
 
 fn declared_models(env: &dyn EnvVars) -> Vec<String> {
     let mut models = env.get("FLOTILLA_PROBE_MODELS").map_or_else(
@@ -108,7 +109,10 @@ async fn credential_fingerprint(runner: &dyn CommandRunner, env: &dyn EnvVars, s
 }
 
 fn cached_or_budgeted_model(state: &mut ModelProbeState, key: &str, now: chrono::DateTime<Utc>) -> Option<Option<ModelFact>> {
-    state.entries.retain(|_, entry| now.signed_duration_since(entry.observed_at) < MODEL_CACHE_MAX_AGE);
+    state.entries.retain(|_, entry| {
+        let max_age = if entry.fact.is_some() { MODEL_CACHE_MAX_AGE } else { INCONCLUSIVE_CACHE_MAX_AGE };
+        now.signed_duration_since(entry.observed_at) < max_age
+    });
     if let Some(entry) = state.entries.get(key) {
         return Some(entry.fact.clone());
     }
@@ -156,7 +160,7 @@ pub(crate) async fn probe_kind(
         return Err("probe scratch directory must not be HOME".to_string());
     }
     if !runner.run_output("mkdir", &["-p", &scratch_name], parent, &ChannelLabel::Default).await.is_ok_and(|output| output.success) {
-        return Err(format!("cannot create probe scratch directory {}", scratch.display()));
+        return Err(format!("cannot create probe scratch directory {} from parent {}", scratch.display(), parent.display()));
     }
     let mut image_digest = None;
     if matches!(spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) {
@@ -569,5 +573,6 @@ mod tests {
         assert_eq!(cached_or_budgeted_model(&mut state, "blocked", now + chrono::Duration::days(7)), Some(None));
         assert_eq!(cached_or_budgeted_model(&mut state, "blocked", now + chrono::Duration::days(8)), None);
         assert_eq!(state.requests_in_window, 1);
+        assert_eq!(cached_or_budgeted_model(&mut state, "blocked", now + chrono::Duration::days(10)), None);
     }
 }
