@@ -74,7 +74,7 @@ use crate::{
     resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
-    vessel_config::{compose, ComposedFile, Fragment, TargetId},
+    vessel_config::{compose, crew_git_identity_environment_fragments, ComposedFile, Fragment, TargetId},
     Aggregator, AggregatorResolvers,
 };
 
@@ -94,10 +94,7 @@ const RECONCILE_NOW_ANNOTATION: &str = "flotilla.work/reconcile-now-at";
 const CREW_SESSION_SIZE: TerminalSize = TerminalSize::new(200, 50);
 
 fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> Result<Option<ComposedFile>, String> {
-    let fragments = fragments.into_iter().collect::<Vec<_>>();
-    if fragments.is_empty() {
-        return Ok(None);
-    }
+    let fragments = crew_git_identity_environment_fragments().into_iter().chain(fragments).collect::<Vec<_>>();
     compose(TargetId::AgentEnvironment, fragments).map(Some).map_err(|error| format!("compose shared agent environment: {error}"))
 }
 
@@ -4757,6 +4754,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .stance(plan.stance)
                     .build();
                 let mut env = plan.env;
+                let git_identity = compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments())
+                    .expect("crew Git identity environment must compose")
+                    .environment;
+                env.retain(|(key, _)| !git_identity.iter().any(|(identity_key, _)| identity_key == key));
+                env.extend(git_identity);
                 env.extend([
                     ("FLOTILLA_CREW_ID".to_string(), crew_id),
                     ("FLOTILLA_CONVOY".to_string(), context.convoy.clone()),
@@ -6936,7 +6938,11 @@ mod tests {
         assert_eq!(error.to_string(), "stop after capturing create options");
         let opts = provider.create_opts.lock().await.take().expect("captured create options");
         assert!(opts.provisioned_mounts.is_empty(), "tool assets remain provider-neutral until the environment provider delivers them");
-        assert!(opts.tokens.is_empty(), "tool environment belongs to the tool description");
+        assert_eq!(
+            opts.tokens,
+            compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment,
+            "tool environment belongs to the tool description; crew Git identity is a container baseline"
+        );
         assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat"]);
         assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
         assert_eq!(opts.tools[0].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
@@ -7215,7 +7221,10 @@ mod tests {
             CONTAINER_CODEX_HOME,
             ProvisionedMountMode::Rw,
         )));
-        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())]);
+        let mut expected_tokens = vec![("CODEX_HOME".to_string(), CONTAINER_CODEX_HOME.to_string())];
+        expected_tokens
+            .extend(compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment);
+        assert_eq!(opts.tokens, expected_tokens);
 
         let mut preconfigured = spec;
         preconfigured.env.insert("CODEX_HOME".to_string(), "/image/codex".to_string());
@@ -7224,7 +7233,10 @@ mod tests {
             .await
             .expect_err("capture provider should stop provision");
         let opts = provider.create_opts.lock().await.take().expect("captured preconfigured create options");
-        assert_eq!(opts.tokens, vec![("CODEX_HOME".to_string(), "/image/codex".to_string())]);
+        let mut expected_tokens = vec![("CODEX_HOME".to_string(), "/image/codex".to_string())];
+        expected_tokens
+            .extend(compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment);
+        assert_eq!(opts.tokens, expected_tokens);
         assert!(
             opts.provisioned_mounts.iter().all(|mount| mount.environment_path.as_path() != Path::new(CONTAINER_CODEX_HOME)),
             "a placement-provided CODEX_HOME must not be overwritten with a delivered Codex home"
@@ -12303,6 +12315,10 @@ mod tests {
             ("FLOTILLA_CREW_ROLE", "coder"),
             ("FLOTILLA_NAMESPACE", NAMESPACE),
             ("FLOTILLA_TERMINAL_SESSION", "terminal-demo-work-coder"),
+            ("GIT_AUTHOR_NAME", "flotilla-crew[bot]"),
+            ("GIT_AUTHOR_EMAIL", "309902803+flotilla-crew[bot]@users.noreply.github.com"),
+            ("GIT_COMMITTER_NAME", "flotilla-crew[bot]"),
+            ("GIT_COMMITTER_EMAIL", "309902803+flotilla-crew[bot]@users.noreply.github.com"),
         ] {
             assert!(launch.env_vars.iter().any(|(key, value)| key == name && value == expected), "contained launch missing {name}");
         }
@@ -12702,6 +12718,10 @@ mod tests {
             ("FLOTILLA_CREW_ROLE", "coder"),
             ("FLOTILLA_NAMESPACE", NAMESPACE),
             ("FLOTILLA_TERMINAL_SESSION", coder_launch.session_name.as_str()),
+            ("GIT_AUTHOR_NAME", "flotilla-crew[bot]"),
+            ("GIT_AUTHOR_EMAIL", "309902803+flotilla-crew[bot]@users.noreply.github.com"),
+            ("GIT_COMMITTER_NAME", "flotilla-crew[bot]"),
+            ("GIT_COMMITTER_EMAIL", "309902803+flotilla-crew[bot]@users.noreply.github.com"),
         ] {
             assert!(coder_launch.env_vars.iter().any(|(key, value)| key == name && value == expected), "host-direct launch missing {name}");
         }

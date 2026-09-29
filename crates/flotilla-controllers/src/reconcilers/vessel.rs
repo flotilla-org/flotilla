@@ -836,11 +836,23 @@ impl Reconciler for VesselReconciler {
                             };
                             mounted_common_dirs.insert(format!("{}/.git", clone.spec.path.trim_end_matches('/')));
                         }
-                        mounts.extend(mounted_common_dirs.into_iter().map(|git_common_dir| EnvironmentMount {
-                            source_path: git_common_dir.clone(),
-                            target_path: git_common_dir,
-                            mode: EnvironmentMountMode::Rw,
-                        }));
+                        for git_common_dir in mounted_common_dirs {
+                            mounts.push(EnvironmentMount {
+                                source_path: git_common_dir.clone(),
+                                target_path: git_common_dir.clone(),
+                                mode: EnvironmentMountMode::Rw,
+                            });
+                            // Git needs writable refs, objects, and worktree metadata. Keep
+                            // the host-owned config and hooks immutable inside the vessel.
+                            for protected in ["config", "hooks"] {
+                                let path = format!("{git_common_dir}/{protected}");
+                                mounts.push(EnvironmentMount {
+                                    source_path: path.clone(),
+                                    target_path: path,
+                                    mode: EnvironmentMountMode::Ro,
+                                });
+                            }
+                        }
                         let image = match image.resolve(&self.image_baselines).await {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),

@@ -366,6 +366,7 @@ impl CommandProcess for TokioCommandProcess {
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -381,6 +382,7 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         let output = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -403,6 +405,7 @@ impl CommandRunner for ProcessCommandRunner {
         cwd: &Path,
         _label: &ChannelLabel,
     ) -> Result<Box<dyn CommandProcess>, String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         let child = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -416,6 +419,7 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         use tokio::io::AsyncWriteExt;
 
         let mut child = tokio::process::Command::new(cmd)
@@ -441,6 +445,7 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_to_file(&self, cmd: &str, args: &[&str], cwd: &Path, destination: &Path) -> Result<(), String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         let mut child = tokio::process::Command::new(cmd)
             .args(args)
             .current_dir(cwd)
@@ -461,6 +466,7 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn run_from_file(&self, cmd: &str, args: &[&str], cwd: &Path, source: &Path) -> Result<(), String> {
+        crate::vcs::guard_host_git_config(cmd, args, cwd)?;
         use tokio::io::AsyncWriteExt;
         let mut child = tokio::process::Command::new(cmd)
             .args(args)

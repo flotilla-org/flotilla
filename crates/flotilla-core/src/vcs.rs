@@ -6,6 +6,7 @@
 use std::{
     fmt,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
 };
 
@@ -23,6 +24,144 @@ use crate::{
         CommandOutput, CommandRunner,
     },
 };
+
+/// Check host-owned repository configuration before a local Git process can
+/// interpret it. A contained worktree can write refs in the shared gitdir, so
+/// the host must treat config there as untrusted even with read-only overlays.
+pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+    if cmd != "git" {
+        return Ok(());
+    }
+    let mut directory = cwd.to_path_buf();
+    for pair in args.windows(2) {
+        if pair[0] == "-C" {
+            directory = if Path::new(pair[1]).is_absolute() { PathBuf::from(pair[1]) } else { directory.join(pair[1]) };
+        }
+    }
+    let Some(git_entry) = directory.ancestors().map(|ancestor| ancestor.join(".git")).find(|path| path.exists()) else {
+        return Ok(());
+    };
+    let admin_dir = if git_entry.is_dir() {
+        git_entry
+    } else {
+        let pointer = std::fs::read_to_string(&git_entry).map_err(|error| format!("read {}: {error}", git_entry.display()))?;
+        let target = pointer.trim().strip_prefix("gitdir: ").ok_or_else(|| format!("invalid gitdir pointer at {}", git_entry.display()))?;
+        if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            git_entry.parent().expect(".git has a parent").join(target)
+        }
+    };
+    let common_dir = match std::fs::read_to_string(admin_dir.join("commondir")) {
+        Ok(relative) => admin_dir.join(relative.trim()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => admin_dir.clone(),
+        Err(error) => return Err(format!("read {}: {error}", admin_dir.join("commondir").display())),
+    };
+    let common_dir =
+        common_dir.canonicalize().map_err(|error| format!("resolve shared Git directory {}: {error}", common_dir.display()))?;
+    for config in [common_dir.join("config"), admin_dir.join("config.worktree")] {
+        if !config.exists() {
+            continue;
+        }
+        let output = Command::new("git")
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args(["--name-only", "--list", "--null"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .output()
+            .map_err(|error| format!("inspect {}: {error}", config.display()))?;
+        if !output.status.success() {
+            return Err(format!("cannot inspect Git configuration {}: {}", config.display(), String::from_utf8_lossy(&output.stderr)));
+        }
+        for key in output.stdout.split(|byte| *byte == 0).filter(|key| !key.is_empty()) {
+            let key = String::from_utf8_lossy(key).to_ascii_lowercase();
+            let risky = key == "core.fsmonitor"
+                || key == "core.sshcommand"
+                || key == "core.hookspath"
+                || key == "include.path"
+                || key.starts_with("includeif.")
+                || key.starts_with("filter.")
+                || key.starts_with("credential.");
+            if risky {
+                // An explicit default hooks path is harmless; hosts have used
+                // it historically. Other paths may execute container code.
+                if key == "core.hookspath" && default_hooks_path(&config, &common_dir)? {
+                    continue;
+                }
+                tracing::error!(config = %config.display(), %key, "unsafe shared Git configuration; refusing Git operation");
+                return Err(format!("unsafe shared Git configuration {}: {key}", config.display()));
+            }
+            if !allowed_shared_config_key(&key) {
+                tracing::warn!(config = %config.display(), %key, "unexpected shared Git configuration");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_hooks_path(config: &Path, common_dir: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["config", "--no-includes", "--file"])
+        .arg(config)
+        .args(["--get", "core.hooksPath"])
+        .output()
+        .map_err(|error| format!("inspect hooks path in {}: {error}", config.display()))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    let path = value.trim();
+    Ok(Path::new(path) == common_dir.join("hooks"))
+}
+
+fn allowed_shared_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "core.bare"
+            | "core.repositoryformatversion"
+            | "core.filemode"
+            | "core.logallrefupdates"
+            | "core.ignorecase"
+            | "core.precomposeunicode"
+            | "core.worktree"
+            | "extensions.worktreeconfig"
+            | "extensions.objectformat"
+            | "user.name"
+            | "user.email"
+    ) || key.starts_with("remote.")
+        || key.starts_with("branch.")
+        || key.starts_with("worktrunk.")
+}
+
+#[cfg(test)]
+mod git_config_guard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn injected_fsmonitor_blocks_host_git_before_it_runs() {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        let marker = repo.path().join("fsmonitor-ran");
+        let init = Command::new("git").args(["init", "-q"]).current_dir(repo.path()).output().expect("initialize repository");
+        assert!(init.status.success());
+        let config = Command::new("git")
+            .args(["config", "core.fsmonitor", &format!("touch {}", marker.display())])
+            .current_dir(repo.path())
+            .output()
+            .expect("inject config");
+        assert!(config.status.success());
+
+        let runner = crate::providers::ProcessCommandRunner;
+        let error = runner
+            .run("git", &["status"], repo.path(), &crate::providers::ChannelLabel::Default)
+            .await
+            .expect_err("unsafe key must block Git");
+        assert!(error.contains("core.fsmonitor"), "{error}");
+        assert!(!marker.exists());
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VcsCheck {
