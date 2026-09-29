@@ -46,7 +46,13 @@ The receiving crew's turn is not deliverable until every carried item is present
 
 ### 4. Where handoff refs live, and for how long
 
-- **The default is a fleet-internal, private git mirror per repository** (lab Forgejo `handoff/<repo>`, or daemon-served bare repositories, whichever proves simpler). Refs go under `refs/flotilla/convoy/<id>/handoff/<n>`, authenticated with the **daemon's** credentials, never a crew's. This is fast on the LAN, private, and works for forks we can't push to.
+- **The software defines a configurable handoff store; it hard-codes no location.** A handoff store is any daemon-reachable git remote. It is configured per installation, as a declared resource or daemon config, with a URL template per repository and a daemon credential. Candidate backends:
+  - a private repository on any forge;
+  - a bare repository over ssh;
+  - daemon-served bare repositories.
+
+  Refs go under `refs/flotilla/convoy/<id>/handoff/<n>`, authenticated with the **daemon's** credentials, never a crew's. The recommended configuration is a private, fleet-internal store: fast, not public, and it works for forks we can't push to.
+- **This fleet's choice** (a deployment preference, not a software requirement) is lab Forgejo `handoff/<repo>` repositories.
 - **On the same host,** transfer is point-to-point: the receiver fetches from the sender's checkout.
 - **The forge** is used only when a workflow explicitly asks.
 - **Allocation counts cross-host handoff cost** (ADR 0046 §3).
@@ -61,4 +67,4 @@ The receiving crew's turn is not deliverable until every carried item is present
   - carry declarations in workflow templates;
   - a `crew handoff --carry` extension;
   - staging integrated with turn delivery;
-  - the fleet git mirror as a piece of infrastructure (an operator provisioning step).
+  - a handoff-store configuration surface. Each installation provisions its own store; for this fleet, lab Forgejo repositories.

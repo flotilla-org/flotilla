@@ -690,7 +690,7 @@ _Avoid_: The convoy's PR (there may be several, across repositories).
 
 **Carry**:
 Something that moves with a cross-vessel handoff (ADR 0050): repository state (always, by default), named artifacts, context, or an agent-added path. The workflow declares what carries, the agent may add more, and the system chooses the transport:
-- a fleet git mirror for repository state;
+- the installation's configured handoff store (any daemon-reachable git remote) for repository state;
 - the artifact store for files;
 - point-to-point on the same host.
 
