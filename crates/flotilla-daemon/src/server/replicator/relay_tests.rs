@@ -148,6 +148,7 @@ async fn governor_relay_contract(storage: TestBackend) {
     workflow.exit = None;
     // No processes are launched: this tests admission independently of adapters.
     workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "true".to_string() };
+    workflow.turn_delivery.clear();
     let templates = feta.resource_backend().definitions::<WorkflowTemplate>("flotilla");
     let metadata = InputMeta::builder().name("governor".to_string()).build();
     templates.apply(&metadata, &workflow).await.expect("author feta governor");
@@ -191,9 +192,13 @@ async fn governor_relay_contract(storage: TestBackend) {
         let source = sources.items.iter().find(|source| source.object.metadata.name == "governor").expect("governor replica");
         assert!(matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == feta.node_id()));
     }
-    assert!(matches!(admit_governor(udder).await, CommandValue::ConvoyStarted { .. }));
+    let admitted = admit_governor(udder).await;
+    assert!(matches!(admitted, CommandValue::ConvoyStarted { .. }), "{admitted:?}");
     let (first_convoy, first_snapshot) = governor_snapshot(udder).await;
-    assert_eq!(first_snapshot, workflow);
+    assert_eq!(first_snapshot.allocation.len(), 1);
+    let mut expected_snapshot = workflow.clone();
+    expected_snapshot.allocation = first_snapshot.allocation.clone();
+    assert_eq!(first_snapshot, expected_snapshot);
 
     workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "echo revised-governor".to_string() };
     templates.apply(&metadata, &workflow).await.expect("revise feta template during live watches");
@@ -204,7 +209,9 @@ async fn governor_relay_contract(storage: TestBackend) {
     udder.resource_backend().using::<Convoy>("flotilla").delete(&first_convoy.metadata.name).await.expect("retire first admission");
     let result = admit_governor(udder).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
-    assert_eq!(governor_snapshot(udder).await.1, workflow, "re-admission must capture the newly relayed merge view");
+    expected_snapshot = workflow.clone();
+    expected_snapshot.allocation = first_snapshot.allocation;
+    assert_eq!(governor_snapshot(udder).await.1, expected_snapshot, "re-admission must capture the newly relayed merge view");
 
     // Also cover a record first authored after all watches are already live.
     templates.apply(&InputMeta::builder().name("late-governor".to_string()).build(), &workflow).await.expect("author late template");

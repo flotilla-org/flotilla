@@ -25,6 +25,105 @@ use crate::providers::{
 };
 
 #[test]
+fn allocation_groups_by_needs_and_credential_environment() {
+    let cases = [
+        (vec![("coder", vec!["platform:linux"], "write"), ("reviewer", vec!["platform:linux"], "write")], 1),
+        (vec![("coder", vec!["platform:linux"], "write"), ("verifier", vec!["gui_session"], "write")], 2),
+        (vec![("coder", vec![], "write"), ("reviewer", vec!["host_account_reach"], "write")], 2),
+        (vec![("coder", vec![], "write"), ("reviewer", vec![], "read")], 2),
+    ];
+    for (case, expected_count) in cases {
+        let roles = case
+            .into_iter()
+            .map(|(name, needs, grants)| AllocationRole {
+                crew: CrewSpec::builder()
+                    .role(name.to_string())
+                    .needs(needs.into_iter().map(|need| need.parse().expect("valid need")).collect())
+                    .source(CrewSource::Tool { command: "true".to_string() })
+                    .build(),
+                hint: name.to_string(),
+                repository_refs: None,
+                depends_on: Vec::new(),
+                credential_signature: grants.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .handoffs(vec![RoleHandoff { from: "coder".to_string(), to: roles[1].crew.role.clone() }])
+            .build();
+        allocate_roles(&mut workflow, &roles).expect("allocation");
+        assert_eq!(workflow.vessels.len(), expected_count);
+        assert_eq!(workflow.allocation.len(), expected_count);
+        if expected_count == 1 {
+            assert!(workflow.allocation[0].crossed_handoffs.is_empty());
+        } else {
+            assert!(workflow.allocation.iter().any(|decision| !decision.crossed_handoffs.is_empty()));
+        }
+    }
+}
+
+#[test]
+fn platform_matrix_expands_into_named_vessels() {
+    let project = ProjectSpec::builder()
+        .display_name("example".to_string())
+        .default_workflow_ref("verify".to_string())
+        .platform_matrix(vec!["macos".to_string(), "windows".to_string()])
+        .build();
+    let verifier = CrewSpec::builder()
+        .role("verify".to_string())
+        .needs(BTreeSet::from(["platform:$matrix".parse().expect("matrix need")]))
+        .source(CrewSource::Tool { command: "true".to_string() })
+        .build();
+    let mut workflow = WorkflowTemplateSpec::builder().roles(vec![verifier]).build();
+    workflow.repository_refs = Some(vec![RepositoryKey("scoped-repository".to_string())]);
+    let roles = expand_allocation_roles(&mut workflow, &project).expect("expand matrix");
+    assert_eq!(roles.iter().map(|role| role.hint.as_str()).collect::<Vec<_>>(), ["verify[macos]", "verify[windows]"]);
+    assert_eq!(roles[0].crew.needs.iter().map(ToString::to_string).collect::<Vec<_>>(), ["platform:macos"]);
+    assert_eq!(roles[0].repository_refs, workflow.repository_refs);
+}
+
+#[test]
+fn dual_authored_template_refuses_a_role_only_in_the_vessel_hint() {
+    let project = ProjectSpec::builder().display_name("example".to_string()).default_workflow_ref("work".to_string()).build();
+    let crew = |role: &str| CrewSpec::builder().role(role.to_string()).source(CrewSource::Tool { command: "true".to_string() }).build();
+    let mut workflow = WorkflowTemplateSpec::builder()
+        .roles(vec![crew("coder")])
+        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew("reviewer")]).build()])
+        .build();
+    let error = expand_allocation_roles(&mut workflow, &project).expect_err("missing role must refuse");
+    assert!(error.contains("reviewer"), "{error}");
+}
+
+#[test]
+fn matrix_turn_delivery_requires_a_concrete_vessel() {
+    let roles = ["macos", "windows"]
+        .into_iter()
+        .map(|platform| AllocationRole {
+            crew: CrewSpec::builder()
+                .role("verify".to_string())
+                .needs(BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]))
+                .source(CrewSource::Tool { command: "true".to_string() })
+                .build(),
+            hint: format!("verify[{platform}]"),
+            repository_refs: None,
+            depends_on: Vec::new(),
+            credential_signature: String::new(),
+        })
+        .collect::<Vec<_>>();
+    let rule = flotilla_resources::TurnDeliveryRule::builder()
+        .on("$cr.mergeable == conflicting".parse().expect("leaf"))
+        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("verify".to_string()).role("verify".to_string()).build())
+        .brief("Verify the result".to_string())
+        .hold(HoldAct::ChangeRequestComment { body: "Verification needed".to_string() })
+        .build();
+    let mut workflow = WorkflowTemplateSpec::builder().turn_delivery(indexmap::IndexMap::from([("verify".to_string(), rule)])).build();
+    let error = allocate_roles(&mut workflow, &roles).expect_err("ambiguous delivery must refuse");
+    assert!(error.contains("multiple vessels"), "{error}");
+    workflow.turn_delivery["verify"].to.vessel = "verify[macos]".to_string();
+    allocate_roles(&mut workflow, &roles).expect("explicit concrete target");
+    assert_eq!(workflow.turn_delivery["verify"].to.vessel, "verify[macos]");
+}
+
+#[test]
 fn standalone_issue_source_lookup_round_trips_installation_identity() {
     let lab = flotilla_resources::ForgeSpec::builder()
         .forge_id("lab".into())

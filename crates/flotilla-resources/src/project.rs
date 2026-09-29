@@ -23,6 +23,10 @@ pub struct ProjectSpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
+    /// Platforms used to expand a role with `platform:$matrix` at admission.
+    #[builder(default)]
+    #[serde(default)]
+    pub platform_matrix: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Vec<crate::SupervisionTarget>>,
     #[builder(default)]
@@ -325,6 +329,15 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
     }
 }
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
+    let mut platforms = BTreeSet::new();
+    for platform in &spec.platform_matrix {
+        if !matches!(platform.as_str(), "linux" | "macos" | "windows") {
+            return Err(format!("unknown platform in project matrix `{platform}`"));
+        }
+        if !platforms.insert(platform) {
+            return Err(format!("duplicate platform in project matrix `{platform}`"));
+        }
+    }
     spec.display_name = required_value(spec.display_name, "display_name")?;
     spec.default_workflow_ref = required_value(spec.default_workflow_ref, "default_workflow_ref")?;
     for binding in &mut spec.issue_source_bindings {
@@ -492,6 +505,7 @@ mod tests {
     #[test]
     fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
+            platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
             role_needs: BTreeMap::new(),
@@ -524,6 +538,7 @@ mod tests {
             default_branch: None,
         };
         let spec = ProjectSpec {
+            platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
             role_needs: BTreeMap::new(),

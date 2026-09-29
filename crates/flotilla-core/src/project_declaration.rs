@@ -16,6 +16,8 @@ pub struct ProjectDeclaration {
     pub default_workflow: Option<String>,
     #[serde(default)]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
+    #[serde(default)]
+    pub platform_matrix: Vec<String>,
     pub members: Vec<ProjectDeclarationMember>,
 }
 

@@ -869,6 +869,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .resource_backend()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Missing repository".into(),
             default_workflow_ref: "wf".into(),
@@ -1731,6 +1732,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -1808,6 +1810,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Zellij".into(),
             default_workflow_ref: "single-agent".into(),
@@ -1938,6 +1941,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".to_string(),
             default_workflow_ref: "single-agent".to_string(),
@@ -2173,6 +2177,21 @@ async fn capability_admission_names_unobserved_kind_facts() {
 }
 
 #[tokio::test]
+async fn ad_hoc_matrix_need_is_refused_before_placement() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let result = start_capability_convoy(&daemon, "ad-hoc-matrix", |intent| {
+        intent.needs.push("platform:$matrix".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("platform:$matrix is only valid on workflow roles or Project role needs")),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn model_selector_admission_names_unobserved_kind_facts() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
@@ -2278,7 +2297,182 @@ async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
 }
 
 #[tokio::test]
-async fn conflicting_role_platform_needs_refuse_the_shared_vessel() {
+async fn allocation_shares_equal_need_roles_and_explains_grouping() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let crew = |role: &str| {
+        flotilla_resources::CrewSpec::builder()
+            .role(role.to_string())
+            .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+            .build()
+    };
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("shared-needs".to_string()).build(),
+            &flotilla_resources::WorkflowTemplateSpec::builder()
+                .roles(vec![crew("coder"), crew("reviewer")])
+                .handoffs(vec![flotilla_resources::RoleHandoff { from: "coder".to_string(), to: "reviewer".to_string() }])
+                .build(),
+        )
+        .await
+        .expect("workflow");
+    let result = start_capability_convoy(&daemon, "shared-needs", |intent| intent.workflow_ref = Some("shared-needs".to_string())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "shared-needs").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
+    assert_eq!(snapshot.spec.vessels.len(), 1);
+    assert_eq!(snapshot.spec.vessels[0].crew.len(), 2);
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".to_string()), name: "shared-needs".to_string() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("expected explanation: {result:?}") };
+    assert_eq!(explanation.allocation.len(), 1);
+    assert!(explanation.allocation[0].crossed_handoffs.is_empty());
+}
+
+#[tokio::test]
+async fn allocation_separates_linux_coder_from_gui_verifier() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-gui", "gui-host", 0, BTreeSet::new()).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("gui-host").await.expect("host");
+    let mut status = host.status.expect("host status");
+    status.fulfilment_facts.insert("host-direct-gui".to_string(), FulfilmentFacts { gui_session_logged_in: true, ..Default::default() });
+    hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("GUI facts");
+    let crew = |role: &str, need: &str| {
+        flotilla_resources::CrewSpec::builder()
+            .role(role.to_string())
+            .needs(BTreeSet::from([need.parse().expect("need")]))
+            .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+            .build()
+    };
+    let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
+        .roles(vec![crew("coder", "platform:linux"), crew("verify", "gui_session")])
+        .build();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("gui-verify".to_string()).build(), &workflow)
+        .await
+        .expect("workflow");
+    let result = start_capability_convoy(&daemon, "gui-verify", |intent| intent.workflow_ref = Some("gui-verify".to_string())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "gui-verify").await;
+    assert_eq!(flotilla_resources::vessel_placement_pin(&admitted, "coder").expect("coder pin").decision.policy_name, "docker-test");
+    assert_eq!(
+        flotilla_resources::vessel_placement_pin(&admitted, "verify").expect("verifier pin").decision.policy_name,
+        "host-direct-gui"
+    );
+}
+
+#[tokio::test]
+async fn allocation_expands_project_platform_matrix() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let projects = backend.using::<Project>("flotilla");
+    let project = projects.get("flotilla").await.expect("project");
+    let mut project_spec = project.spec.clone();
+    project_spec.platform_matrix = vec!["macos".to_string(), "windows".to_string()];
+    projects.update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &project_spec).await.expect("update matrix");
+    for platform in ["macos", "windows"] {
+        let kind_name = format!("direct-{platform}");
+        create_test_host_direct_policy(&backend, &kind_name, &format!("host-{platform}"), 0, BTreeSet::new()).await;
+        let kinds = backend.using::<FulfilmentKind>("flotilla");
+        let kind = kinds.get(&kind_name).await.expect("kind");
+        let mut spec = kind.spec.clone();
+        spec.grants.remove(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string()));
+        spec.grants.insert(flotilla_resources::FulfilmentGrant::Platform(platform.to_string()));
+        kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("platform kind");
+    }
+    let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
+        .roles(vec![flotilla_resources::CrewSpec::builder()
+            .role("verify".to_string())
+            .needs(BTreeSet::from(["platform:$matrix".parse().expect("matrix need")]))
+            .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+            .build()])
+        .build();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("matrix-verify".to_string()).build(), &workflow)
+        .await
+        .expect("workflow");
+    let result = start_capability_convoy(&daemon, "matrix-verify", |intent| intent.workflow_ref = Some("matrix-verify".to_string())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "matrix-verify").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
+    assert_eq!(snapshot.spec.vessels.iter().map(|vessel| vessel.name.as_str()).collect::<Vec<_>>(), ["verify[macos]", "verify[windows]"]);
+}
+
+#[tokio::test]
+async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "direct-macos", "host-macos", 0, BTreeSet::new()).await;
+    let kinds = backend.using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get("direct-macos").await.expect("kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.remove(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string()));
+    spec.grants.insert(flotilla_resources::FulfilmentGrant::Platform("macos".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("mac kind");
+    let crew = |role: &str, platform: &str| {
+        flotilla_resources::CrewSpec::builder()
+            .role(role.to_string())
+            .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::Platform(platform.to_string())]))
+            .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+            .build()
+    };
+    let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            flotilla_resources::VesselRequirement::builder()
+                .name("work".to_string())
+                .crew(vec![crew("coder", "linux"), crew("verifier", "macos")])
+                .build(),
+            flotilla_resources::VesselRequirement::builder()
+                .name("prepare".to_string())
+                .crew(vec![flotilla_resources::CrewSpec::builder()
+                    .role("planner".to_string())
+                    .needs(BTreeSet::from([flotilla_resources::CapabilityNeed::HostAccountReach]))
+                    .source(flotilla_resources::CrewSource::Tool { command: "true".to_string() })
+                    .build()])
+                .build(),
+        ])
+        .handoffs(vec![flotilla_resources::RoleHandoff { from: "planner".to_string(), to: "verifier".to_string() }])
+        .build();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("backtrack".to_string()).build(), &workflow)
+        .await
+        .expect("workflow");
+    let result = start_capability_convoy(&daemon, "backtrack", |intent| intent.workflow_ref = Some("backtrack".to_string())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "backtrack").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("pinned workflow");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
+    assert_eq!(snapshot.spec.vessels.len(), 3);
+    assert!(snapshot.spec.vessels.iter().any(|vessel| vessel.name == "work[coder]"));
+    assert!(snapshot.spec.vessels.iter().any(|vessel| vessel.name == "work[verifier]"));
+    assert!(snapshot
+        .spec
+        .allocation
+        .iter()
+        .any(|decision| { decision.vessel == "work[verifier]" && decision.crossed_handoffs == ["planner -> verifier"] }));
+}
+
+#[tokio::test]
+async fn conflicting_role_platform_needs_split_and_name_uncovered_role() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
@@ -2310,7 +2504,7 @@ async fn conflicting_role_platform_needs_refuse_the_shared_vessel() {
     .await;
     assert!(
         matches!(&result, CommandValue::Error { message }
-        if message.contains("vessel work") && message.contains("platform:linux") && message.contains("platform:windows")),
+        if message.contains("role `windows`") && message.contains("platform:windows")),
         "{result:?}"
     );
 }
@@ -2491,6 +2685,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -2614,6 +2809,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -2738,6 +2934,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .clone()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -2888,6 +3085,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -3208,6 +3406,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
@@ -3396,6 +3595,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
@@ -5103,6 +5303,7 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let projects = daemon.resource_backend().using::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "repo suite".to_string(),
             default_workflow_ref: "single-agent".to_string(),
@@ -5271,6 +5472,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let projects = daemon.resource_backend().definitions::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent".to_string(),
@@ -5451,6 +5653,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .resource_backend()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            platform_matrix: Vec::new(),
             role_needs: Default::default(),
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent".to_string(),
