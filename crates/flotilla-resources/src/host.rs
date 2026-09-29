@@ -95,6 +95,7 @@ pub struct HostStatus {
     pub ready: bool,
     /// A host may be reachable while its scheduled sleep prevents admission.
     /// Absent in previous-generation records (ADR 0047).
+    /// Remove this decoder default one fleet roll after the field is written everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sleeping_until: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

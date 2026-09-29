@@ -155,6 +155,7 @@ pub struct FulfilmentKindSpec {
     pub pool: String,
     /// Billing class used after the least-privilege cut. Old records default
     /// to owned capacity for the N to N+1 stored-data window (ADR 0047).
+    /// Remove this decoder default one fleet roll after the field is written everywhere.
     #[serde(default)]
     #[builder(default)]
     pub cost_class: FulfilmentCostClass,

@@ -877,6 +877,7 @@ pub struct StalledCondition {
     pub maker: Option<LeafMaker>,
     pub evidence: String,
     pub source: StallEvidenceSource,
+    /// Remove this decoder default one fleet roll after the field is written everywhere (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<StallCause>,
     pub began_at: DateTime<Utc>,
