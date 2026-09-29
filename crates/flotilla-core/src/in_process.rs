@@ -4095,7 +4095,9 @@ impl InProcessDaemon {
                 continue;
             }
             if let Some(branch) = convoy.spec.r#ref.as_deref() {
-                let _ = self.discover_convoy_branch_subjects(&namespace, &convoy.metadata.name, branch).await;
+                if let Err(error) = self.discover_convoy_branch_subjects(&namespace, &convoy.metadata.name, branch).await {
+                    tracing::warn!(convoy = %convoy.metadata.name, %error, "relay hint branch discovery failed");
+                }
             }
             let refreshed = convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
             let relationships = refreshed
@@ -4871,6 +4873,8 @@ impl InProcessDaemon {
     }
 
     /// Persist every branch-matching PR across the convoy's repositories.
+    /// Successful lookups are written even when another repository lookup fails;
+    /// the first error is returned after those writes.
     pub async fn discover_convoy_branch_subjects(&self, namespace: &str, convoy_name: &str, branch: &str) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
@@ -4916,13 +4920,13 @@ impl InProcessDaemon {
         &self,
         namespace: &str,
         convoy: &ResourceObject<ResourceConvoy>,
-    ) -> flotilla_protocol::ReferenceContext {
+    ) -> Result<flotilla_protocol::ReferenceContext, String> {
         let forges = self
             .resource_backend
             .definitions::<Forge>(namespace)
             .list()
             .await
-            .unwrap_or_default()
+            .map_err(|error| error.to_string())?
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
@@ -4958,7 +4962,7 @@ impl InProcessDaemon {
                 })
             })
             .collect();
-        flotilla_protocol::ReferenceContext { repositories }
+        Ok(flotilla_protocol::ReferenceContext { repositories })
     }
 
     pub async fn link_convoy_subject(
@@ -4970,7 +4974,7 @@ impl InProcessDaemon {
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
-        let context = self.convoy_reference_context(namespace, &convoy).await;
+        let context = self.convoy_reference_context(namespace, &convoy).await?;
         let subject = context.parse(reference)?;
         if let Some(relationship) = relationship {
             apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {

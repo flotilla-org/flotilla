@@ -42,7 +42,7 @@ pub enum ConvoyVerb {
         #[arg(long = "as", value_parser = parse_relationship)]
         relationship: flotilla_protocol::Relationship,
     },
-    /// Remove a discovered subject from a convoy
+    /// Unlink a discovered subject and suppress automatic rediscovery
     Unlink { name: String, reference: String },
     /// Abandon a convoy, archive best-effort, and tear it down
     Abandon {

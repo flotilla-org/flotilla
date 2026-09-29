@@ -488,6 +488,16 @@ mod tests {
         );
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0].internal().expect("internal reference"), "cr/lab/robert/project-map/12");
+        let subjects = change_request_subjects_from_claim("https://forge.example/team/other/repository/pulls/13", &repositories, &[
+            flotilla_resources::ForgeSpec::builder()
+                .forge_id("lab".into())
+                .kind(flotilla_resources::ForgeKind::Forgejo)
+                .hosts(std::collections::BTreeSet::from(["forge.example".into()]))
+                .https_url("https://forge.example/team".into())
+                .git_ssh_host("forge.example".into())
+                .build(),
+        ]);
+        assert!(subjects.is_empty(), "a claim cannot produce a PR in an unadmitted repository");
     }
 
     fn test_vcs(runner: Arc<MockRunner>) -> FlotillaVcs {

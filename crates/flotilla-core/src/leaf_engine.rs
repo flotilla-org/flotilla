@@ -1493,10 +1493,19 @@ impl ReconcilerWake {
         }) {
             let status = convoy.status.as_ref().expect("holding convoy has status");
             let mut controller_rows = HashSet::<(String, String)>::new();
-            for (left, right) in produced_subject_conflicts(convoy) {
-                let left_ref = left.internal().unwrap_or_else(|_| left.id.clone());
-                let right_ref = right.internal().unwrap_or_else(|_| right.id.clone());
-                let now = Utc::now();
+            let conflicts = produced_subject_conflicts(convoy);
+            if !conflicts.is_empty() {
+                let details = conflicts
+                    .into_iter()
+                    .map(|(left, right)| {
+                        let left_ref = left.internal().unwrap_or_else(|_| left.id.clone());
+                        let right_ref = right.internal().unwrap_or_else(|_| right.id.clone());
+                        format!("{left_ref} and {right_ref}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let created_at = convoy.metadata.creation_timestamp;
+                // One standing row carries all subject conflicts until the convoy lands.
                 desired.push(LeafSubscriptionRow {
                     id: uuid::Uuid::nil(),
                     namespace: namespace.to_string(),
@@ -1512,15 +1521,13 @@ impl ReconcilerWake {
                         name: Some(convoy.metadata.name.clone()),
                         retry: ControllerRetry::terminal(
                             None,
-                            now,
-                            format!(
-                                "conflicting produced change requests {left_ref} and {right_ref}; link one as supersedes or unlink one"
-                            ),
+                            created_at,
+                            format!("conflicting produced change requests {details}; link one as supersedes or unlink one"),
                         ),
                         ceiling: RetryCeiling::default(),
                     },
                     freshness_demand: None,
-                    created_at: now,
+                    created_at,
                     episode_key: EpisodeKeyFields::default(),
                 });
             }
