@@ -387,6 +387,7 @@ pub struct CrewSpec {
 
 // Decode-only compatibility for the previous generation's closed expectation
 // names. Every persisted CrewSpec is normalized to declared leaves when read.
+// Remove after the next fleet roll verifies no stored snapshots use the old field.
 #[derive(Deserialize)]
 struct CrewSpecRecord {
     role: String,

@@ -42,6 +42,8 @@ pub struct ArtifactSpec {
     pub digest: String,
     pub size: u64,
     pub media_type: String,
+    // Decode pre-recorded_at artifacts for one generation. Remove the default
+    // after the next fleet roll verifies those stored artifacts are gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
