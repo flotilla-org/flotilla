@@ -44,7 +44,8 @@ use flotilla_resources::{
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
     ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
-    InputDefinition, InputMeta, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass,
+    InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
+    ReplicationClass,
     Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
     TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec,
     AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
@@ -68,7 +69,7 @@ use crate::{
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
     resource_limits::file_descriptor_pressure_condition,
-    resource_manifest::ResourceManifestReconciler,
+    resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
     vessel_config::{compose, ComposedFile, Fragment, TargetId},
@@ -140,13 +141,15 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
         let normalized = kind.to_ascii_lowercase().replace(['_', '-'], "");
         match normalized.as_str() {
             "convoyensure" | "convoyensures" => self.state.daemon.reconcile_convoy_ensure_now(namespace, name, &*self.state).await,
-            "manifest" | "manifestroot" | "manifestroots" => {
-                let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
-                if manifests.reconciler_root != name {
-                    return Err(format!("manifest root `{name}` does not match configured root `{}`", manifests.reconciler_root));
-                }
-                if manifests.reconciler_root != self.local_root {
+            "manifestroot" | "manifestroots" => {
+                let root = self.state.daemon.resource_backend().using::<ManifestRoot>(namespace).get(name).await
+                    .map_err(|error| error.to_string())?;
+                if root.spec.host != self.local_root {
                     return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));
+                }
+                let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
+                if root.spec.path != manifests.dir.to_string_lossy() || root.spec.source != manifests.source {
+                    return Err(format!("manifest root `{name}` does not match the declared source"));
                 }
                 let mut reconciler =
                     ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
@@ -183,7 +186,7 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
             }
             "convoy" | "convoys" => wake_controller_resource::<Convoy>(&self.state.daemon.resource_backend(), namespace, name).await,
             _ => Err(format!(
-                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, manifest-root, or Repository"
+                "resource kind `{kind}` does not support reconcile-now; expected Clone, Convoy, ConvoyEnsure, CredentialDelivery, ManifestRoot, or Repository"
             )),
         }
     }
@@ -668,6 +671,16 @@ impl DaemonRuntime {
                 }
             }));
         }
+        let desired_manifest_root = manifests
+            .as_ref()
+            .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
+            .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
+        let roots = daemon.resource_backend().using::<ManifestRoot>(&options.namespace);
+        for root in roots.list().await.map_err(|error| error.to_string())?.items {
+            if root.spec.host == profile.host_id && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str()) {
+                roots.delete(&root.metadata.name).await.map_err(|error| error.to_string())?;
+            }
+        }
         if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
@@ -810,6 +823,15 @@ fn spawn_manifest_reconciler_task(
             let namespace = namespace.clone();
             let manifests = manifests.clone();
             async move {
+                materialize_manifest_root(
+                    &daemon.resource_backend(),
+                    &namespace,
+                    &manifests.dir,
+                    &manifests.source,
+                    &manifests.reconciler_root,
+                )
+                .await
+                .map_err(ResourceError::other)?;
                 let vcs = daemon.local_vcs_for_checkout(&manifests.dir).await.map_err(ResourceError::other)?;
                 ResourceManifestReconciler::new(daemon.resource_backend(), namespace, manifests.dir)
                     .with_declared_source(manifests.source, manifests.reconciler_root)

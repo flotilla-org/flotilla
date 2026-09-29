@@ -59,8 +59,7 @@ use flotilla_resources::{
     RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, MANIFEST_RESOLUTION_ANNOTATION, REPO_KEY_LABEL, REPO_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, HELD_CREDENTIALS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::Notify;
@@ -1504,18 +1503,28 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
 }
 
 #[tokio::test]
-async fn manifest_resolution_command_persists_the_reconciler_request_annotation() {
+async fn manifest_resolution_command_persists_a_root_spec_token() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =
         InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
-    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
-    policies
+    let roots = daemon.resource_backend().using::<flotilla_resources::ManifestRoot>("flotilla");
+    roots
         .create(
-            &InputMeta::builder().name("resolve-me".to_string()).build(),
-            &PlacementPolicySpec::builder().pool("live".to_string()).build(),
+            &InputMeta::builder().name("manifest-test".to_string()).build(),
+            &flotilla_resources::ManifestRootSpec::builder()
+                .host("local".to_string())
+                .path("/tmp/manifests".to_string())
+                .source("test".to_string())
+                .build(),
         )
         .await
-        .expect("create policy");
+        .expect("create root");
+    let policies = daemon.resource_backend().using::<PlacementPolicy>("flotilla");
+    let mut meta = InputMeta::builder().name("resolve-me".to_string()).build();
+    meta.annotations.insert("flotilla.work/manifest-path".into(), "policy.yaml".into());
+    meta.annotations.insert("flotilla.work/manifest-source".into(), "test".into());
+    meta.annotations.insert("flotilla.work/manifest-reconciler-root".into(), "local".into());
+    policies.create(&meta, &PlacementPolicySpec::builder().pool("live".to_string()).build()).await.expect("create policy");
     let mut events = daemon.subscribe();
 
     let command_id = daemon
@@ -1532,10 +1541,18 @@ async fn manifest_resolution_command_persists_the_reconciler_request_annotation(
         .await
         .expect("request manifest sync");
     let result = recv_command_finished(&mut events, command_id).await;
-    let stored = policies.get("resolve-me").await.expect("resolved policy");
-
-    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "PlacementPolicy"));
-    assert_eq!(stored.metadata.annotations.get(MANIFEST_RESOLUTION_ANNOTATION).map(String::as_str), Some("sync"));
+    let stored = policies.get("resolve-me").await.expect("policy");
+    let root = roots.get("manifest-test").await.expect("root");
+    let key = flotilla_resources::DocumentKey {
+        path: "policy.yaml".into(),
+        kind: "PlacementPolicy".into(),
+        namespace: "flotilla".into(),
+        name: "resolve-me".into(),
+    };
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.kind == "ManifestRoot"));
+    assert_eq!(root.spec.resolutions[&key].action, flotilla_resources::ResolutionAction::Sync);
+    assert!(!root.spec.resolutions[&key].token.is_empty());
+    assert!(!stored.metadata.annotations.contains_key("flotilla.work/manifest-resolution"));
 }
 
 #[tokio::test]

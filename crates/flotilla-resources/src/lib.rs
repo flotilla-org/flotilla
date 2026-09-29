@@ -25,6 +25,7 @@ mod issue;
 mod labels;
 mod landing_gate;
 mod leaf;
+mod manifest_root;
 mod owner_gc;
 mod placement_policy;
 mod prepared_snapshot;
@@ -114,13 +115,16 @@ pub use in_memory::InMemoryBackend;
 pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
     LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, GENERATION_LABEL, MANAGED_BY_LABEL,
-    MANIFEST_RESOLUTION_ANNOTATION, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
     actor_obligation, admit_leaf, evaluate_leaf, ArtifactLeafSubject, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject,
     LeafEvaluation, LeafSubject, LeafValue, ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+};
+pub use manifest_root::{
+    DocumentKey, DocumentPhase, DocumentState, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ManifestRootStatusPatch, Resolution,
+    ResolutionAction,
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
@@ -209,6 +213,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Forge>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);
+        $callback::<$crate::ManifestRoot>($($argument),*);
         $callback::<$crate::PlacementPolicy>($($argument),*);
         $callback::<$crate::Presentation>($($argument),*);
         $callback::<$crate::Project>($($argument),*);
