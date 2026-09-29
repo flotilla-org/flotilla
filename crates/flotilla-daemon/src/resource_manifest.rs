@@ -392,6 +392,7 @@ impl ResourceManifestReconciler {
                 }),
                 evidence,
                 source: StallEvidenceSource::LeafEngine,
+                cause: None,
                 began_at: now,
                 rung: StallRung::Operator,
                 supervisor: None,

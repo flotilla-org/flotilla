@@ -17,10 +17,10 @@ use flotilla_resources::{
 use super::*;
 
 #[test]
-fn quartermaster_orders_live_minimal_candidates_by_availability_then_cost() {
+fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
     let now = chrono::Utc::now();
     let needs = BTreeSet::new();
-    let quartermaster = Quartermaster { needs: &needs, now };
+    let placement_tiebreak = PlacementTieBreak { needs: &needs, now };
     let candidate = |name: &str, cost_class, ready, sleeping_until, slots| {
         let metadata = flotilla_resources::ObjectMeta {
             name: name.to_string(),
@@ -103,12 +103,12 @@ fn quartermaster_orders_live_minimal_candidates_by_availability_then_cost() {
     for (label, left, right, left_wins) in cases {
         let left = candidate("left", left.3, left.0, left.1, left.2);
         let right = candidate("right", right.3, right.0, right.1, right.2);
-        assert_eq!(quartermaster.compare(&left, &right).is_lt(), left_wins, "{label}");
+        assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
     }
 }
 
 #[test]
-fn quartermaster_reserves_scarce_platforms_for_named_needs() {
+fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
     let now = chrono::Utc::now();
     for platform in ["macos", "windows"] {
         let kind = ResourceObject::<FulfilmentKind> {
@@ -145,9 +145,9 @@ fn quartermaster_reserves_scarce_platforms_for_named_needs() {
             sleeping_until: None,
         };
         let no_need = BTreeSet::new();
-        assert!(Quartermaster { needs: &no_need, now }.reserved(&candidate));
+        assert!(PlacementTieBreak { needs: &no_need, now }.reserved(&candidate));
         let named = BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]);
-        assert!(!Quartermaster { needs: &named, now }.reserved(&candidate));
+        assert!(!PlacementTieBreak { needs: &named, now }.reserved(&candidate));
     }
 }
 use crate::providers::{

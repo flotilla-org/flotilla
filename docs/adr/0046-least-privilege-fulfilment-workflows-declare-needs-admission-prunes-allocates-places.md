@@ -73,7 +73,7 @@ ADR 0007 already makes placement requirements-first, with `VesselRequirement` as
 4. **Backtracking is bounded and one level deep.** If placement cannot cover a vessel, allocation may split it, because a union of needs that no single fulfilment grants may be coverable by two. Then it re-places. If that still fails, admission refuses, **naming the uncovered role need**, for example "no fulfilment grants `platform: windows` + `gui_session` + `harness >= 2.1.300`". There is no silent fallback.
 5. **The admission snapshot records all three decisions** (the cuts, the grouping, and the placement), each with its justification. `convoy explain` shows why the crew is arranged and placed as it is.
 
-### 4. Fulfilment kinds declare grant sets; hosts supply live facts; the Quartermaster breaks ties
+### 4. Fulfilment kinds declare grant sets; hosts supply live facts; the placement tie-breaker breaks ties
 
 - **Fulfilment kinds replace placement policies** as what placement chooses between. Each is a declared resource, for example:
   - `docker-per-vessel` on feta with image X;
@@ -91,12 +91,12 @@ ADR 0007 already makes placement requirements-first, with `VesselRequirement` as
 - **Privilege is a partial order on grant sets, not a single score.**
   - Placement keeps the candidates whose grants cover the needs, then takes the **minimal** ones: those where no other candidate's grants are a strict subset.
   - Incomparable candidates (a macOS VM against a Windows host) are separated by the needs themselves.
-- **Ties among minimal candidates go to cost and availability.** That is the Quartermaster's allocation judgement:
+- **Ties among minimal candidates go to cost and availability.** That is the placement tie-breaker's allocation judgement:
   - owned idle capacity first, then subscription-included, then metered;
   - scarce platform capacity reserved for work that names it;
   - live availability counts, for example a host that sleeps on a schedule.
 
-  The tie-breaker is a pluggable decider. It starts static, and a dynamic Quartermaster is needed soon to prove the model.
+  The placement tie-breaker is a pluggable decider for an already selected workflow. The fleet-wide Quartermaster proposed in #1394 remains future work.
 - **An escalation is choosing a non-minimal candidate,** and it must carry a reason (§1).
 
 ### 5. Amendments

@@ -55,10 +55,9 @@ use flotilla_resources::{
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
     CrewCompletionPending, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
     DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding,
-    Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
+    Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
-    FulfilmentCostClass,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch,
     ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
@@ -1464,12 +1463,12 @@ trait FulfilmentDecider {
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering;
 }
 
-struct Quartermaster<'a> {
+struct PlacementTieBreak<'a> {
     needs: &'a BTreeSet<CapabilityNeed>,
     now: DateTime<Utc>,
 }
 
-impl Quartermaster<'_> {
+impl PlacementTieBreak<'_> {
     fn reserved(&self, candidate: &KindCandidate) -> bool {
         candidate.kind.spec.grants.iter().any(|grant| {
             matches!(grant, FulfilmentGrant::Platform(platform) if matches!(platform.as_str(), "macos" | "windows"))
@@ -1487,7 +1486,7 @@ impl Quartermaster<'_> {
     }
 }
 
-impl FulfilmentDecider for Quartermaster<'_> {
+impl FulfilmentDecider for PlacementTieBreak<'_> {
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering {
         let key = |candidate: &KindCandidate| {
             let policy = candidate.placement.selected.as_ref().expect("candidate has a validated placement policy");
@@ -6435,12 +6434,12 @@ impl InProcessDaemon {
                 .collect::<Vec<_>>();
             return Err(format!("no fulfilment kind covers {}; candidates: {}", role_needs.join(", "), rejected.join("; ")));
         }
-        let quartermaster = Quartermaster { needs, now: self.clock.now() };
+        let placement_tiebreak = PlacementTieBreak { needs, now: self.clock.now() };
         // A scarce platform is not a fallback for work that did not ask for it.
         // Pins still require an explicit escalation reason through the normal path.
         let mut reserved = Vec::new();
         if pin.is_none() {
-            (candidates, reserved) = candidates.into_iter().partition(|candidate| !quartermaster.reserved(candidate));
+            (candidates, reserved) = candidates.into_iter().partition(|candidate| !placement_tiebreak.reserved(candidate));
             if candidates.is_empty() {
                 return Err("no fulfilment kind covers needs without consuming reserved macOS or Windows capacity".to_string());
             }
@@ -6458,7 +6457,7 @@ impl InProcessDaemon {
             })
             .map(|candidate| candidate.kind.metadata.name.clone())
             .collect::<BTreeSet<_>>();
-        candidates.sort_by(|left, right| quartermaster.compare(left, right));
+        candidates.sort_by(|left, right| placement_tiebreak.compare(left, right));
         let index = match pin {
             Some(pin) => candidates
                 .iter()
@@ -6484,14 +6483,14 @@ impl InProcessDaemon {
                     host_ready: candidate.host_ready,
                     sleeping_until: candidate.sleeping_until,
                     free_vessel_slots: candidate.free_slots,
-                    reserved_for_platform: quartermaster.reserved(candidate),
+                    reserved_for_platform: placement_tiebreak.reserved(candidate),
                     minimal: minimal.contains(&candidate.kind.metadata.name),
-                    available: quartermaster.available(candidate),
+                    available: placement_tiebreak.available(candidate),
                 })
                 .collect(),
         };
         let mut selected = candidates.remove(index);
-        if quartermaster.reserved(&selected) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
+        if placement_tiebreak.reserved(&selected) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
             return Err(format!(
                 "fulfilment `{}` reserves scarce platform capacity; supply --escalation-reason to pin it for work without a platform need",
                 selected.kind.metadata.name

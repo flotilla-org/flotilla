@@ -2505,6 +2505,7 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "direct-linux", "host-linux", 0, BTreeSet::new()).await;
     create_test_host_direct_policy(&backend, "direct-macos", "host-macos", 0, BTreeSet::new()).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("direct-macos").await.expect("kind");
