@@ -32,20 +32,9 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
     if cmd != "git" {
         return Ok(());
     }
-    let mut directory = cwd.to_path_buf();
-    let mut explicit_git_dir = std::env::var_os("GIT_DIR").map(PathBuf::from);
-    for pair in args.windows(2) {
-        if pair[0] == "-C" {
-            directory = if Path::new(pair[1]).is_absolute() { PathBuf::from(pair[1]) } else { directory.join(pair[1]) };
-        } else if pair[0] == "--git-dir" {
-            explicit_git_dir = Some(PathBuf::from(pair[1]));
-        }
-    }
-    for arg in args {
-        if let Some(value) = arg.strip_prefix("--git-dir=") {
-            explicit_git_dir = Some(PathBuf::from(value));
-        }
-    }
+    // ProcessCommandRunner launches a host child without replacing its process
+    // environment, so this is the same GIT_DIR that the child Git will see.
+    let (directory, explicit_git_dir) = git_command_location(args, cwd, std::env::var_os("GIT_DIR").map(PathBuf::from));
     let git_entry = if let Some(path) = explicit_git_dir {
         if path.is_absolute() {
             path
@@ -103,11 +92,46 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
             }
             if !allowed_shared_config_key(&key) {
                 tracing::error!(config = %config.display(), %key, "unsafe shared Git configuration; refusing Git operation");
-                return Err(format!("unsafe shared Git configuration {}: {key}", config.display()));
+                return Err(format!(
+                    "unsafe shared Git configuration {}: {key}; remove this key from the host-owned clone config before retrying",
+                    config.display()
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn git_command_location(args: &[&str], cwd: &Path, inherited_git_dir: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
+    let mut directory = cwd.to_path_buf();
+    let mut explicit_git_dir = inherited_git_dir;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-C" if index + 1 < args.len() => {
+                let path = Path::new(args[index + 1]);
+                directory = if path.is_absolute() { path.to_path_buf() } else { directory.join(path) };
+                index += 2;
+            }
+            "--git-dir" if index + 1 < args.len() => {
+                explicit_git_dir = Some(PathBuf::from(args[index + 1]));
+                index += 2;
+            }
+            "-c" | "--config-env" | "--work-tree" | "--namespace" if index + 1 < args.len() => index += 2,
+            option if option.starts_with("-C") && option.len() > 2 => {
+                let path = Path::new(&option[2..]);
+                directory = if path.is_absolute() { path.to_path_buf() } else { directory.join(path) };
+                index += 1;
+            }
+            option if option.starts_with("--git-dir=") => {
+                explicit_git_dir = Some(PathBuf::from(&option[10..]));
+                index += 1;
+            }
+            option if option.starts_with('-') => index += 1,
+            _ => break, // everything after the subcommand belongs to that command
+        }
+    }
+    (directory, explicit_git_dir)
 }
 
 fn default_hooks_path(config: &Path, common_dir: &Path) -> Result<bool, String> {
@@ -122,6 +146,7 @@ fn default_hooks_path(config: &Path, common_dir: &Path) -> Result<bool, String> 
     }
     let value = String::from_utf8_lossy(&output.stdout);
     let path = value.trim();
+    // A symlinked spelling is rejected even if it resolves to the default.
     Ok(Path::new(path) == common_dir.join("hooks"))
 }
 
@@ -135,6 +160,17 @@ fn allowed_shared_config_key(key: &str) -> bool {
             | "core.ignorecase"
             | "core.precomposeunicode"
             | "core.worktree"
+            | "core.autocrlf"
+            | "core.symlinks"
+            | "core.sparsecheckout"
+            | "core.sparsecheckoutcone"
+            | "core.untrackedcache"
+            | "gc.auto"
+            | "gc.autodetach"
+            | "gc.pruneexpire"
+            | "pull.rebase"
+            | "pull.ff"
+            | "init.defaultbranch"
             | "extensions.objectformat"
             | "user.name"
             | "user.email"
@@ -142,7 +178,7 @@ fn allowed_shared_config_key(key: &str) -> bool {
     ) || ["url", "fetch", "pushurl", "push", "mirror", "prune", "tagopt"]
         .iter()
         .any(|suffix| key.starts_with("remote.") && key.ends_with(&format!(".{suffix}")))
-        || ["remote", "merge", "rebase", "pushremote", "flotilla.issues.issues"]
+        || ["remote", "merge", "rebase", "pushremote", "description", "flotilla.issues.issues"]
             .iter()
             .any(|suffix| key.starts_with("branch.") && key.ends_with(&format!(".{suffix}")))
 }
@@ -175,10 +211,33 @@ mod git_config_guard_tests {
     fn clean_repo_and_explicit_default_hooks_path_are_allowed() {
         let repo = tempfile::tempdir().expect("temporary repository");
         git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "remote.origin.url", "https://example.com/repo.git"]);
+        git(repo.path(), &["config", "branch.main.remote", "origin"]);
+        git(repo.path(), &["config", "core.autocrlf", "false"]);
         guard_host_git_config("git", &["status"], repo.path()).expect("clean repository");
         let hooks = repo.path().join(".git/hooks");
         git(repo.path(), &["config", "core.hooksPath", hooks.to_str().expect("UTF-8 path")]);
         guard_host_git_config("git", &["status"], repo.path()).expect("host's default hooks path");
+    }
+
+    #[test]
+    fn bare_repository_config_is_checked() {
+        let repo = tempfile::tempdir().expect("temporary bare repository");
+        git(repo.path(), &["init", "--bare", "-q"]);
+        git(repo.path(), &["config", "core.fsmonitor", "true"]);
+        let error = guard_host_git_config("git", &["show-ref"], repo.path()).expect_err("bare config drift");
+        assert!(error.contains("core.fsmonitor"));
+    }
+
+    #[test]
+    fn only_leading_global_options_change_git_config_resolution() {
+        let cwd = Path::new("/safe/repo");
+        let (directory, git_dir) = git_command_location(&["diff", "-C", "/untrusted", "--git-dir=/untrusted/.git"], cwd, None);
+        assert_eq!(directory, cwd);
+        assert!(git_dir.is_none());
+        let (directory, git_dir) = git_command_location(&["-C", "/other", "--git-dir=.git", "status"], cwd, None);
+        assert_eq!(directory, Path::new("/other"));
+        assert_eq!(git_dir, Some(PathBuf::from(".git")));
     }
 
     #[test]
@@ -206,6 +265,7 @@ mod git_config_guard_tests {
         let admin = std::fs::read_to_string(worktree.join(".git")).expect("worktree pointer");
         let admin = PathBuf::from(admin.trim().strip_prefix("gitdir: ").expect("gitdir pointer"));
         std::fs::write(admin.join("config.worktree"), "[core]\n\tfsmonitor = true\n").expect("inject worktree config");
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/work\n").expect("relative worktree pointer");
         let error = guard_host_git_config("git", &["status"], &worktree).expect_err("worktree config drift");
         assert!(error.contains("core.fsmonitor"));
         let git_dir = repo.path().join(".git");

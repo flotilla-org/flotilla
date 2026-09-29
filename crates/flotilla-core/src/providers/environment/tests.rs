@@ -655,6 +655,25 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
 }
 
 #[tokio::test]
+async fn protected_git_mount_rejects_a_comma_in_its_path() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let opts = CreateOpts {
+        tokens: vec![],
+        tools: vec![],
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/a,b/.git/config", "/host/a,b/.git/config", ProvisionedMountMode::Ro)],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+    let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
+    assert!(error.contains("comma"), "{error}");
+    assert!(runner.calls().is_empty());
+}
+
+#[tokio::test]
 async fn list_preserves_provisioned_mount_metadata() {
     use flotilla_protocol::ImageId;
 
