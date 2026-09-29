@@ -13,6 +13,7 @@ pub mod data;
 pub mod demand_lifecycle;
 pub mod environment_manager;
 pub mod executor;
+pub(crate) mod fleet;
 pub mod hop_chain;
 pub mod host_identity;
 pub(crate) mod host_registry;

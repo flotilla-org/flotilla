@@ -1,5 +1,7 @@
 //! Attach target indexing, role resolution, and plan construction.
 
+use flotilla_protocol::ResultSet;
+
 use super::*;
 use crate::{environment_manager::ManagedEnvironmentKind, hop_chain::remote::NoopRemoteHopResolver, providers::registry::ProviderRegistry};
 
@@ -10,27 +12,13 @@ pub(super) trait FleetRowsSource: Send + Sync {
 }
 
 pub(super) struct CachedFleetRows<'a> {
-    pub(super) config: &'a ConfigStore,
-    pub(super) cache: &'a RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
+    pub(super) fleet: &'a FleetService,
 }
 
 #[async_trait]
 impl FleetRowsSource for CachedFleetRows<'_> {
     async fn rows(&self) -> Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)> {
-        let hosts: HashSet<HostName> = self
-            .config
-            .load_hosts()
-            .map(|hosts| {
-                hosts
-                    .hosts
-                    .into_values()
-                    .filter(|remote| !remote.agentless_ssh)
-                    .map(|remote| HostName::new(remote.expected_host_name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cache = self.cache.read().await;
-        hosts.into_iter().filter_map(|host| cache.get(&host).map(|entry| (host, entry.rows.clone(), entry.result_sets.clone()))).collect()
+        self.fleet.cached_rows_for_configured_hosts().await
     }
 }
 
