@@ -151,18 +151,29 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         #[cfg(unix)]
         args.extend(["--user", user.as_str()]);
 
-        let mount_specs: Vec<String> = provisioned_mounts
+        let mount_specs: Vec<(String, String)> = provisioned_mounts
             .iter()
             .map(|mount| {
+                if protected_git_mount(mount) {
+                    // --mount rejects a missing bind source. -v silently creates
+                    // a directory, which would leave Git metadata unprotected.
+                    if mount.host_path.to_string().contains(',') {
+                        return Err(format!("protected Git mount path contains a comma: {}", mount.host_path));
+                    }
+                    return Ok((
+                        "--mount".to_string(),
+                        format!("type=bind,source={},target={},readonly", mount.host_path, mount.environment_path),
+                    ));
+                }
                 let mode = match mount.mode {
                     ProvisionedMountMode::Ro => "ro",
                     ProvisionedMountMode::Rw => "rw",
                 };
-                format!("{}:{}:{mode}", mount.host_path, mount.environment_path)
+                Ok(("-v".to_string(), format!("{}:{}:{mode}", mount.host_path, mount.environment_path)))
             })
-            .collect();
-        for mount_spec in &mount_specs {
-            args.push("-v");
+            .collect::<Result<_, String>>()?;
+        for (flag, mount_spec) in &mount_specs {
+            args.push(flag);
             args.push(mount_spec);
         }
 
@@ -246,6 +257,13 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     async fn destroy(&self, container_id: &str) -> Result<(), String> {
         self.inner.destroy(container_id).await
     }
+}
+
+fn protected_git_mount(mount: &ProvisionedMount) -> bool {
+    mount.mode == ProvisionedMountMode::Ro
+        && mount.host_path.as_path() == mount.environment_path.as_path()
+        && mount.host_path.as_path().parent().is_some_and(|parent| parent.file_name().is_some_and(|name| name == ".git"))
+        && mount.host_path.as_path().file_name().is_some_and(|name| name == "config" || name == "hooks")
 }
 
 fn dockerfile_image_tag(spec_path: &Path, abs_path: &Path) -> Result<String, String> {

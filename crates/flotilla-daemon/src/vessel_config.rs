@@ -169,6 +169,15 @@ pub fn crew_gitconfig_fragments() -> [Fragment; 2] {
     ]
 }
 
+pub fn crew_git_identity_environment_fragments() -> [Fragment; 4] {
+    [
+        agent_environment_fragment("GIT_AUTHOR_NAME", CREW_GIT_USER_NAME, CREW_GIT_IDENTITY_PROVENANCE),
+        agent_environment_fragment("GIT_AUTHOR_EMAIL", CREW_GIT_USER_EMAIL, CREW_GIT_IDENTITY_PROVENANCE),
+        agent_environment_fragment("GIT_COMMITTER_NAME", CREW_GIT_USER_NAME, CREW_GIT_IDENTITY_PROVENANCE),
+        agent_environment_fragment("GIT_COMMITTER_EMAIL", CREW_GIT_USER_EMAIL, CREW_GIT_IDENTITY_PROVENANCE),
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedFile {
     pub target: TargetId,
@@ -412,6 +421,30 @@ mod tests {
 
         assert!(composed.contents.contains("[user]\n\tname = flotilla-crew[bot]"));
         assert!(composed.contents.contains("[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com"));
+    }
+
+    #[test]
+    fn crew_git_environment_overrides_repository_identity_on_commit() {
+        use std::process::Command;
+
+        let repo = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str], environment: &[(String, String)]| {
+            let mut command = Command::new("git");
+            command.arg("-C").arg(repo.path()).args(args).envs(environment.iter().cloned());
+            let output = command.output().expect("run Git");
+            assert!(output.status.success(), "Git failed: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).expect("Git output is UTF-8")
+        };
+        git(&["init", "-q"], &[]);
+        git(&["config", "user.name", "Wrong Repo Name"], &[]);
+        git(&["config", "user.email", "wrong@example.com"], &[]);
+        let environment =
+            compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew identity environment").environment;
+        git(&["commit", "--allow-empty", "-qm", "identity"], &environment);
+        assert_eq!(
+            git(&["show", "-s", "--format=%an <%ae> | %cn <%ce>", "HEAD"], &environment).trim(),
+            format!("{CREW_GIT_USER_NAME} <{CREW_GIT_USER_EMAIL}> | {CREW_GIT_USER_NAME} <{CREW_GIT_USER_EMAIL}>")
+        );
     }
 
     #[test]

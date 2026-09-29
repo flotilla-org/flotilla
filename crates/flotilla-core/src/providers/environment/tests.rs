@@ -625,6 +625,9 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         provisioned_mounts: vec![
             ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
             ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
+            ProvisionedMount::new("/host/clone/.git", "/host/clone/.git", ProvisionedMountMode::Rw),
+            ProvisionedMount::new("/host/clone/.git/config", "/host/clone/.git/config", ProvisionedMountMode::Ro),
+            ProvisionedMount::new("/host/clone/.git/hooks", "/host/clone/.git/hooks", ProvisionedMountMode::Ro),
         ],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
@@ -642,6 +645,32 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
         "read-only reference mount should be passed to docker as :ro; args: {args:?}",
     );
+    for protected in ["config", "hooks"] {
+        let expected = format!("type=bind,source=/host/clone/.git/{protected},target=/host/clone/.git/{protected},readonly");
+        assert!(
+            args.windows(2).any(|pair| pair == ["--mount", expected.as_str()]),
+            "protected Git mount must reject a missing source: {args:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn protected_git_mount_rejects_a_comma_in_its_path() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let opts = CreateOpts {
+        tokens: vec![],
+        tools: vec![],
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/a,b/.git/config", "/host/a,b/.git/config", ProvisionedMountMode::Ro)],
+        image_pull_policy: ImagePullPolicy::IfNotPresent,
+        docker_config_dir: None,
+    };
+    let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
+    assert!(error.contains("comma"), "{error}");
+    assert!(runner.calls().is_empty());
 }
 
 #[tokio::test]

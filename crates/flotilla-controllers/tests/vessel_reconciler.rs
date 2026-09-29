@@ -860,13 +860,21 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         _ => None,
     });
     let mounts = mounts.expect("docker environment should be created");
-    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts.len(), 7);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
     assert_eq!(mounts[1].source_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
     assert_eq!(mounts[1].target_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
-    assert_eq!(mounts[2].source_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
-    assert_eq!(mounts[2].target_path, "/Users/alice/dev/flotilla-repos/flotilla/.git");
+    for (clone, slice) in [("cleat", &mounts[1..4]), ("flotilla", &mounts[4..7])] {
+        let common = format!("/Users/alice/dev/flotilla-repos/{clone}/.git");
+        assert_eq!(slice[0].source_path, common);
+        assert_eq!(slice[0].mode, flotilla_resources::EnvironmentMountMode::Rw);
+        for (mount, name) in slice[1..].iter().zip(["config", "hooks"]) {
+            assert_eq!(mount.source_path, format!("{common}/{name}"));
+            assert_eq!(mount.target_path, mount.source_path);
+            assert_eq!(mount.mode, flotilla_resources::EnvironmentMountMode::Ro);
+        }
+    }
 
     let mixed = backend
         .clone()
@@ -1432,6 +1440,16 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                         target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
                         mode: flotilla_resources::EnvironmentMountMode::Rw,
                     },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Ro,
+                    },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Ro,
+                    },
                 ])
         )
     }));
@@ -1582,6 +1600,16 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
                 source_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
                 target_path: "/Users/alice/dev/flotilla-repos/clone/.git".to_string(),
                 mode: flotilla_resources::EnvironmentMountMode::Rw,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/config".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
             },
         ],
         env: Default::default(),
