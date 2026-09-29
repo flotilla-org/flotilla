@@ -156,10 +156,11 @@ pub struct LeafTemplate {
     pub literal: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectVariable {
     ChangeRequest,
     Issue,
+    Artifact { producer: String, kind: String, about: ArtifactSubjectBinding },
 }
 
 impl FromStr for LeafTemplate {
@@ -180,7 +181,22 @@ impl FromStr for LeafTemplate {
         let subject = match subject {
             "$cr" => SubjectVariable::ChangeRequest,
             "$issue" => SubjectVariable::Issue,
-            unknown => return Err(format!("unknown exit leaf subject variable `{unknown}`; admitted variables: $cr, $issue")),
+            artifact if artifact.starts_with("$artifact(") && artifact.ends_with(')') => {
+                let values = artifact.trim_start_matches("$artifact(").trim_end_matches(')').split(',').collect::<Vec<_>>();
+                let [producer, kind, about] = values.as_slice() else {
+                    return Err("artifact leaf subject requires producer, kind, and about".to_string());
+                };
+                if producer.is_empty() || kind.is_empty() {
+                    return Err("artifact leaf producer and kind must be nonempty".to_string());
+                }
+                let about = match *about {
+                    "convoy" => ArtifactSubjectBinding::Convoy,
+                    "change-request-head" => ArtifactSubjectBinding::ChangeRequestHead,
+                    _ => return Err(format!("unknown artifact subject binding `{about}`")),
+                };
+                SubjectVariable::Artifact { producer: (*producer).to_string(), kind: (*kind).to_string(), about }
+            }
+            unknown => return Err(format!("unknown leaf subject variable `{unknown}`; admitted variables: $cr, $issue, $artifact(...)")),
         };
         if field_path == "." {
             return Err(leaf_template_syntax_error(input));
@@ -196,16 +212,30 @@ impl FromStr for LeafTemplate {
 }
 
 fn leaf_template_syntax_error(input: &str) -> String {
-    format!("invalid exit leaf template `{input}`; expected `$cr.<field-path> <operator> <literal>`")
+    format!("invalid leaf template `{input}`; expected `$cr.<path>`, `$issue.<path>`, or `$artifact(<producer>,<kind>,<about>).<path>` followed by an operator and literal")
 }
 
 impl fmt::Display for LeafTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let subject = match self.subject {
+        let subject = match &self.subject {
             SubjectVariable::ChangeRequest => "$cr",
             SubjectVariable::Issue => "$issue",
+            SubjectVariable::Artifact { .. } => return write!(f, "{}{} {} {}", self.subject, self.field_path, self.operator, self.literal),
         };
         write!(f, "{subject}{} {} {}", self.field_path, self.operator, self.literal)
+    }
+}
+
+impl fmt::Display for SubjectVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChangeRequest => f.write_str("$cr"),
+            Self::Issue => f.write_str("$issue"),
+            Self::Artifact { producer, kind, about } => write!(f, "$artifact({producer},{kind},{})", match about {
+                ArtifactSubjectBinding::Convoy => "convoy",
+                ArtifactSubjectBinding::ChangeRequestHead => "change-request-head",
+            }),
+        }
     }
 }
 
@@ -339,6 +369,7 @@ impl std::fmt::Display for Stance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(from = "CrewSpecRecord")]
 pub struct CrewSpec {
     pub role: String,
     #[builder(default)]
@@ -347,18 +378,110 @@ pub struct CrewSpec {
     #[serde(flatten)]
     pub source: CrewSource,
     #[builder(default)]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub completion_expectations: Vec<CrewCompletionExpectation>,
+    #[serde(default, rename = "completion_conditions", skip_serializing_if = "Vec::is_empty")]
+    pub completion_conditions: Vec<CrewCompletionExpectation>,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
 
+// Decode-only compatibility for the previous generation's closed expectation
+// names. Every persisted CrewSpec is normalized to declared leaves when read.
+// Remove after the next fleet roll verifies no stored snapshots use the old field.
+#[derive(Deserialize)]
+struct CrewSpecRecord {
+    role: String,
+    #[serde(default)]
+    needs: BTreeSet<CapabilityNeed>,
+    #[serde(flatten)]
+    source: CrewSource,
+    #[serde(default, rename = "completion_conditions", alias = "completion_expectations")]
+    completion_conditions: Vec<CrewCompletionExpectation>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+impl From<CrewSpecRecord> for CrewSpec {
+    fn from(record: CrewSpecRecord) -> Self {
+        let completion_conditions = record
+            .completion_conditions
+            .into_iter()
+            .map(|expectation| match expectation {
+                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::DecisionLedger) => ledger_condition(&record.role),
+                CrewCompletionExpectation::Legacy(LegacyCompletionExpectation::ChangeRequestReady) => ready_change_request_condition(),
+                condition => condition,
+            })
+            .collect();
+        Self { role: record.role, needs: record.needs, source: record.source, completion_conditions, labels: record.labels }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CrewCompletionExpectation {
+    Condition(CompletionCondition),
+    // Decode-only compatibility with workflow snapshots written before ADR 0043.
+    Legacy(LegacyCompletionExpectation),
+}
+
+impl CrewCompletionExpectation {
+    pub fn artifact_exists(producer: &str, kind: &str, about: ArtifactSubjectBinding) -> Self {
+        Self::Condition(CompletionCondition::Artifact {
+            producer: producer.to_string(),
+            kind: kind.to_string(),
+            about,
+            field_path: ".exists".to_string(),
+            operator: LeafOperator::Equal,
+            literal: "true".to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum CrewCompletionExpectation {
+pub enum LegacyCompletionExpectation {
     DecisionLedger,
     ChangeRequestReady,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "subject", rename_all = "kebab-case")]
+pub enum CompletionCondition {
+    Artifact {
+        producer: String,
+        kind: String,
+        about: ArtifactSubjectBinding,
+        field_path: String,
+        operator: LeafOperator,
+        literal: String,
+    },
+    ChangeRequest {
+        field_path: String,
+        operator: LeafOperator,
+        literal: String,
+        #[serde(default)]
+        optional_when_absent: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactSubjectBinding {
+    Convoy,
+    ChangeRequestHead,
+}
+
+fn ledger_condition(role: &str) -> CrewCompletionExpectation {
+    CrewCompletionExpectation::artifact_exists(role, "decision-ledger", ArtifactSubjectBinding::Convoy)
+}
+
+fn ready_change_request_condition() -> CrewCompletionExpectation {
+    CrewCompletionExpectation::Condition(CompletionCondition::ChangeRequest {
+        field_path: ".ready".to_string(),
+        operator: LeafOperator::Equal,
+        literal: "true".to_string(),
+        optional_when_absent: true,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,7 +527,7 @@ pub fn single_agent_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
+                .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
                 .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                 .build()])
             .build()])
@@ -419,7 +542,7 @@ pub fn single_agent_shepherd_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("shepherd".to_string())
-                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
+                .completion_conditions(vec![ledger_condition("shepherd"), ready_change_request_condition()])
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -437,7 +560,7 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
             .name("work".to_string())
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
+                .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
                 .source(CrewSource::Agent {
                     selector: Selector::for_capability("code"),
                     prompt: None,
@@ -457,12 +580,12 @@ pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
             .crew(vec![
                 CrewSpec::builder()
                     .role("coder".to_string())
-                    .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger, CrewCompletionExpectation::ChangeRequestReady])
+                    .completion_conditions(vec![ledger_condition("coder"), ready_change_request_condition()])
                     .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
                     .build(),
                 CrewSpec::builder()
                     .role("reviewer".to_string())
-                    .completion_expectations(vec![CrewCompletionExpectation::DecisionLedger])
+                    .completion_conditions(vec![ledger_condition("reviewer")])
                     .source(CrewSource::Agent {
                         selector: Selector::for_capability("code-review"),
                         prompt: None,
@@ -512,6 +635,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
+    InvalidCompletionCondition { vessel: String, role: String, reason: String },
     EmptyExitTable,
     InvalidExitLeaf { disposition: String, template: String },
     InvalidTurnDeliveryLeaf { source: String, template: String },
@@ -566,6 +690,9 @@ impl std::fmt::Display for InterpolationLocation {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ValidationError::InvalidCompletionCondition { vessel, role, reason } => {
+                write!(f, "vessel `{vessel}` role `{role}` has invalid completion condition: {reason}")
+            }
             ValidationError::EmptyExitTable => f.write_str("exit table must declare at least one disposition entry"),
             ValidationError::InvalidExitLeaf { disposition, template } => {
                 write!(f, "exit disposition `{disposition}` is not a world-terminal leaf: `{template}`")
@@ -682,14 +809,17 @@ fn validate_turn_delivery(
         let admitted = (rule.on.subject == SubjectVariable::ChangeRequest
             && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable")
             || rule.on.subject == SubjectVariable::Issue
-                && (matches!(rule.on.field_path.as_str(), ".state" | ".updated-at") || rule.on.field_path.starts_with(".labels.")))
+                && (matches!(rule.on.field_path.as_str(), ".state" | ".updated-at") || rule.on.field_path.starts_with(".labels."))
+            || matches!(rule.on.subject, SubjectVariable::Artifact { .. })
+                && (rule.on.field_path == ".exists" || rule.on.field_path.starts_with(".summary.")))
             && (rule.on.field_path == ".updated-at" || matches!(rule.on.operator, LeafOperator::Equal | LeafOperator::NotEqual));
         if !admitted {
             push_error(errors, ValidationError::InvalidTurnDeliveryLeaf { source: source.clone(), template: rule.on.to_string() });
         } else {
-            let kind = match rule.on.subject {
+            let kind = match &rule.on.subject {
                 SubjectVariable::ChangeRequest => LeafKind::ChangeRequest,
                 SubjectVariable::Issue => LeafKind::Issue,
+                SubjectVariable::Artifact { .. } => LeafKind::Artifact,
             };
             if let Err(reason) = validate_leaf_literal(kind, &rule.on.field_path, &rule.on.literal) {
                 push_error(errors, ValidationError::InvalidTurnDeliveryLiteral {
@@ -783,6 +913,40 @@ fn validate_vessel(
     }
 
     for process in &vessel.crew {
+        for expectation in &process.completion_conditions {
+            let CrewCompletionExpectation::Condition(condition) = expectation else { continue };
+            let (address, field_path, operator, literal) = match condition {
+                CompletionCondition::Artifact { producer, kind, field_path, operator, literal, .. } => (
+                    flotilla_protocol::LeafAddress::Artifact {
+                        convoy: "example".to_string(),
+                        producer: producer.clone(),
+                        kind: kind.clone(),
+                        subject: "example".to_string(),
+                    },
+                    field_path,
+                    operator,
+                    literal,
+                ),
+                CompletionCondition::ChangeRequest { field_path, operator, literal, .. } => (
+                    flotilla_protocol::LeafAddress::ChangeRequest {
+                        service: "github.com".to_string(),
+                        scope: "owner/repo".to_string(),
+                        number: 1,
+                    },
+                    field_path,
+                    operator,
+                    literal,
+                ),
+            };
+            let leaf = flotilla_protocol::Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
+            if let Err(reason) = crate::admit_leaf(&leaf) {
+                push_error(errors, ValidationError::InvalidCompletionCondition {
+                    vessel: vessel.name.clone(),
+                    role: process.role.clone(),
+                    reason,
+                });
+            }
+        }
         if process.role.starts_with('@') {
             push_error(errors, ValidationError::ReservedAddressMarkerInCrewRole {
                 vessel: vessel.name.clone(),

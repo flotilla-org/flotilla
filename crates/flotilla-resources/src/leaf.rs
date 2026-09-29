@@ -3,7 +3,7 @@ use std::{cmp::Ordering, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{Leaf, LeafAddress, LeafKind, LeafOperator};
 
-use crate::{ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, Issue, ResourceObject, Usage, Vessel, WorkState};
+use crate::{Artifact, ChangeRequest, Convoy, CrewWorkPhase, CrewWorkState, Issue, ResourceObject, Usage, Vessel, WorkState};
 
 pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("convoy", ".status.phase"),
@@ -17,8 +17,10 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
     ("cr", ".checks"),
     ("cr", ".review.actionable-at-head"),
     ("cr", ".mergeable"),
+    ("cr", ".ready"),
     ("issue", ".state"),
     ("issue", ".updated-at"),
+    ("artifact", ".exists"),
 ];
 
 /// Phrasing is part of the closed actor-leaf vocabulary. An actor row without
@@ -26,7 +28,7 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
 pub fn actor_obligation(leaf: &Leaf) -> Result<String, String> {
     match (&leaf.address, crew_role_path(&leaf.field_path), leaf.operator, leaf.literal.as_str()) {
         (LeafAddress::Work { work, .. }, Some(role), LeafOperator::Equal, "Done") => Ok(format!(
-            "You owe a settlement claim for {work}/{role}: finish, then run `flotilla crew complete --decision-ledger-ref …`, or `crew fail --message …`."
+            "You owe a settlement claim for {work}/{role}: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew fail --message …`."
         )),
         _ => Err(format!("actor leaf `{leaf:?}` has no obligation phrasing")),
     }
@@ -79,9 +81,12 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
     let usage_field = kind == LeafKind::Usage && admitted_usage_field(&leaf.field_path);
     let crew_field = kind == LeafKind::Work && crew_role_path(&leaf.field_path).is_some();
     let issue_label = kind == LeafKind::Issue && issue_label_path(&leaf.field_path).is_some();
+    let artifact_summary = kind == LeafKind::Artifact
+        && leaf.field_path.strip_prefix(".summary.").is_some_and(|field| !field.is_empty() && !field.contains('.'));
     let admitted = usage_field
         || crew_field
         || issue_label
+        || artifact_summary
         || ADMITTED_LEAF_VOCABULARY.iter().any(|(candidate_kind, path)| *candidate_kind == kind.to_string() && *path == leaf.field_path);
     if !admitted {
         let mut vocabulary = ADMITTED_LEAF_VOCABULARY.iter().map(|(kind, path)| format!("{kind}{path}")).collect::<Vec<_>>();
@@ -92,9 +97,13 @@ pub fn admit_leaf(leaf: &Leaf) -> Result<(), String> {
             "usage.plan".to_string(),
             "usage.organization".to_string(),
             "usage.windows.<name>.{used-percent,resets-at,window-minutes}".to_string(),
+            "artifact.summary.<field>".to_string(),
         ]);
         let vocabulary = vocabulary.join(", ");
         return Err(format!("leaf path `{kind}{}` is not admitted; admitted vocabulary: {vocabulary}", leaf.field_path));
+    }
+    if kind == LeafKind::Artifact && leaf.field_path == ".exists" && (leaf.operator != LeafOperator::Equal || leaf.literal != "true") {
+        return Err("artifact existence leaf must compare `.exists == true`".to_string());
     }
     let ordered_usage_field = kind == LeafKind::Usage
         && usage_window_path(&leaf.field_path).is_some_and(|(_, field)| matches!(field, "used-percent" | "window-minutes" | "resets-at"));
@@ -191,6 +200,32 @@ fn compare_values(left: &LeafValue, right: &LeafValue) -> Result<Ordering, Strin
         }
         (LeafValue::Timestamp(left), LeafValue::Timestamp(right)) => Ok(left.cmp(right)),
         _ => Err("leaf value and bound literal have different types".to_string()),
+    }
+}
+
+pub struct ArtifactLeafSubject<'a>(pub &'a ResourceObject<Artifact>);
+
+impl LeafSubject for ArtifactLeafSubject<'_> {
+    fn kind(&self) -> LeafKind {
+        LeafKind::Artifact
+    }
+
+    fn value(&self, field_path: &str) -> Option<LeafValue> {
+        if field_path == ".exists" {
+            return Some(LeafValue::Text("true".to_string()));
+        }
+        let field = field_path.strip_prefix(".summary.")?;
+        let value = self.0.spec.summary.get(field)?;
+        match value {
+            serde_json::Value::String(value) => Some(LeafValue::Text(value.clone())),
+            serde_json::Value::Bool(value) => Some(LeafValue::Text(value.to_string())),
+            serde_json::Value::Number(value) => Some(LeafValue::Text(value.to_string())),
+            _ => None,
+        }
+    }
+
+    fn observed_at(&self, _field_path: &str) -> Option<DateTime<Utc>> {
+        Some(self.0.spec.recorded_at.unwrap_or(self.0.metadata.creation_timestamp))
     }
 }
 
@@ -372,6 +407,13 @@ impl ChangeRequestLeafSubject<'_> {
             ".checks" => status.checks.observed_at,
             ".review.actionable-at-head" => status.review.actionable_at_head.observed_at,
             ".mergeable" => status.mergeable.observed_at,
+            ".ready" => {
+                if status.state.value == Some(crate::ObservedChangeRequestState::Merged) {
+                    status.state.observed_at
+                } else {
+                    status.state.observed_at.min(status.checks.observed_at)
+                }
+            }
             _ => return None,
         })
     }
@@ -394,6 +436,12 @@ impl LeafSubject for ChangeRequestLeafSubject<'_> {
         }
         let status = self.change_request.status.as_ref()?;
         let value = match field_path {
+            ".ready" => {
+                let merged = status.state.value == Some(crate::ObservedChangeRequestState::Merged);
+                let open = status.state.value == Some(crate::ObservedChangeRequestState::Open);
+                let checks_pass = status.checks.value == Some(crate::ObservedChecks::Pass);
+                (merged || (open && checks_pass)).to_string()
+            }
             ".state" => match status.state.value? {
                 crate::ObservedChangeRequestState::Open => "open".to_string(),
                 crate::ObservedChangeRequestState::Draft => "draft".to_string(),

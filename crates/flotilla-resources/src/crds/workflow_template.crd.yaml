@@ -57,7 +57,6 @@ spec:
                     properties:
                       on:
                         type: string
-                        pattern: '^\$cr\.(checks|review\.actionable-at-head|mergeable) (==|!=) .+$'
                       to:
                         type: object
                         required:
@@ -158,10 +157,42 @@ spec:
                               minLength: 1
                             completion_expectations:
                               type: array
-                              uniqueItems: true
                               items:
                                 type: string
                                 enum: [decision-ledger, change-request-ready]
+                            completion_conditions:
+                              type: array
+                              items:
+                                type: object
+                                required: [subject, field_path, operator, literal]
+                                oneOf:
+                                  - required: [producer, kind, about]
+                                    properties:
+                                      subject:
+                                        enum: [artifact]
+                                  - properties:
+                                      subject:
+                                        enum: [change-request]
+                                properties:
+                                  subject:
+                                    type: string
+                                    enum: [artifact, change-request]
+                                  producer:
+                                    type: string
+                                  kind:
+                                    type: string
+                                  about:
+                                    type: string
+                                    enum: [convoy, change-request-head]
+                                  field_path:
+                                    type: string
+                                  operator:
+                                    type: string
+                                    enum: ['==', '!=', '<', '<=', '>', '>=']
+                                  literal:
+                                    type: string
+                                  optional_when_absent:
+                                    type: boolean
                             selector:
                               type: object
                               required:

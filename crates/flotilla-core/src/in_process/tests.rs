@@ -874,7 +874,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(message.is_none());
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            assert_eq!(message.expect("nudge").text, "You owe a settlement claim for work/coder: finish, then run `flotilla crew complete --decision-ledger-ref …`, or `crew fail --message …`.");
+            assert_eq!(message.expect("nudge").text, "You owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew fail --message …`.");
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 let session = sessions.get("resume-staging-session").await.expect("session");
@@ -1029,17 +1029,6 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
             repository_key: remote_key
         })
     );
-}
-
-#[test]
-fn missing_change_request_binding_explains_the_crew_role_without_a_placeholder() {
-    let explanation = explain_unmet_expectation(UnmetSettlementExpectation::MissingChangeRequestBinding {
-        vessel: "work".to_string(),
-        role: "coder".to_string(),
-    });
-    assert_eq!(explanation.reason, "missing_change_request_binding");
-    assert_eq!(explanation.subject, "crew/work/coder");
-    assert!(explanation.detail.contains("create and bind a ready PR"));
 }
 
 #[test]
@@ -5293,7 +5282,11 @@ fn claim_crew(role: &str) -> flotilla_resources::CrewSpec {
     flotilla_resources::CrewSpec::builder()
         .role(role.to_string())
         .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
-        .completion_expectations(vec![flotilla_resources::CrewCompletionExpectation::DecisionLedger])
+        .completion_conditions(vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
+            role,
+            "decision-ledger",
+            flotilla_resources::ArtifactSubjectBinding::Convoy,
+        )])
         .build()
 }
 

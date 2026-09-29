@@ -362,6 +362,73 @@ fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() 
 }
 
 #[test]
+fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
+    let mut workflow = single_agent_workflow_spec();
+    workflow.turn_delivery["actionable-review"].on =
+        "$artifact(reviewer,review-round,convoy).summary.disposition == approve".parse().expect("parse artifact leaf");
+    validate(&workflow).expect("artifact turn delivery is admitted");
+    let snapshot = flotilla_resources::WorkflowSnapshot {
+        stall_nudges: Default::default(),
+        supervision: None,
+        exit: workflow.exit,
+        turn_delivery: workflow.turn_delivery,
+        vessels: workflow.vessels,
+    };
+    let convoy = common::convoy_object(
+        "artifact-turn",
+        common::task_provisioning_convoy_spec(),
+        Some(flotilla_resources::ConvoyStatus { workflow_snapshot: Some(snapshot), ..Default::default() }),
+    );
+    let turns = flotilla_resources::instantiate_turn_delivery(&convoy, &Default::default(), &Default::default(), &[])
+        .expect("instantiate artifact leaf");
+    let leaf = &turns.iter().find(|turn| turn.source == "actionable-review").expect("artifact turn").leaf;
+    assert!(matches!(&leaf.address, flotilla_protocol::LeafAddress::Artifact { convoy, producer, kind, subject }
+        if convoy == "artifact-turn" && producer == "reviewer" && kind == "review-round" && subject == "artifact-turn"));
+    assert_eq!(leaf.field_path, ".summary.disposition");
+}
+
+#[test]
+fn previous_generation_completion_conditions_still_decode() {
+    let old = r#"{"role":"coder","selector":{"capability":"code"},"completion_expectations":["decision-ledger","change-request-ready"]}"#;
+    let decoded: flotilla_resources::CrewSpec = serde_json::from_str(old).expect("previous generation crew record");
+    assert!(decoded
+        .completion_conditions
+        .iter()
+        .all(|condition| matches!(condition, flotilla_resources::CrewCompletionExpectation::Condition(_))));
+    let written = serde_json::to_value(decoded).expect("new conditions");
+    assert!(written["completion_conditions"][0].is_object());
+    assert!(written["completion_conditions"][1].is_object());
+}
+
+#[test]
+fn template_yaml_declares_a_new_artifact_completion_kind() {
+    let spec = parse_spec(
+        r#"
+vessels:
+  - name: work
+    crew:
+      - role: coder
+        selector:
+          capability: code
+        completion_conditions:
+          - subject: artifact
+            producer: coder
+            kind: toy-report
+            about: convoy
+            field_path: .summary.disposition
+            operator: "=="
+            literal: approved
+"#,
+    );
+    validate(&spec).expect("new artifact kind is admitted as template data");
+    assert!(matches!(
+        &spec.vessels[0].crew[0].completion_conditions[0],
+        flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::Artifact { kind, .. })
+            if kind == "toy-report"
+    ));
+}
+
+#[test]
 fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
     let workflow = single_agent_workflow_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {

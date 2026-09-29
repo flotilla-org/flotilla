@@ -42,6 +42,10 @@ pub struct ArtifactSpec {
     pub digest: String,
     pub size: u64,
     pub media_type: String,
+    // Decode pre-recorded_at artifacts for one generation. Remove the default
+    // after the next fleet roll verifies those stored artifacts are gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
     #[builder(default)]
     #[serde(default)]
@@ -57,4 +61,20 @@ pub fn artifact_record_name(convoy: &str, producer: &str, kind: &str, subject: &
         hash.update(component.as_bytes());
     }
     format!("artifact-{:x}", hash.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_generation_artifact_without_recorded_at_decodes() {
+        let old = serde_json::json!({
+            "convoy": "demo", "producer": "coder", "kind": "decision-ledger", "subject": "demo",
+            "summary": {}, "digest": "digest", "size": 1, "media_type": "text/markdown",
+            "expires_at": "2026-09-28T00:00:00Z"
+        });
+        let decoded: ArtifactSpec = serde_json::from_value(old).expect("previous artifact spec");
+        assert!(decoded.recorded_at.is_none());
+    }
 }

@@ -546,10 +546,10 @@ fn explain_condition(condition: &IntegrationCondition, now: DateTime<Utc>, ttl: 
 
 fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
     match expectation {
-        UnmetSettlementExpectation::MissingDecisionLedger { vessel, role } => ExplainedUnmetExpectation {
-            reason: "missing_decision_ledger".to_string(),
-            subject: format!("crew/{vessel}/{role}"),
-            detail: "post the decision ledger comment and pass its URL with `--decision-ledger-ref`".to_string(),
+        UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value } => ExplainedUnmetExpectation {
+            reason: "completion_condition_unsatisfied".to_string(),
+            detail: format!("{field_path} is {}", value.unwrap_or_else(|| "unavailable".to_string())),
+            subject,
         },
         UnmetSettlementExpectation::ChangeRequestNotReady { record, detail } => ExplainedUnmetExpectation {
             reason: "change_request_not_ready".to_string(),
@@ -593,11 +593,6 @@ fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> Explain
             reason: "missing_record".to_string(),
             subject: format!("change_request/{record}"),
             detail: "expected change request has no federated observation".to_string(),
-        },
-        UnmetSettlementExpectation::MissingChangeRequestBinding { vessel, role } => ExplainedUnmetExpectation {
-            reason: "missing_change_request_binding".to_string(),
-            subject: format!("crew/{vessel}/{role}"),
-            detail: "change request missing; create and bind a ready PR before completing".to_string(),
         },
         UnmetSettlementExpectation::StaleChangeRequest { record, observed_at } => ExplainedUnmetExpectation {
             reason: "stale_evidence".to_string(),
@@ -10071,6 +10066,14 @@ impl InProcessDaemon {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|err| err.to_string())?;
         ensure_crew_work_is_defined(&convoy, &context)?;
+        let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
+        let projected_ledger_ref =
+            match self.resource_backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&ledger_name).await {
+                Ok(record) => record.object.spec.summary.get("comment_url").and_then(serde_json::Value::as_str).map(str::to_string),
+                Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+        let decision_ledger_ref = projected_ledger_ref.or(decision_ledger_ref);
         // This records the principal declared by the connected surface. Stronger
         // authentication and operator/agent separation belongs to the caller-
         // identity contract; until then the durable attribution is the audit
@@ -10098,7 +10101,14 @@ impl InProcessDaemon {
                 .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
                 .and_then(|vessel| vessel.crew.iter().find(|crew| crew.role == context.caller_role))
                 .is_some_and(|crew| {
-                    crew.completion_expectations.contains(&flotilla_resources::CrewCompletionExpectation::ChangeRequestReady)
+                    crew.completion_conditions.iter().any(|condition| {
+                        matches!(
+                            condition,
+                            flotilla_resources::CrewCompletionExpectation::Condition(
+                                flotilla_resources::CompletionCondition::ChangeRequest { .. }
+                            )
+                        )
+                    })
                 });
             let mut observation_errors = Vec::new();
             if requires_ready_change_request && (!expected_checkout_refs(&convoy)?.is_empty() || convoy.spec.change_request.is_some()) {
@@ -10129,15 +10139,25 @@ impl InProcessDaemon {
                     change_requests.insert(name, source.object);
                 }
             }
+            let artifact_sources = self
+                .resource_backend
+                .including_replicas::<flotilla_resources::Artifact>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut artifacts = BTreeMap::new();
+            for source in artifact_sources.items {
+                let name = source.object.metadata.name.clone();
+                if !artifacts.contains_key(&name) || matches!(source.provenance, ResourceProvenance::Local) {
+                    artifacts.insert(name, source.object);
+                }
+            }
             let unmet = evaluate_crew_completion(
                 &convoy,
-                CrewCompletionClaim {
-                    vessel: &context.vessel,
-                    role: &context.caller_role,
-                    decision_ledger_ref: decision_ledger_ref.as_deref(),
-                },
+                CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
                 &checkouts,
                 &change_requests,
+                &artifacts,
                 self.change_request_stale_after(),
                 self.clock.now(),
             )?;

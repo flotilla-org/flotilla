@@ -119,8 +119,8 @@ pub use labels::{
 };
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{
-    actor_obligation, admit_leaf, evaluate_leaf, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject, LeafEvaluation,
-    LeafSubject, LeafValue, ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
+    actor_obligation, admit_leaf, evaluate_leaf, ArtifactLeafSubject, ChangeRequestLeafSubject, ConvoyLeafSubject, IssueLeafSubject,
+    LeafEvaluation, LeafSubject, LeafValue, ThreeValue, UsageLeafSubject, VesselLeafSubject, WorkLeafSubject, ADMITTED_LEAF_VOCABULARY,
 };
 pub use owner_gc::OwnerGarbageCollector;
 pub use placement_policy::{
@@ -222,7 +222,8 @@ macro_rules! for_each_registered_resource {
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
 pub use workflow_template::{
     implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_workflow_spec,
-    validate, AllocationDecision, ClaimExit, CrewCompletionExpectation, CrewSource, CrewSpec, ExitDeclaration, HoldAct, InputDefinition,
-    InterpolationField, InterpolationLocation, LeafTemplate, RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable,
-    SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit, CompletionCondition, CrewCompletionExpectation, CrewSource, CrewSpec,
+    ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, LegacyCompletionExpectation,
+    RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget,
+    ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };

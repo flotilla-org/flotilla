@@ -26,7 +26,7 @@ use flotilla_resources::{
 struct AlwaysEligible;
 
 #[test]
-fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
+fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     let now = timestamp(100);
     let mut spec = task_provisioning_convoy_spec();
     spec.repositories[0].url = "https://github.com/flotilla-org/flotilla.git".to_string();
@@ -49,40 +49,61 @@ fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
     let record_name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
     let checkouts = BTreeMap::new();
     let mut change_requests = BTreeMap::new();
-    let evaluate = |role: &str, ledger: Option<&str>, records: &BTreeMap<_, _>| {
+    let ledger = |role: &str| {
+        let name = flotilla_resources::artifact_record_name("completion", role, "decision-ledger", "completion");
+        (name.clone(), flotilla_resources::ResourceObject::<flotilla_resources::Artifact> {
+            metadata: common::object_meta(&name, "flotilla", "1"),
+            spec: flotilla_resources::ArtifactSpec::builder()
+                .convoy("completion".to_string())
+                .producer(role.to_string())
+                .kind("decision-ledger".to_string())
+                .subject("completion".to_string())
+                .digest("sha256:test".to_string())
+                .size(1)
+                .media_type("text/markdown".to_string())
+                .expires_at(now)
+                .build(),
+            status: None,
+        })
+    };
+    let mut artifacts = BTreeMap::new();
+    let evaluate = |role: &str, records: &BTreeMap<_, _>, artifacts: &BTreeMap<_, _>| {
         evaluate_crew_completion(
             &convoy,
-            flotilla_resources::CrewCompletionClaim { vessel: "work", role, decision_ledger_ref: ledger },
+            flotilla_resources::CrewCompletionClaim { vessel: "work", role },
             &checkouts,
             records,
+            artifacts,
             Duration::from_secs(300),
             now,
         )
         .expect("evaluate role")
     };
-    let missing = evaluate("coder", None, &change_requests);
-    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingDecisionLedger { .. })));
-    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::MissingChangeRequest { .. })));
+    let missing = evaluate("coder", &change_requests, &artifacts);
+    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("artifact/"))));
+    assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))));
+    artifacts.insert(ledger("coder").0, ledger("coder").1);
     let mut unbound = convoy.clone();
     unbound.spec.change_request = None;
     let missing_binding = evaluate_crew_completion(
         &unbound,
-        flotilla_resources::CrewCompletionClaim {
-            vessel: "work",
-            role: "coder",
-            decision_ledger_ref: Some("https://example.test/comment"),
-        },
+        flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
         &checkouts,
         &change_requests,
+        &artifacts,
         Duration::from_secs(300),
         now,
     )
     .expect("evaluate unbound PR");
-    assert_eq!(missing_binding, vec![UnmetSettlementExpectation::MissingChangeRequestBinding {
-        vessel: "work".to_string(),
-        role: "coder".to_string()
-    }]);
-    let reviewer = evaluate("reviewer", Some("https://example.test/comment"), &change_requests);
+    assert!(
+        missing_binding.iter().any(|expectation| matches!(
+            expectation,
+            UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject == "cr/unbound"
+        )),
+        "stock PR condition still requires a PR when checkout work is expected"
+    );
+    artifacts.insert(ledger("reviewer").0, ledger("reviewer").1);
+    let reviewer = evaluate("reviewer", &change_requests, &artifacts);
     assert!(reviewer.is_empty(), "reviewer does not carry the coder's PR readiness obligation");
 
     let record = |state, checks| flotilla_resources::ResourceObject::<ChangeRequest> {
@@ -102,17 +123,118 @@ fn crew_completion_expectations_are_role_scoped_and_require_a_ready_pr() {
         }),
     };
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Draft, ObservedChecks::Pass));
-    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests)
+    assert!(evaluate("coder", &change_requests, &artifacts)
         .iter()
-        .any(|expectation| matches!(expectation, UnmetSettlementExpectation::ChangeRequestNotReady { detail, .. } if detail.contains("PR not ready"))));
+        .any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))));
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Open, ObservedChecks::Pending));
-    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).iter().any(
-        |expectation| matches!(expectation, UnmetSettlementExpectation::ChangeRequestNotReady { detail, .. } if detail.contains("checks"))
+    assert!(evaluate("coder", &change_requests, &artifacts).iter().any(
+        |expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))
     ));
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Open, ObservedChecks::Pass));
-    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).is_empty());
+    assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Merged, ObservedChecks::Pending));
-    assert!(evaluate("coder", Some("https://example.test/comment"), &change_requests).is_empty());
+    assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
+}
+
+#[test]
+fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head() {
+    use flotilla_protocol::LeafOperator;
+    use flotilla_resources::{Artifact, ArtifactSpec, ArtifactSubjectBinding, CompletionCondition, CrewCompletionExpectation};
+
+    let now = timestamp(100);
+    let mut spec = task_provisioning_convoy_spec();
+    spec.repositories[0].url = "https://github.com/flotilla-org/flotilla.git".to_string();
+    let repository_ref = spec.repositories[0].repo_ref.clone();
+    spec.change_request =
+        Some(BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("Work".to_string()).build());
+    let mut workflow = flotilla_resources::single_agent_workflow_spec();
+    let crew = &mut workflow.vessels[0].crew[0];
+    crew.completion_conditions = vec![CrewCompletionExpectation::Condition(CompletionCondition::Artifact {
+        producer: "coder".to_string(),
+        kind: "toy-explainer".to_string(),
+        about: ArtifactSubjectBinding::ChangeRequestHead,
+        field_path: ".summary.disposition".to_string(),
+        operator: LeafOperator::Equal,
+        literal: "approved".to_string(),
+    })];
+    workflow.turn_delivery["actionable-review"].on =
+        "$artifact(coder,toy-explainer,change-request-head).summary.disposition == approved".parse().expect("head-bound artifact leaf");
+    flotilla_resources::validate(&workflow).expect("new artifact kind needs no core admission change");
+    let status = ConvoyStatus {
+        workflow_snapshot: Some(WorkflowSnapshot {
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+        }),
+        ..Default::default()
+    };
+    let convoy = convoy_object("toy", spec, Some(status));
+    let cr_name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+    let record = |head: &str| flotilla_resources::ResourceObject::<ChangeRequest> {
+        metadata: common::object_meta(&cr_name, "flotilla", "1"),
+        spec: ChangeRequestSpec::builder()
+            .service("github.com".to_string())
+            .scope("flotilla-org/flotilla".to_string())
+            .number(42)
+            .observing_authority("test".to_string())
+            .build(),
+        status: Some(ChangeRequestStatus {
+            state: Observation::known(ObservedChangeRequestState::Open, now),
+            head_sha: Observation::known(head.to_string(), now),
+            checks: Observation::known(ObservedChecks::Pass, now),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+            mergeable: Observation::known(ObservedMergeability::Mergeable, now),
+        }),
+    };
+    let artifact = |head: &str| {
+        let name = flotilla_resources::artifact_record_name("toy", "coder", "toy-explainer", head);
+        (name.clone(), flotilla_resources::ResourceObject::<Artifact> {
+            metadata: common::object_meta(&name, "flotilla", "1"),
+            spec: ArtifactSpec::builder()
+                .convoy("toy".to_string())
+                .producer("coder".to_string())
+                .kind("toy-explainer".to_string())
+                .subject(head.to_string())
+                .summary(BTreeMap::from([("disposition".to_string(), serde_json::json!("approved"))]))
+                .digest("sha256:test".to_string())
+                .size(1)
+                .media_type("text/plain".to_string())
+                .expires_at(now)
+                .build(),
+            status: None,
+        })
+    };
+    let mut change_requests = BTreeMap::from([(cr_name.clone(), record("X"))]);
+    let mut artifacts = BTreeMap::from([artifact("X")]);
+    let bound = flotilla_resources::instantiate_turn_delivery(&convoy, &BTreeMap::new(), &change_requests, &[])
+        .expect("bind artifact delivery to X");
+    assert!(bound
+        .iter()
+        .any(|turn| matches!(&turn.leaf.address, flotilla_protocol::LeafAddress::Artifact { subject, .. } if subject == "X")));
+    let evaluate = |change_requests: &BTreeMap<_, _>, artifacts: &BTreeMap<_, _>| {
+        evaluate_crew_completion(
+            &convoy,
+            flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+            &BTreeMap::new(),
+            change_requests,
+            artifacts,
+            Duration::from_secs(300),
+            now,
+        )
+        .expect("evaluate toy workflow")
+    };
+    assert!(evaluate(&change_requests, &artifacts).is_empty());
+    change_requests.insert(cr_name.clone(), record("Y"));
+    let rebound = flotilla_resources::instantiate_turn_delivery(&convoy, &BTreeMap::new(), &change_requests, &[])
+        .expect("rebind artifact delivery to Y");
+    assert!(rebound
+        .iter()
+        .any(|turn| matches!(&turn.leaf.address, flotilla_protocol::LeafAddress::Artifact { subject, .. } if subject == "Y")));
+    assert!(!evaluate(&change_requests, &artifacts).is_empty(), "approval of X cannot satisfy Y");
+    artifacts.insert(artifact("Y").0, artifact("Y").1);
+    assert!(evaluate(&change_requests, &artifacts).is_empty());
 }
 
 #[async_trait]

@@ -26,7 +26,18 @@ spec:
     - name: implement
       crew:
         - role: coder
-          completion_expectations: [decision-ledger, change-request-ready]
+          completion_conditions:
+            - subject: artifact
+              producer: coder
+              kind: decision-ledger
+              about: convoy
+              field_path: .exists
+              operator: '=='
+              literal: 'true'
+            - subject: change-request
+              field_path: .ready
+              operator: '=='
+              literal: 'true'
           selector:
             capability: code
           prompt: |
@@ -39,7 +50,14 @@ spec:
         - implement
       crew:
         - role: reviewer
-          completion_expectations: [decision-ledger]
+          completion_conditions:
+            - subject: artifact
+              producer: reviewer
+              kind: decision-ledger
+              about: convoy
+              field_path: .exists
+              operator: '=='
+              literal: 'true'
           selector:
             capability: code-review
           prompt: Review branch {{inputs.branch}} for correctness and style.
