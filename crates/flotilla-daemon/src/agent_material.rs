@@ -15,7 +15,8 @@ use flotilla_core::providers::{
     ChannelLabel, CommandRunner,
 };
 use tokio::{fs, io::AsyncWriteExt};
-use tracing::info;
+use tracing::{info, warn};
+use url::Url;
 
 use crate::{
     codex_central::codex_central_auth_path,
@@ -158,7 +159,13 @@ impl AgentMaterialRegistry {
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-        self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner).await
+        let result = self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner).await;
+        if result.is_err() {
+            if let Err(error) = remove_source_token_files(source_token_files, runner).await {
+                warn!(%error, "failed to clean skill-source tokens after staging error");
+            }
+        }
+        result
     }
 
     pub(crate) async fn skill_source_credentials(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
@@ -477,6 +484,7 @@ impl SkillBundle {
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
             String::new(),
             String::new(),
+            config_base.join("skill-source-cache").to_string_lossy().into_owned(),
         ];
         for source in &inspection.sources {
             let token_file = source_token_files.get(&source.name).map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
@@ -511,7 +519,12 @@ fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
         .find_map(|line| line.strip_prefix(STAGE_DIAGNOSTIC_PREFIX))
         .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("skill staging command failed");
-    format!("stage generation-pinned skills for {environment_ref}: {reason}")
+    let details = stderr.trim();
+    if details.is_empty() {
+        format!("stage generation-pinned skills for {environment_ref}: {reason}")
+    } else {
+        format!("stage generation-pinned skills for {environment_ref}: {reason}\n{details}")
+    }
 }
 
 async fn remove_source_token_files(source_token_files: &BTreeMap<String, PathBuf>, runner: &dyn CommandRunner) -> Result<(), String> {
@@ -558,6 +571,8 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
                 || source.name.contains('\\')
                 || source.name.chars().any(|character| matches!(character, '\r' | '\n'))
                 || source.repository.is_empty()
+                || (source.repository.contains("://")
+                    && Url::parse(&source.repository).map_or(true, |url| !url.username().is_empty() || url.password().is_some()))
                 || source.credential.as_ref().is_some_and(|credential| {
                     credential.is_empty()
                         || credential.contains('/')
@@ -742,6 +757,7 @@ mod tests {
                 .args(&args)
                 .current_dir(cwd)
                 .env("PATH", &self.path)
+                .env("FLOTILLA_TEST_FETCH_LOG", self.config_base.parent().expect("config parent").join("fetches"))
                 .output()
                 .map_err(|error| format!("run {cmd}: {error}"))?;
             if output.status.success() {
@@ -792,6 +808,7 @@ case "$1" in
   -c|fetch)
     while [ "$1" = -c ]; do shift 2; done
     test "$1" = fetch
+    printf '%s\n' fetch >>"$FLOTILLA_TEST_FETCH_LOG"
     eval "revision=\${$#}"
     printf '%s' "$revision" >"$checkout/.git/FETCH_HEAD"
     ;;
@@ -997,7 +1014,7 @@ esac
         assert!(calls[0].1.contains(&"/tmp/skills-token".to_string()));
         assert!(calls[0].1[1].contains("fetch --quiet --depth=1 --filter=blob:none --no-tags"));
         assert!(calls[0].1[1].contains("credential.helper="), "public fetches must clear the project credential helper");
-        assert!(calls[0].1[1].contains("anonymous fetch failed"));
+        assert!(calls[0].1[1].contains("pinned revision does not exist"));
         assert!(calls[0].1[1].contains("init --quiet"));
         assert!(!calls[0].1[1].contains("2>&1"), "git failures must retain their stderr diagnostics");
         assert!(calls[0].1[1].contains("sparse-checkout set --no-cone --stdin"));
@@ -1010,27 +1027,25 @@ esac
     fn skill_stage_error_leads_with_declared_path_failure() {
         let stderr = "hint: Using 'master' as the name for the initial branch.\nFrom https://github.com/flotilla-org/cleat\n * branch 0f23944 -> FETCH_HEAD\nflotilla-stage-skills: skill source cleat declared path skills is missing at pinned revision 0f23944\n";
         let message = skill_stage_error("crew-work", stderr);
-        assert_eq!(
-            message,
+        assert!(message.starts_with(
             "stage generation-pinned skills for crew-work: skill source cleat declared path skills is missing at pinned revision 0f23944"
-        );
+        ));
+        assert!(message.contains("From https://github.com/flotilla-org/cleat"));
     }
 
     #[test]
     fn skill_stage_error_prefers_script_diagnostic_over_late_git_stderr() {
         let stderr = "fatal: early git failure\nflotilla-stage-skills: skill source missing-source anonymous fetch failed at pinned revision 0000000000000000000000000000000000000000\nfatal: git upload-pack: not our ref 0000000000000000000000000000000000000000\n";
-        assert_eq!(
-            skill_stage_error("crew-fetch", stderr),
-            "stage generation-pinned skills for crew-fetch: skill source missing-source anonymous fetch failed at pinned revision 0000000000000000000000000000000000000000"
-        );
+        let message = skill_stage_error("crew-fetch", stderr);
+        assert!(message.starts_with("stage generation-pinned skills for crew-fetch: skill source missing-source anonymous fetch failed"));
+        assert!(message.contains("fatal: git upload-pack: not our ref"));
     }
 
     #[test]
     fn skill_stage_error_uses_last_nonempty_line_without_script_diagnostic() {
-        assert_eq!(
-            skill_stage_error("crew-fetch", "fatal: early git failure\nfatal: final git failure\n"),
-            "stage generation-pinned skills for crew-fetch: fatal: final git failure"
-        );
+        let message = skill_stage_error("crew-fetch", "fatal: early git failure\nfatal: final git failure\n");
+        assert!(message.starts_with("stage generation-pinned skills for crew-fetch: fatal: final git failure"));
+        assert!(message.contains("fatal: early git failure"));
     }
 
     #[tokio::test]
@@ -1075,7 +1090,10 @@ esac
             assert!(!error.is_empty(), "fetch failure must produce a diagnostic");
             assert!(error.contains("missing-source"), "diagnostic must name the source: {error}");
             assert!(error.contains(revision), "diagnostic must name the pinned revision: {error}");
-            assert!(error.contains("fetch failed"), "diagnostic must identify the failed operation: {error}");
+            assert!(error.contains("pinned revision does not exist"), "absent revision must be terminal: {error}");
+            assert!(error.contains("command: git -C"), "diagnostic must name the Git command: {error}");
+            assert!(error.contains("exit code: 128"), "diagnostic must include Git's exit code: {error}");
+            assert!(error.contains("fatal:"), "diagnostic must retain Git stderr: {error}");
             if credentialed {
                 assert!(!token_file.exists(), "failed staging must remove the source token");
             }
@@ -1110,6 +1128,45 @@ esac
 
         assert!(destination.join("private-source/SKILL.md").is_file());
         assert!(!token_file.exists(), "one-shot source token must be cleaned after materialization");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_staging_reuses_one_pinned_fetch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(registry(temp.path()));
+        let runner = Arc::new(promisor_runner(temp.path()));
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]);
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("write manifest");
+        let token_file = temp.path().join("source.token");
+        std::fs::write(&token_file, "test-token").expect("write token");
+        let tokens = BTreeMap::from([("private-skills".to_string(), token_file)]);
+        let results = futures::future::join_all((0..4).map(|index| {
+            let destination = runner.config_base.join(format!("claude-{index}"));
+            let required = required.clone();
+            let registry = Arc::clone(&registry);
+            let runner = Arc::clone(&runner);
+            let tokens = tokens.clone();
+            tokio::spawn(async move {
+                registry
+                    .stage_skills(
+                        &format!("crew-{index}"),
+                        &required,
+                        &[("CLAUDE_CONFIG_DIR".to_string(), destination.to_string_lossy().into_owned())],
+                        &tokens,
+                        &*runner,
+                    )
+                    .await
+            })
+        }))
+        .await;
+        assert!(results.iter().all(|result| result.as_ref().is_ok_and(Result::is_ok)), "concurrent staging failed: {results:?}");
+        let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake fetch log");
+        assert_eq!(fetches.lines().count(), 1, "one fetch for the pinned source");
     }
 
     #[tokio::test]
