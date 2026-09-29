@@ -665,6 +665,7 @@ mod tests {
                     target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
                     refused_candidates: vec![],
                     viable_not_selected: vec![],
+                    allocation: None,
                 }),
                 ..ConvoyStatus::default()
             })
@@ -835,6 +836,7 @@ mod tests {
                     },
                     refused_candidates: vec![],
                     viable_not_selected: vec![],
+                    allocation: None,
                 }),
                 ..ConvoyStatus::default()
             })

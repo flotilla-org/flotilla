@@ -192,6 +192,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             }),
             evidence,
             source: StallEvidenceSource::LeafEngine,
+            cause: None,
             began_at: status.stalled.as_ref().map_or(now, |stalled| stalled.began_at),
             rung: StallRung::Operator,
             supervisor: None,

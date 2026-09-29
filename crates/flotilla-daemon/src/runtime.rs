@@ -1099,6 +1099,7 @@ async fn apply_agentless_ssh_observation(
         // never a heartbeat emitted by a daemon on the target host.
         heartbeat_at: probe_succeeded.then(Utc::now),
         ready,
+        sleeping_until: host.status.as_ref().and_then(|status| status.sleeping_until),
         disk_free_bytes: free_bytes,
         admission_free_space_floor_bytes: Some(daemon.admission_free_space_floor_bytes()?),
         conditions,
@@ -2206,6 +2207,7 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             Ok(existing) => {
                 let mut updated = spec.clone();
                 updated.grants = existing.spec.grants.clone();
+                updated.cost_class = existing.spec.cost_class;
                 // Platform is a host fact. Correct an initial local-OS
                 // registration when an agentless SSH host reports its own OS.
                 updated.grants.retain(|grant| !matches!(grant, flotilla_resources::FulfilmentGrant::Platform(_)));
@@ -3066,6 +3068,7 @@ async fn apply_host_heartbeat_with_credentials(
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Some(Utc::now()),
         ready: !conditions.iter().any(HostCondition::blocks_readiness),
+        sleeping_until: host.status.as_ref().and_then(|status| status.sleeping_until),
         resource_store,
         blob_sync: host.status.as_ref().and_then(|status| status.blob_sync.clone()),
         daemon_generation: health.generation.clone(),
@@ -3458,6 +3461,7 @@ fn spawn_controller_loops(
                 (
                     secondaries,
                     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(&namespace_string))
+                        .with_hosts(backend.including_replicas::<Host>(&namespace_string))
                         .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                         .with_federated_vessels(backend.including_replicas::<Vessel>(&namespace_string))
                         .with_terminal_sessions(backend.clone().using::<TerminalSession>(&namespace_string))
@@ -5050,6 +5054,7 @@ mod tests {
                 .create(&empty_meta(name), &FulfilmentKindSpec {
                     host_ref: "host".to_string(),
                     pool: "test".to_string(),
+                    cost_class: Default::default(),
                     grants,
                     realisation: FulfilmentRealisation::HostDirect,
                 })
@@ -8826,6 +8831,7 @@ mod tests {
                     },
                     refused_candidates: Vec::new(),
                     viable_not_selected: Vec::new(),
+                    allocation: None,
                 }),
                 ..ConvoyStatus::default()
             })

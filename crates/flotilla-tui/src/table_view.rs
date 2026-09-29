@@ -1608,6 +1608,7 @@ mod tests {
                 },
                 reason: "priority 0 is lower than selected policy `host-direct-kiwi` priority 100".into(),
             }],
+            allocation: None,
         };
         let mut vessel = vessel("implement", &[], WorkPhase::Running);
         vessel.placement_decision = Some(decision.clone());

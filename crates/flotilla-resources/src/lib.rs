@@ -76,8 +76,8 @@ pub use convoy::{
     ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim,
     CrewWorkPhase, CrewWorkState, DeclaredSubject, DiscoveredSubject, InputValue, InstantiatedExit, InstantiatedExitEntry,
     InstantiatedTurnDelivery, IssueSnapshot, LeafMaker, LifecycleMutation, PendingBrief, PlacementStatus, ReconcileOutcome,
-    SettlementEvaluation, SettlementMode, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition,
-    SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
+    SettlementEvaluation, SettlementMode, StallCause, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor,
+    StalledCondition, SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
     TurnDeliveryStatus, UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
     PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
@@ -104,7 +104,7 @@ pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DE
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
-pub use fulfilment_kind::{FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
+pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
 pub use host::{
     canonical_host_id, CachedModelProbe, CredentialExpiry, FulfilmentFacts, HarnessFacts, Host, HostCondition, HostConnection, HostSpec,
     HostStatus, HostStatusPatch, ModelFact, ModelFactSource, ModelProbeState, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,

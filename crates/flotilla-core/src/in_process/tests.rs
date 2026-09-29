@@ -15,6 +15,141 @@ use flotilla_resources::{
 };
 
 use super::*;
+
+#[test]
+fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
+    let now = chrono::Utc::now();
+    let needs = BTreeSet::new();
+    let placement_tiebreak = PlacementTieBreak { needs: &needs, now };
+    let candidate = |name: &str, cost_class, ready, sleeping_until, slots| {
+        let metadata = flotilla_resources::ObjectMeta {
+            name: name.to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: now,
+            merge: None,
+        };
+        let policy = ResourceObject::<PlacementPolicy> {
+            metadata: metadata.clone(),
+            spec: PlacementPolicySpec::builder()
+                .pool("test".to_string())
+                .priority(0)
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: "host".to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+            status: None,
+        };
+        KindCandidate {
+            kind: ResourceObject::<FulfilmentKind> {
+                metadata,
+                spec: FulfilmentKindSpec::builder()
+                    .host_ref("host".to_string())
+                    .pool("test".to_string())
+                    .cost_class(cost_class)
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+                status: None,
+            },
+            placement: PlacementResolution {
+                selected: Some(policy),
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+                allocation: None,
+            },
+            free_slots: slots,
+            host_ready: ready,
+            sleeping_until,
+        }
+    };
+    let cases = [
+        (
+            "owned available beats metered",
+            (true, None, Some(1), FulfilmentCostClass::OwnedIdle),
+            (true, None, Some(1), FulfilmentCostClass::Metered),
+            true,
+        ),
+        (
+            "available metered beats full owned",
+            (true, None, Some(0), FulfilmentCostClass::OwnedIdle),
+            (true, None, Some(1), FulfilmentCostClass::Metered),
+            false,
+        ),
+        (
+            "awake beats sleeping",
+            (true, Some(now + ChronoDuration::hours(1)), Some(1), FulfilmentCostClass::OwnedIdle),
+            (true, None, Some(1), FulfilmentCostClass::Metered),
+            false,
+        ),
+        (
+            "ready beats unready",
+            (false, None, Some(1), FulfilmentCostClass::OwnedIdle),
+            (true, None, Some(1), FulfilmentCostClass::SubscriptionIncluded),
+            false,
+        ),
+        (
+            "subscription beats metered",
+            (true, None, None, FulfilmentCostClass::SubscriptionIncluded),
+            (true, None, None, FulfilmentCostClass::Metered),
+            true,
+        ),
+    ];
+    for (label, left, right, left_wins) in cases {
+        let left = candidate("left", left.3, left.0, left.1, left.2);
+        let right = candidate("right", right.3, right.0, right.1, right.2);
+        assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
+    }
+}
+
+#[test]
+fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
+    let now = chrono::Utc::now();
+    for platform in ["macos", "windows"] {
+        let kind = ResourceObject::<FulfilmentKind> {
+            metadata: flotilla_resources::ObjectMeta {
+                name: platform.to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: now,
+                merge: None,
+            },
+            spec: FulfilmentKindSpec::builder()
+                .host_ref("host".to_string())
+                .pool("test".to_string())
+                .grants(BTreeSet::from([FulfilmentGrant::Platform(platform.to_string())]))
+                .realisation(FulfilmentRealisation::HostDirect)
+                .build(),
+            status: None,
+        };
+        let candidate = KindCandidate {
+            kind,
+            placement: PlacementResolution {
+                selected: None,
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+                allocation: None,
+            },
+            free_slots: Some(1),
+            host_ready: true,
+            sleeping_until: None,
+        };
+        let no_need = BTreeSet::new();
+        assert!(PlacementTieBreak { needs: &no_need, now }.reserved(&candidate));
+        let named = BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]);
+        assert!(!PlacementTieBreak { needs: &named, now }.reserved(&candidate));
+    }
+}
 use crate::providers::{
     discovery::test_support::{
         fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_runner, FakeChangeRequest, FakeDiscoveryProviders,
@@ -3960,6 +4095,7 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
                 },
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
+                allocation: None,
             }),
         )
         .await
@@ -4042,6 +4178,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
                 target_host: target,
                 refused_candidates: Vec::new(),
                 viable_not_selected: Vec::new(),
+                allocation: None,
             }),
         )
         .await
@@ -4174,7 +4311,7 @@ async fn default_remote_placement_routes_before_admission() {
         .await
         .expect("resolve replicated credential grant");
     assert_eq!(resolved_workflow.vessels[0].credential_refs, BTreeSet::from(["claude-max".to_string()]));
-    validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement))
+    validate_workflow_agent_adapters(&backend, "flotilla", &resolved_workflow, Some(&placement), false)
         .await
         .expect("placement should provide agent adapter");
     validate_workflow_credentials(&backend, "flotilla", &resolved_workflow, Some(&placement))
@@ -4783,7 +4920,7 @@ async fn docker_placement_refuses_hosts_missing_runtime_or_linux_before_selectio
 
         for policy in [Some("docker-kiwi"), None] {
             let error = daemon
-                .resolve_convoy_placement("flotilla", None, &[], &workflow, policy)
+                .resolve_convoy_placement("flotilla", None, &[], &workflow, policy, false)
                 .await
                 .expect_err("ineligible host must refuse admission");
             assert!(error.contains("host `kiwi`"), "{error}");
@@ -5296,21 +5433,21 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
     policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("reference baseline");
     let workflow = WorkflowTemplateSpec::builder().vessels(Vec::new()).build();
     let error = daemon
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"))
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false)
         .await
         .expect_err("missing baseline must fail");
     assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
     let error = daemon
-        .resolve_convoy_placement("flotilla", None, &[], &workflow, None)
+        .resolve_convoy_placement("flotilla", None, &[], &workflow, None, false)
         .await
         .expect_err("default selection must reject missing baseline");
     assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
     let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
     baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
-    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy")).await.expect("admit");
+    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("admit");
     baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string() }).await.expect("bump");
     assert_eq!(admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v1"));
-    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy")).await.expect("next admission");
+    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("next admission");
     assert_eq!(next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v2"));
 }
 

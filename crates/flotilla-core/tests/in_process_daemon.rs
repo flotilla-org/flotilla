@@ -52,10 +52,10 @@ use flotilla_resources::{
     single_agent_shepherd_workflow_spec, single_agent_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
     CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy, ConvoyPhase, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
-    HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
+    CredentialSpecSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentFacts, FulfilmentGrant, FulfilmentKind,
+    FulfilmentKindSpec, HarnessFacts, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, ModelFact, ModelFactSource, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositoryKey, RepositoryRelation,
     RepositorySpec, ResourceBackend, ResourceError, SqliteBackend, Stance, TerminalAttention, TerminalAttentionSource,
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     TerminalSessionStatusPatch, TypedResolver, WatchEvent, WatchStart, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
@@ -2272,6 +2272,72 @@ async fn capability_placement_prefers_docker_and_records_pinned_escalation() {
 }
 
 #[tokio::test]
+async fn capability_admission_queues_on_sleeping_minimal_host() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-sleeping", "sleeping-host", 0, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("sleeping-host").await.expect("host");
+    let mut status = host.status.expect("host status");
+    status.ready = false;
+    status.sleeping_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+    hosts.update_status("sleeping-host", &host.metadata.resource_version, &status).await.expect("sleeping host");
+
+    let result = start_capability_convoy(&daemon, "sleeping-capacity", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+    })
+    .await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let convoy = admitted_convoy(&backend, "sleeping-capacity").await;
+    let decision = convoy.status.expect("status").placement_decision.expect("placement");
+    assert_eq!(decision.policy_name, "host-direct-sleeping");
+    let allocation = decision.allocation.expect("frozen allocation");
+    let selected = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("candidate");
+    assert!(!selected.available);
+    assert!(selected.sleeping_until.is_some());
+}
+
+#[tokio::test]
+async fn capability_admission_reserves_macos_for_explicit_platform_needs() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
+    let kinds = backend.using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get("macos-scarce").await.expect("macOS kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
+
+    let refused = start_capability_convoy(&daemon, "reserved-unpinned", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+    })
+    .await;
+    assert!(matches!(&refused, CommandValue::Error { message } if message.contains("reserved macOS or Windows capacity")), "{refused:?}");
+
+    let pinned = start_capability_convoy(&daemon, "reserved-pinned", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+        intent.placement_policy = Some("macos-scarce".to_string());
+    })
+    .await;
+    assert!(matches!(&pinned, CommandValue::Error { message } if message.contains("--escalation-reason")), "{pinned:?}");
+
+    let escalated = start_capability_convoy(&daemon, "reserved-escalated", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+        intent.placement_policy = Some("macos-scarce".to_string());
+        intent.escalation_reason = Some("operator needs this host".to_string());
+    })
+    .await;
+    assert!(matches!(escalated, CommandValue::ConvoyStarted { .. }), "{escalated:?}");
+    let convoy = admitted_convoy(&backend, "reserved-escalated").await;
+    let allocation = convoy.status.expect("status").placement_decision.expect("placement").allocation.expect("allocation");
+    assert_eq!(allocation.chosen_kind, "macos-scarce");
+    assert!(allocation.candidates.iter().any(|candidate| candidate.kind == "macos-scarce" && candidate.reserved_for_platform));
+}
+
+#[tokio::test]
 async fn capability_placement_selects_each_vessel_from_its_own_role_needs() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
@@ -2439,6 +2505,7 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "direct-linux", "host-linux", 0, BTreeSet::new()).await;
     create_test_host_direct_policy(&backend, "direct-macos", "host-macos", 0, BTreeSet::new()).await;
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("direct-macos").await.expect("kind");

@@ -1151,6 +1151,7 @@ impl ReconcilerWake {
                     maker,
                     evidence,
                     source,
+                    cause: None,
                     began_at: prior.map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
                     supervisor: None,

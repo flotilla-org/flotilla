@@ -30,14 +30,14 @@ use flotilla_protocol::{
     ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger,
     ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement,
-    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
-    HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal,
-    NodeId, NodeInfo, PeerConnectionState, PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate,
-    PrincipalRef, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta,
-    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor,
-    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, ResourceRef,
-    StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentHarness,
+    FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary,
+    ResolvedAttachAction, ResolvedAttachPlan, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
+    ResourceRecordProvenance, ResourceRecordType, ResourceRef, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, TopologyResponse,
+    TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
@@ -55,7 +55,7 @@ use flotilla_resources::{
     ConvoyStatus, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim,
     CrewCompletionPending, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition,
     DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding,
-    Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
+    Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
@@ -1448,28 +1448,51 @@ struct PlacementResolution {
     selected: Option<ResourceObject<PlacementPolicy>>,
     refused_candidates: Vec<PlacementRefusal>,
     viable_not_selected: Vec<PlacementViableCandidate>,
+    allocation: Option<FulfilmentAllocation>,
 }
 
 struct KindCandidate {
     kind: ResourceObject<FulfilmentKind>,
     placement: PlacementResolution,
     free_slots: Option<u32>,
+    host_ready: bool,
+    sleeping_until: Option<DateTime<Utc>>,
 }
 
-/// Slice D can replace this ordering without changing capability matching.
 trait FulfilmentDecider {
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering;
 }
 
-struct StaticFulfilmentDecider;
+struct PlacementTieBreak<'a> {
+    needs: &'a BTreeSet<CapabilityNeed>,
+    now: DateTime<Utc>,
+}
 
-impl FulfilmentDecider for StaticFulfilmentDecider {
+impl PlacementTieBreak<'_> {
+    fn reserved(&self, candidate: &KindCandidate) -> bool {
+        candidate.kind.spec.grants.iter().any(|grant| {
+            matches!(grant, FulfilmentGrant::Platform(platform) if matches!(platform.as_str(), "macos" | "windows"))
+                && !self
+                    .needs
+                    .iter()
+                    .any(|need| matches!(need, CapabilityNeed::Platform(need_platform) if grant == &FulfilmentGrant::Platform(need_platform.clone())))
+        })
+    }
+
+    fn available(&self, candidate: &KindCandidate) -> bool {
+        candidate.host_ready
+            && candidate.sleeping_until.is_none_or(|until| until <= self.now)
+            && candidate.free_slots.is_none_or(|slots| slots > 0)
+    }
+}
+
+impl FulfilmentDecider for PlacementTieBreak<'_> {
     fn compare(&self, left: &KindCandidate, right: &KindCandidate) -> std::cmp::Ordering {
         let key = |candidate: &KindCandidate| {
             let policy = candidate.placement.selected.as_ref().expect("candidate has a validated placement policy");
             (
-                candidate.free_slots.is_none_or(|slots| slots == 0),
-                !matches!(candidate.kind.spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }),
+                !self.available(candidate),
+                candidate.kind.spec.cost_class,
                 Reverse(policy.spec.priority),
                 candidate.kind.metadata.name.clone(),
             )
@@ -1650,7 +1673,12 @@ async fn default_convoy_placement_policy(
         Ok(list) => home_copy_wins_by_name(list.items),
         Err(err) => {
             warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
-            return Ok(PlacementResolution { selected: None, refused_candidates: Vec::new(), viable_not_selected: Vec::new() });
+            return Ok(PlacementResolution {
+                selected: None,
+                refused_candidates: Vec::new(),
+                viable_not_selected: Vec::new(),
+                allocation: None,
+            });
         }
     };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
@@ -1660,12 +1688,12 @@ async fn default_convoy_placement_policy(
     for policy in policies {
         let mut candidate_workflow = workflow.clone();
         let agentless_ssh = policy_targets_agentless_ssh(backend, namespace, &policy).await;
-        let agentless_unready = if agentless_ssh { placement_agent_adapters(backend, namespace, &policy).await.err() } else { None };
+        let agentless_unready = if agentless_ssh { placement_agent_adapters(backend, namespace, &policy, false).await.err() } else { None };
         let refusal = if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
             Some(reason)
         } else if let Some(reason) = agentless_unready {
             Some(reason)
-        } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await {
+        } else if let Err(reason) = validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy), false).await {
             Some(reason)
         } else {
             resolve_and_validate_workflow_credentials(backend, namespace, project_ref, repositories, Some(&policy), &mut candidate_workflow)
@@ -1716,7 +1744,7 @@ async fn default_convoy_placement_policy(
             let reason = placement_ordering_reason(&selected, &selected_target, &policy, &target_host, local_host_ref);
             viable_not_selected.push(PlacementViableCandidate { policy_name: policy.metadata.name.clone(), target_host, reason });
         }
-        return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected });
+        return Ok(PlacementResolution { selected: Some(selected), refused_candidates, viable_not_selected, allocation: None });
     }
 
     let required_adapters = required_workflow_agent_adapters(workflow)?;
@@ -1741,7 +1769,7 @@ async fn default_convoy_placement_policy(
     if candidate_names.is_empty() {
         warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
     }
-    Ok(PlacementResolution { selected: None, refused_candidates, viable_not_selected: Vec::new() })
+    Ok(PlacementResolution { selected: None, refused_candidates, viable_not_selected: Vec::new(), allocation: None })
 }
 
 fn placement_ordering_reason(
@@ -4414,7 +4442,8 @@ impl InProcessDaemon {
         let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref, None).await?;
         let (_, mut workflow) =
             self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent).await?;
-        let placement = self.resolve_convoy_placement(&project_namespace, Some(&project_ref), &repositories, &workflow, None).await?;
+        let placement =
+            self.resolve_convoy_placement(&project_namespace, Some(&project_ref), &repositories, &workflow, None, false).await?;
         resolve_and_validate_workflow_credentials(
             &self.resource_backend,
             &project_namespace,
@@ -5537,12 +5566,13 @@ async fn validate_workflow_agent_adapters(
     namespace: &str,
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
+    allow_unready: bool,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
     // Resolve each candidate's image once, even for tool-only workflows.
     let capabilities = match placement {
         Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
-            Some(placement_agent_adapters(backend, namespace, policy).await?)
+            Some(placement_agent_adapters(backend, namespace, policy, allow_unready).await?)
         }
         _ => None,
     };
@@ -5702,6 +5732,19 @@ async fn resolve_and_validate_workflow_credentials(
     validate_workflow_credentials(backend, namespace, workflow, placement).await
 }
 
+async fn resolve_and_validate_workflow_credentials_for_capability_admission(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: Option<&str>,
+    repositories: &[ConvoyRepositorySpec],
+    placement: Option<&ResourceObject<PlacementPolicy>>,
+    workflow: &mut WorkflowTemplateSpec,
+) -> Result<(), String> {
+    resolve_workflow_credentials(backend, namespace, project_ref, repositories, workflow).await?;
+    validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, &CapabilityTable::seeded(), true)
+        .await
+}
+
 async fn validate_workflow_credentials(
     backend: &ResourceBackend,
     namespace: &str,
@@ -5717,6 +5760,17 @@ async fn validate_workflow_credentials_with_capabilities(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
     capabilities: &CapabilityTable,
+) -> Result<(), String> {
+    validate_workflow_credentials_with_capabilities_for_admission(backend, namespace, workflow, placement, capabilities, false).await
+}
+
+async fn validate_workflow_credentials_with_capabilities_for_admission(
+    backend: &ResourceBackend,
+    namespace: &str,
+    workflow: &WorkflowTemplateSpec,
+    placement: Option<&ResourceObject<PlacementPolicy>>,
+    capabilities: &CapabilityTable,
+    allow_unready: bool,
 ) -> Result<(), String> {
     let specs = backend
         .including_replicas::<CredentialSpec>(namespace)
@@ -5791,7 +5845,7 @@ async fn validate_workflow_credentials_with_capabilities(
     };
     status.apply_heartbeat_readiness(Utc::now());
     if !required.is_empty() {
-        if !status.ready {
+        if !status.ready && !allow_unready {
             return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let held = status.held_credentials().map_err(|error| {
@@ -5938,6 +5992,7 @@ async fn placement_agent_adapters(
     backend: &ResourceBackend,
     namespace: &str,
     placement: &ResourceObject<PlacementPolicy>,
+    allow_unready: bool,
 ) -> Result<(BTreeSet<String>, String), String> {
     if let Some(docker) = &placement.spec.docker_per_vessel {
         let image = docker.image.resolve(&backend.definitions(namespace)).await?;
@@ -5951,7 +6006,7 @@ async fn placement_agent_adapters(
             format!("placement `{}` host `{host_label}` generation `{generation}` has no observed status", placement.metadata.name)
         })?;
         status.apply_heartbeat_readiness(Utc::now());
-        if !status.ready {
+        if !status.ready && !allow_unready {
             return Err(placement_host_not_ready_reason(&placement.metadata.name, &host_label, &generation, &status));
         }
         let available_adapters = status.agent_adapters().map_err(|error| {
@@ -6290,11 +6345,13 @@ impl InProcessDaemon {
                 return Err(format!("no fulfilment kind covers role need `{need}`"));
             }
             return self
-                .resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, pin)
+                .resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, pin, false)
                 .await
                 .map(|placement| (placement, Vec::new()));
         }
-        let hosts = self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
+        let hosts = home_copy_wins_by_name(
+            self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?.items,
+        );
         if let Some(pin) = pin {
             if !kinds.iter().any(|kind| kind.metadata.name == pin) {
                 return Err(format!("fulfilment kind `{pin}` does not exist"));
@@ -6303,9 +6360,8 @@ impl InProcessDaemon {
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
         for kind in kinds {
-            let host = hosts.items.iter().find(|host| host.object.metadata.name == kind.spec.host_ref);
-            let facts =
-                host.and_then(|host| host.object.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
+            let host = hosts.iter().find(|host| host.metadata.name == kind.spec.host_ref);
+            let facts = host.and_then(|host| host.status.as_ref()).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
             let structurally_missing = needs
                 .iter()
                 .filter(|need| match need {
@@ -6339,7 +6395,8 @@ impl InProcessDaemon {
                 ));
                 continue;
             }
-            match self.resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, Some(&kind.metadata.name)).await {
+            match self.resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, Some(&kind.metadata.name), true).await
+            {
                 Ok(placement) => {
                     let policy = placement.selected.as_ref().expect("pinned placement has a policy");
                     let realization_matches = match (&kind.spec.realisation, &policy.spec.docker_per_vessel, &policy.spec.host_direct) {
@@ -6357,7 +6414,13 @@ impl InProcessDaemon {
                         continue;
                     }
                     let free_slots = facts.and_then(|facts| facts.free_vessel_slots);
-                    candidates.push(KindCandidate { kind, placement, free_slots });
+                    let host_ready = host.and_then(|host| host.status.as_ref()).is_some_and(|status| {
+                        let mut status = status.clone();
+                        status.apply_heartbeat_readiness(self.clock.now());
+                        status.ready
+                    });
+                    let sleeping_until = host.and_then(|host| host.status.as_ref()).and_then(|status| status.sleeping_until);
+                    candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until });
                 }
                 Err(error) => rejected.push(format!("{}: {error}", kind.metadata.name)),
             }
@@ -6370,6 +6433,16 @@ impl InProcessDaemon {
                 .flat_map(|crew| crew.needs.iter().map(move |need| format!("role {} need `{need}`", crew.role)))
                 .collect::<Vec<_>>();
             return Err(format!("no fulfilment kind covers {}; candidates: {}", role_needs.join(", "), rejected.join("; ")));
+        }
+        let placement_tiebreak = PlacementTieBreak { needs, now: self.clock.now() };
+        // A scarce platform is not a fallback for work that did not ask for it.
+        // Pins still require an explicit escalation reason through the normal path.
+        let mut reserved = Vec::new();
+        if pin.is_none() {
+            (candidates, reserved) = candidates.into_iter().partition(|candidate| !placement_tiebreak.reserved(candidate));
+            if candidates.is_empty() {
+                return Err("no fulfilment kind covers needs without consuming reserved macOS or Windows capacity".to_string());
+            }
         }
         let minimal = candidates
             .iter()
@@ -6384,7 +6457,7 @@ impl InProcessDaemon {
             })
             .map(|candidate| candidate.kind.metadata.name.clone())
             .collect::<BTreeSet<_>>();
-        candidates.sort_by(|left, right| StaticFulfilmentDecider.compare(left, right));
+        candidates.sort_by(|left, right| placement_tiebreak.compare(left, right));
         let index = match pin {
             Some(pin) => candidates
                 .iter()
@@ -6392,7 +6465,37 @@ impl InProcessDaemon {
                 .ok_or_else(|| format!("pinned fulfilment `{pin}` cannot cover vessel needs; candidates: {}", rejected.join("; ")))?,
             None => candidates.iter().position(|candidate| minimal.contains(&candidate.kind.metadata.name)).expect("nonempty minimal set"),
         };
+        let chosen_kind = candidates[index].kind.metadata.name.clone();
+        let allocation = FulfilmentAllocation {
+            chosen_kind,
+            candidates: candidates
+                .iter()
+                .chain(reserved.iter())
+                .map(|candidate| FulfilmentAllocationCandidate {
+                    kind: candidate.kind.metadata.name.clone(),
+                    host: candidate.kind.spec.host_ref.clone(),
+                    cost_class: match candidate.kind.spec.cost_class {
+                        FulfilmentCostClass::OwnedIdle => "owned_idle",
+                        FulfilmentCostClass::SubscriptionIncluded => "subscription_included",
+                        FulfilmentCostClass::Metered => "metered",
+                    }
+                    .to_string(),
+                    host_ready: candidate.host_ready,
+                    sleeping_until: candidate.sleeping_until,
+                    free_vessel_slots: candidate.free_slots,
+                    reserved_for_platform: placement_tiebreak.reserved(candidate),
+                    minimal: minimal.contains(&candidate.kind.metadata.name),
+                    available: placement_tiebreak.available(candidate),
+                })
+                .collect(),
+        };
         let mut selected = candidates.remove(index);
+        if placement_tiebreak.reserved(&selected) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
+            return Err(format!(
+                "fulfilment `{}` reserves scarce platform capacity; supply --escalation-reason to pin it for work without a platform need",
+                selected.kind.metadata.name
+            ));
+        }
         if !minimal.contains(&selected.kind.metadata.name) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
             return Err(format!(
                 "fulfilment `{}` exceeds minimal alternatives {}; supply --escalation-reason",
@@ -6411,6 +6514,7 @@ impl InProcessDaemon {
                     .to_string(),
             });
         }
+        selected.placement.allocation = Some(allocation);
         Ok((selected.placement, alternatives))
     }
 
@@ -6612,7 +6716,7 @@ impl InProcessDaemon {
                             ));
                         }
                     };
-                resolve_and_validate_workflow_credentials(
+                resolve_and_validate_workflow_credentials_for_capability_admission(
                     &self.resource_backend,
                     namespace,
                     Some(project_ref),
@@ -6630,6 +6734,7 @@ impl InProcessDaemon {
                         target_host: placement_target_host(&self.resource_backend, namespace, selected).await?,
                         refused_candidates: resolution.refused_candidates.clone(),
                         viable_not_selected: resolution.viable_not_selected.clone(),
+                        allocation: resolution.allocation.clone(),
                     };
                     vessel_placements.insert(vessel.name.clone(), (selected.spec.clone(), decision));
                 }
@@ -6643,15 +6748,27 @@ impl InProcessDaemon {
             let needs = workflow.vessels.iter().flat_map(|vessel| vessel.crew.iter()).flat_map(|crew| crew.needs.iter().cloned()).collect();
             let result =
                 self.resolve_capability_placement(namespace, project_ref, &repositories_snapshot, &workflow, &needs, intent).await?;
-            resolve_and_validate_workflow_credentials(
-                &self.resource_backend,
-                namespace,
-                Some(project_ref),
-                &repositories_snapshot,
-                result.0.selected.as_ref(),
-                &mut workflow,
-            )
-            .await?;
+            if has_kinds {
+                resolve_and_validate_workflow_credentials_for_capability_admission(
+                    &self.resource_backend,
+                    namespace,
+                    Some(project_ref),
+                    &repositories_snapshot,
+                    result.0.selected.as_ref(),
+                    &mut workflow,
+                )
+                .await?;
+            } else {
+                resolve_and_validate_workflow_credentials(
+                    &self.resource_backend,
+                    namespace,
+                    Some(project_ref),
+                    &repositories_snapshot,
+                    result.0.selected.as_ref(),
+                    &mut workflow,
+                )
+                .await?;
+            }
             result
         };
         refresh_crossed_handoffs(&mut workflow);
@@ -6667,6 +6784,7 @@ impl InProcessDaemon {
                 target_host: placement_target_host(&self.resource_backend, namespace, selected).await?,
                 refused_candidates: placement.refused_candidates,
                 viable_not_selected: placement.viable_not_selected,
+                allocation: placement.allocation,
             }),
             None => None,
         };
@@ -7902,6 +8020,7 @@ impl InProcessDaemon {
         repositories: &[ConvoyRepositorySpec],
         workflow: &WorkflowTemplateSpec,
         placement_policy: Option<&str>,
+        allow_unready: bool,
     ) -> Result<PlacementResolution, String> {
         let mut placement = match placement_policy {
             Some(policy) => {
@@ -7915,7 +8034,12 @@ impl InProcessDaemon {
                     .map(|source| source.object)
                     .map_err(|error| format!("placement policy {policy}: {error}"))?;
                 validate_docker_placement_host(&self.resource_backend, namespace, &resolved).await?;
-                PlacementResolution { selected: Some(resolved), refused_candidates: Vec::new(), viable_not_selected: Vec::new() }
+                PlacementResolution {
+                    selected: Some(resolved),
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                    allocation: None,
+                }
             }
             None => {
                 let local_host_id = self.canonical_local_host_id();
@@ -7943,7 +8067,7 @@ impl InProcessDaemon {
         if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
             docker.image = docker.image.resolve(&self.resource_backend.definitions(namespace)).await?.into();
         }
-        validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.selected.as_ref()).await?;
+        validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
         Ok(placement)
     }
 
@@ -13074,7 +13198,14 @@ impl InProcessDaemon {
                 adopted_checkout_refs.insert(repo_ref, checkout_ref);
             }
             let placement = match self
-                .resolve_convoy_placement(&namespace, project_ref.as_deref(), &repositories, &workflow.spec, placement_policy.as_deref())
+                .resolve_convoy_placement(
+                    &namespace,
+                    project_ref.as_deref(),
+                    &repositories,
+                    &workflow.spec,
+                    placement_policy.as_deref(),
+                    false,
+                )
                 .await
             {
                 Ok(placement) => placement,
@@ -13117,6 +13248,7 @@ impl InProcessDaemon {
                         target_host,
                         refused_candidates: placement.refused_candidates,
                         viable_not_selected: placement.viable_not_selected,
+                        allocation: placement.allocation,
                     }),
                     Err(message) => {
                         let _ = self.event_tx.send(DaemonEvent::CommandFinished {
