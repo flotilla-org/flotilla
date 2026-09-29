@@ -67,6 +67,11 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
         unclaimed_work: vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "turn_idle".into() }],
+        artifacts: vec![flotilla_protocol::ExplainedArtifact {
+            kind: "explainer".into(),
+            address: "artifact/example".into(),
+            view_url: Some("https://artifacts.example.test/fleet/digest".into()),
+        }],
         decision_ledgers: vec![
             ExplainedDecisionLedger {
                 vessel: "work".into(),
@@ -117,6 +122,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     };
 
     let output = format_convoy_explanation_human(&explanation);
+    assert!(output.contains("Artifacts:\n  - explainer: artifact/example https://artifacts.example.test/fleet/digest"));
     assert!(
         output.contains("superseded claim at=2026-08-21T11:59:00Z comment=https://example.test/pull/1#prior message=first turn complete")
     );

@@ -1,5 +1,6 @@
 ---
 source: crates/flotilla-core/src/agent_adapter.rs
+assertion_line: 1105
 expression: content
 ---
 # Flotilla crew brief
@@ -21,6 +22,17 @@ Clone scratch repositories outside the vessel checkout (for example under a `mkt
 For a GitHub destination, use only the injected `gh` token-file wrapper with `$GITHUB_TOKEN_FILE` or an injected `GH_TOKEN` for GitHub API operations. Before checking PR/CI status or delivering, verify that `$GITHUB_TOKEN_FILE` names a nonempty file or `GH_TOKEN` is set, and that `gh auth status` succeeds. Never use unauthenticated or anonymous GitHub API requests or ambient human credentials. If the injected GitHub credentials are missing or rejected, fail the assignment with `flotilla crew fail --message '...'` instead of proceeding anonymously.
 Hand off to reviewer with `flotilla crew reviewer handoff --message '...'`.
 For assignments that change a repository, delivery is part of the assignment. The pull-request destination is the repository URL and target ref named in `## Work context`; the issue source may be a different forge. Inspect the existing remotes and push to the one whose URL matches that destination; never add or repoint a remote. Open a pull request that closes the issue (ready for review, never a draft), and shepherd it until all checks pass; if it is a draft for any reason, mark it ready once checks are green. For a GitHub destination, use the `pr-shepherd` skill to process reviews, check results, and conflicts. For a GitHub destination, apply the `in-vessel-review` label in the PR-create command itself so the opened event cannot start the repository's duplicate review bot; do not create the PR first and label it afterward. For a Forgejo destination, use the injected `FORGEJO_SERVER_URL`, `FORGEJO_API_URL`, `FORGEJO_USERNAME`, and `FORGEJO_TOKEN_FILE` values for API operations; Git is configured with a destination-scoped credential helper. Do not use `gh`, a GitHub-only shepherding helper, or ambient human credentials for Forgejo delivery. Use a shepherding tool only when it explicitly supports the destination forge; otherwise inspect the Forgejo PR, reviews, and checks through its API. If those credentials are unavailable or rejected, fail the assignment instead of delivering to another forge. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`. Run the applicable `flotilla crew complete` command as your final act so the convoy can enter landing.
+
+## Artifacts
+
+Use `flotilla artifact put --kind <kind> --about <subject> --summary key=value <path>` for durable crew work. The daemon reads the file, so pass a path rather than its contents. Prefer Markdown for prose; self-contained HTML is also accepted. Use `--about` for the exact subject (such as a commit or review round), and `--summary` for small scalar facts that workflow conditions can query, not a duplicate of the body.
+
+- `explainer`: human-readable explanation of a completed change.
+- `decision-ledger`: decisions made while carrying out the work.
+- `review-round`: one review verdict and its evidence.
+- `brief`: instructions or context handed to another crew.
+- `review-bundle`: durable review evidence collected across rounds.
+- `recording`, `test-report`, and `raw-test-output`: bulky supporting material with short retention; keep conclusions in prose artifacts.
 
 ## Decision ledger
 

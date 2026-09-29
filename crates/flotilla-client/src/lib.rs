@@ -173,16 +173,16 @@ impl SocketDaemon {
         summary: std::collections::BTreeMap<String, serde_json::Value>,
         media_type: String,
         source_path: std::path::PathBuf,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, String, Option<String>), String> {
         match into_success_response(self.request(Request::ArtifactPut { kind, subject, summary, media_type, source_path }).await?)? {
-            Response::ArtifactPut { address, digest } => Ok((address, digest)),
+            Response::ArtifactPut { address, digest, view_url } => Ok((address, digest, view_url)),
             other => Err(format!("unexpected artifact put response: {other:?}")),
         }
     }
 
-    pub async fn artifact_get(&self, reference: String, destination_path: std::path::PathBuf) -> Result<u64, String> {
+    pub async fn artifact_get(&self, reference: String, destination_path: std::path::PathBuf) -> Result<(u64, Option<String>), String> {
         match into_success_response(self.request(Request::ArtifactGet { reference, destination_path }).await?)? {
-            Response::ArtifactGet { size } => Ok(size),
+            Response::ArtifactGet { size, view_url } => Ok((size, view_url)),
             other => Err(format!("unexpected artifact get response: {other:?}")),
         }
     }

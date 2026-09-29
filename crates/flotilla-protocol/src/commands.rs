@@ -332,6 +332,8 @@ pub struct ConvoyExplanation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unclaimed_work: Vec<ExplainedUnclaimedWork>,
     pub decision_ledgers: Vec<ExplainedDecisionLedger>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ExplainedArtifact>,
     pub settlement: ExplainedSettlement,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<ExplainedEvent>,
@@ -345,6 +347,14 @@ pub struct ExplainedAllocation {
     pub roles: Vec<String>,
     pub reason: String,
     pub crossed_handoffs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedArtifact {
+    pub kind: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

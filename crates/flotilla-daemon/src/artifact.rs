@@ -71,7 +71,7 @@ pub struct SystemBriefArtifactWriter {
 #[async_trait]
 impl BriefArtifactWriter for SystemBriefArtifactWriter {
     async fn put_brief(&self, namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String> {
-        let digest = self.blobs.put(content).await?;
+        let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
         let name = artifact_record_name(convoy, role, "brief", subject);
         let resolver = self.backend.using::<Artifact>(namespace);
         let prior = match resolver.get(&name).await {
@@ -182,8 +182,8 @@ impl ArtifactService<'_> {
             }
         }
         let (digest, size) = match &input.body {
-            ArtifactBody::Bytes(bytes) => (self.blobs.put(bytes).await?, bytes.len() as u64),
-            ArtifactBody::File(path) => self.blobs.put_file(path).await?,
+            ArtifactBody::Bytes(bytes) => (self.blobs.put_with_media_type(bytes, &input.media_type).await?, bytes.len() as u64),
+            ArtifactBody::File(path) => self.blobs.put_file_with_media_type(path, &input.media_type).await?,
         };
         let name = artifact_record_name(&caller.convoy, &producer, &input.kind, &input.subject);
         let prior = match self.backend.including_replicas::<Artifact>(self.namespace).get(&name).await {
@@ -273,6 +273,20 @@ impl ArtifactService<'_> {
     pub async fn get_to_file(&self, reference: &str, path: &Path) -> Result<u64, String> {
         let digest = self.resolve_digest(reference).await?;
         self.blobs.get_file(&digest, path).await?.ok_or_else(|| format!("artifact blob {} is unavailable", digest.as_str()))
+    }
+
+    pub async fn artifact_for_reference(&self, reference: &str) -> Result<Option<ResourceObject<Artifact>>, String> {
+        if BlobDigest::parse(reference).is_ok() {
+            Ok(None)
+        } else {
+            let name = reference.strip_prefix("artifact/").unwrap_or(reference);
+            self.backend
+                .including_replicas::<Artifact>(self.namespace)
+                .get(name)
+                .await
+                .map(|item| Some(item.object))
+                .map_err(|error| error.to_string())
+        }
     }
 
     async fn resolve_digest(&self, reference: &str) -> Result<BlobDigest, String> {

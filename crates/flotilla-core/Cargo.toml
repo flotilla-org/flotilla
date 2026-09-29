@@ -33,6 +33,7 @@ minijinja = "2"
 serde_yml = "0.0.12"
 futures = "0.3"
 urlencoding = "2"
+url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gethostname = "1.1.0"
 sysinfo = "0.38.4"
