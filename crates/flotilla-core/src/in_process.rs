@@ -3,6 +3,8 @@
 //! `InProcessDaemon` owns repos, runs refresh loops, executes commands,
 //! and broadcasts events — all within the same process.
 
+#[path = "attach.rs"]
+mod attach;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -18,6 +20,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+pub use attach::ResolvedAttach;
+use attach::{AttachResolver, CachedFleetRows};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
@@ -484,223 +488,6 @@ fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
 
 fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
-}
-
-/// An attach resolution: the plan the CLI should execute, plus the
-/// structured binding it stamps onto its enclosing PM pane (#708).
-#[derive(Debug, Clone)]
-pub struct ResolvedAttach {
-    pub plan: ResolvedAttachPlan,
-    pub binding: Option<AttachBinding>,
-}
-
-fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> Vec<String> {
-    let mut refs = vec![session_name.to_string()];
-
-    let convoy = labels.get(CONVOY_LABEL);
-    let task = labels.get(VESSEL_LABEL);
-    let role = labels.get(ROLE_LABEL);
-    let vessel = labels.get(VESSEL_REF_LABEL);
-
-    if let Some(convoy) = convoy {
-        refs.push(convoy.clone());
-    }
-    if let Some(address) = convoy_address {
-        refs.push(address.to_string());
-        if let Some(task) = task {
-            refs.push(format!("{address}/{task}"));
-        }
-        if let (Some(task), Some(role)) = (task, role) {
-            refs.push(format!("{address}/{task}/{role}"));
-        }
-    }
-    if let Some(vessel) = vessel {
-        refs.push(vessel.clone());
-    }
-    if let (Some(convoy), Some(task)) = (convoy, task) {
-        refs.push(format!("{convoy}/{task}"));
-    }
-    if let (Some(convoy), Some(task), Some(role)) = (convoy, task, role) {
-        refs.push(format!("{convoy}/{task}/{role}"));
-    }
-    if let (Some(vessel), Some(role)) = (vessel, role) {
-        refs.push(format!("{vessel}/{role}"));
-    }
-    if let Some(role) = role {
-        refs.push(role.clone());
-    }
-
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
-fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> String {
-    if let Some(address) = convoy_address {
-        return format!("{} ({session_name})", address.replace('@', " @ "));
-    }
-    match (labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) {
-        (Some(convoy), Some(task), Some(role)) => format!("{convoy}/{task}/{role} ({session_name})"),
-        (Some(convoy), Some(task), None) => format!("{convoy}/{task} ({session_name})"),
-        (Some(convoy), None, Some(role)) => format!("{convoy}/{role} ({session_name})"),
-        (Some(convoy), None, None) => format!("{convoy} ({session_name})"),
-        _ => session_name.to_string(),
-    }
-}
-
-fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
-    let address = row.convoy.replace(" @ ", "@");
-    let mut refs = vec![address.clone(), row.vessel.clone(), row.crew.clone()];
-    if let Some(convoy_ref) = &row.convoy_ref {
-        refs.push(convoy_ref.clone());
-    }
-    if let Some(session) = &row.session {
-        refs.push(session.clone());
-    }
-    if row.crew != "-" {
-        refs.push(format!("{address}/{}", row.crew));
-        if let Some(convoy_ref) = &row.convoy_ref {
-            refs.push(format!("{convoy_ref}/{}", row.crew));
-        }
-        if let Some((_task, role)) = row.crew.rsplit_once('/') {
-            refs.push(role.to_string());
-        }
-    }
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
-fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
-    if row.crew == "-" {
-        format!("{} ({})", row.convoy, row.host)
-    } else {
-        format!("{}/{} ({})", row.convoy, row.crew, row.host)
-    }
-}
-
-enum AttachTarget {
-    Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
-    Replica { row: Box<FleetListRow> },
-    Checkout(Box<CheckoutRow>),
-}
-
-impl AttachTarget {
-    async fn resolve(
-        &self,
-        daemon: &InProcessDaemon,
-        reference: &str,
-        transient: bool,
-        seat: AttachMode,
-    ) -> Result<ResolvedAttach, String> {
-        match self {
-            Self::Local(session) => {
-                let (plan, host) = daemon.attach_plan_for_session(reference, session, seat).await?;
-                let labels = &session.metadata.labels;
-                let binding = AttachBinding::builder()
-                    .host(host)
-                    .namespace(session.metadata.namespace.clone())
-                    .session(session.metadata.name.clone())
-                    .maybe_convoy(labels.get(CONVOY_LABEL).cloned())
-                    .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
-                    .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
-                    .build();
-                Ok(ResolvedAttach { plan, binding: Some(binding) })
-            }
-            Self::Replica { row } => {
-                let plan = daemon.recursive_attach_plan_for_remote(&row.host, reference, seat).await?;
-                // Replica rows carry crew as "vessel/role" (or a bare role)
-                // and the owning host's namespace + session name, so
-                // cross-host panes stamp the full join key.
-                let (vessel, role) = match row.crew.split_once('/') {
-                    Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
-                    None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty() && role != "-")),
-                };
-                let binding = AttachBinding::builder()
-                    .host(row.host.clone())
-                    .namespace(row.namespace.clone())
-                    .maybe_session(row.session.clone())
-                    .maybe_convoy(row.convoy_ref.clone().or_else(|| Some(row.convoy.clone()).filter(|convoy| convoy != "-")))
-                    .maybe_vessel(vessel)
-                    .maybe_role(role)
-                    .build();
-                Ok(ResolvedAttach { plan, binding: Some(binding) })
-            }
-            Self::Checkout(row) => {
-                if !transient {
-                    return Err(format!("checkout '{}' is only available as a transient attach target", row.path));
-                }
-                let plan = if row.host == daemon.host_name {
-                    daemon.local_checkout_terminal_plan(row, seat).await?
-                } else {
-                    daemon.recursive_attach_plan_for_remote(&row.host, reference, seat).await?
-                };
-                Ok(ResolvedAttach { plan, binding: None })
-            }
-        }
-    }
-}
-
-struct AttachCandidate {
-    label: String,
-    references: Vec<String>,
-    host: HostName,
-    target: AttachTarget,
-}
-
-struct AttachCandidateIndex {
-    candidates: Vec<AttachCandidate>,
-    exact: HashMap<String, Vec<usize>>,
-}
-
-impl AttachCandidateIndex {
-    fn new(candidates: Vec<AttachCandidate>) -> Self {
-        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
-        for (index, candidate) in candidates.iter().enumerate() {
-            for reference in &candidate.references {
-                exact.entry(reference.clone()).or_default().push(index);
-            }
-        }
-        Self { candidates, exact }
-    }
-
-    async fn resolve(
-        &self,
-        daemon: &InProcessDaemon,
-        reference: &str,
-        host: Option<&HostName>,
-        transient: bool,
-        seat: AttachMode,
-    ) -> Result<ResolvedAttach, String> {
-        if reference.trim().is_empty() {
-            return Err("attach reference is required".to_string());
-        }
-
-        let mut matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
-            self.candidates
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| candidate.references.iter().any(|candidate_reference| candidate_reference.starts_with(reference)))
-                .map(|(index, _)| index)
-                .collect()
-        });
-        if let Some(host) = host {
-            matches.retain(|index| &self.candidates[*index].host == host);
-        }
-        match matches.as_slice() {
-            [] => match host {
-                Some(host) => Err(format!("no attach target matching '{reference}' on host '{host}'")),
-                None => Err(format!("no attach target matching '{reference}'")),
-            },
-            [index] => self.candidates[*index].target.resolve(daemon, reference, transient, seat).await,
-            _ => {
-                let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
-                labels.sort();
-                labels.dedup();
-                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
-            }
-        }
-    }
 }
 
 fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
@@ -11476,113 +11263,27 @@ impl InProcessDaemon {
         Ok((rows, observed_generation))
     }
 
+    fn attach_resolver(&self) -> AttachResolver<'_> {
+        AttachResolver {
+            resource_backend: &self.resource_backend,
+            observed_resource_backend: &self.observed_resource_backend,
+            aggregator_projection_state: &self.aggregator_projection_state,
+            config: &self.config,
+            host_registry: &self.host_registry,
+            environment_manager: &self.environment_manager,
+            discovery: &self.discovery,
+            local_environment_id: &self.local_environment_id,
+            host_name: &self.host_name,
+            namespace: &self.provisioning_namespace,
+            fleet_rows: Box::new(CachedFleetRows { config: &self.config, cache: &self.fleet_replica_cache }),
+            repository_keys_by_path: &self.repository_keys_by_path,
+            path_identities: &self.path_identities,
+            repos: &self.repos,
+        }
+    }
+
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_command_on_host_internal(reference, None).await
-    }
-
-    async fn attach_project_context(&self, selector: Option<&flotilla_protocol::RepoSelector>) -> Result<Option<String>, String> {
-        let Some(selector) = selector else {
-            return Ok(None);
-        };
-        let Ok(path) = self.resolve_repo_selector(selector).await else {
-            return Ok(None);
-        };
-        let Some(repository_key) = self.repository_keys_by_path.read().await.get(&path).cloned() else {
-            return Ok(None);
-        };
-        let namespace = self.provisioning_namespace().await;
-        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let mut matches = projects
-            .into_iter()
-            .filter(|project| project.spec.repositories.iter().any(|repository| repository.repo == repository_key))
-            .collect::<Vec<_>>();
-        let repository_key = repository_key.to_string();
-        let mut declaration_matches = matches
-            .iter()
-            .filter(|project| project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&repository_key))
-            .map(|project| project.metadata.name.clone())
-            .collect::<Vec<_>>();
-        declaration_matches.sort();
-        declaration_matches.dedup();
-        if let [project] = declaration_matches.as_slice() {
-            return Ok(Some(project.clone()));
-        }
-        matches.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-        matches.dedup_by(|left, right| left.metadata.name == right.metadata.name);
-        Ok(matches.as_slice().first().filter(|_| matches.len() == 1).map(|project| project.metadata.name.clone()))
-    }
-
-    async fn resolve_live_convoy_record(&self, reference: &str, project_context: Option<&str>) -> Result<Option<LiveConvoyRecord>, String> {
-        let explicit = reference.contains('@');
-        let requested = if explicit {
-            Some(RoleAddress::from_str(reference)?)
-        } else {
-            project_context.map(|project| RoleAddress { project: project.to_string(), role: reference.to_string() })
-        };
-        let namespace = self.provisioning_namespace().await;
-        let sources =
-            self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let has_role = sources.items.iter().any(|source| source.object.spec.role == reference);
-        if !explicit && requested.is_none() && !has_role {
-            return Ok(None);
-        }
-
-        let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
-        let mut candidates = sources
-            .items
-            .into_iter()
-            .filter(|source| {
-                source.object.spec.role == role
-                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                    && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            (&left.object.spec.project_ref, &left.object.metadata.name).cmp(&(&right.object.spec.project_ref, &right.object.metadata.name))
-        });
-        match candidates.as_slice() {
-            [] if explicit => Err(format!("no live convoy matches `{reference}`")),
-            [] => Ok(None),
-            [source] => {
-                let project = source
-                    .object
-                    .spec
-                    .project_ref
-                    .clone()
-                    .ok_or_else(|| format!("live convoy {} has no project identity", source.object.metadata.name))?;
-                let owner_host = match &source.provenance {
-                    ResourceProvenance::Local => self.host_name.clone(),
-                    ResourceProvenance::Replica { origin_root, .. } => self
-                        .host_registry
-                        .live_routed_host_name(origin_root)
-                        .await
-                        .ok_or_else(|| format!("owner host for {role}@{project} is unreachable"))?,
-                };
-                Ok(Some(LiveConvoyRecord {
-                    address: RoleAddress { project, role: role.to_string() },
-                    record_name: source.object.metadata.name.clone(),
-                    owner_host,
-                }))
-            }
-            candidates => {
-                let addresses = candidates
-                    .iter()
-                    .filter_map(|source| {
-                        source
-                            .object
-                            .spec
-                            .project_ref
-                            .as_ref()
-                            .map(|project| RoleAddress { project: project.clone(), role: source.object.spec.role.clone() })
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(|address| address.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Err(format!("{role} is ambiguous: {addresses}"))
-            }
-        }
+        self.attach_resolver().resolve_attach(reference, None, false, AttachMode::PreferTake, None).await
     }
 
     pub async fn resolve_attach_command_on_host_internal(
@@ -11590,17 +11291,7 @@ impl InProcessDaemon {
         reference: &str,
         host: Option<&HostName>,
     ) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_with_mode_internal(reference, host, false, AttachMode::PreferTake).await
-    }
-
-    async fn resolve_attach_with_mode_internal(
-        &self,
-        reference: &str,
-        host: Option<&HostName>,
-        transient: bool,
-        mode: AttachMode,
-    ) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_with_context(reference, host, transient, mode, None).await
+        self.attach_resolver().resolve_attach(reference, host, false, AttachMode::PreferTake, None).await
     }
 
     async fn resolve_attach_with_context(
@@ -11611,31 +11302,7 @@ impl InProcessDaemon {
         mode: AttachMode,
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String> {
-        // Preserve validation precedence without paying to build the candidate index.
-        if reference.trim().is_empty() {
-            return Err("attach reference is required".to_string());
-        }
-        if let Some(record) = self.resolve_live_convoy_record(reference, project_context).await? {
-            if let Some(requested) = host {
-                if requested != &record.owner_host {
-                    return Err(format!("no attach target matching '{reference}' on host '{requested}'"));
-                }
-            }
-            if record.owner_host != self.host_name {
-                let plan = self.recursive_attach_plan_for_remote(&record.owner_host, &record.address.to_string(), mode).await?;
-                let binding = AttachBinding::builder()
-                    .host(record.owner_host)
-                    .namespace(self.provisioning_namespace().await)
-                    .convoy(record.record_name)
-                    .role(record.address.role)
-                    .build();
-                return Ok(ResolvedAttach { plan, binding: Some(binding) });
-            }
-            let index = self.attach_candidate_index().await?;
-            return index.resolve(self, &record.record_name, host, transient, mode).await;
-        }
-        let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference, host, transient, mode).await
+        self.attach_resolver().resolve_attach(reference, host, transient, mode, project_context).await
     }
 
     pub async fn resolve_transient_attach_command_internal(
@@ -11643,33 +11310,15 @@ impl InProcessDaemon {
         reference: &str,
         host: Option<&HostName>,
     ) -> Result<ResolvedAttach, String> {
-        if reference.trim().is_empty() {
-            return Err("attach reference is required".to_string());
-        }
-        self.resolve_attach_with_mode_internal(reference, host, true, AttachMode::Default).await
+        self.attach_resolver().resolve_transient(reference, host).await
     }
 
     pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
-        if references.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let index = self.attach_candidate_index().await?;
-        let mut resolved = HashSet::new();
-        for reference in references {
-            if index.resolve(self, reference, None, false, AttachMode::Default).await.is_ok() {
-                resolved.insert(reference.clone());
-            }
-        }
-        Ok(resolved)
+        self.attach_resolver().resolvable_references(references).await
     }
 
     pub async fn resolvable_attach_targets_internal(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
-        let index = self.attach_candidate_index().await?;
-        let mut resolved = Vec::with_capacity(targets.len());
-        for (reference, host) in targets {
-            resolved.push(index.resolve(self, reference, Some(host), false, AttachMode::Default).await.is_ok());
-        }
-        Ok(resolved)
+        self.attach_resolver().resolvable_targets(targets).await
     }
 
     pub async fn origin_host_names_internal(&self, origins: &HashSet<NodeId>) -> HashMap<NodeId, HostName> {
@@ -11682,358 +11331,13 @@ impl InProcessDaemon {
         hosts
     }
 
-    async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
-        let namespace = self.provisioning_namespace().await;
-        let convoy_addresses = self
-            .resource_backend
-            .including_replicas::<ResourceConvoy>(&namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .filter(|source| source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
-            .map(|source| {
-                let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
-                (source.object.metadata.name, address)
-            })
-            .collect::<HashMap<_, _>>();
-        let durable_sessions = self
-            .resource_backend
-            .including_replicas::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
-        let observed_sessions = self
-            .observed_resource_backend
-            .clone()
-            .using::<ResourceTerminalSession>(&namespace)
-            .list()
-            .await
-            .map_err(|err| err.to_string())?
-            .items;
-        let mut sessions_by_name = HashMap::new();
-        let mut replicated_sessions = Vec::new();
-        for session in durable_sessions {
-            match session.provenance {
-                ResourceProvenance::Local => {
-                    sessions_by_name.insert(session.object.metadata.name.clone(), session.object);
-                }
-                ResourceProvenance::Replica { .. } => replicated_sessions.push(session),
-            }
-        }
-        for session in observed_sessions {
-            sessions_by_name.insert(session.metadata.name.clone(), session);
-        }
-        let mut candidates = Vec::new();
-        for session in sessions_by_name.into_values() {
-            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
-                continue;
-            }
-            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
-            candidates.push(AttachCandidate {
-                label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
-                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
-                host: self.host_name.clone(),
-                target: AttachTarget::Local(Box::new(session)),
-            });
-        }
-        let mut indexed_remote_sessions = HashSet::new();
-        for replicated in replicated_sessions {
-            let session = replicated.object;
-            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
-                continue;
-            }
-            let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
-                unreachable!("local durable sessions were partitioned above");
-            };
-            let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
-                continue;
-            };
-            indexed_remote_sessions.insert((host.clone(), session.metadata.name.clone()));
-            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
-            let convoy = session.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
-            let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
-            let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
-            let row = FleetListRow::builder()
-                .convoy(convoy)
-                .vessel(session.spec.env_ref.clone())
-                .crew(crew)
-                .crew_state("running")
-                .host(host.clone())
-                .namespace(session.metadata.namespace.clone())
-                .session(session.metadata.name.clone())
-                .staleness(FleetStaleness::Local)
-                .build();
-            candidates.push(AttachCandidate {
-                label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
-                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
-                host,
-                target: AttachTarget::Replica { row: Box::new(row) },
-            });
-        }
-
-        let checkout_set = self
-            .aggregator_projection_state()
-            .await
-            .result_set_for(&flotilla_protocol::QueryId::Checkouts { scope: None })
-            .await
-            .expect("checkout query is always materialized");
-        if let Rows::Checkouts { rows, .. } = checkout_set.rows {
-            candidates.extend(rows.into_iter().filter(|row| row.for_convoy.is_none()).map(|row| AttachCandidate {
-                label: format!("{} ({})", row.path, row.host),
-                references: vec![row.path.clone()],
-                host: row.host.clone(),
-                target: AttachTarget::Checkout(Box::new(row)),
-            }));
-        }
-
-        let configured_replica_hosts: HashSet<HostName> = self
-            .config
-            .load_hosts()
-            .map(|hosts| {
-                hosts
-                    .hosts
-                    .into_values()
-                    .filter(|remote| !remote.agentless_ssh)
-                    .map(|remote| HostName::new(remote.expected_host_name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cache = self.fleet_replica_cache.read().await;
-        for host in configured_replica_hosts {
-            if let Some(entry) = cache.get(&host) {
-                let independent_references = entry
-                    .result_sets
-                    .iter()
-                    .filter_map(|result_set| result_set.rows.as_independents())
-                    .flatten()
-                    .filter_map(|row| row.attach.as_deref())
-                    .collect::<HashSet<_>>();
-                let mut indexed_sessions = HashSet::new();
-                for row in &entry.rows {
-                    if row.crew_state != "running" {
-                        continue;
-                    }
-                    if let Some(session) = &row.session {
-                        if indexed_remote_sessions.contains(&(row.host.clone(), session.clone())) {
-                            continue;
-                        }
-                        if independent_references.contains(session.as_str()) {
-                            continue;
-                        }
-                        indexed_sessions.insert(session.clone());
-                    }
-                    candidates.push(AttachCandidate {
-                        label: fleet_row_attach_reference_label(row),
-                        references: fleet_row_attach_reference_keys(row),
-                        host: row.host.clone(),
-                        target: AttachTarget::Replica { row: Box::new(row.clone()) },
-                    });
-                }
-                for result_set in &entry.result_sets {
-                    let Rows::Independents { scope: None, rows } = &result_set.rows else { continue };
-                    for row in rows {
-                        let Some(reference) = &row.attach else { continue };
-                        if row.phase != flotilla_protocol::SessionPhase::Running || !indexed_sessions.insert(reference.clone()) {
-                            continue;
-                        }
-                        let fleet_row = FleetListRow::builder()
-                            .convoy("-")
-                            .vessel("-")
-                            .crew("-")
-                            .crew_state("running")
-                            .host(host.clone())
-                            .namespace(row.resource.namespace.clone())
-                            .session(reference.clone())
-                            .staleness(FleetStaleness::Local)
-                            .build();
-                        candidates.push(AttachCandidate {
-                            label: format!("{} ({host})", row.name),
-                            references: vec![reference.clone()],
-                            host: host.clone(),
-                            target: AttachTarget::Replica { row: Box::new(fleet_row) },
-                        });
-                    }
-                }
-            }
-        }
-        drop(cache);
-        Ok(AttachCandidateIndex::new(candidates))
-    }
-
-    async fn local_checkout_terminal_plan(&self, checkout: &CheckoutRow, seat: AttachMode) -> Result<ResolvedAttachPlan, String> {
-        let cwd = ExecutionEnvironmentPath::new(&checkout.path);
-        let discovery = discover_repo_for_environment(
-            &self.environment_manager,
-            &self.discovery,
-            &self.config,
-            &self.resource_backend,
-            &self.provisioning_namespace().await,
-            &self.local_environment_id,
-            &self.local_environment_id,
-            cwd.as_path(),
-        )
-        .await
-        .map_err(|error| format!("checkout {} provider discovery failed: {error}", checkout.path))?;
-        let pool = discovery
-            .registry
-            .terminal_pools
-            .preferred()
-            .cloned()
-            .ok_or_else(|| format!("no terminal pool available for checkout {}", checkout.path))?;
-        let session_name = transient_checkout_session_name(checkout);
-        let command = "${SHELL:-/bin/sh}";
-        pool.preflight_attach(seat).await?;
-        pool.ensure_session(&session_name, command, &cwd, &Vec::new(), &[]).await?;
-        let args = pool.attach_args_for_mode(&session_name, command, &cwd, &Vec::new(), seat)?;
-        Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(args)]))
-    }
-
-    /// Resolve the attach plan for a locally-known session, returning it
-    /// with the host that actually owns the session (the binding host).
-    async fn attach_plan_for_session(
-        &self,
-        reference: &str,
-        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        seat: AttachMode,
-    ) -> Result<(ResolvedAttachPlan, HostName), String> {
-        let namespace = self.provisioning_namespace().await;
-        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
-        let environment = environments
-            .get(&session.spec.env_ref)
-            .await
-            .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?;
-        let host_ref = environment
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|spec| spec.host_ref.as_str())
-            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
-            .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
-        if let Some(destination) =
-            self.environment_manager.managed_environments().into_iter().find(|(id, _)| id.as_str() == session.spec.env_ref).and_then(
-                |(_, state)| match state {
-                    crate::environment_manager::ManagedEnvironmentKind::Direct(direct) => direct.ssh_destination,
-                    _ => None,
-                },
-            )
-        {
-            let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-            let attach_args = self.terminal_pool_attach_args(session, &environment, &cwd, seat).await?;
-            let plan = ResolvedAttachPlan::command(vec![
-                Arg::Literal("ssh".to_string()),
-                Arg::Literal("-tt".to_string()),
-                Arg::Literal("-o".to_string()),
-                Arg::Literal("BatchMode=yes".to_string()),
-                Arg::Quoted(destination),
-                Arg::Literal("sh".to_string()),
-                Arg::Literal("-lc".to_string()),
-                Arg::NestedCommand(attach_args),
-            ]);
-            // The owning daemon resolves future attach requests; the target
-            // has no flotillad to receive a recursive attach command.
-            return Ok((plan, self.host_name.clone()));
-        }
-        let target_host = self.target_host_for_resource_ref(&namespace, host_ref).await?;
-        if target_host != self.host_name {
-            let plan = self.recursive_attach_plan_for_remote(&target_host, reference, seat).await?;
-            return Ok((plan, target_host));
-        }
-
-        let plan = self.local_attach_plan_for_session(session, &environment, seat).await?;
-        Ok((plan, self.host_name.clone()))
-    }
-
-    async fn recursive_attach_plan_for_remote(
-        &self,
-        target_host: &HostName,
-        reference: &str,
-        seat: AttachMode,
-    ) -> Result<ResolvedAttachPlan, String> {
-        let next_hop = self.host_registry.next_hop_host_for_target_host(target_host).await?.unwrap_or_else(|| target_host.clone());
-        if next_hop == self.host_name {
-            return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
-        }
-
-        let resolver = ssh_resolver_from_config(self.config.base_path())?;
-        let command = recursive_attach_command(target_host, reference, seat);
-        resolver
-            .one_hop_command_args(&next_hop, command)
-            .map(ResolvedAttachPlan::command)
-            .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))
-    }
-
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
-        let reference = binding
-            .session
-            .as_deref()
-            .or(binding.convoy.as_deref())
-            .ok_or_else(|| "remote attach binding has neither a session nor convoy reference".to_string())?;
-        self.recursive_attach_plan_for_remote(&binding.host, reference, AttachMode::PreferTake).await
+        self.attach_resolver().route_remote_attach_binding(binding).await
     }
 
-    async fn local_attach_plan_for_session(
-        &self,
-        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
-        seat: AttachMode,
-    ) -> Result<ResolvedAttachPlan, String> {
-        let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let attach_args = self.terminal_pool_attach_args(session, environment, &cwd, seat).await?;
-        if environment.spec.docker.is_some() {
-            let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
-            let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
-            let container_name =
-                container_name.ok_or_else(|| format!("environment {} has no docker container id", session.spec.env_ref))?;
-            let environment_resolver =
-                DockerEnvironmentHopResolver::new(HashMap::from([(environment_id.clone(), container_name.to_string())]));
-            let hop_resolver = HopResolver::new(
-                Arc::new(crate::hop_chain::remote::NoopRemoteHopResolver),
-                Arc::new(environment_resolver),
-                Arc::new(NoopTerminalHopResolver),
-            );
-            let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: environment_id, provider: "docker".to_string() }, Hop::RunCommand {
-                command: attach_args,
-            }]);
-            let mut context = ResolutionContext {
-                current_host: self.host_name.clone(),
-                current_environment: None,
-                working_directory: Some(cwd),
-                actions: Vec::new(),
-                nesting_depth: 0,
-            };
-            return hop_resolver.resolve(&plan, &mut context).map(|resolved| ResolvedAttachPlan(resolved.0));
-        }
-        Ok(ResolvedAttachPlan(vec![ResolvedAttachAction::Command(attach_args)]))
-    }
-
-    async fn terminal_pool_attach_args(
-        &self,
-        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
-        cwd: &ExecutionEnvironmentPath,
-        seat: AttachMode,
-    ) -> Result<Vec<Arg>, String> {
-        let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
-        let pool = registry
-            .terminal_pools
-            .get(&session.spec.pool)
-            .map(|(_, pool)| Arc::clone(pool))
-            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-        let attach_target = terminal_session_attach_target(session)?;
-        pool.preflight_attach(seat).await?;
-        pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, cwd, &Vec::new(), seat)
-    }
-
+    #[cfg(test)]
     async fn target_host_for_resource_ref(&self, namespace: &str, host_ref: &str) -> Result<HostName, String> {
-        let canonical_ref = match canonical_placement_host_ref(&self.resource_backend, namespace, host_ref).await {
-            Ok(Some(target_host)) => target_host.reference,
-            Ok(None) => return Err(format!("references unknown host `{host_ref}`")),
-            Err(error) => return Err(error),
-        };
-        Ok(self.host_name_for_canonical_ref(&canonical_ref))
+        self.attach_resolver().target_host_for_resource_ref(namespace, host_ref).await
     }
 
     pub async fn canonical_host_id_internal(&self, namespace: &str, host_ref: &str) -> Result<CanonicalHostId, String> {
@@ -12053,45 +11357,6 @@ impl InProcessDaemon {
         } else {
             HostName::new(canonical_ref.as_str())
         }
-    }
-
-    async fn registry_for_resource_environment(
-        &self,
-        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
-        cwd: &Path,
-    ) -> Result<Arc<crate::providers::registry::ProviderRegistry>, String> {
-        let environment_id = if let Some(host_direct) = environment.spec.host_direct.as_ref() {
-            let canonical_ref =
-                match canonical_placement_host_ref(&self.resource_backend, &environment.metadata.namespace, &host_direct.host_ref).await {
-                    Ok(Some(target_host)) => target_host.reference,
-                    Ok(None) => return Err(format!("references unknown host `{}`", host_direct.host_ref)),
-                    Err(error) => return Err(error),
-                };
-            if self.canonical_local_host_id().as_ref() == Some(&canonical_ref) {
-                self.local_environment_id.clone()
-            } else {
-                EnvironmentId::new(environment.metadata.name.clone())
-            }
-        } else {
-            EnvironmentId::new(environment.metadata.name.clone())
-        };
-
-        if let Some(registry) = self.environment_registry_for_environment(&environment_id) {
-            return Ok(registry);
-        }
-
-        discover_repo_for_environment(
-            &self.environment_manager,
-            &self.discovery,
-            &self.config,
-            &self.resource_backend,
-            &self.provisioning_namespace().await,
-            &self.local_environment_id,
-            &environment_id,
-            cwd,
-        )
-        .await
-        .map(|result| Arc::new(result.registry))
     }
 
     async fn refresh_local_host_summary(&self) -> HostSummary {
@@ -13541,33 +12806,6 @@ impl InProcessDaemon {
     }
 }
 
-fn recursive_attach_command(target_host: &HostName, reference: &str, seat: AttachMode) -> Vec<flotilla_protocol::arg::Arg> {
-    let mut command =
-        vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
-    command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
-    command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
-    // Recursive attaches only traverse transport boundaries; Presentation
-    // Manager identity belongs to the original foreground attach.
-    command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
-    match seat {
-        AttachMode::Default => command.push(flotilla_protocol::arg::Arg::Literal("--watch".to_string())),
-        AttachMode::PreferTake => {}
-        AttachMode::Strict => command.push(flotilla_protocol::arg::Arg::Literal("--strict".to_string())),
-        AttachMode::Take => command.push(flotilla_protocol::arg::Arg::Literal("--take".to_string())),
-    }
-    command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
-    command
-}
-
-fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(checkout.host.as_str().as_bytes());
-    hasher.update([0]);
-    hasher.update(checkout.path.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    format!("flotilla-checkout-{}", &digest[..32])
-}
-
 async fn execute_local_remote_step_batch(
     local_host: NodeId,
     request: RemoteStepBatchRequest,
@@ -14255,7 +13493,7 @@ impl DaemonHandle for InProcessDaemon {
                 ))))
             }
             CommandAction::Attach { reference, host, mode } => {
-                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                let project_context = self.attach_resolver().attach_project_context(command.context_repo.as_ref()).await?;
                 match self.resolve_attach_with_context(reference, host.as_ref(), false, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         if let Some(binding) = &resolved.binding {
@@ -14269,7 +13507,7 @@ impl DaemonHandle for InProcessDaemon {
                 }
             }
             CommandAction::AttachTransient { reference, host, mode } => {
-                let project_context = self.attach_project_context(command.context_repo.as_ref()).await?;
+                let project_context = self.attach_resolver().attach_project_context(command.context_repo.as_ref()).await?;
                 match self.resolve_attach_with_context(reference, host.as_ref(), true, *mode, project_context.as_deref()).await {
                     Ok(resolved) => {
                         Ok(flotilla_protocol::CommandValue::AttachCommandResolved { plan: resolved.plan, binding: resolved.binding })

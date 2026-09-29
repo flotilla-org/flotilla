@@ -1337,20 +1337,6 @@ fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
     }));
 }
 
-#[test]
-fn recursive_attach_preserves_take_preference_and_explicit_watch() {
-    let host = HostName::new("udder");
-    let take = flotilla_protocol::arg::flatten(&recursive_attach_command(&host, "crew-session", AttachMode::PreferTake), 0);
-    let watch = flotilla_protocol::arg::flatten(&recursive_attach_command(&host, "crew-session", AttachMode::Default), 0);
-
-    assert_eq!(take, "flotilla attach --host 'udder' --transient 'crew-session'");
-    assert_eq!(watch, "flotilla attach --host 'udder' --transient --watch 'crew-session'");
-}
-
-fn test_meta(name: &str) -> InputMeta {
-    InputMeta::builder().name(name.to_string()).build()
-}
-
 #[tokio::test]
 async fn prepared_workflow_snapshot_reuses_an_identical_replica() {
     let home_root = NodeId::new("snapshot-home");
@@ -2145,7 +2131,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
     assert_eq!(reviewer.metadata.annotations, coder_meta.annotations);
 }
 
-async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
+pub(super) async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {
     let labels = BTreeMap::from([
         (PROJECT_LABEL.to_string(), project.unwrap_or_default().to_string()),
         (ROLE_LABEL.to_string(), role.to_string()),
@@ -2291,86 +2277,8 @@ async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
     ));
 }
 
-#[tokio::test]
-async fn attach_resolves_role_addresses_to_the_live_record_before_planning_the_hop() {
-    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
-    create_identity_convoy(&backend, "convoy-andamento", "governor", Some("andamento")).await;
-    create_identity_convoy(&backend, "convoy-flotilla", "governor", Some("flotilla")).await;
-    let local_host = daemon.local_host_id().expect("local host identity").to_string();
-    backend
-        .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&local_host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
-        .await
-        .expect("local host resource");
-    let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
-    create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
-
-    let contextual = daemon
-        .resolve_attach_with_context("governor", None, false, AttachMode::Default, Some("andamento"))
-        .await
-        .expect("bare role resolves inside project context");
-    assert_eq!(contextual.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
-    assert!(matches!(contextual.plan.0.as_slice(), [ResolvedAttachAction::Command(_)]));
-
-    let ambiguous = daemon
-        .resolve_attach_with_context("governor", None, false, AttachMode::Default, None)
-        .await
-        .expect_err("bare fleet context must refuse ambiguity");
-    assert_eq!(ambiguous, "governor is ambiguous: governor@andamento, governor@flotilla");
-
-    let qualified = daemon
-        .resolve_attach_with_context("governor@andamento", None, false, AttachMode::Default, None)
-        .await
-        .expect("qualified role resolves without project context");
-    assert_eq!(qualified.binding.as_ref().and_then(|binding| binding.convoy.as_deref()), Some("convoy-andamento"));
-
-    let from_untracked_repo = daemon
-        .execute_query(
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: Some(flotilla_protocol::RepoSelector::Path(PathBuf::from("/scratch/untracked"))),
-                action: CommandAction::Attach { reference: "governor@andamento".to_string(), host: None, mode: AttachMode::Default },
-            },
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .expect("untracked cwd context must not abort attach");
-    assert!(matches!(from_untracked_repo, CommandValue::AttachCommandResolved { .. }));
-
-    let session_in_project_context = daemon
-        .resolve_attach_with_context("governor-session", None, false, AttachMode::Default, Some("andamento"))
-        .await
-        .expect("non-role references must fall back to the attach index in project context");
-    assert_eq!(session_in_project_context.binding.as_ref().and_then(|binding| binding.session.as_deref()), Some("governor-session"));
-
-    let wrong_host = daemon
-        .resolve_attach_with_context("governor@andamento", Some(&HostName::new("udder")), false, AttachMode::Default, None)
-        .await
-        .expect_err("an explicit host must constrain role-address resolution");
-    assert_eq!(wrong_host, "no attach target matching 'governor@andamento' on host 'udder'");
-}
-
-#[test]
-fn remote_fleet_attach_references_use_the_canonical_role_address() {
-    let row = FleetListRow::builder()
-        .convoy("reviewer @ flotilla")
-        .convoy_ref("convoy-opaque")
-        .vessel("convoy-opaque-implement")
-        .crew("implement/coder")
-        .crew_state("running")
-        .host(HostName::new("remote"))
-        .namespace("flotilla")
-        .session("session-opaque")
-        .staleness(FleetStaleness::Fresh { last_sync: Utc::now() })
-        .build();
-
-    let references = fleet_row_attach_reference_keys(&row);
-    assert!(references.contains(&"reviewer@flotilla".to_string()));
-    assert!(references.contains(&"reviewer@flotilla/implement/coder".to_string()));
-    assert!(references.contains(&"convoy-opaque".to_string()));
-    assert!(!references.contains(&"reviewer @ flotilla".to_string()));
-    assert_eq!(fleet_row_attach_reference_label(&row), "reviewer @ flotilla/implement/coder (remote)");
+pub(super) fn test_meta(name: &str) -> InputMeta {
+    InputMeta::builder().name(name.to_string()).build()
 }
 
 #[tokio::test]
@@ -2645,7 +2553,7 @@ async fn projectless_convoys_do_not_share_an_identity_bucket_with_a_project_name
     assert!(allocate_convoy_generation(&backend, "flotilla", Some("standalone"), "worker").await.is_ok());
 }
 
-async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
+pub(super) async fn standing_ensure_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<VirtualClock>, tempfile::TempDir) {
     standing_ensure_fixture_for("local", true).await
 }
 
@@ -5000,7 +4908,7 @@ async fn default_placement_accepts_a_host_with_an_authorship_collision() {
     assert_eq!(resolution.selected.expect("viable placement").metadata.name, "host-direct-feta");
 }
 
-async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {
+pub(super) async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref: &str) -> String {
     daemon
         .resource_backend()
         .using::<ResourceEnvironment>("flotilla")
@@ -5013,7 +4921,7 @@ async fn create_test_environment(daemon: &InProcessDaemon, name: &str, host_ref:
     name.to_string()
 }
 
-async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &str, convoy: &str, role: &str) {
+pub(super) async fn create_running_session(daemon: &InProcessDaemon, env_ref: &str, name: &str, convoy: &str, role: &str) {
     let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
     let created = terminals
         .create(
