@@ -6,19 +6,22 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use flotilla_core::agent_adapter::{
-    append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
-    CrewBriefTemplateResolver,
+use flotilla_core::{
+    agent_adapter::{
+        append_convoy_work_context, build_convoy_crew_brief_with_options, required_agent_adapters, CrewAssignment, CrewBriefMember,
+        CrewBriefTemplateResolver,
+    },
+    in_process::BRIEF_ARTIFACTS_ANNOTATION,
 };
 use flotilla_protocol::{CanonicalHostId, PlacementDecision};
 use flotilla_resources::{
-    canonicalize_repo_url,
+    artifact_record_name, canonicalize_repo_url,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline,
-    CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
+    repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, Convoy,
+    CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy,
+    DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
     PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec,
@@ -46,6 +49,7 @@ pub struct VesselReconciler {
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
+    artifacts: ReplicaReadResolver<Artifact>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     federated_placement_policies: Option<ReplicaReadResolver<PlacementPolicy>>,
     local_host_ref: Option<CanonicalHostId>,
@@ -64,7 +68,8 @@ impl VesselReconciler {
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
-            terminal_sessions: backend.using::<TerminalSession>(namespace),
+            terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
+            artifacts: backend.including_replicas::<Artifact>(namespace),
             federated_convoys: None,
             federated_placement_policies: None,
             local_host_ref: None,
@@ -949,19 +954,42 @@ impl Reconciler for VesselReconciler {
                                 fork_stance,
                             );
                             render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
-                            let mut brief = match build_convoy_crew_brief_with_options(
-                                &convoy,
-                                &context,
-                                &obj.spec.vessel_name,
-                                &process.role,
-                                assignment,
-                                &members,
-                                &render_options,
-                            ) {
-                                Ok(brief) => brief,
-                                Err(message) => return Ok(VesselPrepared::failed(message)),
+                            let mut brief = if convoy.metadata.annotations.contains_key(BRIEF_ARTIFACTS_ANNOTATION) {
+                                let name = artifact_record_name(&context.convoy, &process.role, "brief", &context.convoy);
+                                let artifact = match self.artifacts.get(&name).await {
+                                    Ok(artifact) => artifact.object,
+                                    Err(ResourceError::NotFound { .. }) => {
+                                        return Ok(VesselPrepared::provisioning(
+                                            &placement_policy,
+                                            placement_decision.clone(),
+                                            format!("brief artifact {name} to replicate"),
+                                            actuations,
+                                        ));
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                flotilla_resources::TerminalBrief {
+                                    path: flotilla_core::agent_adapter::crew_brief_path(&process.role),
+                                    content: String::new(),
+                                    artifact_digest: Some(artifact.spec.digest),
+                                    copies: Vec::new(),
+                                }
+                            } else {
+                                let mut brief = match build_convoy_crew_brief_with_options(
+                                    &convoy,
+                                    &context,
+                                    &obj.spec.vessel_name,
+                                    &process.role,
+                                    assignment,
+                                    &members,
+                                    &render_options,
+                                ) {
+                                    Ok(brief) => brief,
+                                    Err(message) => return Ok(VesselPrepared::failed(message)),
+                                };
+                                append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
+                                brief
                             };
-                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent {
                                 selector: selector.clone(),

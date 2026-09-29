@@ -191,6 +191,7 @@ async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "code".to_string(), adapter: None, model: None },
                     brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
                         path: "brief.md".to_string(),
                         content: "original".to_string(),
                         copies: vec![],
@@ -563,6 +564,43 @@ async fn turn_delivery_restores_convoy_when_session_write_fails_after_staging() 
 }
 
 #[tokio::test]
+async fn fresh_turn_replaces_the_old_brief_digest() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let mut spec = session.spec.clone();
+    let TerminalSessionSource::Agent { brief, .. } = &mut spec.source else { panic!("agent session") };
+    brief.artifact_digest = Some("a".repeat(64));
+    brief.content.clear();
+    let session = sessions
+        .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
+        .await
+        .expect("digest-backed session");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Stopped,
+            ..Default::default()
+        })
+        .await
+        .expect("stopped session");
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("resume-staging".to_string())
+        .source("review".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .brief("fresh turn".to_string())
+        .subject_revision("next-head".to_string())
+        .build();
+    daemon.deliver_standing_turn(&request).await.expect("deliver fresh turn");
+    let session = sessions.get("resume-staging-session").await.expect("updated session");
+    let TerminalSessionSource::Agent { brief, .. } = session.spec.source else { panic!("agent session") };
+    assert_eq!(brief.content, "fresh turn");
+    assert_eq!(brief.artifact_digest, None);
+}
+
+#[tokio::test]
 async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_rung() {
     for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -630,6 +668,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
                     source: TerminalSessionSource::Agent {
                         selector: Selector { capability: "code".to_string(), adapter: None, model: None },
                         brief: flotilla_resources::TerminalBrief {
+                            artifact_digest: None,
                             path: "brief.md".to_string(),
                             content: "original".to_string(),
                             copies: vec![],
@@ -1381,6 +1420,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
             source: TerminalSessionSource::Agent {
                 selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: Vec::new(),
@@ -2196,6 +2236,66 @@ async fn standing_ensure_without_agent_overrides_preserves_the_workflow_selector
     let CrewSource::Agent { selector, .. } = &workflow.vessels[0].crew[0].source else { panic!("governor must remain an agent") };
     assert_eq!(selector.adapter.as_deref(), Some("codex"));
     assert_eq!(selector.model, None);
+}
+
+#[derive(Default)]
+struct RecordingBriefArtifacts {
+    writes: tokio::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+}
+
+#[async_trait]
+impl BriefArtifactWriter for RecordingBriefArtifacts {
+    async fn put_brief(&self, _namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String> {
+        assert_eq!(subject, convoy);
+        self.writes.lock().await.push((convoy.to_string(), role.to_string(), content.to_vec()));
+        Ok(format!("{:x}", Sha256::digest(content)))
+    }
+}
+
+#[tokio::test]
+async fn standing_readmission_writes_a_new_brief_artifact() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    let writer = Arc::new(RecordingBriefArtifacts::default());
+    daemon.set_brief_artifact_writer(writer.clone()).await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let first = fail_ensured_generation(&backend, &clock).await;
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("record dead generation");
+    clock.advance(ChronoDuration::seconds(30));
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("readmit governor");
+    let writes = writer.writes.lock().await;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].0, first);
+    assert_ne!(writes[0].0, writes[1].0);
+    for (convoy, role, body) in writes.iter() {
+        assert_eq!(role, "governor");
+        assert!(String::from_utf8_lossy(body).contains(convoy));
+        let admitted = backend.using::<ResourceConvoy>("flotilla").get(convoy).await.expect("admitted convoy");
+        assert!(admitted.metadata.annotations.contains_key(BRIEF_ARTIFACTS_ANNOTATION));
+    }
+}
+
+#[tokio::test]
+async fn admission_rejects_agent_roles_reused_across_vessels_before_writing_briefs() {
+    let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
+    let writer = Arc::new(RecordingBriefArtifacts::default());
+    daemon.set_brief_artifact_writer(writer.clone()).await;
+    let agent = || {
+        CrewSpec::builder()
+            .role("coder".to_string())
+            .source(CrewSource::Agent { selector: Selector::for_capability("coding"), prompt: None, brief_template: None })
+            .build()
+    };
+    let workflow = WorkflowTemplateSpec::builder()
+        .vessels(vec![
+            VesselRequirement::builder().name("implement".to_string()).crew(vec![agent()]).build(),
+            VesselRequirement::builder().name("verify".to_string()).crew(vec![agent()]).build(),
+        ])
+        .build();
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    let error = daemon.write_admission_briefs("flotilla", "convoy-ambiguous", &spec, &workflow).await.expect_err("duplicate role");
+    assert!(error.contains("agent role `coder` occurs in vessels `implement` and `verify`"), "{error}");
+    assert!(writer.writes.lock().await.is_empty(), "admission must not publish a partial set of briefs");
 }
 
 #[tokio::test]
@@ -4365,6 +4465,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
                         source: TerminalSessionSource::Agent {
                             selector: Selector { capability: "code".to_string(), adapter: Some("codex".to_string()), model: None },
                             brief: flotilla_resources::TerminalBrief {
+                                artifact_digest: None,
                                 path: "brief.md".to_string(),
                                 content: "Work".to_string(),
                                 copies: vec![],

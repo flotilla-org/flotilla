@@ -62,7 +62,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     agent_material::AgentMaterialRegistry,
-    blob_store::TieredBlobStore,
+    blob_store::{BlobDigest, BlobStore, TieredBlobStore},
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
@@ -533,6 +533,13 @@ impl DaemonRuntime {
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let blob_store = Arc::new(TieredBlobStore::from_config(config.state_dir().as_path(), &daemon_config.blob_stores)?);
+        daemon
+            .set_brief_artifact_writer(Arc::new(crate::artifact::SystemBriefArtifactWriter {
+                backend: daemon.resource_backend(),
+                blobs: Arc::clone(&blob_store),
+                retention_days: daemon_config.artifact_retention_days.get("brief").copied().unwrap_or(30),
+            }))
+            .await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -690,7 +697,8 @@ impl DaemonRuntime {
                 )
                 .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(credential_store)
-                .with_agent_material(agent_material),
+                .with_agent_material(agent_material)
+                .with_blob_store(Arc::clone(&blob_store)),
             );
             daemon
                 .set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
@@ -1088,6 +1096,7 @@ struct ControllerRuntimeState {
     environment_tools: EnvironmentToolProvisioner,
     credential_store: Option<Arc<CredentialStore>>,
     agent_material: Option<Arc<AgentMaterialRegistry>>,
+    blob_store: Option<Arc<TieredBlobStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
@@ -1156,6 +1165,7 @@ impl ControllerRuntimeState {
             environment_tools,
             credential_store: None,
             agent_material: None,
+            blob_store: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
@@ -1178,6 +1188,11 @@ impl ControllerRuntimeState {
 
     fn with_agent_material(mut self, agent_material: Arc<AgentMaterialRegistry>) -> Self {
         self.agent_material = Some(agent_material);
+        self
+    }
+
+    fn with_blob_store(mut self, blob_store: Arc<TieredBlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
         self
     }
 
@@ -4475,6 +4490,13 @@ async fn fulfilment_grants_for_terminal(
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
+    async fn brief_ready(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+        let TerminalSessionSource::Agent { brief, .. } = &spec.source else { return Ok(true) };
+        let Some(digest) = &brief.artifact_digest else { return Ok(true) };
+        let store = self.state.blob_store.as_ref().ok_or("brief blob store unavailable")?;
+        Ok(store.get(&BlobDigest::parse(digest)?).await?.is_some())
+    }
+
     async fn cleat_endpoint(
         &self,
         session_id: &str,
@@ -4534,6 +4556,15 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let (command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
+                let mut materialized_brief = brief.clone();
+                if let Some(digest) = &brief.artifact_digest {
+                    let store = self.state.blob_store.as_ref().ok_or("brief blob store unavailable")?;
+                    let digest = BlobDigest::parse(digest)?;
+                    let body =
+                        store.get(&digest).await?.ok_or_else(|| format!("brief artifact blob {} is unavailable", digest.as_str()))?;
+                    materialized_brief.content =
+                        String::from_utf8(body).map_err(|error| format!("brief artifact is not UTF-8: {error}"))?;
+                }
                 let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
                 let adapter = registry
                     .agent_adapters
@@ -4544,7 +4575,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 } else {
                     self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
                 };
-                adapter.prepare_with_vcs(&cwd, brief, &credential_env, vcs.as_ref()).await?;
+                adapter.prepare_with_vcs(&cwd, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {
                     let copy_root = ExecutionEnvironmentPath::new(copy_root);
                     if copy_root != cwd {
@@ -4553,7 +4584,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         } else {
                             self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), copy_root.as_path()).await?
                         };
-                        adapter.prepare_with_vcs(&copy_root, brief, &credential_env, vcs.as_ref()).await?;
+                        adapter.prepare_with_vcs(&copy_root, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                     }
                 }
                 let backend = self.state.daemon.resource_backend();
@@ -4561,7 +4592,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 let plan = adapter.launch(&AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
-                    brief: brief.clone(),
+                    brief: materialized_brief,
                     environment: credential_env.clone(),
                     fulfilment_grants,
                 })?;
@@ -8898,6 +8929,7 @@ mod tests {
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "code".to_string(), adapter: None, model: None },
                     brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
                         path: ".flotilla/briefs/coder.md".to_string(),
                         content: "Work on the issue".to_string(),
                         copies: Vec::new(),
@@ -11986,6 +12018,7 @@ mod tests {
             source: TerminalSessionSource::Agent {
                 selector: Selector { capability: "code".to_string(), adapter: Some("claude-code".to_string()), model: None },
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: Vec::new(),
@@ -12075,6 +12108,7 @@ mod tests {
             source: TerminalSessionSource::Agent {
                 selector: Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: vec![durable_checkout.display().to_string()],
@@ -12206,6 +12240,7 @@ mod tests {
             source: TerminalSessionSource::Agent {
                 selector: Selector::for_capability("coding"),
                 brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
                     copies: Vec::new(),

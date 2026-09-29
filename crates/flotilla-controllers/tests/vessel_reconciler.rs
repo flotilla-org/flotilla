@@ -13,20 +13,21 @@ use common::{
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::VesselReconciler;
+use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key,
+    artifact_record_name, canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    ensure_repository, interactive_single_workflow_spec, BoundChangeRequest, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus,
-    CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ExitDeclaration, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel,
-    VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    ensure_repository, interactive_single_workflow_spec, patch_resource_annotation, Artifact, ArtifactSpec, BoundChangeRequest, Checkout,
+    CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, ClaimExit, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyTeardownRuntime, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
+    ExitDeclaration, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
+    InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
+    ResourceError, Selector, Stance, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState,
+    WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
@@ -1645,6 +1646,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
             source: TerminalSessionSource::Agent {
                 selector: Selector::for_capability("coding"),
                 brief: TerminalBrief {
+                    artifact_digest: None,
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Finish the issue.".to_string(),
                     copies: Vec::new(),
@@ -1830,6 +1832,82 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .actuations
         .iter()
         .all(|actuation| { !matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer") }));
+}
+
+#[tokio::test]
+async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-artifact", "implement", REPO_URL, GIT_REF).await;
+    let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
+    let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![CrewSpec::builder()
+        .role("coder".to_string())
+        .source(CrewSource::Agent {
+            selector: Selector::for_capability("coding"),
+            prompt: Some("Implement this task.".to_string()),
+            brief_template: None,
+        })
+        .build()];
+    backend.using::<Convoy>(NAMESPACE).update_status("convoy-artifact", &convoy.metadata.resource_version, &status).await.expect("crew");
+    patch_resource_annotation(&backend, NAMESPACE, "Convoy", "convoy-artifact", BRIEF_ARTIFACTS_ANNOTATION, "true")
+        .await
+        .expect("artifact admission marker");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-artifact", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-artifact", "/Users/alice/dev/flotilla-existing").await;
+    let vessel = backend
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-artifact", REPO_URL), &VesselSpec {
+            convoy_ref: "convoy-artifact".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-artifact".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-artifact".to_string())]),
+        })
+        .await
+        .expect("vessel");
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let waiting = reconciler.prepare(&vessel).await.expect("wait for artifact");
+    assert!(reconciler
+        .reconcile(&vessel, &waiting, Utc::now())
+        .actuations
+        .iter()
+        .all(|actuation| !matches!(actuation, Actuation::CreateTerminalSession { .. })));
+
+    let name = artifact_record_name("convoy-artifact", "coder", "brief", "convoy-artifact");
+    let digest = "a".repeat(64);
+    backend
+        .using::<Artifact>(NAMESPACE)
+        .create(
+            &meta(&name),
+            &ArtifactSpec::builder()
+                .convoy("convoy-artifact".to_string())
+                .producer("coder".to_string())
+                .kind("brief".to_string())
+                .subject("convoy-artifact".to_string())
+                .digest(digest.clone())
+                .size(12)
+                .media_type("text/markdown".to_string())
+                .expires_at(Utc::now() + chrono::Duration::days(3650))
+                .build(),
+        )
+        .await
+        .expect("replicated brief envelope");
+    let prepared = reconciler.prepare(&vessel).await.expect("artifact available");
+    let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
+    let brief = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateTerminalSession { spec, .. } => match &spec.source {
+                TerminalSessionSource::Agent { brief, .. } => Some(brief),
+                TerminalSessionSource::Tool { .. } => None,
+            },
+            _ => None,
+        })
+        .expect("session created from brief artifact");
+    assert_eq!(brief.path, ".flotilla/briefs/coder.md");
+    assert_eq!(brief.artifact_digest.as_deref(), Some(digest.as_str()));
+    assert!(brief.content.is_empty());
 }
 
 #[tokio::test]

@@ -547,7 +547,7 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
                 .role("coder".to_string())
                 .source(TerminalSessionSource::Agent {
                     selector: Selector::for_capability("coding"),
-                    brief: TerminalBrief { path: "brief.md".into(), content: String::new(), copies: vec![] },
+                    brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
                     context: Box::new(TerminalCrewContext {
                         namespace: namespace.into(),
                         convoy: convoy.into(),

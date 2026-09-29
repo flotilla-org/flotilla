@@ -214,7 +214,7 @@ fn build_crew_brief_with_options(
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    Ok(flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() })
+    Ok(flotilla_resources::TerminalBrief { artifact_digest: None, path: crew_brief_path(role), content, copies: Vec::new() })
 }
 
 /// Production entry point: deriving the standing variant from the convoy here
@@ -1572,6 +1572,7 @@ mod tests {
         let registry = discovered_registry();
         let cwd = ExecutionEnvironmentPath::new("/workspace");
         let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
             path: ".flotilla/briefs/coder.md".into(),
             content: "protocol preamble\n\nImplement the issue.".into(),
             copies: Vec::new(),
@@ -1640,8 +1641,12 @@ mod tests {
     fn launch_plan_uses_the_discovered_absolute_binary_path() {
         let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/x/y/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: String::new(),
+            copies: Vec::new(),
+        };
 
         let plan = registry
             .get("claude-code")
@@ -1666,8 +1671,12 @@ mod tests {
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let claude = registry.get("claude-code").expect("claude adapter");
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
 
         let invocation_environment = vec![
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
@@ -1724,8 +1733,12 @@ mod tests {
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, runner.clone());
         let claude = registry.get("claude-code").expect("Claude adapter");
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
         let invocation_environment = vec![
             ("CLAUDE_CODE_OAUTH_TOKEN".to_string(), "redacted-test-token".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), "/home/crew/flotilla/credentials/claude-max/claude".to_string()),
@@ -1772,8 +1785,12 @@ mod tests {
             .with(EnvironmentAssertion::env_var("CLAUDE_CONFIG_DIR", claude_config.display().to_string()))
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
 
         registry
             .get("claude-code")
@@ -1805,8 +1822,12 @@ mod tests {
             .with(EnvironmentAssertion::env_var("HOME", home.display().to_string()))
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
 
         registry
             .get("claude-code")
@@ -1828,8 +1849,12 @@ mod tests {
         let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
         let claude = registry.get("claude-code").expect("Claude adapter");
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "brief".into(),
+            copies: Vec::new(),
+        };
         let plan = claude
             .launch(&AgentLaunchRequest {
                 fulfilment_grants: None,
@@ -1873,8 +1898,12 @@ mod tests {
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let codex = registry.get("codex").expect("codex adapter");
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: String::new(),
+            copies: Vec::new(),
+        };
         codex.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare Codex workspace");
 
         let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
@@ -1907,8 +1936,12 @@ mod tests {
             .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.display().to_string()))
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
-        let brief =
-            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: String::new(),
+            copies: Vec::new(),
+        };
 
         registry.get("codex").expect("codex adapter").prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare");
 
@@ -2004,6 +2037,7 @@ mod tests {
             .await
             .expect("discovered VCS");
         let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
             path: ".flotilla/briefs/coder.md".into(),
             content: "secret assignment".into(),
             copies: Vec::new(),

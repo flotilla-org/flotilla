@@ -60,6 +60,9 @@ pub enum TerminalDeliveryReadiness {
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
+    async fn brief_ready(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+        Ok(true)
+    }
     async fn ensure_session(
         &self,
         name: &str,
@@ -226,6 +229,7 @@ enum TerminalOwnerState {
 pub enum TerminalPrepared {
     None,
     Waiting,
+    BriefWaiting,
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     MessageDeliveryPending,
@@ -347,6 +351,9 @@ where
         if !environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Ready && status.ready) {
             return Ok(TerminalPrepared::Waiting);
         }
+        if !self.runtime.brief_ready(&obj.spec).await.map_err(ResourceError::other)? {
+            return Ok(TerminalPrepared::BriefWaiting);
+        }
 
         let mut tags = [
             obj.metadata.labels.get(CONVOY_LABEL).map(|value| TerminalSessionTag::new("convoy", value)),
@@ -406,6 +413,7 @@ where
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }
                 TerminalPrepared::Waiting
+                | TerminalPrepared::BriefWaiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::CleatEndpoint(_)
@@ -498,6 +506,8 @@ where
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
             outcome.requeue_after = Some(Duration::from_millis(200));
+        } else if matches!(prepared, TerminalPrepared::BriefWaiting) {
+            outcome.requeue_after = Some(Duration::from_secs(5));
         }
         outcome
     }
