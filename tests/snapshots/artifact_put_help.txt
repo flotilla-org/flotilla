@@ -4,7 +4,7 @@ Kinds: explainer (change explanation), decision-ledger (choices and alternatives
 
 Prefer Markdown for prose; self-contained HTML is also supported. --about names the exact subject, such as a commit or review round. --summary records small scalar facts for workflow conditions; keep detailed prose in the file.
 
-Usage: flotilla artifact put [OPTIONS] --kind <KIND> --about <ABOUT> <FILE>
+Usage: flotilla artifact put [OPTIONS] --kind <KIND> <FILE>
 
 Arguments:
   <FILE>
