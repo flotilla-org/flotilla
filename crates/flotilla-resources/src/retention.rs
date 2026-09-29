@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{FieldOwnershipViolation, ResourceError};
 
 pub(crate) const MAX_FIELD_OWNERSHIP_VIOLATIONS: usize = 1_024;
+pub(crate) const FIELD_OWNERSHIP_VIOLATION_TTL_HOURS: i64 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventRetention {

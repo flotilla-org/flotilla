@@ -59,7 +59,14 @@ impl fmt::Display for ResourceError {
             }
             Self::Unauthorized { message } => write!(f, "unauthorized: {message}"),
             Self::FieldOwnership { violations } => {
-                write!(f, "field ownership refused {} violation(s)", violations.len())
+                write!(f, "field ownership refused {} violation(s): ", violations.len())?;
+                for (index, violation) in violations.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{} ({})", violation.field, violation.rule)?;
+                }
+                Ok(())
             }
             Self::Other { message } => f.write_str(message),
         }

@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_resources::{
-    ApiPaths, DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, FieldOwnedResource, FieldOwnership,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, NoStatusPatch, OwnershipEnforcement,
-    PlacementPolicy, PlacementPolicySpec, ReplicationClass, Resource, ResourceBackend, ResourceError, WriterIdentity, WriterRole,
+    apply_resource_document, ApiPaths, DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec,
+    FieldOwnedResource, FieldOwnership, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta,
+    NoStatusPatch, OwnershipEnforcement, PlacementPolicy, PlacementPolicySpec, ReplicationClass, Resource, ResourceBackend, ResourceError,
+    WriterIdentity, WriterRole,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 fn host_direct(pool: &str, priority: i32, host: &str) -> PlacementPolicySpec {
     PlacementPolicySpec::builder()
@@ -107,6 +109,37 @@ async fn operator_apply_preserves_loop_fields_while_updating_priority() {
     assert_eq!(updated.spec.priority, 99);
     assert_eq!(updated.spec.pool, "owned-pool");
     assert_eq!(updated.spec.host_direct.expect("host-direct").host_ref, "owned-host");
+}
+
+#[tokio::test]
+async fn resource_apply_reports_rejected_field_and_owner() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let policies = backend.using::<PlacementPolicy>("flotilla");
+    policies
+        .create(&InputMeta::builder().name("policy".to_string()).build(), &docker("docker", 4, "udder", "image:old"))
+        .await
+        .expect("create policy");
+
+    let error = apply_resource_document(
+        &backend,
+        "flotilla",
+        json!({
+            "apiVersion": "flotilla.work/v1",
+            "kind": "PlacementPolicy",
+            "metadata": { "name": "policy" },
+            "spec": docker("docker", 4, "other-host", "image:new")
+        }),
+    )
+    .await
+    .expect_err("operator apply must report rejected ownership change");
+
+    let message = error.to_string();
+    assert!(message.contains("spec.docker_per_vessel.host_ref"), "{message}");
+    assert!(message.contains("ReconcileLoop"), "{message}");
+    let stored = policies.get("policy").await.expect("stored policy").spec.docker_per_vessel.expect("docker");
+    assert_eq!(stored.host_ref, "udder");
+    assert_eq!(stored.image, "image:old".into(), "a rejected apply must not partially change operator fields");
+    assert_eq!(backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics").field_ownership_violations.len(), 1);
 }
 
 #[tokio::test]

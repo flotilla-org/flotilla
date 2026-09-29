@@ -14,7 +14,7 @@ use crate::{
     field_ownership::FieldOwnershipViolation,
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
-    retention::{EventRetention, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS},
+    retention::{EventRetention, ResourceStoreDiagnostics, FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS},
     watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -158,7 +158,10 @@ impl InMemoryBackend {
         let event_count = stores.values().map(|store| store.event_log.len() as u64).sum();
         let resource_stream_count = stores.values().filter(|store| store.current_version() > 0).count() as u64;
         let mut diagnostics = ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, self.event_retention);
-        diagnostics.field_ownership_violations = self.ownership_violations.lock().await.clone();
+        let mut violations = self.ownership_violations.lock().await;
+        let cutoff = Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS);
+        violations.retain(|violation| violation.observed_at >= cutoff);
+        diagnostics.field_ownership_violations = violations.clone();
         Ok(diagnostics)
     }
 
