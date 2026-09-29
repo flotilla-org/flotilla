@@ -688,6 +688,15 @@ A source-scoped external thing a convoy relates to: a change request, an issue, 
 - **short**: `repo#n` for an issue, `repo!n` for a change request.
 _Avoid_: The convoy's PR (there may be several, across repositories).
 
+**Carry**:
+Something that moves with a cross-vessel handoff (ADR 0050): repository state (always, by default), named artifacts, context, or an agent-added path. The workflow declares what carries, the agent may add more, and the system chooses the transport:
+- a fleet git mirror for repository state;
+- the artifact store for files;
+- point-to-point on the same host.
+
+A carry is staged and verified before the receiving crew's turn; a missing carry is a stall. Within one vessel, carrying is a no-op.
+_Avoid_: Sync, transfer (mechanisms), ambient state.
+
 ||||||| f2008365
 **ManifestRoot**:
 The resource that owns reconciliation of one declared manifest root, such as project-map on kiwi (ADR 0048). Its **spec** holds operator intent: per-document suspend, and sync/adopt requests as tokens. Its **status** holds the controller's judgement per document: applied, refused, drifted or suspended, with the reason and hashes. Its home is the host whose checkout it reads, and it replicates read-only. Managed objects carry only provenance annotations (source, path, revision, baseline hash).
