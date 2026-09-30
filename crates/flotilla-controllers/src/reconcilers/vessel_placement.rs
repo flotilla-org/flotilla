@@ -148,6 +148,7 @@ impl VesselPlacementProjector {
             labels.insert(flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string());
             let mut annotations = source.metadata.annotations.clone();
             annotations.insert(ACTUATOR_HOST_REF_ANNOTATION.to_string(), target_host.to_string());
+            let source_root = origin_root.clone();
             annotations.insert(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), origin_root);
             let mut meta = InputMeta::builder()
                 .name(name.clone())
@@ -170,7 +171,7 @@ impl VesselPlacementProjector {
                 result.updated += 1;
             } else {
                 vessels.create(&meta, &source.spec).await?;
-                info!(convoy = %source.spec.convoy_ref, vessel = %name, source_root = %meta.annotations[ACTUATOR_SOURCE_ROOT_ANNOTATION], authoring_path = "placed_vessel_projector", "created placed Vessel actuator");
+                info!(convoy = %source.spec.convoy_ref, vessel = %name, %source_root, authoring_path = "placed_vessel_projector", "created placed Vessel actuator");
                 result.created += 1;
             }
         }

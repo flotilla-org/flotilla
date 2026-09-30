@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
 pub(crate) static GC_FULL_KIND_LISTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -406,9 +406,9 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
     let local_names = sources
         .items
         .iter()
-        .filter(|item| matches!(item.provenance, ResourceProvenance::Local) && !is_projected_vessel_actuator::<T>(&item.object))
-        .map(|item| item.object.metadata.name.as_str())
-        .collect::<HashSet<_>>();
+        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+        .map(|item| (item.object.metadata.name.as_str(), projected_vessel_source_root::<T>(&item.object)))
+        .collect::<HashMap<_, _>>();
     Ok(sources
         .items
         .iter()
@@ -416,10 +416,15 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
             let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
                 return None;
             };
-            if is_projected_vessel_actuator::<T>(&item.object) {
+            let local_source_root = local_names.get(item.object.metadata.name.as_str())?;
+            let replica_source_root = projected_vessel_source_root::<T>(&item.object);
+            // A placed actuator is a local projection of the admitting Vessel.
+            // Match the marker to the counterpart root so an unrelated marker
+            // cannot suppress an independently authored collision.
+            if *local_source_root == Some(origin_root.as_str()) || replica_source_root == Some(local_root.as_str()) {
                 return None;
             }
-            (origin_root != local_root && local_names.contains(item.object.metadata.name.as_str())).then(|| {
+            (origin_root != local_root).then(|| {
                 HomeBoundAuthorshipCollision::builder()
                     .kind(T::API_PATHS.kind.to_string())
                     .namespace(namespace.to_string())
@@ -432,8 +437,10 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
         .collect())
 }
 
-fn is_projected_vessel_actuator<T: Resource>(object: &ResourceObject<T>) -> bool {
-    T::API_PATHS.kind == Vessel::API_PATHS.kind && object.metadata.annotations.contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION)
+fn projected_vessel_source_root<T: Resource>(object: &ResourceObject<T>) -> Option<&str> {
+    (T::API_PATHS.kind == Vessel::API_PATHS.kind)
+        .then(|| object.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str))
+        .flatten()
 }
 
 async fn replica_cursor_typed<T: Resource>(
