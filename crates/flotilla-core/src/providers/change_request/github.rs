@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::{
-    change_request_observer::parse_gh_observation,
+    change_request_observer::{parse_gh_observation_with_review_bot, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
         gh_api_get,
         github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, GhApi},
@@ -23,6 +23,7 @@ pub struct GitHubChangeRequest {
     repo_slug: String,
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
+    review_bot_login: String,
 }
 
 #[derive(Debug, bon::Builder)]
@@ -39,7 +40,12 @@ struct GhPr {
 
 impl GitHubChangeRequest {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { provider_name, repo_slug, api, runner }
+        Self { provider_name, repo_slug, api, runner, review_bot_login: DEFAULT_REVIEW_BOT_LOGIN.to_string() }
+    }
+
+    pub fn with_review_bot_login(mut self, login: String) -> Self {
+        self.review_bot_login = login;
+        self
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -102,7 +108,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         // independent of convoy count. If a repository exceeds GitHub's query
         // limits, surface the forge error instead of silently omitting CRs.
         for number in numbers {
-            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ state isDraft headRefOid reviewDecision mergeable author {{ login }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
+            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ state isDraft headRefOid reviewDecision mergeable author {{ login }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }
         query.push_str(" } }");
         let argument = format!("query={query}");
@@ -144,7 +150,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             }
             let mut request = request.clone();
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
-            statuses.insert(*number, Ok(parse_gh_observation(&request.to_string(), observed_at)?));
+            statuses.insert(*number, Ok(parse_gh_observation_with_review_bot(&request.to_string(), observed_at, &self.review_bot_login)?));
         }
         Ok(statuses)
     }

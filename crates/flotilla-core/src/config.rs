@@ -20,6 +20,9 @@ pub struct ProviderPreference {
 pub struct ChangeRequestConfig {
     #[serde(flatten)]
     pub preference: ProviderPreference,
+    /// GitHub bot whose review comments should wake a crew (GraphQL login, without `[bot]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_bot_login: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

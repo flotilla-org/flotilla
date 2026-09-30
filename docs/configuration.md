@@ -286,3 +286,14 @@ The Repository spec can override the path template used when creating worktrees:
 ```json
 { "vcs": { "git": { "checkout_path": "{{ repo_path }}/../work/{{ branch | sanitize }}" } } }
 ```
+
+## Review bot feedback
+
+Set the GraphQL login of the GitHub review bot in `~/.config/flotilla/config.toml` if it differs from the default `claude`:
+
+```toml
+[change_request]
+review_bot_login = "review-helper"
+```
+
+Only comments from that bot identity are treated as bot review feedback. Other bot comments do not wake a crew.
