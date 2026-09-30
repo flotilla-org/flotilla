@@ -139,7 +139,7 @@ impl WorkCredentialReconciler for RuntimeWorkCredentialReconciler {
         let state = self.state.upgrade().ok_or_else(|| "credential controller is unavailable".to_string())?;
         reconcile_work_credentials_for_environment(&state, namespace, environment_ref).await?;
         let store = state.credential_store.as_ref().ok_or("credential store is unavailable")?;
-        Ok(store.ledger_delivery_environment(environment_ref).await)
+        store.ledger_delivery_environment(environment_ref).await
     }
 }
 
