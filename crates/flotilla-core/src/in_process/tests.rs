@@ -4503,7 +4503,7 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
 }
 
 #[tokio::test]
-async fn default_remote_placement_routes_before_admission() {
+async fn default_remote_placement_resolves_replicated_credentials_before_admission() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"local-host\"\n").expect("daemon config");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -4635,13 +4635,6 @@ async fn default_remote_placement_routes_before_admission() {
         .await
         .expect("placement should hold resolved credential");
 
-    let target = daemon
-        .convoy_start_placement_host("flotilla", &intent)
-        .await
-        .expect("resolve default placement")
-        .expect("default placement should be remote");
-
-    assert_eq!(target.as_str(), "udder-id");
     assert!(matches!(backend.using::<ResourceConvoy>("flotilla").list().await, Ok(list) if list.items.is_empty()));
 }
 

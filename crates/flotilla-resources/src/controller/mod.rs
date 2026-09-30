@@ -17,7 +17,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     apply_status_patch,
@@ -556,7 +556,16 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::CreateVessel { meta, spec } => {
                 let resolver = backend.using::<crate::Vessel>(namespace);
-                Self::create_if_missing(&resolver, meta, spec).await
+                let mut meta = meta;
+                meta.set_lifecycle_authority(LifecycleAuthority::Managed);
+                match resolver.create(&meta, &spec).await {
+                    Ok(_) => {
+                        info!(convoy = %spec.convoy_ref, vessel = %meta.name, authoring_path = "convoy_reconciler", "created Vessel");
+                        Ok(())
+                    }
+                    Err(ResourceError::Conflict { .. }) => Ok(()),
+                    Err(error) => Err(error),
+                }
             }
             Actuation::CreatePresentation { meta, spec } => {
                 let resolver = backend.using::<crate::Presentation>(namespace);

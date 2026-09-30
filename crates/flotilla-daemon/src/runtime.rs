@@ -3200,13 +3200,18 @@ async fn resource_authorship_collision_condition(daemon: &Arc<InProcessDaemon>, 
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let vessel_guidance = if collisions.iter().any(|collision| collision.kind == Vessel::API_PATHS.kind) {
+        " For a Vessel with live crew on the non-origin copy, preserve both copies until that crew is drained or finished; deleting the origin Vessel can tear down the placed actuator. Then remove the non-origin authored copy and let the origin's Vessel replicate and project again. Do not delete a running copy to clear this warning."
+    } else {
+        ""
+    };
     Ok(Some(
         HostCondition::builder()
             .condition_type("ResourceReplication/AuthorshipCollision")
             .value(ConditionValue::False)
             .reason("HomeBoundRecordAuthoredAtMultipleRoots")
             .message(format!(
-                "{} home-bound resource authorship collision{} detected: {identities}. Choose the record's natural home and delete the other authored copy at its root; the replicator will not choose a winner",
+                "{} home-bound resource authorship collision{} detected: {identities}. Choose the record's natural home and delete the other authored copy at its root; the replicator will not choose a winner.{vessel_guidance}",
                 collisions.len(),
                 if collisions.len() == 1 { "" } else { "s" },
             ))
