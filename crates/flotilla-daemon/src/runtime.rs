@@ -10500,6 +10500,8 @@ mod tests {
     async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
         let runtime_health = RuntimeHealth::default();
         let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        runtime_health.issue_polling.note(&format!("github rate limited (budget=REST search, identity=host gh login, reset_at={reset})"));
+        assert!(runtime_health.conditions().await.is_empty(), "search has a separate rate limit");
         runtime_health
             .issue_polling
             .note(&format!("github rate limited (budget=REST core remaining 75, identity=host gh login, reset_at={reset})"));

@@ -34,6 +34,10 @@ const MAX_CONCURRENT_SOURCES: usize = 8;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_JITTER: Duration = Duration::from_secs(5);
 
+fn is_github_source(source: &IssueSource) -> bool {
+    matches!(source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
+}
+
 #[async_trait]
 pub(crate) trait IssueMaterializationResolver: Send + Sync {
     async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String>;
@@ -105,7 +109,7 @@ struct BudgetBackoff {
 
 impl IssuePollingHealth {
     pub(crate) fn note(&self, message: &str) {
-        if let Some(reset) = rate_limit_reset(message) {
+        if let Some(reset) = rate_limit_reset(message).filter(|_| message.starts_with("github rate limited (budget=REST core")) {
             self.backoff.lock().expect("issue polling health lock poisoned").current = Some((reset, message.to_string()));
         }
     }
@@ -136,14 +140,14 @@ impl IssuePollingHealth {
 
 struct SourceRefresh {
     provider: Arc<dyn IssueProvider>,
-    cursors: StdMutex<HashMap<QueryId, String>>,
+    cursors: StdMutex<HashMap<QueryId, DateTime<Utc>>>,
     last: Mutex<Option<SourceRefreshResult>>,
 }
 
 struct SourceRefreshResult {
     fetched_at: tokio::time::Instant,
-    since: String,
-    next_cursor: String,
+    since: DateTime<Utc>,
+    next_cursor: DateTime<Utc>,
     result: Result<IssueChangeset, String>,
 }
 
@@ -153,7 +157,8 @@ impl SharedIssueRefresh {
         let entry = sources.entry(source.clone()).or_insert_with(|| {
             Arc::new(SourceRefresh { provider: Arc::clone(provider), cursors: StdMutex::new(HashMap::new()), last: Mutex::new(None) })
         });
-        entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor.to_string());
+        let cursor = cursor.parse().expect("materializer creates RFC 3339 cursors");
+        entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor);
     }
 
     fn unregister(&self, query: &QueryId) {
@@ -165,41 +170,56 @@ impl SharedIssueRefresh {
         });
     }
 
+    fn unregister_source(&self, source: &IssueSource, query: &QueryId) {
+        let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
+        if let Some(entry) = sources.get(source) {
+            let mut cursors = entry.cursors.lock().expect("shared issue cursors lock poisoned");
+            cursors.remove(query);
+            if cursors.is_empty() {
+                drop(cursors);
+                sources.remove(source);
+            }
+        }
+    }
+
     fn advance(&self, source: &IssueSource, query: &QueryId, cursor: &str) {
         if let Some(entry) = self.sources.lock().expect("shared issue sources lock poisoned").get(source) {
-            entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor.to_string());
+            let cursor = cursor.parse().expect("materializer creates RFC 3339 cursors");
+            entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor);
         }
     }
 
     async fn changed_since(&self, source: &IssueSource, query: &QueryId, since: &str) -> (String, Result<IssueChangeset, String>) {
-        if let Some(message) = self.health.active_error() {
-            return (since.to_string(), Err(message));
-        }
-        let entry = self.sources.lock().expect("shared issue sources lock poisoned").get(source).cloned().expect("registered issue source");
-        let mut last = entry.last.lock().await;
-        if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < REFRESH_INTERVAL) {
-            if since >= cached.since.as_str() {
-                if since >= cached.next_cursor.as_str() {
-                    return (since.to_string(), Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false }));
-                }
-                return (cached.next_cursor.clone(), cached.result.clone());
+        if is_github_source(source) {
+            if let Some(message) = self.health.active_error() {
+                return (since.to_string(), Err(message));
             }
         }
-        let oldest =
-            entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().cloned().unwrap_or_else(|| since.to_string());
-        let next_cursor = Utc::now().to_rfc3339();
-        let result = entry.provider.list_changed_since(source, &oldest, PAGE_SIZE).await;
+        let Some(entry) = self.sources.lock().expect("shared issue sources lock poisoned").get(source).cloned() else {
+            return (since.to_string(), Err(format!("issue source {} is no longer registered", source.scope)));
+        };
+        let since_time = match since.parse::<DateTime<Utc>>() {
+            Ok(time) => time,
+            Err(error) => return (since.to_string(), Err(format!("invalid issue refresh cursor: {error}"))),
+        };
+        let mut last = entry.last.lock().await;
+        if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < REFRESH_INTERVAL) {
+            if since_time >= cached.since {
+                if since_time >= cached.next_cursor {
+                    return (since.to_string(), Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false }));
+                }
+                return (cached.next_cursor.to_rfc3339(), cached.result.clone());
+            }
+        }
+        let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
+        let next_cursor = Utc::now();
+        let result = entry.provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
         if let Err(message) = &result {
             self.health.note(message);
         }
-        *last = Some(SourceRefreshResult {
-            fetched_at: tokio::time::Instant::now(),
-            since: oldest,
-            next_cursor: next_cursor.clone(),
-            result: result.clone(),
-        });
+        *last = Some(SourceRefreshResult { fetched_at: tokio::time::Instant::now(), since: oldest, next_cursor, result: result.clone() });
         tracing::debug!(%query, source = %source.scope, "shared issue source refresh");
-        (next_cursor, result)
+        (next_cursor.to_rfc3339(), result)
     }
 }
 
@@ -391,11 +411,13 @@ async fn load_window(
     let bindings = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
+            shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, "query scope has no issue source")];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
         Err(message) => {
+            shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, message)];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
@@ -407,8 +429,10 @@ async fn load_window(
         let mut params = base_params.clone();
         params.match_fields = binding.filter.match_fields.into_iter().map(|(field, value)| (field, value.to_values())).collect();
         async move {
-            if let Some(message) = shared_refresh.health.active_error() {
-                return Err(unavailable(Some(source), message));
+            if is_github_source(&source) {
+                if let Some(message) = shared_refresh.health.active_error() {
+                    return Err(unavailable(Some(source), message));
+                }
             }
             let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
             // Capture before the request. Re-reading changes is safe; skipping an
@@ -442,6 +466,7 @@ async fn load_window(
     let mut windows = Vec::new();
     let mut conditions = Vec::new();
     let mut suspension = None;
+    let mut failed_sources = Vec::new();
     for result in loaded {
         match result {
             Ok((window, source_rows)) => {
@@ -450,12 +475,20 @@ async fn load_window(
                 windows.push(window);
             }
             Err(condition) => {
-                if let ResultSetCondition::IssueSourceUnavailable { message, .. } = &condition {
+                if let ResultSetCondition::IssueSourceUnavailable { source, message } = &condition {
+                    if let Some(source) = source {
+                        failed_sources.push(source.clone());
+                    }
                     shared_refresh.health.note(message);
                     suspension = suspended_until(query, message);
                 }
                 conditions.push(condition);
             }
+        }
+    }
+    for source in failed_sources {
+        if !windows.iter().any(|window: &IssueSourceWindow| window.source == source) {
+            shared_refresh.unregister_source(&source, query);
         }
     }
     let rows = rows.into_values().collect::<Vec<_>>();
@@ -612,6 +645,7 @@ async fn refresh_window(
                 shared_refresh.advance(&source.source, query, &source.refresh_cursor);
             }
             Err(message) => {
+                shared_refresh.unregister_source(&source.source, query);
                 shared_refresh.health.note(&message);
                 if let Some(deadline) = suspended_until(query, &message) {
                     window.suspended_until = Some(deadline);

@@ -127,9 +127,9 @@ impl super::IssueProvider for GitHubIssueProvider {
         // continue onto another page.
         let endpoint = format!("repos/{}/issues?state=all&sort=updated&direction=desc&per_page={}", source.scope, per_page);
         let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
-        if response.status == 304 {
-            return Ok(IssueChangeset { updated: Vec::new(), closed: Vec::new(), has_more: false });
-        }
+        // GhApi serves the cached 200 body on a 304. Reapply it against the
+        // caller's cursor: a previous consumer may have failed before it
+        // committed the changes and must be able to retry without another 200.
         let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
         let as_of = Utc::now();
         let since = since.parse::<DateTime<Utc>>().map_err(|error| format!("invalid issue refresh cursor: {error}"))?;
@@ -362,6 +362,21 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].1[2], calls[1].1[2], "incremental endpoint must be stable for ETag reuse");
         assert!(calls[1].1.contains(&"If-None-Match: \"issue-window\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn conditional_hit_replays_a_change_when_the_consumer_retries_its_cursor() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("HTTP/2 200 OK\r\nETag: \"issue-window\"\r\n\r\n[{\"number\":1,\"title\":\"Changed\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-01T00:00:10Z\"}]".into()),
+            Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\n\r\n".into()),
+        ]));
+        let api = Arc::new(crate::providers::github_api::GhApiClient::new(runner.clone()));
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/neutral"));
+
+        provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("first poll");
+        let retried = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("retry after 304");
+
+        assert_eq!(retried.updated.len(), 1, "a 304 must not discard uncommitted changes");
     }
 
     #[tokio::test]
