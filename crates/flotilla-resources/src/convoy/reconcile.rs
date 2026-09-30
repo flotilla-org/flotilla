@@ -840,6 +840,7 @@ impl Reconciler for ConvoyReconciler {
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,
+                    proposed_disposition: None,
                     nudge_history: Vec::new(),
                 };
                 return ControllerReconcileOutcome {

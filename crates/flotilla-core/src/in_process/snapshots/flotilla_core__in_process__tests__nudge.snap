@@ -2,6 +2,6 @@
 source: crates/flotilla-core/src/in_process/tests.rs
 expression: "frame_crew_message(&sender, \"Example message.\")"
 ---
-[flotilla · nudge · reply by running `crew complete` or `crew fail`]
+[flotilla · nudge · reply by running `crew complete` or `crew stall`]
 
 Example message.

@@ -199,6 +199,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             supervision_index: None,
             supervision_exhausted: false,
             reason: None,
+            proposed_disposition: None,
             nudge_history: Vec::new(),
         });
     }

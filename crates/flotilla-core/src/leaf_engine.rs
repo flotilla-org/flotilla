@@ -16,10 +16,10 @@ use flotilla_resources::{
     produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Checkout,
     CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit,
     Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, StatusPatch,
-    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage,
-    UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
+    ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung, StallSupervisor,
+    StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
+    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
     VESSEL_LABEL,
 };
 use futures::StreamExt;
@@ -1195,6 +1195,7 @@ impl ReconcilerWake {
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,
+                    proposed_disposition: None,
                     nudge_history: prior.map_or_else(Vec::new, |stalled| stalled.nudge_history.clone()),
                 };
                 let declared = status
@@ -1205,6 +1206,7 @@ impl ReconcilerWake {
                     condition.evidence = declared.evidence.clone();
                     condition.source = StallEvidenceSource::Crew;
                     condition.reason = declared.reason;
+                    condition.proposed_disposition = declared.proposed_disposition;
                     condition.began_at = declared.began_at;
                 }
                 if matches!(condition.maker, Some(LeafMaker::Supervisor { .. })) {
@@ -1212,6 +1214,7 @@ impl ReconcilerWake {
                         condition.evidence = prior.evidence.clone();
                         condition.source = prior.source.clone();
                         condition.reason = prior.reason;
+                        condition.proposed_disposition = prior.proposed_disposition;
                         condition.began_at = prior.began_at;
                     }
                 }
@@ -1384,11 +1387,20 @@ impl ReconcilerWake {
                                 {
                                     continue;
                                 }
+                                let proposal = condition.proposed_disposition.map_or(String::new(), |disposition| {
+                                    let label = match disposition {
+                                        StallProposedDisposition::Resume => "resume",
+                                        StallProposedDisposition::ReduceScope => "reduce-scope",
+                                        StallProposedDisposition::Fail => "fail",
+                                    };
+                                    format!(" Proposed disposition: {label}.")
+                                });
                                 let brief = format!(
-                                    "Supervise stalled crew {} in convoy {}. Reason: {}. Resume it with guidance, fail it, or escalate it.",
+                                    "Supervise stalled crew {} in convoy {}. Reason: {}.{} Resume it with guidance, fail it, or escalate it.",
                                     condition.leaves.first().map(|leaf| leaf.field_path.as_str()).unwrap_or_default(),
                                     convoy.metadata.name,
                                     condition.evidence,
+                                    proposal,
                                 );
                                 let delivery = TurnDeliveryRequest::builder()
                                     .namespace(namespace.to_string())

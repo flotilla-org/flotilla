@@ -1183,7 +1183,7 @@ fn safe_header_value(value: &str) -> String {
 fn crew_message_header(sender: &CrewMessageSender) -> String {
     match sender {
         CrewMessageSender::Unknown => "unknown sender · message".to_string(),
-        CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew fail`".to_string(),
+        CrewMessageSender::FlotillaNudge => "flotilla · nudge · reply by running `crew complete` or `crew stall`".to_string(),
         CrewMessageSender::FlotillaTurn { source } => {
             format!("flotilla · turn: {} · reply by running `crew complete`", safe_header_value(source))
         }
@@ -8401,7 +8401,16 @@ impl InProcessDaemon {
         Ok(flotilla_protocol::CommandValue::Ok)
     }
 
-    pub async fn crew_fail_internal(&self, requested: &CrewCommandContext, message: String) -> Result<(), String> {
+    pub async fn crew_fail_internal(
+        &self,
+        requested: &CrewCommandContext,
+        message: String,
+        force: bool,
+        principal: Option<&PrincipalRef>,
+    ) -> Result<(), String> {
+        if !force || principal.is_none() || requested.crew_id.is_some() {
+            return Err("crew fail requires an operator principal with --force; crew members should use `flotilla crew stall --reason <infra|scope|decision|access|other> --message '...'` and supervisors should use `flotilla crew supervise … convert-to-failed`".to_string());
+        }
         self.apply_crew_work_patch(requested, |context| {
             convoy_external_patches::mark_crew_failed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
         })
@@ -8412,6 +8421,7 @@ impl InProcessDaemon {
         &self,
         requested: &CrewCommandContext,
         reason: flotilla_protocol::StallReason,
+        proposed_disposition: Option<flotilla_protocol::StallProposedDisposition>,
         message: String,
     ) -> Result<(), String> {
         if message.trim().is_empty() {
@@ -8442,6 +8452,7 @@ impl InProcessDaemon {
                 context.caller_role.clone(),
                 chrono::Utc::now(),
                 reason,
+                proposed_disposition,
                 message,
             ),
         )
@@ -10204,9 +10215,11 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::CrewFail { context, message } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewFail { context, message, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_fail_internal(context, message.clone()).await {
+            let operator =
+                caller.as_ref().filter(|caller| caller.crew.is_none() && context.crew_id.is_none()).map(|caller| &caller.principal_ref);
+            let result = match self.crew_fail_internal(context, message.clone(), *force, operator).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
@@ -10214,9 +10227,9 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::CrewStall { context, reason, message } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_stall_internal(context, *reason, message.clone()).await {
+            let result = match self.crew_stall_internal(context, *reason, *proposed_disposition, message.clone()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
