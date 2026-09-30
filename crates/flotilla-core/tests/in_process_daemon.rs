@@ -1285,6 +1285,37 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
             "a replica mutation must identify its origin: {result:?}"
         );
     }
+
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    let repository_name = repository_spec.key().to_string();
+    let repositories = authority.resource_backend().using::<Repository>("flotilla");
+    repositories
+        .create(&InputMeta::builder().name(repository_name.clone()).build(), &repository_spec)
+        .await
+        .expect("create repository at authority");
+    replica
+        .resource_backend()
+        .replica_writer::<Repository>(origin.clone(), "flotilla")
+        .replace(&repositories.list().await.expect("repository snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate repository");
+    let command_id = replica
+        .execute(
+            Command::builder()
+                .action(CommandAction::RepositoryRemoteRemove {
+                    namespace: "flotilla".to_string(),
+                    name: repository_name,
+                    remote: "https://github.com/flotilla-org/flotilla".to_string(),
+                })
+                .build(),
+        )
+        .await
+        .expect("submit repository mutation");
+    let result = recv_command_finished(&mut events, command_id).await;
+    assert!(
+        matches!(result, CommandValue::Error { ref message } if message.contains(origin.as_str())),
+        "a repository replica mutation must identify its origin: {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -7175,6 +7206,170 @@ async fn cancel_nonexistent_command_returns_error() {
     let result = daemon.cancel(999).await;
     assert!(result.is_err(), "cancelling a non-existent command should fail");
     assert!(result.unwrap_err().contains("no matching active command"), "error should mention no matching active command");
+}
+
+#[tokio::test]
+async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
+    let authority_temp = tempfile::tempdir().expect("authority tempdir");
+    let terminal_temp = tempfile::tempdir().expect("terminal tempdir");
+    let authority =
+        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
+            .await;
+    let terminal_host =
+        InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
+            .await;
+    let snapshot = WorkflowSnapshot {
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+        vessels: vec![flotilla_resources::VesselRequirement::builder()
+            .name("work".to_string())
+            .crew(
+                ["coder", "reviewer"]
+                    .into_iter()
+                    .map(|role| {
+                        flotilla_resources::CrewSpec::builder()
+                            .role(role.to_string())
+                            .source(flotilla_resources::CrewSource::Agent {
+                                selector: flotilla_resources::Selector::for_capability("coding"),
+                                prompt: None,
+                                brief_template: None,
+                            })
+                            .build()
+                    })
+                    .collect(),
+            )
+            .build()],
+    };
+    let initial_status = flotilla_resources::ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(snapshot),
+        crew_work: BTreeMap::from([(
+            "work".to_string(),
+            BTreeMap::from([
+                (
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                ),
+                (
+                    "reviewer".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Pending).build(),
+                ),
+            ]),
+        )]),
+        ..Default::default()
+    };
+    let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("handoff-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys.update_status("handoff-convoy", &created.metadata.resource_version, &initial_status).await.expect("set crew status");
+    authority
+        .resource_backend()
+        .using::<flotilla_resources::Vessel>("flotilla")
+        .create(&InputMeta::builder().name("work-vessel".to_string()).build(), &flotilla_resources::VesselSpec {
+            convoy_ref: "handoff-convoy".to_string(),
+            vessel_name: "work".to_string(),
+            placement_policy_ref: "host-direct".to_string(),
+            adopted_checkout_refs: Default::default(),
+        })
+        .await
+        .expect("create vessel");
+    let session_name = |role: &str, index| {
+        flotilla_resources::TerminalSessionIdentity::builder()
+            .vessel_ref("work-vessel".to_string())
+            .convoy("handoff-convoy".to_string())
+            .vessel("work".to_string())
+            .role(role.to_string())
+            .vessel_index(0)
+            .crew_index(index)
+            .labels(BTreeMap::new())
+            .build()
+            .name()
+    };
+    let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
+    let create_session = |role: &str, index| {
+        let name = session_name(role, index);
+        let labels = BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "handoff-convoy".to_string()),
+            (VESSEL_LABEL.to_string(), "work".to_string()),
+            (ROLE_LABEL.to_string(), role.to_string()),
+            (flotilla_resources::VESSEL_REF_LABEL.to_string(), "work-vessel".to_string()),
+        ]);
+        let spec = TerminalSessionSpec::builder()
+            .env_ref("remote-environment".to_string())
+            .role(role.to_string())
+            .source(TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    artifact_digest: None,
+                    path: "brief".to_string(),
+                    content: "Initial".to_string(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".to_string(),
+                    convoy: "handoff-convoy".to_string(),
+                    vessel_ref: "work-vessel".to_string(),
+                }),
+                message: None,
+            })
+            .cwd("/workspace".to_string())
+            .pool("fake-terminals".to_string())
+            .build();
+        (name, labels, spec)
+    };
+    let (reviewer_name, labels, spec) = create_session("reviewer", 1);
+    sessions.create(&InputMeta::builder().name(reviewer_name.clone()).labels(labels).build(), &spec).await.expect("remote reviewer");
+    authority
+        .resource_backend()
+        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
+        .replace(&sessions.list().await.expect("reviewer snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate reviewer");
+    let context = flotilla_protocol::CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".to_string()),
+        convoy: Some("handoff-convoy".to_string()),
+        vessel_ref: Some("work-vessel".to_string()),
+        role: Some("coder".to_string()),
+    };
+    authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
+    let convoy = convoys.get("handoff-convoy").await.expect("convoy after handoff");
+    assert!(convoy.status.expect("convoy status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    terminal_host
+        .resource_backend()
+        .replica_writer::<ResourceConvoy>(authority.node_id().clone(), "flotilla")
+        .replace(&convoys.list().await.expect("convoy snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate handoff");
+    terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver handoff at session origin");
+    let reviewer = sessions.get(&reviewer_name).await.expect("reviewer after delivery");
+    let TerminalSessionSource::Agent { message, .. } = reviewer.spec.source else { panic!("agent session expected") };
+    assert!(message.expect("queued handoff").text.contains("Review this"));
+
+    sessions.delete(&reviewer_name).await.expect("remove target session");
+    let (coder_name, labels, spec) = create_session("coder", 0);
+    sessions.create(&InputMeta::builder().name(coder_name).labels(labels).build(), &spec).await.expect("remote coder anchor");
+    authority
+        .resource_backend()
+        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
+        .replace(&sessions.list().await.expect("coder snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate coder anchor");
+    let current = convoys.get("handoff-convoy").await.expect("convoy before refusal");
+    convoys.update_status("handoff-convoy", &current.metadata.resource_version, &initial_status).await.expect("reset crew status");
+    let error = authority
+        .crew_handoff_internal(&context, "reviewer", "Review again")
+        .await
+        .expect_err("remote anchor cannot create a local target");
+    assert!(error.contains(terminal_host.node_id().as_str()), "refusal must name the anchor origin: {error}");
+    assert_eq!(convoys.get("handoff-convoy").await.expect("convoy after refusal").status, Some(initial_status));
 }
 
 #[tokio::test]

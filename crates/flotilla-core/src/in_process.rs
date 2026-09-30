@@ -8923,12 +8923,11 @@ impl InProcessDaemon {
             return Err(format!("crew target `{target}` failed provisioning and cannot be revived"));
         }
         let anchor = if target_session.is_none() {
-            Some(if let Some(caller) = context.caller_session.as_ref() {
-                caller.clone()
+            let visible_sessions = self.resource_backend.including_replicas::<ResourceTerminalSession>(&context.namespace);
+            let source = if let Some(caller) = context.caller_session.as_ref() {
+                visible_sessions.get(&caller.metadata.name).await.map_err(|error| error.to_string())?
             } else {
-                let mut sources = self
-                    .resource_backend
-                    .including_replicas::<ResourceTerminalSession>(&context.namespace)
+                let mut sources = visible_sessions
                     .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
                     .await
                     .map_err(|error| error.to_string())?
@@ -8938,14 +8937,15 @@ impl InProcessDaemon {
                     .into_iter()
                     .next()
                     .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?;
-                if let ResourceProvenance::Replica { origin_root, .. } = source.provenance {
-                    return Err(format!(
-                        "handoff target has no session on {}; its anchor session belongs to origin {origin_root}; create the target there",
-                        self.host_name
-                    ));
-                }
-                source.object
-            })
+                source
+            };
+            if let ResourceProvenance::Replica { origin_root, .. } = source.provenance {
+                return Err(format!(
+                    "handoff target has no session on {}; its anchor session belongs to origin {origin_root}; create the target there",
+                    self.host_name
+                ));
+            }
+            Some(source.object)
         } else {
             None
         };
@@ -9887,7 +9887,11 @@ impl InProcessDaemon {
                 let host =
                     self.host_registry.host_name_for_node(&origin).await.map(|name| name.to_string()).unwrap_or_else(|| origin.to_string());
                 let result = CommandValue::Error {
-                    message: format!("resource is a replica on {}; its origin is {host} ({origin}). Retry when the origin is reachable, or pass --host {host}", self.host_name),
+                    message: format!(
+                        "resource is a replica on {}; its origin is {host} ({origin}). \
+                         Retry when the origin is reachable",
+                        self.host_name
+                    ),
                 };
                 self.finish_context_free_command(id, empty_identity, result);
                 return Ok(id);
