@@ -44,17 +44,17 @@ use flotilla_resources::{
     change_request_address_with_forges, change_request_record_name, controller::delete_lifecycle_owned_matching, evaluate_crew_completion,
     expected_change_request_leaves, external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas,
     list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec,
-    resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Clock, ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure,
-    ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase,
-    ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource,
-    CredentialSpec, CrewCompletionClaim, CrewCompletionPending, CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec,
-    CrewWorkPhase, Demand as ResourceDemand, DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey,
-    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass,
-    FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope,
-    LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
+    observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
+    ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
+    ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
+    CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
+    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
+    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
+    HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
     Presentation as ResourcePresentation, Project, ProjectSpec, ReadResourceObject, ReplicaReadResolver, Repository, RepositoryIdentity,
     RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject,
@@ -4047,8 +4047,29 @@ impl InProcessDaemon {
     /// Successful lookups are written even when another repository lookup fails;
     /// the first error is returned after those writes.
     pub async fn discover_convoy_branch_subjects(&self, namespace: &str, convoy_name: &str, branch: &str) -> Result<(), String> {
+        self.discover_convoy_branch_subjects_with_resolution(namespace, convoy_name, branch, None).await
+    }
+
+    pub async fn discover_convoy_branch_subjects_with_resolution(
+        &self,
+        namespace: &str,
+        convoy_name: &str,
+        branch: &str,
+        resolution: Option<&Result<Option<ConvoyChangeRequest>, String>>,
+    ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-        let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
+        let convoy = match convoys.get(convoy_name).await {
+            Ok(convoy) => convoy,
+            Err(ResourceError::NotFound { .. })
+                if self.resource_backend.including_replicas::<ResourceConvoy>(namespace).get(convoy_name).await.is_ok() =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let checkout_sources =
+            self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
+        let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
         let forges = self
             .resource_backend
             .definitions::<Forge>(namespace)
@@ -4060,12 +4081,55 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let mut subjects = Vec::new();
         let mut errors = Vec::new();
+        let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
+        for subject in &observed_subjects {
+            if !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject)) {
+                subjects.push((subject.clone(), flotilla_protocol::Relationship::Produces));
+            }
+        }
         for repository in &convoy.spec.repositories {
+            // A checkout observation already identifies this repository's PR.
+            // Reuse that durable fact instead of spending another provider lookup.
+            if observed_subjects.iter().any(|subject| {
+                change_request_address_with_forges(&repository.url, &subject.id, &forges)
+                    .ok()
+                    .and_then(|address| flotilla_protocol::Subject::from_leaf(&address))
+                    .is_some_and(|candidate| candidate == *subject)
+            }) {
+                continue;
+            }
+            match resolution {
+                Some(Ok(Some(request))) if request.repository_key == repository.repo_ref => {
+                    let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
+                    if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
+                        if !convoy
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        {
+                            subjects.push((subject, flotilla_protocol::Relationship::Produces));
+                        }
+                    }
+                    continue;
+                }
+                // The batched lookup covered every repository. A miss or error is
+                // retried by the aggregator; repeating it per repository here
+                // would spend extra provider quota. A match in another repository
+                // falls through to this repository's individual lookup.
+                Some(Ok(None) | Err(_)) => continue,
+                _ => {}
+            }
             match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
                 Ok(Some(request)) => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        subjects.push((subject, flotilla_protocol::Relationship::Produces));
+                        if !convoy
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        {
+                            subjects.push((subject, flotilla_protocol::Relationship::Produces));
+                        }
                     }
                 }
                 Ok(None) => {}

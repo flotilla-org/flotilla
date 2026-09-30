@@ -46,6 +46,14 @@ impl CheckoutSpec {
         }
     }
 
+    pub fn branch(&self) -> &str {
+        match self {
+            Self::Worktree(spec) => &spec.r#ref,
+            Self::FreshClone(spec) => &spec.r#ref,
+            Self::Observed(spec) => &spec.r#ref,
+        }
+    }
+
     pub fn repository_checkout_kind(&self) -> RepositoryCheckoutKind {
         match self {
             Self::Worktree(_) => RepositoryCheckoutKind::Worktree,

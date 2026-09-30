@@ -239,6 +239,39 @@ pub fn expected_checkout_refs(convoy: &crate::ResourceObject<Convoy>) -> Result<
     Ok(expected)
 }
 
+/// Change requests already known through the convoy's expected checkouts.
+/// This is a home-side fact derived from local or replicated checkout evidence.
+pub fn observed_change_request_subjects(
+    convoy: &crate::ResourceObject<Convoy>,
+    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+    forges: &[crate::ForgeSpec],
+) -> Result<Vec<Subject>, String> {
+    let expected = expected_checkout_refs(convoy)?;
+    let mut subjects = Vec::new();
+    for name in expected {
+        let Some(checkout) = checkouts.get(&name) else { continue };
+        if convoy.spec.r#ref.as_deref() != Some(checkout.spec.branch()) {
+            continue;
+        }
+        let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
+            continue;
+        };
+        let repository = convoy
+            .spec
+            .repositories
+            .iter()
+            .find(|repository| repository.repo_ref == *checkout.spec.repo_ref())
+            .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
+        let address = change_request_address_with_forges(&repository.url, &observed.id, forges)?;
+        if let Some(subject) = Subject::from_leaf(&address) {
+            if !subjects.contains(&subject) {
+                subjects.push(subject);
+            }
+        }
+    }
+    Ok(subjects)
+}
+
 /// The one sanction for collecting a convoy's managed checkouts.
 ///
 /// Two controllers can remove a checkout: the checkout authority's
@@ -674,6 +707,10 @@ pub struct DiscoveredSubject {
 }
 
 impl ConvoyStatus {
+    pub fn produces(&self, subject: &Subject) -> bool {
+        self.subjects.iter().any(|entry| &entry.subject == subject && entry.relationship == Relationship::Produces)
+    }
+
     pub fn discover_subject(&mut self, subject: Subject, relationship: Relationship, source: SubjectDiscoverySource, at: DateTime<Utc>) {
         if self.unlinked_subjects.contains(&subject) && source != SubjectDiscoverySource::Operator {
             return;
