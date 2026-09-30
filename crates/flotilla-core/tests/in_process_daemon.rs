@@ -5756,7 +5756,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .expect("legacy grant");
 
     let expected = front.clone().on_forge(&forge).expect("canonical forge identity").key();
-    let host_ref = daemon.local_host_id().expect("local host id").to_string();
+    let host_ref = "host-udder".to_string();
     create_test_host_direct_policy(&daemon.resource_backend(), "governor-host", &host_ref, 1, BTreeSet::from(["codex".to_string()])).await;
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     let host = hosts.get(&host_ref).await.expect("governor host");
@@ -5787,12 +5787,24 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
         .await
         .expect("declare forge after first admission");
+    let forge_repository = daemon.inspect_repository_path(&repo, None).await.expect("resolve Forge repository");
+    let stored = repositories.get(&forge_repository.key().to_string()).await.expect("Forge repository");
+    let alias_first = stored.spec.update_remotes("https://forgejo-manchego/robert/ghostty-ops").expect("observe alias remote");
+    repositories
+        .update(&InputMeta::builder().name(stored.metadata.name.clone()).build(), &stored.metadata.resource_version, &alias_first)
+        .await
+        .expect("record alias first");
     daemon.reconcile_convoy_ensure_now("flotilla", "governor", daemon.as_ref()).await.expect("ensure re-admits after forge sweep");
     let renewed = ensures.get("governor").await.expect("migrated ensure");
     let successor = convoys.get(&renewed.status.expect("ensure status").convoy_ref.expect("successor")).await.expect("second generation");
     assert_eq!(successor.spec.generation, 2);
     assert_eq!(successor.spec.repositories.len(), 1);
     assert_eq!(successor.spec.repositories[0].repo_ref, expected);
+    assert_eq!(successor.spec.repositories[0].url, "https://forgejo.lab.flotilla.work/robert/ghostty-ops");
+    assert_eq!(
+        successor.status.as_ref().expect("admitted status").placement_decision.as_ref().expect("placement").policy_name,
+        "governor-host"
+    );
 
     let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve and sweep identities");
     assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Forge { forge_ref, .. } if forge_ref == "flotilla-lab"));
