@@ -240,6 +240,12 @@ pub(crate) struct CredentialStore {
 }
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
+const GITHUB_APP_MIN_REFRESH_LEAD: Duration = Duration::minutes(15);
+
+fn github_app_refresh_at(issued_at: DateTime<Utc>, expires_at: DateTime<Utc>) -> DateTime<Utc> {
+    let half_life = issued_at + (expires_at - issued_at) / 2;
+    half_life.min(expires_at - GITHUB_APP_MIN_REFRESH_LEAD)
+}
 
 #[derive(Clone)]
 struct GithubAppDelivery {
@@ -247,6 +253,7 @@ struct GithubAppDelivery {
     request: GithubAppMintRequest,
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
+    issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     refresh_failures: usize,
     installation_repository: Option<String>,
@@ -772,6 +779,7 @@ impl CredentialStore {
                         request,
                         runner: Arc::clone(&runner),
                         token_file: github_app_token_file(paths, name),
+                        issued_at: self.clock.now(),
                         expires_at,
                         refresh_failures: 0,
                         installation_repository: match &spec.consumer {
@@ -1145,7 +1153,7 @@ impl CredentialStore {
     /// expiry. The daemon calls this from its host-side periodic loop; vessels
     /// receive only the resulting file and never the App signing material.
     pub(crate) async fn refresh_due_github_app_tokens(&self) -> Vec<CredentialRefreshError> {
-        let refresh_before = self.clock.now() + GITHUB_APP_REFRESH_MARGIN;
+        let now = self.clock.now();
         let deliveries =
             self.github_app_deliveries.lock().await.iter().map(|(key, delivery)| (key.clone(), delivery.clone())).collect::<Vec<_>>();
         let mut errors = Vec::new();
@@ -1168,7 +1176,8 @@ impl CredentialStore {
                 request.repositories = repositories;
                 request.permissions = scope.permissions.clone().or_else(|| delivery.request.permissions.clone());
             }
-            if delivery.expires_at > refresh_before
+            let refresh_at = github_app_refresh_at(delivery.issued_at, delivery.expires_at);
+            if now < refresh_at
                 && request.repositories == delivery.request.repositories
                 && request.permissions == delivery.request.permissions
             {
@@ -1207,13 +1216,21 @@ impl CredentialStore {
                     environment_ref: key.0.clone(),
                     credential_name: Some(key.1.clone()),
                     message: self.refresh_failure_message(&key.1, current.expires_at, &error),
-                    should_surface: (current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
-                        && self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at)
-                        || self.clock.now() >= current.expires_at,
+                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+                        || self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at,
                 });
                 continue;
             }
+            if self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at {
+                errors.push(CredentialRefreshError {
+                    environment_ref: key.0.clone(),
+                    credential_name: Some(key.1.clone()),
+                    message: self.refresh_failure_message(&key.1, current.expires_at, "refresh started inside the expiry margin"),
+                    should_surface: true,
+                });
+            }
             current.expires_at = token.expires_at;
+            current.issued_at = self.clock.now();
             current.refresh_failures = 0;
             current.request = request;
         }
@@ -1260,9 +1277,8 @@ impl CredentialStore {
             return false;
         };
         current.refresh_failures += 1;
-        (current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
-            && self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at)
-            || self.clock.now() >= current.expires_at
+        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
+            || self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -2300,6 +2316,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn github_app_refresh_deadline_keeps_fifteen_minutes_of_lead() {
+        let issued_at: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        assert_eq!(github_app_refresh_at(issued_at, issued_at + Duration::hours(1)), issued_at + Duration::minutes(30));
+        assert_eq!(github_app_refresh_at(issued_at, issued_at + Duration::minutes(20)), issued_at + Duration::minutes(5));
+    }
+
+    #[tokio::test]
+    async fn github_app_refreshes_at_half_life_after_a_stalled_tick() {
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let clock = Arc::new(VirtualClock::new(now));
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { value: "replacement".to_string(), expires_at: now + Duration::hours(2) }),
+                Ok(GithubAppToken { value: "late-replacement".to_string(), expires_at: now + Duration::hours(3) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(RecordingRunner::default());
+        let store = CredentialStore::new_with_github_app_minter(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
+            PathBuf::from("/state"),
+        );
+        store.github_app_deliveries.lock().await.insert(("vessel".to_string(), "github-app".to_string()), GithubAppDelivery {
+            generation: uuid::Uuid::new_v4(),
+            request: GithubAppMintRequest {
+                installation_id: 1,
+                app_id_path: "app-id".to_string(),
+                private_key_path: "key".to_string(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: None,
+            },
+            runner,
+            token_file: PathBuf::from("/state/credentials/github-app/token"),
+            issued_at: now,
+            expires_at: now + Duration::hours(1),
+            refresh_failures: 0,
+            installation_repository: None,
+            scope: None,
+        });
+        clock.advance(Duration::minutes(29));
+        assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        assert!(minter.requests.lock().expect("requests lock").is_empty());
+        clock.advance(Duration::minutes(11)); // The scheduler missed the exact half-life tick.
+        assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        assert_eq!(minter.requests.lock().expect("requests lock").len(), 1, "refresh before the five-minute expiry margin");
+        clock.advance(Duration::minutes(76));
+        let errors = store.refresh_due_github_app_tokens().await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].should_surface, "a successful but late refresh still needs attention");
+        assert!(errors[0].message.contains("refresh started inside the expiry margin"));
+        assert!(errors[0].message.contains("expires in 4 minutes"));
+        clock.advance(Duration::minutes(60));
+        let errors = store.refresh_due_github_app_tokens().await;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].should_surface, "one failed refresh within the expiry margin needs attention immediately");
+    }
+
     #[tokio::test]
     async fn github_app_mint_uses_resolved_permissions_for_each_crew() {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
@@ -3322,7 +3401,7 @@ interactions:
         store.adopt_github_app_deliveries("standing-vessel", &refs, &scopes, runner.clone()).await.expect("re-adopt standing vessel");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 5, "startup adoption retries and rebuilds the registration");
 
-        clock.advance(Duration::minutes(115));
+        clock.advance(Duration::minutes(60));
         let first_failure = store.refresh_due_github_app_tokens().await;
         assert_eq!(first_failure.len(), 1);
         assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");

@@ -638,6 +638,7 @@ impl DaemonRuntime {
                 runtime_health.clone(),
                 options.heartbeat_interval,
             ),
+            spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
@@ -2611,20 +2612,29 @@ fn spawn_heartbeat_task_with_credentials(
         let health = health.clone();
         let runtime_health = runtime_health.clone();
         async move {
-            if let Some(store) = credential_store.as_ref().as_ref() {
-                let errors = store.refresh_due_github_app_tokens().await;
-                for error in &errors {
-                    warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
-                }
-                if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors).await {
-                    warn!(%status_error, "failed to reconcile credential refresh attention");
-                }
-            }
             if let Err(err) =
                 apply_host_heartbeat_with_credentials(&daemon, &namespace, &profile, credential_store.as_deref(), &health, &runtime_health)
                     .await
             {
                 warn!(%err, "failed to publish host heartbeat");
+            }
+        }
+    })
+}
+
+/// Credential rotation must keep running even when a host heartbeat is slow.
+fn spawn_credential_refresh_task(daemon: Arc<InProcessDaemon>, namespace: String, store: Arc<CredentialStore>) -> JoinHandle<()> {
+    spawn_periodic_task(Duration::from_secs(30), PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        let store = Arc::clone(&store);
+        async move {
+            let errors = store.refresh_due_github_app_tokens().await;
+            for error in &errors {
+                warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
+            }
+            if let Err(status_error) = reconcile_credential_refresh_attention(&daemon, &namespace, &errors).await {
+                warn!(%status_error, "failed to reconcile credential refresh attention");
             }
         }
     })
