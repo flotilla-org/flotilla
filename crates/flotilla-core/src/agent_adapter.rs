@@ -197,7 +197,7 @@ fn build_crew_brief_with_options(
         CrewAssignment::Unassigned if options.is_standing =>
             "No task was provided for this turn. Check `## Human instruction` below if present; otherwise yield at the turn boundary and wait for work.",
         CrewAssignment::Unassigned =>
-            "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
+            "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise run `flotilla crew stall --reason decision --message 'No assignment was provided'` rather than inventing work.",
     };
     let mut content = render_crew_brief_template(options, &CrewBriefTemplateContext {
         role,
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("Crews never enact failure"));
         assert!(content.contains("--propose <resume|reduce-scope|fail>"));
-        assert!(!content.contains("flotilla crew fail --message"));
+        assert!(!content.contains("crew fail"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
         insta::assert_snapshot!("dispatched_crew_brief", content);
     }
@@ -1187,7 +1187,7 @@ mod tests {
             .expect("render variant")
             .content;
             assert!(content.contains("--propose <resume|reduce-scope|fail>"), "{template}");
-            assert!(!content.contains("flotilla crew fail --message"), "{template}");
+            assert!(!content.contains("crew fail"), "{template}");
         }
     }
 
@@ -1532,6 +1532,8 @@ mod tests {
         let content = brief_for(CrewAssignment::Unassigned);
         assert!(content.contains("No assignment was provided with this dispatch."));
         assert!(content.contains("rather than inventing work"));
+        assert!(content.contains("flotilla crew stall --reason decision"));
+        assert!(!content.contains("crew fail"));
     }
 
     #[test]
