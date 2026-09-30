@@ -3268,6 +3268,7 @@ fn resource_field_ownership_condition(diagnostics: Option<&flotilla_resources::R
                 if violations.len() == 1 { "" } else { "s" }
             ))
             .observed_at(Utc::now())
+            .blocks_readiness(false)
             .build(),
     )
 }
@@ -10469,6 +10470,27 @@ mod tests {
         assert_eq!(condition.reason, "StoredEventDecodeFailed");
         assert!(condition.message.contains("CredentialSpec/forgejo-token@17"), "unexpected diagnosis: {}", condition.message);
         assert!(condition.message.contains("missing field `username`"), "unexpected diagnosis: {}", condition.message);
+    }
+
+    #[test]
+    fn field_ownership_violation_degrades_without_blocking_admission() {
+        let now = Utc::now();
+        let mut diagnostics = flotilla_resources::ResourceStoreDiagnostics::default();
+        diagnostics.field_ownership_violations.push(
+            flotilla_resources::FieldOwnershipViolation::builder()
+                .kind("PlacementPolicy".to_string())
+                .namespace("flotilla".to_string())
+                .name("docker".to_string())
+                .writer(flotilla_resources::WriterIdentity::operator())
+                .field("spec.docker_per_vessel.host_ref".to_string())
+                .attempted_value(serde_json::json!("other-host"))
+                .rule("spec.docker_per_vessel.host_ref is owned by ReconcileLoop".to_string())
+                .observed_at(now)
+                .build(),
+        );
+        let condition = resource_field_ownership_condition(Some(&diagnostics)).expect("violation must be diagnosed");
+        assert_eq!(condition.value, ConditionValue::False);
+        assert!(!condition.blocks_readiness(), "historical rejected writes must not block admission");
     }
 
     fn insert_undecodable_resource<T: Resource>(connection: &rusqlite::Connection, name: &str) {

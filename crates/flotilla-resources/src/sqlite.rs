@@ -18,7 +18,8 @@ use crate::{
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{
-        EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, MAX_FIELD_OWNERSHIP_VIOLATIONS,
+        EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics,
+        FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS,
     },
     watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
     FieldOwnershipViolation,
@@ -508,6 +509,10 @@ impl SqliteBackend {
                 Ok(ResourceEventDecodeQuarantine { kind, namespace, name, event_version, error, quarantined_at })
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;
+        let cutoff = (Utc::now() - chrono::Duration::hours(FIELD_OWNERSHIP_VIOLATION_TTL_HOURS)).to_rfc3339();
+        connection
+            .execute("DELETE FROM field_ownership_violations WHERE unixepoch(observed_at) < unixepoch(?1)", [cutoff])
+            .map_err(|err| Self::map_sqlite(err, "expire field ownership violations"))?;
         let mut statement = connection
             .prepare("SELECT body_json FROM field_ownership_violations ORDER BY id")
             .map_err(|err| Self::map_sqlite(err, "prepare field ownership violation diagnostics"))?;
@@ -1934,6 +1939,38 @@ mod tests {
 
     use super::*;
     use crate::{Environment, EnvironmentSpec, InputMeta};
+
+    #[tokio::test]
+    async fn field_ownership_diagnostics_expire_old_violations() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("resources.sqlite");
+        let backend = SqliteBackend::open(&path).expect("sqlite backend");
+        let old = Utc::now() - chrono::Duration::days(2);
+        for (name, observed_at) in [("old", old), ("recent", Utc::now())] {
+            backend
+                .record_field_ownership_violation(
+                    FieldOwnershipViolation::builder()
+                        .kind("PlacementPolicy".to_string())
+                        .namespace("flotilla".to_string())
+                        .name(name.to_string())
+                        .writer(crate::WriterIdentity::operator())
+                        .field("spec.docker_per_vessel.host_ref".to_string())
+                        .attempted_value(serde_json::json!("wrong"))
+                        .rule("owned by ReconcileLoop".to_string())
+                        .observed_at(observed_at)
+                        .build(),
+                )
+                .await
+                .expect("record violation");
+        }
+
+        let diagnostics = backend.diagnostics().await.expect("diagnostics");
+        assert_eq!(diagnostics.field_ownership_violations.len(), 1);
+        assert_eq!(diagnostics.field_ownership_violations[0].name, "recent");
+        let connection = RusqliteConnection::open(&path).expect("sqlite connection");
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM field_ownership_violations", [], |row| row.get(0)).expect("count rows");
+        assert_eq!(count, 1, "expired rows should be removed from SQLite");
+    }
 
     #[tokio::test]
     async fn quarantine_only_delete_refuses_a_concurrently_created_live_object() {

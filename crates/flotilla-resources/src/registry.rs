@@ -1213,7 +1213,7 @@ async fn apply_owned_typed<T: FieldOwnedResource>(
     let object = match resolver.get(&metadata.name).await {
         Ok(existing) => {
             let meta = metadata.input_meta_for_update(&existing.metadata);
-            resolver.write_spec(&WriterIdentity::operator(), &meta, &existing.metadata.resource_version, &spec).await?
+            resolver.write_spec_rejecting_violations(&WriterIdentity::operator(), &meta, &existing.metadata.resource_version, &spec).await?
         }
         Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
         Err(error) => return Err(error),

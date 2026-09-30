@@ -593,9 +593,38 @@ impl<T: FieldOwnedResource> TypedResolver<T> {
         resource_version: &str,
         requested: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
+        self.write_spec_with_enforcement(writer, meta, resource_version, requested, T::OWNERSHIP_ENFORCEMENT).await
+    }
+
+    pub(crate) async fn write_spec_rejecting_violations(
+        &self,
+        writer: &WriterIdentity,
+        meta: &InputMeta,
+        resource_version: &str,
+        requested: &T::Spec,
+    ) -> Result<ResourceObject<T>, ResourceError> {
+        self.write_spec_with_enforcement(writer, meta, resource_version, requested, OwnershipEnforcement::Enforce).await
+    }
+
+    async fn write_spec_with_enforcement(
+        &self,
+        writer: &WriterIdentity,
+        meta: &InputMeta,
+        resource_version: &str,
+        requested: &T::Spec,
+        enforcement: OwnershipEnforcement,
+    ) -> Result<ResourceObject<T>, ResourceError> {
         let current = self.get(&meta.name).await?;
         let (merged, violations) = merge_owned_spec::<T>(&current.spec, requested, writer, &self.namespace, &meta.name)?;
-        for violation in &violations {
+        self.record_field_ownership_violations(&violations).await?;
+        if !violations.is_empty() && enforcement == OwnershipEnforcement::Enforce {
+            return Err(ResourceError::FieldOwnership { violations });
+        }
+        self.update(meta, resource_version, &merged).await
+    }
+
+    pub(crate) async fn record_field_ownership_violations(&self, violations: &[FieldOwnershipViolation]) -> Result<(), ResourceError> {
+        for violation in violations {
             tracing::warn!(
                 kind = %violation.kind,
                 namespace = %violation.namespace,
@@ -608,9 +637,6 @@ impl<T: FieldOwnedResource> TypedResolver<T> {
             );
             self.backend.record_field_ownership_violation(violation.clone()).await?;
         }
-        if !violations.is_empty() && T::OWNERSHIP_ENFORCEMENT == OwnershipEnforcement::Enforce {
-            return Err(ResourceError::FieldOwnership { violations });
-        }
-        self.update(meta, resource_version, &merged).await
+        Ok(())
     }
 }
