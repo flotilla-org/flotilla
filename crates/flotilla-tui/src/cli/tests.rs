@@ -16,6 +16,37 @@ fn crew_follow_up_result_tells_the_crew_to_complete_again() {
 }
 
 #[test]
+fn resource_human_output_names_each_record_origin() {
+    use flotilla_protocol::{ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType};
+
+    let response = ResourceReadEnvelope {
+        api_version: "flotilla.work/v1".to_string(),
+        resource_kind: "Convoy".to_string(),
+        plural: "convoys".to_string(),
+        namespace: "flotilla".to_string(),
+        cursor: ResourceCursor::from_position("1", None),
+        records: vec![
+            ResourceReadRecord {
+                record_type: ResourceRecordType::Current,
+                provenance: ResourceRecordProvenance::Local { node_id: NodeId::new("kiwi-root") },
+                object: Some(serde_json::json!({"metadata": {"name": "local"}})),
+            },
+            ResourceReadRecord {
+                record_type: ResourceRecordType::Current,
+                provenance: ResourceRecordProvenance::Replica {
+                    origin_root: NodeId::new("feta-root"),
+                    last_synced_at: "2026-09-30T00:00:00Z".to_string(),
+                },
+                object: Some(serde_json::json!({"metadata": {"name": "remote"}})),
+            },
+        ],
+    };
+    let output = format_command_result(&CommandValue::ResourceRead(Box::new(response)));
+    assert!(output.contains("Convoy/flotilla/local origin: kiwi-root"), "{output}");
+    assert!(output.contains("Convoy/flotilla/remote origin: feta-root"), "{output}");
+}
+
+#[test]
 fn fulfilment_list_distinguishes_image_and_host_model_support() {
     let make = |name: &str, realisation: &str, version: &str, usable: bool| flotilla_protocol::FulfilmentRow {
         name: name.to_string(),

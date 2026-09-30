@@ -1213,6 +1213,81 @@ async fn operator_can_remove_a_wrong_repository_remote_without_deleting_the_reco
 }
 
 #[tokio::test]
+async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
+    let authority_temp = tempfile::tempdir().expect("authority tempdir");
+    let replica_temp = tempfile::tempdir().expect("replica tempdir");
+    let authority =
+        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
+            .await;
+    let replica =
+        InProcessDaemon::new(vec![], test_config_store(replica_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
+            .await;
+    let origin = authority.node_id().clone();
+    let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
+    convoys
+        .create(
+            &InputMeta::builder().name("remote-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy at authority");
+    let snapshot = convoys.list().await.expect("authority snapshot");
+    replica
+        .resource_backend()
+        .replica_writer::<ResourceConvoy>(origin.clone(), "flotilla")
+        .replace(&snapshot, chrono::Utc::now())
+        .await
+        .expect("replicate convoy");
+
+    let mut events = replica.subscribe();
+    let command_id = replica
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    name: "remote-convoy".to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("submit delete");
+    let result = recv_command_finished(&mut events, command_id).await;
+    assert!(
+        matches!(result, CommandValue::Error { ref message } if message.contains(origin.as_str())),
+        "a replica delete must identify its origin: {result:?}"
+    );
+    assert!(convoys.get("remote-convoy").await.is_ok(), "authority record must remain");
+    assert!(
+        replica.resource_backend().including_replicas::<ResourceConvoy>("flotilla").get("remote-convoy").await.is_ok(),
+        "replica must remain visible"
+    );
+
+    for action in [
+        CommandAction::ResourceStatusPatch {
+            namespace: "flotilla".to_string(),
+            kind: "convoys".to_string(),
+            name: "remote-convoy".to_string(),
+            status: serde_json::json!({}),
+        },
+        CommandAction::ResourceApply {
+            namespace: "flotilla".to_string(),
+            document: serde_json::json!({
+                "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": {"name": "remote-convoy"}, "spec": {}
+            }),
+        },
+    ] {
+        let command_id = replica.execute(Command::builder().action(action).build()).await.expect("submit mutation");
+        let result = recv_command_finished(&mut events, command_id).await;
+        assert!(
+            matches!(result, CommandValue::Error { ref message } if message.contains(origin.as_str())),
+            "a replica mutation must identify its origin: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn orphaned_authority_record_can_be_collected_from_the_replica_store() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =
@@ -7100,6 +7175,102 @@ async fn cancel_nonexistent_command_returns_error() {
     let result = daemon.cancel(999).await;
     assert!(result.is_err(), "cancelling a non-existent command should fail");
     assert!(result.unwrap_err().contains("no matching active command"), "error should mention no matching active command");
+}
+
+#[tokio::test]
+async fn convoy_resume_finds_a_terminal_session_on_another_host() {
+    let authority_temp = tempfile::tempdir().expect("authority tempdir");
+    let terminal_temp = tempfile::tempdir().expect("terminal tempdir");
+    let authority =
+        InProcessDaemon::new(vec![], test_config_store(authority_temp.path().join("config")), fake_discovery(false), HostName::new("feta"))
+            .await;
+    let terminal_host =
+        InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
+            .await;
+    let convoys = authority.resource_backend().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &InputMeta::builder().name("split-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    convoys
+        .update_status("split-convoy", &created.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([(
+                    "coder".to_string(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark completed crew work");
+    let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder()
+                .name("split-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "split-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("remote-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: "brief".to_string(),
+                        content: "Initial".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "split-convoy".to_string(),
+                        vessel_ref: "work-vessel".to_string(),
+                    }),
+                    message: None,
+                })
+                .cwd("/workspace".to_string())
+                .pool("fake-terminals".to_string())
+                .build(),
+        )
+        .await
+        .expect("create terminal at placement host");
+    authority
+        .resource_backend()
+        .replica_writer::<TerminalSession>(terminal_host.node_id().clone(), "flotilla")
+        .replace(&sessions.list().await.expect("session snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate terminal session");
+
+    let outcome = authority
+        .convoy_resume_internal("flotilla", "split-convoy", "Continue", Some("work"), Some("coder"))
+        .await
+        .expect("resume remote crew session");
+    assert!(matches!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { .. }));
+    let convoy = convoys.get("split-convoy").await.expect("convoy after resume");
+    assert!(convoy.status.expect("convoy status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    assert!(authority.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("local sessions").items.is_empty());
+    terminal_host
+        .resource_backend()
+        .replica_writer::<ResourceConvoy>(authority.node_id().clone(), "flotilla")
+        .replace(&convoys.list().await.expect("convoy snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate pending turn");
+    terminal_host.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at session origin");
+    let session = sessions.get("split-session").await.expect("session after delivery");
+    let TerminalSessionSource::Agent { message, .. } = session.spec.source else { panic!("agent session expected") };
+    let message = message.expect("queued remote turn");
+    assert!(message.text.contains("Continue"));
+    assert!(matches!(message.sender, flotilla_resources::CrewMessageSender::OperatorResume { .. }));
 }
 
 #[tokio::test]

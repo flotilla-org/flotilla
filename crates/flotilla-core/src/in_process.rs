@@ -7913,8 +7913,16 @@ impl InProcessDaemon {
         if namespace != provisioning_namespace {
             return Err(format!("crew namespace `{namespace}` is not served by this daemon"));
         }
-        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace);
-        let session_list = sessions.list().await.map_err(|err| err.to_string())?.items;
+        let session_list = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .map(|source| source.object)
+            .collect::<Vec<_>>();
 
         if let Some(crew_id) = requested.crew_id.as_deref() {
             let session = session_list
@@ -7985,7 +7993,13 @@ impl InProcessDaemon {
         let vessel_ref = routing.command_context.vessel_ref.as_ref().expect("routing context always has vessel ref").clone();
         let role = routing.command_context.role.as_ref().expect("routing context always has role").clone();
         let caller = match routing.session_name.as_ref() {
-            Some(name) => self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).get(name).await.ok(),
+            Some(name) => self
+                .resource_backend
+                .including_replicas::<ResourceTerminalSession>(&namespace)
+                .get(name)
+                .await
+                .ok()
+                .map(|source| source.object),
             None => None,
         };
         self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
@@ -8047,7 +8061,8 @@ impl InProcessDaemon {
         caller_role: String,
         caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
     ) -> Result<ResolvedCrewContext, String> {
-        let workspace = self.resource_backend.clone().using::<Vessel>(&namespace).get(&vessel_ref).await.map_err(|err| err.to_string())?;
+        let workspace =
+            self.resource_backend.including_replicas::<Vessel>(&namespace).get(&vessel_ref).await.map_err(|err| err.to_string())?.object;
         if workspace.spec.convoy_ref != convoy {
             return Err(format!("vessel `{vessel_ref}` does not belong to convoy `{convoy}`"));
         }
@@ -8071,14 +8086,15 @@ impl InProcessDaemon {
             .and_then(|status| status.workflow_snapshot.as_ref())
             .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
             .ok_or_else(|| format!("vessel `{}` is missing from convoy `{}`", context.vessel, context.convoy))?;
-        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
-        let by_role: HashMap<_, _> = sessions
+        let by_role: HashMap<_, _> = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&context.namespace)
             .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
             .await
             .map_err(|err| err.to_string())?
             .items
             .into_iter()
-            .map(|session| (session.spec.role.clone(), session))
+            .map(|session| (session.object.spec.role.clone(), session.object))
             .collect();
         let credential_alerts = self
             .resource_backend
@@ -8888,11 +8904,17 @@ impl InProcessDaemon {
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
-        let target_session = match sessions.get(&terminal_name).await {
-            Ok(session) => Some(session),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error.to_string()),
-        };
+        let target_source =
+            match self.resource_backend.including_replicas::<ResourceTerminalSession>(&context.namespace).get(&terminal_name).await {
+                Ok(session) => Some(session),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+        let target_origin = target_source.as_ref().and_then(|session| match &session.provenance {
+            ResourceProvenance::Replica { origin_root, .. } => Some(origin_root.clone()),
+            ResourceProvenance::Local => None,
+        });
+        let target_session = target_source.map(|session| session.object);
         if target_session
             .as_ref()
             .and_then(|session| session.status.as_ref())
@@ -8904,14 +8926,25 @@ impl InProcessDaemon {
             Some(if let Some(caller) = context.caller_session.as_ref() {
                 caller.clone()
             } else {
-                sessions
+                let mut sources = self
+                    .resource_backend
+                    .including_replicas::<ResourceTerminalSession>(&context.namespace)
                     .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
                     .await
                     .map_err(|error| error.to_string())?
-                    .items
+                    .items;
+                sources.sort_by_key(|source| !matches!(source.provenance, ResourceProvenance::Local));
+                let source = sources
                     .into_iter()
                     .next()
-                    .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?
+                    .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?;
+                if let ResourceProvenance::Replica { origin_root, .. } = source.provenance {
+                    return Err(format!(
+                        "handoff target has no session on {}; its anchor session belongs to origin {origin_root}; create the target there",
+                        self.host_name
+                    ));
+                }
+                source.object
             })
         } else {
             None
@@ -8933,6 +8966,32 @@ impl InProcessDaemon {
         .map_err(|err| err.to_string())?;
         if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
+        }
+        if target_origin.is_some() {
+            let turn = flotilla_resources::PendingSupervisorTurn {
+                vessel: context.vessel.clone(),
+                role: target.to_string(),
+                message: TerminalCrewMessage {
+                    id: format!("crew-handoff:{}", uuid::Uuid::new_v4().simple()),
+                    text: frame_crew_message(&sender, message),
+                    sender,
+                    delivery: CrewMessageDelivery::Queued,
+                },
+            };
+            if let Err(error) =
+                apply_resource_status_patch(&convoys, &context.convoy, &ConvoyStatusPatch::QueueSupervisorTurn { turn }).await
+            {
+                return Err(self
+                    .restore_crew_work_after_delivery_failure(
+                        &convoys,
+                        &context.convoy,
+                        &reopened.metadata.resource_version,
+                        &previous_status,
+                        error.to_string(),
+                    )
+                    .await);
+            }
+            return Ok(());
         }
         self.reconcile_or_restore_crew_work(
             &context.namespace,
@@ -9109,7 +9168,9 @@ impl InProcessDaemon {
             .map(|state| state.phase)
             .expect("selected candidate has crew work");
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
-        let session = sessions
+        let session = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(namespace)
             .list_matching_labels(&BTreeMap::from([
                 (CONVOY_LABEL.to_string(), name.to_string()),
                 (VESSEL_LABEL.to_string(), vessel.clone()),
@@ -9119,7 +9180,7 @@ impl InProcessDaemon {
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
         let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
-            session.status.as_ref().is_some_and(|status| {
+            session.object.status.as_ref().is_some_and(|status| {
                 status.phase == ResourceTerminalSessionPhase::Running
                     && status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
             })
@@ -9147,7 +9208,7 @@ impl InProcessDaemon {
         let displaced =
             status.pending_brief().filter(|brief| brief.vessel == vessel && brief.role == role).map(|brief| brief.content.clone());
         let session = session?.ok_or_else(|| format!("crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
-        if session.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
+        if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
         }
         let reopened = apply_resource_status_patch(
@@ -9157,6 +9218,31 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|err| err.to_string())?;
+        if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
+            let turn = flotilla_resources::PendingSupervisorTurn {
+                vessel,
+                role,
+                message: TerminalCrewMessage {
+                    id: format!("operator-resume:{}", uuid::Uuid::new_v4().simple()),
+                    text: frame_crew_message(&sender, prompt),
+                    sender,
+                    delivery: CrewMessageDelivery::Queued,
+                },
+            };
+            if let Err(error) = apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueSupervisorTurn { turn }).await {
+                return Err(self
+                    .restore_crew_work_after_delivery_failure(
+                        &convoys,
+                        name,
+                        &reopened.metadata.resource_version,
+                        status,
+                        error.to_string(),
+                    )
+                    .await);
+            }
+            return Ok(ConvoyResumeOutcome::Queued { displaced });
+        }
+        let session = session.object;
         self.reconcile_or_restore_crew_work(namespace, &session.spec.env_ref, &convoys, name, status.clone(), &reopened).await?;
         let delivery_result: Result<(), String> = async {
             match session.status.as_ref().map(|status| status.phase) {
@@ -9576,6 +9662,35 @@ impl InProcessDaemon {
         hosts
     }
 
+    /// The home root of an existing resource addressed by a mutation. New
+    /// resources have no origin yet and are authored by the selected host.
+    pub async fn resource_mutation_origin(&self, action: &flotilla_protocol::CommandAction) -> Result<Option<NodeId>, String> {
+        use flotilla_protocol::CommandAction;
+
+        let target = match action {
+            CommandAction::ResourceDelete { namespace, kind, name, replica_origin: None }
+            | CommandAction::ResourceStatusPatch { namespace, kind, name, .. }
+            | CommandAction::ResourceManifestResolve { namespace, kind, name, .. }
+            | CommandAction::ResourceReconcileNow { namespace, kind, name } => Some((namespace.as_str(), kind.as_str(), name.as_str())),
+            CommandAction::RepositoryRemoteRemove { namespace, name, .. } => Some((namespace.as_str(), "Repository", name.as_str())),
+            CommandAction::ResourceApply { namespace, document } => match (
+                document.get("kind").and_then(serde_json::Value::as_str),
+                document.pointer("/metadata/name").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(kind), Some(name)) => Some((namespace.as_str(), kind, name)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((namespace, kind, name)) = target else { return Ok(None) };
+        let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
+            Ok(object) => object,
+            Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        Ok(object.value.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(serde_json::Value::as_str).map(NodeId::new))
+    }
+
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
         self.attach_resolver().route_remote_attach_binding(binding).await
     }
@@ -9723,6 +9838,8 @@ impl InProcessDaemon {
         result
     }
 
+    // This executor has many async arms. Box substantial nested futures below
+    // so their combined state fits on the default Tokio test-thread stack.
     async fn execute_impl(
         &self,
         command: Command,
@@ -9762,6 +9879,19 @@ impl InProcessDaemon {
                 result,
             });
             return Ok(id);
+        }
+
+        if let Some(origin) = Box::pin(self.resource_mutation_origin(&command.action)).await? {
+            if origin != self.node_id {
+                let empty_identity = self.start_context_free_command(id, command.description().to_string());
+                let host =
+                    self.host_registry.host_name_for_node(&origin).await.map(|name| name.to_string()).unwrap_or_else(|| origin.to_string());
+                let result = CommandValue::Error {
+                    message: format!("resource is a replica on {}; its origin is {host} ({origin}). Retry when the origin is reachable, or pass --host {host}", self.host_name),
+                };
+                self.finish_context_free_command(id, empty_identity, result);
+                return Ok(id);
+            }
         }
 
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
@@ -9984,7 +10114,7 @@ impl InProcessDaemon {
 
         if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match self.crew_handoff_internal(context, target, message).await {
+            let result = match Box::pin(self.crew_handoff_internal(context, target, message)).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
@@ -9997,16 +10127,15 @@ impl InProcessDaemon {
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
             let result = match resolve_local_convoy_name(&self.resource_backend, &namespace, name).await {
                 Ok(record_name) => {
-                    match self
-                        .convoy_resume_with_sender_internal(
-                            &namespace,
-                            &record_name,
-                            prompt,
-                            vessel.as_deref(),
-                            role.as_deref(),
-                            CrewMessageSender::OperatorResume { principal: dispatching_principal_ref.clone() },
-                        )
-                        .await
+                    match Box::pin(self.convoy_resume_with_sender_internal(
+                        &namespace,
+                        &record_name,
+                        prompt,
+                        vessel.as_deref(),
+                        role.as_deref(),
+                        CrewMessageSender::OperatorResume { principal: dispatching_principal_ref.clone() },
+                    ))
+                    .await
                     {
                         Ok(ConvoyResumeOutcome::Delivered { displaced }) => {
                             self.record_lifecycle_mutation_best_effort(&namespace, &record_name, "convoy_resume", caller.as_ref(), false)
@@ -10045,7 +10174,7 @@ impl InProcessDaemon {
             &command.action
         {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let routing = self.resolve_crew_routing_context(context).await.ok();
+            let routing = Box::pin(self.resolve_crew_routing_context(context)).await.ok();
             let result = match self
                 .crew_complete_as_principal_internal(
                     context,
