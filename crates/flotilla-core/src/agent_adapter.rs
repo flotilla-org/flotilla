@@ -829,6 +829,8 @@ async fn seed_codex_workspace_trust(
     }
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
+    // Preserve existing settings, including legacy keys written by older crews.
+    // Codex owns their interpretation; Flotilla only writes trust and its hook.
     let needs_notify = contained
         && document.get("notify").and_then(Item::as_array).is_none_or(|array| {
             array.iter().map(|entry| entry.as_str()).ne(crate::agents::CODEX_NOTIFY_COMMAND.iter().map(|entry| Some(*entry)))
@@ -1984,7 +1986,7 @@ mod tests {
             .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
             .expect("contained Codex launch");
         assert!(plan.command.contains("--no-daemon"));
-        assert!(!plan.command.contains("-c"));
+        assert!(!plan.command.contains(" -c "));
 
         let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
