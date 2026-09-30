@@ -9434,9 +9434,12 @@ impl InProcessDaemon {
             .items
             .into_iter()
             .find(|session| matches!(session.provenance, ResourceProvenance::Replica { .. }));
-        if !(matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaEscalation { .. })
-            || matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaNudge) && remote.is_some())
-        {
+        let may_queue = match &request.sender {
+            flotilla_resources::CrewMessageSender::FlotillaEscalation { .. } => true,
+            flotilla_resources::CrewMessageSender::FlotillaNudge => remote.is_some(),
+            _ => false,
+        };
+        if !may_queue {
             return Err(format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role));
         }
         let plan = if let Some(remote) = remote {

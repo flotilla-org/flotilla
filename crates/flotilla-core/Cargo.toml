@@ -47,6 +47,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = "0.2"
 
 [dev-dependencies]
+# Unit tests use VesselReconciler's actuation with InProcessDaemon's private delivery path.
+# This test boundary only exchanges flotilla-resources types with the controller crate.
 flotilla-controllers = { path = "../flotilla-controllers" }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
