@@ -39,7 +39,9 @@ Use `flotilla artifact put --kind <kind> --about <subject> --summary key=value <
 - **Alternative:** the alternative you considered
 - **If asking were free:** what you would have asked
 
-Run `flotilla artifact put --kind decision-ledger <path>`; the daemon reads and validates the file, and projects a PR comment when a change request is bound. Keep the file outside the repository. Then run `flotilla crew complete ...`. A completion without this artifact is refused; only an operator may override it with `--force`.{% endif %}
+Run `flotilla artifact put --kind decision-ledger <path>`; the daemon reads and validates the file, and projects a PR comment when a change request is bound. Keep the file outside the repository. Then run `flotilla crew complete ...`. A completion without this artifact is refused; only an operator may override it with `--force`.
+
+If artifact put fails during PR comment projection, treat it as a settlement flag rather than a stall. Post the same `## Decision ledger` file as a PR comment using `gh pr comment --body-file <path>` for GitHub, report the comment URL, and ask the operator to force completion. Never pass a file path as the comment body.{% endif %}
 
 ## Assignment
 

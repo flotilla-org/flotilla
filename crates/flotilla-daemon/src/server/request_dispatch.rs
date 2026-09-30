@@ -27,6 +27,23 @@ fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
     }
 }
 
+// Execute gh in the crew environment, where the repository-scoped credential
+// is staged. The token stays in that process and never enters daemon memory.
+const GITHUB_LEDGER_API: &str = r#"set -eu
+if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+  echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+  exit 1
+fi
+GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+if [ -z "$GH_TOKEN" ]; then
+  echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+  exit 1
+fi
+export GH_TOKEN
+unset GITHUB_TOKEN
+exec gh api "$@"
+"#;
+
 async fn project_decision_ledger(
     backend: &ResourceBackend,
     namespace: &str,
@@ -60,8 +77,15 @@ async fn project_decision_ledger(
     // The comment itself records the projection identity. If the forge accepts a
     // POST but its response or the artifact write is lost, a retry can find it.
     let existing = if service == "github.com" {
-        let listing =
-            runner.run("gh", &["api", &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"], cwd, &ChannelLabel::Default).await?;
+        let listing = runner
+            .run(
+                "sh",
+                &["-c", GITHUB_LEDGER_API, "github-ledger-list", &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"],
+                cwd,
+                &ChannelLabel::Default,
+            )
+            .await
+            .map_err(|error| format!("GitHub ledger comment lookup failed: {error}"))?;
         serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&listing)
             .map_err(|error| format!("parse ledger comments: {error}"))?
             .into_iter()
@@ -108,7 +132,16 @@ curl --fail-with-body --silent --show-error \
     }
     let input = serde_json::to_vec(&serde_json::json!({ "body": format!("{text}\n{marker}") })).map_err(|error| error.to_string())?;
     let response = if service == "github.com" {
-        runner.run_with_input("gh", &["api", "--method", "POST", &endpoint, "--input", "-"], cwd, &ChannelLabel::Default, &input).await?
+        runner
+            .run_with_input(
+                "sh",
+                &["-c", GITHUB_LEDGER_API, "github-ledger-post", "--method", "POST", &endpoint, "--input", "-"],
+                cwd,
+                &ChannelLabel::Default,
+                &input,
+            )
+            .await
+            .map_err(|error| format!("GitHub ledger comment post failed: {error}"))?
     } else {
         // The scoped Forgejo credential is staged in the crew environment.
         // The daemon supplies the JSON body on stdin and never reads the token.
@@ -253,7 +286,8 @@ impl<'a> RequestDispatcher<'a> {
                             runner.as_ref(),
                             Path::new(&session.spec.cwd),
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
                         if let Some(comment_url) = comment_url {
                             summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url));
                         }
@@ -274,7 +308,10 @@ impl<'a> RequestDispatcher<'a> {
                         .await?;
                     match target {
                         Some(target) if target.node_id != *self.daemon.node_id() => {
-                            let (name, spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
+                            let (name, spec, owner) = service
+                                .prepare_put(caller, input, &settings.artifact_retention_days)
+                                .await
+                                .map_err(|error| format!("artifact storage failed: {error}"))?;
                             let digest = spec.digest.clone();
                             let document = serde_json::json!({
                                 "apiVersion": "flotilla.work/v1",
@@ -294,7 +331,8 @@ impl<'a> RequestDispatcher<'a> {
                                     },
                                     Some(self.caller.clone()),
                                 )
-                                .await?;
+                                .await
+                                .map_err(|error| format!("artifact storage dispatch failed: {error}"))?;
                             let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                                 loop {
                                     match events.recv().await {
@@ -314,12 +352,15 @@ impl<'a> RequestDispatcher<'a> {
                                     view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
                                     digest,
                                 }),
-                                CommandValue::Error { message } => Err(message),
+                                CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
                                 other => Err(format!("unexpected artifact home result: {other:?}")),
                             }
                         }
                         Some(_) => {
-                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
+                            let object = service
+                                .put(caller, input, &settings.artifact_retention_days)
+                                .await
+                                .map_err(|error| format!("artifact storage failed: {error}"))?;
                             Ok(Response::ArtifactPut {
                                 address: format!("artifact/{}", object.metadata.name),
                                 view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
@@ -330,7 +371,10 @@ impl<'a> RequestDispatcher<'a> {
                             if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
                                 return Err("convoy home is unavailable for artifact put".to_string());
                             }
-                            let object = service.put(caller, input, &settings.artifact_retention_days).await?;
+                            let object = service
+                                .put(caller, input, &settings.artifact_retention_days)
+                                .await
+                                .map_err(|error| format!("artifact storage failed: {error}"))?;
                             Ok(Response::ArtifactPut {
                                 address: format!("artifact/{}", object.metadata.name),
                                 view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
@@ -621,7 +665,7 @@ impl<'a> RequestDispatcher<'a> {
 
 #[cfg(test)]
 mod ledger_projection_tests {
-    use std::sync::Mutex;
+    use std::{path::PathBuf, sync::Mutex};
 
     use async_trait::async_trait;
     use flotilla_core::providers::CommandOutput;
@@ -631,6 +675,131 @@ mod ledger_projection_tests {
 
     use super::*;
 
+    struct IsolatedGithubRunner {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+        token_file: Option<PathBuf>,
+    }
+
+    impl IsolatedGithubRunner {
+        fn new(token: Option<&str>) -> Self {
+            let directory = tempfile::tempdir().expect("test directory");
+            let path = directory.path().join("bin");
+            std::fs::create_dir(&path).expect("fake gh directory");
+            let gh = path.join("gh");
+            std::fs::write(
+                &gh,
+                "#!/bin/sh\n[ \"$GH_TOKEN\" = scoped-test-token ] || { echo 'gh auth login required' >&2; exit 1; }\ncase \" $* \" in\n  *' --method POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7\"}' ;;\n  *) printf '%s\\n' '[[]]' ;;\nesac\n",
+            )
+            .expect("fake gh");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).expect("executable fake gh");
+            }
+            let token_file = token.map(|value| {
+                let file = directory.path().join("token");
+                std::fs::write(&file, value).expect("test token");
+                file
+            });
+            Self { _directory: directory, path, token_file }
+        }
+
+        async fn execute(&self, cmd: &str, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+            use tokio::io::AsyncWriteExt;
+
+            let mut command = tokio::process::Command::new(cmd);
+            command.args(args).env_clear().env("PATH", format!("{}:/usr/bin:/bin", self.path.display()));
+            if let Some(file) = &self.token_file {
+                command.env("GITHUB_TOKEN_FILE", file);
+            }
+            let mut child = command
+                .stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            if let Some(input) = input {
+                child.stdin.take().expect("stdin").write_all(input).await.map_err(|error| error.to_string())?;
+            }
+            let output = child.wait_with_output().await.map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for IsolatedGithubRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.execute(cmd, args, None).await
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err("unexpected run_output".to_string())
+        }
+
+        async fn run_with_input(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            input: &[u8],
+        ) -> Result<String, String> {
+            self.execute(cmd, args, Some(input)).await
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
+    async fn github_convoy() -> ResourceBackend {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("single-agent".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla.git".to_string())
+                .repo_ref(repository_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(
+                BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("PR".to_string()).build(),
+            )
+            .build();
+        backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
+        backend
+    }
+
+    #[tokio::test]
+    async fn github_ledger_projects_with_staged_credential_without_ambient_auth() {
+        let backend = github_convoy().await;
+        let runner = IsolatedGithubRunner::new(Some("scoped-test-token"));
+        let url = project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"))
+            .await
+            .expect("project with staged credential");
+        assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
+    }
+
+    #[tokio::test]
+    async fn github_ledger_reports_missing_scoped_credential() {
+        let backend = github_convoy().await;
+        for token in [None, Some("")] {
+            let runner = IsolatedGithubRunner::new(token);
+            let error = project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"))
+                .await
+                .expect_err("missing or empty credential");
+            assert!(error.contains("github-crew-pr credential missing or empty"), "{error}");
+        }
+    }
+
     #[derive(Default)]
     struct CapturingRunner {
         call: Mutex<Option<(Vec<String>, Vec<u8>)>>,
@@ -639,7 +808,7 @@ mod ledger_projection_tests {
     #[async_trait]
     impl CommandRunner for CapturingRunner {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            assert_eq!(cmd, "gh");
+            assert_eq!(cmd, "sh");
             assert!(args.contains(&"--paginate"));
             Ok("[[]]".to_string())
         }
@@ -656,7 +825,7 @@ mod ledger_projection_tests {
             _label: &ChannelLabel,
             input: &[u8],
         ) -> Result<String, String> {
-            assert_eq!(cmd, "gh");
+            assert_eq!(cmd, "sh");
             *self.call.lock().expect("capture lock") = Some((args.iter().map(|arg| (*arg).to_string()).collect(), input.to_vec()));
             Ok(r#"{"html_url":"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"}"#.to_string())
         }
@@ -737,7 +906,7 @@ mod ledger_projection_tests {
         #[async_trait]
         impl CommandRunner for LostResponseRunner {
             async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-                assert_eq!(cmd, "gh");
+                assert_eq!(cmd, "sh");
                 assert!(args.contains(&"--paginate"));
                 Ok(serde_json::to_string(&vec![self.comment.lock().expect("comment lock").clone().into_iter().collect::<Vec<_>>()])
                     .expect("comments JSON"))
@@ -755,7 +924,7 @@ mod ledger_projection_tests {
                 _label: &ChannelLabel,
                 input: &[u8],
             ) -> Result<String, String> {
-                assert_eq!(cmd, "gh");
+                assert_eq!(cmd, "sh");
                 assert!(args.contains(&"POST"));
                 *self.posts.lock().expect("posts lock") += 1;
                 let body =
