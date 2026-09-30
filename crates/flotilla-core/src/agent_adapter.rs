@@ -9,7 +9,7 @@ use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::{Convoy, FulfilmentGrant, ResourceObject, TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use toml_edit::{value, DocumentMut, Item, Table};
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
@@ -630,9 +630,12 @@ impl CliAgentAdapter {
         if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
-        if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
-            let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
-            args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
+        if let AdapterFlavor::Codex { contained, .. } = &self.flavor {
+            args.push(Arg::Literal("--no-daemon".into()));
+            if !contained {
+                let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
+                args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
+            }
         }
         if let Some(model) = &request.model {
             args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
@@ -826,9 +829,16 @@ async fn seed_codex_workspace_trust(
     }
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
-    let needs_attribution = contained && document.get("commit_attribution").and_then(Item::as_str) != Some("");
-    if needs_attribution {
-        document["commit_attribution"] = value("");
+    let needs_notify = contained
+        && document.get("notify").and_then(Item::as_array).is_none_or(|array| {
+            array.iter().map(|entry| entry.as_str()).ne(crate::agents::CODEX_NOTIFY_COMMAND.iter().map(|entry| Some(*entry)))
+        });
+    if needs_notify {
+        let mut notify = Array::new();
+        for entry in crate::agents::CODEX_NOTIFY_COMMAND {
+            notify.push(*entry);
+        }
+        document["notify"] = value(notify);
     }
     let projects = document
         .as_table_mut()
@@ -841,7 +851,7 @@ async fn seed_codex_workspace_trust(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .ok_or_else(|| format!("Codex config {} has a non-table project entry for {canonical_cwd}", config.path.display()))?;
-    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") && !needs_attribution {
+    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") && !needs_notify {
         return Ok(());
     }
     project["trust_level"] = value("trusted");
@@ -1619,7 +1629,7 @@ mod tests {
             .expect("codex launch plan");
         assert_eq!(
             plan.command,
-            "/tools/codex --dangerously-bypass-approvals-and-sandbox -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
         assert_eq!(plan.stance, "trusted-implicit");
@@ -1940,25 +1950,21 @@ mod tests {
         let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
         assert_eq!(parsed["model"].as_str(), Some("gpt-5.6-sol"));
         assert!(parsed.get("commit_attribution").is_none(), "host-direct Codex config should retain operator attribution");
+        assert!(parsed.get("notify").is_none(), "host-direct Codex should use an invocation-only notify override");
         assert_eq!(parsed["projects"]["/existing"]["trust_level"].as_str(), Some("trusted"));
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 
     #[tokio::test]
-    async fn contained_codex_disables_commit_attribution_for_an_already_trusted_workspace() {
+    async fn contained_codex_seeds_notify_for_an_already_trusted_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let codex_home = temp.path().join("codex-home");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&codex_home).expect("codex home");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
-        std::fs::write(
-            codex_home.join("config.toml"),
-            format!(
-                "commit_attribution = \"Codex <noreply@openai.com>\"\n\n[projects.{canonical_workspace:?}]\ntrust_level = \"trusted\"\n"
-            ),
-        )
-        .expect("initial Codex config");
+        std::fs::write(codex_home.join("config.toml"), format!("[projects.{canonical_workspace:?}]\ntrust_level = \"trusted\"\n"))
+            .expect("initial Codex config");
         let env = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained-codex"))
             .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.display().to_string()))
@@ -1971,11 +1977,25 @@ mod tests {
             copies: Vec::new(),
         };
 
-        registry.get("codex").expect("codex adapter").prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare");
+        let codex = registry.get("codex").expect("codex adapter");
+        codex.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare");
+
+        let plan = codex
+            .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
+            .expect("contained Codex launch");
+        assert!(plan.command.contains("--no-daemon"));
+        assert!(!plan.command.contains("-c"));
 
         let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
-        assert_eq!(parsed["commit_attribution"].as_str(), Some(""));
+        assert!(parsed.get("commit_attribution").is_none());
+        let notify = parsed["notify"].as_array().expect("notify command array");
+        assert_eq!(notify.iter().map(|entry| entry.as_str()).collect::<Vec<_>>(), vec![
+            Some("flotilla"),
+            Some("hook"),
+            Some("codex"),
+            Some("notify")
+        ]);
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 
