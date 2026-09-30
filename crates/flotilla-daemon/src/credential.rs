@@ -50,7 +50,7 @@ struct GithubAppInstallationResponse {
     id: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct GithubAppToken {
     value: String,
     expires_at: DateTime<Utc>,
@@ -75,13 +75,14 @@ struct GithubAppInstallationRequest {
 #[derive(Debug)]
 enum GithubAppMintError {
     InstallationNotFound(String),
+    Transient(String),
     Other(String),
 }
 
 impl std::fmt::Display for GithubAppMintError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InstallationNotFound(message) | Self::Other(message) => formatter.write_str(message),
+            Self::InstallationNotFound(message) | Self::Transient(message) | Self::Other(message) => formatter.write_str(message),
         }
     }
 }
@@ -163,6 +164,12 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
         }
         if !response.status().is_success() {
             let detail = String::from_utf8_lossy(response.body());
+            if response.status().is_server_error() {
+                return Err(GithubAppMintError::Transient(format!(
+                    "mint installation token: GitHub returned HTTP {}: {detail}",
+                    response.status()
+                )));
+            }
             return Err(GithubAppMintError::Other(format!(
                 "mint installation token: GitHub returned HTTP {}: {detail}",
                 response.status()
@@ -1017,6 +1024,9 @@ impl CredentialStore {
             .mint_github_app(&mut request, installation_repository.as_deref())
             .await
             .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
+        if token.value.trim().is_empty() {
+            return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
+        }
         let paths = self.delivery_paths(runner).await?;
         // Each staging owns its token. A concurrent staging must not replace or
         // delete a token while another Git process is still reading it.
@@ -1386,7 +1396,7 @@ impl CredentialStore {
         request: &mut GithubAppMintRequest,
         installation_repository: Option<&str>,
     ) -> Result<GithubAppToken, String> {
-        match self.github_app_minter.mint(request).await {
+        match self.mint_github_app_with_retry(request).await {
             Ok(token) => Ok(token),
             Err(GithubAppMintError::InstallationNotFound(_)) if installation_repository.is_some() => {
                 let repository = installation_repository.expect("guarded by is_some");
@@ -1397,10 +1407,22 @@ impl CredentialStore {
                 });
                 request.installation_id =
                     self.resolve_github_app_installation(repository, &request.app_id_path, &request.private_key_path).await?;
-                self.github_app_minter.mint(request).await.map_err(|error| error.to_string())
+                self.mint_github_app_with_retry(request).await.map_err(|error| error.to_string())
             }
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    async fn mint_github_app_with_retry(&self, request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
+        for attempt in 1..=3 {
+            match self.github_app_minter.mint(request).await {
+                Err(GithubAppMintError::Transient(_)) if attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last mint attempt returns")
     }
 
     async fn github_repository_names(&self, repository_scope: &BTreeSet<RepositoryKey>) -> Result<Vec<String>, String> {
@@ -2109,6 +2131,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::agent_material::{tests::promisor_runner, AgentMaterialRegistry, FLOTILLA_SKILLS_DIR_ENV};
 
     #[derive(Default)]
     struct TestEnv(BTreeMap<String, String>);
@@ -2137,6 +2160,107 @@ mod tests {
         calls: AtomicUsize,
         refresh_started: tokio::sync::Notify,
         release_refresh: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
+    struct SlowFlakySkillMinter {
+        calls: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GithubAppTokenMinter for SlowFlakySkillMinter {
+        async fn resolve_installation(&self, _request: &GithubAppInstallationRequest) -> Result<u64, String> {
+            Err("unexpected installation resolution".to_string())
+        }
+
+        async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if matches!(call, 0 | 2) {
+                Err(GithubAppMintError::Transient("GitHub returned HTTP 500".to_string()))
+            } else {
+                Ok(GithubAppToken { value: format!("test-token-{call}"), expires_at: Utc::now() + Duration::hours(1) })
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn six_concurrent_skill_stagings_each_use_own_nonempty_token_after_slow_flaky_mints() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let skills = temp.path().join("generation/skills");
+        std::fs::create_dir_all(&skills).expect("skill bundle");
+        std::fs::write(
+            skills.join(".flotilla-sources.json"),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
+        )
+        .expect("manifest");
+        std::fs::write(temp.path().join("fetches.capture-token"), "").expect("capture marker");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                },
+                source: CredentialSource::GithubApp { app_id_path: "/host/app-id".to_string(), private_key_path: "/host/key".to_string() },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("credential declaration");
+        let minter = Arc::new(SlowFlakySkillMinter::default());
+        let store = Arc::new(CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            GithubAppMinting { clock: Arc::new(SystemClock), minter: minter.clone() },
+            temp.path().to_path_buf(),
+        ));
+        let registry = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnv(BTreeMap::from([
+            ("HOME".to_string(), temp.path().to_string_lossy().into_owned()),
+            (FLOTILLA_SKILLS_DIR_ENV.to_string(), skills.to_string_lossy().into_owned()),
+        ])))));
+        let results = futures::future::join_all((0..6).map(|index| {
+            let store = Arc::clone(&store);
+            let registry = Arc::clone(&registry);
+            let mut runner = promisor_runner(temp.path());
+            runner.config_base = temp.path().join(format!("config-{index}"));
+            tokio::spawn(async move {
+                let token_file = store
+                    .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
+                    .await
+                    .map_err(|error| format!("skill source private-skills credential github-skills-fork mint failed: {error}"))?;
+                let outcome = registry
+                    .stage_skills(
+                        &format!("crew-{index}"),
+                        &BTreeSet::from(["claude-code".to_string()]),
+                        &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                        &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
+                        &runner,
+                    )
+                    .await;
+                assert!(!token_file.exists(), "crew {index} must clean its own token");
+                outcome
+            })
+        }))
+        .await;
+        for result in results {
+            result.expect("staging task").expect("retryable mints should recover and stage");
+        }
+        assert!(minter.max_in_flight.load(Ordering::SeqCst) >= 5, "minting must overlap across at least five stagings");
+        let tokens = std::fs::read_to_string(temp.path().join("fetches.tokens")).expect("captured fetch tokens");
+        let tokens = tokens.lines().collect::<BTreeSet<_>>();
+        assert_eq!(tokens.len(), 6, "each fetch must use its own nonempty token");
+        assert!(tokens.iter().all(|token| token.starts_with("test-token-")));
     }
 
     #[async_trait]
@@ -3016,6 +3140,42 @@ interactions:
         let error = error.to_string();
         assert!(error.contains("HTTP 422 Unprocessable Entity"), "unexpected mint error: {error}");
         assert!(error.contains("permissions requested are not granted"), "GitHub response detail missing: {error}");
+        session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn github_app_classifies_http_500_mint_as_transient() {
+        let state = tempfile::tempdir().expect("state directory");
+        let app_id_path = state.path().join("github-app.id");
+        let private_key_path = state.path().join("github-app.pem");
+        tokio::fs::write(&app_id_path, "12345\n").await.expect("App id");
+        tokio::fs::write(&private_key_path, include_str!("fixtures/github_app_test.pem")).await.expect("App key");
+        let fixture = r#"
+interactions:
+  - channel: http
+    method: POST
+    url: "https://api.github.com/app/installations/9876/access_tokens"
+    request_body: '{"repositories":["flotilla"]}'
+    status: 500
+    response_body: '{"message":"Internal Server Error"}'
+"#;
+        let session = Session::replaying_from_str(fixture, Masks::new());
+        let minter = RealGithubAppTokenMinter {
+            env: Arc::new(TestEnv::default()),
+            http: Arc::new(ReplayHttpClient::new(session.clone())),
+            clock: Arc::new(SystemClock),
+        };
+        let error = minter
+            .mint(&GithubAppMintRequest {
+                installation_id: 9876,
+                app_id_path: app_id_path.to_string_lossy().into_owned(),
+                private_key_path: private_key_path.to_string_lossy().into_owned(),
+                repositories: vec!["flotilla".to_string()],
+                permissions: None,
+            })
+            .await
+            .expect_err("HTTP 500 must be retryable");
+        assert!(matches!(error, GithubAppMintError::Transient(_)), "unexpected mint error: {error}");
         session.assert_complete();
     }
 
