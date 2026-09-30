@@ -715,6 +715,36 @@ fn placement_host_not_ready_reason(placement_name: &str, host_label: &str, gener
     format!("placement `{placement_name}` host `{host_label}` generation `{generation}` is not ready{detail}")
 }
 
+fn unready_placement_refusal(
+    placement_name: &str,
+    host_label: &str,
+    status: Option<&ResourceHostStatus>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let Some(status) = status else {
+        return Some(format!("placement `{placement_name}` host `{host_label}` is not ready: status is unavailable"));
+    };
+    if status.sleeping_until.is_some_and(|until| until > now) {
+        return None;
+    }
+    let mut observed = status.clone();
+    observed.apply_heartbeat_readiness(now);
+    if observed.ready {
+        return None;
+    }
+    let mut reason = placement_host_not_ready_reason(placement_name, host_label, host_generation(Some(status)), &observed);
+    if !observed.readiness_blocked() {
+        match observed.heartbeat_at {
+            None => reason.push_str(": heartbeat is unavailable"),
+            Some(at) if now.signed_duration_since(at) > chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS) => {
+                reason.push_str(": heartbeat is stale");
+            }
+            Some(_) => {}
+        }
+    }
+    Some(reason)
+}
+
 fn check_placement_capacity(target_host: &PlacementTargetHost, capacity: Option<(u64, Option<u64>)>) -> Result<(), String> {
     let Some((floor_bytes, free_bytes)) = capacity else {
         return Err(format!("placement refused on host `{}`: admission free-space floor is unavailable", target_host.display_name));
@@ -3603,6 +3633,12 @@ impl InProcessDaemon {
         if self.canonical_local_host_id().as_ref() == Some(&actuator) {
             return Ok(None);
         }
+        let host = authoritative_placement_host(&self.resource_backend, namespace, &target_host, &policy.metadata.name).await?;
+        if let Some(reason) =
+            unready_placement_refusal(&policy.metadata.name, &target_host.display_name, host.status.as_ref(), self.clock.now())
+        {
+            return Err(reason);
+        }
         Ok(Some(flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
     }
 
@@ -5581,32 +5617,12 @@ impl InProcessDaemon {
                     // A sleeping host may queue work for its wake-up time. A host
                     // that is simply not ready cannot be admitted, even when it
                     // is the only fulfilment that covers the requested needs.
-                    if !host_ready && sleeping_until.is_none_or(|until| until <= self.clock.now()) {
-                        let host_label = &kind.spec.host_ref;
-                        let reason = host.and_then(|host| host.status.as_ref()).map_or_else(
-                            || format!("placement `{}` host `{}` is not ready: status is unavailable", policy.metadata.name, host_label),
-                            |status| {
-                                let mut reason = placement_host_not_ready_reason(
-                                    &policy.metadata.name,
-                                    host_label,
-                                    host_generation(Some(status)),
-                                    status,
-                                );
-                                if !status.readiness_blocked() {
-                                    match status.heartbeat_at {
-                                        None => reason.push_str(": heartbeat is unavailable"),
-                                        Some(at)
-                                            if self.clock.now().signed_duration_since(at)
-                                                > chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS) =>
-                                        {
-                                            reason.push_str(": heartbeat is stale");
-                                        }
-                                        Some(_) => {}
-                                    }
-                                }
-                                reason
-                            },
-                        );
+                    if let Some(reason) = unready_placement_refusal(
+                        &policy.metadata.name,
+                        &kind.spec.host_ref,
+                        host.and_then(|host| host.status.as_ref()),
+                        self.clock.now(),
+                    ) {
                         rejected.push(format!("{}: {reason}", kind.metadata.name));
                         continue;
                     }

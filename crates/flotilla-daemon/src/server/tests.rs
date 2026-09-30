@@ -2009,6 +2009,81 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     );
 }
 
+#[tokio::test]
+async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;
+    let remote_backend = remote_daemon.resource_backend();
+    let hosts = remote_backend.using::<Host>("flotilla");
+    let host = hosts
+        .create(&InputMeta::builder().name("stopped-host-id".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("create remote host");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            daemon_generation: Some("stopped-generation".to_string()),
+            heartbeat_at: Some(chrono::Utc::now()),
+            ready: false,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("mark remote host not ready");
+    daemon
+        .resource_backend()
+        .replica_writer::<Host>(node("stopped"), "flotilla")
+        .replace(&hosts.list().await.expect("list remote host"), chrono::Utc::now())
+        .await
+        .expect("replicate not-ready host");
+    let policy_name = "host-direct-stopped-host-id";
+    let policies = remote_backend.using::<PlacementPolicy>("flotilla");
+    policies
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host.metadata.name,
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("create remote placement policy");
+    daemon
+        .resource_backend()
+        .replica_writer::<PlacementPolicy>(node("stopped"), "flotilla")
+        .replace(&policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .await
+        .expect("replicate remote placement policy");
+    let router = make_remote_command_router(
+        &daemon,
+        &Arc::new(Mutex::new(PeerManager::new(NodeId::new("local")))),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let error = router
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla/flotilla".to_string())
+                            .name("stopped-work".to_string())
+                            .branch("feat/stopped-work".to_string())
+                            .placement_policy(policy_name.to_string())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect_err("not-ready remote placement must be refused before peer routing");
+    assert!(error.contains(policy_name) && error.contains("stopped-host-id") && error.contains("not ready"), "{error}");
+}
+
 struct RunningTerminalRuntime;
 
 #[async_trait::async_trait]
