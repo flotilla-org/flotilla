@@ -733,13 +733,10 @@ fn unready_placement_refusal(
         return None;
     }
     let mut reason = placement_host_not_ready_reason(placement_name, host_label, host_generation(Some(status)), &observed);
-    if !observed.readiness_blocked() {
+    if !observed.readiness_blocked() && !status.heartbeat_is_fresh(now) {
         match observed.heartbeat_at {
             None => reason.push_str(": heartbeat is unavailable"),
-            Some(at) if now.signed_duration_since(at) > chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS) => {
-                reason.push_str(": heartbeat is stale");
-            }
-            Some(_) => {}
+            Some(_) => reason.push_str(": heartbeat is stale"),
         }
     }
     Some(reason)
