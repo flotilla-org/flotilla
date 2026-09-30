@@ -26,7 +26,7 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig},
     event_sink::EventSink,
-    in_process::canonical_placement_host_ref_from_sources,
+    host_resolution::canonical_placement_host_ref_from_sources,
     providers::{ChannelLabel, CommandRunner},
 };
 

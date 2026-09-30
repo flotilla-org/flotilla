@@ -109,6 +109,7 @@ use crate::{
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
+    host_resolution::canonical_placement_host_ref_from_sources,
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
     model::{provider_names_from_registry, repo_name, RepoModel},
     ops_entry::{
@@ -699,26 +700,6 @@ async fn canonical_placement_host_ref(
 ) -> Result<Option<PlacementTargetHost>, String> {
     let hosts = backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
     canonical_placement_host_ref_from_sources(&hosts.items, host_ref)
-}
-
-pub(crate) fn canonical_placement_host_ref_from_sources(
-    hosts: &[ReadResourceObject<ResourceHost>],
-    host_ref: &str,
-) -> Result<Option<PlacementTargetHost>, String> {
-    let canonical = flotilla_resources::canonical_host_id(hosts.iter().map(|host| &host.object), host_ref)?;
-    let Some(canonical) = canonical else {
-        return Ok(None);
-    };
-    let resolved = hosts
-        .iter()
-        .find(|host| host.object.metadata.name == canonical.as_str())
-        .expect("canonical host resolver selected an existing host");
-    let display_name = if resolved.object.spec.display_name.is_empty() {
-        resolved.object.metadata.name.clone()
-    } else {
-        resolved.object.spec.display_name.clone()
-    };
-    Ok(Some(PlacementTargetHost { reference: canonical, display_name }))
 }
 
 async fn authoritative_placement_host(
