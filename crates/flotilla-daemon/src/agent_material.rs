@@ -513,7 +513,7 @@ impl SkillBundle {
                 };
                 match result {
                     Ok(_) => break,
-                    Err(error) if error.contains(STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
+                    Err(error) if error.lines().any(|line| line == STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
                         tokio::time::sleep(Duration::from_secs(attempt)).await;
                     }
                     Err(error) => return Err(skill_stage_error(environment_ref, &error)),
@@ -534,7 +534,8 @@ fn skill_stage_error(environment_ref: &str, stderr: &str) -> String {
         .find_map(|line| line.strip_prefix(STAGE_DIAGNOSTIC_PREFIX))
         .or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("skill staging command failed");
-    let details = stderr.trim();
+    let details = stderr.lines().filter(|line| *line != STAGE_RETRYABLE_PREFIX).collect::<Vec<_>>().join("\n");
+    let details = details.trim();
     if details.is_empty() {
         format!("stage generation-pinned skills for {environment_ref}: {reason}")
     } else {
@@ -1363,9 +1364,9 @@ esac
         )
         .expect("manifest");
         let runner = promisor_runner(temp.path());
-        std::fs::write(temp.path().join("fetches.init-secret"), "fatal: secret-for-redaction\n").expect("init marker");
+        std::fs::write(temp.path().join("fetches.init-secret"), "fatal: secret\\for-redaction\n").expect("init marker");
         let token_file = temp.path().join("source.token");
-        std::fs::write(&token_file, "secret-for-redaction\n").expect("token");
+        std::fs::write(&token_file, "secret\\for-redaction\n").expect("token");
         let error = registry
             .stage_skills(
                 "crew-private",
@@ -1377,7 +1378,7 @@ esac
             .await
             .expect_err("init failure must surface");
         assert!(error.contains("fatal: [redacted credential]"), "{error}");
-        assert!(!error.contains("secret-for-redaction"), "{error}");
+        assert!(!error.contains("secret\\for-redaction"), "{error}");
     }
 
     #[tokio::test]
@@ -1483,14 +1484,21 @@ esac
         })
         .await
         .expect("first fetch started");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        tokio::time::timeout(
-            Duration::from_millis(800),
-            stage("crew-second", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf()),
-        )
+        let guard = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(guard) = registry.skills.staging_lock.try_lock() {
+                    return guard;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
-        .expect("second crew should stage during the first crew's backoff")
-        .expect("second staging");
+        .expect("staging lock should be available during backoff");
+        assert!(!first.is_finished(), "the first crew must still be backing off when the lock becomes available");
+        drop(guard);
+        stage("crew-second", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf())
+            .await
+            .expect("second crew stages while first backs off");
         first.await.expect("first task").expect("first staging");
     }
 

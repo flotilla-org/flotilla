@@ -37,7 +37,8 @@ print_git_stderr() {
   fi
   while IFS= read -r line || [ -n "$line" ]; do
     if [ -n "$token" ]; then
-      printf '%s\n' "$line" | awk -v token="$token" '{
+      printf '%s\n' "$line" | TOKEN_TO_REDACT="$token" awk '{
+        token = ENVIRON["TOKEN_TO_REDACT"]
         while ((position = index($0, token)) > 0) {
           printf "%s[redacted credential]", substr($0, 1, position - 1)
           $0 = substr($0, position + length(token))
@@ -112,7 +113,7 @@ while [ "$#" -gt 0 ]; do
     if [ "$code" -ne 0 ]; then
       if grep -Eiq 'not our ref|could not find remote ref|unadvertised object' "$sources/fetch.stderr"; then
         disposition='pinned revision does not exist'
-      elif grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|permission denied|access denied' "$sources/fetch.stderr"; then
+      elif grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|Permission denied \(publickey\)|remote:.*(permission|access) denied' "$sources/fetch.stderr"; then
         disposition='authentication or authorization failed'
       else
         disposition='fetch failed'
@@ -131,7 +132,7 @@ while [ "$#" -gt 0 ]; do
     test "$fetched_revision" = "$revision" || { echo "${diagnostic_prefix}skill source $name fetch returned the wrong pinned revision $revision" >&2; exit 1; }
     if git -C "$checkout" checkout --quiet --detach FETCH_HEAD >"$sources/checkout.stdout" 2>"$sources/checkout.stderr"; then code=0; else code=$?; fi
     if [ "$code" -ne 0 ]; then
-      if grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|permission denied|access denied' "$sources/checkout.stderr"; then
+      if grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|Permission denied \(publickey\)|remote:.*(permission|access) denied' "$sources/checkout.stderr"; then
         disposition='authentication or authorization failed'
       else
         disposition='checkout failed'
