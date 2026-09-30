@@ -8,6 +8,34 @@ use flotilla_resources::{
 };
 
 #[test]
+fn prior_generation_alias_first_repository_decodes_and_canonicalizes_additively() {
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+
+    let alias = "https://forgejo-manchego/robert/ghostty-ops";
+    let canonical = "https://forgejo.lab.flotilla.work/robert/ghostty-ops";
+    let stored = serde_json::json!({
+        "identity": {"kind": "forge", "forge_ref": "flotilla-lab", "owner": "robert", "repo_name": "ghostty-ops"},
+        "remotes": [alias],
+        "forge": {"service_url": "https://forgejo.lab.flotilla.work", "repository": "robert/ghostty-ops"}
+    });
+    let previous: RepositorySpec = serde_json::from_value(stored).expect("decode existing Repository record");
+    assert_eq!(previous.live_remote(), Some(alias));
+
+    let forge = ForgeSpec::builder()
+        .forge_id("flotilla-lab".to_string())
+        .kind(ForgeKind::Forgejo)
+        .hosts(["forgejo-manchego".to_string()].into())
+        .https_url("https://forgejo.lab.flotilla.work".to_string())
+        .git_ssh_host("forgejo-manchego".to_string())
+        .build();
+    let updated = previous.on_forge(&forge).expect("record canonical live remote");
+    assert_eq!(updated.remotes(), [canonical, alias]);
+    let written = serde_json::to_value(&updated).expect("write new Repository record");
+    let decoded: RepositorySpec = serde_json::from_value(written).expect("decode new Repository record");
+    assert_eq!(decoded, updated);
+}
+
+#[test]
 fn repository_provider_configuration_roundtrips_in_the_spec() {
     let spec = RepositorySpec::remote("https://github.com/acme/widgets")
         .expect("repository")

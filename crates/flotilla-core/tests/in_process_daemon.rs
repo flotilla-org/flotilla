@@ -5558,6 +5558,8 @@ async fn repository_identity_change_does_not_materialize_project_when_superseded
 
 struct ForgeAliasInspector {
     path: PathBuf,
+    remote: &'static str,
+    host_ref: &'static str,
 }
 
 fn lab_forge_spec() -> flotilla_resources::ForgeSpec {
@@ -5609,18 +5611,65 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
 #[async_trait]
 impl RepositoryInspector for ForgeAliasInspector {
     async fn inspect_path(&self, _path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        let remote = "https://manchego.lab.flotilla.work/robert/ghostty-ops.git";
+        let remote = self.remote;
         Ok(RepositoryInspection {
-            spec: RepositorySpec::remote(remote)?,
+            spec: RepositorySpec::remote(flotilla_resources::canonicalize_repo_url(remote)?)?,
             checkout: LocalCheckoutInspection {
                 path: self.path.clone(),
-                host_ref: "host-test".to_string(),
+                host_ref: self.host_ref.to_string(),
                 git_ref: "main".to_string(),
                 is_main: true,
             },
             transport_url: Some(remote.to_string()),
             replaces_prior_repository: false,
         })
+    }
+}
+
+#[tokio::test]
+async fn forge_alias_observations_from_two_hosts_record_canonical_live_remote_additively() {
+    use flotilla_resources::{Forge, InMemoryBackend};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let forge = lab_forge_spec();
+    backend
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name(forge.forge_id.clone()).build(), &forge)
+        .await
+        .expect("declare Forge");
+    let canonical = "https://forgejo.lab.flotilla.work/robert/ghostty-ops";
+    let aliases = ["https://forgejo-manchego/robert/ghostty-ops", "https://manchego.lab.flotilla.work/robert/ghostty-ops"];
+
+    for (index, remote) in
+        ["forgejo-manchego:robert/ghostty-ops.git", "git@manchego.lab.flotilla.work:robert/ghostty-ops.git"].into_iter().enumerate()
+    {
+        let path = temp.path().join(format!("host-{index}")).join("ghostty-ops");
+        std::fs::create_dir_all(&path).expect("create checkout path");
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            test_config_store(temp.path().join(format!("config-{index}"))),
+            fake_discovery(false),
+            HostName::local(),
+            backend.clone(),
+        )
+        .await;
+        daemon
+            .set_repository_inspector(Arc::new(ForgeAliasInspector {
+                path: path.clone(),
+                remote,
+                host_ref: if index == 0 { "host-kiwi" } else { "host-manchego" },
+            }))
+            .await;
+        daemon.add_repo(&path).await.expect("observe checkout");
+
+        let repositories = backend.using::<Repository>("flotilla");
+        let items = repositories.list().await.expect("list Repositories").items;
+        assert_eq!(items.len(), 1, "host observations share one Repository");
+        assert_eq!(items[0].spec.live_remote(), Some(canonical));
+        let expected =
+            if index == 0 { BTreeSet::from([canonical, aliases[0]]) } else { BTreeSet::from([canonical, aliases[0], aliases[1]]) };
+        assert_eq!(items[0].spec.remotes().iter().map(String::as_str).collect::<BTreeSet<_>>(), expected);
     }
 }
 
@@ -5636,7 +5685,13 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     std::fs::create_dir_all(&repo).expect("create repository path");
     let daemon =
         InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
-    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+    daemon
+        .set_repository_inspector(Arc::new(ForgeAliasInspector {
+            path: repo.clone(),
+            remote: "https://manchego.lab.flotilla.work/robert/ghostty-ops.git",
+            host_ref: "host-test",
+        }))
+        .await;
     let forge = lab_forge_spec();
     let front = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/ghostty-ops").expect("front spec");
     let ssh = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops")
@@ -5856,7 +5911,13 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
     std::fs::create_dir_all(&repo).expect("create repository path");
     let daemon =
         InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
-    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+    daemon
+        .set_repository_inspector(Arc::new(ForgeAliasInspector {
+            path: repo.clone(),
+            remote: "https://manchego.lab.flotilla.work/robert/ghostty-ops.git",
+            host_ref: "host-test",
+        }))
+        .await;
     daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
@@ -5945,7 +6006,13 @@ async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
         target.clone(),
     )
     .await;
-    daemon.set_repository_inspector(Arc::new(ForgeAliasInspector { path: repo.clone() })).await;
+    daemon
+        .set_repository_inspector(Arc::new(ForgeAliasInspector {
+            path: repo.clone(),
+            remote: "https://manchego.lab.flotilla.work/robert/ghostty-ops.git",
+            host_ref: "host-test",
+        }))
+        .await;
 
     let inspected = daemon.inspect_repository_path(&repo, None).await.expect("resolve replica-only identity");
     let merged = target.using::<Repository>("flotilla").get(&inspected.key().to_string()).await.expect("local canonical Repository");

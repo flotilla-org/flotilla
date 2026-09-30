@@ -117,6 +117,8 @@ impl RepositorySpec {
         if forge.forge_id.trim().is_empty() {
             return Err("forge_id cannot be empty".to_string());
         }
+        let canonical_remote = format!("{}/{owner}/{repo_name}", forge.https_url.trim_end_matches('/'));
+        self = self.update_remotes(canonical_remote)?;
         self.identity = RepositoryIdentity::Forge { forge_ref: forge.forge_id.clone(), owner: owner.clone(), repo_name: repo_name.clone() };
         self.forge = Some(ForgeIdentity {
             service_url: forge.https_url.trim_end_matches('/').to_string(),
