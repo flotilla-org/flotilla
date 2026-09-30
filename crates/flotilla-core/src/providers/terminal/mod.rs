@@ -40,6 +40,14 @@ pub struct TerminalSession {
     pub screen_activity: Option<ScreenActivity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalSessionLiveness {
+    Running,
+    Stopped,
+    Absent,
+    Lost(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenActivity {
     Active,
@@ -110,6 +118,17 @@ pub trait TerminalPool: Send + Sync {
 
     fn tracks_session_liveness(&self) -> bool {
         false
+    }
+
+    async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
+        if !self.tracks_session_liveness() {
+            return Ok(TerminalSessionLiveness::Running);
+        }
+        Ok(if self.list_sessions().await?.iter().any(|session| session.session_name == session_id) {
+            TerminalSessionLiveness::Running
+        } else {
+            TerminalSessionLiveness::Stopped
+        })
     }
 
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String>;

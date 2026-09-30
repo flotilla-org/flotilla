@@ -17,6 +17,14 @@ use flotilla_resources::{
 use super::*;
 
 #[test]
+fn turn_delivery_restarts_a_lost_session() {
+    assert_eq!(
+        turn_delivery_session_plan(Some(ResourceTerminalSessionPhase::Lost), "work", "coder").expect("delivery plan"),
+        TurnDeliverySessionPlan::RestartFresh
+    );
+}
+
+#[test]
 fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
     let now = chrono::Utc::now();
     let needs = BTreeSet::new();

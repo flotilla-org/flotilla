@@ -58,6 +58,15 @@ pub enum TerminalDeliveryReadiness {
     TurnBoundary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalLiveness {
+    Running,
+    Stopped,
+    Lost(String),
+}
+
+const LOST_RECHECK_AFTER: Duration = Duration::from_secs(5);
+
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
     async fn brief_ready(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
@@ -71,6 +80,9 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<TerminalRuntimeState, String>;
     async fn session_is_running(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
         Ok(true)
+    }
+    async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        Ok(if self.session_is_running(session_id, spec).await? { TerminalLiveness::Running } else { TerminalLiveness::Stopped })
     }
     async fn cleat_endpoint(
         &self,
@@ -235,6 +247,9 @@ pub enum TerminalPrepared {
     MessageDeliveryPending,
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
+    Lost(String),
+    Revived,
+    RecoverLost,
     CleatEndpoint(Option<flotilla_protocol::result_set::CleatEndpoint>),
     Attention(TerminalObservation),
     AttentionStale,
@@ -292,9 +307,10 @@ where
                 .as_ref()
                 .and_then(|status| status.session_id.as_deref())
                 .ok_or_else(|| ResourceError::other("running terminal session has no session id"))?;
-            let running = self.runtime.session_is_running(session_id, &obj.spec).await.map_err(ResourceError::other)?;
-            if !running {
-                return Ok(TerminalPrepared::Stopped);
+            match self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                TerminalLiveness::Running => {}
+                TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
+                TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
             }
             if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Failed(message));
@@ -352,6 +368,23 @@ where
                 return Ok(TerminalPrepared::AttentionStale);
             }
             return Ok(TerminalPrepared::None);
+        }
+        if phase == TerminalSessionPhase::Lost {
+            if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
+                if self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? == TerminalLiveness::Running {
+                    return Ok(TerminalPrepared::Revived);
+                }
+            }
+            let lost_at = obj.status.as_ref().and_then(|status| status.stopped_at);
+            return Ok(
+                if lost_at.is_some_and(|at| {
+                    Utc::now().signed_duration_since(at) >= chrono::Duration::from_std(LOST_RECHECK_AFTER).expect("duration fits")
+                }) {
+                    TerminalPrepared::RecoverLost
+                } else {
+                    TerminalPrepared::None
+                },
+            );
         }
         if phase != TerminalSessionPhase::Starting {
             return Ok(TerminalPrepared::None);
@@ -429,6 +462,9 @@ where
                 | TerminalPrepared::BriefWaiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
+                | TerminalPrepared::Lost(_)
+                | TerminalPrepared::Revived
+                | TerminalPrepared::RecoverLost
                 | TerminalPrepared::CleatEndpoint(_)
                 | TerminalPrepared::MessageDelivered(_)
                 | TerminalPrepared::MessageDeliveryPending
@@ -447,6 +483,7 @@ where
                 })
             }
             TerminalSessionPhase::Running => match prepared {
+                TerminalPrepared::Lost(reason) => Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now }),
                 TerminalPrepared::CleatEndpoint(endpoint) => {
                     Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
                 }
@@ -495,7 +532,11 @@ where
                 }),
                 _ => None,
             },
-            TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
+            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Revived) => Some(TerminalSessionStatusPatch::MarkRevived),
+            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::RecoverLost) => {
+                Some(TerminalSessionStatusPatch::MarkStarting)
+            }
+            TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
         }
         .or_else(|| {
             obj.status
@@ -510,8 +551,10 @@ where
             TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
-            TerminalPrepared::AttentionStale => vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }],
-            _ if matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
+            TerminalPrepared::Lost(_) | TerminalPrepared::AttentionStale => {
+                vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
+            }
+            _ if matches!(phase, TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed) => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
             _ => Vec::new(),
@@ -519,8 +562,10 @@ where
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
             outcome.requeue_after = Some(Duration::from_millis(200));
-        } else if matches!(prepared, TerminalPrepared::BriefWaiting) {
-            outcome.requeue_after = Some(Duration::from_secs(5));
+        } else if (phase == TerminalSessionPhase::Lost && matches!(prepared, TerminalPrepared::None))
+            || matches!(prepared, TerminalPrepared::BriefWaiting)
+        {
+            outcome.requeue_after = Some(LOST_RECHECK_AFTER);
         }
         outcome
     }

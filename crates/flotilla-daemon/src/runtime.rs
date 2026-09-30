@@ -15,7 +15,7 @@ use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
     DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
     PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
-    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
     TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
@@ -34,7 +34,7 @@ use flotilla_core::{
         discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
-        terminal::{ScreenActivity, TerminalPool, TerminalSize},
+        terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
 };
@@ -4716,6 +4716,18 @@ async fn fulfilment_grants_for_terminal(
     backend.including_replicas::<FulfilmentKind>(&context.namespace).get(&selected_kind).await.ok().map(|source| source.object.spec.grants)
 }
 
+fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: TerminalSessionLiveness) -> TerminalLiveness {
+    match liveness {
+        TerminalSessionLiveness::Running => TerminalLiveness::Running,
+        TerminalSessionLiveness::Stopped => TerminalLiveness::Stopped,
+        TerminalSessionLiveness::Absent if matches!(source, TerminalSessionSource::Agent { .. }) => {
+            TerminalLiveness::Lost("cleat agent session is absent from its daemon".into())
+        }
+        TerminalSessionLiveness::Absent => TerminalLiveness::Stopped,
+        TerminalSessionLiveness::Lost(reason) => TerminalLiveness::Lost(reason),
+    }
+}
+
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
     async fn brief_ready(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
@@ -4851,13 +4863,22 @@ impl TerminalRuntime for TerminalControllerRuntime {
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
-        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == name) {
-            pool.kill_session(name).await?;
+        // A dead generation may retain a recording with the old ID. Keep that
+        // recording for recovery and launch into the current generation under
+        // a fresh ID so cleat cannot resolve the name ambiguously. #2254
+        // tracks retention and cleanup of old-generation recordings.
+        let session_id = if matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
+            format!("{name}-{}", uuid::Uuid::new_v4())
+        } else {
+            name.to_string()
+        };
+        if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == session_id) {
+            pool.kill_session(&session_id).await?;
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
-        pool.ensure_session_with_size(name, &command, &cwd, &env, &pool_tags, initial_size).await?;
+        pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
         Ok(TerminalRuntimeState::builder()
-            .session_id(name.to_string())
+            .session_id(session_id)
             .maybe_pid(None)
             .started_at(Utc::now())
             .maybe_crew(crew)
@@ -4866,13 +4887,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .build())
     }
 
-    async fn session_is_running(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+    async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
         let pool = self.pool_for_spec(spec)?;
-        if !pool.tracks_session_liveness() {
-            return Ok(true);
-        }
-        let running = pool.list_sessions().await?.iter().any(|session| session.session_name == session_id);
-        Ok(running)
+        Ok(terminal_liveness_for_source(&spec.source, pool.session_liveness(session_id).await?))
     }
 
     async fn observe_attention(
@@ -5181,6 +5198,16 @@ mod tests {
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
     };
+
+    #[test]
+    fn missing_tool_session_is_stopped_but_a_dead_generation_is_lost() {
+        let tool = TerminalSessionSource::Tool { command: "cargo test".into() };
+        assert_eq!(terminal_liveness_for_source(&tool, TerminalSessionLiveness::Absent), TerminalLiveness::Stopped);
+        assert_eq!(
+            terminal_liveness_for_source(&tool, TerminalSessionLiveness::Lost("daemon generation is dead".into())),
+            TerminalLiveness::Lost("daemon generation is dead".into())
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn controller_loop_watchdog_reports_and_clears_a_stale_heartbeat() {

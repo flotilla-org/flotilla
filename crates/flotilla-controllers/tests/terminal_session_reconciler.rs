@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalObservation, TerminalRuntime,
+    TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
 use flotilla_resources::{
@@ -41,6 +41,203 @@ async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
     let mut status = EnvironmentStatus::default();
     EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut status);
     environments.update_status(name, &environment.metadata.resource_version, &status).await.expect("mark environment ready");
+}
+
+#[derive(Default)]
+struct DeadThenRestoredRuntime {
+    deliveries: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl TerminalRuntime for DeadThenRestoredRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        Ok(TerminalRuntimeState::builder()
+            .session_id("new-generation".to_string())
+            .maybe_pid(None)
+            .started_at(Utc::now())
+            .maybe_crew(None)
+            .launch_command("cargo test".to_string())
+            .maybe_delivered_message_id(None)
+            .build())
+    }
+
+    async fn session_liveness(&self, session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        Ok(if session_id == "old-generation" {
+            TerminalLiveness::Lost("daemon generation is dead; session is recreatable".into())
+        } else {
+            TerminalLiveness::Running
+        })
+    }
+
+    async fn deliver_message(
+        &self,
+        _session_id: &str,
+        _spec: &TerminalSessionSpec,
+        message: &str,
+        _readiness: TerminalDeliveryReadiness,
+    ) -> Result<TerminalDeliveryOutcome, String> {
+        self.deliveries.lock().expect("deliveries").push(message.to_string());
+        Ok(TerminalDeliveryOutcome::Confirmed)
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dead_generation_is_lost_then_recreated() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "Original brief".into(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-work".into(),
+                }),
+                message: Some(flotilla_resources::TerminalCrewMessage {
+                    id: "conflicting-1".into(),
+                    text: "PR #2185 is conflicting; rebase and rerun the gates".into(),
+                    sender: Default::default(),
+                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                }),
+            },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("create session");
+    let mut running = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "old-generation".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut running);
+    let running = sessions.update_status("term-a", &created.metadata.resource_version, &running).await.expect("running status");
+    let runtime = Arc::new(DeadThenRestoredRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let prepared = reconciler.prepare(&running).await.expect("probe");
+    let lost_at = Utc::now() - chrono::Duration::seconds(6);
+    let outcome = reconciler.reconcile(&running, &prepared, lost_at);
+    let patch = outcome.patch.expect("lost patch");
+    assert!(matches!(&patch, TerminalSessionStatusPatch::MarkLost { reason, .. } if reason.contains("generation is dead")));
+    let mut lost = running.status.expect("running status");
+    patch.apply(&mut lost);
+    assert_eq!(lost.phase, TerminalSessionPhase::Lost);
+    assert_eq!(lost.message.as_deref(), Some("daemon generation is dead; session is recreatable"));
+    let lost = sessions.update_status("term-a", &running.metadata.resource_version, &lost).await.expect("persist lost");
+    let prepared = reconciler.prepare(&lost).await.expect("recovery preparation");
+    let outcome = reconciler.reconcile(&lost, &prepared, Utc::now());
+    let mut starting = lost.status.expect("lost status");
+    outcome.patch.expect("restart patch").apply(&mut starting);
+    assert_eq!(starting.phase, TerminalSessionPhase::Starting);
+    let starting = sessions.update_status("term-a", &lost.metadata.resource_version, &starting).await.expect("persist restart");
+    let prepared = reconciler.prepare(&starting).await.expect("recreate");
+    let outcome = reconciler.reconcile(&starting, &prepared, Utc::now());
+    let mut recreated = starting.status.expect("starting status");
+    outcome.patch.expect("running patch").apply(&mut recreated);
+    assert_eq!(recreated.phase, TerminalSessionPhase::Running);
+    assert_eq!(recreated.session_id.as_deref(), Some("new-generation"));
+    let recreated = sessions.update_status("term-a", &starting.metadata.resource_version, &recreated).await.expect("persist running");
+    let prepared = reconciler.prepare(&recreated).await.expect("redeliver pending turn");
+    let outcome = reconciler.reconcile(&recreated, &prepared, Utc::now());
+    assert!(
+        matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkMessageDelivered { ref message_id }) if message_id == "conflicting-1")
+    );
+    assert_eq!(runtime.deliveries.lock().expect("deliveries").as_slice(), ["PR #2185 is conflicting; rebase and rerun the gates"]);
+}
+
+#[derive(Default)]
+struct BrieflyMissingRuntime {
+    probes: AtomicUsize,
+}
+
+#[async_trait]
+impl TerminalRuntime for BrieflyMissingRuntime {
+    async fn ensure_session(
+        &self,
+        _name: &str,
+        _spec: &TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("a revived session must not be launched again")
+    }
+
+    async fn session_liveness(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        Ok(if self.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+            TerminalLiveness::Lost("session absent from list".into())
+        } else {
+            TerminalLiveness::Running
+        })
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("term-a"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("create session");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "session-a".into(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "cargo test".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let running = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running");
+    let runtime = Arc::new(BrieflyMissingRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let prepared = reconciler.prepare(&running).await.expect("first probe");
+    let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
+    outcome.patch.expect("lost patch").apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Lost);
+    let lost = sessions.update_status("term-a", &running.metadata.resource_version, &status).await.expect("persist loss");
+    let prepared = reconciler.prepare(&lost).await.expect("recheck");
+    let outcome = reconciler.reconcile(&lost, &prepared, Utc::now());
+    outcome.patch.expect("revived patch").apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Running);
+    assert_eq!(status.session_id.as_deref(), Some("session-a"));
+    assert_eq!(status.stopped_at, None);
+    assert_eq!(runtime.probes.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1546,45 +1743,47 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
 }
 
 #[tokio::test]
-async fn stale_hook_attention_decays_to_unobservable_without_changing_phase() {
-    let backend = ResourceBackend::InMemory(Default::default());
-    create_ready_environment(&backend, "env-a").await;
-    let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
-    let created = sessions
-        .create(&meta("term-a"), &TerminalSessionSpec {
-            env_ref: "env-a".to_string(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: "/workspace".to_string(),
-            pool: "hookless".to_string(),
-        })
-        .await
-        .expect("session");
-    let mut status = flotilla_resources::TerminalSessionStatus::default();
-    flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
-        session_id: "session-a".into(),
-        pid: None,
-        started_at: Utc::now(),
-        crew: None,
-        launch_command: "cargo test".into(),
-        delivered_message_id: None,
+async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() {
+    for source in [TerminalAttentionSource::Hook, TerminalAttentionSource::Screen] {
+        let backend = ResourceBackend::InMemory(Default::default());
+        create_ready_environment(&backend, "env-a").await;
+        let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
+        let created = sessions
+            .create(&meta("term-a"), &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "hookless".to_string(),
+            })
+            .await
+            .expect("session");
+        let mut status = flotilla_resources::TerminalSessionStatus::default();
+        flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+            session_id: "session-a".into(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "cargo test".into(),
+            delivered_message_id: None,
+        }
+        .apply(&mut status);
+        status.attention = Some(TerminalAttention {
+            state: TerminalAttentionState::Working,
+            as_of: Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1),
+            source,
+        });
+        let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+        let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+
+        let deps = reconciler.prepare(&session).await.expect("observe stale attention");
+        let now = Utc::now();
+        let patch = reconciler.reconcile(&session, &deps, now).patch.expect("decay patch");
+        patch.apply(&mut status);
+
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
     }
-    .apply(&mut status);
-    status.attention = Some(TerminalAttention {
-        state: TerminalAttentionState::Working,
-        as_of: Utc::now() - TerminalAttention::FRESH_FOR - chrono::Duration::seconds(1),
-        source: TerminalAttentionSource::Hook,
-    });
-    let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
-
-    let deps = reconciler.prepare(&session).await.expect("observe stale attention");
-    let now = Utc::now();
-    let patch = reconciler.reconcile(&session, &deps, now).patch.expect("decay patch");
-    patch.apply(&mut status);
-
-    assert_eq!(status.phase, TerminalSessionPhase::Running);
-    assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
 }
 
 struct HooklessTerminalRuntime;

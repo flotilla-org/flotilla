@@ -379,6 +379,7 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     match phase {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
         Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
+        Some(ResourceTerminalSessionPhase::Lost) => "lost".to_string(),
         Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
         Some(ResourceTerminalSessionPhase::Failed) => "failed".to_string(),
     }
