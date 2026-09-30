@@ -1018,7 +1018,10 @@ impl CredentialStore {
             .await
             .map_err(|error| bounded_adapter_error(credential_name, "github-app", &error.to_string()))?;
         let paths = self.delivery_paths(runner).await?;
-        let token_file = paths.base.join("skill-sources").join(safe_component(credential_name)).join("token");
+        // Each staging owns its token. A concurrent staging must not replace or
+        // delete a token while another Git process is still reading it.
+        let token_file =
+            paths.base.join("skill-sources").join(safe_component(credential_name)).join(format!("token-{}", uuid::Uuid::new_v4()));
         write_github_app_token_file(runner, &token_file, token.value.trim_end()).await?;
         Ok(token_file)
     }
@@ -2964,7 +2967,7 @@ interactions:
             .await
             .expect("mint narrowed skill-source credential");
 
-        assert!(token_file.ends_with("skill-sources/github-skills-fork/token"));
+        assert!(token_file.parent().expect("token parent").ends_with("skill-sources/github-skills-fork"));
         assert!(runner.writes.lock().expect("writes lock").iter().any(|(path, contents)| path == &token_file && contents == "skill-token"));
         assert!(store.github_app_deliveries.lock().await.is_empty(), "one-shot skill tokens must not enter refresh registrations");
         session.assert_complete();
