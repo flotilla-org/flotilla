@@ -128,7 +128,16 @@ curl --fail-with-body --silent --show-error \
             let listing = runner
                 .run(
                     "sh",
-                    &["-c", FORGEJO_LIST, "list-ledgers", token_file, forgejo_api_url.expect("Forgejo API URL"), scope, &number, &page],
+                    &[
+                        "-c",
+                        FORGEJO_LIST,
+                        "list-ledgers",
+                        token_file,
+                        forgejo_api_url.ok_or("Forgejo API URL is unavailable")?,
+                        scope,
+                        &number,
+                        &page,
+                    ],
                     cwd,
                     &ChannelLabel::Default,
                 )
@@ -186,7 +195,15 @@ curl --fail-with-body --silent --show-error -X POST \
         runner
             .run_with_input(
                 "sh",
-                &["-c", FORGEJO_COMMENT, "project-ledger", token_file, forgejo_api_url.expect("Forgejo API URL"), scope, &number],
+                &[
+                    "-c",
+                    FORGEJO_COMMENT,
+                    "project-ledger",
+                    token_file,
+                    forgejo_api_url.ok_or("Forgejo API URL is unavailable")?,
+                    scope,
+                    &number,
+                ],
                 cwd,
                 &ChannelLabel::Default,
                 &input,
@@ -315,7 +332,7 @@ impl<'a> RequestDispatcher<'a> {
                         }
                         // Validation runs before the forge write; a path is never treated as content.
                         let body = crate::artifact::read_decision_ledger(temporary.path())?;
-                        let delivery_env = self.daemon.ledger_delivery_environment(&session.spec.env_ref).await?;
+                        let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
                         let comment_url = project_decision_ledger_once(
                             &backend,
                             &namespace,
@@ -726,13 +743,13 @@ mod ledger_projection_tests {
         ])
     }
 
-    struct IsolatedGithubRunner {
+    struct IsolatedForgeRunner {
         _directory: tempfile::TempDir,
         path: PathBuf,
         token_file: Option<PathBuf>,
     }
 
-    impl IsolatedGithubRunner {
+    impl IsolatedForgeRunner {
         fn new(token: Option<&str>) -> Self {
             let directory = tempfile::tempdir().expect("test directory");
             let path = directory.path().join("bin");
@@ -787,7 +804,7 @@ mod ledger_projection_tests {
     }
 
     #[async_trait]
-    impl CommandRunner for IsolatedGithubRunner {
+    impl CommandRunner for IsolatedForgeRunner {
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             self.execute(cmd, args, None).await
         }
@@ -840,7 +857,7 @@ mod ledger_projection_tests {
     #[tokio::test]
     async fn github_ledger_projects_with_staged_credential_without_ambient_auth() {
         let backend = github_convoy().await;
-        let runner = IsolatedGithubRunner::new(Some("scoped-test-token"));
+        let runner = IsolatedForgeRunner::new(Some("scoped-test-token"));
         let delivery_env =
             BTreeMap::from([("GITHUB_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string())]);
         let url =
@@ -854,7 +871,7 @@ mod ledger_projection_tests {
     async fn github_ledger_reports_missing_scoped_credential() {
         let backend = github_convoy().await;
         for token in [None, Some("")] {
-            let runner = IsolatedGithubRunner::new(token);
+            let runner = IsolatedForgeRunner::new(token);
             let delivery_env = BTreeMap::from([(
                 "GITHUB_TOKEN_FILE".to_string(),
                 runner.token_file.as_ref().map_or_else(|| "/missing-token".to_string(), |path| path.display().to_string()),
@@ -878,7 +895,7 @@ mod ledger_projection_tests {
     #[tokio::test]
     async fn forgejo_ledger_projects_with_staged_credential_without_ambient_auth() {
         let backend = convoy_with_repository("https://forgejo.example/acme/repo.git").await;
-        let runner = IsolatedGithubRunner::new(Some("scoped-test-token"));
+        let runner = IsolatedForgeRunner::new(Some("scoped-test-token"));
         let delivery_env = BTreeMap::from([
             ("FORGEJO_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string()),
             ("FORGEJO_API_URL".to_string(), "https://forgejo.example/api/v1".to_string()),

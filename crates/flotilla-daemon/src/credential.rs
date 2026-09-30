@@ -838,7 +838,6 @@ impl CredentialStore {
             }
             fragments_by_environment.insert(environment_ref.to_string(), composed_fragments);
         }
-        self.prepared.lock().await.extend(prepared_cache_keys);
         // Retain only paths and endpoint metadata from the delivery result.
         // The token itself must never cross back into the daemon's projection path.
         let ledger_env: BTreeMap<String, String> = env
@@ -846,7 +845,19 @@ impl CredentialStore {
             .filter(|(key, _)| matches!(key.as_str(), "GITHUB_TOKEN_FILE" | "FORGEJO_TOKEN_FILE" | "FORGEJO_API_URL"))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        self.ledger_delivery_environment.lock().await.entry(environment_ref.to_string()).or_default().extend(ledger_env);
+        {
+            let mut records = self.ledger_delivery_environment.lock().await;
+            let record = records.entry(environment_ref.to_string()).or_default();
+            for (key, value) in &ledger_env {
+                if record.get(key).is_some_and(|existing| existing != value) {
+                    return Err(format!(
+                        "multiple credentials supplied conflicting {key} delivery paths for environment {environment_ref}"
+                    ));
+                }
+            }
+            record.extend(ledger_env);
+        }
+        self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
     }
 
@@ -1115,6 +1126,11 @@ impl CredentialStore {
         }
         let paths = self.delivery_paths(&*runner).await?;
         for name in delivered.difference(running) {
+            let directory = paths.credential_dir(name);
+            runner
+                .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
+                .await
+                .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
             match self.spec(name).await?.consumer {
                 CredentialConsumer::GithubApp { .. } => {
                     self.ledger_delivery_environment
@@ -1132,11 +1148,6 @@ impl CredentialStore {
                 }
                 _ => {}
             }
-            let directory = paths.credential_dir(name);
-            runner
-                .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
-                .await
-                .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
             let key = (environment_ref.to_string(), name.clone());
             self.prepared.lock().await.remove(&key);
             self.materials.lock().await.remove(&key);
@@ -4724,6 +4735,12 @@ interactions:
             .collect();
         assert_eq!(env.get("FORGEJO_SERVER_URL").map(String::as_str), Some("https://forgejo.lab"));
         assert_eq!(env.get("FORGEJO_API_URL").map(String::as_str), Some("https://forgejo.lab/api/v1"));
+        let ledger_env = store.ledger_delivery_environment("env-a").await;
+        assert_eq!(ledger_env.get("FORGEJO_TOKEN_FILE"), env.get("FORGEJO_TOKEN_FILE"));
+        assert_eq!(ledger_env.get("FORGEJO_API_URL"), env.get("FORGEJO_API_URL"));
+        assert!(!ledger_env.contains_key("FORGEJO_SERVER_URL"));
+        store.forget_environment("env-a").await.expect("forget Forgejo delivery");
+        assert!(store.ledger_delivery_environment("env-a").await.is_empty());
     }
 
     #[tokio::test]

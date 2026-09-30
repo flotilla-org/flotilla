@@ -135,8 +135,9 @@ impl WorkCredentialReconciler for RuntimeWorkCredentialReconciler {
         reconcile_work_credentials_for_environment(&state, namespace, environment_ref).await
     }
 
-    async fn ledger_delivery_environment(&self, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
+    async fn ledger_delivery_environment(&self, namespace: &str, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
         let state = self.state.upgrade().ok_or_else(|| "credential controller is unavailable".to_string())?;
+        reconcile_work_credentials_for_environment(&state, namespace, environment_ref).await?;
         let store = state.credential_store.as_ref().ok_or("credential store is unavailable")?;
         Ok(store.ledger_delivery_environment(environment_ref).await)
     }
