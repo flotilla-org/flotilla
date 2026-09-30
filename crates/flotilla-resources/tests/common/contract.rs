@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
@@ -6,12 +9,58 @@ use flotilla_resources::{
     delete_resource_kind, Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, Host, HostSpec, HostStatus,
     InMemoryBackend, InputMeta, IssueSource, OwnerReference, PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard,
     RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
+    ResourceProvenance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
 
 use crate::common::{convoy_meta, convoy_spec, updated_workflow_template_spec, valid_workflow_template_spec, workflow_template_meta};
+
+pub async fn assert_terminal_session_label_lookup_with_backend(backend: ResourceBackend) {
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let spec = TerminalSessionSpec::builder()
+        .env_ref("env-work".to_string())
+        .role("coder".to_string())
+        .source(TerminalSessionSource::Tool { command: "true".to_string() })
+        .cwd("/workspace".to_string())
+        .pool("cleat".to_string())
+        .build();
+    for (convoy, role, vessel_ref) in [
+        ("target", "coder", "target-work-a"),
+        ("target", "coder", "target-work-b"),
+        ("target", "reviewer", "target-work-c"),
+        ("other", "coder", "other-work"),
+    ] {
+        let identity = TerminalSessionIdentity::builder()
+            .vessel_ref(vessel_ref.to_string())
+            .convoy(convoy.to_string())
+            .vessel("work".to_string())
+            .role(role.to_string())
+            .vessel_index(0)
+            .crew_index(0)
+            .build();
+        let created = sessions.create(&identity.input_meta(), &spec).await.expect("create reconciler-shaped session");
+        sessions
+            .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                ..Default::default()
+            })
+            .await
+            .expect("update session status");
+    }
+    let selector = BTreeMap::from([
+        (CONVOY_LABEL.to_string(), "target".to_string()),
+        (VESSEL_LABEL.to_string(), "work".to_string()),
+        (ROLE_LABEL.to_string(), "coder".to_string()),
+    ]);
+    let listed = sessions.list_matching_labels(&selector).await.expect("list sessions by crew labels");
+    assert_eq!(
+        listed.items.iter().map(|session| session.metadata.name.as_str()).collect::<Vec<_>>(),
+        vec!["terminal-target-work-a-coder", "terminal-target-work-b-coder"],
+        "all and only the matching reconciler sessions must be returned"
+    );
+}
 
 pub trait ResourceContractFixture {
     type Resource: Resource;

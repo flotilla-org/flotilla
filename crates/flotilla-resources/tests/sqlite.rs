@@ -47,6 +47,11 @@ fn backend() -> ResourceBackend {
 }
 
 #[tokio::test]
+async fn terminal_session_label_lookup_contract() {
+    common::contract::assert_terminal_session_label_lookup_with_backend(backend()).await;
+}
+
+#[tokio::test]
 async fn workflow_template_definitions_migration_wipes_legacy_local_authorities_once() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("resources.sqlite");

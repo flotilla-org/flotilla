@@ -7397,13 +7397,13 @@ async fn convoy_resume_finds_a_terminal_session_on_another_host() {
                 "work".to_string(),
                 BTreeMap::from([(
                     "coder".to_string(),
-                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Done).build(),
+                    flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Stalled).build(),
                 )]),
             )]),
             ..Default::default()
         })
         .await
-        .expect("mark completed crew work");
+        .expect("mark stalled crew work");
     let sessions = terminal_host.resource_backend().using::<TerminalSession>("flotilla");
     sessions
         .create(
