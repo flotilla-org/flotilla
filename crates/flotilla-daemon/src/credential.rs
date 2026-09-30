@@ -230,6 +230,7 @@ pub(crate) struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    ledger_delivery_environment: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
@@ -479,6 +480,7 @@ impl CredentialStore {
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             work_deliveries: Mutex::new(BTreeMap::new()),
+            ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
@@ -837,7 +839,19 @@ impl CredentialStore {
             fragments_by_environment.insert(environment_ref.to_string(), composed_fragments);
         }
         self.prepared.lock().await.extend(prepared_cache_keys);
+        // Retain only paths and endpoint metadata from the delivery result.
+        // The token itself must never cross back into the daemon's projection path.
+        let ledger_env: BTreeMap<String, String> = env
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "GITHUB_TOKEN_FILE" | "FORGEJO_TOKEN_FILE" | "FORGEJO_API_URL"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        self.ledger_delivery_environment.lock().await.entry(environment_ref.to_string()).or_default().extend(ledger_env);
         Ok(env.into_iter().collect())
+    }
+
+    pub(crate) async fn ledger_delivery_environment(&self, environment_ref: &str) -> BTreeMap<String, String> {
+        self.ledger_delivery_environment.lock().await.get(environment_ref).cloned().unwrap_or_default()
     }
 
     /// Rebuild refresh registrations for an already-running environment from
@@ -1046,6 +1060,7 @@ impl CredentialStore {
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
+        self.ledger_delivery_environment.lock().await.remove(environment_ref);
         self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
@@ -1095,10 +1110,28 @@ impl CredentialStore {
         }
         if delivered.is_empty() {
             self.work_deliveries.lock().await.remove(environment_ref);
+            self.ledger_delivery_environment.lock().await.remove(environment_ref);
             return Ok(());
         }
         let paths = self.delivery_paths(&*runner).await?;
         for name in delivered.difference(running) {
+            match self.spec(name).await?.consumer {
+                CredentialConsumer::GithubApp { .. } => {
+                    self.ledger_delivery_environment
+                        .lock()
+                        .await
+                        .entry(environment_ref.to_string())
+                        .or_default()
+                        .remove("GITHUB_TOKEN_FILE");
+                }
+                CredentialConsumer::Forgejo { .. } => {
+                    let mut environments = self.ledger_delivery_environment.lock().await;
+                    let record = environments.entry(environment_ref.to_string()).or_default();
+                    record.remove("FORGEJO_TOKEN_FILE");
+                    record.remove("FORGEJO_API_URL");
+                }
+                _ => {}
+            }
             let directory = paths.credential_dir(name);
             runner
                 .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)

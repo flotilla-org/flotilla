@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc, time::Duration};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -30,6 +30,9 @@ fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
 // Execute gh in the crew environment, where the repository-scoped credential
 // is staged. The token stays in that process and never enters daemon memory.
 const GITHUB_LEDGER_API: &str = r#"set -eu
+GITHUB_TOKEN_FILE=$1
+shift
+export GITHUB_TOKEN_FILE
 if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
   echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
   exit 1
@@ -45,6 +48,9 @@ unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
 exec gh api "$@"
 "#;
 
+// Projection needs both the resource identity and the execution world's
+// runner, cwd, and delivered credential metadata.
+#[allow(clippy::too_many_arguments)]
 async fn project_decision_ledger(
     backend: &ResourceBackend,
     namespace: &str,
@@ -53,6 +59,7 @@ async fn project_decision_ledger(
     body: &[u8],
     runner: &dyn CommandRunner,
     cwd: &Path,
+    delivery_env: &BTreeMap<String, String>,
 ) -> Result<Option<String>, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let sources = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -75,13 +82,21 @@ async fn project_decision_ledger(
     let name = flotilla_resources::artifact_record_name(convoy_name, producer, "decision-ledger", convoy_name);
     let marker = format!("<!-- flotilla-decision-ledger:{name}:{} -->", digest.as_str());
     let endpoint = format!("repos/{scope}/issues/{number}/comments");
+    let credential_path = if service == "github.com" { "GITHUB_TOKEN_FILE" } else { "FORGEJO_TOKEN_FILE" };
+    let token_file =
+        delivery_env.get(credential_path).ok_or_else(|| format!("{credential_path} is absent from the credential delivery record"))?;
+    let forgejo_api_url = if service == "github.com" {
+        None
+    } else {
+        Some(delivery_env.get("FORGEJO_API_URL").ok_or("FORGEJO_API_URL is absent from the credential delivery record")?)
+    };
     // The comment itself records the projection identity. If the forge accepts a
     // POST but its response or the artifact write is lost, a retry can find it.
     let existing = if service == "github.com" {
         let listing = runner
             .run(
                 "sh",
-                &["-c", GITHUB_LEDGER_API, "github-ledger-list", &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"],
+                &["-c", GITHUB_LEDGER_API, "github-ledger-list", token_file, &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"],
                 cwd,
                 &ChannelLabel::Default,
             )
@@ -94,6 +109,9 @@ async fn project_decision_ledger(
             .collect::<Vec<_>>()
     } else {
         const FORGEJO_LIST: &str = r#"set -eu
+FORGEJO_TOKEN_FILE=$1
+FORGEJO_API_URL=$2
+shift 2
 : "${FORGEJO_API_URL:?missing Forgejo API URL}"
 : "${FORGEJO_TOKEN_FILE:?missing Forgejo token file}"
 test -s "$FORGEJO_TOKEN_FILE"
@@ -107,8 +125,14 @@ curl --fail-with-body --silent --show-error \
         let mut reached_end = false;
         for page in 1..=1000 {
             let page = page.to_string();
-            let listing =
-                runner.run("sh", &["-c", FORGEJO_LIST, "list-ledgers", scope, &number, &page], cwd, &ChannelLabel::Default).await?;
+            let listing = runner
+                .run(
+                    "sh",
+                    &["-c", FORGEJO_LIST, "list-ledgers", token_file, forgejo_api_url.expect("Forgejo API URL"), scope, &number, &page],
+                    cwd,
+                    &ChannelLabel::Default,
+                )
+                .await?;
             let batch =
                 serde_json::from_str::<Vec<serde_json::Value>>(&listing).map_err(|error| format!("parse ledger comments: {error}"))?;
             if batch.is_empty() {
@@ -136,7 +160,7 @@ curl --fail-with-body --silent --show-error \
         runner
             .run_with_input(
                 "sh",
-                &["-c", GITHUB_LEDGER_API, "github-ledger-post", "--method", "POST", &endpoint, "--input", "-"],
+                &["-c", GITHUB_LEDGER_API, "github-ledger-post", token_file, "--method", "POST", &endpoint, "--input", "-"],
                 cwd,
                 &ChannelLabel::Default,
                 &input,
@@ -147,6 +171,9 @@ curl --fail-with-body --silent --show-error \
         // The scoped Forgejo credential is staged in the crew environment.
         // The daemon supplies the JSON body on stdin and never reads the token.
         const FORGEJO_COMMENT: &str = r#"set -eu
+FORGEJO_TOKEN_FILE=$1
+FORGEJO_API_URL=$2
+shift 2
 : "${FORGEJO_API_URL:?missing Forgejo API URL}"
 : "${FORGEJO_TOKEN_FILE:?missing Forgejo token file}"
 test -s "$FORGEJO_TOKEN_FILE"
@@ -156,7 +183,15 @@ curl --fail-with-body --silent --show-error -X POST \
   --data-binary @- "${FORGEJO_API_URL%/}/repos/$1/issues/$2/comments"
 "#;
         let number = number.to_string();
-        runner.run_with_input("sh", &["-c", FORGEJO_COMMENT, "project-ledger", scope, &number], cwd, &ChannelLabel::Default, &input).await?
+        runner
+            .run_with_input(
+                "sh",
+                &["-c", FORGEJO_COMMENT, "project-ledger", token_file, forgejo_api_url.expect("Forgejo API URL"), scope, &number],
+                cwd,
+                &ChannelLabel::Default,
+                &input,
+            )
+            .await?
     };
     serde_json::from_str::<serde_json::Value>(&response)
         .map_err(|error| format!("parse projected ledger comment: {error}"))?
@@ -167,6 +202,7 @@ curl --fail-with-body --silent --show-error -X POST \
         .ok_or_else(|| "projected ledger comment has no HTTPS URL".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn project_decision_ledger_once(
     backend: &ResourceBackend,
     namespace: &str,
@@ -175,6 +211,7 @@ async fn project_decision_ledger_once(
     body: &[u8],
     runner: &dyn CommandRunner,
     cwd: &Path,
+    delivery_env: &BTreeMap<String, String>,
 ) -> Result<Option<String>, String> {
     let name = flotilla_resources::artifact_record_name(convoy, producer, "decision-ledger", convoy);
     let existing = match backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&name).await {
@@ -193,7 +230,7 @@ async fn project_decision_ledger_once(
     }
     let mut last_error = None;
     for attempt in 0..3 {
-        match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd).await {
+        match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd, delivery_env).await {
             Ok(url) => return Ok(url),
             Err(error) => last_error = Some(error),
         }
@@ -278,6 +315,7 @@ impl<'a> RequestDispatcher<'a> {
                         }
                         // Validation runs before the forge write; a path is never treated as content.
                         let body = crate::artifact::read_decision_ledger(temporary.path())?;
+                        let delivery_env = self.daemon.ledger_delivery_environment(&session.spec.env_ref).await?;
                         let comment_url = project_decision_ledger_once(
                             &backend,
                             &namespace,
@@ -286,6 +324,7 @@ impl<'a> RequestDispatcher<'a> {
                             &body,
                             runner.as_ref(),
                             Path::new(&session.spec.cwd),
+                            &delivery_env,
                         )
                         .await
                         .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
@@ -676,6 +715,17 @@ mod ledger_projection_tests {
 
     use super::*;
 
+    fn github_delivery_env() -> BTreeMap<String, String> {
+        BTreeMap::from([("GITHUB_TOKEN_FILE".to_string(), "/staged/github/token".to_string())])
+    }
+
+    fn forgejo_delivery_env() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("FORGEJO_TOKEN_FILE".to_string(), "/staged/forgejo/token".to_string()),
+            ("FORGEJO_API_URL".to_string(), "https://forgejo.example/api/v1".to_string()),
+        ])
+    }
+
     struct IsolatedGithubRunner {
         _directory: tempfile::TempDir,
         path: PathBuf,
@@ -690,13 +740,20 @@ mod ledger_projection_tests {
             let gh = path.join("gh");
             std::fs::write(
                 &gh,
-                "#!/bin/sh\n[ \"$GH_TOKEN\" = scoped-test-token ] || { echo 'gh auth login required' >&2; exit 1; }\n[ \"$GH_HOST\" = github.com ] || { echo 'wrong GitHub host' >&2; exit 1; }\ncase \" $* \" in\n  *' --method POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7\"}' ;;\n  *) printf '%s\\n' '[[]]' ;;\nesac\n",
+                "#!/bin/sh\n[ -s \"$GITHUB_TOKEN_FILE\" ] || { echo 'GitHub token file was not exported' >&2; exit 1; }\n[ \"$GH_TOKEN\" = scoped-test-token ] || { echo 'gh auth login required' >&2; exit 1; }\n[ \"$GH_HOST\" = github.com ] || { echo 'wrong GitHub host' >&2; exit 1; }\ncase \" $* \" in\n  *' --method POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7\"}' ;;\n  *) printf '%s\\n' '[[]]' ;;\nesac\n",
             )
             .expect("fake gh");
+            let curl = path.join("curl");
+            std::fs::write(
+                &curl,
+                "#!/bin/sh\ncase \" $* \" in *'Authorization: token scoped-test-token'*) ;; *) echo 'missing scoped Forgejo token' >&2; exit 1 ;; esac\ncase \" $* \" in *'https://forgejo.example/api/v1/repos/acme/repo/issues/42/comments'*) ;; *) echo 'wrong Forgejo API URL' >&2; exit 1 ;; esac\ncase \" $* \" in *' -X POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://forgejo.example/acme/repo/pulls/42#issuecomment-7\"}' ;; *) printf '%s\\n' '[]' ;; esac\n",
+            )
+            .expect("fake curl");
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).expect("executable fake gh");
+                std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o700)).expect("executable fake curl");
             }
             let token_file = token.map(|value| {
                 let file = directory.path().join("token");
@@ -711,9 +768,6 @@ mod ledger_projection_tests {
 
             let mut command = tokio::process::Command::new(cmd);
             command.args(args).env_clear().env("PATH", format!("{}:/usr/bin:/bin", self.path.display())).env("GH_HOST", "wrong.example");
-            if let Some(file) = &self.token_file {
-                command.env("GITHUB_TOKEN_FILE", file);
-            }
             let mut child = command
                 .stdin(if input.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
                 .stdout(std::process::Stdio::piped())
@@ -759,12 +813,16 @@ mod ledger_projection_tests {
     }
 
     async fn github_convoy() -> ResourceBackend {
+        convoy_with_repository("https://github.com/flotilla-org/flotilla.git").await
+    }
+
+    async fn convoy_with_repository(url: &str) -> ResourceBackend {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let repository_ref = RepositoryKey("repo".to_string());
         let spec = ConvoySpec::builder()
             .workflow_ref("single-agent".to_string())
             .repositories(vec![ConvoyRepositorySpec::builder()
-                .url("https://github.com/flotilla-org/flotilla.git".to_string())
+                .url(url.to_string())
                 .repo_ref(repository_ref.clone())
                 .source_ref("main".to_string())
                 .target_ref("main".to_string())
@@ -783,9 +841,12 @@ mod ledger_projection_tests {
     async fn github_ledger_projects_with_staged_credential_without_ambient_auth() {
         let backend = github_convoy().await;
         let runner = IsolatedGithubRunner::new(Some("scoped-test-token"));
-        let url = project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"))
-            .await
-            .expect("project with staged credential");
+        let delivery_env =
+            BTreeMap::from([("GITHUB_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string())]);
+        let url =
+            project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
+                .await
+                .expect("project with staged credential");
         assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
     }
 
@@ -794,11 +855,39 @@ mod ledger_projection_tests {
         let backend = github_convoy().await;
         for token in [None, Some("")] {
             let runner = IsolatedGithubRunner::new(token);
-            let error = project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"))
-                .await
-                .expect_err("missing or empty credential");
+            let delivery_env = BTreeMap::from([(
+                "GITHUB_TOKEN_FILE".to_string(),
+                runner.token_file.as_ref().map_or_else(|| "/missing-token".to_string(), |path| path.display().to_string()),
+            )]);
+            let error = project_decision_ledger(
+                &backend,
+                "flotilla",
+                "demo",
+                "coder",
+                b"## Decision ledger\n",
+                &runner,
+                Path::new("/"),
+                &delivery_env,
+            )
+            .await
+            .expect_err("missing or empty credential");
             assert!(error.contains("github-crew-pr credential missing or empty"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn forgejo_ledger_projects_with_staged_credential_without_ambient_auth() {
+        let backend = convoy_with_repository("https://forgejo.example/acme/repo.git").await;
+        let runner = IsolatedGithubRunner::new(Some("scoped-test-token"));
+        let delivery_env = BTreeMap::from([
+            ("FORGEJO_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string()),
+            ("FORGEJO_API_URL".to_string(), "https://forgejo.example/api/v1".to_string()),
+        ]);
+        let url =
+            project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
+                .await
+                .expect("project with staged credential");
+        assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
     }
 
     #[derive(Default)]
@@ -857,8 +946,9 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let runner = CapturingRunner::default();
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
-        let url =
-            project_decision_ledger(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/")).await.expect("project ledger");
+        let url = project_decision_ledger(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
+            .await
+            .expect("project ledger");
         assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         let (args, input) = runner.call.lock().expect("capture lock").take().expect("gh call");
         assert!(args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/42/comments"));
@@ -890,9 +980,10 @@ mod ledger_projection_tests {
             .await
             .expect("artifact");
         let runner = CapturingRunner::default();
-        let result = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
-            .await
-            .expect("reuse comment");
+        let result =
+            project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
+                .await
+                .expect("reuse comment");
         assert_eq!(result.as_deref(), Some(comment_url));
         assert!(runner.call.lock().expect("capture lock").is_none());
     }
@@ -961,9 +1052,10 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let runner = LostResponseRunner { posts: Mutex::new(0), comment: Mutex::new(None) };
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
-        let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
-            .await
-            .expect("transient failure retries and finds accepted comment");
+        let url =
+            project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
+                .await
+                .expect("transient failure retries and finds accepted comment");
         assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         assert_eq!(*runner.posts.lock().expect("posts lock"), 1);
     }
@@ -1040,9 +1132,10 @@ mod ledger_projection_tests {
                 marker: format!("<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str()),
                 first_page_len,
             };
-            let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
-                .await
-                .expect("find comment on second page");
+            let url =
+                project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &forgejo_delivery_env())
+                    .await
+                    .expect("find comment on second page");
             assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
             assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2", "3"]);
         }
