@@ -8798,6 +8798,9 @@ impl InProcessDaemon {
         if reason.trim().is_empty() {
             return Err("convoy abandon requires a non-empty reason".to_string());
         }
+        // Archive before stamping the phase so the checkout still exists. A
+        // concurrent phase change may reject the stamp after an archive push;
+        // retrying the command is safe because archiving is best-effort.
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let expected_phase =
@@ -8871,6 +8874,9 @@ impl InProcessDaemon {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Err(format!("convoy `{}` is terminal and cannot accept a crew handoff", context.convoy));
+        }
         let (task_index, task) = convoy
             .status
             .as_ref()
@@ -8955,6 +8961,9 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|err| err.to_string())?;
+        if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
+        }
         self.reconcile_or_restore_crew_work(
             &context.namespace,
             &environment_ref,

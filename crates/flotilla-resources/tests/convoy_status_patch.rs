@@ -330,6 +330,22 @@ fn operator_can_abandon_the_terminal_phase_it_observed() {
 }
 
 #[test]
+fn abandon_does_not_apply_when_a_nonterminal_phase_changes() {
+    let original = ConvoyStatus { phase: ConvoyPhase::Landing, started_at: Some(ts(10)), ..ConvoyStatus::default() };
+    let mut status = original.clone();
+
+    external_patches::mark_convoy_abandoned(
+        ConvoyPhase::Active,
+        ts(30),
+        WorkCompletionAuthority::HumanOverride,
+        "stale request".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status, original);
+}
+
+#[test]
 fn one_shot_work_patches_preserve_existing_terminal_outcomes() {
     for phase in [WorkPhase::Complete, WorkPhase::Failed, WorkPhase::Cancelled, WorkPhase::Abandoned] {
         let original = WorkState { phase, finished_at: Some(ts(20)), message: Some("original outcome".to_string()), ..pending_work() };

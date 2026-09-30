@@ -1630,8 +1630,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     return;
                 }
                 status.phase = ConvoyPhase::Abandoned;
-                status.finished_at = None;
-                status.finished_at.get_or_insert(*finished_at);
+                status.finished_at = Some(*finished_at);
                 let actor = match authority {
                     WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
                     WorkCompletionAuthority::HumanOverride => "human override".to_string(),
