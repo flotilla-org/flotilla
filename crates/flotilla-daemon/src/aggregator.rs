@@ -2228,8 +2228,10 @@ impl Aggregator {
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
+        let convoy_attention = status.and_then(|status| status.attention.as_ref());
         let surface_state = if !subject_conflicts.is_empty()
             || attention_demand.is_some()
+            || convoy_attention.is_some()
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
             SurfaceState::NeedsYou
@@ -2270,6 +2272,7 @@ impl Aggregator {
                             )
                         })
                     })
+                    .or_else(|| convoy_attention.map(|attention| attention.reason.clone()))
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
             .maybe_disposition(status.and_then(|status| status.disposition.clone()))
@@ -2657,6 +2660,24 @@ mod tests {
         assert!(!terminal_surface_state(TerminalAttentionState::Idle).needs_attention());
         assert!(!terminal_surface_state(TerminalAttentionState::Working).needs_attention());
         assert!(!terminal_surface_state(TerminalAttentionState::Unobservable).needs_attention());
+    }
+
+    #[tokio::test]
+    async fn pending_supervisor_turn_is_visible_on_the_governor_convoy() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut governor = convoy_with_vessel("governor").await;
+        governor.status.as_mut().expect("status").attention = Some(flotilla_resources::ConvoyAttention {
+            source: "supervisor-turn-delivery".to_string(),
+            reason: "Stalled crew needs governor@govern; supervisor turn awaits terminal delivery".to_string(),
+            raised_at: Utc::now(),
+        });
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(governor)).await;
+        let result = state.result_set().await;
+        let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "governor").expect("governor row");
+        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
+        assert!(row.message.as_deref().is_some_and(|message| message.contains("supervisor turn awaits terminal delivery")));
     }
 
     #[tokio::test]

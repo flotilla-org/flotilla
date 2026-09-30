@@ -25,6 +25,135 @@ fn turn_delivery_restarts_a_lost_session() {
     );
 }
 
+#[tokio::test]
+async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
+    let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
+    let placement = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("placement"));
+    let temp = tempfile::tempdir().expect("config dir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("machine identity");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::local(),
+        home.clone(),
+    )
+    .await;
+    let placement_config = tempfile::tempdir().expect("placement config dir");
+    std::fs::write(placement_config.path().join("daemon.toml"), "machine_id = \"placement\"\n").expect("placement identity");
+    let placement_daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(placement_config.path())),
+        fake_discovery(false),
+        HostName::local(),
+        placement.clone(),
+    )
+    .await;
+    let convoys = home.clone().using::<ResourceConvoy>("flotilla");
+    let governor = convoys
+        .create(
+            &test_meta("governor-convoy"),
+            &ConvoySpec::builder().workflow_ref("governor".to_string()).role("governor".to_string()).build(),
+        )
+        .await
+        .expect("governor convoy");
+    convoys
+        .update_status(&governor.metadata.name, &governor.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            work: BTreeMap::from([(
+                "govern".to_string(),
+                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+            )]),
+            crew_work: BTreeMap::from([(
+                "govern".to_string(),
+                BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("running governor");
+    let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("governor-terminal".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "governor-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "govern".to_string()),
+                    (ROLE_LABEL.to_string(), "governor".to_string()),
+                ]))
+                .build(),
+            &ResourceTerminalSessionSpec {
+                env_ref: "remote-env".to_string(),
+                role: "governor".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("governor"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".to_string(),
+                        content: "standing brief".to_string(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".to_string(),
+                        convoy: "governor-convoy".to_string(),
+                        vessel_ref: "governor-convoy-govern".to_string(),
+                    }),
+                    message: None,
+                },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("governor terminal on placement host");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            ..Default::default()
+        })
+        .await
+        .expect("running terminal");
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("governor-convoy".to_string())
+        .source("supervision-stalled-crew".to_string())
+        .vessel("govern".to_string())
+        .role("governor".to_string())
+        .brief("Supervise the stalled crew".to_string())
+        .subject_revision("stall-1".to_string())
+        .sender(CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() })
+        .build();
+    daemon.deliver_standing_turn(&request).await.expect("remote governor turn accepted");
+    let queued = convoys.get("governor-convoy").await.expect("governor convoy after turn");
+    assert!(queued.status.as_ref().and_then(|status| status.attention.as_ref()).is_some(), "failed delivery must be visible");
+    placement
+        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
+        .replace(&convoys.list().await.expect("home convoys"), Utc::now())
+        .await
+        .expect("replicate queued turn to placement host");
+    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("placement consumes turn");
+    let delivered = sessions.get("governor-terminal").await.expect("governor terminal after turn");
+    let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("governor turn queued") };
+    assert_eq!(message.text, "[flotilla · escalated from coder@work · supervise the stalled crew]\n\nSupervise the stalled crew");
+    let delivered = sessions.get("governor-terminal").await.expect("governor terminal for acknowledgment");
+    let mut delivered_status = delivered.status.expect("running terminal status");
+    delivered_status.delivered_message_id = Some(message.id);
+    sessions
+        .update_status("governor-terminal", &delivered.metadata.resource_version, &delivered_status)
+        .await
+        .expect("confirm governor delivery");
+    home.replica_writer::<ResourceTerminalSession>(NodeId::new("placement"), "flotilla")
+        .replace(&sessions.list().await.expect("confirmed placement terminals"), Utc::now())
+        .await
+        .expect("replicate delivery confirmation");
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("home acknowledges turn");
+    let acknowledged = convoys.get("governor-convoy").await.expect("governor convoy after acknowledgment");
+    let status = acknowledged.status.expect("governor status");
+    assert!(!status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    assert!(status.attention.is_none());
+}
+
 #[test]
 fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
     let now = chrono::Utc::now();
