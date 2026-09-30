@@ -33,6 +33,12 @@ pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
     error.strip_prefix(RATE_LIMIT_PREFIX)?.rsplit_once("reset_at=")?.1.strip_suffix(')')?.parse().ok()
 }
 
+/// Only the REST core budget controls issue observation. Search has its own quota.
+pub fn core_rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
+    error.strip_prefix(RATE_LIMIT_PREFIX)?.strip_prefix("REST core")?;
+    rate_limit_reset(error)
+}
+
 /// Clamp a limit to GitHub's max per_page (100), warning if truncated.
 pub fn clamp_per_page(limit: usize) -> usize {
     if limit > MAX_PER_PAGE {
@@ -226,6 +232,8 @@ impl GhApi for GhApiClient {
         if parsed.status == 200 && is_issue_observation(endpoint) {
             if let Some((reset, message)) = low_budget_from_response(&output.stdout) {
                 *self.budget_backoff.lock().expect("GitHub budget lock poisoned") = Some((reset, message.clone()));
+                // Keep the ETag and body for a conditional retry after reset, but
+                // report the exhausted budget now so the host condition is visible.
                 return Err(message);
             }
         }

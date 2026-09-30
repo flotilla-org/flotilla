@@ -316,7 +316,8 @@ impl Aggregator {
     }
 
     pub(crate) fn with_issue_polling_health(mut self, health: IssuePollingHealth) -> Self {
-        self.issue_materializer = self.issue_materializer.take().map(|materializer| materializer.with_polling_health(health));
+        let materializer = self.issue_materializer.take().expect("issue resolver must be configured before polling health");
+        self.issue_materializer = Some(materializer.with_polling_health(health));
         self
     }
 

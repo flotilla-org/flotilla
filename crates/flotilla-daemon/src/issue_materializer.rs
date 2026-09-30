@@ -14,7 +14,10 @@ use chrono::{DateTime, Utc};
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
-    providers::{github_api::rate_limit_reset, issue_tracker::IssueProvider},
+    providers::{
+        github_api::{core_rate_limit_reset, rate_limit_reset},
+        issue_tracker::IssueProvider,
+    },
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -109,8 +112,11 @@ struct BudgetBackoff {
 
 impl IssuePollingHealth {
     pub(crate) fn note(&self, message: &str) {
-        if let Some(reset) = rate_limit_reset(message).filter(|_| message.starts_with("github rate limited (budget=REST core")) {
-            self.backoff.lock().expect("issue polling health lock poisoned").current = Some((reset, message.to_string()));
+        if let Some(reset) = core_rate_limit_reset(message) {
+            let mut backoff = self.backoff.lock().expect("issue polling health lock poisoned");
+            if backoff.current.as_ref().is_none_or(|(current, _)| reset > *current) {
+                backoff.current = Some((reset, message.to_string()));
+            }
         }
     }
 
@@ -208,7 +214,22 @@ impl SharedIssueRefresh {
                 if since_time >= cached.next_cursor {
                     return (since.to_string(), Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false }));
                 }
-                return (cached.next_cursor.to_rfc3339(), cached.result.clone());
+                if since_time == cached.since {
+                    return (cached.next_cursor.to_rfc3339(), cached.result.clone());
+                }
+                // This query loaded a newer initial page than the oldest query.
+                // Updates carry timestamps and can be filtered; closures do not.
+                // Keep its cursor so the next source poll can verify closures.
+                let mut next_cursor = cached.next_cursor.to_rfc3339();
+                let filtered = cached.result.clone().map(|mut changes| {
+                    changes.updated.retain(|issue| issue.as_of >= since_time);
+                    if !changes.closed.is_empty() {
+                        next_cursor = since.to_string();
+                    }
+                    changes.closed.clear();
+                    changes
+                });
+                return (next_cursor, filtered);
             }
         }
         let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
@@ -1063,8 +1084,10 @@ mod tests {
         let first = project_query("first-checkout");
         let second = project_query("second-checkout");
         let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
+        let mut changed = issue("2");
+        changed.as_of = Utc::now() + ChronoDuration::seconds(1);
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["1"], false), page(&["1"], false)], vec![IssueChangeset {
-            updated: vec![issue("2")],
+            updated: vec![changed],
             closed: vec![],
             has_more: false,
         }]));
@@ -1120,6 +1143,44 @@ mod tests {
 
         let result = state.result_set_for(&second).await.expect("second issue window");
         assert_eq!(result.rows.as_issues().expect("issue rows")[0].issue.title, "newer page");
+    }
+
+    #[tokio::test]
+    async fn overlapping_query_cursors_do_not_replay_stale_updates_or_closures() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("first");
+        let second = project_query("second");
+        let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
+        let mut stale = issue("1");
+        stale.title = "stale update".into();
+        let mut current = issue("1");
+        current.title = "current page".into();
+        let closed = issue("2").reference;
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["1", "2"], false), IssueResultPage { items: vec![current, issue("2")], total: None, has_more: false }],
+            vec![IssueChangeset { updated: vec![stale], closed: vec![closed], has_more: false }],
+        ));
+        let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
+        let (event_tx, mut events) = broadcast::channel(8);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let first_generation = subscribe(&state, &first);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
+        next_event(&mut events).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second_generation = subscribe(&state, &second);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
+        next_event(&mut events).await;
+
+        materializer.refresh(&first);
+        next_event(&mut events).await;
+        materializer.refresh(&second);
+        next_event(&mut events).await;
+
+        assert_eq!(provider.seen_since.lock().await.len(), 1);
+        let result = state.result_set_for(&second).await.expect("second issue window");
+        let rows = result.rows.as_issues().expect("issue rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.issue.title == "current page"));
     }
 
     #[tokio::test(start_paused = true)]
