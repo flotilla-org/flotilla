@@ -75,6 +75,24 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some("feta-host"));
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str), Some("kiwi-root"));
     assert!(
+        flotilla_resources::home_bound_authorship_collisions(&feta, NAMESPACE)
+            .await
+            .expect("placement host collision diagnosis")
+            .is_empty(),
+        "the placed-Vessel actuator is a projection of the origin's Vessel, not a second author"
+    );
+    kiwi.replica_writer::<Vessel>(NodeId::new("feta-root"), NAMESPACE)
+        .replace(&feta.using::<Vessel>(NAMESPACE).list().await.expect("list actuator Vessels"), Utc::now())
+        .await
+        .expect("replicate actuator status to admitting root");
+    assert!(
+        flotilla_resources::home_bound_authorship_collisions(&kiwi, NAMESPACE)
+            .await
+            .expect("admitting host collision diagnosis")
+            .is_empty(),
+        "the origin must not treat the actuator replica as another author"
+    );
+    assert!(
         !kiwi
             .using::<Vessel>(NAMESPACE)
             .get("remote-placement-work")

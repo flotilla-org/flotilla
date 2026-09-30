@@ -18,7 +18,7 @@ use crate::{
     Demand, DispatchObservation, Environment, Event, FieldOwnedResource, Forge, FulfilmentKind, Host, InputMeta, Issue, ManifestRoot,
     ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor,
     ReplicationClass, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance,
-    TerminalSession, Usage, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity,
+    TerminalSession, Usage, Vessel, WatchEvent, WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -406,7 +406,7 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
     let local_names = sources
         .items
         .iter()
-        .filter(|item| matches!(item.provenance, ResourceProvenance::Local))
+        .filter(|item| matches!(item.provenance, ResourceProvenance::Local) && !is_projected_vessel_actuator::<T>(&item.object))
         .map(|item| item.object.metadata.name.as_str())
         .collect::<HashSet<_>>();
     Ok(sources
@@ -416,6 +416,9 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
             let ResourceProvenance::Replica { origin_root, .. } = &item.provenance else {
                 return None;
             };
+            if is_projected_vessel_actuator::<T>(&item.object) {
+                return None;
+            }
             (origin_root != local_root && local_names.contains(item.object.metadata.name.as_str())).then(|| {
                 HomeBoundAuthorshipCollision::builder()
                     .kind(T::API_PATHS.kind.to_string())
@@ -427,6 +430,10 @@ async fn home_bound_authorship_collisions_typed<T: Resource>(
             })
         })
         .collect())
+}
+
+fn is_projected_vessel_actuator<T: Resource>(object: &ResourceObject<T>) -> bool {
+    T::API_PATHS.kind == Vessel::API_PATHS.kind && object.metadata.annotations.contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION)
 }
 
 async fn replica_cursor_typed<T: Resource>(

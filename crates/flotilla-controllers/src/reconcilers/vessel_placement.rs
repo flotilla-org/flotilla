@@ -6,7 +6,7 @@ use flotilla_resources::{
     Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VesselPlacementSync {
@@ -170,6 +170,7 @@ impl VesselPlacementProjector {
                 result.updated += 1;
             } else {
                 vessels.create(&meta, &source.spec).await?;
+                info!(convoy = %source.spec.convoy_ref, vessel = %name, source_root = %meta.annotations[ACTUATOR_SOURCE_ROOT_ANNOTATION], authoring_path = "placed_vessel_projector", "created placed Vessel actuator");
                 result.created += 1;
             }
         }
