@@ -27,6 +27,16 @@ fn turn_delivery_restarts_a_lost_session() {
     );
 }
 
+async fn replicate_turn_delivery_resources<T: Resource>(
+    source: &ResourceBackend,
+    destination: &ResourceBackend,
+    source_root: &str,
+    context: &str,
+) {
+    let objects = source.clone().using::<T>("flotilla").list().await.expect(context);
+    destination.replica_writer::<T>(NodeId::new(source_root), "flotilla").replace(&objects, Utc::now()).await.expect(context);
+}
+
 #[tokio::test]
 async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
@@ -240,11 +250,7 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         })
         .await
         .expect("working crew");
-    placement
-        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
-        .replace(&convoys.list().await.expect("home convoy"), Utc::now())
-        .await
-        .expect("replicate convoy for vessel reconciliation");
+    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate convoy for vessel reconciliation").await;
     home.using::<PlacementPolicy>("flotilla")
         .create(
             &test_meta("placement-policy"),
@@ -258,11 +264,7 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         )
         .await
         .expect("placement policy");
-    placement
-        .replica_writer::<PlacementPolicy>(NodeId::new("home"), "flotilla")
-        .replace(&home.using::<PlacementPolicy>("flotilla").list().await.expect("home policies"), Utc::now())
-        .await
-        .expect("replicate placement policy");
+    replicate_turn_delivery_resources::<PlacementPolicy>(&home, &placement, "home", "replicate placement policy").await;
     let environments = placement.clone().using::<ResourceEnvironment>("flotilla");
     let environment = environments
         .create(&test_meta("host-direct-placement-host"), &ResourceEnvironmentSpec {
@@ -323,10 +325,7 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         })
         .await
         .expect("running terminal");
-    home.replica_writer::<ResourceTerminalSession>(NodeId::new("placement"), "flotilla")
-        .replace(&sessions.list().await.expect("placement sessions"), Utc::now())
-        .await
-        .expect("replicate session");
+    replicate_turn_delivery_resources::<ResourceTerminalSession>(&placement, &home, "placement", "replicate session").await;
 
     let request = crate::leaf_engine::TurnDeliveryRequest::builder()
         .namespace("flotilla".to_string())
@@ -338,14 +337,18 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         .subject_revision("stall-1".to_string())
         .sender(CrewMessageSender::FlotillaNudge)
         .build();
+    let mut disallowed = request.clone();
+    disallowed.sender = CrewMessageSender::OperatorResume { principal: None };
+    let error = home_daemon.deliver_standing_turn(&disallowed).await.expect_err("operator cannot queue a remote turn");
+    assert!(error.contains("sender is not permitted"), "{error}");
+    let mut missing = request.clone();
+    missing.role = "missing".to_string();
+    let error = home_daemon.deliver_standing_turn(&missing).await.expect_err("nudge requires a remote session");
+    assert!(error.contains("has no durable terminal-session record"), "{error}");
     home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
     let convoy = convoys.get("nudge-convoy").await.expect("queued convoy");
     assert!(convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
-    placement
-        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
-        .replace(&convoys.list().await.expect("home convoys"), Utc::now())
-        .await
-        .expect("replicate turn");
+    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate turn").await;
     placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at placement");
     let delivered = sessions.get(&meta.name).await.expect("delivered session");
     let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("nudge queued") };
@@ -355,10 +358,7 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
     let mut delivered_status = delivered.status.expect("running terminal status");
     delivered_status.delivered_message_id = Some(nudge_id);
     sessions.update_status(&meta.name, &delivered.metadata.resource_version, &delivered_status).await.expect("confirm nudge delivery");
-    home.replica_writer::<ResourceTerminalSession>(NodeId::new("placement"), "flotilla")
-        .replace(&sessions.list().await.expect("confirmed terminal"), Utc::now())
-        .await
-        .expect("replicate nudge confirmation");
+    replicate_turn_delivery_resources::<ResourceTerminalSession>(&placement, &home, "placement", "replicate nudge confirmation").await;
     home_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("acknowledge nudge at convoy home");
 
     let convoy = convoys.get("nudge-convoy").await.expect("convoy after nudge");
@@ -370,11 +370,7 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         .await
         .expect("resume reconciled remote session");
     assert!(matches!(outcome, ConvoyResumeOutcome::Queued { .. }));
-    placement
-        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
-        .replace(&convoys.list().await.expect("resumed convoy"), Utc::now())
-        .await
-        .expect("replicate resume");
+    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate resume").await;
     placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver resume at placement");
     let resumed = sessions.get(&meta.name).await.expect("resumed session");
     let TerminalSessionSource::Agent { message: Some(message), .. } = resumed.spec.source else { panic!("resume queued") };
