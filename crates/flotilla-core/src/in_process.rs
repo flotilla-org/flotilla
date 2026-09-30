@@ -8804,8 +8804,13 @@ impl InProcessDaemon {
         if reason.trim().is_empty() {
             return Err("convoy abandon requires a non-empty reason".to_string());
         }
+        // Archive before stamping the phase so the checkout still exists. A
+        // concurrent phase change may reject the stamp after an archive push;
+        // retrying the command is safe because archiving is best-effort.
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let expected_phase =
+            convoys.get(name).await.map_err(|err| err.to_string())?.status.map_or(ConvoyPhase::Pending, |status| status.phase);
         let authority = match principal_ref {
             Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
@@ -8814,10 +8819,13 @@ impl InProcessDaemon {
         apply_resource_status_patch(
             &convoys,
             name,
-            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), authority, reason.to_string()),
+            &convoy_external_patches::mark_convoy_abandoned(expected_phase, Utc::now(), authority, reason.to_string()),
         )
         .await
         .map_err(|err| err.to_string())?;
+        if !convoys.get(name).await.map_err(|err| err.to_string())?.status.is_some_and(|status| status.phase == ConvoyPhase::Abandoned) {
+            return Err("convoy phase changed while abandonment was being applied; retry the command".to_string());
+        }
         // Abandonment is an explicit terminal override: the phase stamp above is
         // the teardown gate, after the best-effort archive push has run. The
         // lifecycle reconciler reclaims children while retaining the convoy.
@@ -8872,6 +8880,9 @@ impl InProcessDaemon {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Err(format!("convoy `{}` is terminal and cannot accept a crew handoff", context.convoy));
+        }
         let (task_index, task) = convoy
             .status
             .as_ref()
@@ -8956,6 +8967,9 @@ impl InProcessDaemon {
         )
         .await
         .map_err(|err| err.to_string())?;
+        if reopened.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            return Err(format!("convoy `{}` became terminal during crew handoff", context.convoy));
+        }
         self.reconcile_or_restore_crew_work(
             &context.namespace,
             &environment_ref,
