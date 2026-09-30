@@ -33,7 +33,7 @@ use crate::{
     event_sink::EventSink,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
-        is_host_self_report, join_replica_errors, replica_sync_is_fresh, FleetService, ResourceReplicationFailure,
+        join_replica_errors, replica_sync_is_fresh, replicated_host_reports, FleetService, ResourceReplicationFailure,
     },
     host_registry::HostCounts,
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
@@ -229,32 +229,22 @@ impl ReadProjections<'_> {
         let mut host_refs = HashMap::<String, HostName>::new();
         let resource_hosts =
             self.backend.clone().including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
-        for resource_host in resource_hosts.items {
-            let host = match &resource_host.provenance {
-                ResourceProvenance::Local if local_host_id.as_deref() == Some(resource_host.object.metadata.name.as_str()) => {
-                    Some(self.host_name.clone())
+        for source in &resource_hosts.items {
+            if matches!(source.provenance, ResourceProvenance::Local)
+                && local_host_id.as_deref() == Some(source.object.metadata.name.as_str())
+            {
+                host_refs.insert(source.object.metadata.name.clone(), self.host_name.clone());
+                if let Some(status) = &source.object.status {
+                    statuses.insert(self.host_name.clone(), status.clone());
                 }
-                ResourceProvenance::Local => None,
-                ResourceProvenance::Replica { origin_root, .. } => {
-                    // An origin replicates every Host it observes, including this daemon's Host.
-                    // Only the Host matching the origin's canonical environment is its self-report.
-                    if !is_host_self_report(&resource_host, self.host_registry).await {
-                        None
-                    } else {
-                        self.host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
-                    }
-                }
-            };
-            let (Some(host), Some(status)) = (host, resource_host.object.status) else {
-                continue;
-            };
-            host_refs.insert(resource_host.object.metadata.name, host.clone());
-            let replace = statuses.get(&host).is_none_or(|current| current.heartbeat_at < status.heartbeat_at);
-            if replace {
-                if let ResourceProvenance::Replica { last_synced_at, .. } = resource_host.provenance {
-                    host_syncs.insert(host.clone(), last_synced_at);
-                }
-                statuses.insert(host, status);
+            }
+        }
+        // All fleet views select the freshest self-report when multiple origins name one host.
+        for (host, report) in replicated_host_reports(&resource_hosts.items, self.host_registry, &configured_by_node).await {
+            host_refs.insert(report.host_id, host.clone());
+            host_syncs.insert(host.clone(), report.last_synced_at);
+            if let Some(status) = report.status {
+                statuses.entry(host).or_insert(status);
             }
         }
 
@@ -472,24 +462,11 @@ impl ReadProjections<'_> {
         let mut replicas = Vec::new();
         let host_sources =
             self.backend.clone().including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
-        let mut replicated_hosts = HashMap::<HostName, (DateTime<Utc>, Option<String>)>::new();
-        for source in host_sources.items {
-            let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else { continue };
-            if !is_host_self_report(&source, self.host_registry).await {
-                continue;
-            }
-            let Some(host) = self.host_registry.host_name_for_node(origin_root).await else { continue };
-            let last_synced_at = *last_synced_at;
-            let generation = source.object.status.and_then(|status| status.daemon_generation);
-            replicated_hosts
-                .entry(host)
-                .and_modify(|existing| {
-                    if existing.0 < last_synced_at {
-                        *existing = (last_synced_at, generation.clone());
-                    }
-                })
-                .or_insert((last_synced_at, generation));
-        }
+        let mut replicated_hosts = replicated_host_reports(&host_sources.items, self.host_registry, &HashMap::new())
+            .await
+            .into_iter()
+            .map(|(host, report)| (host, (report.last_synced_at, report.status.and_then(|status| status.daemon_generation))))
+            .collect::<HashMap<_, _>>();
         let configured_hosts = self
             .config
             .load_hosts()
@@ -1302,6 +1279,41 @@ mod tests {
         assert_eq!(remote.staleness, FleetHostStaleness::Stale);
         let local = health.hosts.iter().find(|row| row.host == HostName::new("local")).expect("local health");
         assert_ne!(local.daemon_generation.as_deref(), Some("third-party"));
+
+        // A second origin with an older heartbeat but newer sync must win in both views.
+        fixture.register_remote_host("mirror-node", "remote", "mirror-id").await;
+        let mirror_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mirror_hosts = mirror_backend.using::<ResourceHost>("flotilla");
+        let created = mirror_hosts
+            .create(&InputMeta::builder().name("mirror-id".to_string()).build(), &HostSpec::default())
+            .await
+            .expect("mirror host");
+        mirror_hosts
+            .update_status("mirror-id", &created.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(now - chrono::Duration::minutes(10)),
+                daemon_generation: Some("newer-sync".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("mirror status");
+        fixture
+            .backend
+            .replica_writer::<ResourceHost>(NodeId::new("mirror-node"), "flotilla")
+            .replace(&mirror_hosts.list().await.expect("mirror hosts"), now - chrono::Duration::minutes(1))
+            .await
+            .expect("replicate mirror host");
+        let list = fixture.projections().fleet_list("flotilla", Vec::new(), now).await.expect("fleet list with mirror");
+        let remote = list.replicas.iter().find(|row| row.host == HostName::new("remote")).expect("remote mirror list");
+        assert_eq!(remote.generation.as_deref(), Some("newer-sync"));
+        assert!(remote.reachable);
+        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
+        let health = fixture
+            .projections()
+            .fleet_health("flotilla", host_list, Vec::new(), Some("local-id".to_string()), now)
+            .await
+            .expect("fleet health with mirror");
+        let remote = health.hosts.iter().find(|row| row.host == HostName::new("remote")).expect("remote mirror health");
+        assert_eq!(remote.daemon_generation.as_deref(), Some("newer-sync"));
     }
 
     #[tokio::test]

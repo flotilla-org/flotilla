@@ -23,6 +23,7 @@ use flotilla_resources::{
 };
 use futures::future::join_all;
 use tokio::sync::{broadcast, RwLock};
+use tracing::debug;
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
@@ -46,6 +47,42 @@ pub(crate) async fn is_host_self_report(source: &ReadResourceObject<ResourceHost
         .await
         .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
         .is_some_and(|host_id| host_id == source.object.metadata.name)
+}
+
+pub(crate) struct ReplicatedHostReport {
+    pub(crate) host_id: String,
+    pub(crate) last_synced_at: DateTime<Utc>,
+    pub(crate) status: Option<ResourceHostStatus>,
+}
+
+pub(crate) async fn replicated_host_reports(
+    sources: &[ReadResourceObject<ResourceHost>],
+    host_registry: &HostRegistry,
+    configured_by_node: &HashMap<NodeId, HostName>,
+) -> HashMap<HostName, ReplicatedHostReport> {
+    let mut reports = HashMap::<HostName, ReplicatedHostReport>::new();
+    for source in sources {
+        let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else { continue };
+        if !is_host_self_report(source, host_registry).await {
+            continue;
+        }
+        let Some(host) = host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
+        else {
+            continue;
+        };
+        if reports.get(&host).is_some_and(|existing| {
+            existing.last_synced_at > *last_synced_at
+                || (existing.last_synced_at == *last_synced_at && existing.host_id <= source.object.metadata.name)
+        }) {
+            continue;
+        }
+        reports.insert(host, ReplicatedHostReport {
+            host_id: source.object.metadata.name.clone(),
+            last_synced_at: *last_synced_at,
+            status: source.object.status.clone(),
+        });
+    }
+    reports
 }
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -395,7 +432,10 @@ impl FleetService {
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = if let Some((origin_root, _)) = remote_origin {
                 // The origin may arrive before its host summary. Wait for the mapping instead of exposing a phantom host.
-                let Some(host) = host_registry.host_name_for_node(origin_root).await else { continue };
+                let Some(host) = host_registry.host_name_for_node(origin_root).await else {
+                    debug!(origin = %origin_root, session = %session.metadata.name, "omitting fleet row until host origin is mapped");
+                    continue;
+                };
                 host
             } else if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
@@ -437,23 +477,12 @@ impl FleetService {
         }
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local, source);
         if matches!(source, FleetRowSource::IncludingReplicas) {
-            let mut sync_by_host = HashMap::new();
-            for source in &host_sources.items {
-                let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else {
-                    continue;
-                };
-                if !is_host_self_report(source, host_registry).await {
-                    continue;
-                }
-                if let Some(host) = host_registry.host_name_for_node(origin_root).await {
-                    sync_by_host.insert(host, *last_synced_at);
-                }
-            }
+            let reports = replicated_host_reports(&host_sources.items, host_registry, &HashMap::new()).await;
             for row in &mut rows {
                 if row.host == self.host_name || !matches!(row.staleness, FleetStaleness::Local) {
                     continue;
                 }
-                if let Some(last_sync) = sync_by_host.get(&row.host).copied() {
+                if let Some(last_sync) = reports.get(&row.host).map(|report| report.last_synced_at) {
                     row.staleness = if !replica_sync_is_fresh(last_sync, now) {
                         FleetStaleness::Stale { last_sync }
                     } else {
