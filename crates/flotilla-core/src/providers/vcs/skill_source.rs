@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::providers::{ChannelLabel, CommandRunner};
 
 pub const STAGE_DIAGNOSTIC_PREFIX: &str = "flotilla-stage-skills: ";
+pub const STAGE_RETRYABLE_PREFIX: &str = "flotilla-stage-skills-retryable:";
 
 const STAGE_SCRIPT: &str = r#"set -eu
 diagnostic_prefix=$0
@@ -20,18 +21,29 @@ staged="${destination}.flotilla-staging.$$"
 sources="${destination}.flotilla-sources.$$"
 token_files=
 succeeded=false
+retrying=false
 cache_tmp=
 cleanup() {
   rm -rf "$staged" "$sources"
   if [ -n "$cache_tmp" ]; then rm -rf "$cache_tmp"; fi
-  if [ "$cleanup_tokens" = true ] || [ "$succeeded" != true ]; then
+  if [ "$retrying" != true ] && { [ "$cleanup_tokens" = true ] || [ "$succeeded" != true ]; }; then
     for token_file in $token_files; do rm -f "$token_file"; done
   fi
 }
 print_git_stderr() {
+  token=
+  if [ -n "$token_file" ] && [ -s "$token_file" ]; then
+    IFS= read -r token <"$token_file" || :
+  fi
   while IFS= read -r line || [ -n "$line" ]; do
-    if [ -n "$token_file" ] && [ -s "$token_file" ] && printf '%s\n' "$line" | grep -F -q -f "$token_file"; then
-      echo '[redacted credential-bearing git stderr line]' >&2
+    if [ -n "$token" ]; then
+      printf '%s\n' "$line" | awk -v token="$token" '{
+        while ((position = index($0, token)) > 0) {
+          printf "%s[redacted credential]", substr($0, 1, position - 1)
+          $0 = substr($0, position + length(token))
+        }
+        print
+      }' >&2
     else
       printf '%s\n' "$line" >&2
     fi
@@ -68,42 +80,69 @@ while [ "$#" -gt 0 ]; do
     cp -R "$cache" "$checkout"
   else
     rm -rf "$cache"
-    git -C "$sources" init --quiet "$name" >/dev/null
-    git -C "$checkout" remote add origin "$repository"
-    git -C "$checkout" sparse-checkout set --no-cone --stdin <"$sparse_file" >/dev/null
+    if ! git -C "$sources" init --quiet "$name" >/dev/null 2>"$sources/git.stderr"; then
+      print_git_stderr "$sources/git.stderr"
+      exit 1
+    fi
+    print_git_stderr "$sources/git.stderr"
+    if ! git -C "$checkout" remote add origin "$repository" 2>"$sources/git.stderr"; then
+      print_git_stderr "$sources/git.stderr"
+      exit 1
+    fi
+    print_git_stderr "$sources/git.stderr"
+    if ! git -C "$checkout" sparse-checkout set --no-cone --stdin <"$sparse_file" >/dev/null 2>"$sources/git.stderr"; then
+      print_git_stderr "$sources/git.stderr"
+      exit 1
+    fi
+    print_git_stderr "$sources/git.stderr"
     if [ -n "$token_file" ]; then
       export GITHUB_TOKEN_FILE="$token_file"
       helper='!f() { [ "$1" = get ] || exit 0; printf "username=x-access-token\npassword="; cat "$GITHUB_TOKEN_FILE"; printf "\n"; }; f'
-      git -C "$checkout" config credential.helper "$helper"
+      if ! git -C "$checkout" config credential.helper "$helper" 2>"$sources/git.stderr"; then
+        print_git_stderr "$sources/git.stderr"
+        exit 1
+      fi
+      print_git_stderr "$sources/git.stderr"
     fi
-    attempt=0
-    while :; do
-      attempt=$((attempt + 1))
-      if [ -n "$token_file" ]; then
-        if git -C "$checkout" fetch --quiet --depth=1 --filter=blob:none --no-tags origin "$revision" >"$sources/fetch.stdout" 2>"$sources/fetch.stderr"; then break; else code=$?; fi
+    if [ -n "$token_file" ]; then
+      if git -C "$checkout" fetch --quiet --depth=1 --filter=blob:none --no-tags origin "$revision" >"$sources/fetch.stdout" 2>"$sources/fetch.stderr"; then code=0; else code=$?; fi
+    else
+      if git -C "$checkout" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin "$revision" >"$sources/fetch.stdout" 2>"$sources/fetch.stderr"; then code=0; else code=$?; fi
+    fi
+    if [ "$code" -ne 0 ]; then
+      if grep -Eiq 'not our ref|could not find remote ref|unadvertised object' "$sources/fetch.stderr"; then
+        disposition='pinned revision does not exist'
+      elif grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|permission denied|access denied' "$sources/fetch.stderr"; then
+        disposition='authentication or authorization failed'
       else
-        if git -C "$checkout" -c credential.helper= fetch --quiet --depth=1 --filter=blob:none --no-tags origin "$revision" >"$sources/fetch.stdout" 2>"$sources/fetch.stderr"; then break; else code=$?; fi
+        disposition='fetch failed'
+        retrying=true
+        echo 'flotilla-stage-skills-retryable:' >&2
       fi
-      if grep -Eiq 'not our ref|could not find remote ref|unadvertised object' "$sources/fetch.stderr"; then disposition='pinned revision does not exist'; else disposition='fetch failed'; fi
-      if [ "$disposition" = 'pinned revision does not exist' ] || [ "$attempt" -ge 3 ]; then
-        echo "${diagnostic_prefix}skill source $name $disposition at pinned revision $revision; command: git -C $checkout fetch --quiet --depth=1 --filter=blob:none --no-tags origin $revision; exit code: $code; stderr:" >&2
-        print_git_stderr "$sources/fetch.stderr"
-        exit 1
+      echo "${diagnostic_prefix}skill source $name $disposition at pinned revision $revision; command: git -C $checkout fetch --quiet --depth=1 --filter=blob:none --no-tags origin $revision; exit code: $code; stderr:" >&2
+      print_git_stderr "$sources/fetch.stderr"
+      exit 1
+    fi
+    if ! fetched_revision=$(git -C "$checkout" rev-parse FETCH_HEAD 2>"$sources/git.stderr"); then
+      print_git_stderr "$sources/git.stderr"
+      exit 1
+    fi
+    print_git_stderr "$sources/git.stderr"
+    test "$fetched_revision" = "$revision" || { echo "${diagnostic_prefix}skill source $name fetch returned the wrong pinned revision $revision" >&2; exit 1; }
+    if git -C "$checkout" checkout --quiet --detach FETCH_HEAD >"$sources/checkout.stdout" 2>"$sources/checkout.stderr"; then code=0; else code=$?; fi
+    if [ "$code" -ne 0 ]; then
+      if grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|permission denied|access denied' "$sources/checkout.stderr"; then
+        disposition='authentication or authorization failed'
+      else
+        disposition='checkout failed'
+        retrying=true
+        echo 'flotilla-stage-skills-retryable:' >&2
       fi
-      sleep "$attempt"
-    done
-    test "$(git -C "$checkout" rev-parse FETCH_HEAD)" = "$revision" || { echo "${diagnostic_prefix}skill source $name fetch returned the wrong pinned revision $revision" >&2; exit 1; }
-    attempt=0
-    while :; do
-      attempt=$((attempt + 1))
-      if git -C "$checkout" checkout --quiet --detach FETCH_HEAD >"$sources/checkout.stdout" 2>"$sources/checkout.stderr"; then break; else code=$?; fi
-      if [ "$attempt" -ge 3 ]; then
-        echo "${diagnostic_prefix}skill source $name checkout failed at pinned revision $revision; command: git -C $checkout checkout --quiet --detach FETCH_HEAD; exit code: $code; stderr:" >&2
-        print_git_stderr "$sources/checkout.stderr"
-        exit 1
-      fi
-      sleep "$attempt"
-    done
+      echo "${diagnostic_prefix}skill source $name $disposition at pinned revision $revision; command: git -C $checkout checkout --quiet --detach FETCH_HEAD; exit code: $code; stderr:" >&2
+      print_git_stderr "$sources/checkout.stderr"
+      exit 1
+    fi
+    print_git_stderr "$sources/checkout.stderr"
     cache_tmp="$cache.tmp.$$"
     rm -rf "$cache_tmp"
     cp -R "$checkout" "$cache_tmp"

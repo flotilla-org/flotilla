@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use flotilla_core::providers::{
         runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
         ProvisionedMount, ProvisionedMountMode,
     },
-    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX},
+    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX, STAGE_RETRYABLE_PREFIX},
     ChannelLabel, CommandRunner,
 };
 use tokio::{fs, io::AsyncWriteExt};
@@ -457,10 +458,8 @@ impl SkillBundle {
         source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
-        // All stagings through this registry share the same cache and may also
-        // target the same config home. A process-owned lock is released on
-        // cancellation, so a killed staging cannot strand later work.
-        let _staging_guard = self.staging_lock.lock().await;
+        // Each attempt owns the cache and destination swap, but backoff must
+        // leave the lock free for other crews. Cancellation releases the lock.
         if adapters.is_empty() {
             return remove_source_token_files(source_token_files, runner).await;
         }
@@ -507,8 +506,19 @@ impl SkillBundle {
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
             args[2] = destination.to_string_lossy().into_owned();
             args[3] = (index + 1 == destination_count).to_string();
-            let result = stage_git_skill_sources(runner, &args).await;
-            result.map_err(|error| skill_stage_error(environment_ref, &error))?;
+            for attempt in 1..=3 {
+                let result = {
+                    let _staging_guard = self.staging_lock.lock().await;
+                    stage_git_skill_sources(runner, &args).await
+                };
+                match result {
+                    Ok(_) => break,
+                    Err(error) if error.contains(STAGE_RETRYABLE_PREFIX) && attempt < 3 => {
+                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                    }
+                    Err(error) => return Err(skill_stage_error(environment_ref, &error)),
+                }
+            }
             info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
         }
         Ok(())
@@ -577,7 +587,9 @@ fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String>
                 || source.name.chars().any(|character| matches!(character, '\r' | '\n'))
                 || source.repository.is_empty()
                 || (source.repository.contains("://")
-                    && Url::parse(&source.repository).map_or(true, |url| !url.username().is_empty() || url.password().is_some()))
+                    && Url::parse(&source.repository).map_or(true, |url| {
+                        url.password().is_some() || (matches!(url.scheme(), "http" | "https") && !url.username().is_empty())
+                    }))
                 || source.credential.as_ref().is_some_and(|credential| {
                     credential.is_empty()
                         || credential.contains('/')
@@ -801,6 +813,10 @@ checkout=$2
 shift 2
 case "$1" in
   init)
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.init-secret" ]; then
+      cat "$FLOTILLA_TEST_FETCH_LOG.init-secret" >&2
+      exit 1
+    fi
     name=$3
     mkdir -p "$checkout/$name/.git"
     ;;
@@ -816,14 +832,21 @@ case "$1" in
     printf '%s\n' fetch >>"$FLOTILLA_TEST_FETCH_LOG"
     if [ -f "$FLOTILLA_TEST_FETCH_LOG.transient" ]; then
       rm "$FLOTILLA_TEST_FETCH_LOG.transient"
-      echo 'fatal: temporary network failure' >&2
-      exit 75
+      echo 'fatal: TLS connection reset by peer' >&2
+      exit 128
     fi
     if [ -f "$FLOTILLA_TEST_FETCH_LOG.fail" ]; then
       printf 'fatal: credential %s rejected by remote\n' "$(cat "$GITHUB_TOKEN_FILE")" >&2
       exit 75
     fi
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.auth" ]; then
+      printf 'fatal: HTTP/2 %s credential %s rejected by remote\n' "$(cat "$FLOTILLA_TEST_FETCH_LOG.auth")" "$(cat "$GITHUB_TOKEN_FILE")" >&2
+      exit 128
+    fi
     eval "revision=\${$#}"
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.wrong-revision" ]; then
+      revision=2222222222222222222222222222222222222222
+    fi
     printf '%s' "$revision" >"$checkout/.git/FETCH_HEAD"
     ;;
   rev-parse)
@@ -837,6 +860,8 @@ case "$1" in
     fi
     mkdir -p "$checkout/skills/private-source"
     printf '%s\n' '# Private source' >"$checkout/skills/private-source/SKILL.md"
+    mkdir -p "$checkout/plugins/private-source"
+    printf '%s\n' '# Private source' >"$checkout/plugins/private-source/SKILL.md"
     ;;
   *)
     echo "unexpected fake git command: $*" >&2
@@ -1058,8 +1083,10 @@ esac
     #[test]
     fn skill_stage_error_uses_last_nonempty_line_without_script_diagnostic() {
         let message = skill_stage_error("crew-fetch", "fatal: early git failure\nfatal: final git failure\n");
-        assert!(message.starts_with("stage generation-pinned skills for crew-fetch: fatal: final git failure"));
-        assert!(message.contains("fatal: early git failure"));
+        assert_eq!(
+            message,
+            "stage generation-pinned skills for crew-fetch: fatal: final git failure\nfatal: early git failure\nfatal: final git failure"
+        );
     }
 
     #[tokio::test]
@@ -1196,6 +1223,49 @@ esac
         assert!(error.contains("credential private-skills is unavailable"), "unexpected error: {error}");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_dispatches_recover_from_one_git_128_fetch_failure_without_losing_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(registry(temp.path()));
+        let runner = Arc::new(promisor_runner(temp.path()));
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"mattpocock-skills","repository":"https://github.com/example/mattpocock-skills.git","revision":"1111111111111111111111111111111111111111","credential":"github-skills-fork"}]}"#,
+        )
+        .expect("manifest");
+        std::fs::write(temp.path().join("fetches.transient"), "").expect("one failing fetch");
+        let results = futures::future::join_all((0..6).map(|index| {
+            let registry = Arc::clone(&registry);
+            let runner = Arc::clone(&runner);
+            let token_file = temp.path().join(format!("source-{index}.token"));
+            std::fs::write(&token_file, format!("token-{index}\n")).expect("unique minted token");
+            tokio::spawn(async move {
+                let result = registry
+                    .stage_skills(
+                        &format!("crew-{index}"),
+                        &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                        &[(
+                            "CLAUDE_CONFIG_DIR".to_string(),
+                            runner.config_base.join(format!("claude-{index}")).to_string_lossy().into_owned(),
+                        )],
+                        &BTreeMap::from([("mattpocock-skills".to_string(), token_file.clone())]),
+                        &*runner,
+                    )
+                    .await;
+                (result, token_file)
+            })
+        }))
+        .await;
+        for (index, task) in results.into_iter().enumerate() {
+            let (result, token_file) = task.expect("staging task");
+            result.expect("each concurrent crew must stage");
+            assert!(!token_file.exists(), "crew {index} must clean its own token after staging");
+            assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
+        }
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
+    }
+
     #[tokio::test]
     async fn transient_skill_fetch_retries_and_failure_redacts_credential() {
         for should_recover in [true, false] {
@@ -1230,10 +1300,198 @@ esac
                 assert_eq!(fetches.lines().count(), 3, "retry ceiling must be bounded");
                 assert!(error.contains("command: git -C"), "missing Git command: {error}");
                 assert!(error.contains("exit code: 75"), "missing Git exit code: {error}");
-                assert!(error.contains("[redacted credential-bearing git stderr line]"), "missing redacted stderr: {error}");
+                assert!(error.contains("fatal: credential [redacted credential] rejected by remote"), "missing redacted stderr: {error}");
                 assert!(!error.contains("secret-for-redaction"), "credential leaked into status: {error}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn skill_fetch_auth_failure_is_terminal_and_redacts_newline_terminated_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let runner = promisor_runner(temp.path());
+        std::fs::write(temp.path().join("fetches.auth"), "401").expect("auth marker");
+        let token_file = temp.path().join("source.token");
+        std::fs::write(&token_file, "secret-for-redaction\n").expect("token");
+        let error = registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
+                &runner,
+            )
+            .await
+            .expect_err("401 must terminate staging");
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
+        assert!(error.contains("authentication or authorization failed"), "{error}");
+        assert!(error.contains("fatal: HTTP/2 401 credential [redacted credential] rejected by remote"), "{error}");
+        assert!(!error.contains("secret-for-redaction"), "{error}");
+        assert!(!token_file.exists(), "failed staging cleans the token");
+
+        std::fs::write(temp.path().join("fetches.auth"), "403").expect("authorization marker");
+        std::fs::write(&token_file, "secret-for-redaction\n").expect("second token");
+        let error = registry
+            .stage_skills(
+                "crew-private-403",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude-403").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                &runner,
+            )
+            .await
+            .expect_err("403 must terminate staging");
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
+        assert!(error.contains("fatal: HTTP/2 403 credential [redacted credential] rejected by remote"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn skill_stage_redacts_early_git_stderr() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let runner = promisor_runner(temp.path());
+        std::fs::write(temp.path().join("fetches.init-secret"), "fatal: secret-for-redaction\n").expect("init marker");
+        let token_file = temp.path().join("source.token");
+        std::fs::write(&token_file, "secret-for-redaction\n").expect("token");
+        let error = registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                &runner,
+            )
+            .await
+            .expect_err("init failure must surface");
+        assert!(error.contains("fatal: [redacted credential]"), "{error}");
+        assert!(!error.contains("secret-for-redaction"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn skill_cache_rebuilds_when_source_changes_or_ready_marker_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        let manifest = skills.join(SKILL_BUNDLE_MANIFEST);
+        let runner = promisor_runner(temp.path());
+        let cache = runner.config_base.join("skill-source-cache/private-skills-1111111111111111111111111111111111111111");
+        let cases = [
+            ("https://github.com/example/one.git", "skills", 1),
+            ("https://github.com/example/two.git", "skills", 2),
+            ("https://github.com/example/two.git", "plugins", 3),
+            ("https://github.com/example/two.git", "plugins", 4),
+        ];
+        for (index, (repository, path, expected_fetches)) in cases.into_iter().enumerate() {
+            std::fs::write(
+                &manifest,
+                format!(
+                    r#"{{"schema_version":5,"sources":[{{"name":"private-skills","repository":"{repository}","revision":"1111111111111111111111111111111111111111","credential":"private-skills","paths":["{path}"]}}]}}"#
+                ),
+            )
+            .expect("manifest");
+            if index == 3 {
+                std::fs::remove_file(cache.join(".flotilla-ready")).expect("remove ready marker");
+            }
+            let token_file = temp.path().join(format!("source-{index}.token"));
+            std::fs::write(&token_file, "test-token").expect("token");
+            registry
+                .stage_skills(
+                    &format!("crew-{index}"),
+                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(format!("claude-{index}")).to_string_lossy().into_owned())],
+                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                    &runner,
+                )
+                .await
+                .expect("stage source");
+            assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), expected_fetches);
+            assert!(cache.join(".flotilla-ready").is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_stage_rejects_a_fetch_of_the_wrong_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let runner = promisor_runner(temp.path());
+        std::fs::write(temp.path().join("fetches.wrong-revision"), "").expect("wrong revision marker");
+        let token_file = temp.path().join("source.token");
+        std::fs::write(&token_file, "test-token").expect("token");
+        let error = registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                &runner,
+            )
+            .await
+            .expect_err("wrong revision must fail");
+        assert!(error.contains("fetch returned the wrong pinned revision 1111111111111111111111111111111111111111"), "{error}");
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_backoff_does_not_hold_the_staging_mutex() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(registry(temp.path()));
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let runner = Arc::new(promisor_runner(temp.path()));
+        std::fs::write(temp.path().join("fetches.transient"), "").expect("transient marker");
+        let stage = |name: &'static str, registry: Arc<AgentMaterialRegistry>, runner: Arc<PromisorRunner>, root: PathBuf| async move {
+            let token_file = root.join(format!("{name}.token"));
+            std::fs::write(&token_file, "test-token").expect("token");
+            registry
+                .stage_skills(
+                    name,
+                    &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                    &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(name).to_string_lossy().into_owned())],
+                    &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                    &*runner,
+                )
+                .await
+        };
+        let first = tokio::spawn(stage("crew-first", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("fetches").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first fetch started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(
+            Duration::from_millis(800),
+            stage("crew-second", Arc::clone(&registry), Arc::clone(&runner), temp.path().to_path_buf()),
+        )
+        .await
+        .expect("second crew should stage during the first crew's backoff")
+        .expect("second staging");
+        first.await.expect("first task").expect("first staging");
     }
 
     #[tokio::test]
@@ -1439,6 +1697,25 @@ esac
         .expect("write relocated credentialed source fixture manifest");
         let inspection = inspect_skill_sources(&skills).expect("credentialed source repository remains manifest data");
         assert_eq!(inspection.sources.len(), 2);
+    }
+
+    #[test]
+    fn skill_manifest_accepts_ssh_usernames_but_rejects_http_userinfo_and_passwords() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let skills = write_skill_sources(bundle.path());
+        let path = skills.join(SKILL_BUNDLE_MANIFEST);
+        let original = std::fs::read_to_string(&path).expect("manifest");
+        let repository = "https://github.com/rjwittams/rjw-skills.git";
+        std::fs::write(&path, original.replace(repository, "ssh://git@github.com/rjwittams/rjw-skills.git")).expect("SSH manifest");
+        inspect_skill_sources(&skills).expect("ordinary SSH username is allowed");
+        for invalid in [
+            "https://user:pass@github.com/rjwittams/rjw-skills.git",
+            "https://user@github.com/rjwittams/rjw-skills.git",
+            "ssh://git:pass@github.com/rjwittams/rjw-skills.git",
+        ] {
+            std::fs::write(&path, original.replace(repository, invalid)).expect("invalid manifest");
+            inspect_skill_sources(&skills).expect_err("embedded secret or HTTP userinfo is rejected");
+        }
     }
 
     #[test]
