@@ -1804,6 +1804,8 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         Err(error) => panic!("get test placement host: {error}"),
     };
     let mut status = host.status.unwrap_or_default();
+    status.ready = true;
+    status.heartbeat_at = Some(chrono::Utc::now());
     status.capabilities.insert("docker".to_string(), serde_json::json!(true));
     status.capabilities.insert("os".to_string(), serde_json::json!("linux"));
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
@@ -2402,6 +2404,41 @@ async fn capability_admission_queues_on_sleeping_minimal_host() {
     let selected = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind).expect("candidate");
     assert!(!selected.available);
     assert!(selected.sleeping_until.is_some());
+}
+
+#[tokio::test]
+async fn capability_admission_refuses_unready_host_without_sleep_intent() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "host-direct-stopped", "stopped-host", 0, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("stopped-host").await.expect("host");
+    let mut status = host.status.expect("host status");
+    status.ready = false;
+    hosts.update_status("stopped-host", &host.metadata.resource_version, &status).await.expect("stopped host");
+
+    let result = start_capability_convoy(&daemon, "stopped-host-refusal", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+        intent.placement_policy = Some("host-direct-stopped".to_string());
+    })
+    .await;
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("host-direct-stopped") && message.contains("stopped-host") && message.contains("not ready")),
+        "{result:?}"
+    );
+
+    let host = hosts.get("stopped-host").await.expect("host after refusal");
+    let mut status = host.status.expect("host status after refusal");
+    status.ready = true;
+    status.heartbeat_at = Some(chrono::Utc::now() - chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS + 1));
+    hosts.update_status("stopped-host", &host.metadata.resource_version, &status).await.expect("stale heartbeat");
+    let stale = start_capability_convoy(&daemon, "stale-host-refusal", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+        intent.placement_policy = Some("host-direct-stopped".to_string());
+    })
+    .await;
+    assert!(matches!(&stale, CommandValue::Error { message } if message.contains("heartbeat is stale")), "{stale:?}");
 }
 
 #[tokio::test]

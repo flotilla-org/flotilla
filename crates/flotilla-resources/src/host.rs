@@ -209,12 +209,14 @@ impl HostStatus {
         self.capabilities.get(CREDENTIAL_EXPIRY_CAPABILITY).cloned().map(serde_json::from_value).transpose().map(Option::unwrap_or_default)
     }
 
+    /// Whether the last heartbeat is within the host readiness TTL.
+    pub fn heartbeat_is_fresh(&self, now: DateTime<Utc>) -> bool {
+        self.heartbeat_at
+            .is_some_and(|heartbeat_at| now.signed_duration_since(heartbeat_at) <= chrono::Duration::seconds(HEARTBEAT_READY_TTL_SECS))
+    }
+
     pub fn apply_heartbeat_readiness(&mut self, now: DateTime<Utc>) {
-        self.ready = self.ready
-            && !self.readiness_blocked()
-            && self
-                .heartbeat_at
-                .is_some_and(|heartbeat_at| now.signed_duration_since(heartbeat_at) <= chrono::Duration::seconds(HEARTBEAT_READY_TTL_SECS));
+        self.ready = self.ready && !self.readiness_blocked() && self.heartbeat_is_fresh(now);
     }
 
     pub fn is_degraded(&self) -> bool {

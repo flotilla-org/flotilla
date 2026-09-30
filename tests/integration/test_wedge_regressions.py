@@ -326,15 +326,15 @@ def test_05_stopped_host_becomes_not_ready(topology):
         "node-a",
         "flotilla convoy start --project repo "
         "--name readiness-refusal --branch readiness-refusal "
-        f"--placement-policy host-direct-{host_id} "
+        f"--fulfilment host-direct-{host_id} "
         "--no-attach --json",
     )
     assert refused.returncode != 0, (
         "dispatch unexpectedly succeeded against a stopped host"
     )
     error = json.loads(refused.stdout)
-    assert error == {
-        "kind": "error",
-        "message": f"peer host {host_id} is not connected",
-    }
+    assert error["kind"] == "error"
+    assert f"host-direct-{host_id}" in error["message"]
+    assert host_id in error["message"]
+    assert "not ready" in error["message"]
     assert "\n" not in error["message"]
