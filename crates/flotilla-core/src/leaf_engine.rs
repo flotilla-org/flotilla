@@ -780,10 +780,17 @@ fn compose_change_request_turn_brief(
     claim_at: DateTime<Utc>,
     decision_ledger_ref: Option<&str>,
 ) -> String {
+    let review_link = match (&leaf.address, leaf.field_path.as_str()) {
+        (LeafAddress::ChangeRequest { service, scope, number }, ".review.actionable-at-head") if service == "github.com" => {
+            format!("- Review feedback: https://github.com/{scope}/pull/{number}\n")
+        }
+        _ => String::new(),
+    };
     let observation = format!(
-        "- Head SHA: `{}`\n- Review actionable at head: {:?}\n- Checks: {:?}\n- Mergeability: {:?}\n",
+        "- Head SHA: `{}`\n- Review actionable at head: {:?}\n{}- Checks: {:?}\n- Mergeability: {:?}\n",
         cr.head_sha.value.as_deref().unwrap_or("unknown"),
         cr.review.actionable_at_head.value,
+        review_link,
         cr.checks.value,
         cr.mergeable.value,
     );
@@ -2979,6 +2986,11 @@ mod tests {
         assert!(status.attention.is_some());
         let first_brief = &actuator.requests.lock().expect("requests")[0].brief;
         assert!(first_brief.contains("Head SHA: `aaa`"));
+        assert_eq!(
+            first_brief.contains("- Review feedback: https://github.com/flotilla-org/flotilla/pull/1392"),
+            source == "review",
+            "review link appears only in review turns"
+        );
         assert!(first_brief.contains("feature/wake"));
         assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
         assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));

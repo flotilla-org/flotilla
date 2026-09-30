@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::{
-    change_request_observer::parse_gh_observation,
+    change_request_observer::{parse_gh_observation_with_review_bot, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
         gh_api_get,
         github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, GhApi},
@@ -23,6 +23,7 @@ pub struct GitHubChangeRequest {
     repo_slug: String,
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
+    review_bot_login: String,
 }
 
 #[derive(Debug, bon::Builder)]
@@ -39,7 +40,12 @@ struct GhPr {
 
 impl GitHubChangeRequest {
     pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { provider_name, repo_slug, api, runner }
+        Self { provider_name, repo_slug, api, runner, review_bot_login: DEFAULT_REVIEW_BOT_LOGIN.to_string() }
+    }
+
+    pub fn with_review_bot_login(mut self, login: String) -> Self {
+        self.review_bot_login = login;
+        self
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -102,7 +108,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         // independent of convoy count. If a repository exceeds GitHub's query
         // limits, surface the forge error instead of silently omitting CRs.
         for number in numbers {
-            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ state isDraft headRefOid reviewDecision mergeable commits(last:1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
+            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ state isDraft headRefOid reviewDecision mergeable author {{ login }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }
         query.push_str(" } }");
         let argument = format!("query={query}");
@@ -132,9 +138,19 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             if request.is_null() {
                 continue;
             }
+            let truncated = ["comments", "reviews", "reviewThreads"]
+                .iter()
+                .any(|connection| request[connection]["pageInfo"]["hasPreviousPage"] == true)
+                || request["reviewThreads"]["nodes"]
+                    .as_array()
+                    .is_some_and(|threads| threads.iter().any(|thread| thread["comments"]["pageInfo"]["hasPreviousPage"] == true));
+            if truncated {
+                statuses.insert(*number, Err(format!("change request {number} review history truncated by GitHub pagination")));
+                continue;
+            }
             let mut request = request.clone();
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
-            statuses.insert(*number, Ok(parse_gh_observation(&request.to_string(), observed_at)?));
+            statuses.insert(*number, Ok(parse_gh_observation_with_review_bot(&request.to_string(), observed_at, &self.review_bot_login)?));
         }
         Ok(statuses)
     }
@@ -216,6 +232,159 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 mod tests {
     use super::*;
     use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, testing::MockRunner};
+
+    #[tokio::test]
+    async fn bot_comment_after_head_is_actionable() {
+        let request = serde_json::json!({
+            "state": "OPEN", "isDraft": false, "headRefOid": "head-a", "reviewDecision": null,
+            "mergeable": "MERGEABLE", "author": {"login": "flotilla-crew"},
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}
+            }}]},
+            "comments": {"nodes": [{
+                "databaseId": 42, "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "claude"}, "body": "Please fix the race"
+            }]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
+    }
+
+    #[tokio::test]
+    async fn crew_marker_reply_addresses_reviewer_comment() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+            "comments": {"nodes": [
+                {"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "body": "Please fix the race"},
+                {"databaseId": 43, "createdAt": "2026-09-30T12:00:00Z", "author": {"login": "flotilla-crew"},
+                 "body": "Fixed.\n<!-- pr-shepherd-addresses:42 -->"}
+            ]}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn inline_review_comment_after_head_is_actionable() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+            "comments": {"nodes": []},
+            "reviewThreads": {"nodes": [{"comments": {"nodes": [{
+                "fullDatabaseId": "51", "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"},
+                "body": "This branch can panic"
+            }]}}]}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
+    }
+
+    #[tokio::test]
+    async fn pushing_a_new_head_recomputes_review_actionability() {
+        let response = |head: &str, committed_at: &str| {
+            let request = serde_json::json!({
+                "state": "OPEN", "headRefOid": head, "reviewDecision": null,
+                "commits": {"nodes": [{"commit": {"committedDate": committed_at, "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                "comments": {"nodes": [{
+                    "databaseId": 42, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "body": "Please fix"
+                }]}
+            });
+            format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}))
+        };
+        let runner =
+            Arc::new(MockRunner::new(vec![Ok(response("head-a", "2026-09-30T10:00:00Z")), Ok(response("head-b", "2026-09-30T12:00:00Z"))]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let first = provider.observe_bound(&[1]).await.expect("first head");
+        let second = provider.observe_bound(&[1]).await.expect("new head");
+        assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
+        assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn review_with_feedback_is_actionable_until_crew_marks_it_addressed() {
+        let response = |addressed: bool| {
+            let comments = if addressed {
+                vec![serde_json::json!({
+                    "databaseId": 88, "createdAt": "2026-09-30T12:00:00Z", "author": {"login": "flotilla-crew"},
+                    "body": "Fixed.\n<!-- pr-shepherd-addresses:77 -->"
+                })]
+            } else {
+                Vec::new()
+            };
+            let request = serde_json::json!({
+                "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                "comments": {"nodes": comments},
+                "reviews": {"nodes": [{
+                    "fullDatabaseId": "77", "submittedAt": "2026-09-30T11:00:00Z",
+                    "author": {"login": "reviewer"}, "body": "Please fix the race", "state": "COMMENTED"
+                }]}
+            });
+            format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}))
+        };
+        let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let first = provider.observe_bound(&[1]).await.expect("unaddressed review");
+        let second = provider.observe_bound(&[1]).await.expect("addressed review");
+        assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
+        assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn formal_changes_requested_review_is_actionable_until_addressed() {
+        let response = |addressed: bool| {
+            let comments = if addressed {
+                vec![serde_json::json!({
+                    "databaseId": 88, "createdAt": "2026-09-30T12:00:00Z", "author": {"login": "flotilla-crew"},
+                    "body": "Fixed.\n<!-- pr-shepherd-addresses:77 -->"
+                })]
+            } else {
+                Vec::new()
+            };
+            let request = serde_json::json!({
+                "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                "comments": {"nodes": comments},
+                "reviews": {"nodes": [{
+                    "fullDatabaseId": "77", "submittedAt": "2026-09-30T09:00:00Z",
+                    "author": {"login": "reviewer"}, "state": "CHANGES_REQUESTED"
+                }]}
+            });
+            format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}))
+        };
+        let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let first = provider.observe_bound(&[1]).await.expect("unaddressed formal review");
+        let second = provider.observe_bound(&[1]).await.expect("addressed formal review");
+        assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
+        assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn truncated_review_history_is_not_reported_as_clear() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+            "comments": {"pageInfo": {"hasPreviousPage": true}, "nodes": []},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        assert!(statuses[&1].as_ref().expect_err("truncated history").contains("truncated"));
+    }
 
     #[tokio::test]
     async fn bound_observation_batches_n_requests_across_two_repositories() {

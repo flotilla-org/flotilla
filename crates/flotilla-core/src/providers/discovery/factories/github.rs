@@ -64,13 +64,17 @@ impl Factory for GitHubChangeRequestFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         let repo_slug = github_repo_slug(env)?;
         let api = Arc::new(GhApiClient::new(runner.clone()));
-        Ok(Arc::new(GitHubChangeRequest::new("github".into(), repo_slug, api, runner)))
+        let mut provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner);
+        if let Some(login) = config.load_config().change_request.review_bot_login {
+            provider = provider.with_review_bot_login(login);
+        }
+        Ok(Arc::new(provider))
     }
 }
 
