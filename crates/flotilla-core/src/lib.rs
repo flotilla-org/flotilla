@@ -18,6 +18,7 @@ pub(crate) mod fleet;
 pub mod hop_chain;
 pub mod host_identity;
 pub(crate) mod host_registry;
+pub(crate) mod host_resolution;
 pub mod host_summary;
 pub mod in_process;
 pub mod issue_observer;

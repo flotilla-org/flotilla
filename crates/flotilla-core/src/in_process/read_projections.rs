@@ -1,7 +1,44 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
-use super::*;
-use crate::event_sink::EventSink;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
+
+use chrono::{DateTime, Utc};
+use flotilla_protocol::{
+    ConvoyExplanation, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest,
+    ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement,
+    ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
+    FleetListResponse, FleetListRow, FleetReplicaStatus, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
+    HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ViewAddress,
+};
+use flotilla_resources::{
+    bound_change_request_record_name, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
+    repository_display_labels, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus,
+    CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, FulfilmentGrant, FulfilmentKind,
+    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, ManifestRoot, Project, ReadResourceObject, Repository,
+    RepositoryKey, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+use tracing::warn;
+
+use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+use crate::{
+    checkout_integration::LANDING_EVIDENCE_TTL,
+    config::ConfigStore,
+    environment_manager::EnvironmentManager,
+    event_sink::EventSink,
+    fleet::{
+        accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
+        join_replica_errors, replica_staleness, FleetService, ResourceReplicationFailure, FLEET_REPLICA_FRESH_SECS,
+    },
+    host_registry::HostCounts,
+    leaf_engine::{LeafSubscriptionTable, LeafWatcher},
+    resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
+};
 
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
@@ -245,111 +282,124 @@ impl ReadProjections<'_> {
                 fulfilments_by_host.entry(host_name.clone()).or_default().push(kind);
             }
         }
-        let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
-        accumulate_fleet_health_counts(&mut counts, &local_rows);
-        let replicas = self.fleet.health().await;
-        let mut surface_by_convoy = HashMap::new();
-        for row in local_rows.iter().chain(replicas.values().flat_map(|entry| entry.rows.iter())) {
-            let Some(convoy) = &row.convoy_ref else { continue };
-            surface_by_convoy
-                .entry((row.host.clone(), convoy.clone()))
-                .and_modify(|state: &mut flotilla_protocol::result_set::SurfaceState| {
-                    if row.surface_state.needs_attention()
-                        || (matches!(row.surface_state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
-                            && !state.needs_attention())
-                    {
-                        *state = row.surface_state;
-                    }
-                })
-                .or_insert(row.surface_state);
-        }
-        for entry in replicas.values() {
-            accumulate_fleet_health_counts(&mut counts, &entry.rows);
-        }
-
         let warning_window_days = self.config.load_daemon_config().unwrap_or_default().credentials.warning_window_days;
         let credential_warning_window = chrono::Duration::days(i64::from(warning_window_days));
-        let mut rows = Vec::with_capacity(host_rows.len());
-        for (host, (is_local, configured, link)) in host_rows {
-            let status = statuses.get(&host);
-            let replica = replicas.get(&host);
-            let heartbeat_at = status.and_then(|status| status.heartbeat_at);
-            let heartbeat_fresh = heartbeat_at.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= HEARTBEAT_READY_TTL_SECS);
-            let replica_fresh = is_local
-                || replica.is_some_and(|replica| {
-                    replica.last_error.is_none()
-                        && replica.last_sync.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= FLEET_REPLICA_FRESH_SECS)
-                });
-            let daemon_generation = status.and_then(|status| status.daemon_generation.clone());
-            let replica_generation =
-                if is_local { daemon_generation.clone() } else { replica.and_then(|replica| replica.generation.clone()) };
-            let staleness = if heartbeat_fresh && replica_fresh {
-                FleetHostStaleness::Current
-            } else if heartbeat_at.is_some() || replica.and_then(|replica| replica.last_sync).is_some() {
-                FleetHostStaleness::Stale
-            } else {
-                FleetHostStaleness::Unknown
-            };
-            let observation_agreement = fleet_observation_agreement(
-                &link,
-                heartbeat_at,
-                heartbeat_fresh,
-                daemon_generation.as_deref(),
-                replica_generation.as_deref(),
-                is_local,
-            );
-            let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
-            let surface_states = flotilla_protocol::FleetSurfaceCounts {
-                available: surface_by_convoy
-                    .iter()
-                    .filter(|((row_host, _), state)| row_host == &host && **state == flotilla_protocol::result_set::SurfaceState::Available)
-                    .count(),
-                stalled_handled: surface_by_convoy
-                    .iter()
-                    .filter(|((row_host, _), state)| {
-                        row_host == &host && matches!(state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
-                    })
-                    .count(),
-                needs_you: surface_by_convoy.iter().filter(|((row_host, _), state)| row_host == &host && state.needs_attention()).count()
-                    + manifest_needs_by_host.get(&host).copied().unwrap_or_default(),
-            };
-            let degraded_conditions = status
-                .into_iter()
-                .flat_map(|status| status.conditions.iter())
-                .filter(|condition| condition.value == ConditionValue::False)
-                .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
-                .collect();
-            let credential_attention =
-                status.map(|status| host_credential_attention(status, now, credential_warning_window)).unwrap_or_default();
+        let mut rows = self
+            .fleet
+            .with_health(|replicas| {
+                let mut counts = HashMap::<HostName, (usize, HashSet<String>)>::new();
+                accumulate_fleet_health_counts(&mut counts, &local_rows);
+                let mut surface_by_convoy = HashMap::new();
+                for row in local_rows.iter().chain(replicas.values().flat_map(|entry| entry.rows.iter())) {
+                    let Some(convoy) = &row.convoy_ref else { continue };
+                    surface_by_convoy
+                        .entry((row.host.clone(), convoy.clone()))
+                        .and_modify(|state: &mut flotilla_protocol::result_set::SurfaceState| {
+                            if row.surface_state.needs_attention()
+                                || (matches!(row.surface_state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
+                                    && !state.needs_attention())
+                            {
+                                *state = row.surface_state;
+                            }
+                        })
+                        .or_insert(row.surface_state);
+                }
+                for entry in replicas.values() {
+                    accumulate_fleet_health_counts(&mut counts, &entry.rows);
+                }
 
-            rows.push(
-                FleetHostRow::builder()
-                    .fulfilments(fulfilments_by_host.remove(&host).unwrap_or_default())
-                    .host(host)
-                    .is_local(is_local)
-                    .configured(configured)
-                    .link(link)
-                    .maybe_daemon_generation(daemon_generation)
-                    .maybe_daemon_version(status.and_then(|status| status.daemon_version.clone()))
-                    .maybe_daemon_uptime_seconds(status.and_then(|status| {
-                        status.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64)
-                    }))
-                    .maybe_heartbeat_at(heartbeat_at)
-                    .maybe_replica_last_sync(if is_local { Some(now) } else { replica.and_then(|replica| replica.last_sync) })
-                    .maybe_replica_generation(replica_generation)
-                    .crew_count(crew_count)
-                    .convoy_count(convoys.len())
-                    .surface_states(surface_states)
-                    .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
-                    .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
-                    .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
-                    .staleness(staleness)
-                    .observation_agreement(observation_agreement)
-                    .degraded_conditions(degraded_conditions)
-                    .credential_attention(credential_attention)
-                    .build(),
-            );
-        }
+                let mut rows = Vec::with_capacity(host_rows.len());
+                for (host, (is_local, configured, link)) in host_rows {
+                    let status = statuses.get(&host);
+                    let replica = replicas.get(&host);
+                    let heartbeat_at = status.and_then(|status| status.heartbeat_at);
+                    let heartbeat_fresh =
+                        heartbeat_at.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= HEARTBEAT_READY_TTL_SECS);
+                    let replica_fresh = is_local
+                        || replica.is_some_and(|replica| {
+                            replica.last_error.is_none()
+                                && replica
+                                    .last_sync
+                                    .is_some_and(|at| now.signed_duration_since(at).num_seconds() <= FLEET_REPLICA_FRESH_SECS)
+                        });
+                    let daemon_generation = status.and_then(|status| status.daemon_generation.clone());
+                    let replica_generation =
+                        if is_local { daemon_generation.clone() } else { replica.and_then(|replica| replica.generation.clone()) };
+                    let staleness = if heartbeat_fresh && replica_fresh {
+                        FleetHostStaleness::Current
+                    } else if heartbeat_at.is_some() || replica.and_then(|replica| replica.last_sync).is_some() {
+                        FleetHostStaleness::Stale
+                    } else {
+                        FleetHostStaleness::Unknown
+                    };
+                    let observation_agreement = fleet_observation_agreement(
+                        &link,
+                        heartbeat_at,
+                        heartbeat_fresh,
+                        daemon_generation.as_deref(),
+                        replica_generation.as_deref(),
+                        is_local,
+                    );
+                    let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
+                    let surface_states = flotilla_protocol::FleetSurfaceCounts {
+                        available: surface_by_convoy
+                            .iter()
+                            .filter(|((row_host, _), state)| {
+                                row_host == &host && **state == flotilla_protocol::result_set::SurfaceState::Available
+                            })
+                            .count(),
+                        stalled_handled: surface_by_convoy
+                            .iter()
+                            .filter(|((row_host, _), state)| {
+                                row_host == &host && matches!(state, flotilla_protocol::result_set::SurfaceState::StalledHandled { .. })
+                            })
+                            .count(),
+                        needs_you: surface_by_convoy
+                            .iter()
+                            .filter(|((row_host, _), state)| row_host == &host && state.needs_attention())
+                            .count()
+                            + manifest_needs_by_host.get(&host).copied().unwrap_or_default(),
+                    };
+                    let degraded_conditions = status
+                        .into_iter()
+                        .flat_map(|status| status.conditions.iter())
+                        .filter(|condition| condition.value == ConditionValue::False)
+                        .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
+                        .collect();
+                    let credential_attention =
+                        status.map(|status| host_credential_attention(status, now, credential_warning_window)).unwrap_or_default();
+
+                    rows.push(
+                        FleetHostRow::builder()
+                            .fulfilments(fulfilments_by_host.remove(&host).unwrap_or_default())
+                            .host(host)
+                            .is_local(is_local)
+                            .configured(configured)
+                            .link(link)
+                            .maybe_daemon_generation(daemon_generation)
+                            .maybe_daemon_version(status.and_then(|status| status.daemon_version.clone()))
+                            .maybe_daemon_uptime_seconds(status.and_then(|status| {
+                                status.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64)
+                            }))
+                            .maybe_heartbeat_at(heartbeat_at)
+                            .maybe_replica_last_sync(if is_local { Some(now) } else { replica.and_then(|replica| replica.last_sync) })
+                            .maybe_replica_generation(replica_generation)
+                            .crew_count(crew_count)
+                            .convoy_count(convoys.len())
+                            .surface_states(surface_states)
+                            .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
+                            .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
+                            .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
+                            .staleness(staleness)
+                            .observation_agreement(observation_agreement)
+                            .degraded_conditions(degraded_conditions)
+                            .credential_attention(credential_attention)
+                            .build(),
+                    );
+                }
+                rows
+            })
+            .await;
         rows.sort_by(|left, right| right.is_local.cmp(&left.is_local).then_with(|| left.host.cmp(&right.host)));
         let dispatch_queue = Self::dispatch_queue(self.backend, namespace, None, Utc::now()).await?;
         Ok(FleetHealthResponse { hosts: rows, dispatch_queue })
@@ -451,43 +501,45 @@ impl ReadProjections<'_> {
                 .or_default()
                 .extend(peer_failures.into_iter().map(|(kind, message)| ResourceReplicationFailure { kind, message }));
         }
-        let cache = self.fleet.health().await;
-
-        for (label, remote) in configured_hosts {
-            let host = HostName::new(remote.expected_host_name);
-            let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
-            let replication_error = format_resource_replication_failures(&replication_failures);
-            match cache.get(&host) {
-                Some(entry) => {
-                    let staleness = replica_staleness(entry, now);
-                    rows.extend(entry.rows.iter().cloned().map(|mut row| {
-                        row.staleness = staleness.clone();
-                        row
-                    }));
-                    replicas.push(FleetReplicaStatus {
-                        host,
-                        reachable: entry.last_error.is_none() && replication_error.is_none(),
-                        last_sync: entry.last_sync,
-                        generation: entry.generation.clone(),
-                        skipped_records: entry.skipped_records,
-                        first_parse_error: entry.first_parse_error.clone(),
-                        message: join_replica_errors(entry.last_error.as_deref(), replication_error.as_deref()),
-                    });
+        self.fleet
+            .with_health(|cache| {
+                for (label, remote) in configured_hosts {
+                    let host = HostName::new(remote.expected_host_name);
+                    let replication_failures = replication_failures_by_host.remove(&host).unwrap_or_default();
+                    let replication_error = format_resource_replication_failures(&replication_failures);
+                    match cache.get(&host) {
+                        Some(entry) => {
+                            let staleness = replica_staleness(entry, now);
+                            rows.extend(entry.rows.iter().cloned().map(|mut row| {
+                                row.staleness = staleness.clone();
+                                row
+                            }));
+                            replicas.push(FleetReplicaStatus {
+                                host,
+                                reachable: entry.last_error.is_none() && replication_error.is_none(),
+                                last_sync: entry.last_sync,
+                                generation: entry.generation.clone(),
+                                skipped_records: entry.skipped_records,
+                                first_parse_error: entry.first_parse_error.clone(),
+                                message: join_replica_errors(entry.last_error.as_deref(), replication_error.as_deref()),
+                            });
+                        }
+                        None => {
+                            let unsynced = format!("replica source '{label}' has not synced yet");
+                            replicas.push(FleetReplicaStatus {
+                                host,
+                                reachable: false,
+                                last_sync: None,
+                                generation: None,
+                                skipped_records: 0,
+                                first_parse_error: None,
+                                message: join_replica_errors(Some(&unsynced), replication_error.as_deref()),
+                            });
+                        }
+                    }
                 }
-                None => {
-                    let unsynced = format!("replica source '{label}' has not synced yet");
-                    replicas.push(FleetReplicaStatus {
-                        host,
-                        reachable: false,
-                        last_sync: None,
-                        generation: None,
-                        skipped_records: 0,
-                        first_parse_error: None,
-                        message: join_replica_errors(Some(&unsynced), replication_error.as_deref()),
-                    });
-                }
-            }
-        }
+            })
+            .await;
         for (host, failures) in replication_failures_by_host {
             replicas.push(FleetReplicaStatus {
                 host,
@@ -963,10 +1015,226 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
-    use flotilla_resources::{CrewWorkState, DispatchQueueEntry, ProjectStatus};
+    use chrono::{Duration as ChronoDuration, TimeZone};
+    use flotilla_protocol::{qualified_path::HostId, HostSummary, NodeInfo, SystemInfo};
+    use flotilla_resources::{
+        ConvoyPhase, ConvoySpec, CrewWorkState, DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend,
+        InputMeta, ProjectSpec, ProjectStatus, SystemClock,
+    };
 
     use super::*;
+    use crate::{
+        aggregator_projection::AggregatorProjectionState,
+        change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
+        fleet::SshFleetReplicaTransport,
+        providers::{discovery::EnvironmentBag, ProcessCommandRunner},
+    };
+
+    struct ProjectionFixture {
+        temp: tempfile::TempDir,
+        backend: ResourceBackend,
+        config: Arc<ConfigStore>,
+        registry: crate::host_registry::HostRegistry,
+        environments: EnvironmentManager,
+        host_name: HostName,
+        node_id: NodeId,
+        clock: Arc<dyn Clock>,
+        subscriptions: LeafSubscriptionTable,
+        fleet: FleetService,
+        event_sink: Arc<dyn EventSink>,
+    }
+
+    impl ProjectionFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let event_sink: Arc<dyn EventSink> = Arc::new(crate::event_sink::RecordingEventSink::default());
+            let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
+            let host_name = HostName::new("local");
+            let host_id = HostId::new("local-id");
+            let node_id = NodeId::new("local-node");
+            let environment_id = EnvironmentId::host(host_id.clone());
+            let node = NodeInfo::new(node_id.clone(), "local");
+            let summary = HostSummary::builder()
+                .environment_id(environment_id.clone())
+                .host_name(host_name.clone())
+                .node(node.clone())
+                .system(SystemInfo::default())
+                .build();
+            let registry = crate::host_registry::HostRegistry::new(node, summary);
+            let environments = EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new());
+            let refresher = ChangeRequestRefresher::new(
+                backend.clone(),
+                node_id.to_string(),
+                Arc::new(GhChangeRequestObservationSource::new(Arc::clone(&runner))),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::clone(&event_sink), refresher);
+            let fleet = FleetService::new(
+                Arc::clone(&event_sink),
+                Arc::clone(&config),
+                backend.clone(),
+                observed,
+                AggregatorProjectionState::new(),
+                host_name.clone(),
+                None,
+                Arc::new(SshFleetReplicaTransport),
+            );
+            Self {
+                temp,
+                backend,
+                config,
+                registry,
+                environments,
+                host_name,
+                node_id,
+                clock: Arc::new(SystemClock),
+                subscriptions,
+                fleet,
+                event_sink,
+            }
+        }
+
+        fn projections(&self) -> ReadProjections<'_> {
+            ReadProjections {
+                _event_sink: Arc::clone(&self.event_sink),
+                backend: &self.backend,
+                config: &self.config,
+                host_registry: &self.registry,
+                environment_manager: &self.environments,
+                host_name: &self.host_name,
+                node_id: &self.node_id,
+                clock: &self.clock,
+                leaf_subscriptions: &self.subscriptions,
+                fleet: &self.fleet,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fulfilment_projection_joins_kind_with_host_facts() {
+        let fixture = ProjectionFixture::new();
+        let kinds = fixture.backend.clone().using::<FulfilmentKind>("flotilla");
+        kinds
+            .create(
+                &InputMeta::builder().name("linux-cleat".to_string()).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref("local-id".to_string())
+                    .pool("cleat".to_string())
+                    .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string())]))
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("kind");
+        let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
+        let host = hosts
+            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
+                display_name: "local".to_string(),
+                connection: Default::default(),
+            })
+            .await
+            .expect("host");
+        hosts
+            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([("linux-cleat".to_string(), flotilla_resources::FulfilmentFacts {
+                    gui_session_logged_in: true,
+                    ..Default::default()
+                })]),
+                ..Default::default()
+            })
+            .await
+            .expect("host facts");
+
+        let response = fixture.projections().fulfilment_list("flotilla").await.expect("fulfilment list");
+        assert_eq!(response.kinds.len(), 1);
+        assert_eq!(response.kinds[0].name, "linux-cleat");
+        assert_eq!(response.kinds[0].gui_session_logged_in, Some(true));
+        assert_eq!(response.kinds[0].grants, vec!["platform:linux"]);
+    }
+
+    #[tokio::test]
+    async fn fleet_health_projection_includes_local_fulfilment() {
+        let fixture = ProjectionFixture::new();
+        fixture
+            .backend
+            .clone()
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name("local-kind".to_string()).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref("local-id".to_string())
+                    .pool("cleat".to_string())
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("kind");
+        let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
+        let host = hosts
+            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
+                display_name: "local".to_string(),
+                connection: Default::default(),
+            })
+            .await
+            .expect("host");
+        hosts
+            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..Default::default()
+            })
+            .await
+            .expect("host status");
+        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
+        let response = fixture
+            .projections()
+            .fleet_health("flotilla", host_list, Vec::new(), Some("local-id".to_string()), Utc::now())
+            .await
+            .expect("fleet health");
+        let local = response.hosts.iter().find(|host| host.host == HostName::new("local")).expect("local host");
+        assert_eq!(local.fulfilments.len(), 1);
+        assert_eq!(local.fulfilments[0].name, "local-kind");
+    }
+
+    #[tokio::test]
+    async fn fleet_list_projection_reports_configured_unsynced_remote() {
+        let fixture = ProjectionFixture::new();
+        std::fs::write(fixture.temp.path().join("hosts.toml"), "[hosts.remote]\nhostname = 'remote.example'\n").expect("host config");
+        let response = fixture.projections().fleet_list(Vec::new(), Utc::now()).await.expect("fleet list");
+        assert!(response.rows.is_empty());
+        assert_eq!(response.replicas.len(), 1);
+        assert_eq!(response.replicas[0].host, HostName::new("remote"));
+        assert!(!response.replicas[0].reachable);
+        assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("not synced yet")));
+    }
+
+    #[tokio::test]
+    async fn convoy_explanation_projection_reports_terminal_record() {
+        let fixture = ProjectionFixture::new();
+        let convoys = fixture.backend.clone().using::<ResourceConvoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("finished".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("finished", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("terminal status");
+        let response = fixture.projections().explain_convoy("flotilla", "finished").await.expect("explanation");
+        assert_eq!(response.convoy, "finished");
+        assert_eq!(response.phase, "Failed");
+    }
 
     #[test]
     fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
