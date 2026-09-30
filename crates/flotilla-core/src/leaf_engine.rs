@@ -2251,7 +2251,10 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let wake = ReconcilerWake { subscriptions: LeafSubscriptionTable::new(backend.clone(), event_tx, refresher), _marker: PhantomData };
+        let wake = ReconcilerWake {
+            subscriptions: LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher),
+            _marker: PhantomData,
+        };
         create_convoy(&backend, "delivery", ConvoyStatus {
             phase: ConvoyPhase::Active,
             crew_work: BTreeMap::from([(
