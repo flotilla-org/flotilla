@@ -2744,6 +2744,7 @@ mod tests {
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,
+                    proposed_disposition: None,
                     nudge_history: Vec::new(),
                 });
             }
@@ -2784,6 +2785,7 @@ mod tests {
             supervision_index: None,
             supervision_exhausted: false,
             reason: None,
+            proposed_disposition: None,
             nudge_history: Vec::new(),
         };
         let supervisor_state = stalled_surface_state(&supervised);
@@ -3035,6 +3037,7 @@ mod tests {
             supervision_index: None,
             supervision_exhausted: false,
             reason: None,
+            proposed_disposition: None,
             nudge_history: Vec::new(),
         });
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;

@@ -90,7 +90,7 @@ The engine emits a stall; reactions climb a ladder. The substrate provides a def
 
 **0. Mechanical nudge** (infrastructure, not an agent):
 - The daemon re-delivers the unmet obligation to the named actor through turn delivery. It therefore inherits #2111's credentials-staged-before-delivery guarantee.
-- Each actor leaf kind in the closed vocabulary carries an **obligation phrasing**, for example: "You owe a settlement claim for work/coder: finish, then run `flotilla crew complete --decision-ledger-ref …`, or `crew fail` with a reason." A leaf kind without a phrasing is refused at admission, as an unknown path is.
+- Each actor leaf kind in the closed vocabulary carries an **obligation phrasing**, for example: "You owe a settlement claim for work/coder: finish, then run `flotilla crew complete`, or `crew stall` with a reason if blocked." A leaf kind without a phrasing is refused at admission, as an unknown path is.
 - Nudges are bounded: at most N per row per idle episode, default 2. An episode resets when the actor returns to Working.
 
 **1. Supervisor agent**:
@@ -125,12 +125,12 @@ The engine emits a stall; reactions climb a ladder. The substrate provides a def
 
 - **`flotilla crew stall --reason <kind> --message …`** lets a crew member say "blocked, but the work still matters".
 - The reasons are a closed vocabulary, so supervisors and dashboards can act on them:
-  - `infra`: environment, credentials or tooling;
-  - `scope`: the ticket needs cutting down or splitting;
-  - `decision`: blocked on a ruling;
+  - `infra`: credentials, authentication, network, disk, daemon, CI infrastructure, flaky jobs, environment or tooling;
+  - `scope`: the brief needs cutting down or splitting, or is wrong or unsolvable as written; describe what is achievable;
+  - `decision`: the brief is contradictory or blocked on a ruling; describe what is achievable;
   - `access`: a missing repository or permission;
   - `other`.
-- **Crew work gains a `Stalled` phase, distinct from Done and Failed.** Failed still means the work cannot be done as briefed. Stalled keeps the convoy live and the session resumable. It is the declared form of NeedsInput: the obligation re-routes up the supervision ladder (§5).
+- **Crew work gains a `Stalled` phase, distinct from Done and Failed.** Stalled keeps the convoy live and the session resumable even when the brief itself cannot be completed as written. It is the declared form of NeedsInput: the obligation re-routes up the supervision ladder (§5). A crew may add `--propose <resume|reduce-scope|fail>` to recommend a disposition without enacting it. The proposed disposition is optional stored status and decodes with a default for one generation (ADR 0047).
 - **Supervisor verbs on a stalled crew:**
   - resume it with guidance (turn delivery);
   - re-scope it (split the issue, abandon the convoy, dispatch the parts);
@@ -138,7 +138,7 @@ The engine emits a stall; reactions climb a ladder. The substrate provides a def
   - escalate it;
   - convert it to failed.
 - **Credentials stay staged while a crew is Stalled**, because a stalled crew usually resumes, and revoke-then-restore cycles have proved fragile (#2107). The retry ceiling (§4) still applies, so a long stall escalates.
-- **The crew brief teaches the distinction.** `crew stall` means blocked but still wanted. `crew fail` means the work itself is wrong.
+- **Crews stall; supervisors decide failure.** A crew never enacts terminal failure, including when the brief is wrong or unsolvable. `crew fail` refuses a crew principal with a pointer to `crew stall`; supervisors use `crew supervise … convert-to-failed`, and operators may force failure. Authentication failures are usually transient credential-refresh gaps: retry once, then stall with `infra` if still blocked.
 
 ### 8. Governors watch; navigating is a separate mind
 

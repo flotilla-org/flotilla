@@ -1100,6 +1100,9 @@ mod tests {
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
         assert!(content.contains("A completion without this artifact is refused"));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
+        assert!(content.contains("Crews never enact failure"));
+        assert!(content.contains("--propose <resume|reduce-scope|fail>"));
+        assert!(!content.contains("flotilla crew fail --message"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
         insta::assert_snapshot!("dispatched_crew_brief", content);
     }
@@ -1162,7 +1165,30 @@ mod tests {
         assert!(brief.contains("use only the injected `gh` token-file wrapper with `$GITHUB_TOKEN_FILE` or an injected `GH_TOKEN`"));
         assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(brief.contains("`$GITHUB_TOKEN_FILE` names a nonempty file or `GH_TOKEN` is set, and that `gh auth status` succeeds"));
-        assert!(brief.contains("fail the assignment with `flotilla crew fail --message '...'`"));
+        assert!(brief.contains("retry authentication once because credential refresh is usually transient"));
+        assert!(brief.contains("flotilla crew stall --reason infra"));
+    }
+
+    #[test]
+    fn every_task_brief_variant_directs_blocked_crew_to_stall() {
+        for template in ["interactive-session.md", "diff-review.md", "shepherd.md"] {
+            let content = build_crew_brief_with_options(
+                &TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "fix-delivery".into(),
+                    vessel_ref: "fix-delivery-work".into(),
+                },
+                "work",
+                "coder",
+                CrewAssignment::Prompt("Complete the assignment."),
+                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true }],
+                &CrewBriefRenderOptions { template: template.into(), ..CrewBriefRenderOptions::default() },
+            )
+            .expect("render variant")
+            .content;
+            assert!(content.contains("--propose <resume|reduce-scope|fail>"), "{template}");
+            assert!(!content.contains("flotilla crew fail --message"), "{template}");
+        }
     }
 
     #[test]

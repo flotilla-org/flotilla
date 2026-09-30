@@ -28,7 +28,7 @@ pub const ADMITTED_LEAF_VOCABULARY: &[(&str, &str)] = &[
 pub fn actor_obligation(leaf: &Leaf) -> Result<String, String> {
     match (&leaf.address, crew_role_path(&leaf.field_path), leaf.operator, leaf.literal.as_str()) {
         (LeafAddress::Work { work, .. }, Some(role), LeafOperator::Equal, "Done") => Ok(format!(
-            "You owe a settlement claim for {work}/{role}: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew fail --message …`."
+            "You owe a settlement claim for {work}/{role}: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked."
         )),
         _ => Err(format!("actor leaf `{leaf:?}` has no obligation phrasing")),
     }

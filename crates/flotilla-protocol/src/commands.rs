@@ -579,6 +579,14 @@ pub enum StallReason {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StallProposedDisposition {
+    Resume,
+    ReduceScope,
+    Fail,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
@@ -726,10 +734,14 @@ pub enum CommandAction {
     CrewFail {
         context: CrewCommandContext,
         message: String,
+        #[serde(default)]
+        force: bool,
     },
     CrewStall {
         context: CrewCommandContext,
         reason: StallReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     },
     CrewSupervise {
@@ -1365,6 +1377,7 @@ mod tests {
                 .action(CommandAction::CrewFail {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     message: "blocked".into(),
+                    force: false,
                 })
                 .build(),
             Command::builder()

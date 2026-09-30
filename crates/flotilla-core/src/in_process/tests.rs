@@ -808,6 +808,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         "coder".to_string(),
         chrono::Utc::now(),
         flotilla_resources::StallReason::Access,
+        None,
         "repository permission missing".to_string(),
     );
     apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("declare stall");
@@ -889,6 +890,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         "coder".to_string(),
         chrono::Utc::now(),
         flotilla_resources::StallReason::Access,
+        None,
         "repository permission still missing".to_string(),
     );
     apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("stall again");
@@ -1227,7 +1229,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(message.is_none());
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            assert_eq!(message.expect("nudge").text, "[flotilla · nudge · reply by running `crew complete` or `crew fail`]\n\nYou owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew fail --message …`.");
+            assert_eq!(message.expect("nudge").text, "[flotilla · nudge · reply by running `crew complete` or `crew stall`]\n\nYou owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.");
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 let session = sessions.get("resume-staging-session").await.expect("session");
@@ -5956,6 +5958,28 @@ async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile
         drain.abort();
     });
     (daemon, backend, temp, task)
+}
+
+#[tokio::test]
+async fn crew_cannot_fail_its_own_work() {
+    let (daemon, _backend, _temp, watch) = stall_test_daemon().await;
+    let error = daemon
+        .crew_fail_internal(&CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }, "blocked".into(), false, None)
+        .await
+        .expect_err("crew failure must be refused");
+    assert!(error.contains("crew stall"), "{error}");
+    let principal = flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla");
+    let error = daemon
+        .crew_fail_internal(
+            &CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            "blocked".into(),
+            true,
+            Some(&principal),
+        )
+        .await
+        .expect_err("crew identity cannot force failure");
+    assert!(error.contains("crew stall"), "{error}");
+    watch.abort();
 }
 
 async fn wait_for_stall(backend: &ResourceBackend, name: &str, expected: bool) -> ConvoyStatus {

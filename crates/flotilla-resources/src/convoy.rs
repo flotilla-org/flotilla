@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-pub use flotilla_protocol::StallReason;
 use flotilla_protocol::{
     CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
 };
+pub use flotilla_protocol::{StallProposedDisposition, StallReason};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
@@ -919,6 +919,9 @@ pub struct StalledCondition {
     pub supervision_exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<StallReason>,
+    /// Remove this decoder default one fleet roll after the field is written everywhere (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_disposition: Option<StallProposedDisposition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nudge_history: Vec<StallNudge>,
 }
@@ -1343,6 +1346,7 @@ pub enum ConvoyStatusPatch {
         role: String,
         at: DateTime<Utc>,
         reason: StallReason,
+        proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     },
     HandoffCrewWork {
@@ -1704,7 +1708,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_pending_brief_for(status, vessel, role);
                 clear_stall_for_crew(status, vessel, role);
             }
-            Self::MarkCrewStalled { convoy, vessel, role, at, reason, message } => {
+            Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.phase = CrewWorkPhase::Stalled;
                     state.finished_at = None;
@@ -1727,6 +1731,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: Some(*reason),
+                    proposed_disposition: *proposed_disposition,
                     nudge_history: Vec::new(),
                 });
             }
@@ -2030,9 +2035,10 @@ pub mod external_patches {
         role: String,
         at: DateTime<Utc>,
         reason: StallReason,
+        proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkCrewStalled { convoy, vessel, role, at, reason, message }
+        ConvoyStatusPatch::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message }
     }
 
     pub fn handoff_crew_work(
@@ -2101,6 +2107,44 @@ pub mod external_patches {
 mod subject_tests {
     use super::*;
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    #[test]
+    fn proposed_stall_disposition_round_trips_and_old_status_decodes() {
+        let mut status = ConvoyStatus::default();
+        status
+            .crew_work
+            .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+        ConvoyStatusPatch::MarkCrewStalled {
+            convoy: "job".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            at: Utc::now(),
+            reason: StallReason::Scope,
+            proposed_disposition: Some(StallProposedDisposition::ReduceScope),
+            message: "ship the decoder first".into(),
+        }
+        .apply(&mut status);
+        let written = serde_json::to_value(&status).expect("serialize stall");
+        let restored: ConvoyStatus = serde_json::from_value(written.clone()).expect("decode stall");
+        assert_eq!(restored.stalled.expect("stall").proposed_disposition, Some(StallProposedDisposition::ReduceScope));
+        let mut previous = written;
+        previous["stalled"].as_object_mut().expect("stall object").remove("proposed_disposition");
+        let restored: ConvoyStatus = serde_json::from_value(previous).expect("decode prior-generation status");
+        assert_eq!(restored.stalled.expect("stall").proposed_disposition, None);
+
+        ConvoyStatusPatch::MarkCrewStalled {
+            convoy: "job".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            at: Utc::now(),
+            reason: StallReason::Decision,
+            proposed_disposition: Some(StallProposedDisposition::Fail),
+            message: "the brief is contradictory".into(),
+        }
+        .apply(&mut status);
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
+        assert_eq!(status.stalled.expect("stall").proposed_disposition, Some(StallProposedDisposition::Fail));
+    }
 
     #[test]
     fn supervisor_turn_acknowledgment_clears_only_prior_generation_delivery_attention() {

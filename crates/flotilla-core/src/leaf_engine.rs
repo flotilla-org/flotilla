@@ -1195,6 +1195,7 @@ impl ReconcilerWake {
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,
+                    proposed_disposition: None,
                     nudge_history: prior.map_or_else(Vec::new, |stalled| stalled.nudge_history.clone()),
                 };
                 let declared = status
@@ -1205,6 +1206,7 @@ impl ReconcilerWake {
                     condition.evidence = declared.evidence.clone();
                     condition.source = StallEvidenceSource::Crew;
                     condition.reason = declared.reason;
+                    condition.proposed_disposition = declared.proposed_disposition;
                     condition.began_at = declared.began_at;
                 }
                 if matches!(condition.maker, Some(LeafMaker::Supervisor { .. })) {
@@ -1212,6 +1214,7 @@ impl ReconcilerWake {
                         condition.evidence = prior.evidence.clone();
                         condition.source = prior.source.clone();
                         condition.reason = prior.reason;
+                        condition.proposed_disposition = prior.proposed_disposition;
                         condition.began_at = prior.began_at;
                     }
                 }

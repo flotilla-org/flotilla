@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{Command, CommandAction, CrewCommandContext, CrewSupervisionAction, StallReason};
+use flotilla_protocol::{Command, CommandAction, CrewCommandContext, CrewSupervisionAction, StallProposedDisposition, StallReason};
 
 use crate::{
     quote_value,
@@ -30,19 +30,22 @@ pub struct CrewNoun {
     pub vessel: Option<String>,
     #[arg(long)]
     pub role: Option<String>,
-    /// Completion or failure message
+    /// Completion, stall, or failure message
     #[arg(long)]
     pub message: Option<String>,
     /// Why crew work is blocked while it remains wanted
     #[arg(long)]
     pub reason: Option<String>,
+    /// Suggested supervisor action when stalling crew work
+    #[arg(long)]
+    pub propose: Option<String>,
     /// Machine-readable settlement answer declared by the brief
     #[arg(long)]
     pub disposition: Option<String>,
     /// Previous-generation completion pointer; accepted only for pinned legacy snapshots.
     #[arg(long = "decision-ledger-ref", hide = true)]
     pub decision_ledger_ref: Option<String>,
-    /// Admit a ledger-less completion as the connected operator principal
+    /// Admit a ledger-less completion or failure as the connected operator principal
     #[arg(long)]
     pub force: bool,
 }
@@ -88,10 +91,14 @@ impl CrewNoun {
             .maybe_role(self.role)
             .build();
         let subject = self.subjects.resolve()?.ok_or_else(|| "crew command requires a command or target subject".to_string())?;
+        if self.propose.is_some() && subject.value != "stall" {
+            return Err("--propose is only valid with `flotilla crew stall`".to_string());
+        }
         let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
             ("list", SubjectInterpretation::Ordinary, None)
                 if self.message.is_none()
                     && self.reason.is_none()
+                    && self.propose.is_none()
                     && self.disposition.is_none()
                     && self.decision_ledger_ref.is_none()
                     && !self.force =>
@@ -104,6 +111,9 @@ impl CrewNoun {
             ("complete", SubjectInterpretation::Ordinary, None) => {
                 if self.reason.is_some() {
                     return Err("--reason is only valid with `flotilla crew stall`".to_string());
+                }
+                if self.propose.is_some() {
+                    return Err("--propose is only valid with `flotilla crew stall`".to_string());
                 }
                 if self
                     .decision_ledger_ref
@@ -121,13 +131,14 @@ impl CrewNoun {
                 }
             }
             ("fail", SubjectInterpretation::Ordinary, None)
-                if self.reason.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force =>
+                if self.reason.is_some() || self.propose.is_some() || self.disposition.is_some() || self.decision_ledger_ref.is_some() =>
             {
                 return Err("`flotilla crew fail` does not accept completion options".to_string());
             }
             ("fail", SubjectInterpretation::Ordinary, None) => CommandAction::CrewFail {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
+                force: self.force,
             },
             ("stall", SubjectInterpretation::Ordinary, None) => {
                 if self.disposition.is_some() || self.decision_ledger_ref.is_some() || self.force {
@@ -142,9 +153,19 @@ impl CrewNoun {
                     "other" => StallReason::Other,
                     _ => return Err(format!("invalid stall reason `{reason}`; expected infra, scope, decision, access, or other")),
                 };
+                let proposed_disposition = self
+                    .propose
+                    .map(|propose| match propose.as_str() {
+                        "resume" => Ok(StallProposedDisposition::Resume),
+                        "reduce-scope" => Ok(StallProposedDisposition::ReduceScope),
+                        "fail" => Ok(StallProposedDisposition::Fail),
+                        _ => Err(format!("invalid proposed disposition `{propose}`; expected resume, reduce-scope, or fail")),
+                    })
+                    .transpose()?;
                 CommandAction::CrewStall {
                     context,
                     reason,
+                    proposed_disposition,
                     message: self.message.ok_or_else(|| "`flotilla crew stall` requires --message".to_string())?,
                 }
             }
@@ -169,7 +190,9 @@ impl CrewNoun {
             (reserved, SubjectInterpretation::Ordinary, Some(_)) if is_crew_command_subject(reserved) => {
                 return Err(format!("`{reserved}` is a crew command; use `@{reserved}` to address the crew role"));
             }
-            (_, _, Some(_)) if self.force => return Err("--force is only valid with `flotilla crew complete`".to_string()),
+            (_, _, Some(_)) if self.force => {
+                return Err("--force is only valid with `flotilla crew complete` or `flotilla crew fail`".to_string())
+            }
             (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
             (_, _, Some(_)) => return Err("resume, fail, and escalate require `flotilla crew supervise`".to_string()),
             (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
@@ -207,6 +230,9 @@ impl std::fmt::Display for CrewNoun {
         }
         if let Some(reason) = &self.reason {
             write!(f, " --reason {}", quote_value(reason))?;
+        }
+        if let Some(propose) = &self.propose {
+            write!(f, " --propose {}", quote_value(propose))?;
         }
         if let Some(disposition) = &self.disposition {
             write!(f, " --disposition {}", quote_value(disposition))?;
@@ -260,11 +286,46 @@ mod tests {
         assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewStall {
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             reason: StallReason::Access,
+            proposed_disposition: None,
             message: "repo denied".into(),
         });
         let invalid =
             CrewNoun::try_parse_from(["crew", "stall", "--reason", "maybe", "--message", "blocked"]).expect("parse invalid reason");
         assert!(invalid.resolve_with_crew_id(None).expect_err("closed reason").contains("invalid stall reason"));
+    }
+
+    #[test]
+    fn stall_carries_proposed_disposition() {
+        let noun = CrewNoun::try_parse_from([
+            "crew",
+            "stall",
+            "--reason",
+            "scope",
+            "--propose",
+            "reduce-scope",
+            "--message",
+            "ship the decoder first",
+        ])
+        .expect("parse proposed stall");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewStall {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            reason: StallReason::Scope,
+            proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
+            message: "ship the decoder first".into(),
+        });
+        let invalid = CrewNoun::try_parse_from(["crew", "stall", "--reason", "scope", "--propose", "maybe", "--message", "blocked"])
+            .expect("parse invalid proposal");
+        assert!(invalid.resolve_with_crew_id(None).expect_err("closed proposal").contains("invalid proposed disposition"));
+    }
+
+    #[test]
+    fn operator_can_request_forced_failure() {
+        let noun = CrewNoun::try_parse_from(["crew", "fail", "--force", "--message", "supervisor ruling"]).expect("parse forced failure");
+        assert_eq!(action(noun, None), CommandAction::CrewFail {
+            context: CrewCommandContext::default(),
+            message: "supervisor ruling".into(),
+            force: true,
+        });
     }
 
     #[test]
@@ -414,6 +475,7 @@ mod tests {
         assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewFail {
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             message: "cannot reproduce".into(),
+            force: false,
         });
     }
 
