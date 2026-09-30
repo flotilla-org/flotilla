@@ -32,14 +32,15 @@ use flotilla_protocol::{
     SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Artifact, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FulfilmentKind, FulfilmentKindSpec,
-    Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, Regard, Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL,
-    HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    api_version, controller::ControllerLoop, Artifact, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec,
+    ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
+    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard,
+    Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY,
+    PROJECT_LABEL, ROLE_LABEL,
 };
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -1054,6 +1055,125 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
         matches!(follower_convoys.get(convoy_name).await, Err(ResourceError::NotFound { .. })),
         "remote-homed convoy should be deleted through the live peer route"
     );
+}
+
+async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandCaller>) {
+    let leader = empty_daemon_named("kiwi").await;
+    let follower = empty_daemon_named("feta").await;
+    seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+    follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+    let expected_principal = caller.as_ref().map(|caller| caller.principal_ref.clone()).unwrap_or_default();
+    let topology = match caller {
+        Some(caller) => {
+            spawn_in_memory_request_topology_stateful_with_caller(
+                leader,
+                follower,
+                SurfaceDeclaration { principal_ref: caller.principal_ref.clone(), character: SurfaceCharacter::Focal },
+                caller,
+            )
+            .await
+        }
+        None => spawn_in_memory_request_topology_stateful(leader, follower).await,
+    }
+    .expect("connect two in-process daemons over peer sessions");
+    let namespace = "flotilla";
+    let remote_host_id = topology.follower.local_host_id().expect("feta host identity").to_string();
+    let placement_policy = format!("host-direct-{remote_host_id}");
+    seed_target_placement_policy(&topology, namespace, &placement_policy).await;
+    await_host_capacity(&topology.leader, &remote_host_id).await;
+    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+    await_placement_workflow(&topology, "remote-workflow", None).await;
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("routed-work".to_string())
+                            .branch("fix/routed-work".to_string())
+                            .placement_policy(placement_policy)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("dispatch convoy start on kiwi");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::CommandFinished { command_id: id, node_id, result, .. } = events.recv().await.expect("command event") {
+                if id == command_id {
+                    assert_eq!(node_id, *topology.follower.node_id(), "admission command executes on feta");
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("routed admission finishes");
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "placement admission failed: {result:?}");
+
+    let dispatcher = topology.leader.resource_backend();
+    let placement = topology.follower.resource_backend();
+    assert!(dispatcher.using::<Convoy>(namespace).list().await.expect("kiwi Convoys").items.is_empty());
+    let convoys = placement.using::<Convoy>(namespace).list().await.expect("feta Convoys");
+    assert_eq!(convoys.items.len(), 1, "one Convoy is homed on feta");
+    let convoy = &convoys.items[0];
+    assert_eq!(convoy.spec.dispatching_principal_ref, expected_principal, "crew caller reaches admission across the peer session");
+
+    let controller = ControllerLoop {
+        primary: placement.using::<Convoy>(namespace),
+        secondaries: Vec::new(),
+        reconciler: ConvoyReconciler::new(placement.definitions::<WorkflowTemplate>(namespace))
+            .with_hosts(placement.including_replicas::<Host>(namespace))
+            .with_vessels(placement.using::<Vessel>(namespace)),
+        resync_interval: Duration::from_millis(20),
+        backend: placement.clone(),
+    };
+    let controller_task = tokio::spawn(controller.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let vessels = placement.using::<Vessel>(namespace).list().await.expect("feta Vessels");
+            if !vessels.items.is_empty() {
+                assert_eq!(vessels.items.len(), 1, "one Vessel is authored at its actuation host");
+                assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feta authors its Vessel");
+    controller_task.abort();
+    assert!(dispatcher.using::<Vessel>(namespace).list().await.expect("kiwi Vessels").items.is_empty());
+}
+
+#[tokio::test]
+async fn convoy_start_routes_admission_to_placement_over_peer_session() {
+    assert_convoy_start_routes_through_peer_session(None).await;
+}
+
+#[tokio::test]
+async fn governor_crew_caller_routes_admission_to_placement_over_peer_session() {
+    let caller = CommandCaller {
+        principal_ref: PrincipalRef { namespace: "flotilla".to_string(), name: "governor".to_string() },
+        process: None,
+        crew: Some(
+            CallerCrew::builder()
+                .namespace("flotilla".to_string())
+                .convoy("standing-governor".to_string())
+                .vessel("governor-work".to_string())
+                .role("governor".to_string())
+                .crew_id("crew-governor".to_string())
+                .build(),
+        ),
+    };
+    assert_convoy_start_routes_through_peer_session(Some(caller)).await;
 }
 
 #[tokio::test]
