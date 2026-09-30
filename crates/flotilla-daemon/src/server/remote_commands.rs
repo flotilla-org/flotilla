@@ -268,6 +268,10 @@ impl RemoteCommandRouter {
             command.node_id = Some(origin.clone());
         }
         let remote_placement_host = match &command.action {
+            CommandAction::ConvoyStart { intent } => {
+                let namespace = intent.namespace.clone().unwrap_or(self.daemon.provisioning_namespace().await);
+                self.daemon.convoy_start_placement_host(&namespace, intent).await?
+            }
             CommandAction::ConvoyCreate { placement_policy, .. } => {
                 let namespace = self.daemon.provisioning_namespace().await;
                 self.daemon.remote_placement_host(&namespace, placement_policy.as_deref()).await?

@@ -8,7 +8,6 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use flotilla_controllers::reconcilers::VesselPlacementProjector;
 use flotilla_core::{
     agents::AgentEntry,
     config::ConfigStore,
@@ -23,21 +22,19 @@ use flotilla_protocol::{
     commands::DaemonLogQuery,
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
-    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, CanonicalHostId, CheckoutTarget, Command,
-    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId,
-    HostName, HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PreparedWorkspace,
-    QueryCursor, RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction,
-    StepExecutionContext, StepOutcome, StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, CheckoutTarget, Command, CommandAction,
+    CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, CrewCommandContext, DaemonEvent, EnvironmentId, HostName,
+    HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PreparedWorkspace, QueryCursor,
+    RepoIdentity, RepoSelector, Request, ResourceCursor, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext,
+    StepOutcome, StepStatus, StreamKey, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    controller::ControllerLoop, home_bound_authorship_collisions, list_resource_kind, Checkout as ResourceCheckout,
-    CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoyReconciler, ConvoySpec, CrewSessionStatus, Host, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError,
-    ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkflowTemplate, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    controller::ControllerLoop, list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy,
+    ConvoyReconciler, ConvoySpec, CrewSessionStatus, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    PlacementPolicySpec, ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch,
+    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -1749,8 +1746,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     assert_eq!(query_error, "authority unreachable for stranded at feta: outbound channel closed");
 }
 
-#[tokio::test]
-async fn dispatch_execute_keeps_remote_placement_admission_on_the_origin() {
+async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option<flotilla_protocol::CommandCaller>) {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = "feta-host-id".to_string();
@@ -1842,84 +1838,221 @@ async fn dispatch_execute_keeps_remote_placement_admission_on_the_origin() {
         })
         .build();
 
-    let mut events = daemon.subscribe();
-    let command_id = remote_command_router.dispatch_execute(command).await.expect("origin should admit remote placement");
-    assert!(pending_remote_commands.lock().await.is_empty(), "placement admission stays on the origin");
-    assert!(sent.lock().expect("sent messages").is_empty(), "placement host receives no admission command");
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if let DaemonEvent::CommandFinished { command_id: id, result, .. } = events.recv().await.expect("event") {
-                if id == command_id {
-                    break result;
-                }
-            }
-        }
-    })
-    .await
-    .expect("origin admission should finish");
-    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "origin admission failed: {result:?}");
+    let expected_caller = caller.clone();
+    remote_command_router.dispatch_execute_for_caller(command, caller).await.expect("origin should route remote placement");
+    assert_eq!(pending_remote_commands.lock().await.len(), 1, "placement admission must wait on the routed command");
+    let routed_command = {
+        let sent = sent.lock().expect("sent messages");
+        assert_eq!(sent.len(), 1, "placement admission must be sent to the actuator");
+        let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, caller, .. }) = &sent[0] else {
+            panic!("expected routed admission, got {:?}", sent[0]);
+        };
+        assert_eq!(target_node_id, &node("feta"));
+        assert_eq!(caller.as_deref(), expected_caller.as_ref(), "crew caller must reach placement admission");
+        assert!(matches!(command.action, CommandAction::ConvoyStart { .. }));
+        command.clone()
+    };
     let origin_convoys = daemon
         .resource_backend()
         .using::<Convoy>("flotilla")
         .list_matching_labels(&BTreeMap::from([(flotilla_resources::ROLE_LABEL.to_string(), "remote-work".to_string())]))
         .await
         .expect("list origin convoys");
-    assert_eq!(origin_convoys.items.len(), 1);
+    assert!(origin_convoys.items.is_empty(), "the origin must not half-admit a routed convoy");
 
-    let origin = daemon.resource_backend();
-    let placed = remote_daemon.resource_backend();
-    let convoy_controller = ControllerLoop {
-        primary: origin.using::<Convoy>("flotilla"),
-        secondaries: Vec::new(),
-        reconciler: ConvoyReconciler::new(origin.definitions::<WorkflowTemplate>("flotilla"))
-            .with_hosts(origin.including_replicas::<Host>("flotilla"))
-            .with_vessels(origin.using::<Vessel>("flotilla")),
-        resync_interval: Duration::from_millis(20),
-        backend: origin.clone(),
-    };
-    let controller_task = tokio::spawn(convoy_controller.run());
-    let origin_vessel = tokio::time::timeout(Duration::from_secs(5), async {
+    seed_trusted_remote_convoy_project(&remote_daemon, "flotilla").await;
+    let mut placed_events = remote_daemon.subscribe();
+    let mut placed_command = *routed_command;
+    placed_command.node_id = None;
+    let placed_id = remote_daemon.execute(placed_command).await.expect("placement host accepts routed start");
+    let placed_result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let vessels = origin.using::<Vessel>("flotilla").list().await.expect("list origin Vessels");
-            if let Some(vessel) = vessels.items.into_iter().find(|vessel| vessel.spec.convoy_ref == origin_convoys.items[0].metadata.name) {
-                break vessel;
+            if let DaemonEvent::CommandFinished { command_id, result, .. } = placed_events.recv().await.expect("placed event") {
+                if command_id == placed_id {
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("placement admission finishes");
+    assert!(matches!(placed_result, CommandValue::ConvoyStarted { .. }), "placement admission failed: {placed_result:?}");
+    let placed = remote_daemon.resource_backend();
+    let placed_convoys = placed.using::<Convoy>("flotilla").list().await.expect("placed convoys");
+    assert_eq!(placed_convoys.items.len(), 1, "convoy is homed on the placement host");
+    let convoy = &placed_convoys.items[0];
+    let controller = ControllerLoop {
+        primary: placed.using::<Convoy>("flotilla"),
+        secondaries: Vec::new(),
+        reconciler: ConvoyReconciler::new(placed.definitions::<WorkflowTemplate>("flotilla"))
+            .with_hosts(placed.including_replicas::<Host>("flotilla"))
+            .with_vessels(placed.using::<Vessel>("flotilla")),
+        resync_interval: Duration::from_millis(20),
+        backend: placed.clone(),
+    };
+    let controller_task = tokio::spawn(controller.run());
+    let vessels = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let vessels = placed.using::<Vessel>("flotilla").list().await.expect("placed vessels");
+            if !vessels.items.is_empty() {
+                break vessels;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("origin should author its Vessel");
+    .expect("placed vessel authored");
     controller_task.abort();
+    assert_eq!(vessels.items.len(), 1, "one vessel is authored at its actuation host");
+    assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
+    assert!(daemon.resource_backend().using::<Vessel>("flotilla").list().await.expect("dispatcher vessels").items.is_empty());
 
-    let origin_root = daemon.node_id().clone();
-    placed
-        .replica_writer::<Convoy>(origin_root.clone(), "flotilla")
-        .replace(&origin.using::<Convoy>("flotilla").list().await.expect("origin Convoys"), chrono::Utc::now())
+    let environments = placed.using::<flotilla_resources::Environment>("flotilla");
+    let environment_name = format!("host-direct-{remote_host_id}");
+    let environment = environments
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &flotilla_resources::EnvironmentSpec {
+            host_direct: Some(flotilla_resources::HostDirectEnvironmentSpec {
+                host_ref: remote_host_id.clone(),
+                repo_default_dir: "/workspace".to_string(),
+            }),
+            docker: None,
+        })
         .await
-        .expect("replicate Convoy to placement host");
-    placed
-        .replica_writer::<Vessel>(origin_root.clone(), "flotilla")
-        .replace(&origin.using::<Vessel>("flotilla").list().await.expect("origin Vessels"), chrono::Utc::now())
+        .expect("placement host environment");
+    environments
+        .update_status(&environment_name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+            phase: flotilla_resources::EnvironmentPhase::Ready,
+            ready: true,
+            docker_container_id: None,
+            image_ref: None,
+            image_digest: None,
+            message: None,
+            credential_delivery_retry: None,
+            credential_refresh_retry: None,
+        })
         .await
-        .expect("replicate Vessel to placement host");
-    placed
-        .replica_writer::<PlacementPolicy>(origin_root.clone(), "flotilla")
-        .replace(&origin.using::<PlacementPolicy>("flotilla").list().await.expect("origin snapshots"), chrono::Utc::now())
+        .expect("placement host environment ready");
+    let vessel_task = tokio::spawn(
+        ControllerLoop {
+            primary: placed.using::<Vessel>("flotilla"),
+            secondaries: flotilla_controllers::reconcilers::VesselReconciler::secondary_watches(),
+            reconciler: flotilla_controllers::reconcilers::VesselReconciler::new(placed.clone(), "flotilla"),
+            resync_interval: Duration::from_millis(20),
+            backend: placed.clone(),
+        }
+        .run(),
+    );
+    let terminal_task = tokio::spawn(
+        ControllerLoop {
+            primary: placed.using::<TerminalSession>("flotilla"),
+            secondaries: Vec::new(),
+            reconciler: flotilla_controllers::reconcilers::TerminalSessionReconciler::new(
+                Arc::new(RunningTerminalRuntime),
+                placed.clone(),
+                "flotilla",
+            ),
+            resync_interval: Duration::from_millis(20),
+            backend: placed.clone(),
+        }
+        .run(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = placed.using::<TerminalSession>("flotilla").list().await.expect("placement sessions");
+            if sessions.items.iter().any(|session| {
+                session.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::TerminalSessionPhase::Running)
+            }) {
+                assert_eq!(sessions.items.len(), 1, "one running session is authored at the actuation host");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("placement session reaches Running");
+    vessel_task.abort();
+    terminal_task.abort();
+    assert!(daemon.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("dispatcher sessions").items.is_empty());
+
+    let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    disconnected_peers.lock().await.store_host_summary(remote_summary);
+    let disconnected_router = make_remote_command_router(
+        &daemon,
+        &disconnected_peers,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let error = disconnected_router
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla/flotilla".to_string())
+                            .name("unreachable-work".to_string())
+                            .branch("feat/unreachable-work".to_string())
+                            .placement_policy(remote_policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
         .await
-        .expect("replicate placement snapshots");
-    let projection = VesselPlacementProjector::new(placed.clone(), "flotilla", CanonicalHostId::resolved(&remote_host_id));
-    assert_eq!(projection.sync_once().await.expect("realise placed Vessel").created, 1);
-    let actuator = placed.using::<Vessel>("flotilla").get(&origin_vessel.metadata.name).await.expect("placed actuator");
-    assert_eq!(actuator.metadata.annotations.get(ACTUATOR_SOURCE_ROOT_ANNOTATION).map(String::as_str), Some(origin_root.as_str()));
-    assert!(placed
-        .using::<PlacementPolicy>("flotilla")
-        .list()
-        .await
-        .expect("local policies")
-        .items
-        .iter()
-        .all(|policy| { !policy.metadata.name.starts_with("placement-snapshot-") }));
-    assert!(home_bound_authorship_collisions(&placed, "flotilla").await.expect("placement diagnosis").is_empty());
+        .expect_err("an unreachable placement host must refuse admission");
+    assert_eq!(error, "peer host feta is not connected");
+    assert!(
+        matches!(daemon.resource_backend().using::<Convoy>("flotilla").get("unreachable-work").await, Err(ResourceError::NotFound { .. })),
+        "unreachable placement must not leave a half-admitted record"
+    );
+}
+
+struct RunningTerminalRuntime;
+
+#[async_trait::async_trait]
+impl flotilla_controllers::reconcilers::TerminalRuntime for RunningTerminalRuntime {
+    async fn ensure_session(
+        &self,
+        name: &str,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<flotilla_controllers::reconcilers::TerminalRuntimeState, String> {
+        Ok(flotilla_controllers::reconcilers::TerminalRuntimeState::builder()
+            .session_id(format!("session-{name}"))
+            .pid(42)
+            .started_at(chrono::Utc::now())
+            .launch_command("test terminal".to_string())
+            .build())
+    }
+
+    async fn kill_session(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dispatch_execute_routes_remote_placement_admission_to_the_actuator() {
+    assert_remote_placement_admission_routes_to_the_actuator(None).await;
+}
+
+#[tokio::test]
+async fn crew_caller_dispatch_routes_admission_to_the_placement_host() {
+    let caller = flotilla_protocol::CommandCaller {
+        principal_ref: flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"),
+        process: None,
+        crew: Some(
+            flotilla_protocol::CallerCrew::builder()
+                .namespace("flotilla".to_string())
+                .convoy("governor".to_string())
+                .vessel("governor".to_string())
+                .role("governor".to_string())
+                .crew_id("crew-governor".to_string())
+                .build(),
+        ),
+    };
+    assert_remote_placement_admission_routes_to_the_actuator(Some(caller)).await;
 }
 
 #[tokio::test]

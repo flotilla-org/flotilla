@@ -3606,6 +3606,49 @@ impl InProcessDaemon {
         Ok(Some(flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
     }
 
+    pub async fn convoy_start_placement_host(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
+        if intent.placement_policy.is_some() {
+            return self.remote_placement_host(namespace, intent.placement_policy.as_deref()).await;
+        }
+
+        let (project_namespace, project_ref) = resolve_project_ref(namespace, &intent.project_ref)?;
+        let project = self
+            .resource_backend
+            .clone()
+            .including_replicas::<Project>(&project_namespace)
+            .get(&project_ref)
+            .await
+            .map(|source| source.object)
+            .map_err(|error| project_not_ready_error(&project_namespace, &project_ref, error))?;
+        let repositories = self.snapshot_project_repositories(&project_namespace, &project_ref, None).await?;
+        let (_, mut workflow) =
+            self.resolve_convoy_admission_workflow(&project_namespace, &project_ref, &project.spec, &repositories, intent).await?;
+        let placement =
+            self.resolve_convoy_placement(&project_namespace, Some(&project_ref), &repositories, &workflow, None, false).await?;
+        resolve_and_validate_workflow_credentials(
+            &self.resource_backend,
+            &project_namespace,
+            Some(&project_ref),
+            &repositories,
+            placement.selected.as_ref(),
+            &mut workflow,
+        )
+        .await?;
+        let Some(policy) = placement.selected else {
+            return Ok(None);
+        };
+        let target_host = placement_target_host(&self.resource_backend, &project_namespace, &policy).await?;
+        let actuator = placement_actuator_host_ref(&self.resource_backend, &project_namespace, &target_host).await?;
+        if self.canonical_local_host_id().as_ref() == Some(&actuator) {
+            return Ok(None);
+        }
+        Ok(Some(flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
+    }
+
     pub async fn resolve_existing_convoy_target(
         &self,
         action: &flotilla_protocol::CommandAction,
