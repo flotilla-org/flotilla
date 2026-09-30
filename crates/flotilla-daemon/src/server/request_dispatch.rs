@@ -39,8 +39,9 @@ if [ -z "$GH_TOKEN" ]; then
   echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
   exit 1
 fi
-export GH_TOKEN
-unset GITHUB_TOKEN
+GH_HOST=github.com
+export GH_TOKEN GH_HOST
+unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
 exec gh api "$@"
 "#;
 
@@ -311,7 +312,7 @@ impl<'a> RequestDispatcher<'a> {
                             let (name, spec, owner) = service
                                 .prepare_put(caller, input, &settings.artifact_retention_days)
                                 .await
-                                .map_err(|error| format!("artifact storage failed: {error}"))?;
+                                .map_err(|error| format!("artifact put failed: {error}"))?;
                             let digest = spec.digest.clone();
                             let document = serde_json::json!({
                                 "apiVersion": "flotilla.work/v1",
@@ -360,7 +361,7 @@ impl<'a> RequestDispatcher<'a> {
                             let object = service
                                 .put(caller, input, &settings.artifact_retention_days)
                                 .await
-                                .map_err(|error| format!("artifact storage failed: {error}"))?;
+                                .map_err(|error| format!("artifact put failed: {error}"))?;
                             Ok(Response::ArtifactPut {
                                 address: format!("artifact/{}", object.metadata.name),
                                 view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
@@ -374,7 +375,7 @@ impl<'a> RequestDispatcher<'a> {
                             let object = service
                                 .put(caller, input, &settings.artifact_retention_days)
                                 .await
-                                .map_err(|error| format!("artifact storage failed: {error}"))?;
+                                .map_err(|error| format!("artifact put failed: {error}"))?;
                             Ok(Response::ArtifactPut {
                                 address: format!("artifact/{}", object.metadata.name),
                                 view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
@@ -689,7 +690,7 @@ mod ledger_projection_tests {
             let gh = path.join("gh");
             std::fs::write(
                 &gh,
-                "#!/bin/sh\n[ \"$GH_TOKEN\" = scoped-test-token ] || { echo 'gh auth login required' >&2; exit 1; }\ncase \" $* \" in\n  *' --method POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7\"}' ;;\n  *) printf '%s\\n' '[[]]' ;;\nesac\n",
+                "#!/bin/sh\n[ \"$GH_TOKEN\" = scoped-test-token ] || { echo 'gh auth login required' >&2; exit 1; }\n[ \"$GH_HOST\" = github.com ] || { echo 'wrong GitHub host' >&2; exit 1; }\ncase \" $* \" in\n  *' --method POST '*) cat >/dev/null; printf '%s\\n' '{\"html_url\":\"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7\"}' ;;\n  *) printf '%s\\n' '[[]]' ;;\nesac\n",
             )
             .expect("fake gh");
             #[cfg(unix)]
@@ -709,7 +710,7 @@ mod ledger_projection_tests {
             use tokio::io::AsyncWriteExt;
 
             let mut command = tokio::process::Command::new(cmd);
-            command.args(args).env_clear().env("PATH", format!("{}:/usr/bin:/bin", self.path.display()));
+            command.args(args).env_clear().env("PATH", format!("{}:/usr/bin:/bin", self.path.display())).env("GH_HOST", "wrong.example");
             if let Some(file) = &self.token_file {
                 command.env("GITHUB_TOKEN_FILE", file);
             }
