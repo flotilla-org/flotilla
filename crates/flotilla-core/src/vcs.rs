@@ -845,7 +845,10 @@ impl Vcs for FlotillaVcs {
 
     async fn commits_beyond_base(&self, base_ref: Option<&str>) -> Result<(String, usize), String> {
         let base_ref = match base_ref {
-            Some(base_ref) => base_ref.to_string(),
+            // Checkout specs name the default branch, while a host clone's
+            // local branch may remain at its original provisioning commit.
+            Some(base_ref) if base_ref.starts_with("origin/") || base_ref.starts_with("refs/") => base_ref.to_string(),
+            Some(base_ref) => format!("origin/{base_ref}"),
             None => {
                 let output = self.cli().default_remote_branch("origin").await?;
                 if !output.success || output.stdout.trim().is_empty() {
@@ -1430,6 +1433,46 @@ mod tests {
         let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
         vcs.explicit_checkout = explicit;
         vcs
+    }
+
+    #[tokio::test]
+    async fn untouched_sibling_checkouts_compare_with_remote_main_when_host_clones_are_stale() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        for repository in ["first", "second"] {
+            let root = temp.path().join(repository);
+            std::fs::create_dir(&root).expect("create repository root");
+            let remote = root.join("remote.git");
+            let source = root.join("source");
+            let host_clone = root.join("host-clone");
+            git(&root, &["init", "--bare", remote.to_str().expect("remote path")]);
+            std::fs::create_dir(&source).expect("create source");
+            git(&source, &["init", "-b", "main"]);
+            git(&source, &["config", "user.email", "test@example.com"]);
+            git(&source, &["config", "user.name", "Test"]);
+            std::fs::write(source.join("README.md"), "initial\n").expect("write initial file");
+            git(&source, &["add", "README.md"]);
+            git(&source, &["commit", "-m", "initial"]);
+            git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
+            git(&source, &["push", "origin", "main"]);
+            git(&root, &["clone", "-b", "main", remote.to_str().expect("remote path"), host_clone.to_str().expect("clone path")]);
+            std::fs::write(source.join("README.md"), "advanced\n").expect("advance source");
+            git(&source, &["commit", "-am", "advance remote main"]);
+            git(&source, &["push", "origin", "main"]);
+            git(&host_clone, &["fetch", "origin", "main"]);
+            git(&host_clone, &[
+                "worktree",
+                "add",
+                "-b",
+                "untouched",
+                root.join("checkout").to_str().expect("checkout path"),
+                "origin/main",
+            ]);
+
+            let checkout = root.join("checkout");
+            let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+            let vcs = test_fl(&checkout, runner, true);
+            assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare against remote main"), ("origin/main".to_string(), 0));
+        }
     }
 
     #[tokio::test]

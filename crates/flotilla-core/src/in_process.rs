@@ -8685,8 +8685,15 @@ impl InProcessDaemon {
                 refusals.push(format!("{}: integration evidence is missing", checkout.metadata.name));
                 continue;
             };
+            let landed_by_merged_change_request = condition_is_true(&integration.landed)
+                && integration.change_request.as_ref().is_some_and(|change_request| {
+                    change_request.state == flotilla_resources::ChangeRequestState::Merged
+                        && integration.landed_evidence.as_ref().is_some_and(|evidence| evidence.change_request_id == change_request.id)
+                });
             let required = if is_adopted {
                 vec![("Landed", &integration.landed)]
+            } else if landed_by_merged_change_request {
+                vec![("Clean", &integration.clean), ("Landed", &integration.landed)]
             } else {
                 vec![("Clean", &integration.clean), ("Pushed", &integration.pushed), ("Landed", &integration.landed)]
             };
@@ -8707,7 +8714,9 @@ impl InProcessDaemon {
                 }
                 continue;
             }
-            if !(condition_is_true(&integration.clean) && condition_is_true(&integration.pushed) && condition_is_true(&integration.landed))
+            if !(condition_is_true(&integration.clean)
+                && (condition_is_true(&integration.pushed) || landed_by_merged_change_request)
+                && condition_is_true(&integration.landed))
             {
                 if let Some(summary) = checkout_integration_summary(checkout, integration) {
                     refusals.push(summary);
