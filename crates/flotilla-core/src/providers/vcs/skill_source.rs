@@ -6,6 +6,7 @@ use crate::providers::{ChannelLabel, CommandRunner};
 
 pub const STAGE_DIAGNOSTIC_PREFIX: &str = "flotilla-stage-skills: ";
 pub const STAGE_RETRYABLE_PREFIX: &str = "flotilla-stage-skills-retryable:";
+pub const STAGE_SOURCE_PREFIX: &str = "flotilla-stage-skills-source: ";
 
 const STAGE_SCRIPT: &str = r#"set -eu
 diagnostic_prefix=$0
@@ -61,6 +62,7 @@ while [ "$#" -gt 0 ]; do
   revision=$3
   token_file=$4
   credential=$5
+  echo "flotilla-stage-skills-source: $name" >&2
   path_count=$6
   shift 6
   checkout="$sources/$name"
@@ -75,9 +77,24 @@ while [ "$#" -gt 0 ]; do
     path_count=$((path_count - 1))
   done
   if [ -n "$token_file" ]; then token_files="$token_files $token_file"; fi
-  if [ -n "$credential" ] && { [ -z "$token_file" ] || [ ! -s "$token_file" ]; }; then
-    echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
-    exit 1
+  if [ -n "$credential" ]; then
+    if [ -z "$token_file" ] || [ ! -s "$token_file" ]; then
+      echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
+      exit 1
+    fi
+    # Hold a private snapshot through fetch and lazy checkout. The supplied
+    # file could disappear after the check above but before Git asks for it.
+    snapshot="$sources/$name.token"
+    if ! cp -- "$token_file" "$snapshot" 2>/dev/null || [ ! -s "$snapshot" ]; then
+      echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
+      exit 1
+    fi
+    IFS= read -r token <"$snapshot" || :
+    if [ -z "$token" ]; then
+      echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
+      exit 1
+    fi
+    token_file=$snapshot
   fi
   cache="$cache_root/$name-$revision"
   if [ -f "$cache/.flotilla-ready" ] && [ "$(cat "$cache/.flotilla-repository")" = "$repository" ] && cmp -s "$paths_file" "$cache/.flotilla-paths"; then
@@ -101,7 +118,7 @@ while [ "$#" -gt 0 ]; do
     print_git_stderr "$sources/git.stderr"
     if [ -n "$token_file" ]; then
       export GITHUB_TOKEN_FILE="$token_file"
-      helper='!f() { [ "$1" = get ] || exit 0; printf "username=x-access-token\npassword="; cat "$GITHUB_TOKEN_FILE"; printf "\n"; }; f'
+      helper='!f() { [ "$1" = get ] || exit 0; [ -s "$GITHUB_TOKEN_FILE" ] || exit 1; IFS= read -r token <"$GITHUB_TOKEN_FILE" || :; [ -n "$token" ] || exit 1; printf "username=x-access-token\npassword=%s\n" "$token"; }; f'
       if ! git -C "$checkout" config credential.helper "$helper" 2>"$sources/git.stderr"; then
         print_git_stderr "$sources/git.stderr"
         exit 1

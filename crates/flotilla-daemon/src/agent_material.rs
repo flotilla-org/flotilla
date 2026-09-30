@@ -12,7 +12,7 @@ use flotilla_core::providers::{
         runner::{CONTAINED_CODEX_HOME, CONTAINED_WRITABLE_CONFIG_BASE},
         ProvisionedMount, ProvisionedMountMode,
     },
-    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX, STAGE_RETRYABLE_PREFIX},
+    vcs::skill_source::{stage_git_skill_sources, STAGE_DIAGNOSTIC_PREFIX, STAGE_RETRYABLE_PREFIX, STAGE_SOURCE_PREFIX},
     ChannelLabel, CommandRunner,
 };
 use tokio::{fs, io::AsyncWriteExt};
@@ -60,6 +60,7 @@ pub(crate) struct AgentMaterialDelivery {
 pub(crate) struct SkillSourceCredentialRequest {
     pub(crate) source: String,
     pub(crate) repository: String,
+    pub(crate) revision: String,
     pub(crate) credential: String,
 }
 
@@ -161,12 +162,29 @@ impl AgentMaterialRegistry {
     ) -> Result<(), String> {
         let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
         let result = self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner).await;
-        if result.is_err() {
+        if let Err(ref error) = result {
+            let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
+            let source = if let Some(path) = self.skills.source.clone() {
+                tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .and_then(|inspection| inspection.sources.into_iter().find(|source| Some(source.name.as_str()) == source_name))
+            } else {
+                None
+            };
+            warn!(
+                environment = environment_ref,
+                source = source.as_ref().map_or("unknown", |source| source.name.as_str()),
+                revision = source.as_ref().map_or("unknown", |source| source.revision.as_str()),
+                credential = source.as_ref().and_then(|source| source.credential.as_deref()).unwrap_or("none"),
+                "skill staging failed"
+            );
             if let Err(error) = remove_source_token_files(source_token_files, runner).await {
                 warn!(%error, "failed to clean skill-source tokens after staging error");
             }
         }
-        result
+        result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
     }
 
     pub(crate) async fn skill_source_credentials(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
@@ -444,6 +462,7 @@ impl SkillBundle {
                 source.credential.map(|credential| SkillSourceCredentialRequest {
                     source: source.name,
                     repository: source.repository,
+                    revision: source.revision,
                     credential,
                 })
             })
@@ -703,7 +722,7 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{io, os::unix::fs::PermissionsExt, path::Path, process::Command, sync::Mutex};
 
     use flotilla_core::providers::{discovery::test_support::TestEnvVars, CommandOutput};
@@ -756,8 +775,8 @@ mod tests {
         }
     }
 
-    struct PromisorRunner {
-        config_base: PathBuf,
+    pub(crate) struct PromisorRunner {
+        pub(crate) config_base: PathBuf,
         skills_source: PathBuf,
         path: String,
     }
@@ -799,9 +818,13 @@ mod tests {
         async fn writable_config_base(&self, _preferred: Option<&Path>, _fallback: &Path) -> Result<PathBuf, String> {
             Ok(self.config_base.clone())
         }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            flotilla_core::providers::ProcessCommandRunner.write_file(path, content).await
+        }
     }
 
-    fn promisor_runner(root: &Path) -> PromisorRunner {
+    pub(crate) fn promisor_runner(root: &Path) -> PromisorRunner {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).expect("create fake Git bin");
         let git = bin.join("git");
@@ -831,6 +854,26 @@ case "$1" in
     while [ "$1" = -c ]; do shift 2; done
     test "$1" = fetch
     printf '%s\n' fetch >>"$FLOTILLA_TEST_FETCH_LOG"
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.drop-token" ]; then
+      rm -f -- "$(cat "$FLOTILLA_TEST_FETCH_LOG.drop-token")"
+      helper=$(cat "$checkout/.git/credential-helper")
+      credentials=$(sh -c "${helper#\!} get")
+      case "$credentials" in
+        *'password=test-token'*) ;;
+        *) echo 'anonymous fetch attempted' >&2; exit 128;;
+      esac
+    fi
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.capture-token" ]; then
+      helper=$(cat "$checkout/.git/credential-helper")
+      credentials=$(sh -c "${helper#\!} get")
+      case "$credentials" in
+        *'password='*) ;;
+        *) echo 'credential helper did not return a password' >&2; exit 128;;
+      esac
+      token=${credentials##*password=}
+      [ -n "$token" ] || { echo 'anonymous fetch attempted' >&2; exit 128; }
+      printf '%s\n' "$token" >>"$FLOTILLA_TEST_FETCH_LOG.tokens"
+    fi
     if [ -f "$FLOTILLA_TEST_FETCH_LOG.transient" ]; then
       rm "$FLOTILLA_TEST_FETCH_LOG.transient"
       echo 'fatal: TLS connection reset by peer' >&2
@@ -1269,6 +1312,46 @@ esac
             assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
         }
         assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn credentialed_fetch_survives_original_token_file_disappearing_before_git_reads_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let runner = promisor_runner(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let token_file = temp.path().join("one-shot.token");
+        std::fs::write(&token_file, "test-token").expect("token");
+        std::fs::write(temp.path().join("fetches.drop-token"), token_file.to_string_lossy().as_bytes()).expect("drop marker");
+        registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                &runner,
+            )
+            .await
+            .expect("staging keeps its own credential copy through fetch");
+        let empty_token = temp.path().join("empty.token");
+        std::fs::write(&empty_token, "").expect("empty token fixture");
+        let error = registry
+            .stage_skills(
+                "crew-with-empty-token",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("empty").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), empty_token)]),
+                &runner,
+            )
+            .await
+            .expect_err("empty token must stop staging before fetch");
+        assert!(error.contains("credential private-skills is unavailable"), "unexpected error: {error}");
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
     }
 
     #[tokio::test]
