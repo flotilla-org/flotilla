@@ -57,6 +57,11 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         )
         .await
         .expect("governor convoy");
+    let existing_attention = flotilla_resources::ConvoyAttention {
+        source: "existing-attention".to_string(),
+        reason: "Existing concern".to_string(),
+        raised_at: Utc::now(),
+    };
     convoys
         .update_status(&governor.metadata.name, &governor.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
@@ -68,6 +73,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
                 "govern".to_string(),
                 BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
             )]),
+            attention: Some(existing_attention.clone()),
             ..Default::default()
         })
         .await
@@ -126,7 +132,11 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .build();
     daemon.deliver_standing_turn(&request).await.expect("remote governor turn accepted");
     let queued = convoys.get("governor-convoy").await.expect("governor convoy after turn");
-    assert!(queued.status.as_ref().and_then(|status| status.attention.as_ref()).is_some(), "failed delivery must be visible");
+    assert_eq!(queued.status.as_ref().and_then(|status| status.attention.as_ref()), Some(&existing_attention));
+    assert!(queued
+        .status
+        .as_ref()
+        .is_some_and(|status| status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())));
     placement
         .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
         .replace(&convoys.list().await.expect("home convoys"), Utc::now())
@@ -147,11 +157,24 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .replace(&sessions.list().await.expect("confirmed placement terminals"), Utc::now())
         .await
         .expect("replicate delivery confirmation");
-    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("home acknowledges turn");
+    let bad_sessions = home.clone().using::<ResourceTerminalSession>("flotilla");
+    let bad = bad_sessions
+        .create(&InputMeta::builder().name("bad-local-terminal".to_string()).labels(session.metadata.labels.clone()).build(), &session.spec)
+        .await
+        .expect("failed local session");
+    bad_sessions
+        .update_status(&bad.metadata.name, &bad.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("mark local session failed");
+    let error = daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect_err("failed session is reported");
+    assert!(error.contains("bad-local-terminal"));
     let acknowledged = convoys.get("governor-convoy").await.expect("governor convoy after acknowledgment");
     let status = acknowledged.status.expect("governor status");
     assert!(!status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
-    assert!(status.attention.is_none());
+    assert_eq!(status.attention, Some(existing_attention));
 }
 
 #[test]
