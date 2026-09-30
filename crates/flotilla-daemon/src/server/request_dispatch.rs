@@ -79,17 +79,21 @@ curl --fail-with-body --silent --show-error \
 "#;
         let number = number.to_string();
         let mut comments = Vec::new();
-        for page in 1.. {
+        let mut reached_end = false;
+        for page in 1..=1000 {
             let page = page.to_string();
             let listing =
                 runner.run("sh", &["-c", FORGEJO_LIST, "list-ledgers", scope, &number, &page], cwd, &ChannelLabel::Default).await?;
             let batch =
                 serde_json::from_str::<Vec<serde_json::Value>>(&listing).map_err(|error| format!("parse ledger comments: {error}"))?;
-            let last = batch.len() < 100;
-            comments.extend(batch);
-            if last {
+            if batch.is_empty() {
+                reached_end = true;
                 break;
             }
+            comments.extend(batch);
+        }
+        if !reached_end {
+            return Err("ledger comment listing exceeded 1000 pages".to_string());
         }
         comments
     };
@@ -799,6 +803,7 @@ mod ledger_projection_tests {
         struct ForgejoRunner {
             pages: Mutex<Vec<String>>,
             marker: String,
+            first_page_len: usize,
         }
 
         #[async_trait]
@@ -808,12 +813,14 @@ mod ledger_projection_tests {
                 let page = args.last().expect("page argument");
                 self.pages.lock().expect("pages lock").push((*page).to_string());
                 let comments = if page == &"1" {
-                    vec![serde_json::json!({ "body": "unrelated comment" }); 100]
-                } else {
+                    vec![serde_json::json!({ "body": "unrelated comment" }); self.first_page_len]
+                } else if page == &"2" {
                     vec![serde_json::json!({
                         "body": format!("ledger\n{}", self.marker),
                         "html_url": "https://forgejo.example/acme/repo/pulls/42#issuecomment-7"
                     })]
+                } else {
+                    Vec::new()
                 };
                 serde_json::to_string(&comments).map_err(|error| error.to_string())
             }
@@ -857,14 +864,17 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
         let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
-        let runner = ForgejoRunner {
-            pages: Mutex::new(Vec::new()),
-            marker: format!("<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str()),
-        };
-        let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
-            .await
-            .expect("find comment on second page");
-        assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
-        assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2"]);
+        for first_page_len in [50, 100] {
+            let runner = ForgejoRunner {
+                pages: Mutex::new(Vec::new()),
+                marker: format!("<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str()),
+                first_page_len,
+            };
+            let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
+                .await
+                .expect("find comment on second page");
+            assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
+            assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2", "3"]);
+        }
     }
 }
