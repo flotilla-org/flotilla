@@ -77,8 +77,8 @@ pub use convoy::{
     ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim, CrewCompletionRefusal, CrewWorkPhase, CrewWorkState,
     DeclaredSubject, DiscoveredSubject, InputValue, InstantiatedExit, InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot,
     LeafMaker, LifecycleMutation, PendingBrief, PendingSupervisorTurn, PlacementStatus, ReconcileOutcome, SettlementEvaluation,
-    SettlementMode, StallCause, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition,
-    SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
+    SettlementMode, StallCause, StallEvidenceSource, StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor,
+    StalledCondition, SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
     TurnDeliveryStatus, UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
     PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };

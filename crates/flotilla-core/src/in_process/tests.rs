@@ -808,7 +808,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         "coder".to_string(),
         chrono::Utc::now(),
         flotilla_resources::StallReason::Access,
-        None,
+        Some(flotilla_resources::StallProposedDisposition::ReduceScope),
         "repository permission missing".to_string(),
     );
     apply_resource_status_patch(&convoys, "resume-staging", &patch).await.expect("declare stall");
@@ -826,6 +826,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let stalled = convoys.get("resume-staging").await.expect("source").status.expect("status");
     let condition = stalled.stalled.expect("stall condition");
     assert_eq!(condition.reason, Some(flotilla_resources::StallReason::Access));
+    assert_eq!(condition.proposed_disposition, Some(flotilla_resources::StallProposedDisposition::ReduceScope));
     assert_eq!(condition.supervisor.expect("governor").convoy, "governor");
     assert_eq!(stalled.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
     {
@@ -5971,8 +5972,8 @@ async fn stall_test_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, tempfile
 }
 
 #[tokio::test]
-async fn crew_cannot_fail_its_own_work() {
-    let (daemon, _backend, _temp, watch) = stall_test_daemon().await;
+async fn crew_fail_requires_operator_force() {
+    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
     let error = daemon
         .crew_fail_internal(&CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }, "blocked".into(), false, None)
         .await
@@ -5989,6 +5990,48 @@ async fn crew_cannot_fail_its_own_work() {
         .await
         .expect_err("crew identity cannot force failure");
     assert!(error.contains("crew stall"), "{error}");
+
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy =
+        convoys.create(&test_meta("operator-failure"), &ConvoySpec::builder().workflow_ref("test".into()).build()).await.expect("convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("crew status");
+    backend
+        .clone()
+        .using::<Vessel>("flotilla")
+        .create(&test_meta("operator-failure-vessel"), &VesselSpec {
+            convoy_ref: "operator-failure".into(),
+            vessel_name: "work".into(),
+            placement_policy_ref: "test".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("vessel");
+    daemon
+        .crew_fail_internal(
+            &CrewCommandContext {
+                namespace: Some("flotilla".into()),
+                convoy: Some("operator-failure".into()),
+                vessel_ref: Some("operator-failure-vessel".into()),
+                role: Some("coder".into()),
+                ..Default::default()
+            },
+            "supervisor ruling".into(),
+            true,
+            Some(&principal),
+        )
+        .await
+        .expect("operator force failure");
+    let status = convoys.get("operator-failure").await.expect("convoy").status.expect("status");
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Failed);
     watch.abort();
 }
 
