@@ -1054,7 +1054,24 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
-        CommandValue::ResourceRead(response) => flotilla_protocol::output::json_pretty(response),
+        CommandValue::ResourceRead(response) => {
+            let mut output = String::new();
+            for record in &response.records {
+                let name = record
+                    .object
+                    .as_ref()
+                    .and_then(|object| object.pointer("/metadata/name"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<unknown>");
+                let origin = match &record.provenance {
+                    flotilla_protocol::ResourceRecordProvenance::Local { node_id } => node_id,
+                    flotilla_protocol::ResourceRecordProvenance::Replica { origin_root, .. } => origin_root,
+                };
+                let _ = writeln!(output, "{}/{}/{} origin: {origin}", response.resource_kind, response.namespace, name);
+            }
+            output.push_str(&flotilla_protocol::output::json_pretty(response));
+            output
+        }
         CommandValue::ResourceObject(response) => flotilla_protocol::output::json_pretty(&response.value),
         CommandValue::ResourceDeleted(response) => {
             let name = response.value["metadata"]["name"].as_str().unwrap_or("<unknown>");
@@ -1141,12 +1158,16 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 format!("[command]  {}: started \"{}\"", repo_label(repo.as_deref(), repo_identity), description)
             }
         }
-        DaemonEvent::CommandFinished { repo_identity, repo, result, .. } => {
+        DaemonEvent::CommandFinished { node_id, repo_identity, repo, result, .. } => {
             if repo.is_none() && repo_identity.authority.is_empty() && repo_identity.path.is_empty() {
                 // Query commands have no repo context — show result directly
-                format_command_result(result)
+                format!("{}\nran on {node_id}", format_command_result(result))
             } else {
-                format!("[command]  {}: finished \u{2192} {}", repo_label(repo.as_deref(), repo_identity), format_command_result(result))
+                format!(
+                    "[command]  {}: finished on {node_id} \u{2192} {}",
+                    repo_label(repo.as_deref(), repo_identity),
+                    format_command_result(result)
+                )
             }
         }
         DaemonEvent::CommandStepUpdate { repo_identity, repo, description, step_index, step_count, .. } => {

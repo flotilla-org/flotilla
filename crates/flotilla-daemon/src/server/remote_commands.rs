@@ -263,6 +263,10 @@ impl RemoteCommandRouter {
         if let Some(target) = existing_convoy_target.as_ref() {
             command.node_id = Some(target.node_id.clone());
         }
+        let resource_origin = self.daemon.resource_mutation_origin(&command.action).await?;
+        if let Some(origin) = &resource_origin {
+            command.node_id = Some(origin.clone());
+        }
         let remote_placement_host = match &command.action {
             CommandAction::ConvoyCreate { placement_policy, .. } => {
                 let namespace = self.daemon.provisioning_namespace().await;
@@ -308,6 +312,7 @@ impl RemoteCommandRouter {
                         | CommandAction::ResourceReconcileNow { .. }
                         | CommandAction::ResourceDelete { .. }
                         | CommandAction::ResourceStatusPatch { .. }
+                        | CommandAction::RepositoryRemoteRemove { .. }
                         | CommandAction::ResourceWatch { .. }
                 )
             {
@@ -347,7 +352,11 @@ impl RemoteCommandRouter {
                 let send_result = match &existing_convoy_target {
                     Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
                     None => self.send_routed_to(&target_node_id, routed).await,
-                };
+                }
+                .map_err(|error| match &resource_origin {
+                    Some(origin) => format!("resource origin {origin} is unreachable: {error}"),
+                    None => error,
+                });
 
                 match send_result {
                     Ok(()) => Ok(command_id),
