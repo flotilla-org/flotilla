@@ -38,7 +38,7 @@ use tokio::{
 };
 use tracing::debug;
 
-use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer};
+use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer, IssuePollingHealth};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
@@ -312,6 +312,11 @@ impl Aggregator {
         R: IssueMaterializationResolver + 'static,
     {
         self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_tx.clone()));
+        self
+    }
+
+    pub(crate) fn with_issue_polling_health(mut self, health: IssuePollingHealth) -> Self {
+        self.issue_materializer = self.issue_materializer.take().map(|materializer| materializer.with_polling_health(health));
         self
     }
 

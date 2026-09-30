@@ -71,6 +71,7 @@ use crate::{
     credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
     environment_tools::EnvironmentToolProvisioner,
+    issue_materializer::IssuePollingHealth,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
@@ -356,6 +357,7 @@ struct RuntimeHealth {
     failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
     restart_history_dir: Option<Arc<PathBuf>>,
     fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
+    issue_polling: IssuePollingHealth,
 }
 
 impl RuntimeHealth {
@@ -429,6 +431,7 @@ impl RuntimeHealth {
 
     async fn conditions(&self) -> Vec<HostCondition> {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
+        conditions.extend(self.issue_polling.condition());
         if let Some(state_dir) = self.restart_history_dir.clone() {
             let frequency =
                 tokio::task::spawn_blocking(move || crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now()))
@@ -3658,6 +3661,7 @@ fn spawn_aggregator_task(
 ) -> JoinHandle<()> {
     let durable = daemon.resource_backend();
     let observed = daemon.observed_resource_backend();
+    let issue_polling = runtime_health.issue_polling.clone();
     tokio::spawn(async move {
         supervise_controller("aggregator", supervision, runtime_health, move || {
             let daemon = Arc::clone(&daemon);
@@ -3665,11 +3669,13 @@ fn spawn_aggregator_task(
             let observed = observed.clone();
             let namespace = namespace.clone();
             let state = state.clone();
+            let issue_polling = issue_polling.clone();
             async move {
                 let mut aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender())
                     .with_attach_resolver(Arc::clone(&daemon))
                     .with_change_request_resolver(Arc::clone(&daemon))
-                    .with_issue_resolver(Arc::clone(&daemon));
+                    .with_issue_resolver(Arc::clone(&daemon))
+                    .with_issue_polling_health(issue_polling);
                 aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
                 aggregator
                     .run(
@@ -10488,6 +10494,21 @@ mod tests {
 
         runtime_health.clear_convoy_ensure_timeout();
         assert!(runtime_health.conditions().await.is_empty(), "a completed pass should restore fleet health");
+    }
+
+    #[tokio::test]
+    async fn issue_budget_backoff_surfaces_a_nonblocking_host_condition() {
+        let runtime_health = RuntimeHealth::default();
+        let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        runtime_health
+            .issue_polling
+            .note(&format!("github rate limited (budget=REST core remaining 75, identity=host gh login, reset_at={reset})"));
+
+        let conditions = runtime_health.conditions().await;
+        let condition = conditions.iter().find(|condition| condition.condition_type == "Forge/GitHubRateBudget").expect("host condition");
+        assert_eq!(condition.reason, "LowRemainingBudget");
+        assert!(!condition.blocks_readiness);
+        assert!(condition.message.contains(&reset));
     }
 
     async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
