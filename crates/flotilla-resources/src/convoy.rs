@@ -1275,7 +1275,6 @@ pub enum ConvoyStatusPatch {
     },
     QueueSupervisorTurn {
         turn: PendingSupervisorTurn,
-        attention: ConvoyAttention,
     },
     AcknowledgeSupervisorTurn {
         message_id: String,
@@ -1522,9 +1521,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_operator_pending_brief(status);
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
-            Self::QueueSupervisorTurn { turn, attention } => {
+            Self::QueueSupervisorTurn { turn } => {
                 status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(turn.clone());
-                status.attention = Some(attention.clone());
             }
             Self::AcknowledgeSupervisorTurn { message_id } => {
                 if let Some(delivery) = status.turn_deliveries.get_mut(message_id) {
@@ -1532,11 +1530,6 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     if delivery.episodes.is_empty() && delivery.pending_brief.is_none() {
                         status.turn_deliveries.remove(message_id);
                     }
-                }
-                if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
-                    && status.attention.as_ref().is_some_and(|attention| attention.source == "supervisor-turn-delivery")
-                {
-                    status.attention = None;
                 }
             }
             Self::WorkLaunching { work, started_at, placement } => {
