@@ -8800,6 +8800,8 @@ impl InProcessDaemon {
         }
         let archives = self.archive_convoy_checkouts_best_effort(namespace, name).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let expected_phase =
+            convoys.get(name).await.map_err(|err| err.to_string())?.status.map_or(ConvoyPhase::Pending, |status| status.phase);
         let authority = match principal_ref {
             Some(principal) if principal.name == PrincipalRef::IMPLICIT_NAME => WorkCompletionAuthority::HumanOverride,
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
@@ -8808,10 +8810,13 @@ impl InProcessDaemon {
         apply_resource_status_patch(
             &convoys,
             name,
-            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), authority, reason.to_string()),
+            &convoy_external_patches::mark_convoy_abandoned(expected_phase, Utc::now(), authority, reason.to_string()),
         )
         .await
         .map_err(|err| err.to_string())?;
+        if !convoys.get(name).await.map_err(|err| err.to_string())?.status.is_some_and(|status| status.phase == ConvoyPhase::Abandoned) {
+            return Err("convoy phase changed while abandonment was being applied; retry the command".to_string());
+        }
         // Abandonment is an explicit terminal override: the phase stamp above is
         // the teardown gate, after the best-effort archive push has run. The
         // lifecycle reconciler reclaims children while retaining the convoy.

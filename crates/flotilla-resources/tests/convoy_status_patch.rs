@@ -242,8 +242,13 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         lifecycle_mutations: Vec::new(),
     };
 
-    external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "superseded by operator".to_string())
-        .apply(&mut status);
+    external_patches::mark_convoy_abandoned(
+        ConvoyPhase::Active,
+        ts(50),
+        WorkCompletionAuthority::HumanOverride,
+        "superseded by operator".to_string(),
+    )
+    .apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Abandoned);
     assert_eq!(status.finished_at, Some(ts(50)));
@@ -258,14 +263,70 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
 #[test]
 fn abandoned_status_is_immutable_against_stale_and_duplicate_patches() {
     let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..ConvoyStatus::default() };
-    external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "first reason".to_string()).apply(&mut status);
+    external_patches::mark_convoy_abandoned(
+        ConvoyPhase::Active,
+        ts(50),
+        WorkCompletionAuthority::HumanOverride,
+        "first reason".to_string(),
+    )
+    .apply(&mut status);
     let abandoned = status.clone();
 
     controller_patches::roll_up_phase(ConvoyPhase::Active, Some(ts(60)), None).apply(&mut status);
-    external_patches::mark_convoy_abandoned(ts(70), WorkCompletionAuthority::HumanOverride, "replacement reason".to_string())
-        .apply(&mut status);
+    external_patches::mark_convoy_abandoned(
+        ConvoyPhase::Active,
+        ts(70),
+        WorkCompletionAuthority::HumanOverride,
+        "replacement reason".to_string(),
+    )
+    .apply(&mut status);
 
     assert_eq!(status, abandoned);
+}
+
+#[test]
+fn terminal_convoy_outcomes_survive_stale_status_patches() {
+    for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned] {
+        let settled = ConvoyStatus {
+            phase,
+            finished_at: Some(ts(50)),
+            message: Some("settled".to_string()),
+            work: BTreeMap::from([("implement".to_string(), pending_work())]),
+            ..ConvoyStatus::default()
+        };
+        let stale = [
+            controller_patches::roll_up_phase(ConvoyPhase::Active, Some(ts(60)), None),
+            controller_patches::fail_convoy(BTreeMap::from([("implement".to_string(), ts(60))]), ts(60), Some("stale".to_string())),
+            ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(60) },
+            external_patches::mark_convoy_abandoned(
+                if phase == ConvoyPhase::Failed { ConvoyPhase::Active } else { ConvoyPhase::Failed },
+                ts(60),
+                WorkCompletionAuthority::HumanOverride,
+                "stale".to_string(),
+            ),
+        ];
+        for patch in stale {
+            let mut status = settled.clone();
+            patch.apply(&mut status);
+            assert_eq!(status, settled, "{phase:?} changed after {patch:?}");
+        }
+    }
+}
+
+#[test]
+fn operator_can_abandon_the_terminal_phase_it_observed() {
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Failed, finished_at: Some(ts(20)), ..ConvoyStatus::default() };
+
+    external_patches::mark_convoy_abandoned(
+        ConvoyPhase::Failed,
+        ts(30),
+        WorkCompletionAuthority::HumanOverride,
+        "reclaim override".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status.phase, ConvoyPhase::Abandoned);
+    assert_eq!(status.finished_at, Some(ts(30)));
 }
 
 #[test]
@@ -429,7 +490,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         stalled: None,
         provisioning: None,
         placement_decision: None,
-        phase: ConvoyPhase::Landed,
+        phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
@@ -446,7 +507,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         )]),
         message: None,
         started_at: Some(ts(1)),
-        finished_at: Some(ts(16)),
+        finished_at: None,
         observed_workflow_ref: Some("review-and-fix".to_string()),
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,
@@ -484,7 +545,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         stalled: None,
         provisioning: None,
         placement_decision: None,
-        phase: ConvoyPhase::Landed,
+        phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
@@ -498,7 +559,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), coder)]))]),
         message: None,
         started_at: Some(ts(1)),
-        finished_at: Some(ts(16)),
+        finished_at: None,
         observed_workflow_ref: Some("single-agent".to_string()),
         observed_workflows: Some(BTreeMap::new()),
         disposition: None,

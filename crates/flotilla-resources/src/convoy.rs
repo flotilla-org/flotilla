@@ -1311,6 +1311,7 @@ pub enum ConvoyStatusPatch {
         finished_at: DateTime<Utc>,
     },
     MarkConvoyAbandoned {
+        expected_phase: ConvoyPhase,
         finished_at: DateTime<Utc>,
         authority: WorkCompletionAuthority,
         reason: String,
@@ -1395,13 +1396,15 @@ pub enum ConvoyStatusPatch {
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
-        // Abandonment is an operator-authored terminal boundary. A controller
-        // may have computed any of the patches below from an older Active
-        // resource version; optimistic retry reapplies that patch to the
-        // current status, so accepting it here would resurrect the convoy and
-        // erase its terminal history. Once stamped, the historical record is
-        // immutable, including under duplicate abandon requests.
-        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. }) {
+        // Optimistic retry can reapply a patch computed from an older phase.
+        // Terminal outcomes reject stale and duplicate patches. An explicit
+        // abandon may override a terminal outcome only when its caller saw
+        // that exact phase. Mutation audit records remain appendable, and
+        // SetStalled may clear stale attention.
+        if status.phase.is_terminal()
+            && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. })
+            && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
+        {
             return;
         }
         match self {
@@ -1606,8 +1609,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                 }
             }
-            Self::MarkConvoyAbandoned { finished_at, authority, reason } => {
+            Self::MarkConvoyAbandoned { expected_phase, finished_at, authority, reason } => {
+                if status.phase != *expected_phase {
+                    return;
+                }
                 status.phase = ConvoyPhase::Abandoned;
+                status.finished_at = None;
                 status.finished_at.get_or_insert(*finished_at);
                 let actor = match authority {
                     WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
@@ -1982,8 +1989,13 @@ pub mod external_patches {
         ConvoyStatusPatch::MarkWorkCancelled { work, finished_at }
     }
 
-    pub fn mark_convoy_abandoned(finished_at: DateTime<Utc>, authority: WorkCompletionAuthority, reason: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkConvoyAbandoned { finished_at, authority, reason }
+    pub fn mark_convoy_abandoned(
+        expected_phase: ConvoyPhase,
+        finished_at: DateTime<Utc>,
+        authority: WorkCompletionAuthority,
+        reason: String,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkConvoyAbandoned { expected_phase, finished_at, authority, reason }
     }
 
     pub fn mark_crew_completed(
