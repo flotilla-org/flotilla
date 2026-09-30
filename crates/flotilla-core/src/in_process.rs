@@ -9284,8 +9284,10 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
-            .next()
-            .ok_or_else(|| format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role))?;
+            .next();
+        let Some(session) = session else {
+            return self.queue_remote_supervisor_turn(request).await;
+        };
         let mut spec = session.spec.clone();
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
@@ -9367,6 +9369,147 @@ impl InProcessDaemon {
             }
             TurnDeliverySessionPlan::QueueFresh => Ok(TurnDeliveryRung::FreshAgent),
         }
+    }
+
+    async fn queue_remote_supervisor_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        if !matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaEscalation { .. }) {
+            return Err(format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role));
+        }
+        let selector = BTreeMap::from([
+            (CONVOY_LABEL.to_string(), request.convoy.clone()),
+            (VESSEL_LABEL.to_string(), request.vessel.clone()),
+            (ROLE_LABEL.to_string(), request.role.clone()),
+        ]);
+        let remote = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&request.namespace)
+            .list_matching_labels(&selector)
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|session| matches!(session.provenance, ResourceProvenance::Replica { .. }));
+        let plan = if let Some(remote) = remote {
+            if !matches!(remote.object.spec.source, TerminalSessionSource::Agent { .. }) {
+                return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
+            }
+            turn_delivery_session_plan(remote.object.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?
+        } else {
+            // The placement host may not have published its new session yet.
+            // Keep the turn on the governor convoy and surface attention until
+            // an owning session confirms delivery.
+            TurnDeliverySessionPlan::QueueFresh
+        };
+        let message = TerminalCrewMessage {
+            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
+            text: frame_crew_message(&request.sender, &request.brief),
+            sender: request.sender.clone(),
+            delivery: CrewMessageDelivery::Queued,
+        };
+        let turn = flotilla_resources::PendingSupervisorTurn { vessel: request.vessel.clone(), role: request.role.clone(), message };
+        let attention = flotilla_resources::ConvoyAttention::builder()
+            .source("supervisor-turn-delivery".to_string())
+            .reason(format!("{} Supervisor turn awaits terminal delivery.", request.brief))
+            .raised_at(self.clock.now())
+            .build();
+        apply_resource_status_patch(
+            &self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace),
+            &request.convoy,
+            &ConvoyStatusPatch::QueueSupervisorTurn { turn, attention },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(match plan {
+            TurnDeliverySessionPlan::QueueWarm => TurnDeliveryRung::WarmSession,
+            TurnDeliverySessionPlan::QueueFresh | TurnDeliverySessionPlan::RestartFresh => TurnDeliveryRung::FreshAgent,
+        })
+    }
+
+    /// Deliver supervision turns on the host that owns the terminal session,
+    /// then acknowledge them at the convoy's home after status replication.
+    pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
+        let convoys = self.resource_backend.clone().including_replicas::<ResourceConvoy>(namespace);
+        for session in sessions.list().await.map_err(|error| error.to_string())?.items {
+            let Some(convoy_name) = session.metadata.labels.get(CONVOY_LABEL) else { continue };
+            let Some(vessel) = session.metadata.labels.get(VESSEL_LABEL) else { continue };
+            let Some(role) = session.metadata.labels.get(ROLE_LABEL) else { continue };
+            let convoy = match convoys.get(convoy_name).await {
+                Ok(convoy) => convoy,
+                Err(ResourceError::NotFound { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            };
+            let Some(status) = convoy.object.status else { continue };
+            let delivered = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+            let Some(turn) = status
+                .turn_deliveries
+                .values()
+                .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref())
+                .find(|turn| turn.vessel == *vessel && turn.role == *role && delivered != Some(turn.message.id.as_str()))
+            else {
+                continue;
+            };
+            let mut spec = session.spec.clone();
+            let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else { continue };
+            let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), vessel, role)?;
+            if message.as_ref().is_some_and(|current| current.id == turn.message.id) {
+                if plan == TurnDeliverySessionPlan::RestartFresh {
+                    apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                continue;
+            }
+            if message.as_ref().is_some_and(|current| delivered != Some(current.id.as_str())) {
+                continue;
+            }
+            let mut queued = turn.message.clone();
+            if plan == TurnDeliverySessionPlan::RestartFresh {
+                queued.delivery = CrewMessageDelivery::LaunchBrief;
+                brief.content = queued.text.clone();
+                brief.artifact_digest = None;
+            }
+            *message = Some(queued);
+            sessions
+                .update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec)
+                .await
+                .map_err(|error| error.to_string())?;
+            if plan == TurnDeliverySessionPlan::RestartFresh {
+                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+
+        let local_convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let visible_sessions = self.resource_backend.clone().including_replicas::<ResourceTerminalSession>(namespace);
+        for convoy in local_convoys.list().await.map_err(|error| error.to_string())?.items {
+            let Some(status) = convoy.status else { continue };
+            for (message_id, turn) in
+                status.turn_deliveries.into_iter().filter_map(|(id, delivery)| delivery.pending_supervisor_turn.map(|turn| (id, turn)))
+            {
+                let selector = BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
+                    (VESSEL_LABEL.to_string(), turn.vessel),
+                    (ROLE_LABEL.to_string(), turn.role),
+                ]);
+                let delivered =
+                    visible_sessions.list_matching_labels(&selector).await.map_err(|error| error.to_string())?.items.iter().any(
+                        |session| {
+                            session.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())
+                                == Some(message_id.as_str())
+                        },
+                    );
+                if delivered {
+                    apply_resource_status_patch(&local_convoys, &convoy.metadata.name, &ConvoyStatusPatch::AcknowledgeSupervisorTurn {
+                        message_id,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn execute_turn_delivery_hold(

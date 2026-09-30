@@ -983,6 +983,18 @@ pub struct TurnDeliveryStatus {
     /// The operator brief waiting for its target crew member's turn boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_brief: Option<PendingBrief>,
+    /// The placement host consumes this from the replicated convoy record.
+    /// Decodes turn delivery statuses stored before remote supervision; remove
+    /// the compatibility default one fleet roll after this field is deployed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_supervisor_turn: Option<PendingSupervisorTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSupervisorTurn {
+    pub vessel: String,
+    pub role: String,
+    pub message: crate::TerminalCrewMessage,
 }
 
 pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
@@ -1261,6 +1273,13 @@ pub enum ConvoyStatusPatch {
     SetSettlementAttention {
         attention: Option<ConvoyAttention>,
     },
+    QueueSupervisorTurn {
+        turn: PendingSupervisorTurn,
+        attention: ConvoyAttention,
+    },
+    AcknowledgeSupervisorTurn {
+        message_id: String,
+    },
     WorkLaunching {
         work: String,
         started_at: DateTime<Utc>,
@@ -1503,6 +1522,23 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_operator_pending_brief(status);
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
+            Self::QueueSupervisorTurn { turn, attention } => {
+                status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(turn.clone());
+                status.attention = Some(attention.clone());
+            }
+            Self::AcknowledgeSupervisorTurn { message_id } => {
+                if let Some(delivery) = status.turn_deliveries.get_mut(message_id) {
+                    delivery.pending_supervisor_turn = None;
+                    if delivery.episodes.is_empty() && delivery.pending_brief.is_none() {
+                        status.turn_deliveries.remove(message_id);
+                    }
+                }
+                if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
+                    && status.attention.as_ref().is_some_and(|attention| attention.source == "supervisor-turn-delivery")
+                {
+                    status.attention = None;
+                }
+            }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Launching;

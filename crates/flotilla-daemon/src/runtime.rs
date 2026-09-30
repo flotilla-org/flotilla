@@ -754,6 +754,11 @@ impl DaemonRuntime {
                 options.controller_resync_interval,
                 runtime_health.clone(),
             ));
+            tasks.push(spawn_pending_supervisor_turn_task(
+                Arc::clone(&daemon),
+                options.namespace.clone(),
+                options.controller_resync_interval,
+            ));
             tasks.push(spawn_provisioned_environment_reconciliation_task(
                 Arc::clone(&state),
                 options.namespace.clone(),
@@ -2784,6 +2789,18 @@ fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) 
         async move {
             if let Err(err) = daemon.refresh_fleet_replicas_once().await {
                 warn!(%err, "failed to refresh fleet replicas");
+            }
+        }
+    })
+}
+
+fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
+                warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
             }
         }
     })
