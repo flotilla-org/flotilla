@@ -1,7 +1,44 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
-use super::*;
-use crate::event_sink::EventSink;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
+
+use chrono::{DateTime, Utc};
+use flotilla_protocol::{
+    ConvoyExplanation, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest,
+    ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement,
+    ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
+    FleetListResponse, FleetListRow, FleetReplicaStatus, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
+    HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ViewAddress,
+};
+use flotilla_resources::{
+    bound_change_request_record_name, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
+    repository_display_labels, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus,
+    CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, FulfilmentGrant, FulfilmentKind,
+    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, ManifestRoot, Project, ReadResourceObject, Repository,
+    RepositoryKey, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+};
+use tracing::warn;
+
+use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
+use crate::{
+    checkout_integration::LANDING_EVIDENCE_TTL,
+    config::ConfigStore,
+    environment_manager::EnvironmentManager,
+    event_sink::EventSink,
+    fleet::{
+        accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
+        join_replica_errors, replica_staleness, FleetService, ResourceReplicationFailure, FLEET_REPLICA_FRESH_SECS,
+    },
+    host_registry::HostCounts,
+    leaf_engine::{LeafSubscriptionTable, LeafWatcher},
+    resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
+};
 
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
@@ -978,10 +1015,226 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
-    use flotilla_resources::{CrewWorkState, DispatchQueueEntry, ProjectStatus};
+    use chrono::{Duration as ChronoDuration, TimeZone};
+    use flotilla_protocol::{qualified_path::HostId, HostSummary, NodeInfo, SystemInfo};
+    use flotilla_resources::{
+        ConvoyPhase, ConvoySpec, CrewWorkState, DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend,
+        InputMeta, ProjectSpec, ProjectStatus, SystemClock,
+    };
 
     use super::*;
+    use crate::{
+        aggregator_projection::AggregatorProjectionState,
+        change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
+        fleet::SshFleetReplicaTransport,
+        providers::{discovery::EnvironmentBag, ProcessCommandRunner},
+    };
+
+    struct ProjectionFixture {
+        temp: tempfile::TempDir,
+        backend: ResourceBackend,
+        config: Arc<ConfigStore>,
+        registry: crate::host_registry::HostRegistry,
+        environments: EnvironmentManager,
+        host_name: HostName,
+        node_id: NodeId,
+        clock: Arc<dyn Clock>,
+        subscriptions: LeafSubscriptionTable,
+        fleet: FleetService,
+        event_sink: Arc<dyn EventSink>,
+    }
+
+    impl ProjectionFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let event_sink: Arc<dyn EventSink> = Arc::new(crate::event_sink::RecordingEventSink::default());
+            let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
+            let host_name = HostName::new("local");
+            let host_id = HostId::new("local-id");
+            let node_id = NodeId::new("local-node");
+            let environment_id = EnvironmentId::host(host_id.clone());
+            let node = NodeInfo::new(node_id.clone(), "local");
+            let summary = HostSummary::builder()
+                .environment_id(environment_id.clone())
+                .host_name(host_name.clone())
+                .node(node.clone())
+                .system(SystemInfo::default())
+                .build();
+            let registry = crate::host_registry::HostRegistry::new(node, summary);
+            let environments = EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new());
+            let refresher = ChangeRequestRefresher::new(
+                backend.clone(),
+                node_id.to_string(),
+                Arc::new(GhChangeRequestObservationSource::new(Arc::clone(&runner))),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::clone(&event_sink), refresher);
+            let fleet = FleetService::new(
+                Arc::clone(&event_sink),
+                Arc::clone(&config),
+                backend.clone(),
+                observed,
+                AggregatorProjectionState::new(),
+                host_name.clone(),
+                None,
+                Arc::new(SshFleetReplicaTransport),
+            );
+            Self {
+                temp,
+                backend,
+                config,
+                registry,
+                environments,
+                host_name,
+                node_id,
+                clock: Arc::new(SystemClock),
+                subscriptions,
+                fleet,
+                event_sink,
+            }
+        }
+
+        fn projections(&self) -> ReadProjections<'_> {
+            ReadProjections {
+                _event_sink: Arc::clone(&self.event_sink),
+                backend: &self.backend,
+                config: &self.config,
+                host_registry: &self.registry,
+                environment_manager: &self.environments,
+                host_name: &self.host_name,
+                node_id: &self.node_id,
+                clock: &self.clock,
+                leaf_subscriptions: &self.subscriptions,
+                fleet: &self.fleet,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fulfilment_projection_joins_kind_with_host_facts() {
+        let fixture = ProjectionFixture::new();
+        let kinds = fixture.backend.clone().using::<FulfilmentKind>("flotilla");
+        kinds
+            .create(
+                &InputMeta::builder().name("linux-cleat".to_string()).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref("local-id".to_string())
+                    .pool("cleat".to_string())
+                    .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string())]))
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("kind");
+        let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
+        let host = hosts
+            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
+                display_name: "local".to_string(),
+                connection: Default::default(),
+            })
+            .await
+            .expect("host");
+        hosts
+            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                fulfilment_facts: BTreeMap::from([("linux-cleat".to_string(), flotilla_resources::FulfilmentFacts {
+                    gui_session_logged_in: true,
+                    ..Default::default()
+                })]),
+                ..Default::default()
+            })
+            .await
+            .expect("host facts");
+
+        let response = fixture.projections().fulfilment_list("flotilla").await.expect("fulfilment list");
+        assert_eq!(response.kinds.len(), 1);
+        assert_eq!(response.kinds[0].name, "linux-cleat");
+        assert_eq!(response.kinds[0].gui_session_logged_in, Some(true));
+        assert_eq!(response.kinds[0].grants, vec!["platform:linux"]);
+    }
+
+    #[tokio::test]
+    async fn fleet_health_projection_includes_local_fulfilment() {
+        let fixture = ProjectionFixture::new();
+        fixture
+            .backend
+            .clone()
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name("local-kind".to_string()).build(),
+                &FulfilmentKindSpec::builder()
+                    .host_ref("local-id".to_string())
+                    .pool("cleat".to_string())
+                    .realisation(FulfilmentRealisation::HostDirect)
+                    .build(),
+            )
+            .await
+            .expect("kind");
+        let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
+        let host = hosts
+            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
+                display_name: "local".to_string(),
+                connection: Default::default(),
+            })
+            .await
+            .expect("host");
+        hosts
+            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..Default::default()
+            })
+            .await
+            .expect("host status");
+        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
+        let response = fixture
+            .projections()
+            .fleet_health("flotilla", host_list, Vec::new(), Some("local-id".to_string()), Utc::now())
+            .await
+            .expect("fleet health");
+        let local = response.hosts.iter().find(|host| host.host == HostName::new("local")).expect("local host");
+        assert_eq!(local.fulfilments.len(), 1);
+        assert_eq!(local.fulfilments[0].name, "local-kind");
+    }
+
+    #[tokio::test]
+    async fn fleet_list_projection_reports_configured_unsynced_remote() {
+        let fixture = ProjectionFixture::new();
+        std::fs::write(fixture.temp.path().join("hosts.toml"), "[hosts.remote]\nhostname = 'remote.example'\n").expect("host config");
+        let response = fixture.projections().fleet_list(Vec::new(), Utc::now()).await.expect("fleet list");
+        assert!(response.rows.is_empty());
+        assert_eq!(response.replicas.len(), 1);
+        assert_eq!(response.replicas[0].host, HostName::new("remote"));
+        assert!(!response.replicas[0].reachable);
+        assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("not synced yet")));
+    }
+
+    #[tokio::test]
+    async fn convoy_explanation_projection_reports_terminal_record() {
+        let fixture = ProjectionFixture::new();
+        let convoys = fixture.backend.clone().using::<ResourceConvoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("finished".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("finished", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("terminal status");
+        let response = fixture.projections().explain_convoy("flotilla", "finished").await.expect("explanation");
+        assert_eq!(response.convoy, "finished");
+        assert_eq!(response.phase, "Failed");
+    }
 
     #[test]
     fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
