@@ -88,7 +88,7 @@ use crate::{
     event_sink::{BroadcastEventSink, EventSink},
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
-    fleet::{crew_attention, FleetService, SshFleetReplicaTransport},
+    fleet::{crew_attention, FleetRowSource, FleetService, SshFleetReplicaTransport},
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -7899,8 +7899,8 @@ impl InProcessDaemon {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
         let host_list = self.list_hosts_internal().await?;
-        let (local_rows, _) = self.fleet.rows(&namespace).await?;
-        self.read_projections().fleet_health(&namespace, host_list, local_rows, self.local_host_id().map(|id| id.to_string()), now).await
+        let (rows, _) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::IncludingReplicas).await?;
+        self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await
     }
 
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
@@ -7921,15 +7921,15 @@ impl InProcessDaemon {
 
     pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
         let namespace = self.provisioning_namespace().await;
-        let (rows, generation) = self.fleet.rows(&namespace).await?;
+        let (rows, generation) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::Local).await?;
         let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, result_sets })
     }
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
         let namespace = self.provisioning_namespace().await;
-        let (rows, _) = self.fleet.rows(&namespace).await?;
-        self.read_projections().fleet_list(rows, Utc::now()).await
+        let (rows, _) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::IncludingReplicas).await?;
+        self.read_projections().fleet_list(&namespace, rows, Utc::now()).await
     }
 
     async fn scoped_fleet_list(
