@@ -1020,7 +1020,7 @@ mod tests {
     use flotilla_protocol::{qualified_path::HostId, HostSummary, NodeInfo, SystemInfo};
     use flotilla_resources::{
         ConvoyPhase, ConvoySpec, CrewWorkState, DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend,
-        InputMeta, ProjectSpec, ProjectStatus, SystemClock,
+        InputMeta, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource, TerminalSessionSpec,
     };
 
     use super::*;
@@ -1111,6 +1111,17 @@ mod tests {
                 leaf_subscriptions: &self.subscriptions,
                 fleet: &self.fleet,
             }
+        }
+
+        async fn register_remote_host(&self, node_id: &str, host_name: &str, host_id: &str) {
+            let summary = HostSummary::builder()
+                .environment_id(EnvironmentId::host(HostId::new(host_id)))
+                .host_name(HostName::new(host_name))
+                .node(NodeInfo::new(NodeId::new(node_id), host_name))
+                .system(SystemInfo::default())
+                .build();
+            self.registry.publish_peer_summary(summary, &|_| {}).await;
+            assert_eq!(self.registry.host_name_for_node(&NodeId::new(node_id)).await, Some(HostName::new(host_name)));
         }
     }
 
@@ -1212,6 +1223,128 @@ mod tests {
         assert_eq!(response.replicas[0].host, HostName::new("remote"));
         assert!(!response.replicas[0].reachable);
         assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("not synced yet")));
+    }
+
+    #[tokio::test]
+    async fn fleet_views_trust_only_host_self_reports_and_merge_configured_hosts() {
+        let fixture = ProjectionFixture::new();
+        let now = Utc::now();
+        std::fs::write(
+            fixture.temp.path().join("hosts.toml"),
+            "[hosts.remote]\nhostname = 'remote.example'\n[hosts.missing]\nhostname = 'missing.example'\n",
+        )
+        .expect("host config");
+        fixture.register_remote_host("remote-node", "remote", "remote-id").await;
+        fixture.register_remote_host("free-node", "free", "free-id").await;
+
+        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
+        for (name, generation, heartbeat_at) in
+            [("remote-id", "trusted", now - chrono::Duration::minutes(3)), ("local-id", "third-party", now)]
+        {
+            let created =
+                remote_hosts.create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default()).await.expect("host");
+            remote_hosts
+                .update_status(name, &created.metadata.resource_version, &ResourceHostStatus {
+                    heartbeat_at: Some(heartbeat_at),
+                    daemon_generation: Some(generation.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .expect("host status");
+        }
+        fixture
+            .backend
+            .replica_writer::<ResourceHost>(NodeId::new("remote-node"), "flotilla")
+            .replace(&remote_hosts.list().await.expect("remote hosts"), now - chrono::Duration::minutes(2))
+            .await
+            .expect("replicate remote hosts");
+
+        let free_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let free_hosts = free_backend.using::<ResourceHost>("flotilla");
+        let created =
+            free_hosts.create(&InputMeta::builder().name("free-id".to_string()).build(), &HostSpec::default()).await.expect("free host");
+        free_hosts
+            .update_status("free-id", &created.metadata.resource_version, &ResourceHostStatus {
+                heartbeat_at: Some(now),
+                daemon_generation: Some("free-generation".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("free status");
+        fixture
+            .backend
+            .replica_writer::<ResourceHost>(NodeId::new("free-node"), "flotilla")
+            .replace(&free_hosts.list().await.expect("free hosts"), now)
+            .await
+            .expect("replicate free host");
+
+        let list = fixture.projections().fleet_list("flotilla", Vec::new(), now).await.expect("fleet list");
+        assert_eq!(list.replicas.len(), 3);
+        let remote = list.replicas.iter().find(|row| row.host == HostName::new("remote")).expect("configured remote");
+        assert_eq!(remote.generation.as_deref(), Some("trusted"));
+        assert!(!remote.reachable, "old replica must be stale");
+        let free = list.replicas.iter().find(|row| row.host == HostName::new("free")).expect("unconfigured replicated host");
+        assert_eq!(free.generation.as_deref(), Some("free-generation"));
+        assert!(free.reachable);
+        let missing = list.replicas.iter().find(|row| row.host == HostName::new("missing")).expect("unsynced configured host");
+        assert!(!missing.reachable);
+        assert!(missing.last_sync.is_none());
+
+        let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
+        let health = fixture
+            .projections()
+            .fleet_health("flotilla", host_list, Vec::new(), Some("local-id".to_string()), now)
+            .await
+            .expect("fleet health");
+        let remote = health.hosts.iter().find(|row| row.host == HostName::new("remote")).expect("remote health");
+        assert_eq!(remote.daemon_generation.as_deref(), Some("trusted"));
+        assert_eq!(remote.staleness, FleetHostStaleness::Stale);
+        let local = health.hosts.iter().find(|row| row.host == HostName::new("local")).expect("local health");
+        assert_ne!(local.daemon_generation.as_deref(), Some("third-party"));
+    }
+
+    #[tokio::test]
+    async fn fleet_rows_skip_unmapped_origins_and_keep_local_snapshot_local() {
+        let fixture = ProjectionFixture::new();
+        fixture.register_remote_host("remote-node", "remote", "remote-id").await;
+        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let sessions = remote_backend.using::<ResourceTerminalSession>("flotilla");
+        sessions
+            .create(
+                &InputMeta::builder().name("mapped-session".to_string()).build(),
+                &TerminalSessionSpec::builder()
+                    .env_ref("remote-env".to_string())
+                    .role("coder".to_string())
+                    .source(TerminalSessionSource::Tool { command: "true".to_string() })
+                    .cwd("/tmp".to_string())
+                    .pool("passthrough".to_string())
+                    .build(),
+            )
+            .await
+            .expect("remote session");
+        let stale_sync = Utc::now() - chrono::Duration::minutes(2);
+        fixture
+            .backend
+            .replica_writer::<ResourceTerminalSession>(NodeId::new("remote-node"), "flotilla")
+            .replace(&sessions.list().await.expect("remote sessions"), stale_sync)
+            .await
+            .expect("replicate remote session");
+        fixture
+            .backend
+            .replica_writer::<ResourceTerminalSession>(NodeId::new("unmapped-node"), "flotilla")
+            .replace(&sessions.list().await.expect("unmapped sessions"), stale_sync)
+            .await
+            .expect("replicate unmapped session");
+
+        let (local_rows, _) =
+            fixture.fleet.rows("flotilla", &fixture.registry, crate::fleet::FleetRowSource::Local).await.expect("local rows");
+        assert!(local_rows.is_empty());
+        let (merged_rows, _) =
+            fixture.fleet.rows("flotilla", &fixture.registry, crate::fleet::FleetRowSource::IncludingReplicas).await.expect("merged rows");
+        assert_eq!(merged_rows.len(), 1, "unmapped origin must not create a phantom host row");
+        assert_eq!(merged_rows[0].host, HostName::new("remote"));
+        assert!(matches!(merged_rows[0].staleness, flotilla_protocol::FleetStaleness::Stale { .. }));
     }
 
     #[tokio::test]

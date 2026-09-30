@@ -49,6 +49,7 @@ pub(crate) async fn is_host_self_report(source: &ReadResourceObject<ResourceHost
 }
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy)]
 pub(crate) enum FleetRowSource {
     Local,
     IncludingReplicas,
@@ -237,7 +238,14 @@ impl FleetService {
                         .collect();
                     // Replica rows from current daemons already include crewless rows via local_fleet_rows.
                     // Keep result-set rows as a secondary source for direct snapshots; existing rows win.
-                    append_crewless_convoy_rows(&mut rows, namespace, &snapshot.result_sets, &snapshot_host, staleness);
+                    append_crewless_convoy_rows(
+                        &mut rows,
+                        namespace,
+                        &snapshot.result_sets,
+                        &snapshot_host,
+                        staleness,
+                        FleetRowSource::Local,
+                    );
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
                         result_sets,
@@ -386,7 +394,9 @@ impl FleetService {
             let attention = crew_attention(session.status.as_ref(), now);
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = if let Some((origin_root, _)) = remote_origin {
-                host_registry.host_name_for_node(origin_root).await.unwrap_or_else(|| HostName::new(origin_root.as_str()))
+                // The origin may arrive before its host summary. Wait for the mapping instead of exposing a phantom host.
+                let Some(host) = host_registry.host_name_for_node(origin_root).await else { continue };
+                host
             } else if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
             {
@@ -425,7 +435,7 @@ impl FleetService {
                     .build(),
             );
         }
-        append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
+        append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local, source);
         if matches!(source, FleetRowSource::IncludingReplicas) {
             let mut sync_by_host = HashMap::new();
             for source in &host_sources.items {
@@ -535,6 +545,7 @@ fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<Str
     args
 }
 
+// Retained with the SSH snapshot cache until #742 migrates its remaining consumers.
 #[cfg(test)]
 pub(crate) fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> FleetStaleness {
     if let Some(message) = &entry.last_error {
@@ -662,6 +673,7 @@ impl ReplicaParseDiagnostics {
 #[derive(Debug)]
 pub(crate) struct ParsedFleetReplicaSnapshot {
     snapshot: FleetReplicaSnapshot,
+    // Retained with the SSH snapshot parser until #742 migrates its remaining consumers.
     #[cfg_attr(not(test), allow(dead_code))]
     diagnostics: ReplicaParseDiagnostics,
 }
@@ -738,6 +750,7 @@ fn parse_fleet_replica_snapshot(input: &str) -> Result<ParsedFleetReplicaSnapsho
 pub(crate) struct FleetReplicaCacheEntry {
     pub(crate) rows: Vec<FleetListRow>,
     pub(crate) result_sets: Vec<ResultSet>,
+    // Retained with the SSH snapshot cache until #742 migrates its remaining consumers.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) last_sync: Option<DateTime<Utc>>,
     pub(crate) generation: Option<String>,
@@ -763,6 +776,7 @@ fn append_crewless_convoy_rows(
     result_sets: &[ResultSet],
     host: &HostName,
     staleness: FleetStaleness,
+    source: FleetRowSource,
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().filter_map(|row| row.convoy_ref.clone()).collect();
     for result_set in result_sets {
@@ -783,7 +797,10 @@ fn append_crewless_convoy_rows(
                     .crew("-")
                     .crew_state(convoy_state_label(row))
                     .surface_state(row.surface_state)
-                    .host(row.resource.host.clone().unwrap_or_else(|| host.clone()))
+                    .host(match source {
+                        FleetRowSource::Local => host.clone(),
+                        FleetRowSource::IncludingReplicas => row.resource.host.clone().unwrap_or_else(|| host.clone()),
+                    })
                     .maybe_placement_decision(row.placement_decision.clone())
                     .namespace(target_namespace)
                     .staleness(staleness.clone())
@@ -806,7 +823,7 @@ fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObjec
 mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
-    use flotilla_protocol::FleetReplicaSnapshot;
+    use flotilla_protocol::{ConvoyPhase, FleetReplicaSnapshot, ResourceRef};
     use flotilla_resources::{TerminalAttention, TerminalAttentionSource};
     use tokio::sync::Barrier;
 
@@ -866,6 +883,36 @@ mod tests {
         assert!(parsed.snapshot.rows.is_empty());
         assert_eq!(parsed.diagnostics.skipped_records, 2);
         assert!(parsed.diagnostics.first_error.expect("diagnostic").starts_with("rows[0]:"));
+    }
+
+    #[test]
+    fn crewless_convoy_rows_use_snapshot_host_for_local_source() {
+        let local = HostName::new("local");
+        let remote = HostName::new("remote");
+        let convoy = ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy").on_host(remote.clone()))
+            .name("convoy".to_string())
+            .workflow_ref("workflow".to_string())
+            .phase(ConvoyPhase::Active)
+            .build();
+        let result_sets = vec![ResultSet { seq: 1, rows: Rows::Convoys { scope: None, rows: vec![convoy] }, state: Default::default() }];
+
+        let mut local_rows = Vec::new();
+        append_crewless_convoy_rows(&mut local_rows, "flotilla", &result_sets, &local, FleetStaleness::Local, FleetRowSource::Local);
+        assert_eq!(local_rows.len(), 1);
+        assert_eq!(local_rows[0].host, local);
+
+        let mut merged_rows = Vec::new();
+        append_crewless_convoy_rows(
+            &mut merged_rows,
+            "flotilla",
+            &result_sets,
+            &local,
+            FleetStaleness::Local,
+            FleetRowSource::IncludingReplicas,
+        );
+        assert_eq!(merged_rows.len(), 1);
+        assert_eq!(merged_rows[0].host, remote);
     }
 
     #[test]
