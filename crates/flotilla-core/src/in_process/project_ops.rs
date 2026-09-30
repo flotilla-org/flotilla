@@ -13,9 +13,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, ensure_repository, normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec,
-    ConvoyRepositorySpec, EventRecorder, InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-    ProjectStatusPatch, Repository, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
-    WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    ConvoyRepositorySpec, EventRecorder, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject,
+    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -208,6 +208,23 @@ impl ProjectService<'_> {
     fn provisioning_namespace(&self) -> String {
         self.namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
+
+    pub(super) async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String> {
+        match repository.identity() {
+            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => {
+                let forge = self
+                    .resource_backend
+                    .including_replicas::<Forge>(namespace)
+                    .get(forge_ref)
+                    .await
+                    .map_err(|error| format!("Forge {forge_ref}: {error}"))?;
+                Ok(format!("{}/{owner}/{repo_name}", forge.object.spec.https_url.trim_end_matches('/')))
+            }
+            RepositoryIdentity::Remote { .. } => repository.live_remote().map(str::to_string).ok_or("no transport remote".to_string()),
+            RepositoryIdentity::Local { .. } => Err("local Repository has no transport URL".to_string()),
+        }
+    }
+
     pub(super) async fn snapshot_project_repositories(
         &self,
         namespace: &str,
@@ -240,10 +257,10 @@ impl ProjectService<'_> {
                         unresolved.push(error);
                         continue;
                     }
-                    let url = match repository.spec.live_remote() {
-                        Some(remote) => remote.to_string(),
-                        None => {
-                            unresolved.push(format!("repository {} has no transport remote", entry.repo));
+                    let url = match self.repository_transport_url(namespace, &repository.spec).await {
+                        Ok(url) => url,
+                        Err(error) => {
+                            unresolved.push(format!("repository {}: {error}", entry.repo));
                             continue;
                         }
                     };

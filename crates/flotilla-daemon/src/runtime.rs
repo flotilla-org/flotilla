@@ -45,15 +45,16 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy,
     ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
     DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
-    EnvironmentStatusPatch, ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition,
-    HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard,
-    ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject,
-    RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch,
-    WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
-    CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
+    EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation,
+    Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError,
+    ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement,
+    VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
+    TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -2095,7 +2096,11 @@ async fn discover_local_clones(
         let name = format!("clone-{}", repository_spec.clone_key(&host_direct_env_ref)?);
         let expected_spec = CloneSpec {
             repo_ref: repository_key.clone(),
-            url: transport_url.clone(),
+            url: if matches!(repository_spec.identity(), flotilla_resources::RepositoryIdentity::Forge { .. }) {
+                canonical_url.clone()
+            } else {
+                transport_url.clone()
+            },
             env_ref: host_direct_env_ref.clone(),
             path: repo_path.display().to_string(),
         };
@@ -4202,6 +4207,7 @@ struct CloneControllerRuntime {
     runner: Arc<dyn CommandRunner>,
     vcs: Option<Arc<dyn flotilla_core::vcs::Vcs>>,
     flights: Arc<CloneFlights>,
+    forges: Vec<ForgeSpec>,
 }
 
 fn controller_vcs(
@@ -4245,7 +4251,20 @@ impl RoutingCloneRuntime {
         } else {
             self.state.daemon.vcs_for_checkout(&EnvironmentId::new(env_ref), Path::new(checkout)).await?
         };
-        Ok(CloneControllerRuntime { runner, vcs: Some(vcs), flights: Arc::clone(&self.state.clone_flights) })
+        let namespace = self.state.daemon.provisioning_namespace().await;
+        let forges = self
+            .state
+            .daemon
+            .resource_backend()
+            .including_replicas::<Forge>(&namespace)
+            .list()
+            .await
+            .map_err(|error| format!("list Forge definitions: {error}"))?
+            .items
+            .into_iter()
+            .map(|forge| forge.object.spec)
+            .collect();
+        Ok(CloneControllerRuntime { runner, vcs: Some(vcs), flights: Arc::clone(&self.state.clone_flights), forges })
     }
 }
 
@@ -4274,7 +4293,7 @@ impl CloneRuntime for CloneControllerRuntime {
         let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
         let flight = self.flights.for_target(target_path);
         let _flight_guard = flight.lock().await;
-        if let Some(inspection) = recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path).await? {
+        if let Some(inspection) = recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path, &self.forges).await? {
             return Ok(inspection);
         }
 
@@ -4291,7 +4310,7 @@ impl CloneRuntime for CloneControllerRuntime {
         };
         if let Err(error) = self.runner.run("mv", &[&staging_path, target_path], Path::new("/"), &ChannelLabel::Default).await {
             let error = cleanup_failed_checkout(&*self.runner, &staging_path, format!("publish clone: {error}")).await;
-            return match recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path).await {
+            return match recover_existing_clone(vcs.as_ref(), &*self.runner, repo_url, target_path, &self.forges).await {
                 Ok(Some(inspection)) => Ok(inspection),
                 Ok(None) => Err(error),
                 Err(adoption_error) => Err(format!("{error}; additionally failed to adopt clone at target: {adoption_error}")),
@@ -4310,12 +4329,13 @@ async fn recover_existing_clone(
     runner: &dyn CommandRunner,
     repo_url: &str,
     target_path: &str,
+    forges: &[ForgeSpec],
 ) -> Result<Option<Option<String>>, String> {
     if !runner.path_exists(Path::new(target_path)).await? {
         return Ok(None);
     }
 
-    verify_clone_origin(vcs, repo_url, target_path, "clone target").await?;
+    verify_clone_origin(vcs, repo_url, target_path, "clone target", forges).await?;
     vcs.inspect_clone(Path::new(target_path)).await.map(Some)
 }
 
@@ -4324,6 +4344,7 @@ async fn verify_clone_origin(
     repo_url: &str,
     target_path: &str,
     target_label: &str,
+    forges: &[ForgeSpec],
 ) -> Result<(), String> {
     let origin = vcs
         .clone_origin(Path::new(target_path))
@@ -4334,7 +4355,15 @@ async fn verify_clone_origin(
         || canonicalize_repo_url(origin)
             .ok()
             .zip(canonicalize_repo_url(repo_url).ok())
-            .is_some_and(|(origin, expected)| origin == expected);
+            .is_some_and(|(origin, expected)| origin == expected)
+        || forges.iter().any(|forge| {
+            forge
+                .repository_path(origin)
+                .ok()
+                .flatten()
+                .zip(forge.repository_path(repo_url).ok().flatten())
+                .is_some_and(|(origin, expected)| origin == expected)
+        });
     if !same_origin {
         return Err(format!("{target_label} {target_path} already exists with origin {origin}, expected {repo_url}"));
     }
@@ -6640,8 +6669,9 @@ mod tests {
             release_clone: Notify::new(),
         });
         let flights = Arc::new(CloneFlights::default());
-        let first_runtime = Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::clone(&flights) });
-        let second_runtime = Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights });
+        let first_runtime =
+            Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::clone(&flights), forges: vec![] });
+        let second_runtime = Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights, forges: vec![] });
         let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
         let target_path = target.to_str().expect("utf-8 target path").to_string();
 
@@ -6677,10 +6707,18 @@ mod tests {
             clone_started: Notify::new(),
             release_clone: Notify::new(),
         });
-        let first_runtime =
-            Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
-        let external_runtime =
-            Arc::new(CloneControllerRuntime { vcs: None, runner: runner.clone(), flights: Arc::new(CloneFlights::default()) });
+        let first_runtime = Arc::new(CloneControllerRuntime {
+            vcs: None,
+            runner: runner.clone(),
+            flights: Arc::new(CloneFlights::default()),
+            forges: vec![],
+        });
+        let external_runtime = Arc::new(CloneControllerRuntime {
+            vcs: None,
+            runner: runner.clone(),
+            flights: Arc::new(CloneFlights::default()),
+            forges: vec![],
+        });
         let repo_url = source.path().to_str().expect("utf-8 source path").to_string();
         let target_path = target.to_str().expect("utf-8 target path").to_string();
 
@@ -6713,6 +6751,7 @@ mod tests {
             vcs: None,
             runner: Arc::new(FailFirstCloneProcessRunner { failed: AtomicBool::new(false) }),
             flights: Arc::new(CloneFlights::default()),
+            forges: vec![],
         };
         let repo_url = source.path().to_str().expect("utf-8 source path");
         let target_path = target.to_str().expect("utf-8 target path");
@@ -6776,6 +6815,7 @@ mod tests {
                         vcs: None,
                         runner: Arc::new(ProcessCommandRunner),
                         flights: Arc::new(CloneFlights::default()),
+                        forges: vec![],
                     }),
                     backend.using::<Repository>(NAMESPACE),
                 ),
@@ -6836,14 +6876,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clone_runtime_adopts_existing_forge_clone_across_host_aliases() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("clone");
+        let source_path = source.path().to_str().expect("source path");
+        assert!(ProcessCommand::new("git")
+            .args(["clone", source_path, target.to_str().expect("target path")])
+            .status()
+            .expect("clone fixture")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["remote", "set-url", "origin", "https://forgejo.lab.flotilla.work/robert/ghostty-ops"])
+            .status()
+            .expect("set clone origin")
+            .success());
+        let runtime = CloneControllerRuntime {
+            vcs: None,
+            runner: Arc::new(ProcessCommandRunner),
+            flights: Arc::new(CloneFlights::default()),
+            forges: vec![flotilla_resources::ForgeSpec::builder()
+                .forge_id("lab".to_string())
+                .kind(flotilla_resources::ForgeKind::Forgejo)
+                .hosts(BTreeSet::from(["forgejo-manchego".to_string(), "forgejo.lab.flotilla.work".to_string()]))
+                .https_url("https://forgejo.lab.flotilla.work".to_string())
+                .git_ssh_host("forgejo.lab.flotilla.work".to_string())
+                .build()],
+        };
+
+        let branch = runtime
+            .clone_and_inspect("https://forgejo-manchego/robert/ghostty-ops", target.to_str().expect("target path"))
+            .await
+            .expect("existing clone should be adopted by Forge identity");
+        assert_eq!(branch.as_deref(), Some("main"));
+
+        assert!(ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(["remote", "set-url", "origin", "forgejo-manchego:robert/ghostty-ops.git"])
+            .status()
+            .expect("set alias origin")
+            .success());
+        let branch = runtime
+            .clone_and_inspect("https://forgejo.lab.flotilla.work/robert/ghostty-ops", target.to_str().expect("target path"))
+            .await
+            .expect("alias-origin clone should be adopted by Forge identity");
+        assert_eq!(branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
     async fn clone_runtime_rejects_a_dirty_target_then_recovers_after_it_is_removed() {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("clone");
         fs::create_dir_all(&target).expect("dirty target directory");
         fs::write(target.join("leftover"), "debris").expect("dirty target contents");
-        let runtime =
-            CloneControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), flights: Arc::new(CloneFlights::default()) };
+        let runtime = CloneControllerRuntime {
+            vcs: None,
+            runner: Arc::new(ProcessCommandRunner),
+            flights: Arc::new(CloneFlights::default()),
+            forges: vec![],
+        };
         let repo_url = source.path().to_str().expect("utf-8 source path");
         let target_path = target.to_str().expect("utf-8 target path");
 

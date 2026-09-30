@@ -10355,12 +10355,7 @@ impl InProcessDaemon {
             } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.resolve_repository_remote(&url).await?;
-                    let canonical_url = match repository_spec.live_remote() {
-                        Some(remote) => remote.to_string(),
-                        None => {
-                            return Err(format!("repository {url} did not resolve to a remote identity"));
-                        }
-                    };
+                    let canonical_url = self.project_service().repository_transport_url(&namespace, &repository_spec).await?;
                     let repo_ref = repository_spec.key();
                     let repository = flotilla_resources::ensure_repository(
                         &self.resource_backend.clone().using::<Repository>(&namespace),
