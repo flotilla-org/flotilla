@@ -4,7 +4,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Convoy, PlacementPolicy, ResourceBackend, ResourceError, WorkflowTemplate, PLACEMENT_SNAPSHOT_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    Convoy, PlacementPolicy, ResourceBackend, ResourceError, ResourceProvenance, WorkflowTemplate, PLACEMENT_SNAPSHOT_ANNOTATION,
+    WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 pub const PREPARED_SNAPSHOT_LABEL: &str = "flotilla.work/prepared-snapshot";
@@ -41,13 +42,16 @@ impl PreparedSnapshotGarbageCollector {
     /// `excluding_convoy` is used by the convoy finalizer: the deleting convoy
     /// still exists until its finalizer returns, but no longer retains a claim.
     pub async fn collect(&self, excluding_convoy: Option<&str>) -> Result<PreparedSnapshotGcResult, ResourceError> {
-        let convoys = self.backend.clone().using::<Convoy>(&self.namespace).list().await?;
+        let convoys = self.backend.including_replicas::<Convoy>(&self.namespace).list_sources().await?;
         let mut workflow_refs = BTreeSet::new();
         let mut placement_refs = BTreeSet::new();
-        for convoy in convoys.items {
-            if excluding_convoy.is_some_and(|excluded| convoy.metadata.name == excluded) {
+        for source in convoys.items {
+            if matches!(source.provenance, ResourceProvenance::Local)
+                && excluding_convoy.is_some_and(|excluded| source.object.metadata.name == excluded)
+            {
                 continue;
             }
+            let convoy = source.object;
             workflow_refs.insert(convoy.spec.workflow_ref);
             if let Some(snapshot) = convoy.metadata.annotations.get(WORKFLOW_SNAPSHOT_ANNOTATION) {
                 workflow_refs.insert(snapshot.clone());
