@@ -10,8 +10,8 @@ use flotilla_resources::{
     watch_resource_kind_replica_sources, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase,
     CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus,
     InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceBackend,
-    ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
-    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 
