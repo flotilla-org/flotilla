@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, sync::Arc};
+use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -14,7 +14,10 @@ use flotilla_resources::{expected_change_request_leaves, select_convoy_children,
 use tracing::warn;
 
 use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
-use crate::artifact::{ArtifactBody, ArtifactPutInput, ArtifactService};
+use crate::{
+    artifact::{ArtifactBody, ArtifactPutInput, ArtifactService},
+    blob_store::BlobDigest,
+};
 
 fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
     if path.is_absolute() {
@@ -28,6 +31,7 @@ async fn project_decision_ledger(
     backend: &ResourceBackend,
     namespace: &str,
     convoy_name: &str,
+    producer: &str,
     body: &[u8],
     runner: &dyn CommandRunner,
     cwd: &Path,
@@ -49,8 +53,60 @@ async fn project_decision_ledger(
         return Err("decision ledger projection has an invalid change request binding".to_string());
     };
     let text = std::str::from_utf8(body).map_err(|_| "decision ledger must be UTF-8".to_string())?;
-    let input = serde_json::to_vec(&serde_json::json!({ "body": text })).map_err(|error| error.to_string())?;
+    let digest = BlobDigest::of(body);
+    let name = flotilla_resources::artifact_record_name(convoy_name, producer, "decision-ledger", convoy_name);
+    let marker = format!("<!-- flotilla-decision-ledger:{name}:{} -->", digest.as_str());
     let endpoint = format!("repos/{scope}/issues/{number}/comments");
+    // The comment itself records the projection identity. If the forge accepts a
+    // POST but its response or the artifact write is lost, a retry can find it.
+    let existing = if service == "github.com" {
+        let listing =
+            runner.run("gh", &["api", &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"], cwd, &ChannelLabel::Default).await?;
+        serde_json::from_str::<Vec<Vec<serde_json::Value>>>(&listing)
+            .map_err(|error| format!("parse ledger comments: {error}"))?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    } else {
+        const FORGEJO_LIST: &str = r#"set -eu
+: "${FORGEJO_API_URL:?missing Forgejo API URL}"
+: "${FORGEJO_TOKEN_FILE:?missing Forgejo token file}"
+test -s "$FORGEJO_TOKEN_FILE"
+token=$(cat "$FORGEJO_TOKEN_FILE")
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: token $token" \
+  "${FORGEJO_API_URL%/}/repos/$1/issues/$2/comments?limit=100&page=$3"
+"#;
+        let number = number.to_string();
+        let mut comments = Vec::new();
+        let mut reached_end = false;
+        for page in 1..=1000 {
+            let page = page.to_string();
+            let listing =
+                runner.run("sh", &["-c", FORGEJO_LIST, "list-ledgers", scope, &number, &page], cwd, &ChannelLabel::Default).await?;
+            let batch =
+                serde_json::from_str::<Vec<serde_json::Value>>(&listing).map_err(|error| format!("parse ledger comments: {error}"))?;
+            if batch.is_empty() {
+                reached_end = true;
+                break;
+            }
+            comments.extend(batch);
+        }
+        if !reached_end {
+            return Err("ledger comment listing exceeded 1000 pages".to_string());
+        }
+        comments
+    };
+    if let Some(url) = existing
+        .iter()
+        .find(|comment| comment.get("body").and_then(serde_json::Value::as_str).is_some_and(|body| body.trim_end().ends_with(&marker)))
+        .and_then(|comment| comment.get("html_url"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| url.starts_with("https://"))
+    {
+        return Ok(Some(url.to_string()));
+    }
+    let input = serde_json::to_vec(&serde_json::json!({ "body": format!("{text}\n{marker}") })).map_err(|error| error.to_string())?;
     let response = if service == "github.com" {
         runner.run_with_input("gh", &["api", "--method", "POST", &endpoint, "--input", "-"], cwd, &ChannelLabel::Default, &input).await?
     } else {
@@ -92,7 +148,7 @@ async fn project_decision_ledger_once(
         Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
         Err(error) => return Err(error.to_string()),
     };
-    let digest = crate::blob_store::BlobDigest::of(body);
+    let digest = BlobDigest::of(body);
     if let Some(url) = existing
         .as_ref()
         .filter(|record| record.spec.digest == digest.as_str())
@@ -101,7 +157,17 @@ async fn project_decision_ledger_once(
     {
         return Ok(Some(url.to_string()));
     }
-    project_decision_ledger(backend, namespace, convoy, body, runner, cwd).await
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd).await {
+            Ok(url) => return Ok(url),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+        }
+    }
+    Err(last_error.expect("projection attempted at least once"))
 }
 
 pub(super) struct RequestDispatcher<'a> {
@@ -572,8 +638,10 @@ mod ledger_projection_tests {
 
     #[async_trait]
     impl CommandRunner for CapturingRunner {
-        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            Err("unexpected run".to_string())
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            assert_eq!(cmd, "gh");
+            assert!(args.contains(&"--paginate"));
+            Ok("[[]]".to_string())
         }
 
         async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -619,12 +687,14 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let runner = CapturingRunner::default();
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
-        let url = project_decision_ledger(&backend, "flotilla", "demo", body, &runner, Path::new("/")).await.expect("project ledger");
+        let url =
+            project_decision_ledger(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/")).await.expect("project ledger");
         assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         let (args, input) = runner.call.lock().expect("capture lock").take().expect("gh call");
         assert!(args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/42/comments"));
         assert!(!args.iter().any(|arg| arg.contains("Brief silence")));
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&input).expect("JSON")["body"], std::str::from_utf8(body).expect("UTF-8"));
+        let posted = serde_json::from_slice::<serde_json::Value>(&input).expect("JSON");
+        assert!(posted["body"].as_str().expect("comment body").starts_with(std::str::from_utf8(body).expect("UTF-8")));
     }
 
     #[tokio::test]
@@ -638,7 +708,7 @@ mod ledger_projection_tests {
             .kind("decision-ledger".to_string())
             .subject("demo".to_string())
             .summary(std::collections::BTreeMap::from([("comment_url".to_string(), serde_json::json!(comment_url))]))
-            .digest(crate::blob_store::BlobDigest::of(body).as_str().to_string())
+            .digest(BlobDigest::of(body).as_str().to_string())
             .size(body.len() as u64)
             .media_type("text/markdown".to_string())
             .expires_at(chrono::Utc::now())
@@ -655,5 +725,156 @@ mod ledger_projection_tests {
             .expect("reuse comment");
         assert_eq!(result.as_deref(), Some(comment_url));
         assert!(runner.call.lock().expect("capture lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_projection_recovers_after_post_succeeds_but_response_fails() {
+        struct LostResponseRunner {
+            posts: Mutex<usize>,
+            comment: Mutex<Option<serde_json::Value>>,
+        }
+
+        #[async_trait]
+        impl CommandRunner for LostResponseRunner {
+            async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+                assert_eq!(cmd, "gh");
+                assert!(args.contains(&"--paginate"));
+                Ok(serde_json::to_string(&vec![self.comment.lock().expect("comment lock").clone().into_iter().collect::<Vec<_>>()])
+                    .expect("comments JSON"))
+            }
+
+            async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+                Err("unexpected run_output".to_string())
+            }
+
+            async fn run_with_input(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                _cwd: &Path,
+                _label: &ChannelLabel,
+                input: &[u8],
+            ) -> Result<String, String> {
+                assert_eq!(cmd, "gh");
+                assert!(args.contains(&"POST"));
+                *self.posts.lock().expect("posts lock") += 1;
+                let body =
+                    serde_json::from_slice::<serde_json::Value>(input).expect("posted JSON")["body"].as_str().expect("body").to_string();
+                *self.comment.lock().expect("comment lock") = Some(serde_json::json!({
+                    "body": body,
+                    "html_url": "https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"
+                }));
+                Err("response lost after forge accepted comment".to_string())
+            }
+
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                false
+            }
+        }
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("single-agent".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://github.com/flotilla-org/flotilla.git".to_string())
+                .repo_ref(repository_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("flotilla".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(
+                BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("PR".to_string()).build(),
+            )
+            .build();
+        backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
+        let runner = LostResponseRunner { posts: Mutex::new(0), comment: Mutex::new(None) };
+        let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
+        let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
+            .await
+            .expect("transient failure retries and finds accepted comment");
+        assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
+        assert_eq!(*runner.posts.lock().expect("posts lock"), 1);
+    }
+
+    #[tokio::test]
+    async fn forgejo_projection_finds_comment_after_full_page() {
+        struct ForgejoRunner {
+            pages: Mutex<Vec<String>>,
+            marker: String,
+            first_page_len: usize,
+        }
+
+        #[async_trait]
+        impl CommandRunner for ForgejoRunner {
+            async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+                assert_eq!(cmd, "sh");
+                let page = args.last().expect("page argument");
+                self.pages.lock().expect("pages lock").push((*page).to_string());
+                let comments = if page == &"1" {
+                    vec![serde_json::json!({ "body": "unrelated comment" }); self.first_page_len]
+                } else if page == &"2" {
+                    vec![serde_json::json!({
+                        "body": format!("ledger\n{}", self.marker),
+                        "html_url": "https://forgejo.example/acme/repo/pulls/42#issuecomment-7"
+                    })]
+                } else {
+                    Vec::new()
+                };
+                serde_json::to_string(&comments).map_err(|error| error.to_string())
+            }
+
+            async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+                Err("unexpected run_output".to_string())
+            }
+
+            async fn run_with_input(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _cwd: &Path,
+                _label: &ChannelLabel,
+                _input: &[u8],
+            ) -> Result<String, String> {
+                Err("existing comment should prevent POST".to_string())
+            }
+
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                false
+            }
+        }
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let repository_ref = RepositoryKey("repo".to_string());
+        let spec = ConvoySpec::builder()
+            .workflow_ref("single-agent".to_string())
+            .repositories(vec![ConvoyRepositorySpec::builder()
+                .url("https://forgejo.example/acme/repo.git".to_string())
+                .repo_ref(repository_ref.clone())
+                .source_ref("main".to_string())
+                .target_ref("main".to_string())
+                .workspace_slug("repo".to_string())
+                .subpaths(Vec::new())
+                .build()])
+            .change_request(
+                BoundChangeRequest::builder().id("42".to_string()).repository_ref(repository_ref).title("PR".to_string()).build(),
+            )
+            .build();
+        backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
+        let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
+        let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
+        for first_page_len in [50, 100] {
+            let runner = ForgejoRunner {
+                pages: Mutex::new(Vec::new()),
+                marker: format!("<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str()),
+                first_page_len,
+            };
+            let url = project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"))
+                .await
+                .expect("find comment on second page");
+            assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
+            assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2", "3"]);
+        }
     }
 }
