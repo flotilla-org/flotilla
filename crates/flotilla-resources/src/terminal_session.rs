@@ -67,13 +67,19 @@ pub struct TerminalSessionAttachTarget<'a> {
 }
 
 pub fn terminal_session_attach_target(session: &ResourceObject<TerminalSession>) -> Result<TerminalSessionAttachTarget<'_>, String> {
-    let status = session
-        .status
-        .as_ref()
-        .filter(|status| status.phase == TerminalSessionPhase::Running)
-        .ok_or_else(|| format!("terminal session {} is not running and cannot be attached", session.metadata.name))?;
-    let session_id =
-        status.session_id.as_deref().ok_or_else(|| format!("running terminal session {} has no session id", session.metadata.name))?;
+    if session.status.as_ref().is_none_or(|status| status.phase != TerminalSessionPhase::Running) {
+        return Err(format!("terminal session {} is not running and cannot be attached", session.metadata.name));
+    }
+    terminal_session_attach_target_with_stale_status(session)
+}
+
+/// Resolve the recorded endpoint without treating the observed phase as liveness.
+/// Attach callers verify the endpoint with the terminal pool itself.
+pub fn terminal_session_attach_target_with_stale_status(
+    session: &ResourceObject<TerminalSession>,
+) -> Result<TerminalSessionAttachTarget<'_>, String> {
+    let status = session.status.as_ref().ok_or_else(|| format!("terminal session {} has no recorded endpoint", session.metadata.name))?;
+    let session_id = status.session_id.as_deref().ok_or_else(|| format!("terminal session {} has no session id", session.metadata.name))?;
     let launch_command = status.launch_command.as_deref().or(match &session.spec.source {
         TerminalSessionSource::Tool { command } => Some(command.as_str()),
         TerminalSessionSource::Agent { .. } => None,

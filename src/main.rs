@@ -1529,6 +1529,9 @@ async fn run_attach(
                 Ok(())
             }
             OutputFormat::Human => {
+                if let Some(phase) = binding.as_ref().and_then(|binding| binding.convoy_phase) {
+                    eprintln!("Convoy phase: {phase}");
+                }
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }

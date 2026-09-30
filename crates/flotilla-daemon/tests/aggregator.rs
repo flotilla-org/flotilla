@@ -13,15 +13,18 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    providers::discovery::test_support::{
-        fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool,
+    providers::{
+        discovery::test_support::{
+            fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool,
+        },
+        terminal::{TerminalSession as PoolTerminalSession, TerminalSessionLiveness},
     },
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
     result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
     test_support::TestIssue,
-    DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope,
+    DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope, TerminalStatus,
 };
 use flotilla_resources::{
     Checkout, CheckoutPhase, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment,
@@ -542,10 +545,16 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         )
         .await
         .expect("create project");
+    let pool = Arc::new(FakeTerminalPool::new());
+    pool.add_sessions(vec![
+        PoolTerminalSession::builder().session_name("cleat-convoy-coder".to_string()).status(TerminalStatus::Disconnected).build(),
+        PoolTerminalSession::builder().session_name("cleat-yeoman".to_string()).status(TerminalStatus::Disconnected).build(),
+    ])
+    .await;
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new()))),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(pool.clone())),
         HostName::new("local"),
         backend.clone(),
     )
@@ -845,6 +854,18 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let removed = removed.changes.removed_resources().expect("independent removals");
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].name, "terminal-yeoman");
+
+    pool.remove_session("cleat-yeoman").await;
+    let error = daemon.resolve_attach_command_internal("terminal-yeoman").await.expect_err("missing endpoint");
+    assert_eq!(error, "session terminal-yeoman no longer exists on local");
+
+    pool.set_liveness_override(Ok(TerminalSessionLiveness::Lost("socket gone".to_string()))).await;
+    let error = daemon.resolve_attach_command_internal("terminal-yeoman").await.expect_err("lost endpoint");
+    assert_eq!(error, "session terminal-yeoman is unreachable on local: socket gone");
+
+    pool.set_liveness_override(Err("cleat unavailable".to_string())).await;
+    let error = daemon.resolve_attach_command_internal("terminal-yeoman").await.expect_err("unreachable pool");
+    assert_eq!(error, "local unreachable: cleat unavailable");
 }
 
 /// Verifies the causal chain:

@@ -13,13 +13,13 @@ use flotilla_protocol::{
     commands::AttachMode,
     qualified_path::HostId,
     result_set::{CheckoutRow, Rows},
-    AttachBinding, CanonicalHostId, EnvironmentId, FleetListRow, FleetStaleness, HostName, RepoIdentity, ResolvedAttachAction,
+    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, RepoIdentity, ResolvedAttachAction,
     ResolvedAttachPlan, ResultSet,
 };
 use flotilla_resources::{
-    terminal_session_attach_target, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Project, RepositoryKey, ResourceBackend,
-    ResourceProvenance, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
+    Environment as ResourceEnvironment, Project, RepositoryKey, ResourceBackend, ResourceProvenance,
+    TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -40,7 +40,7 @@ use crate::{
     },
     path_context::ExecutionEnvironmentPath,
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
-    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
+    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
     repo_state::RepoState,
 };
 
@@ -129,14 +129,32 @@ impl<'a> AttachResolver<'a> {
         mode: AttachMode,
         project_context: Option<&str>,
     ) -> Result<ResolvedAttach, String> {
-        self.resolve_attach_with_context(reference, host, transient, mode, project_context).await
+        let mut resolved = self.resolve_attach_with_context(reference, host, transient, mode, project_context).await?;
+        if let Some(binding) = resolved.binding.as_mut() {
+            if let Some(convoy_name) = &binding.convoy {
+                let namespace = self.provisioning_namespace().await;
+                let convoys = self
+                    .resource_backend
+                    .including_replicas::<ResourceConvoy>(&namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                binding.convoy_phase = convoys
+                    .items
+                    .into_iter()
+                    .find(|source| source.object.metadata.name == *convoy_name)
+                    .and_then(|source| source.object.status)
+                    .map(|status| attach_convoy_phase(status.phase));
+            }
+        }
+        Ok(resolved)
     }
 
     pub(super) async fn resolve_transient(&self, reference: &str, host: Option<&HostName>) -> Result<ResolvedAttach, String> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
-        self.resolve_attach_with_context(reference, host, true, AttachMode::Default, None).await
+        self.resolve_attach(reference, host, true, AttachMode::Default, None).await
     }
 
     pub(super) async fn resolvable_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
@@ -213,22 +231,84 @@ impl<'a> AttachResolver<'a> {
         }
 
         let role = requested.as_ref().map_or(reference, |address| address.role.as_str());
+        let matching_convoy_exists = sources.items.iter().any(|source| {
+            source.object.spec.role == role
+                && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
+        });
+        let durable_sessions = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let observed_sessions = self
+            .observed_resource_backend
+            .clone()
+            .using::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut sessions_by_convoy = HashMap::<String, Vec<_>>::new();
+        for source in durable_sessions.items {
+            if source.object.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
+                if let Some(convoy) = source.object.metadata.labels.get(CONVOY_LABEL).cloned() {
+                    sessions_by_convoy.entry(convoy).or_default().push((source.object, source.provenance));
+                }
+            }
+        }
+        for session in observed_sessions.items {
+            if session.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
+                if let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL).cloned() {
+                    sessions_by_convoy.entry(convoy).or_default().push((session, ResourceProvenance::Local));
+                }
+            }
+        }
         let mut candidates = sources
             .items
             .into_iter()
             .filter(|source| {
                 source.object.spec.role == role
-                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                    && sessions_by_convoy.contains_key(&source.object.metadata.name)
                     && requested.as_ref().is_none_or(|address| source.object.spec.project_ref.as_deref() == Some(&address.project))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            (&left.object.spec.project_ref, &left.object.metadata.name).cmp(&(&right.object.spec.project_ref, &right.object.metadata.name))
+            (&left.object.spec.project_ref, std::cmp::Reverse(left.object.spec.generation), &left.object.metadata.name).cmp(&(
+                &right.object.spec.project_ref,
+                std::cmp::Reverse(right.object.spec.generation),
+                &right.object.metadata.name,
+            ))
         });
+        let mut connectable = Vec::new();
+        for source in candidates {
+            let sessions = sessions_by_convoy.get(&source.object.metadata.name).expect("candidate convoy has a session");
+            let mut reachable = false;
+            for (session, provenance) in sessions {
+                reachable = match provenance {
+                    ResourceProvenance::Local => {
+                        self.attach_plan_for_session(&session.metadata.name, session, AttachMode::Default).await.is_ok()
+                    }
+                    ResourceProvenance::Replica { origin_root, .. } => {
+                        self.host_registry.live_routed_host_name(origin_root).await.is_some()
+                    }
+                };
+                if reachable {
+                    break;
+                }
+            }
+            if reachable {
+                connectable.push(source);
+            }
+        }
+        let candidates = connectable;
+        let unique_projects = candidates.iter().map(|source| &source.object.spec.project_ref).collect::<BTreeSet<_>>();
         match candidates.as_slice() {
-            [] if explicit => Err(format!("no live convoy matches `{reference}`")),
+            [] if explicit && !matching_convoy_exists => Err(format!("no live convoy matches `{reference}`")),
             [] => Ok(None),
-            [source] => {
+            [source, ..]
+                if unique_projects.len() == 1
+                    && candidates.get(1).is_none_or(|next| source.object.spec.generation > next.object.spec.generation) =>
+            {
                 let project = source
                     .object
                     .spec
@@ -299,10 +379,33 @@ impl<'a> AttachResolver<'a> {
                 return Ok(ResolvedAttach { plan, binding: Some(binding) });
             }
             let index = self.attach_candidate_index().await?;
-            return index.resolve(self, &record.record_name, host, transient, mode).await;
+            return index.resolve(self, &record.record_name, host, transient, mode).await.map_err(AttachIndexError::into_message);
         }
         let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference, host, transient, mode).await
+        match index.resolve(self, reference, host, transient, mode).await {
+            Err(AttachIndexError::NoMatch(_)) if reference.starts_with("terminal-") => {
+                Err(format!("session {reference} no longer exists on {}", host.unwrap_or(self.host_name)))
+            }
+            Err(AttachIndexError::NoMatch(error)) => {
+                let namespace = self.provisioning_namespace().await;
+                let convoys =
+                    self.resource_backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|err| err.to_string())?;
+                let requested_role = reference.contains('@').then(|| RoleAddress::from_str(reference)).transpose()?;
+                if convoys.items.iter().any(|source| {
+                    source.object.metadata.name == reference
+                        || (source.object.spec.role == reference)
+                        || requested_role.as_ref().is_some_and(|address| {
+                            source.object.spec.role == address.role && source.object.spec.project_ref.as_deref() == Some(&address.project)
+                        })
+                }) {
+                    Err(format!("session for {reference} no longer exists on {}", host.unwrap_or(self.host_name)))
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error.into_message()),
+            Ok(resolved) => Ok(resolved),
+        }
     }
 
     async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
@@ -315,7 +418,6 @@ impl<'a> AttachResolver<'a> {
             .map_err(|error| error.to_string())?
             .items
             .into_iter()
-            .filter(|source| source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
             .map(|source| {
                 let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
                 (source.object.metadata.name, address)
@@ -351,9 +453,6 @@ impl<'a> AttachResolver<'a> {
         }
         let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
-            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
-                continue;
-            }
             let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
             candidates.push(AttachCandidate {
                 label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
@@ -365,9 +464,6 @@ impl<'a> AttachResolver<'a> {
         let mut indexed_remote_sessions = HashSet::new();
         for replicated in replicated_sessions {
             let session = replicated.object;
-            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
-                continue;
-            }
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
             };
@@ -421,18 +517,14 @@ impl<'a> AttachResolver<'a> {
                 .collect::<HashSet<_>>();
             let mut indexed_sessions = HashSet::new();
             for row in &rows {
-                if row.crew_state != "running" {
+                let Some(session) = &row.session else { continue };
+                if indexed_remote_sessions.contains(&(row.host.clone(), session.clone())) {
                     continue;
                 }
-                if let Some(session) = &row.session {
-                    if indexed_remote_sessions.contains(&(row.host.clone(), session.clone())) {
-                        continue;
-                    }
-                    if independent_references.contains(session.as_str()) {
-                        continue;
-                    }
-                    indexed_sessions.insert(session.clone());
+                if independent_references.contains(session.as_str()) {
+                    continue;
                 }
+                indexed_sessions.insert(session.clone());
                 candidates.push(AttachCandidate {
                     label: fleet_row_attach_reference_label(row),
                     references: fleet_row_attach_reference_keys(row),
@@ -625,7 +717,20 @@ impl<'a> AttachResolver<'a> {
             .get(&session.spec.pool)
             .map(|(_, pool)| Arc::clone(pool))
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-        let attach_target = terminal_session_attach_target(session)?;
+        if session.status.as_ref().and_then(|status| status.session_id.as_ref()).is_none() {
+            return Err(format!("session {} no longer exists on {}", session.metadata.name, self.host_name));
+        }
+        let attach_target = terminal_session_attach_target_with_stale_status(session)?;
+        match pool.session_liveness(attach_target.session_id).await {
+            Ok(TerminalSessionLiveness::Running) => {}
+            Ok(TerminalSessionLiveness::Stopped | TerminalSessionLiveness::Absent) => {
+                return Err(format!("session {} no longer exists on {}", session.metadata.name, self.host_name));
+            }
+            Ok(TerminalSessionLiveness::Lost(reason)) => {
+                return Err(format!("session {} is unreachable on {}: {reason}", session.metadata.name, self.host_name));
+            }
+            Err(error) => return Err(format!("{} unreachable: {error}", self.host_name)),
+        }
         pool.preflight_attach(seat).await?;
         pool.attach_args_for_mode(attach_target.session_id, attach_target.launch_command, cwd, &Vec::new(), seat)
     }
@@ -697,6 +802,20 @@ impl<'a> AttachResolver<'a> {
 pub struct ResolvedAttach {
     pub plan: ResolvedAttachPlan,
     pub binding: Option<AttachBinding>,
+}
+
+fn attach_convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
+    match phase {
+        ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
+        ResourceConvoyPhase::Active => ConvoyPhase::Active,
+        ResourceConvoyPhase::Interrupted => ConvoyPhase::Interrupted,
+        ResourceConvoyPhase::Anchored => ConvoyPhase::Anchored,
+        ResourceConvoyPhase::Landing => ConvoyPhase::Landing,
+        ResourceConvoyPhase::Landed => ConvoyPhase::Landed,
+        ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
+        ResourceConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
+        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
+    }
 }
 
 fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>, convoy_address: Option<&str>) -> Vec<String> {
@@ -858,6 +977,19 @@ struct AttachCandidateIndex {
     exact: HashMap<String, Vec<usize>>,
 }
 
+enum AttachIndexError {
+    NoMatch(String),
+    Other(String),
+}
+
+impl AttachIndexError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NoMatch(message) | Self::Other(message) => message,
+        }
+    }
+}
+
 impl AttachCandidateIndex {
     fn new(candidates: Vec<AttachCandidate>) -> Self {
         let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
@@ -876,9 +1008,9 @@ impl AttachCandidateIndex {
         host: Option<&HostName>,
         transient: bool,
         seat: AttachMode,
-    ) -> Result<ResolvedAttach, String> {
+    ) -> Result<ResolvedAttach, AttachIndexError> {
         if reference.trim().is_empty() {
-            return Err("attach reference is required".to_string());
+            return Err(AttachIndexError::Other("attach reference is required".to_string()));
         }
 
         let mut matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
@@ -894,15 +1026,15 @@ impl AttachCandidateIndex {
         }
         match matches.as_slice() {
             [] => match host {
-                Some(host) => Err(format!("no attach target matching '{reference}' on host '{host}'")),
-                None => Err(format!("no attach target matching '{reference}'")),
+                Some(host) => Err(AttachIndexError::NoMatch(format!("no attach target matching '{reference}' on host '{host}'"))),
+                None => Err(AttachIndexError::NoMatch(format!("no attach target matching '{reference}'"))),
             },
-            [index] => self.candidates[*index].target.resolve(resolver, reference, transient, seat).await,
+            [index] => self.candidates[*index].target.resolve(resolver, reference, transient, seat).await.map_err(AttachIndexError::Other),
             _ => {
                 let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
                 labels.sort();
                 labels.dedup();
-                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
+                Err(AttachIndexError::Other(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", "))))
             }
         }
     }
@@ -939,7 +1071,9 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
 mod tests {
     use chrono::Utc;
     use flotilla_protocol::{Command, CommandAction, CommandValue};
-    use flotilla_resources::{Host as ResourceHost, HostSpec};
+    use flotilla_resources::{
+        ConvoyPhase, ConvoySpec, ConvoyStatus, Host as ResourceHost, HostSpec, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    };
 
     use super::*;
     use crate::{
@@ -1000,6 +1134,7 @@ mod tests {
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
         create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
+        create_running_session(&daemon, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
 
         let mut resolver = daemon.attach_resolver();
         resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
@@ -1049,6 +1184,118 @@ mod tests {
             .expect_err("an explicit host must constrain role-address resolution");
         assert_eq!(wrong_host, "no attach target matching 'governor@andamento' on host 'udder'");
     }
+
+    #[tokio::test]
+    async fn failed_convoy_with_live_session_remains_attachable_and_listed() {
+        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        create_identity_convoy(&backend, "convoy-failed", "coder", Some("flotilla")).await;
+        let host = daemon.local_host_id().expect("local host identity").to_string();
+        backend
+            .using::<ResourceHost>("flotilla")
+            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .await
+            .expect("local host resource");
+        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        create_running_session(&daemon, &environment, "coder-session", "convoy-failed", "coder").await;
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        let convoy = convoys.get("convoy-failed").await.expect("convoy");
+        convoys
+            .update_status("convoy-failed", &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Failed,
+                ..Default::default()
+            })
+            .await
+            .expect("failed convoy status");
+        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+        let session = sessions.get("coder-session").await.expect("session");
+        let mut status = session.status.expect("session status");
+        status.phase = ResourceTerminalSessionPhase::Lost;
+        sessions.update_status("coder-session", &session.metadata.resource_version, &status).await.expect("stale session status");
+
+        let mut resolver = daemon.attach_resolver();
+        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        for reference in ["coder", "coder@flotilla", "convoy-failed", "coder-session"] {
+            let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect(reference);
+            assert_eq!(resolved.binding.as_ref().and_then(|binding| binding.convoy_phase), Some(flotilla_protocol::ConvoyPhase::Failed));
+            assert_eq!(serde_json::to_value(&resolved.binding).expect("binding JSON")["convoy_phase"], "failed");
+            assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("coder-session".to_string()));
+        }
+        let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;
+        assert!(rows
+            .iter()
+            .any(|row| row.convoy_ref.as_deref() == Some("convoy-failed") && row.session.as_deref() == Some("coder-session")));
+    }
+
+    #[tokio::test]
+    async fn bare_role_prefers_newest_connectable_generation() {
+        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        create_identity_convoy(&backend, "convoy-old", "coder", Some("flotilla")).await;
+        let mut successor = ConvoySpec::builder().workflow_ref("review".to_string()).role("coder".to_string()).generation(2).build();
+        successor.project_ref = Some("flotilla".to_string());
+        backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-new"), &successor).await.expect("successor");
+        let host = daemon.local_host_id().expect("local host identity").to_string();
+        backend
+            .using::<ResourceHost>("flotilla")
+            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .await
+            .expect("local host resource");
+        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        create_running_session(&daemon, &environment, "terminal-old", "convoy-old", "coder").await;
+        create_running_session(&daemon, &environment, "terminal-new", "convoy-new", "coder").await;
+
+        let mut resolver = daemon.attach_resolver();
+        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let resolved = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("newest generation");
+        assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("terminal-new".to_string()));
+        let old = resolver.resolve_attach("convoy-old", None, false, AttachMode::Default, None).await.expect("explicit old generation");
+        assert_eq!(old.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
+
+        backend.using::<ResourceConvoy>("flotilla").create(&test_meta("convoy-peer"), &successor).await.expect("peer generation");
+        create_running_session(&daemon, &environment, "terminal-peer", "convoy-peer", "coder").await;
+        let error =
+            resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect_err("same generation is ambiguous");
+        assert!(error.contains("ambiguous"), "{error}");
+
+        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+        sessions.delete("terminal-peer").await.expect("remove peer endpoint");
+        let newest = sessions.get("terminal-new").await.expect("newest session");
+        let mut unreachable_spec = newest.spec;
+        unreachable_spec.pool = "missing-pool".to_string();
+        sessions
+            .update(
+                &flotilla_resources::InputMeta::builder().name("terminal-new".to_string()).labels(newest.metadata.labels.clone()).build(),
+                &newest.metadata.resource_version,
+                &unreachable_spec,
+            )
+            .await
+            .expect("make newer endpoint unreachable");
+        let fallback = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("older reachable generation");
+        assert_eq!(fallback.binding.and_then(|binding| binding.session), Some("terminal-old".to_string()));
+    }
+
+    #[tokio::test]
+    async fn deleted_terminal_session_is_named_in_attach_error() {
+        let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+        create_identity_convoy(&backend, "convoy-gone", "coder", Some("flotilla")).await;
+        let host = daemon.local_host_id().expect("local host identity").to_string();
+        backend
+            .using::<ResourceHost>("flotilla")
+            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .await
+            .expect("local host resource");
+        let environment = create_test_environment(&daemon, "coder-env", &host).await;
+        create_running_session(&daemon, &environment, "terminal-gone", "convoy-gone", "coder").await;
+        backend.using::<ResourceTerminalSession>("flotilla").delete("terminal-gone").await.expect("delete terminal session");
+
+        let mut resolver = daemon.attach_resolver();
+        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let error = resolver.resolve_attach("terminal-gone", None, false, AttachMode::Default, None).await.expect_err("gone session");
+        assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
+        let error = resolver.resolve_attach("convoy-gone", None, false, AttachMode::Default, None).await.expect_err("gone convoy session");
+        assert_eq!(error, format!("session for convoy-gone no longer exists on {}", daemon.host_name));
+        let error = resolver.resolve_attach("coder@flotilla", None, false, AttachMode::Default, None).await.expect_err("gone role session");
+        assert_eq!(error, format!("session for coder@flotilla no longer exists on {}", daemon.host_name));
+    }
     #[tokio::test]
     async fn candidate_index_reads_fleet_rows_from_its_source() {
         let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
@@ -1058,7 +1305,7 @@ mod tests {
             .convoy_ref("convoy-opaque")
             .vessel("vessel-opaque")
             .crew("implement/coder")
-            .crew_state("running")
+            .crew_state("failed")
             .host(host.clone())
             .namespace("flotilla")
             .session("remote-session")
