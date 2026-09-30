@@ -854,6 +854,10 @@ case "$1" in
     cat "$checkout/.git/FETCH_HEAD"
     ;;
   checkout)
+    if [ -f "$FLOTILLA_TEST_FETCH_LOG.checkout-auth" ]; then
+      echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
+      exit 128
+    fi
     if [ ! -s "$checkout/.git/credential-helper" ] || [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
       echo "fatal: could not read Username for 'https://github.com': terminal prompts disabled" >&2
       echo "fatal: could not fetch promised blob from promisor remote" >&2
@@ -1351,6 +1355,35 @@ esac
             .expect_err("403 must terminate staging");
         assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 2);
         assert!(error.contains("fatal: HTTP/2 403 credential [redacted credential] rejected by remote"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn skill_checkout_prompt_failure_is_terminal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let skills = registry.skills.source.as_ref().expect("generation source");
+        std::fs::write(
+            skills.join(SKILL_BUNDLE_MANIFEST),
+            r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#,
+        )
+        .expect("manifest");
+        let runner = promisor_runner(temp.path());
+        std::fs::write(temp.path().join("fetches.checkout-auth"), "").expect("checkout auth marker");
+        let token_file = temp.path().join("source.token");
+        std::fs::write(&token_file, "test-token").expect("token");
+        let error = registry
+            .stage_skills(
+                "crew-private",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
+                &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                &BTreeMap::from([("private-skills".to_string(), token_file)]),
+                &runner,
+            )
+            .await
+            .expect_err("disabled credential prompt is terminal");
+        assert!(error.contains("authentication or authorization failed"), "{error}");
+        assert!(error.contains("could not read Username"), "{error}");
+        assert_eq!(std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(), 1);
     }
 
     #[tokio::test]

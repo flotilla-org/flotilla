@@ -50,6 +50,9 @@ print_git_stderr() {
     fi
   done <"$1"
 }
+is_auth_failure() {
+  grep -Eiq 'authentication failed|authorization failed|could not read (Username|Password)|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|Permission denied \(publickey\)|remote:.*(permission|access) denied' "$1"
+}
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$staged" "$sources" "$cache_root"
 while [ "$#" -gt 0 ]; do
@@ -113,10 +116,11 @@ while [ "$#" -gt 0 ]; do
     if [ "$code" -ne 0 ]; then
       if grep -Eiq 'not our ref|could not find remote ref|unadvertised object' "$sources/fetch.stderr"; then
         disposition='pinned revision does not exist'
-      elif grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|Permission denied \(publickey\)|remote:.*(permission|access) denied' "$sources/fetch.stderr"; then
+      elif is_auth_failure "$sources/fetch.stderr"; then
         disposition='authentication or authorization failed'
       else
         disposition='fetch failed'
+        # Rust owns final-failure cleanup; preserve this token for its next attempt.
         retrying=true
         echo 'flotilla-stage-skills-retryable:' >&2
       fi
@@ -132,10 +136,11 @@ while [ "$#" -gt 0 ]; do
     test "$fetched_revision" = "$revision" || { echo "${diagnostic_prefix}skill source $name fetch returned the wrong pinned revision $revision" >&2; exit 1; }
     if git -C "$checkout" checkout --quiet --detach FETCH_HEAD >"$sources/checkout.stdout" 2>"$sources/checkout.stderr"; then code=0; else code=$?; fi
     if [ "$code" -ne 0 ]; then
-      if grep -Eiq 'authentication failed|authorization failed|HTTP[^[:space:]]*[[:space:]]+(401|403)|requested URL returned error: (401|403)|401 Unauthorized|403 Forbidden|Permission denied \(publickey\)|remote:.*(permission|access) denied' "$sources/checkout.stderr"; then
+      if is_auth_failure "$sources/checkout.stderr"; then
         disposition='authentication or authorization failed'
       else
         disposition='checkout failed'
+        # Rust owns final-failure cleanup; preserve this token for its next attempt.
         retrying=true
         echo 'flotilla-stage-skills-retryable:' >&2
       fi
