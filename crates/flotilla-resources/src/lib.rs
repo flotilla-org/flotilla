@@ -71,7 +71,7 @@ pub use convoy::{
     bound_change_request_record_name, change_request_address, change_request_address_with_forges,
     change_request_id_from_completion_message, controller_patches, convoy_sanctions_checkout_reclaim, evaluate_crew_completion,
     evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit,
-    instantiate_turn_delivery, issue_address, issue_address_with_forges, pinned_placement_ref, pinned_workflow_ref,
+    instantiate_turn_delivery, issue_address, issue_address_with_forges, observed_change_request_subjects, pinned_placement_ref, pinned_workflow_ref,
     produced_subject_conflicts, provisioning_patches, reconcile, select_convoy_children, vessel_placement_pin, BoundChangeRequest, Convoy,
     ConvoyAttention, ConvoyEvent, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionClaim, CrewCompletionRefusal, CrewWorkPhase, CrewWorkState,

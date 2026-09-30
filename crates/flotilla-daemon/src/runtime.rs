@@ -3627,6 +3627,7 @@ fn spawn_controller_loops(
                         .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
                         .with_checkouts(backend.clone().using::<Checkout>(&namespace_string))
                         .with_federated_checkouts(backend.including_replicas::<Checkout>(&namespace_string))
+                        .with_forges(backend.definitions::<Forge>(&namespace_string))
                         .with_change_requests(
                             backend.including_replicas::<flotilla_resources::ChangeRequest>(&namespace_string),
                             daemon.change_request_stale_after(),

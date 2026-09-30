@@ -627,10 +627,16 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel_count: convoy.vessels.len(),
                 vessel: vessel.clone(),
             });
-            let title = convoy.change_request.as_ref().map_or_else(
-                || format!("Convoy · {}", convoy.name),
-                |change_request| format!("Convoy · {} · PR #{} {}", convoy.name, change_request.id, change_request.status),
-            );
+            let title = match (produced_change_request_subject(convoy), &convoy.change_request) {
+                (Some(subject), Some(change_request)) if change_request.id == subject.subject.id => {
+                    format!("Convoy · {} · PR #{} {}", convoy.name, subject.subject.id, change_request.status)
+                }
+                (Some(subject), _) => format!("Convoy · {} · PR #{}", convoy.name, subject.subject.id),
+                (None, Some(change_request)) => {
+                    format!("Convoy · {} · PR #{} {}", convoy.name, change_request.id, change_request.status)
+                }
+                (None, None) => format!("Convoy · {}", convoy.name),
+            };
             Ok(vessel_spec().project(title, rows))
         }
         ViewAddress::Vessel { namespace, convoy, vessel } => {
@@ -1139,6 +1145,11 @@ fn convoy_progress(row: &ConvoySummary) -> CellValue {
 }
 
 fn convoy_change_request(row: &ConvoySummary) -> CellValue {
+    if let Some(subject) = produced_change_request_subject(row) {
+        if row.change_request.as_ref().is_none_or(|cached| cached.id != subject.subject.id) {
+            return CellValue::plain(format!("#{}", subject.subject.id));
+        }
+    }
     let Some(change_request) = &row.change_request else {
         return CellValue::plain("");
     };
@@ -1149,6 +1160,13 @@ fn convoy_change_request(row: &ConvoySummary) -> CellValue {
         ChangeRequestStatus::Closed => CellTone::Muted,
     };
     CellValue::toned(format!("#{} {}", change_request.id, change_request.status), tone)
+}
+
+fn produced_change_request_subject(row: &ConvoySummary) -> Option<&flotilla_protocol::result_set::ConvoySubjectRow> {
+    row.subjects.iter().find(|entry| {
+        entry.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+            && entry.relationship == flotilla_protocol::Relationship::Produces
+    })
 }
 
 fn convoy_scope(row: &ConvoySummary) -> CellValue {
@@ -1689,6 +1707,27 @@ mod tests {
             })
         );
         assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · PR #815 open");
+    }
+
+    #[test]
+    fn convoy_projection_shows_replicated_produced_subject_without_local_pr_cache() {
+        let mut row = convoy(vec![]);
+        row.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "2301".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            declared: false,
+            short: "flotilla!2301".into(),
+            url: Some("https://github.com/flotilla-org/flotilla/pull/2301".into()),
+        });
+
+        let view = project_convoys("convoys/dev", &[&row]).expect("project table");
+        let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
+        assert_eq!(view.rows[0].cells[pr_index].text, "#2301");
+        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · PR #2301");
     }
 
     #[test]

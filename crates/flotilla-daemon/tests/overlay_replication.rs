@@ -1,12 +1,16 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-use flotilla_daemon::server::test_support::spawn_in_memory_request_topology;
-use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState};
+use flotilla_daemon::{
+    runtime::{DaemonRuntime, RuntimeOptions},
+    server::test_support::spawn_in_memory_request_topology,
+};
+use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState, Relationship, SubjectKind};
 use flotilla_resources::{
-    watch_resource_kind_replica_sources, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoySpec, Host,
-    HostSpec, HostStatus, InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey,
-    ResourceBackend, ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
+    watch_resource_kind_replica_sources, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout, CheckoutPhase,
+    CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, Host, HostSpec, HostStatus,
+    InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey, ResourceBackend,
+    ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
     CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
@@ -476,6 +480,158 @@ async fn connected_in_process_daemons_replicate_checkout_settlement_evidence() {
         kiwi.resource_backend().using::<Checkout>("flotilla").list().await.expect("list authority-local checkouts").items.is_empty(),
         "replication must not re-author the vessel-host checkout on the authority"
     );
+    drop(topology);
+}
+
+#[tokio::test]
+async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let repository_url = "https://github.com/flotilla-org/flotilla";
+    let _kiwi_runtime = DaemonRuntime::start_with_options(Arc::clone(&kiwi), kiwi.config_store(), None, RuntimeOptions {
+        namespace: "flotilla".into(),
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    })
+    .await
+    .expect("start other host query projection");
+    let repository_key = RepositoryKey("repo_flotilla".into());
+    let home = feta.resource_backend();
+    let convoy = home
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("crew-convoy".to_string()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".to_string())
+                .r#ref("fix/crew-branch".to_string())
+                .repositories(vec![ConvoyRepositorySpec {
+                    url: repository_url.into(),
+                    repo_ref: repository_key.clone(),
+                    source_ref: "main".into(),
+                    target_ref: "main".into(),
+                    workspace_slug: "flotilla".into(),
+                    subpaths: Vec::new(),
+                }])
+                .adopted_checkout_refs(BTreeMap::from([(repository_key.clone(), "crew-checkout".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("admit convoy before PR exists");
+    home.using::<Convoy>("flotilla")
+        .update_status("crew-convoy", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            observed_workflow_ref: Some("workflow".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("convoy is active before PR exists");
+    let _feta_runtime = DaemonRuntime::start_with_options(Arc::clone(&feta), feta.config_store(), None, RuntimeOptions {
+        namespace: "flotilla".into(),
+        controller_resync_interval: Duration::from_secs(300),
+        ..RuntimeOptions::default()
+    })
+    .await
+    .expect("start home controller before crew opens PR");
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect hosts");
+    let kiwi_checkouts = kiwi.resource_backend().using::<Checkout>("flotilla");
+    let checkout = kiwi_checkouts
+        .create(
+            &InputMeta::builder()
+                .name("crew-checkout".to_string())
+                .labels(BTreeMap::from([("flotilla.work/convoy".to_string(), "crew-convoy".to_string())]))
+                .build(),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "fix/crew-branch".into(),
+                path: "/srv/crew/flotilla".into(),
+                repo_ref: repository_key,
+                host_ref: "kiwi".into(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create checkout after admission");
+    kiwi_checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            integration: flotilla_resources::CheckoutIntegrationStatus {
+                change_request: Some(ChangeRequestObservation {
+                    id: "2301".into(),
+                    state: ChangeRequestState::Open,
+                    mergeability: ChangeRequestMergeability::Unknown,
+                    target_ref: Some("main".into()),
+                    observed_at: chrono::Utc::now().to_rfc3339(),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("crew opens PR without changing convoy phase");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if home
+                .including_replicas::<Checkout>("flotilla")
+                .get("crew-checkout")
+                .await
+                .ok()
+                .and_then(|checkout| checkout.object.status)
+                .is_some_and(|status| status.integration.change_request.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("home receives checkout observation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("other host receives convoy replica");
+    kiwi.discover_convoy_branch_subjects("flotilla", "crew-convoy", "fix/crew-branch")
+        .await
+        .expect("replica host skips home-only discovery");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let replica = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await;
+            if replica.ok().and_then(|record| record.object.status).is_some_and(|status| {
+                status.subjects.iter().any(|entry| {
+                    entry.subject.kind == SubjectKind::ChangeRequest
+                        && entry.subject.id == "2301"
+                        && entry.relationship == Relationship::Produces
+                })
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("other host sees replicated PR subject");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = kiwi.aggregator_projection_state().await.result_set().await;
+            if result
+                .rows
+                .as_convoys()
+                .expect("convoy rows")
+                .iter()
+                .any(|row| row.resource.name == "crew-convoy" && row.subjects.iter().any(|entry| entry.subject.id == "2301"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("other host row shows replicated PR subject");
     drop(topology);
 }
 

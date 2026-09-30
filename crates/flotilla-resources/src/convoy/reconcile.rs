@@ -6,14 +6,14 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{Leaf, LeafAddress};
+use flotilla_protocol::{Leaf, LeafAddress, Relationship, Subject};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    controller_patches, expected_change_request_leaves, expected_checkout_refs, instantiate_exit, provisioning_patches,
-    select_convoy_children, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InstantiatedExit, VesselRequirement,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, expected_change_request_leaves, expected_checkout_refs, instantiate_exit, observed_change_request_subjects,
+    provisioning_patches, select_convoy_children, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InstantiatedExit,
+    SubjectDiscoverySource, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -32,9 +32,10 @@ use crate::{
         validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ValidationError,
         WorkflowTemplate,
     },
-    Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Host, InputMeta,
-    InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource, ResourceError,
-    RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue, TypedResolver,
+    Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
+    InputMeta, InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource,
+    ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue,
+    TypedResolver,
 };
 
 #[async_trait]
@@ -82,6 +83,7 @@ pub struct ConvoyReconciler {
     checkouts: Option<TypedResolver<Checkout>>,
     federated_checkouts: Option<ReplicaReadResolver<Checkout>>,
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
+    forges: Option<DefinitionResolver<Forge>>,
     hosts: Option<ReplicaReadResolver<Host>>,
     change_request_stale_after: std::time::Duration,
     landing_evidence_stale_after: std::time::Duration,
@@ -96,6 +98,7 @@ pub struct ConvoyPrepared {
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     presentations: BTreeMap<String, ResourceObject<Presentation>>,
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
+    observed_subjects: Vec<Subject>,
     exit_disposition: Option<String>,
     settlement_attention: Option<crate::ConvoyAttention>,
     reclaim_eligible: bool,
@@ -113,6 +116,7 @@ impl ConvoyReconciler {
             checkouts: None,
             federated_checkouts: None,
             change_requests: None,
+            forges: None,
             hosts: None,
             change_request_stale_after: std::time::Duration::from_secs(180),
             landing_evidence_stale_after: std::time::Duration::from_secs(30),
@@ -160,6 +164,11 @@ impl ConvoyReconciler {
     pub fn with_change_requests(mut self, change_requests: ReplicaReadResolver<ChangeRequest>, stale_after: std::time::Duration) -> Self {
         self.change_requests = Some(change_requests);
         self.change_request_stale_after = stale_after;
+        self
+    }
+
+    pub fn with_forges(mut self, forges: DefinitionResolver<Forge>) -> Self {
+        self.forges = Some(forges);
         self
     }
 
@@ -754,6 +763,11 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
+        let forges = match &self.forges {
+            Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        let observed_subjects = observed_change_request_subjects(obj, &checkouts, &forges).map_err(ResourceError::other)?;
         let is_landing = obj.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landing);
         let change_requests = match &self.change_requests {
             Some(change_requests) if is_landing => {
@@ -803,6 +817,7 @@ impl Reconciler for ConvoyReconciler {
             vessels,
             presentations,
             checkouts,
+            observed_subjects,
             exit_disposition,
             settlement_attention,
             reclaim_eligible,
@@ -871,6 +886,27 @@ impl Reconciler for ConvoyReconciler {
             LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
         );
+        if outcome.patch.is_none() {
+            let missing = prepared
+                .observed_subjects
+                .iter()
+                .filter(|subject| {
+                    !obj.status.as_ref().is_some_and(|status| {
+                        status.unlinked_subjects.contains(*subject)
+                            || status
+                                .subjects
+                                .iter()
+                                .any(|entry| entry.subject == **subject && entry.relationship == Relationship::Produces)
+                    })
+                })
+                .cloned()
+                .map(|subject| (subject, Relationship::Produces))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                outcome.patch =
+                    Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now });
+            }
+        }
         if outcome.patch.is_none() {
             if let Some(attention) = &prepared.settlement_attention {
                 let changed = obj
