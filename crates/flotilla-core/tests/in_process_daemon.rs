@@ -3876,6 +3876,97 @@ async fn convoy_delete_reaps_a_landed_pre_identity_record_and_its_terminal_sessi
 }
 
 #[tokio::test]
+async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repo_ref = RepositoryKey("repo-a".to_string());
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("merged-deleted-branch".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("implement-review".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+    let mut status = flotilla_resources::ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
+    status.work.insert("work".to_string(), WorkState {
+        phase: WorkPhase::Complete,
+        placement: Some(flotilla_resources::PlacementStatus {
+            fields: BTreeMap::from([(
+                "checkout_refs".to_string(),
+                serde_json::json!(BTreeMap::from([(repo_ref.clone(), "merged-checkout".to_string())])),
+            )]),
+        }),
+        ..WorkState::builder().phase(WorkPhase::Complete).build()
+    });
+    let convoy = convoys.update_status("merged-deleted-branch", &convoy.metadata.resource_version, &status).await.expect("mark landed");
+    let checkouts = backend.clone().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("merged-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "merged-deleted-branch".to_string())]))
+                .build(),
+            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "deleted-feature".to_string(),
+                path: "/tmp/merged-checkout".to_string(),
+                repo_ref,
+                host_ref: "host-test".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let condition = |value| flotilla_resources::IntegrationCondition::builder().value(value).observed_at(observed_at.clone()).build();
+    let integration = flotilla_resources::CheckoutIntegrationStatus {
+        clean: condition(flotilla_resources::ConditionValue::True),
+        pushed: condition(flotilla_resources::ConditionValue::False),
+        landed: condition(flotilla_resources::ConditionValue::True),
+        landed_evidence: Some(flotilla_resources::LandedEvidence::builder().change_request_id("127".to_string()).build()),
+        change_request: Some(
+            flotilla_resources::ChangeRequestObservation::builder()
+                .id("127".to_string())
+                .state(flotilla_resources::ChangeRequestState::Merged)
+                .mergeability(flotilla_resources::ChangeRequestMergeability::Unknown)
+                .observed_at(observed_at)
+                .build(),
+        ),
+        ..Default::default()
+    };
+    let checkout = checkouts
+        .update_status("merged-checkout", &checkout.metadata.resource_version, &flotilla_resources::CheckoutStatus {
+            integration,
+            ..Default::default()
+        })
+        .await
+        .expect("publish integration observation");
+
+    daemon
+        .verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false)
+        .await
+        .expect("merged PR makes deleted branch safe to reclaim");
+
+    let mut mismatched = checkout.clone();
+    mismatched
+        .status
+        .as_mut()
+        .expect("checkout status")
+        .integration
+        .landed_evidence
+        .as_mut()
+        .expect("landing evidence")
+        .change_request_id = "different-pr".to_string();
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[mismatched], false).await.is_err());
+
+    let mut dirty = checkout;
+    dirty.status.as_mut().expect("checkout status").integration.clean.value = flotilla_resources::ConditionValue::False;
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[dirty], false).await.is_err());
+}
+
+#[tokio::test]
 async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_status_is_missing() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let daemon =

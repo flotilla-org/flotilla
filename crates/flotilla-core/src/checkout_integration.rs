@@ -721,7 +721,7 @@ mod tests {
         // predate the change request, so the branch must not count as landed.
         let landed = landed_with_responses(vec![Ok("2".into()), Ok("[]".into())]).await;
         assert_eq!(landed.value, ConditionValue::False);
-        assert!(landed.details.iter().any(|detail| detail.contains("2 commits beyond main")), "details: {:?}", landed.details);
+        assert!(landed.details.iter().any(|detail| detail.contains("2 commits beyond origin/main")), "details: {:?}", landed.details);
     }
 
     #[tokio::test]
