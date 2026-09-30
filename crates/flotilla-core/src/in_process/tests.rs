@@ -833,8 +833,9 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
         assert_eq!(escalation.sender, CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() });
-        assert!(frame_crew_message(&escalation.sender, &escalation.brief)
-            .starts_with("[flotilla · escalated from coder@work · supervise the stalled crew]"));
+        let framed = frame_crew_message(&escalation.sender, &escalation.brief);
+        assert!(framed.starts_with("[flotilla · escalated from coder@work · supervise the stalled crew]"));
+        assert!(framed.contains("Proposed disposition: reduce-scope."), "{framed}");
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

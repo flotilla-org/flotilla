@@ -95,6 +95,8 @@ a Codex parser can take precedence once its hook contract is documented.
   plan is wrong). Consumers must not parse message strings to tell them
   apart. `Steward` has no writer yet — it is reserved for stewards
   (ADR 0009) independently failing work once they exist.
+  ADR 0045 amends the crew path: crews declare a stall and may propose failure;
+  a supervisor converts stalled work to `Failed`.
 - **Completion policy per workflow is a named, deferred extension point.**
   The current rollup (any work fails → convoy fails; all works settle →
   convoy completes) is correct for sequential workflows and wrong for
