@@ -33,7 +33,7 @@ use crate::{
     event_sink::EventSink,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
-        join_replica_errors, FleetService, ResourceReplicationFailure, FLEET_REPLICA_FRESH_SECS,
+        is_host_self_report, join_replica_errors, replica_sync_is_fresh, FleetService, ResourceReplicationFailure,
     },
     host_registry::HostCounts,
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
@@ -238,13 +238,7 @@ impl ReadProjections<'_> {
                 ResourceProvenance::Replica { origin_root, .. } => {
                     // An origin replicates every Host it observes, including this daemon's Host.
                     // Only the Host matching the origin's canonical environment is its self-report.
-                    let is_self_report = self
-                        .host_registry
-                        .environment_id_for_node(origin_root)
-                        .await
-                        .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
-                        .is_some_and(|host_id| host_id == resource_host.object.metadata.name);
-                    if !is_self_report {
+                    if !is_host_self_report(&resource_host, self.host_registry).await {
                         None
                     } else {
                         self.host_registry.host_name_for_node(origin_root).await.or_else(|| configured_by_node.get(origin_root).cloned())
@@ -313,8 +307,7 @@ impl ReadProjections<'_> {
                 let heartbeat_at = status.and_then(|status| status.heartbeat_at);
                 let heartbeat_fresh =
                     heartbeat_at.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= HEARTBEAT_READY_TTL_SECS);
-                let replica_fresh =
-                    is_local || last_sync.is_some_and(|at| now.signed_duration_since(at).num_seconds() <= FLEET_REPLICA_FRESH_SECS);
+                let replica_fresh = is_local || last_sync.is_some_and(|at| replica_sync_is_fresh(at, now));
                 let daemon_generation = status.and_then(|status| status.daemon_generation.clone());
                 let replica_generation = daemon_generation.clone();
                 let staleness = if heartbeat_fresh && replica_fresh {
@@ -324,14 +317,8 @@ impl ReadProjections<'_> {
                 } else {
                     FleetHostStaleness::Unknown
                 };
-                let observation_agreement = fleet_observation_agreement(
-                    &link,
-                    heartbeat_at,
-                    heartbeat_fresh,
-                    daemon_generation.as_deref(),
-                    replica_generation.as_deref(),
-                    is_local,
-                );
+                let observation_agreement =
+                    fleet_observation_agreement(&link, heartbeat_at, heartbeat_fresh, daemon_generation.as_deref(), is_local);
                 let (crew_count, convoys) = counts.remove(&host).unwrap_or_default();
                 let surface_states = flotilla_protocol::FleetSurfaceCounts {
                     available: surface_by_convoy
@@ -487,17 +474,12 @@ impl ReadProjections<'_> {
             self.backend.clone().including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
         let mut replicated_hosts = HashMap::<HostName, (DateTime<Utc>, Option<String>)>::new();
         for source in host_sources.items {
-            let ResourceProvenance::Replica { origin_root, last_synced_at } = source.provenance else { continue };
-            let is_self_report = self
-                .host_registry
-                .environment_id_for_node(&origin_root)
-                .await
-                .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
-                .is_some_and(|host_id| host_id == source.object.metadata.name);
-            if !is_self_report {
+            let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else { continue };
+            if !is_host_self_report(&source, self.host_registry).await {
                 continue;
             }
-            let Some(host) = self.host_registry.host_name_for_node(&origin_root).await else { continue };
+            let Some(host) = self.host_registry.host_name_for_node(origin_root).await else { continue };
+            let last_synced_at = *last_synced_at;
             let generation = source.object.status.and_then(|status| status.daemon_generation);
             replicated_hosts
                 .entry(host)
@@ -528,12 +510,9 @@ impl ReadProjections<'_> {
             let replication_error = format_resource_replication_failures(&replication_failures);
             let source = replicated_hosts.remove(&host);
             let (reachable, last_sync, generation, message) = match source {
-                Some((last_sync, generation)) => (
-                    now.signed_duration_since(last_sync).num_seconds() <= FLEET_REPLICA_FRESH_SECS && replication_error.is_none(),
-                    Some(last_sync),
-                    generation,
-                    replication_error,
-                ),
+                Some((last_sync, generation)) => {
+                    (replica_sync_is_fresh(last_sync, now) && replication_error.is_none(), Some(last_sync), generation, replication_error)
+                }
                 None => {
                     let unsynced = format!("replica source '{label}' has not synced yet");
                     (false, None, None, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
@@ -554,7 +533,7 @@ impl ReadProjections<'_> {
                 replication_failures_by_host.remove(&host).and_then(|failures| format_resource_replication_failures(&failures));
             replicas.push(FleetReplicaStatus {
                 host,
-                reachable: now.signed_duration_since(last_sync).num_seconds() <= FLEET_REPLICA_FRESH_SECS && replication_error.is_none(),
+                reachable: replica_sync_is_fresh(last_sync, now) && replication_error.is_none(),
                 last_sync: Some(last_sync),
                 generation,
                 skipped_records: 0,

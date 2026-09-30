@@ -17,8 +17,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Host as ResourceHost,
-    HostStatus as ResourceHostStatus, ResourceBackend, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    HostStatus as ResourceHostStatus, ReadResourceObject, ResourceBackend, ResourceProvenance, TerminalAttentionState,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::future::join_all;
 use tokio::sync::{broadcast, RwLock};
@@ -33,6 +34,19 @@ use crate::{
 };
 
 pub(crate) const FLEET_REPLICA_FRESH_SECS: i64 = 90;
+
+pub(crate) fn replica_sync_is_fresh(last_sync: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(last_sync).num_seconds() <= FLEET_REPLICA_FRESH_SECS
+}
+
+pub(crate) async fn is_host_self_report(source: &ReadResourceObject<ResourceHost>, host_registry: &HostRegistry) -> bool {
+    let ResourceProvenance::Replica { origin_root, .. } = &source.provenance else { return false };
+    host_registry
+        .environment_id_for_node(origin_root)
+        .await
+        .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
+        .is_some_and(|host_id| host_id == source.object.metadata.name)
+}
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) enum FleetRowSource {
@@ -258,6 +272,7 @@ impl FleetService {
         host_registry: &HostRegistry,
         source: FleetRowSource,
     ) -> Result<(Vec<FleetListRow>, Option<String>), String> {
+        let now = Utc::now();
         let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
@@ -278,7 +293,7 @@ impl FleetService {
                 .map_err(|err| err.to_string())?
                 .items
                 .into_iter()
-                .map(|object| flotilla_resources::ReadResourceObject { object, provenance: flotilla_resources::ResourceProvenance::Local })
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
                 .collect()
         };
         let host_sources =
@@ -357,8 +372,8 @@ impl FleetService {
         for session_source in session_list {
             let session = session_source.object;
             let remote_origin = match &session_source.provenance {
-                flotilla_resources::ResourceProvenance::Local => None,
-                flotilla_resources::ResourceProvenance::Replica { origin_root, last_synced_at } => Some((origin_root, *last_synced_at)),
+                ResourceProvenance::Local => None,
+                ResourceProvenance::Replica { origin_root, last_synced_at } => Some((origin_root, *last_synced_at)),
             };
             let labels = &session.metadata.labels;
             let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
@@ -368,7 +383,7 @@ impl FleetService {
                 Some(task) => format!("{task}/{role}"),
                 None => role.clone(),
             };
-            let attention = crew_attention(session.status.as_ref(), Utc::now());
+            let attention = crew_attention(session.status.as_ref(), now);
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
             let host = if let Some((origin_root, _)) = remote_origin {
                 host_registry.host_name_for_node(origin_root).await.unwrap_or_else(|| HostName::new(origin_root.as_str()))
@@ -403,9 +418,7 @@ impl FleetService {
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
                     .staleness(match remote_origin {
-                        Some((_, last_sync)) if Utc::now().signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS => {
-                            FleetStaleness::Stale { last_sync }
-                        }
+                        Some((_, last_sync)) if !replica_sync_is_fresh(last_sync, now) => FleetStaleness::Stale { last_sync },
                         Some((_, last_sync)) => FleetStaleness::Fresh { last_sync },
                         None => FleetStaleness::Local,
                     })
@@ -416,15 +429,10 @@ impl FleetService {
         if matches!(source, FleetRowSource::IncludingReplicas) {
             let mut sync_by_host = HashMap::new();
             for source in &host_sources.items {
-                let flotilla_resources::ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else {
+                let ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else {
                     continue;
                 };
-                let is_self_report = host_registry
-                    .environment_id_for_node(origin_root)
-                    .await
-                    .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
-                    .is_some_and(|host_id| host_id == source.object.metadata.name);
-                if !is_self_report {
+                if !is_host_self_report(source, host_registry).await {
                     continue;
                 }
                 if let Some(host) = host_registry.host_name_for_node(origin_root).await {
@@ -436,7 +444,7 @@ impl FleetService {
                     continue;
                 }
                 if let Some(last_sync) = sync_by_host.get(&row.host).copied() {
-                    row.staleness = if Utc::now().signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS {
+                    row.staleness = if !replica_sync_is_fresh(last_sync, now) {
                         FleetStaleness::Stale { last_sync }
                     } else {
                         FleetStaleness::Fresh { last_sync }
@@ -535,7 +543,7 @@ pub(crate) fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Ut
     let Some(last_sync) = entry.last_sync else {
         return FleetStaleness::Unreachable { last_sync: None, message: "replica has never synced".to_string() };
     };
-    if now.signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS {
+    if !replica_sync_is_fresh(last_sync, now) {
         FleetStaleness::Stale { last_sync }
     } else {
         FleetStaleness::Fresh { last_sync }
@@ -594,24 +602,21 @@ pub(crate) fn fleet_observation_agreement(
     heartbeat_at: Option<DateTime<Utc>>,
     heartbeat_fresh: bool,
     daemon_generation: Option<&str>,
-    replica_generation: Option<&str>,
     is_local: bool,
 ) -> FleetObservationAgreement {
     if is_local {
         return FleetObservationAgreement::Agree;
     }
-    let generation_disagrees = matches!((daemon_generation, replica_generation), (Some(daemon), Some(replica)) if daemon != replica);
     let link_disagrees = match link {
         PeerConnectionState::Connected => !heartbeat_fresh,
         PeerConnectionState::Disconnected | PeerConnectionState::Rejected { .. } => heartbeat_fresh,
         PeerConnectionState::Connecting | PeerConnectionState::Reconnecting => false,
     };
-    if generation_disagrees || link_disagrees {
+    if link_disagrees {
         FleetObservationAgreement::Disagree
     } else if heartbeat_at.is_none()
         || matches!(link, PeerConnectionState::Connecting | PeerConnectionState::Reconnecting)
         || daemon_generation.is_none()
-        || replica_generation.is_none()
     {
         FleetObservationAgreement::Unknown
     } else {
@@ -867,15 +872,19 @@ mod tests {
     fn agreement_distinguishes_disagreement_from_missing_evidence() {
         let now = Utc::now();
         assert_eq!(
-            fleet_observation_agreement(&PeerConnectionState::Connected, Some(now), true, Some("a"), Some("b"), false),
+            fleet_observation_agreement(&PeerConnectionState::Connected, Some(now), true, Some("a"), false),
+            FleetObservationAgreement::Agree
+        );
+        assert_eq!(
+            fleet_observation_agreement(&PeerConnectionState::Disconnected, Some(now), true, Some("a"), false),
             FleetObservationAgreement::Disagree
         );
         assert_eq!(
-            fleet_observation_agreement(&PeerConnectionState::Connecting, Some(now), true, Some("a"), Some("a"), false),
+            fleet_observation_agreement(&PeerConnectionState::Connecting, Some(now), true, Some("a"), false),
             FleetObservationAgreement::Unknown
         );
         assert_eq!(
-            fleet_observation_agreement(&PeerConnectionState::Disconnected, Some(now), true, Some("a"), Some("a"), true),
+            fleet_observation_agreement(&PeerConnectionState::Disconnected, Some(now), true, Some("a"), true),
             FleetObservationAgreement::Agree
         );
     }
