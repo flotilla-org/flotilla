@@ -9420,9 +9420,6 @@ impl InProcessDaemon {
     }
 
     async fn queue_remote_supervisor_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
-        if !matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaEscalation { .. }) {
-            return Err(format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role));
-        }
         let selector = BTreeMap::from([
             (CONVOY_LABEL.to_string(), request.convoy.clone()),
             (VESSEL_LABEL.to_string(), request.vessel.clone()),
@@ -9437,6 +9434,11 @@ impl InProcessDaemon {
             .items
             .into_iter()
             .find(|session| matches!(session.provenance, ResourceProvenance::Replica { .. }));
+        if !(matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaEscalation { .. })
+            || matches!(request.sender, flotilla_resources::CrewMessageSender::FlotillaNudge) && remote.is_some())
+        {
+            return Err(format!("turn-delivery target {}/{} has no durable terminal-session record", request.vessel, request.role));
+        }
         let plan = if let Some(remote) = remote {
             if !matches!(remote.object.spec.source, TerminalSessionSource::Agent { .. }) {
                 return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));

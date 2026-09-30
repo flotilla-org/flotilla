@@ -214,6 +214,11 @@ async fn list_matching_labels_returns_only_exact_matches() {
 }
 
 #[tokio::test]
+async fn terminal_session_label_lookup_contract() {
+    common::contract::assert_terminal_session_label_lookup_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
 async fn observed_backend_surfaces_generation_on_list_and_watch() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
     let resolver = backend.using::<Convoy>("flotilla");

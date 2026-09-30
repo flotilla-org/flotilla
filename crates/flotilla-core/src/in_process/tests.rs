@@ -177,6 +177,116 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     assert_eq!(status.attention, Some(existing_attention));
 }
 
+#[tokio::test]
+async fn nudge_reaches_a_reconciler_named_session_on_its_placement_host() {
+    let home = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("home store"))
+        .with_local_root(NodeId::new("home"));
+    let placement = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("placement store"))
+        .with_local_root(NodeId::new("placement"));
+    let home_dir = tempfile::tempdir().expect("home config");
+    std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
+    let home_daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(home_dir.path())),
+        fake_discovery(false),
+        HostName::local(),
+        home.clone(),
+    )
+    .await;
+    let placement_dir = tempfile::tempdir().expect("placement config");
+    std::fs::write(placement_dir.path().join("daemon.toml"), "machine_id = \"placement\"\n").expect("placement identity");
+    let placement_daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(placement_dir.path())),
+        fake_discovery(false),
+        HostName::local(),
+        placement.clone(),
+    )
+    .await;
+    let convoys = home.clone().using::<ResourceConvoy>("flotilla");
+    let created =
+        convoys.create(&test_meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".to_string(),
+                BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Stalled).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("stalled crew");
+    let identity = flotilla_resources::TerminalSessionIdentity::builder()
+        .vessel_ref("nudge-convoy-work".to_string())
+        .convoy("nudge-convoy".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .vessel_index(0)
+        .crew_index(0)
+        .build();
+    let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
+    let session = sessions
+        .create(&identity.input_meta(), &ResourceTerminalSessionSpec {
+            env_ref: "remote-env".to_string(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".to_string(),
+                    content: "Initial".to_string(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".to_string(),
+                    convoy: "nudge-convoy".to_string(),
+                    vessel_ref: "nudge-convoy-work".to_string(),
+                }),
+                message: None,
+            },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("reconciler-shaped terminal");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            ..Default::default()
+        })
+        .await
+        .expect("running terminal");
+    home.replica_writer::<ResourceTerminalSession>(NodeId::new("placement"), "flotilla")
+        .replace(&sessions.list().await.expect("placement sessions"), Utc::now())
+        .await
+        .expect("replicate session");
+
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("nudge-convoy".to_string())
+        .source("stall-nudge-1".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .brief("Please continue".to_string())
+        .subject_revision("stall-1".to_string())
+        .sender(CrewMessageSender::FlotillaNudge)
+        .build();
+    home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
+    let convoy = convoys.get("nudge-convoy").await.expect("queued convoy");
+    assert!(convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    placement
+        .replica_writer::<ResourceConvoy>(NodeId::new("home"), "flotilla")
+        .replace(&convoys.list().await.expect("home convoys"), Utc::now())
+        .await
+        .expect("replicate turn");
+    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at placement");
+    let delivered = sessions.get(&identity.name()).await.expect("delivered session");
+    let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("nudge queued") };
+    assert!(message.text.contains("Please continue"));
+    assert!(matches!(message.sender, CrewMessageSender::FlotillaNudge));
+}
+
 #[test]
 fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
     let now = chrono::Utc::now();
