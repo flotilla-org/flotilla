@@ -1,6 +1,41 @@
 //! Project registration, refresh, and operational entry materialization.
 
-use super::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use flotilla_protocol::{
+    qualified_path::{HostId, QualifiedPath},
+    ProviderData,
+};
+use flotilla_resources::{
+    apply_status_patch as apply_resource_status_patch, ensure_repository, normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec,
+    ConvoyRepositorySpec, EventRecorder, InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+    ProjectStatusPatch, Repository, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
+    WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+};
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
+
+use super::{
+    convoy_ensure_name, ensure_repository_and_default_project_workflow, project_not_ready_error, repository_matches_target, InProcessDaemon,
+};
+use crate::{
+    event_sink::EventSink,
+    ops_entry::{
+        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
+        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
+        VERIFICATION_PROVENANCE_ANNOTATION,
+    },
+    project_declaration::{
+        parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
+        BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
+    },
+    repository_inspection::{OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
+};
 
 pub(super) fn validate_project_name(name: &str) -> Result<(), String> {
     let normalized = normalize_project_name(name)?;
@@ -113,6 +148,8 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
 }
 
 /// Read-only lookup of local checkout paths by repository identity.
+/// This is the separate `repository_keys_by_path` index; it never takes the
+/// `repos`, `repo_order`, or `path_identities` locks.
 pub(super) struct RepositoryIndex<'a> {
     pub(super) keys_by_path: &'a RwLock<HashMap<PathBuf, RepositoryKey>>,
 }
