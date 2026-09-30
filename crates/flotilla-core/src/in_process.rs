@@ -2196,6 +2196,10 @@ pub trait OperatorReconciler: Send + Sync {
 #[async_trait]
 pub trait WorkCredentialReconciler: Send + Sync {
     async fn reconcile(&self, namespace: &str, environment_ref: &str) -> Result<(), String>;
+
+    async fn ledger_delivery_environment(&self, _namespace: &str, _environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
+        Err("credential delivery record is unavailable".to_string())
+    }
 }
 
 #[async_trait]
@@ -2607,6 +2611,11 @@ impl InProcessDaemon {
 
     pub async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
         *self.work_credential_reconciler.write().await = Some(reconciler);
+    }
+
+    pub async fn ledger_delivery_environment(&self, namespace: &str, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
+        let reconciler = self.work_credential_reconciler.read().await.clone().ok_or("credential controller is unavailable")?;
+        reconciler.ledger_delivery_environment(namespace, environment_ref).await
     }
 
     async fn reconcile_resumed_work_credentials(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {

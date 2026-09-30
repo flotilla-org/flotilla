@@ -219,6 +219,8 @@ struct AmbientClaudeOauthMetadata {
     refresh_token_expires_at: Option<i64>,
 }
 
+type LedgerDeliveryRecord = BTreeMap<String, BTreeMap<String, String>>;
+
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
     namespace: String,
@@ -230,6 +232,7 @@ pub(crate) struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
@@ -479,6 +482,7 @@ impl CredentialStore {
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             work_deliveries: Mutex::new(BTreeMap::new()),
+            ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
@@ -711,6 +715,7 @@ impl CredentialStore {
             }
         }
         let mut env = BTreeMap::new();
+        let mut ledger_deliveries = BTreeMap::new();
         let mut new_git_config_fragments = BTreeMap::new();
         let mut git_config_owner = None;
         let mut pending_git_preflights = Vec::new();
@@ -769,6 +774,15 @@ impl CredentialStore {
                         return Err(bounded_adapter_error(name, spec.consumer.adapter_name(), &message.replace(material, "[redacted]")));
                     }
                 };
+            ledger_deliveries.insert(
+                name.clone(),
+                delivered
+                    .env
+                    .iter()
+                    .filter(|(key, _)| matches!(key.as_str(), "GITHUB_TOKEN_FILE" | "FORGEJO_TOKEN_FILE" | "FORGEJO_API_URL"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+            );
             env.extend(delivered.env);
             if let Some((request, expires_at)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
@@ -836,8 +850,26 @@ impl CredentialStore {
             }
             fragments_by_environment.insert(environment_ref.to_string(), composed_fragments);
         }
+        // Retain only paths and endpoint metadata, keyed by credential so a
+        // redelivery can replace its own path without disturbing another grant.
+        self.ledger_delivery_environment.lock().await.entry(environment_ref.to_string()).or_default().extend(ledger_deliveries);
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
+    }
+
+    pub(crate) async fn ledger_delivery_environment(&self, environment_ref: &str) -> Result<BTreeMap<String, String>, String> {
+        let records = self.ledger_delivery_environment.lock().await;
+        let mut env = BTreeMap::new();
+        if let Some(deliveries) = records.get(environment_ref) {
+            for (name, delivery) in deliveries {
+                for (key, value) in delivery {
+                    if env.insert(key.clone(), value.clone()).is_some() {
+                        return Err(format!("multiple credentials supplied {key} for environment {environment_ref}, including {name}"));
+                    }
+                }
+            }
+        }
+        Ok(env)
     }
 
     /// Rebuild refresh registrations for an already-running environment from
@@ -1046,6 +1078,7 @@ impl CredentialStore {
 
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
+        self.ledger_delivery_environment.lock().await.remove(environment_ref);
         self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
@@ -1095,6 +1128,7 @@ impl CredentialStore {
         }
         if delivered.is_empty() {
             self.work_deliveries.lock().await.remove(environment_ref);
+            self.ledger_delivery_environment.lock().await.remove(environment_ref);
             return Ok(());
         }
         let paths = self.delivery_paths(&*runner).await?;
@@ -1104,6 +1138,9 @@ impl CredentialStore {
                 .run("rm", &["-rf", "--", &directory.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
                 .await
                 .map_err(|error| format!("revoke credential `{name}`: {error}"))?;
+            if let Some(record) = self.ledger_delivery_environment.lock().await.get_mut(environment_ref) {
+                record.remove(name);
+            }
             let key = (environment_ref.to_string(), name.clone());
             self.prepared.lock().await.remove(&key);
             self.materials.lock().await.remove(&key);
@@ -4691,6 +4728,12 @@ interactions:
             .collect();
         assert_eq!(env.get("FORGEJO_SERVER_URL").map(String::as_str), Some("https://forgejo.lab"));
         assert_eq!(env.get("FORGEJO_API_URL").map(String::as_str), Some("https://forgejo.lab/api/v1"));
+        let ledger_env = store.ledger_delivery_environment("env-a").await.expect("Forgejo delivery record");
+        assert_eq!(ledger_env.get("FORGEJO_TOKEN_FILE"), env.get("FORGEJO_TOKEN_FILE"));
+        assert_eq!(ledger_env.get("FORGEJO_API_URL"), env.get("FORGEJO_API_URL"));
+        assert!(!ledger_env.contains_key("FORGEJO_SERVER_URL"));
+        store.forget_environment("env-a").await.expect("forget Forgejo delivery");
+        assert!(store.ledger_delivery_environment("env-a").await.expect("forgotten record").is_empty());
     }
 
     #[tokio::test]
