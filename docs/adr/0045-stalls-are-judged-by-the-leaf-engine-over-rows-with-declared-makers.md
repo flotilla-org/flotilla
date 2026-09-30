@@ -139,6 +139,7 @@ The engine emits a stall; reactions climb a ladder. The substrate provides a def
   - convert it to failed.
 - **Credentials stay staged while a crew is Stalled**, because a stalled crew usually resumes, and revoke-then-restore cycles have proved fragile (#2107). The retry ceiling (§4) still applies, so a long stall escalates.
 - **Crews stall; supervisors decide failure.** A crew never enacts terminal failure, including when the brief is wrong or unsolvable. `crew fail` refuses a crew principal with a pointer to `crew stall`; supervisors use `crew supervise … convert-to-failed`, and operators may force failure. Authentication failures are usually transient credential-refresh gaps: retry once, then stall with `infra` if still blocked.
+- **PR review completeness is a crew obligation.** Every finding in every review is in scope, regardless of severity label or position in the review. A crew replies to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number. The crew checks CI and review feedback after its last push and confirms mergeability against current main before settling. Until review wake-up (#2300) is deployed, briefs require a short re-review wait; afterward, the wake-up starts the next pass. If main repeatedly moves during rebases, the crew declares an `infra` stall after a bounded number of attempts.
 
 ### 8. Governors watch; navigating is a separate mind
 

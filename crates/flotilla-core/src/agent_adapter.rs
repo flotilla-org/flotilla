@@ -105,7 +105,14 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false, is_standing: false }
+        CrewBriefRenderOptions {
+            template: template.to_string(),
+            overrides,
+            fork_stance,
+            has_credential_scope: false,
+            is_standing: false,
+            wait_for_rereview: true,
+        }
     }
 }
 
@@ -124,6 +131,8 @@ pub struct CrewBriefRenderOptions {
     pub fork_stance: bool,
     pub has_credential_scope: bool,
     pub is_standing: bool,
+    /// Disable after #2300 deploys review wake-up; the next review then starts a new pass.
+    pub wait_for_rereview: bool,
 }
 
 impl CrewBriefRenderOptions {
@@ -144,6 +153,7 @@ impl Default for CrewBriefRenderOptions {
             fork_stance: false,
             has_credential_scope: false,
             is_standing: false,
+            wait_for_rereview: true,
         }
     }
 }
@@ -166,6 +176,7 @@ struct CrewBriefTemplateContext<'a> {
     has_credential_scope: bool,
     has_in_crew_reviewer: bool,
     is_standing: bool,
+    wait_for_rereview: bool,
 }
 
 #[cfg(test)]
@@ -210,6 +221,7 @@ fn build_crew_brief_with_options(
         has_credential_scope: options.has_credential_scope,
         has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
         is_standing: options.is_standing,
+        wait_for_rereview: options.wait_for_rereview,
     })?;
     if !content.ends_with('\n') {
         content.push('\n');
@@ -1104,6 +1116,11 @@ mod tests {
         assert!(content.contains("--propose <resume|reduce-scope|fail>"));
         assert!(!content.contains("crew fail"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
+        assert!(content.contains("Every item in every review is in scope"));
+        assert!(content.contains("Reply to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number"));
+        assert!(content.contains("wait about one minute after the last push or reply for re-review"));
+        assert!(content.contains("Re-check mergeability against current main after re-review"));
+        assert!(content.contains("Retry the rebase at most three times"));
         insta::assert_snapshot!("dispatched_crew_brief", content);
     }
 
@@ -1235,6 +1252,7 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: false,
                 is_standing: false,
+                wait_for_rereview: true,
             },
         )
         .expect("render selected template")
@@ -1268,6 +1286,7 @@ mod tests {
                 fork_stance: true,
                 has_credential_scope: false,
                 is_standing: false,
+                wait_for_rereview: true,
             },
         )
         .expect("render fork review brief")
@@ -1283,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn shepherd_template_processes_exactly_one_round_and_yields() {
+    fn shepherd_template_handles_every_review_item_through_merge_readiness() {
         let brief = build_crew_brief_with_options(
             &TerminalCrewContext {
                 namespace: "flotilla".to_string(),
@@ -1300,18 +1319,22 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: true,
                 is_standing: false,
+                wait_for_rereview: true,
             },
         )
         .expect("render shepherd brief")
         .content;
 
-        assert!(brief.contains("exactly one review and CI round"));
-        assert!(brief.contains("Finish, don't redo"));
+        assert!(brief.contains("every item in every review"));
+        assert!(brief.contains("Reply to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number"));
+        assert!(brief.contains("mergeable against current main"));
+        assert!(brief.contains("wait about one minute after the last push or reply for re-review"));
+        assert!(brief.contains("Retry the rebase at most three times"));
         assert!(brief.contains("`pr-shepherd` skill"));
         assert!(brief.contains("For a Forgejo destination, do not use that GitHub-only helper"));
         assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
-        assert!(brief.contains("Future events belong to a later engagement"));
+        assert!(!brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
         assert!(brief.contains("A completion without a ledger is refused"));
         assert!(brief.contains("park the verified commit"));
@@ -1320,6 +1343,28 @@ mod tests {
         assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(!brief.contains("wait-for-checks"));
         assert!(!brief.contains("No assignment was provided"));
+    }
+
+    #[test]
+    fn review_wake_up_disables_only_the_temporary_rereview_wait() {
+        for template in ["crew.md", "shepherd", "diff-review"] {
+            let options =
+                CrewBriefRenderOptions { template: template.into(), wait_for_rereview: false, ..CrewBriefRenderOptions::default() };
+            let brief = build_crew_brief_with_options(
+                &TerminalCrewContext { namespace: "flotilla".into(), convoy: "review".into(), vessel_ref: "review-work".into() },
+                "work",
+                "coder",
+                CrewAssignment::Prompt("Review the PR."),
+                &[CrewBriefMember { role: "coder".into(), state: "active".into(), is_agent: true }],
+                &options,
+            )
+            .expect("render review brief")
+            .content;
+
+            assert!(!brief.contains("wait about one minute after the last push or reply for re-review"), "{template}");
+            assert!(brief.contains("every review"), "{template}");
+            assert!(brief.contains("mergeable against current main"), "{template}");
+        }
     }
 
     #[test]
@@ -1374,6 +1419,7 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: false,
                 is_standing: false,
+                wait_for_rereview: true,
             },
         )
         .expect("render custom block-only template");
