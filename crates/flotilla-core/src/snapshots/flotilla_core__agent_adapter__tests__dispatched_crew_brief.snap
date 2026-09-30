@@ -1,6 +1,5 @@
 ---
 source: crates/flotilla-core/src/agent_adapter.rs
-assertion_line: 1124
 expression: content
 ---
 # Flotilla crew brief

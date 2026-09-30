@@ -1146,9 +1146,12 @@ mod tests {
 
         assert!(!content.contains("flotilla crew complete"));
         assert!(!content.contains("flotilla crew fail"));
+        assert!(!content.contains("flotilla crew stall"));
         assert!(content.contains("Open a pull request that closes the issue"));
         assert!(content.contains("ADR carry:"));
         assert!(content.contains("yield at the turn boundary"));
+        assert!(content.contains("After three rebase attempts against a moving main, report the blockage to the operator and yield"));
+        assert!(!content.contains("Main moved during three rebase attempts"));
         insta::assert_snapshot!("standing_crew_brief", content);
     }
 
@@ -1330,6 +1333,7 @@ mod tests {
         assert!(brief.contains("mergeable against current main"));
         assert!(brief.contains("wait about one minute after the last push or reply for re-review"));
         assert!(brief.contains("Retry the rebase at most three times"));
+        assert!(brief.contains("If CI remains red for reasons outside this pull request, or a required reviewer has not responded"));
         assert!(brief.contains("`pr-shepherd` skill"));
         assert!(brief.contains("For a Forgejo destination, do not use that GitHub-only helper"));
         assert!(brief.contains("with the `pr-shepherd` skill for a GitHub destination, or through the injected Forgejo API credentials for a Forgejo destination"));
