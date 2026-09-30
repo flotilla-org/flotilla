@@ -2427,6 +2427,18 @@ async fn capability_admission_refuses_unready_host_without_sleep_intent() {
         matches!(&result, CommandValue::Error { message } if message.contains("host-direct-stopped") && message.contains("stopped-host") && message.contains("not ready")),
         "{result:?}"
     );
+
+    let host = hosts.get("stopped-host").await.expect("host after refusal");
+    let mut status = host.status.expect("host status after refusal");
+    status.ready = true;
+    status.heartbeat_at = Some(chrono::Utc::now() - chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS + 1));
+    hosts.update_status("stopped-host", &host.metadata.resource_version, &status).await.expect("stale heartbeat");
+    let stale = start_capability_convoy(&daemon, "stale-host-refusal", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+        intent.placement_policy = Some("host-direct-stopped".to_string());
+    })
+    .await;
+    assert!(matches!(&stale, CommandValue::Error { message } if message.contains("heartbeat is stale")), "{stale:?}");
 }
 
 #[tokio::test]

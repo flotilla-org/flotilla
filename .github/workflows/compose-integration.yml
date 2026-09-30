@@ -19,6 +19,7 @@ on:
       - crates/flotilla-core/src/admission.rs
       - crates/flotilla-core/tests/in_process_daemon.rs
       - crates/flotilla-daemon/**
+      - crates/flotilla-protocol/**
       - crates/flotilla-resources/src/host.rs
       - crates/flotilla-resources/src/fulfilment_kind.rs
       - crates/flotilla-resources/src/placement*.rs

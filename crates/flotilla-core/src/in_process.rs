@@ -5582,21 +5582,29 @@ impl InProcessDaemon {
                     // that is simply not ready cannot be admitted, even when it
                     // is the only fulfilment that covers the requested needs.
                     if !host_ready && sleeping_until.is_none_or(|until| until <= self.clock.now()) {
-                        let target = placement_target_host(&self.resource_backend, namespace, policy).await?;
+                        let host_label = &kind.spec.host_ref;
                         let reason = host.and_then(|host| host.status.as_ref()).map_or_else(
-                            || {
-                                format!(
-                                    "placement `{}` host `{}` is not ready: status is unavailable",
-                                    policy.metadata.name, target.display_name
-                                )
-                            },
+                            || format!("placement `{}` host `{}` is not ready: status is unavailable", policy.metadata.name, host_label),
                             |status| {
-                                placement_host_not_ready_reason(
+                                let mut reason = placement_host_not_ready_reason(
                                     &policy.metadata.name,
-                                    &target.display_name,
+                                    host_label,
                                     host_generation(Some(status)),
                                     status,
-                                )
+                                );
+                                if !status.readiness_blocked() {
+                                    match status.heartbeat_at {
+                                        None => reason.push_str(": heartbeat is unavailable"),
+                                        Some(at)
+                                            if self.clock.now().signed_duration_since(at)
+                                                > chrono::Duration::seconds(flotilla_resources::HEARTBEAT_READY_TTL_SECS) =>
+                                        {
+                                            reason.push_str(": heartbeat is stale");
+                                        }
+                                        Some(_) => {}
+                                    }
+                                }
+                                reason
                             },
                         );
                         rejected.push(format!("{}: {reason}", kind.metadata.name));
