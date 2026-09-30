@@ -30,7 +30,7 @@ use crate::{
         discovery::EnvVars,
         issue_tracker::IssueProvider,
         presentation::PresentationManager,
-        terminal::TerminalPool,
+        terminal::{TerminalPool, TerminalSessionLiveness},
         types::BranchInfo,
         vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
@@ -802,6 +802,7 @@ impl PresentationManager for FakePresentationManager {
 
 pub struct FakeTerminalPool {
     pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
+    liveness_override: Arc<TokioMutex<Option<Result<TerminalSessionLiveness, String>>>>,
     pub killed: Arc<TokioMutex<Vec<String>>>,
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
@@ -827,6 +828,7 @@ impl FakeTerminalPool {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(TokioMutex::new(Vec::new())),
+            liveness_override: Arc::new(TokioMutex::new(None)),
             killed: Arc::new(TokioMutex::new(Vec::new())),
             delivered: Arc::new(TokioMutex::new(Vec::new())),
             ensured: Arc::new(TokioMutex::new(Vec::new())),
@@ -843,6 +845,10 @@ impl FakeTerminalPool {
         self.sessions.lock().await.retain(|session| session.session_name != session_name);
     }
 
+    pub async fn set_liveness_override(&self, result: Result<TerminalSessionLiveness, String>) {
+        *self.liveness_override.lock().await = Some(result);
+    }
+
     pub async fn set_captured_screen(&self, session_name: &str, screen: &str) {
         self.captured_screens.lock().await.insert(session_name.to_string(), screen.to_string());
     }
@@ -854,6 +860,17 @@ impl FakeTerminalPool {
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
+    async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
+        if let Some(result) = self.liveness_override.lock().await.clone() {
+            return result;
+        }
+        Ok(if self.sessions.lock().await.iter().any(|session| session.session_name == session_id) {
+            TerminalSessionLiveness::Running
+        } else {
+            TerminalSessionLiveness::Stopped
+        })
+    }
+
     fn tracks_session_liveness(&self) -> bool {
         true
     }

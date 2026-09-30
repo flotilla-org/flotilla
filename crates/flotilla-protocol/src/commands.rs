@@ -1041,6 +1041,9 @@ pub struct AttachBinding {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy: Option<String>,
+    /// The convoy phase observed when the attach plan was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy_phase: Option<crate::ConvoyPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vessel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
