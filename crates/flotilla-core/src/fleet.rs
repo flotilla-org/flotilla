@@ -27,12 +27,18 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig},
     event_sink::EventSink,
+    host_registry::HostRegistry,
     host_resolution::canonical_placement_host_ref_from_sources,
     providers::{ChannelLabel, CommandRunner},
 };
 
 pub(crate) const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) enum FleetRowSource {
+    Local,
+    IncludingReplicas,
+}
 
 #[async_trait]
 pub(crate) trait FleetReplicaTransport: Send + Sync {
@@ -149,11 +155,6 @@ impl FleetService {
         hosts.into_iter().filter_map(|host| cache.get(&host).map(|entry| (host, entry.rows.clone(), entry.result_sets.clone()))).collect()
     }
 
-    pub(crate) async fn with_health<T>(&self, read: impl FnOnce(&HashMap<HostName, FleetReplicaCacheEntry>) -> T) -> T {
-        let cache = self.fleet_replica_cache.read().await;
-        read(&cache)
-    }
-
     pub(crate) async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
         self.resource_replication_failures.read().await.clone()
     }
@@ -206,7 +207,6 @@ impl FleetService {
             match result {
                 Ok(parsed) => {
                     let now = Utc::now();
-                    let diagnostics = parsed.diagnostics;
                     let snapshot = parsed.snapshot;
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
@@ -229,8 +229,6 @@ impl FleetService {
                         result_sets,
                         last_sync: Some(now),
                         generation,
-                        skipped_records: diagnostics.skipped_records,
-                        first_parse_error: diagnostics.first_error,
                         last_error: None,
                     });
                 }
@@ -242,8 +240,6 @@ impl FleetService {
                             result_sets: Vec::new(),
                             last_sync: None,
                             generation: None,
-                            skipped_records: 0,
-                            first_parse_error: None,
                             last_error: Some(message),
                         }
                     });
@@ -256,18 +252,43 @@ impl FleetService {
         Ok(())
     }
 
-    pub(crate) async fn rows(&self, namespace: &str) -> Result<(Vec<FleetListRow>, Option<String>), String> {
+    pub(crate) async fn rows(
+        &self,
+        namespace: &str,
+        host_registry: &HostRegistry,
+        source: FleetRowSource,
+    ) -> Result<(Vec<FleetListRow>, Option<String>), String> {
         let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let observed_checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
 
-        let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
+        let session_list = if matches!(source, FleetRowSource::IncludingReplicas) {
+            self.resource_backend
+                .including_replicas::<ResourceTerminalSession>(namespace)
+                .list()
+                .await
+                .map_err(|err| err.to_string())?
+                .items
+        } else {
+            terminal_sessions
+                .list()
+                .await
+                .map_err(|err| err.to_string())?
+                .items
+                .into_iter()
+                .map(|object| flotilla_resources::ReadResourceObject { object, provenance: flotilla_resources::ResourceProvenance::Local })
+                .collect()
+        };
         let host_sources =
             self.resource_backend.including_replicas::<ResourceHost>(namespace).list().await.map_err(|err| err.to_string())?;
         let observed_generation = observed_checkouts.list().await.map_err(|err| err.to_string())?.generation;
-        let result_sets = self.aggregator_projection_state.local_result_sets().await;
+        let result_sets = if matches!(source, FleetRowSource::IncludingReplicas) {
+            vec![self.aggregator_projection_state.result_set().await]
+        } else {
+            self.aggregator_projection_state.local_result_sets().await
+        };
         let placement_by_convoy = result_sets
             .iter()
             .filter_map(|result_set| result_set.rows.as_convoys())
@@ -293,7 +314,19 @@ impl FleetService {
             .into_iter()
             .map(|environment| (environment.metadata.name.clone(), environment))
             .collect();
-        let convoy_items = convoys.list().await.map_err(|err| err.to_string())?.items;
+        let convoy_items = if matches!(source, FleetRowSource::IncludingReplicas) {
+            self.resource_backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .list()
+                .await
+                .map_err(|err| err.to_string())?
+                .items
+                .into_iter()
+                .map(|item| item.object)
+                .collect()
+        } else {
+            convoys.list().await.map_err(|err| err.to_string())?.items
+        };
         let convoy_addresses = convoy_items
             .iter()
             .map(|convoy| {
@@ -321,7 +354,12 @@ impl FleetService {
         }
 
         let mut rows = Vec::new();
-        for session in session_list.items {
+        for session_source in session_list {
+            let session = session_source.object;
+            let remote_origin = match &session_source.provenance {
+                flotilla_resources::ResourceProvenance::Local => None,
+                flotilla_resources::ResourceProvenance::Replica { origin_root, last_synced_at } => Some((origin_root, *last_synced_at)),
+            };
             let labels = &session.metadata.labels;
             let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
             let task = labels.get(VESSEL_LABEL).cloned();
@@ -332,7 +370,9 @@ impl FleetService {
             };
             let attention = crew_attention(session.status.as_ref(), Utc::now());
             let convoy_key = (session.metadata.namespace.clone(), convoy.clone());
-            let host = if let Some(host_ref) =
+            let host = if let Some((origin_root, _)) = remote_origin {
+                host_registry.host_name_for_node(origin_root).await.unwrap_or_else(|| HostName::new(origin_root.as_str()))
+            } else if let Some(host_ref) =
                 environment_map.get(&session.spec.env_ref).and_then(|environment| resource_environment_host_ref(environment))
             {
                 canonical_placement_host_ref_from_sources(&host_sources.items, host_ref).ok().flatten().map_or_else(
@@ -362,11 +402,48 @@ impl FleetService {
                     .maybe_placement_decision(placement_by_convoy.get(&convoy_key).cloned())
                     .namespace(session.metadata.namespace.clone())
                     .session(session.metadata.name.clone())
-                    .staleness(FleetStaleness::Local)
+                    .staleness(match remote_origin {
+                        Some((_, last_sync)) if Utc::now().signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS => {
+                            FleetStaleness::Stale { last_sync }
+                        }
+                        Some((_, last_sync)) => FleetStaleness::Fresh { last_sync },
+                        None => FleetStaleness::Local,
+                    })
                     .build(),
             );
         }
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
+        if matches!(source, FleetRowSource::IncludingReplicas) {
+            let mut sync_by_host = HashMap::new();
+            for source in &host_sources.items {
+                let flotilla_resources::ResourceProvenance::Replica { origin_root, last_synced_at } = &source.provenance else {
+                    continue;
+                };
+                let is_self_report = host_registry
+                    .environment_id_for_node(origin_root)
+                    .await
+                    .and_then(|environment_id| environment_id.host_id().map(ToString::to_string))
+                    .is_some_and(|host_id| host_id == source.object.metadata.name);
+                if !is_self_report {
+                    continue;
+                }
+                if let Some(host) = host_registry.host_name_for_node(origin_root).await {
+                    sync_by_host.insert(host, *last_synced_at);
+                }
+            }
+            for row in &mut rows {
+                if row.host == self.host_name || !matches!(row.staleness, FleetStaleness::Local) {
+                    continue;
+                }
+                if let Some(last_sync) = sync_by_host.get(&row.host).copied() {
+                    row.staleness = if Utc::now().signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS {
+                        FleetStaleness::Stale { last_sync }
+                    } else {
+                        FleetStaleness::Fresh { last_sync }
+                    };
+                }
+            }
+        }
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,
@@ -450,6 +527,7 @@ fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<Str
     args
 }
 
+#[cfg(test)]
 pub(crate) fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> FleetStaleness {
     if let Some(message) = &entry.last_error {
         return FleetStaleness::Unreachable { last_sync: entry.last_sync, message: message.clone() };
@@ -579,6 +657,7 @@ impl ReplicaParseDiagnostics {
 #[derive(Debug)]
 pub(crate) struct ParsedFleetReplicaSnapshot {
     snapshot: FleetReplicaSnapshot,
+    #[cfg_attr(not(test), allow(dead_code))]
     diagnostics: ReplicaParseDiagnostics,
 }
 
@@ -654,10 +733,9 @@ fn parse_fleet_replica_snapshot(input: &str) -> Result<ParsedFleetReplicaSnapsho
 pub(crate) struct FleetReplicaCacheEntry {
     pub(crate) rows: Vec<FleetListRow>,
     pub(crate) result_sets: Vec<ResultSet>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) last_sync: Option<DateTime<Utc>>,
     pub(crate) generation: Option<String>,
-    pub(crate) skipped_records: usize,
-    pub(crate) first_parse_error: Option<String>,
     pub(crate) last_error: Option<String>,
 }
 
@@ -700,7 +778,7 @@ fn append_crewless_convoy_rows(
                     .crew("-")
                     .crew_state(convoy_state_label(row))
                     .surface_state(row.surface_state)
-                    .host(host.clone())
+                    .host(row.resource.host.clone().unwrap_or_else(|| host.clone()))
                     .maybe_placement_decision(row.placement_decision.clone())
                     .namespace(target_namespace)
                     .staleness(staleness.clone())
@@ -805,15 +883,8 @@ mod tests {
     #[test]
     fn staleness_keeps_last_success_when_refresh_fails() {
         let now = Utc::now();
-        let mut entry = FleetReplicaCacheEntry {
-            rows: vec![],
-            result_sets: vec![],
-            last_sync: Some(now),
-            generation: None,
-            skipped_records: 0,
-            first_parse_error: None,
-            last_error: None,
-        };
+        let mut entry =
+            FleetReplicaCacheEntry { rows: vec![], result_sets: vec![], last_sync: Some(now), generation: None, last_error: None };
         assert!(matches!(replica_staleness(&entry, now), FleetStaleness::Fresh { .. }));
         entry.last_error = Some("ssh failed".into());
         assert!(matches!(replica_staleness(&entry, now), FleetStaleness::Unreachable { last_sync: Some(_), .. }));
@@ -875,7 +946,7 @@ mod tests {
         assert!(snapshots[0].rows.is_empty());
         assert_eq!(snapshots[1].host, HostName::new("healthy"));
         assert_eq!(snapshots[1].generation.as_deref(), Some("g1"));
-        let error = service.with_health(|cache| cache.get(&HostName::new("failed")).and_then(|entry| entry.last_error.clone())).await;
+        let error = service.fleet_replica_cache.read().await.get(&HostName::new("failed")).and_then(|entry| entry.last_error.clone());
         assert_eq!(error.as_deref(), Some("remote unavailable"));
     }
 

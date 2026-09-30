@@ -2,11 +2,12 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
 use flotilla_daemon::server::test_support::spawn_in_memory_request_topology;
-use flotilla_protocol::{HostName, PeerConnectionState};
+use flotilla_protocol::{FleetStaleness, HostName, PeerConnectionState};
 use flotilla_resources::{
     watch_resource_kind_replica_sources, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, ConditionValue, Convoy, ConvoySpec, Host,
     HostSpec, HostStatus, InMemoryBackend, InputMeta, IntegrationCondition, ObservedCheckoutSpec, Project, ProjectSpec, RepositoryKey,
     ResourceBackend, ResourceProvenance, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 
@@ -86,6 +87,80 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
     assert_eq!(row.link, PeerConnectionState::Connected);
     assert_eq!(row.disk_free_bytes, Some(459_371_896_832));
     assert!(row.daemon_uptime_seconds.is_some_and(|uptime| uptime >= 2 * 60 * 60));
+    drop(topology);
+}
+
+#[tokio::test]
+async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_fetch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let feta_host_id = feta.local_host_id().expect("feta host id").to_string();
+    let feta_hosts = feta.resource_backend().using::<Host>("flotilla");
+    let host =
+        feta_hosts.create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default()).await.expect("create feta host");
+    feta_hosts
+        .update_status(&feta_host_id, &host.metadata.resource_version, &HostStatus {
+            heartbeat_at: Some(chrono::Utc::now()),
+            daemon_generation: Some("feta-generation".to_string()),
+            ready: true,
+            ..HostStatus::default()
+        })
+        .await
+        .expect("publish feta heartbeat");
+    feta.resource_backend()
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("feta-convoy".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("feta-convoy".to_string()).build(),
+        )
+        .await
+        .expect("create feta convoy");
+    feta.resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("feta-session".to_string())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "feta-convoy".to_string()),
+                    (VESSEL_LABEL.to_string(), "work".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]))
+                .build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("feta-environment".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "true".to_string() })
+                .cwd("/tmp".to_string())
+                .pool("passthrough".to_string())
+                .build(),
+        )
+        .await
+        .expect("create feta session");
+
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = kiwi.fleet_list_internal().await.expect("fleet list");
+            if list.rows.iter().any(|row| row.session.as_deref() == Some("feta-session")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("remote crew did not appear in fleet list");
+    let list = kiwi.fleet_list_internal().await.expect("fleet list");
+    let row = list.rows.iter().find(|row| row.session.as_deref() == Some("feta-session")).expect("feta crew row");
+    assert_eq!(row.host, HostName::new("feta"));
+    assert_eq!(row.crew, "work/coder");
+    assert_eq!(row.convoy, "feta-convoy");
+    assert!(matches!(row.staleness, FleetStaleness::Fresh { .. }));
+    let health = kiwi.fleet_health_internal().await.expect("fleet health");
+    let feta_health = health.hosts.iter().find(|row| row.host == HostName::new("feta")).expect("feta health");
+    assert_eq!(feta_health.crew_count, 1);
+    assert_eq!(feta_health.convoy_count, 1);
+    assert_eq!(feta_health.replica_generation.as_deref(), Some("feta-generation"));
     drop(topology);
 }
 
