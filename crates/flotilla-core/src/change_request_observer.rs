@@ -153,20 +153,42 @@ pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Re
                 .filter_map(|part| part.split_once("-->")?.0.trim().strip_prefix("pr-shepherd-addresses:")?.parse::<u64>().ok())
         })
         .collect::<HashSet<_>>();
+    // GitHub returns these timestamps in UTC ISO-8601 form, so lexical order is chronological.
+    // Commit time can precede the push that introduced this head; see the follow-up on push-time cutoff.
     let head_at = value["commits"]["nodes"][0]["commit"]["committedDate"].as_str();
     let reviews = value["reviews"]["nodes"].as_array();
     let actionable_at_head = value.get("reviewDecision").map(|decision| {
         let unaddressed = |item: &serde_json::Value| {
-            item["author"]["login"].as_str() != Some(CREW_GITHUB_LOGIN) && github_comment_id(item).is_none_or(|id| !addressed.contains(&id))
+            actionable_author(item, value["author"]["login"].as_str()) && github_comment_id(item).is_none_or(|id| !addressed.contains(&id))
         };
-        reviews.is_some_and(|items| items.iter().any(|review| review["state"] == "CHANGES_REQUESTED" && unaddressed(review)))
+        let mut latest_formal = HashMap::new();
+        if let Some(items) = reviews {
+            for review in items {
+                if review["state"].as_str().is_some_and(|state| state != "COMMENTED" && state != "PENDING") {
+                    if let Some(login) = review["author"]["login"].as_str() {
+                        latest_formal.insert(login, review);
+                    }
+                }
+            }
+        }
+        latest_formal.values().any(|review| review["state"] == "CHANGES_REQUESTED" && unaddressed(review))
             || head_at.is_some_and(|head_at| {
-                comments.iter().copied().chain(reviews.into_iter().flatten()).any(|item| {
+                comments.iter().copied().any(|item| {
                     unaddressed(item)
+                        && substantive_feedback(item)
                         && item["createdAt"]
                             .as_str()
                             .or_else(|| item["submittedAt"].as_str())
                             .is_some_and(|created_at| created_at > head_at)
+                }) || reviews.into_iter().flatten().any(|review| {
+                    unaddressed(review)
+                        && substantive_feedback(review)
+                        && (review["state"] == "COMMENTED"
+                            || review["author"]["login"]
+                                .as_str()
+                                .and_then(|login| latest_formal.get(login))
+                                .is_some_and(|latest| std::ptr::eq(*latest, review)))
+                        && review["submittedAt"].as_str().is_some_and(|submitted_at| submitted_at > head_at)
                 })
             })
             || (reviews.is_none() && decision.as_str() == Some("CHANGES_REQUESTED"))
@@ -183,6 +205,20 @@ pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Re
         review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: actionable_at_head, observed_at } },
         mergeable: Observation { value: mergeable, observed_at },
     })
+}
+
+fn actionable_author(item: &serde_json::Value, pr_author: Option<&str>) -> bool {
+    let Some(login) = item["author"]["login"].as_str() else { return false };
+    if login == CREW_GITHUB_LOGIN || Some(login) == pr_author {
+        return false;
+    }
+    // claude-review is the configured reviewer Action. Other bot traffic is not review feedback.
+    login == "claude" || (item["author"]["__typename"] != "Bot" && !login.ends_with("[bot]"))
+}
+
+fn substantive_feedback(item: &serde_json::Value) -> bool {
+    let body = item["body"].as_str().unwrap_or_default().trim();
+    !body.is_empty() && !matches!(body.to_ascii_lowercase().as_str(), "thanks" | "thank you" | "lgtm" | "+1" | "approved")
 }
 
 fn github_comment_id(comment: &serde_json::Value) -> Option<u64> {
@@ -667,6 +703,66 @@ mod tests {
     }
 
     struct CountingSource(Arc<AtomicUsize>);
+
+    fn review_actionable(request: serde_json::Value) -> bool {
+        parse_gh_observation(&request.to_string(), "2026-09-30T12:00:00Z".parse().expect("time"))
+            .expect("parse review")
+            .review
+            .actionable_at_head
+            .value
+            .expect("review observation")
+    }
+
+    #[test]
+    fn approval_supersedes_requested_changes_even_when_old_review_has_feedback() {
+        let request = serde_json::json!({
+            "reviewDecision": "APPROVED", "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [
+                {"fullDatabaseId": "1", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"},
+                 "state": "CHANGES_REQUESTED", "body": "Please fix this"},
+                {"fullDatabaseId": "2", "submittedAt": "2026-09-30T11:30:00Z", "author": {"login": "reviewer"},
+                 "state": "APPROVED", "body": ""}
+            ]}
+        });
+        assert!(!review_actionable(request));
+    }
+
+    #[test]
+    fn bot_chatter_empty_reviews_and_author_acknowledgments_do_not_wake_crew() {
+        let mut request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "comments": {"nodes": [
+                {"databaseId": 1, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "codecov", "__typename": "Bot"}, "body": "Coverage dropped"},
+                {"databaseId": 2, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "author", "__typename": "User"}, "body": "Thanks"}
+            ]},
+            "reviews": {"nodes": [
+                {"fullDatabaseId": "3", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "state": "APPROVED", "body": ""},
+                {"fullDatabaseId": "4", "submittedAt": "2026-09-30T11:00:00Z", "author": {"login": "other"}, "state": "COMMENTED", "body": ""}
+            ]}
+        });
+        assert!(!review_actionable(request.clone()));
+        request["comments"]["nodes"].as_array_mut().expect("comments").push(serde_json::json!({
+            "databaseId": 5, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "claude", "__typename": "Bot"},
+            "body": "Please fix the race"
+        }));
+        assert!(review_actionable(request));
+    }
+
+    #[test]
+    fn marker_in_non_crew_comment_cannot_suppress_feedback() {
+        let request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "comments": {"nodes": [
+                {"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "body": "Please fix"},
+                {"databaseId": 43, "createdAt": "2026-09-30T11:30:00Z", "author": {"login": "other"},
+                 "body": "<!-- pr-shepherd-addresses:42 -->"}
+            ]}
+        });
+        assert!(review_actionable(request));
+    }
 
     #[async_trait]
     impl ChangeRequestObservationSource for CountingSource {

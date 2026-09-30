@@ -2974,9 +2974,11 @@ mod tests {
         assert!(status.attention.is_some());
         let first_brief = &actuator.requests.lock().expect("requests")[0].brief;
         assert!(first_brief.contains("Head SHA: `aaa`"));
-        if source == "review" {
-            assert!(first_brief.contains("- Review feedback: https://github.com/flotilla-org/flotilla/pull/1392"));
-        }
+        assert_eq!(
+            first_brief.contains("- Review feedback: https://github.com/flotilla-org/flotilla/pull/1392"),
+            source == "review",
+            "review link appears only in review turns"
+        );
         assert!(first_brief.contains("feature/wake"));
         assert!(first_brief.contains("Durable convoy record: `flotilla/wake-turn`"));
         assert!(first_brief.contains("Decision ledger: https://github.com/flotilla-org/flotilla/pull/1392#issuecomment-1"));
