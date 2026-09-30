@@ -80,6 +80,8 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         self.removals.lock().expect("removals lock").push(removal.clone());
         let target_path = match removal {
             CheckoutRemoval::Worktree { target_path, .. }
+            | CheckoutRemoval::ForcedWorktree { target_path, .. }
+            | CheckoutRemoval::LandedWorktree { target_path, .. }
             | CheckoutRemoval::OrphanedWorktree { target_path }
             | CheckoutRemoval::FreshClone { target_path } => target_path,
         };
@@ -345,6 +347,49 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
         branch: "feature/cleanup".to_string(),
         target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
     }]);
+}
+
+#[tokio::test]
+async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_removal() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    convoys
+        .create(
+            &InputMeta::builder()
+                .name("convoy-a".to_string())
+                .annotations(BTreeMap::from([(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string())]))
+                .build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create forced convoy");
+    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("checkout-a".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                .build(),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+
+    reconciler.run_finalizer(&checkout).await.expect("forced finalizer");
+
+    assert!(
+        matches!(runtime.removals.lock().expect("removals lock").as_slice(), [CheckoutRemoval::ForcedWorktree { branch, .. }] if branch == "feature/cleanup")
+    );
 }
 
 #[tokio::test]

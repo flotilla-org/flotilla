@@ -4449,7 +4449,9 @@ impl RoutingCheckoutRuntime {
 
 fn removal_source_path(removal: &CheckoutRemoval) -> &str {
     match removal {
-        CheckoutRemoval::Worktree { clone_path, .. } => clone_path,
+        CheckoutRemoval::Worktree { clone_path, .. }
+        | CheckoutRemoval::ForcedWorktree { clone_path, .. }
+        | CheckoutRemoval::LandedWorktree { clone_path, .. } => clone_path,
         CheckoutRemoval::FreshClone { target_path } | CheckoutRemoval::OrphanedWorktree { target_path } => target_path,
     }
 }
@@ -4643,10 +4645,33 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
-            CheckoutRemoval::Worktree { branch, target_path, .. } => {
+            CheckoutRemoval::Worktree { branch, target_path, .. }
+            | CheckoutRemoval::ForcedWorktree { branch, target_path, .. }
+            | CheckoutRemoval::LandedWorktree { branch, target_path, .. } => {
                 let vcs = controller_vcs(&self.vcs, &self.runner, removal_source_path(removal))?;
-                match vcs.remove_materialised_checkout(branch, target_path).await? {
+                let result = if matches!(removal, CheckoutRemoval::ForcedWorktree { .. }) {
+                    vcs.force_remove_materialised_checkout(branch, target_path).await?
+                } else {
+                    vcs.remove_materialised_checkout(branch, target_path).await?
+                };
+                let result = if matches!(removal, CheckoutRemoval::LandedWorktree { .. })
+                    && matches!(result, flotilla_core::vcs::CheckoutRemoval::PreservedCheckout {
+                        reason: flotilla_core::vcs::CheckoutPreservationReason::DifferentBranch,
+                        ..
+                    }) {
+                    // A merged PR may have deleted its head ref after a squash.
+                    // Archive first so a checkout that changed since settlement
+                    // evidence was observed still remains recoverable.
+                    vcs.force_remove_materialised_checkout(branch, target_path).await?
+                } else {
+                    result
+                };
+                match result {
                     flotilla_core::vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
+                    flotilla_core::vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path } => {
+                        tracing::warn!(checkout = %target_path, archive = %archive_path, "checkout archive saved before forced removal");
+                        Ok(CheckoutRemovalOutcome::Removed)
+                    }
                     flotilla_core::vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
                         let reason = match reason {
                             flotilla_core::vcs::CheckoutPreservationReason::CommitsPastBase => BranchPreservationReason::CommitsPastBase,
@@ -8492,6 +8517,62 @@ mod tests {
             .status()
             .expect("git should inspect the ownership marker");
         assert!(!marker.success(), "ownership marker should be removed after preserving committed work");
+    }
+
+    #[tokio::test]
+    async fn landed_checkout_on_deleted_squash_branch_does_not_hold_teardown() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let remote = temp.path().join("remote.git");
+        assert!(ProcessCommand::new("git").args(["init", "--bare"]).arg(&remote).status().expect("create bare remote").success());
+        assert!(ProcessCommand::new("git")
+            .arg("-C")
+            .arg(clone.path())
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .status()
+            .expect("add origin")
+            .success());
+        let target = temp.path().join("checkout-root/convoy-a/work");
+        let runtime = CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None };
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("clone path"),
+                "feature/original",
+                Some("main"),
+                target.to_str().expect("target path"),
+            )
+            .await
+            .expect("create worktree");
+        let switched = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("target path"), "switch", "-c", "feature/merged"])
+            .status()
+            .expect("switch branch");
+        assert!(switched.success());
+        fs::write(target.join("result.txt"), "merged work\n").expect("write work");
+        for args in [["add", "result.txt"].as_slice(), ["commit", "-m", "merged work"].as_slice()] {
+            assert!(ProcessCommand::new("git").arg("-C").arg(&target).args(args).status().expect("git operation").success());
+        }
+        for args in [["push", "origin", "feature/merged"].as_slice(), ["push", "origin", ":feature/merged"].as_slice()] {
+            assert!(ProcessCommand::new("git").arg("-C").arg(&target).args(args).status().expect("remote branch lifecycle").success());
+        }
+
+        let removal = CheckoutRemoval::LandedWorktree {
+            clone_path: clone.path().to_str().expect("clone path").to_string(),
+            branch: "feature/original".to_string(),
+            target_path: target.to_str().expect("target path").to_string(),
+        };
+        fs::write(target.join("uncommitted.txt"), "keep this work\n").expect("write local work");
+        let refusal = runtime.remove_checkout(&removal).await.expect_err("dirty landed checkout must be preserved");
+        assert!(refusal.contains("DirtyCheckout"));
+        assert!(target.join("uncommitted.txt").exists());
+        fs::remove_file(target.join("uncommitted.txt")).expect("clear local work");
+        assert_eq!(runtime.remove_checkout(&removal).await.expect("landed removal"), CheckoutRemovalOutcome::Removed);
+        assert!(!target.exists());
+        let archive_parent = temp.path().join(".flotilla-archives");
+        assert!(fs::read_dir(archive_parent)
+            .expect("archive directory")
+            .any(|entry| { entry.expect("entry").file_name().to_string_lossy().starts_with("work-") }));
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ macro_rules! define_patch_kinds {
 
 define_patch_kinds! {
     ConvoySetStalled => NONE,
+    ConvoySetTeardownWait => NONE,
     ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
     ConvoyBootstrap => DUPLICATE,
@@ -132,6 +133,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
             panic!("subject patches are outside this lifecycle contract")
         }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
+        ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
         ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
         ConvoyStatusPatch::Bootstrap { .. } => PatchKind::ConvoyBootstrap,

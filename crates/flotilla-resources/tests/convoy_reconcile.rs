@@ -624,7 +624,7 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
     let convoy =
         authority.clone().using::<Convoy>("flotilla").create(&convoy_meta("convoy-a"), &valid_convoy_spec()).await.expect("create convoy");
     let remote_checkouts = remote.clone().using::<Checkout>("flotilla");
-    remote_checkouts
+    let checkout = remote_checkouts
         .create(
             &InputMeta::builder()
                 .name("checkout-convoy-a-feta".to_string())
@@ -642,6 +642,14 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
         )
         .await
         .expect("create remote checkout");
+    remote_checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Failed,
+            message: Some("checkout teardown failed: checkout /checkouts/a preserved: DirtyCheckout".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("record checkout preservation");
     let remote_root = flotilla_protocol::NodeId::new("feta-root");
     authority
         .replica_writer::<Checkout>(remote_root.clone(), "flotilla")
@@ -653,7 +661,11 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
         .with_federated_checkouts(authority.clone().including_replicas::<Checkout>("flotilla"));
 
     let error = reconciler.run_finalizer(&convoy).await.expect_err("remote checkout should hold convoy finalization");
-    assert!(error.to_string().contains("checkout-convoy-a-feta"));
+    assert!(error.to_string().contains("teardown waiting on checkout checkout-convoy-a-feta: preserved (DirtyCheckout)"));
+    let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("waiting reason should reach convoy status");
+    let mut status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
+    patch.apply(&mut status);
+    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout checkout-convoy-a-feta: preserved (DirtyCheckout)"));
 
     authority
         .replica_writer::<Checkout>(remote_root, "flotilla")

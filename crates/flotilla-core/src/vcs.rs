@@ -328,6 +328,7 @@ pub enum CheckoutPreservationReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
     Removed,
+    ArchivedAndRemoved { archive_path: String },
     PreservedBranch { branch: String, reason: CheckoutPreservationReason },
     PreservedCheckout { path: String, reason: CheckoutPreservationReason },
 }
@@ -469,6 +470,8 @@ pub trait VcsBackend: Send + Sync {
     async fn switch_create(&self, branch: &str, track: Option<&str>) -> Result<(), String>;
     async fn clone_repo(&self, url: &str, target: &str, branch: Option<&str>) -> Result<(), String>;
     async fn head_commit_text(&self) -> Result<String, String>;
+    async fn bundle_head(&self, path: &str) -> Result<(), String>;
+    async fn write_patch(&self, path: &str) -> Result<(), String>;
     async fn query(&self, query: VcsQuery<'_>) -> Result<String, String>;
     async fn grep_operational_entries(&self, commit: &str) -> Result<CommandOutput, String>;
     async fn git_path(&self, name: &str) -> Result<CommandOutput, String>;
@@ -493,6 +496,9 @@ pub trait Vcs: Send + Sync {
     }
     async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
         Err("checkout removal is unavailable".into())
+    }
+    async fn force_remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
+        Err("forced checkout removal is unavailable".into())
     }
     async fn is_clean(&self) -> VcsCheck {
         VcsCheck::Unknown(vec!["checkout cleanliness is unavailable".into()])
@@ -587,15 +593,26 @@ impl FlotillaVcs {
     async fn checkout_removal_guard(&self, branch: &str, target: &str) -> Result<Option<CheckoutRemoval>, String> {
         let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
-        match backend.current_branch().await {
-            Ok(current) if current.trim() != branch => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
+        let current = match backend.current_branch().await {
             Err(error) if error.contains("not a git repository") => return Ok(None),
             Err(_) => return Ok(preserve(CheckoutPreservationReason::DifferentBranch)),
-            _ => {}
-        }
+            Ok(current) => current,
+        };
         let status = backend.working_tree_status(false).await?;
         if !status.success || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
             return Ok(preserve(CheckoutPreservationReason::DirtyCheckout));
+        }
+        if current.trim() != branch {
+            let remote_ref = format!("refs/heads/{}", current.trim());
+            let head = backend.head_commit_text().await?;
+            let pushed = backend.remote_heads("origin", &remote_ref).await.ok().is_some_and(|advertised| {
+                advertised
+                    .lines()
+                    .any(|line| line.split_once('\t').is_some_and(|(sha, reference)| sha == head.trim() && reference == remote_ref))
+            });
+            if !pushed {
+                return Ok(preserve(CheckoutPreservationReason::DifferentBranch));
+            }
         }
         Ok(None)
     }
@@ -708,6 +725,70 @@ impl Vcs for FlotillaVcs {
                 Ok(CheckoutRemoval::Removed)
             }
         }
+    }
+
+    async fn force_remove_materialised_checkout(&self, _branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
+        if !self.runner.path_exists(Path::new(target)).await? {
+            return Ok(CheckoutRemoval::Removed);
+        }
+        let path = Path::new(target);
+        let parent = path.parent().ok_or_else(|| format!("checkout has no archive parent: {target}"))?;
+        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| format!("checkout has no UTF-8 name: {target}"))?;
+        let archive_base = match self.strategy {
+            GitCheckoutStrategy::Worktree(_) => self.checkout.as_path().parent().unwrap_or(parent),
+            GitCheckoutStrategy::ReferenceClone(_) => parent,
+        };
+        let archive = archive_base.join(".flotilla-archives").join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        let archive_path = archive.to_str().ok_or_else(|| "archive path is not UTF-8".to_string())?;
+        let bundle = archive.join("history.bundle");
+        let patch = archive.join("changes.patch");
+        let snapshot = archive.join("worktree.tar.gz");
+        let bundle_path = bundle.to_str().ok_or_else(|| "bundle path is not UTF-8".to_string())?;
+        let patch_path = patch.to_str().ok_or_else(|| "patch path is not UTF-8".to_string())?;
+        let snapshot_path = snapshot.to_str().ok_or_else(|| "snapshot path is not UTF-8".to_string())?;
+        self.runner.run("mkdir", &["-p", archive_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
+        let backend = GitCliBackend::explicit_checkout(path, &*self.runner);
+        let archive_result = async {
+            backend.bundle_head(bundle_path).await?;
+            backend.write_patch(patch_path).await?;
+            self.runner
+                .run(
+                    "tar",
+                    &["-czf", snapshot_path, "-C", parent.to_str().ok_or_else(|| "archive parent is not UTF-8".to_string())?, "--", name],
+                    Path::new("/"),
+                    &crate::providers::ChannelLabel::Default,
+                )
+                .await?;
+            if !self.runner.path_exists(&bundle).await?
+                || !self.runner.path_exists(&patch).await?
+                || !self.runner.path_exists(&snapshot).await?
+            {
+                return Err(format!("checkout archive is incomplete at {archive_path}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = archive_result {
+            // The checkout remains in place, so a failed archive can be retried safely.
+            if let Err(cleanup_error) =
+                self.runner.run("rm", &["-rf", archive_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await
+            {
+                return Err(format!("{error}; failed to remove partial archive at {archive_path}: {cleanup_error}"));
+            }
+            return Err(error);
+        }
+        if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
+            let remove = self.controller_cli().worktree_remove(target).await?;
+            if !remove.success && !remove.stderr.contains("is not a working tree") {
+                return Err(remove.stderr);
+            }
+        }
+        remove_worktree_path(&*self.runner, target).await?;
+        if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
+            self.controller_cli().worktree_prune().await?;
+        }
+        warn!(checkout = %target, archive = %archive_path, "forced checkout removal archived local state");
+        Ok(CheckoutRemoval::ArchivedAndRemoved { archive_path: archive_path.to_string() })
     }
 
     async fn is_clean(&self) -> VcsCheck {
@@ -1240,6 +1321,14 @@ impl VcsBackend for GitCliBackend<'_> {
 
     async fn head_commit_text(&self) -> Result<String, String> {
         self.run(&["rev-parse", "HEAD"]).await
+    }
+
+    async fn bundle_head(&self, path: &str) -> Result<(), String> {
+        self.run(&["bundle", "create", path, "HEAD"]).await.map(|_| ())
+    }
+
+    async fn write_patch(&self, path: &str) -> Result<(), String> {
+        self.run(&["diff", "--binary", &format!("--output={path}"), "HEAD"]).await.map(|_| ())
     }
 
     async fn query(&self, query: VcsQuery<'_>) -> Result<String, String> {
@@ -1778,6 +1867,88 @@ mod tests {
         );
         std::fs::remove_file(dirty_file).expect("remove dirty file");
         assert_eq!(vcs.remove_materialised_checkout("feature/new", target).await.expect("remove clean clone"), CheckoutRemoval::Removed);
+    }
+
+    #[tokio::test]
+    async fn convoy_worktree_on_a_pushed_different_branch_can_be_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("checkout");
+        git(root, &["init", "--bare", remote.to_str().expect("remote path")]);
+        std::fs::create_dir(&source).expect("source directory");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        std::fs::write(source.join("README.md"), "initial\n").expect("initial file");
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "-m", "initial"]);
+        git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
+        git(&source, &["push", "origin", "main"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner, true);
+        let target = target.to_str().expect("target path");
+        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        git(Path::new(target), &["switch", "-c", "research/result"]);
+        std::fs::write(Path::new(target).join("README.md"), "research\n").expect("research result");
+        git(Path::new(target), &["add", "README.md"]);
+        git(Path::new(target), &["commit", "-m", "research result"]);
+        git(Path::new(target), &["push", "origin", "research/result"]);
+
+        assert_eq!(
+            vcs.remove_materialised_checkout("convoy/work", target).await.expect("remove pushed checkout"),
+            CheckoutRemoval::Removed
+        );
+        assert!(!Path::new(target).exists());
+    }
+
+    #[tokio::test]
+    async fn forced_convoy_worktree_removal_archives_dirty_and_unpushed_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("checkout");
+        git(root, &["init", "--bare", remote.to_str().expect("remote path")]);
+        std::fs::create_dir(&source).expect("source directory");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        std::fs::write(source.join("README.md"), "initial\n").expect("initial file");
+        git(&source, &["add", "README.md"]);
+        git(&source, &["commit", "-m", "initial"]);
+        git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
+        git(&source, &["push", "origin", "main"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner, true);
+        let target = target.to_str().expect("target path");
+        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        std::fs::write(Path::new(target).join("README.md"), "committed locally\n").expect("tracked file");
+        std::fs::write(Path::new(target).join("new.txt"), "untracked\n").expect("dirty untracked file");
+        git(Path::new(target), &["add", "README.md"]);
+        git(Path::new(target), &["commit", "-m", "unpushed work"]);
+        std::fs::write(Path::new(target).join("README.md"), "uncommitted\n").expect("dirty tracked file");
+
+        let outcome = vcs.force_remove_materialised_checkout("convoy/work", target).await.expect("forced removal");
+        let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive of work at risk") };
+        let archive = Path::new(&archive_path);
+        assert_eq!(archive.parent(), Some(root.join(".flotilla-archives").as_path()));
+        assert!(archive.join("history.bundle").exists(), "unpushed commit must remain recoverable");
+        let bundle = std::process::Command::new("git")
+            .args(["bundle", "list-heads"])
+            .arg(archive.join("history.bundle"))
+            .output()
+            .expect("inspect saved Git bundle");
+        assert!(bundle.status.success());
+        assert!(String::from_utf8_lossy(&bundle.stdout).contains("HEAD"));
+        assert!(std::fs::read_to_string(archive.join("changes.patch")).expect("saved patch").contains("uncommitted"));
+        assert!(archive.join("worktree.tar.gz").exists(), "dirty files must remain recoverable");
+        let snapshot =
+            std::process::Command::new("tar").arg("-tzf").arg(archive.join("worktree.tar.gz")).output().expect("inspect saved worktree");
+        assert!(snapshot.status.success());
+        assert!(String::from_utf8_lossy(&snapshot.stdout).contains("checkout/new.txt"));
+        assert!(!Path::new(target).exists());
     }
 
     #[tokio::test]
