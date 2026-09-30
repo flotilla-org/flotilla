@@ -1255,6 +1255,8 @@ pub enum ConvoyStatusPatch {
     AdvanceWorkToReady {
         ready: BTreeMap<String, DateTime<Utc>>,
     },
+    /// `cancelled_work` is computed from non-terminal work. Apply checks that
+    /// condition again because a concurrent patch may have settled a work item.
     FailConvoy {
         cancelled_work: BTreeMap<String, DateTime<Utc>>,
         finished_at: DateTime<Utc>,
@@ -1296,6 +1298,9 @@ pub enum ConvoyStatusPatch {
         roles: BTreeSet<String>,
         message: String,
     },
+    /// One-shot work outcomes accept non-terminal input or a duplicate of the
+    /// same outcome. The apply path rejects a different terminal outcome so
+    /// its sticky finished_at cannot be misattributed to this transition.
     ForceWorkCompleted {
         work: String,
         finished_at: DateTime<Utc>,
@@ -1484,8 +1489,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.message = message.clone();
                 for (work, cancelled_at) in cancelled_work {
                     if let Some(state) = status.work.get_mut(work) {
-                        state.phase = WorkPhase::Cancelled;
-                        state.finished_at.get_or_insert(*cancelled_at);
+                        if !state.phase.is_terminal() {
+                            state.phase = WorkPhase::Cancelled;
+                            state.finished_at.get_or_insert(*cancelled_at);
+                        }
                     }
                 }
                 clear_operator_pending_brief(status);
@@ -1589,6 +1596,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::ForceWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Complete {
+                        return;
+                    }
                     state.phase = WorkPhase::Complete;
                     state.completion_authority = WorkCompletionAuthority::HumanOverride;
                     state.finished_at.get_or_insert(*finished_at);
@@ -1598,6 +1608,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Failed {
+                        return;
+                    }
                     state.phase = WorkPhase::Failed;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
@@ -1605,6 +1618,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkWorkCancelled { work, finished_at } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Cancelled {
+                        return;
+                    }
                     state.phase = WorkPhase::Cancelled;
                     state.finished_at.get_or_insert(*finished_at);
                 }

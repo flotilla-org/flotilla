@@ -330,6 +330,43 @@ fn operator_can_abandon_the_terminal_phase_it_observed() {
 }
 
 #[test]
+fn one_shot_work_patches_preserve_existing_terminal_outcomes() {
+    for phase in [WorkPhase::Complete, WorkPhase::Failed, WorkPhase::Cancelled, WorkPhase::Abandoned] {
+        let original = WorkState { phase, finished_at: Some(ts(20)), message: Some("original outcome".to_string()), ..pending_work() };
+        let patches = [
+            (WorkPhase::Complete, external_patches::force_work_completed("implement".to_string(), ts(30), Some("stale".to_string()))),
+            (WorkPhase::Failed, ConvoyStatusPatch::MarkWorkFailed {
+                work: "implement".to_string(),
+                finished_at: ts(30),
+                message: "stale".to_string(),
+            }),
+            (WorkPhase::Cancelled, ConvoyStatusPatch::MarkWorkCancelled { work: "implement".to_string(), finished_at: ts(30) }),
+        ];
+        for (target, patch) in patches {
+            if phase == target {
+                continue;
+            }
+            let mut status = ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("implement".to_string(), original.clone())]),
+                ..ConvoyStatus::default()
+            };
+            patch.apply(&mut status);
+            assert_eq!(status.work["implement"], original, "{phase:?} changed after {patch:?}");
+        }
+
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            work: BTreeMap::from([("implement".to_string(), original.clone())]),
+            ..ConvoyStatus::default()
+        };
+        controller_patches::fail_convoy(BTreeMap::from([("implement".to_string(), ts(30))]), ts(30), None).apply(&mut status);
+        assert_eq!(status.phase, ConvoyPhase::Failed);
+        assert_eq!(status.work["implement"], original, "{phase:?} changed during fail-fast cancellation");
+    }
+}
+
+#[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
