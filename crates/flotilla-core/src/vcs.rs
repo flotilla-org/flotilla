@@ -530,6 +530,8 @@ pub trait Vcs: Send + Sync {
         Err("remote ref inspection is unavailable".into())
     }
 
+    /// Count commits relative to the checkout's base. A remote-tracking base
+    /// reflects the most recent fetch; this operation does not fetch it.
     async fn commits_beyond_base(&self, _base_ref: Option<&str>) -> Result<(String, usize), String> {
         Err("base comparison is unavailable".into())
     }
@@ -1501,6 +1503,51 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let vcs = test_fl(repo, runner, true);
         assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare local-only base"), ("main".to_string(), 0));
+        assert_eq!(
+            vcs.commits_beyond_base(Some("refs/heads/main")).await.expect("compare explicit local ref"),
+            ("refs/heads/main".to_string(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_remote_base_is_used_without_rewriting() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "initial\n").expect("write initial file");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+        git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(repo, runner, true);
+        assert_eq!(
+            vcs.commits_beyond_base(Some("origin/main")).await.expect("compare explicit remote base"),
+            ("origin/main".to_string(), 0)
+        );
+        assert_eq!(
+            vcs.commits_beyond_base(Some("refs/remotes/origin/main")).await.expect("compare explicit remote ref"),
+            ("refs/remotes/origin/main".to_string(), 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_tracking_ref_with_origin_does_not_fall_back_to_local_base() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "initial\n").expect("write initial file");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+        git(repo, &["remote", "add", "origin", "https://example.com/repo.git"]);
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(repo, runner, true);
+        assert!(vcs.commits_beyond_base(Some("main")).await.is_err());
     }
 
     #[tokio::test]
