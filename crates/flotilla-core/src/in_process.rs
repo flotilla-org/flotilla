@@ -8714,10 +8714,7 @@ impl InProcessDaemon {
                 }
                 continue;
             }
-            if !(condition_is_true(&integration.clean)
-                && (condition_is_true(&integration.pushed) || landed_by_merged_change_request)
-                && condition_is_true(&integration.landed))
-            {
+            if !required.iter().all(|(_, condition)| condition_is_true(condition)) {
                 if let Some(summary) = checkout_integration_summary(checkout, integration) {
                     refusals.push(summary);
                 }

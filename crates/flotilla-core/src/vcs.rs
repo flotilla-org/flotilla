@@ -844,7 +844,8 @@ impl Vcs for FlotillaVcs {
     }
 
     async fn commits_beyond_base(&self, base_ref: Option<&str>) -> Result<(String, usize), String> {
-        let base_ref = match base_ref {
+        let local_base_ref = base_ref.filter(|reference| !reference.starts_with("origin/") && !reference.starts_with("refs/"));
+        let mut base_ref = match base_ref {
             // Checkout specs name the default branch, while a host clone's
             // local branch may remain at its original provisioning commit.
             Some(base_ref) if base_ref.starts_with("origin/") || base_ref.starts_with("refs/") => base_ref.to_string(),
@@ -857,7 +858,17 @@ impl Vcs for FlotillaVcs {
                 output.stdout.trim().to_string()
             }
         };
-        let output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
+        let mut output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
+        let fallback = match (output.success, local_base_ref) {
+            (false, Some(local_base_ref)) => self.cli().remote_url("origin").await.is_err().then_some(local_base_ref),
+            _ => None,
+        };
+        if let Some(local_base_ref) = fallback {
+            // A local-only checkout has no remote-tracking branch. Preserve
+            // its local base comparison without masking a broken origin ref.
+            base_ref = local_base_ref.to_string();
+            output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
+        }
         if !output.success {
             return Err(non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr));
         }
@@ -1473,6 +1484,23 @@ mod tests {
             let vcs = test_fl(&checkout, runner, true);
             assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare against remote main"), ("origin/main".to_string(), 0));
         }
+    }
+
+    #[tokio::test]
+    async fn local_only_checkout_compares_with_local_base() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let repo = temp.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "initial\n").expect("write initial file");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+        git(repo, &["switch", "-c", "untouched"]);
+
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(repo, runner, true);
+        assert_eq!(vcs.commits_beyond_base(Some("main")).await.expect("compare local-only base"), ("main".to_string(), 0));
     }
 
     #[tokio::test]

@@ -3945,9 +3945,25 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         .expect("publish integration observation");
 
     daemon
-        .verify_convoy_teardown_gate_for_checkouts(&convoy, &[checkout], false)
+        .verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false)
         .await
         .expect("merged PR makes deleted branch safe to reclaim");
+
+    let mut mismatched = checkout.clone();
+    mismatched
+        .status
+        .as_mut()
+        .expect("checkout status")
+        .integration
+        .landed_evidence
+        .as_mut()
+        .expect("landing evidence")
+        .change_request_id = "different-pr".to_string();
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[mismatched], false).await.is_err());
+
+    let mut dirty = checkout;
+    dirty.status.as_mut().expect("checkout status").integration.clean.value = flotilla_resources::ConditionValue::False;
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[dirty], false).await.is_err());
 }
 
 #[tokio::test]
