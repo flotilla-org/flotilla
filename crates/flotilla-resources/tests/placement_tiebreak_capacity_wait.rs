@@ -8,10 +8,16 @@ use flotilla_resources::{
 };
 
 #[tokio::test]
-async fn convoy_waits_for_selected_minimal_kind_and_resumes_when_capacity_returns() {
+async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resumes_when_capacity_returns() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let hosts = backend.using::<Host>("flotilla");
-    let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("host");
+    let host = hosts
+        .create(&InputMeta::builder().name("host-id".to_string()).build(), &HostSpec {
+            display_name: "feta".to_string(),
+            connection: Default::default(),
+        })
+        .await
+        .expect("host");
     let full = HostStatus {
         ready: true,
         heartbeat_at: Some(Utc::now()),
@@ -22,7 +28,7 @@ async fn convoy_waits_for_selected_minimal_kind_and_resumes_when_capacity_return
         })]),
         ..Default::default()
     };
-    let host = hosts.update_status("feta", &host.metadata.resource_version, &full).await.expect("full host");
+    let host = hosts.update_status("host-id", &host.metadata.resource_version, &full).await.expect("full host");
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys
         .create(
@@ -33,7 +39,7 @@ async fn convoy_waits_for_selected_minimal_kind_and_resumes_when_capacity_return
         .expect("convoy");
     let decision = PlacementDecision {
         policy_name: "linux-docker".to_string(),
-        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta"), display_name: "feta".to_string() },
+        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("host-id"), display_name: "feta".to_string() },
         minimal_alternatives: vec!["large-host".to_string()],
         escalation_reason: None,
         refused_candidates: Vec::new(),
@@ -78,10 +84,23 @@ async fn convoy_waits_for_selected_minimal_kind_and_resumes_when_capacity_return
 
     let mut free = full;
     free.fulfilment_facts.get_mut("linux-docker").expect("facts").free_vessel_slots = Some(1);
-    hosts.update_status("feta", &host.metadata.resource_version, &free).await.expect("capacity restored");
+    hosts.update_status("host-id", &host.metadata.resource_version, &free).await.expect("capacity restored");
     let convoy = convoys.get("waiting").await.expect("convoy");
     let convoy = convoys.update_status("waiting", &convoy.metadata.resource_version, &status).await.expect("persist stall");
     let prepared = reconciler.prepare(&convoy).await.expect("prepare free");
     let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
     assert!(matches!(outcome.patch, Some(ConvoyStatusPatch::SetStalled { condition: None })));
+
+    hosts
+        .create(&InputMeta::builder().name("another-host-id".to_string()).build(), &HostSpec {
+            display_name: "feta".to_string(),
+            connection: Default::default(),
+        })
+        .await
+        .expect("second host with same display name");
+    let prepared = reconciler.prepare(&convoy).await.expect("ambiguous host waits instead of failing prepare");
+    let outcome = reconciler.reconcile(&convoy, &prepared, Utc::now());
+    let mut status = convoy.status.expect("convoy status");
+    outcome.patch.expect("ambiguity stall patch").apply(&mut status);
+    assert!(status.stalled.as_ref().is_some_and(|stall| stall.evidence.contains("ambiguous")));
 }

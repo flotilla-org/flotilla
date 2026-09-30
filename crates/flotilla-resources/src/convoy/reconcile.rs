@@ -648,6 +648,7 @@ impl Reconciler for ConvoyReconciler {
         {
             match &self.hosts {
                 Some(hosts) => {
+                    let available_hosts = hosts.list().await?;
                     let mut decisions =
                         obj.status.as_ref().and_then(|status| status.placement_decision.as_ref()).into_iter().collect::<Vec<_>>();
                     let vessel_pins = obj
@@ -662,11 +663,24 @@ impl Reconciler for ConvoyReconciler {
                         let Some(selected) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) else {
                             continue;
                         };
-                        let host = match hosts.get(&selected.host).await {
-                            Ok(host) => Some(host.object),
-                            Err(ResourceError::NotFound { .. }) => None,
-                            Err(error) => return Err(error),
-                        };
+                        let canonical =
+                            match crate::canonical_host_id(available_hosts.items.iter().map(|host| &host.object), &selected.host) {
+                                Ok(canonical) => canonical,
+                                Err(error) => {
+                                    wait = Some(format!(
+                                        "capacity for fulfilment `{}` on host `{}` is unavailable: {error}",
+                                        selected.kind, selected.host
+                                    ));
+                                    break;
+                                }
+                            };
+                        let host = canonical.and_then(|id| {
+                            available_hosts
+                                .items
+                                .iter()
+                                .find(|host| host.object.metadata.name == id.as_str())
+                                .map(|host| host.object.clone())
+                        });
                         let status = host.and_then(|host| host.status).map(|mut status| {
                             status.apply_heartbeat_readiness(self.clock.now());
                             status

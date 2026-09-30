@@ -40,18 +40,18 @@ use flotilla_core::{
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
-    canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions, is_prepared_snapshot,
-    watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
-    Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy, ConvoyProvisioningState,
-    ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind, DemandSpec,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatusPatch,
-    ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition, HostConnection,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch,
-    InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard, ReplicaReadResolver,
-    ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock,
-    TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    canonical_host_id, canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
+    is_prepared_snapshot, watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout,
+    CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy,
+    ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
+    DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
+    EnvironmentStatusPatch, ForgeIdentity, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, Host, HostCondition,
+    HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation, Project, Regard,
+    ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject,
+    RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY,
+    CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE, TRANSPORT_CAPABILITY,
 };
@@ -2178,6 +2178,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
 /// A1 runs beside the policy-based admission path. Existing policy names are
 /// retained so operators can inspect the corresponding kind during rollout.
 async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &str, host_ref: &str, platform: &str) -> Result<(), String> {
+    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
     let policies =
         backend.clone().using::<flotilla_resources::PlacementPolicy>(namespace).list().await.map_err(|error| error.to_string())?;
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
@@ -2188,18 +2189,39 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             .as_ref()
             .map(|strategy| strategy.host_ref.as_str())
             .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
-        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
-            if policy_host != Some(host_ref) {
+        let Some(policy_host) = policy_host else { continue };
+        let canonical = match canonical_host_id(&hosts.items, policy_host) {
+            Ok(id) => id.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string()),
+            Err(error) => {
+                warn!(policy = %policy.metadata.name, %policy_host, %error, "skipping ambiguous placement policy host");
                 continue;
             }
+        };
+        if canonical != host_ref {
+            continue;
+        }
+        if is_prepared_snapshot(&policy.metadata.name, &policy.metadata.labels, PLACEMENT_SNAPSHOT_KIND) {
             // Earlier migrations created kinds under frozen policy names. A
             // matching snapshot policy is the proof of origin for cleanup;
             // leave the policy itself for existing convoy references.
             match kinds.get(&policy.metadata.name).await {
-                Ok(kind) if kind.spec.host_ref == host_ref => {
-                    kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
+                Ok(kind) => {
+                    let matches = if kind.spec.host_ref == host_ref {
+                        true
+                    } else {
+                        match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+                            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+                            Err(error) => {
+                                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous snapshot kind host");
+                                false
+                            }
+                        }
+                    };
+                    if matches {
+                        kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
+                    }
                 }
-                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(ResourceError::NotFound { .. }) => {}
                 Err(error) => return Err(format!("inspect snapshot fulfilment kind: {error}")),
             }
             continue;
@@ -2207,17 +2229,33 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
         if policy.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        if policy_host != Some(host_ref) {
-            continue;
+        let mut policy_spec = policy.spec.clone();
+        if policy_host != host_ref {
+            // One-time repair of display-name refs written before host IDs
+            // became the stored PlacementPolicy/FulfilmentKind identity.
+            if let Some(direct) = policy_spec.host_direct.as_mut() {
+                direct.host_ref = host_ref.to_string();
+            }
+            if let Some(docker) = policy_spec.docker_per_vessel.as_mut() {
+                docker.host_ref = host_ref.to_string();
+            }
         }
         let name = &policy.metadata.name;
-        let spec = match FulfilmentKindSpec::from_policy(&policy.spec, platform) {
+        let spec = match FulfilmentKindSpec::from_policy(&policy_spec, platform) {
             Ok(spec) => spec,
             Err(error) => {
                 warn!(policy = %name, %error, "skipping invalid placement policy during fulfilment migration");
                 continue;
             }
         };
+        if policy_spec != policy.spec {
+            backend
+                .clone()
+                .using::<flotilla_resources::PlacementPolicy>(namespace)
+                .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy_spec)
+                .await
+                .map_err(|error| format!("canonicalize placement policy {name}: {error}"))?;
+        }
         match kinds.get(name).await {
             Ok(existing) if existing.metadata.deletion_timestamp.is_some() => {}
             Ok(existing) => {
@@ -2243,6 +2281,29 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             Err(error) => return Err(format!("inspect fulfilment kind {name}: {error}")),
         }
     }
+    // Also repair kinds that were authored directly and have no live policy.
+    // This is idempotent; after the first successful pass the stored ref is
+    // already the canonical Host resource name.
+    for kind in kinds.list().await.map_err(|error| error.to_string())?.items {
+        if kind.metadata.deletion_timestamp.is_some() || kind.spec.host_ref == host_ref {
+            continue;
+        }
+        let matches = match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+            Err(error) => {
+                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind host");
+                continue;
+            }
+        };
+        if matches {
+            let mut spec = kind.spec.clone();
+            spec.host_ref = host_ref.to_string();
+            kinds
+                .update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec)
+                .await
+                .map_err(|error| format!("canonicalize fulfilment kind {}: {error}", kind.metadata.name))?;
+        }
+    }
     Ok(())
 }
 
@@ -2261,8 +2322,28 @@ async fn observe_fulfilment_facts(
     probe: FulfilmentProbeContext<'_>,
     model_probes: &mut ModelProbeState,
 ) -> Result<BTreeMap<String, FulfilmentFacts>, String> {
-    let mut kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
-    kinds.retain(|kind| kind.spec.host_ref == host_ref && kind.metadata.deletion_timestamp.is_none());
+    let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
+    let all_kinds = backend.clone().using::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items;
+    let mut kinds = Vec::new();
+    for kind in all_kinds {
+        if kind.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let matches = if kind.spec.host_ref == host_ref {
+            true
+        } else {
+            match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
+                Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+                Err(error) => {
+                    warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind during fact observation");
+                    continue;
+                }
+            }
+        };
+        if matches {
+            kinds.push(kind);
+        }
+    }
     let baselines = backend.clone().definitions::<flotilla_resources::CrewImageBaseline>(namespace);
     let mut facts = BTreeMap::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
@@ -11819,6 +11900,117 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn migrates_display_name_host_ref_to_canonical_host_id() {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let host_id = "b2aac222-host-id";
+        backend
+            .clone()
+            .using::<Host>(NAMESPACE)
+            .create(&empty_meta(host_id), &HostSpec { display_name: "udder".into(), connection: Default::default() })
+            .await
+            .expect("seed host");
+        for name in ["collision-a", "collision-b"] {
+            backend
+                .clone()
+                .using::<Host>(NAMESPACE)
+                .create(&empty_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default() })
+                .await
+                .expect("seed ambiguous host");
+        }
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let ambiguous_policy = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "collision".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        policies.create(&empty_meta("a-collision"), &ambiguous_policy).await.expect("seed ambiguous policy");
+        let spec = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "udder".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        policies.create(&empty_meta("host-direct-udder"), &spec).await.expect("seed legacy policy");
+        let docker_spec = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: "udder".to_string(),
+                image: "crew:test".into(),
+                pull_policy: Default::default(),
+                agent_adapters: BTreeSet::new(),
+                default_cwd: None,
+                env: BTreeMap::new(),
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            })
+            .build();
+        policies.create(&empty_meta("docker-udder"), &docker_spec).await.expect("seed legacy docker policy");
+        let legacy_kind = FulfilmentKindSpec::from_policy(&spec, "linux").expect("valid legacy policy");
+        backend
+            .clone()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(&empty_meta("host-direct-udder"), &legacy_kind)
+            .await
+            .expect("seed legacy kind");
+        backend
+            .clone()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(&empty_meta("orphan-udder"), &legacy_kind)
+            .await
+            .expect("seed standalone legacy kind");
+        backend
+            .clone()
+            .using::<FulfilmentKind>(NAMESPACE)
+            .create(
+                &empty_meta("a-collision"),
+                &FulfilmentKindSpec::from_policy(&ambiguous_policy, "linux").expect("valid ambiguous policy"),
+            )
+            .await
+            .expect("seed ambiguous kind");
+        let previous =
+            BTreeMap::from([("host-direct-udder".to_string(), FulfilmentFacts { observed_at: Utc::now(), ..FulfilmentFacts::default() })]);
+        let runner = DiscoveryMockRunner::builder().build();
+        let facts = observe_fulfilment_facts(
+            &backend,
+            NAMESPACE,
+            host_id,
+            &["cleat".to_string()],
+            &previous,
+            FulfilmentProbeContext {
+                runner: &runner,
+                env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+                scratch: Path::new("/tmp/flotilla-probe-test"),
+            },
+            &mut ModelProbeState::default(),
+        )
+        .await
+        .expect("observe legacy kind");
+        assert!(facts.contains_key("host-direct-udder"), "display-name kind must receive host facts");
+        assert!(!facts.contains_key("a-collision"), "ambiguous kind must not block healthy facts");
+
+        migrate_live_placement_policies(&backend, NAMESPACE, host_id, "linux").await.expect("migrate policy");
+
+        let policy = policies.get("host-direct-udder").await.expect("policy remains");
+        assert_eq!(policy.spec.host_direct.expect("direct policy").host_ref, host_id);
+        let kind = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("host-direct-udder").await.expect("kind exists");
+        assert_eq!(kind.spec.host_ref, host_id);
+        let orphan = backend.clone().using::<FulfilmentKind>(NAMESPACE).get("orphan-udder").await.expect("orphan kind exists");
+        assert_eq!(orphan.spec.host_ref, host_id);
+        let docker = policies.get("docker-udder").await.expect("docker policy remains");
+        assert_eq!(docker.spec.docker_per_vessel.expect("docker policy").host_ref, host_id);
+        assert_eq!(
+            backend.clone().using::<FulfilmentKind>(NAMESPACE).get("docker-udder").await.expect("docker kind").spec.host_ref,
+            host_id
+        );
+        assert_eq!(
+            policies.get("a-collision").await.expect("ambiguous policy remains").spec.host_direct.expect("direct").host_ref,
+            "collision"
+        );
     }
 
     #[tokio::test]
