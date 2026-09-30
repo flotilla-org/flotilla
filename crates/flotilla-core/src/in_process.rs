@@ -4083,13 +4083,7 @@ impl InProcessDaemon {
         let mut errors = Vec::new();
         let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
         for subject in &observed_subjects {
-            if !convoy.status.as_ref().is_some_and(|status| {
-                status.unlinked_subjects.contains(subject)
-                    || status
-                        .subjects
-                        .iter()
-                        .any(|entry| entry.subject == *subject && entry.relationship == flotilla_protocol::Relationship::Produces)
-            }) {
+            if !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject)) {
                 subjects.push((subject.clone(), flotilla_protocol::Relationship::Produces));
             }
         }
@@ -4108,17 +4102,20 @@ impl InProcessDaemon {
                 Some(Ok(Some(request))) if request.repository_key == repository.repo_ref => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy.status.as_ref().is_some_and(|status| {
-                            status
-                                .subjects
-                                .iter()
-                                .any(|entry| entry.subject == subject && entry.relationship == flotilla_protocol::Relationship::Produces)
-                        }) {
+                        if !convoy
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
                     }
                     continue;
                 }
+                // The batched lookup covered every repository. A miss or error is
+                // retried by the aggregator; repeating it per repository here
+                // would spend extra provider quota. A match in another repository
+                // falls through to this repository's individual lookup.
                 Some(Ok(None) | Err(_)) => continue,
                 _ => {}
             }
@@ -4126,12 +4123,11 @@ impl InProcessDaemon {
                 Ok(Some(request)) => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy.status.as_ref().is_some_and(|status| {
-                            status
-                                .subjects
-                                .iter()
-                                .any(|entry| entry.subject == subject && entry.relationship == flotilla_protocol::Relationship::Produces)
-                        }) {
+                        if !convoy
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
                     }

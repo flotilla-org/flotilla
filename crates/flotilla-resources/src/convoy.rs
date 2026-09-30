@@ -707,6 +707,10 @@ pub struct DiscoveredSubject {
 }
 
 impl ConvoyStatus {
+    pub fn produces(&self, subject: &Subject) -> bool {
+        self.subjects.iter().any(|entry| &entry.subject == subject && entry.relationship == Relationship::Produces)
+    }
+
     pub fn discover_subject(&mut self, subject: Subject, relationship: Relationship, source: SubjectDiscoverySource, at: DateTime<Utc>) {
         if self.unlinked_subjects.contains(&subject) && source != SubjectDiscoverySource::Operator {
             return;

@@ -891,13 +891,7 @@ impl Reconciler for ConvoyReconciler {
                 .observed_subjects
                 .iter()
                 .filter(|subject| {
-                    !obj.status.as_ref().is_some_and(|status| {
-                        status.unlinked_subjects.contains(*subject)
-                            || status
-                                .subjects
-                                .iter()
-                                .any(|entry| entry.subject == **subject && entry.relationship == Relationship::Produces)
-                    })
+                    !obj.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(*subject) || status.produces(subject))
                 })
                 .cloned()
                 .map(|subject| (subject, Relationship::Produces))

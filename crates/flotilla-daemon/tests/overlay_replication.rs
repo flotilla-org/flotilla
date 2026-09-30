@@ -580,7 +580,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -590,7 +590,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("crew-convoy").await.is_ok() {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -610,7 +610,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             }) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -627,7 +627,7 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
