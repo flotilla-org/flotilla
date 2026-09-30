@@ -2082,6 +2082,56 @@ async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
         .await
         .expect_err("not-ready remote placement must be refused before peer routing");
     assert!(error.contains(policy_name) && error.contains("stopped-host-id") && error.contains("not ready"), "{error}");
+
+    let statusless = hosts
+        .create(&InputMeta::builder().name("statusless-host-id".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("create remote host without status");
+    daemon
+        .resource_backend()
+        .replica_writer::<Host>(node("stopped"), "flotilla")
+        .replace(&hosts.list().await.expect("list remote hosts"), chrono::Utc::now())
+        .await
+        .expect("replicate host without status");
+    let statusless_policy = "host-direct-statusless-host-id";
+    policies
+        .create(
+            &InputMeta::builder().name(statusless_policy.to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("cleat".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: statusless.metadata.name,
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("create placement policy without host status");
+    daemon
+        .resource_backend()
+        .replica_writer::<PlacementPolicy>(node("stopped"), "flotilla")
+        .replace(&policies.list().await.expect("list remote placement policies"), chrono::Utc::now())
+        .await
+        .expect("replicate placement policy without host status");
+    let error = router
+        .dispatch_execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla/flotilla".to_string())
+                            .name("statusless-work".to_string())
+                            .branch("feat/statusless-work".to_string())
+                            .placement_policy(statusless_policy.to_string())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect_err("remote placement without replicated status must be refused");
+    assert!(error.contains(statusless_policy) && error.contains("status is unavailable"), "{error}");
 }
 
 struct RunningTerminalRuntime;
