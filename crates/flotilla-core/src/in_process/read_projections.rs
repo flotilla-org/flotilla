@@ -1,10 +1,13 @@
 //! Read-side query projections over resource state and explicit runtime inputs.
 
 use super::*;
+use crate::event_sink::EventSink;
 
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
 pub(super) struct ReadProjections<'a> {
+    // Wired now for read-side operations introduced by later slices.
+    pub(super) _event_sink: Arc<dyn EventSink>,
     pub(super) backend: &'a ResourceBackend,
     pub(super) config: &'a ConfigStore,
     pub(super) host_registry: &'a crate::host_registry::HostRegistry,

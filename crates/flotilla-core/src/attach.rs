@@ -3,7 +3,10 @@
 use flotilla_protocol::ResultSet;
 
 use super::*;
-use crate::{environment_manager::ManagedEnvironmentKind, hop_chain::remote::NoopRemoteHopResolver, providers::registry::ProviderRegistry};
+use crate::{
+    environment_manager::ManagedEnvironmentKind, event_sink::EventSink, hop_chain::remote::NoopRemoteHopResolver,
+    providers::registry::ProviderRegistry,
+};
 
 /// Read-only fleet replica rows used while building the attach index.
 #[async_trait]
@@ -23,6 +26,8 @@ impl FleetRowsSource for CachedFleetRows<'_> {
 }
 
 pub(super) struct AttachResolver<'a> {
+    // Wired now so future attach operations can publish through the daemon port.
+    pub(super) _event_sink: Arc<dyn EventSink>,
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,

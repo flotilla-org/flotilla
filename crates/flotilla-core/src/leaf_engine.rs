@@ -30,6 +30,7 @@ use tokio::{
 
 use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
+    event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
 };
 
@@ -115,7 +116,7 @@ pub struct LeafSubscriptionTable {
 
 struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
     unable_since: Mutex<HashMap<uuid::Uuid, (UnableEvidenceKey, DateTime<Utc>)>>,
@@ -158,33 +159,33 @@ fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
 }
 
 impl LeafSubscriptionTable {
-    pub fn new(backend: ResourceBackend, event_tx: broadcast::Sender<DaemonEvent>, change_requests: ChangeRequestRefresher) -> Self {
-        Self::with_episode_limit(backend, event_tx, change_requests, 3)
+    pub fn new(backend: ResourceBackend, event_sink: Arc<dyn EventSink>, change_requests: ChangeRequestRefresher) -> Self {
+        Self::with_episode_limit(backend, event_sink, change_requests, 3)
     }
 
     pub fn with_episode_limit(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         episode_limit: u32,
     ) -> Self {
         let issues =
             IssueRefresher::new(backend.clone(), "unavailable".into(), Arc::new(UnavailableIssues), IssueRefreshCadence::default());
-        Self::with_issues_and_episode_limit(backend, event_tx, change_requests, issues, episode_limit)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, episode_limit)
     }
 
     pub fn with_issues(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
     ) -> Self {
-        Self::with_issues_and_episode_limit(backend, event_tx, change_requests, issues, 3)
+        Self::with_issues_and_episode_limit(backend, event_sink, change_requests, issues, 3)
     }
 
     fn with_issues_and_episode_limit(
         backend: ResourceBackend,
-        event_tx: broadcast::Sender<DaemonEvent>,
+        event_sink: Arc<dyn EventSink>,
         change_requests: ChangeRequestRefresher,
         issues: IssueRefresher,
         episode_limit: u32,
@@ -193,7 +194,7 @@ impl LeafSubscriptionTable {
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
-                event_tx,
+                event_sink,
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),
                 unable_since: Mutex::new(HashMap::new()),
@@ -507,7 +508,7 @@ impl LeafSubscriptionTable {
         match watcher {
             Some(LeafWatcher::WaitCaller { connection_id }) => {
                 fire.watcher_id = connection_id;
-                let _ = self.inner.event_tx.send(DaemonEvent::LeafFired(fire));
+                self.inner.event_sink.emit(DaemonEvent::LeafFired(fire));
                 self.finish(subscription_id).await;
             }
             Some(LeafWatcher::ReconcilerWake { convoy }) => {
@@ -2243,7 +2244,10 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let wake = ReconcilerWake { subscriptions: LeafSubscriptionTable::new(backend.clone(), event_tx, refresher), _marker: PhantomData };
+        let wake = ReconcilerWake {
+            subscriptions: LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher),
+            _marker: PhantomData,
+        };
         create_convoy(&backend, "delivery", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
         let vessels = backend.using::<Vessel>("flotilla");
         let vessel = vessels
@@ -2388,7 +2392,7 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx.clone(), refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx.clone()), refresher);
         let connection_id = uuid::Uuid::new_v4();
         let mut events = event_tx.subscribe();
 
@@ -2545,7 +2549,7 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend, event_tx.clone(), refresher);
+        let table = LeafSubscriptionTable::new(backend, Arc::new(event_tx.clone()), refresher);
         let mut events = event_tx.subscribe();
         let mut usage_leaf =
             leaf(LeafAddress::Usage { provider: provider.to_string(), account: account.to_string() }, ".windows.weekly.used-percent", "90");
@@ -2574,7 +2578,7 @@ mod tests {
             stale_after: Duration::from_secs(60),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let spec = ConvoySpec::builder()
             .workflow_ref("workflow".to_string())
@@ -2672,7 +2676,7 @@ mod tests {
             Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend, event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend, Arc::new(event_tx), refresher);
         let id = uuid::Uuid::new_v4();
         let fired_leaf = leaf(LeafAddress::Convoy { name: "held".to_string() }, ".status.phase", "Landed");
         table.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
@@ -2718,7 +2722,7 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let actuator = Arc::new(RecordingTurnDelivery::default());
         table.set_turn_delivery_actuator(actuator.clone()).await;
         let rule = TurnDeliveryRule::builder()
@@ -2912,7 +2916,7 @@ mod tests {
             stale_after: Duration::from_secs(60),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let spec = ConvoySpec::builder()
             .workflow_ref("workflow".to_string())
@@ -2996,7 +3000,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(16);
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), Arc::new(UnavailableChangeRequests), cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let created = convoys
             .create(
@@ -3060,7 +3064,7 @@ mod tests {
             stale_after: Duration::from_secs(60),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let mut spec = ConvoySpec::builder()
             .workflow_ref("workflow".to_string())
@@ -3259,7 +3263,7 @@ mod tests {
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
         let refresher =
             ChangeRequestRefresher::new(authority.clone(), "authority-root".to_string(), Arc::new(UnavailableChangeRequests), cadence);
-        let table = LeafSubscriptionTable::new(authority.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(authority.clone(), Arc::new(event_tx), refresher);
         let controller = tokio::spawn(
             ControllerLoop {
                 primary: convoys.clone(),
@@ -3301,7 +3305,7 @@ mod tests {
             stale_after: Duration::from_secs(120),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx.clone(), refresher.clone());
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx.clone()), refresher.clone());
         let connection_id = uuid::Uuid::new_v4();
         let mut events = event_tx.subscribe();
         let request = WaitSubscriptionRequest {
@@ -3337,7 +3341,7 @@ mod tests {
             stale_after: Duration::from_secs(120),
         };
         let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher.clone());
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher.clone());
         let connection_id = uuid::Uuid::new_v4();
         let request = WaitSubscriptionRequest {
             namespace: "flotilla".to_string(),
@@ -3422,7 +3426,7 @@ mod tests {
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
         let (event_tx, _) = broadcast::channel(16);
-        let table = LeafSubscriptionTable::new(reader, event_tx.clone(), refresher);
+        let table = LeafSubscriptionTable::new(reader, Arc::new(event_tx.clone()), refresher);
         let mut events = event_tx.subscribe();
         let subscription_id = table
             .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
@@ -3633,7 +3637,7 @@ mod tests {
             )
             .await
             .expect("keep local observation while waits finish");
-        let table = LeafSubscriptionTable::new(former_owner.clone(), event_tx.clone(), refresher.clone());
+        let table = LeafSubscriptionTable::new(former_owner.clone(), Arc::new(event_tx.clone()), refresher.clone());
         let mut events = event_tx.subscribe();
         let subscription_id = table
             .subscribe_wait(uuid::Uuid::new_v4(), WaitSubscriptionRequest {
@@ -3879,7 +3883,7 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let connection = uuid::Uuid::new_v4();
         let leaf: Leaf = "issue/github.com/flotilla-org/flotilla/2052 .state == closed".parse().expect("issue leaf");
         table
@@ -3946,7 +3950,7 @@ mod tests {
             freshness_demanded: Duration::from_secs(10),
             stale_after: Duration::from_secs(1),
         });
-        let table = LeafSubscriptionTable::with_issues(backend.clone(), event_tx, change_requests, issues);
+        let table = LeafSubscriptionTable::with_issues(backend.clone(), Arc::new(event_tx), change_requests, issues);
         let connection = uuid::Uuid::new_v4();
         table
             .subscribe_wait(connection, WaitSubscriptionRequest {
@@ -3986,7 +3990,7 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let table = LeafSubscriptionTable::new(backend.clone(), event_tx, refresher);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let actuator = Arc::new(RecordingTurnDelivery::default());
         table.set_turn_delivery_actuator(actuator.clone()).await;
         let rule = TurnDeliveryRule::builder()

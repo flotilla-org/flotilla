@@ -2209,7 +2209,7 @@ async fn run_build_plan_to_completion_with(
                 local_host: local_host.clone(),
                 environment_manager: empty_environment_manager().await,
             };
-            run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await
+            run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await
         }
     }
 }
@@ -2600,7 +2600,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2679,7 +2679,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2744,7 +2744,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
         _ => panic!("expected steps"),
     };
 
