@@ -1136,7 +1136,7 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
         backend: placement.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let vessel_result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let vessels = placement.using::<Vessel>(namespace).list().await.expect("feta Vessels");
             if !vessels.items.is_empty() {
@@ -1144,12 +1144,13 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
                 assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("feta authors its Vessel");
+    .await;
     controller_task.abort();
+    vessel_result.expect("feta authors its Vessel");
+    assert_eq!(placement.using::<Vessel>(namespace).list().await.expect("feta Vessels").items.len(), 1);
     assert!(dispatcher.using::<Vessel>(namespace).list().await.expect("kiwi Vessels").items.is_empty());
 }
 
