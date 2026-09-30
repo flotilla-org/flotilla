@@ -76,9 +76,9 @@ define_patch_kinds! {
     ConvoyBackfillCrewWork => NONE,
     ConvoyFailInit => DUPLICATE,
     ConvoyAdvanceWorkToReady => DUPLICATE,
-    ConvoyFail => DUPLICATE_RESETTLEMENT,
-    ConvoyRollUpPhase => DUPLICATE_CONTINUATION_RESETTLEMENT,
-    ConvoySettle => DUPLICATE_RESETTLEMENT,
+    ConvoyFail => DUPLICATE,
+    ConvoyRollUpPhase => &[LifecycleClass::Duplicate, LifecycleClass::Continuation],
+    ConvoySettle => DUPLICATE,
     ConvoySetSettlementAttention => NONE,
     ConvoyQueueSupervisorTurn => NONE,
     ConvoyAcknowledgeSupervisorTurn => NONE,
@@ -466,6 +466,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 status.phase = ConvoyPhase::Abandoned;
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::MarkConvoyAbandoned {
+                    expected_phase: ConvoyPhase::Abandoned,
                     finished_at: ts(30),
                     authority: WorkCompletionAuthority::HumanOverride,
                     reason: "already abandoned".to_string(),
@@ -842,10 +843,11 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
 fn continuation_transitions_keep_started_at_and_clear_finished_at() {
     let cases = [
         LifecycleCase {
-            name: "convoy reopens",
+            name: "convoy continues from landing",
             kind: PatchKind::ConvoyRollUpPhase,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(ts(30)), finished_at: None };
                 apply_and_replay(&mut status, &patch);
@@ -857,6 +859,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyRollUpWork,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = work_timestamps(&status);
                 let patch = ConvoyStatusPatch::RollUpWork {
                     work: "implement".to_string(),
@@ -873,6 +876,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyWorkInterrupted,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = work_timestamps(&status);
                 let patch = ConvoyStatusPatch::WorkInterrupted {
                     work: "implement".to_string(),
@@ -888,6 +892,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyHandoffCrewWork,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = crew_timestamps(&status);
                 let patch = ConvoyStatusPatch::HandoffCrewWork {
                     vessel: "implement".to_string(),
@@ -905,6 +910,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyResumeCrewWork,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = crew_timestamps(&status);
                 let patch = ConvoyStatusPatch::ResumeCrewWork {
                     vessel: "implement".to_string(),
@@ -921,6 +927,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyDeliverPendingBrief,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::DeliverPendingBrief {
@@ -943,6 +950,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::ConvoyRecordTurnDelivery,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::RecordTurnDelivery {
                     source: "review".to_string(),
@@ -1047,50 +1055,11 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
 fn settling_again_after_a_continuation_records_the_new_outcome_time() {
     let cases = [
         LifecycleCase {
-            name: "convoy roll-up changes settled outcome",
-            kind: PatchKind::ConvoyRollUpPhase,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                status.phase = ConvoyPhase::Failed;
-                let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Landed, started_at: None, finished_at: Some(ts(30)) };
-                apply_and_replay(&mut status, &patch);
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "convoy target settlement changes settled outcome",
-            kind: PatchKind::ConvoySettle,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                status.phase = ConvoyPhase::Failed;
-                let before = convoy_timestamps(&status);
-                let patch =
-                    ConvoyStatusPatch::Settle { disposition: "merged".to_string(), target_mismatches: Vec::new(), finished_at: ts(30) };
-                apply_and_replay(&mut status, &patch);
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
-            name: "convoy fail-fast changes settled outcome",
-            kind: PatchKind::ConvoyFail,
-            exercise: || {
-                let mut status = settled_convoy_status();
-                let before = convoy_timestamps(&status);
-                let patch = ConvoyStatusPatch::FailConvoy {
-                    cancelled_work: BTreeMap::new(),
-                    finished_at: ts(30),
-                    message: Some("work failure detected".to_string()),
-                };
-                apply_and_replay(&mut status, &patch);
-                (before, convoy_timestamps(&status))
-            },
-        },
-        LifecycleCase {
             name: "work completes after reopening",
             kind: PatchKind::ConvoyRollUpWork,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = work_timestamps(&status);
                 let reopen = ConvoyStatusPatch::RollUpWork {
                     work: "implement".to_string(),
@@ -1114,6 +1083,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
             kind: PatchKind::ConvoyMarkCrewCompleted,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = crew_timestamps(&status);
                 let hand_back = ConvoyStatusPatch::HandoffCrewWork {
                     vessel: "implement".to_string(),
@@ -1142,6 +1112,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
             kind: PatchKind::ConvoyMarkCrewFailed,
             exercise: || {
                 let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Landing;
                 let before = crew_timestamps(&status);
                 let patch = ConvoyStatusPatch::MarkCrewFailed {
                     vessel: "implement".to_string(),

@@ -1,11 +1,47 @@
 //! Attach target indexing, role resolution, and plan construction.
 
-use flotilla_protocol::ResultSet;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
-use super::*;
+use async_trait::async_trait;
+use flotilla_protocol::{
+    arg::Arg,
+    commands::AttachMode,
+    qualified_path::HostId,
+    result_set::{CheckoutRow, Rows},
+    AttachBinding, CanonicalHostId, EnvironmentId, FleetListRow, FleetStaleness, HostName, RepoIdentity, ResolvedAttachAction,
+    ResolvedAttachPlan, ResultSet,
+};
+use flotilla_resources::{
+    terminal_session_attach_target, Convoy as ResourceConvoy, Environment as ResourceEnvironment, Project, RepositoryKey, ResourceBackend,
+    ResourceProvenance, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+};
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+
+use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
 use crate::{
-    environment_manager::ManagedEnvironmentKind, event_sink::EventSink, hop_chain::remote::NoopRemoteHopResolver,
-    providers::registry::ProviderRegistry,
+    aggregator_projection::AggregatorProjectionState,
+    config::ConfigStore,
+    environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
+    event_sink::EventSink,
+    fleet::FleetService,
+    hop_chain::{
+        environment::DockerEnvironmentHopResolver,
+        remote::{ssh_resolver_from_config, NoopRemoteHopResolver},
+        resolver::HopResolver,
+        terminal::NoopTerminalHopResolver,
+        Hop, HopPlan, ResolutionContext,
+    },
+    path_context::ExecutionEnvironmentPath,
+    project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
+    providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry},
+    repo_state::RepoState,
 };
 
 /// Read-only fleet replica rows used while building the attach index.
@@ -902,11 +938,13 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use flotilla_resources::HostSpec;
+    use flotilla_protocol::{Command, CommandAction, CommandValue};
+    use flotilla_resources::{Host as ResourceHost, HostSpec};
 
     use super::*;
-    use crate::in_process::tests::{
-        create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta,
+    use crate::{
+        daemon::DaemonHandle,
+        in_process::tests::{create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta},
     };
 
     struct FakeFleetRows(Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)>);

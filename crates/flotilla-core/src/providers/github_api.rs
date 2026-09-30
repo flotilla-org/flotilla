@@ -10,7 +10,19 @@ use chrono::{DateTime, TimeZone, Utc};
 use crate::providers::{run_output, ChannelLabel, CommandRunner};
 
 const MAX_PER_PAGE: usize = 100;
+const MIN_REMAINING_BUDGET: u32 = 100;
 const RATE_LIMIT_PREFIX: &str = "github rate limited (budget=";
+
+fn is_issue_observation(endpoint: &str) -> bool {
+    endpoint.starts_with("repos/") && endpoint.contains("/issues?")
+}
+
+fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+    raw.lines().take_while(|line| !line.is_empty()).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
 
 /// Extract a GitHub rate-limit reset timestamp from a provider error.
 ///
@@ -19,6 +31,12 @@ const RATE_LIMIT_PREFIX: &str = "github rate limited (budget=";
 /// reliable way to distinguish a rate limit from an ordinary failure.
 pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
     error.strip_prefix(RATE_LIMIT_PREFIX)?.rsplit_once("reset_at=")?.1.strip_suffix(')')?.parse().ok()
+}
+
+/// Only the REST core budget controls issue observation. Search has its own quota.
+pub fn core_rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
+    error.strip_prefix(RATE_LIMIT_PREFIX)?.strip_prefix("REST core")?;
+    rate_limit_reset(error)
 }
 
 /// Clamp a limit to GitHub's max per_page (100), warning if truncated.
@@ -32,6 +50,7 @@ pub fn clamp_per_page(limit: usize) -> usize {
 }
 
 /// Parsed response from `gh api --include`.
+#[derive(Debug)]
 pub struct GhApiResponse {
     pub status: u16,
     pub etag: Option<String>,
@@ -96,11 +115,26 @@ pub(crate) fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<
         return None;
     }
 
-    let reset = raw.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("x-ratelimit-reset").then_some(value.trim())
-    })?;
-    Some(rate_limit_error_for(budget, reset))
+    let reset = response_header(raw, "x-ratelimit-reset")?;
+    let budget = if budget == "REST core" {
+        response_header(raw, "x-ratelimit-resource").map(|resource| format!("REST {resource}")).unwrap_or_else(|| budget.to_string())
+    } else {
+        budget.to_string()
+    };
+    Some(rate_limit_error_for(&budget, reset))
+}
+
+fn low_budget_from_response(raw: &str) -> Option<(DateTime<Utc>, String)> {
+    let remaining = response_header(raw, "x-ratelimit-remaining")?.parse::<u32>().ok()?;
+    if response_header(raw, "x-ratelimit-resource")? != "core" {
+        return None;
+    }
+    if remaining >= MIN_REMAINING_BUDGET {
+        return None;
+    }
+    let reset = response_header(raw, "x-ratelimit-reset")?;
+    let reset_at = Utc.timestamp_opt(reset.parse().ok()?, 0).single()?;
+    Some((reset_at, rate_limit_error_for(&format!("REST core remaining {remaining}"), reset)))
 }
 
 #[async_trait]
@@ -119,12 +153,13 @@ struct CacheEntry {
 /// Client that wraps `gh api` with ETag-based conditional request caching.
 pub struct GhApiClient {
     cache: Mutex<HashMap<String, CacheEntry>>,
+    budget_backoff: Mutex<Option<(DateTime<Utc>, String)>>,
     runner: Arc<dyn CommandRunner>,
 }
 
 impl GhApiClient {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { cache: Mutex::new(HashMap::new()), runner }
+        Self { cache: Mutex::new(HashMap::new()), budget_backoff: Mutex::new(None), runner }
     }
 }
 
@@ -137,6 +172,13 @@ impl GhApi for GhApiClient {
     }
 
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
+        if is_issue_observation(endpoint) {
+            if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
+                if *reset > Utc::now() {
+                    return Err(message.clone());
+                }
+            }
+        }
         // Build args
         let cached_etag = {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -185,6 +227,15 @@ impl GhApi for GhApiClient {
                 body: parsed.body.clone(),
                 has_next_page: parsed.has_next_page,
             });
+        }
+
+        if parsed.status == 200 && is_issue_observation(endpoint) {
+            if let Some((reset, message)) = low_budget_from_response(&output.stdout) {
+                *self.budget_backoff.lock().expect("GitHub budget lock poisoned") = Some((reset, message.clone()));
+                // Keep the ETag and body for a conditional retry after reset, but
+                // report the exhausted budget now so the host condition is visible.
+                return Err(message);
+            }
         }
 
         Ok(parsed)
@@ -258,5 +309,54 @@ mod tests {
         let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
         let error = rate_limit_error_from_response(raw, "REST core").expect("rate limit error");
         assert_eq!(rate_limit_reset(&error).expect("reset timestamp"), Utc.timestamp_opt(1784736000, 0).single().expect("valid timestamp"));
+    }
+
+    #[test]
+    fn exhausted_search_budget_is_distinct_from_core_budget() {
+        let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Resource: search\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
+        let error = rate_limit_error_from_response(raw, "REST core").expect("rate limit error");
+        assert!(error.contains("budget=REST search"));
+    }
+
+    #[tokio::test]
+    async fn low_remaining_budget_stops_further_requests_until_reset() {
+        let reset = Utc::now().timestamp() + 3600;
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+            Ok(format!("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]")),
+            Ok("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\n\r\n[]".into()),
+        ]));
+        let api = GhApiClient::new(runner.clone());
+        let label = ChannelLabel::Default;
+
+        let first = api
+            .get_with_headers("repos/owner/repo/issues?state=all", Path::new("/host"), &label)
+            .await
+            .expect_err("low budget must surface");
+        api.get_with_headers("repos/owner/repo/pulls", Path::new("/host"), &label).await.expect("PR polling must continue");
+        let second =
+            api.get_with_headers("repos/owner/other/issues?state=all", Path::new("/host"), &label).await.expect_err("budget must back off");
+
+        assert!(rate_limit_reset(&first).is_some());
+        assert_eq!(first, second);
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_rate_limit_does_not_suspend_core_issue_observation() {
+        let reset = Utc::now().timestamp() + 60;
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+            Ok(format!(
+                "HTTP/2 200 OK\r\nX-RateLimit-Resource: search\r\nX-RateLimit-Remaining: 20\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{}}"
+            )),
+            Ok("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 4800\r\n\r\n[]".into()),
+        ]));
+        let api = GhApiClient::new(runner.clone());
+        let label = ChannelLabel::Default;
+
+        api.get_with_headers("search/issues?q=bug", Path::new("/host"), &label).await.expect("search has a separate budget");
+        api.get_with_headers("repos/owner/repo/issues?state=all", Path::new("/host"), &label)
+            .await
+            .expect("core issue observation remains available");
+        assert_eq!(runner.calls().len(), 2);
     }
 }

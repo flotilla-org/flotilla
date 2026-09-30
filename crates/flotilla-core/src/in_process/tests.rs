@@ -6,7 +6,7 @@ use flotilla_resources::{
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
     EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentFacts,
-    FulfilmentKindSpec, HarnessFacts, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
     ProjectRepositorySpec, RepositoryStatus, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
@@ -2352,6 +2352,16 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         Some(&r#"{"claude-max":["github.com-flotilla-org-flotilla"],"github-crew-pr":["github.com-flotilla-org-flotilla"]}"#.to_string())
     );
     assert_eq!(reviewer.metadata.annotations, coder_meta.annotations);
+
+    let convoy = convoys.get("convoy-two-crew").await.expect("convoy");
+    let mut terminal_status = convoy.status.expect("status");
+    terminal_status.phase = flotilla_resources::ConvoyPhase::Landed;
+    convoys.update_status("convoy-two-crew", &convoy.metadata.resource_version, &terminal_status).await.expect("landed convoy");
+    let error = daemon.crew_handoff_internal(&requested, "reviewer", "Late handoff").await.expect_err("terminal handoff");
+    assert!(error.contains("terminal"), "{error}");
+    assert_eq!(convoys.get("convoy-two-crew").await.expect("convoy").status.expect("status"), terminal_status);
+    let reviewer_after = sessions.get(&reviewer.metadata.name).await.expect("reviewer");
+    assert_eq!(reviewer_after.metadata.resource_version, reviewer.metadata.resource_version);
 }
 
 pub(super) async fn create_identity_convoy(backend: &ResourceBackend, record: &str, role: &str, project: Option<&str>) {

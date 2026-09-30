@@ -1072,8 +1072,106 @@ impl ProjectService<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use flotilla_resources::{InMemoryBackend, SystemClock};
+
     use super::*;
     use crate::ops_entry::OperationalEntryFile;
+
+    struct FakeRepositoryInspector {
+        inspection: ProjectDeclarationInspection,
+    }
+
+    #[async_trait]
+    impl RepositoryInspector for FakeRepositoryInspector {
+        async fn inspect_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
+            Ok(self.inspection.repository.clone())
+        }
+
+        async fn inspect_project_declaration(&self, _: &Path) -> Result<ProjectDeclarationInspection, String> {
+            Ok(self.inspection.clone())
+        }
+    }
+
+    struct FakeProjectOperations {
+        inspector: Arc<dyn RepositoryInspector>,
+        identity_resolutions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProjectOperations for FakeProjectOperations {
+        async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
+            Ok(Arc::clone(&self.inspector))
+        }
+
+        async fn inspect_repository_path(&self, _: &Path, _: Option<&str>) -> Result<RepositoryInspection, String> {
+            Err("unexpected direct repository inspection".into())
+        }
+
+        async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+            RepositorySpec::remote(remote)
+        }
+
+        async fn resolve_forge_identity(&self, spec: RepositorySpec) -> Result<RepositorySpec, String> {
+            self.identity_resolutions.fetch_add(1, Ordering::SeqCst);
+            Ok(spec)
+        }
+
+        async fn reap_ensured_convoy(&self, _: &str, _: &str, _: &str, _: bool) -> Result<(), String> {
+            Err("unexpected convoy reap".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn project_registration_uses_injected_inspection_and_identity_resolution() {
+        let temp = tempfile::tempdir().expect("checkout directory");
+        let remote = "https://github.com/example/app";
+        let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
+        let operations = FakeProjectOperations {
+            inspector: Arc::new(FakeRepositoryInspector {
+                inspection: ProjectDeclarationInspection {
+                    repository: RepositoryInspection {
+                        spec: repository_spec.clone(),
+                        checkout: crate::repository_inspection::LocalCheckoutInspection::builder()
+                            .path(temp.path().to_path_buf())
+                            .host_ref("local-host".to_string())
+                            .git_ref("main".to_string())
+                            .is_main(true)
+                            .build(),
+                        transport_url: Some(remote.to_string()),
+                        replaces_prior_repository: false,
+                    },
+                    yaml: format!("name: app\nmembers:\n  - alias: app\n    url: {remote}\n    roles: [code]\n"),
+                    commit: "abc123".into(),
+                },
+            }),
+            identity_resolutions: AtomicUsize::new(0),
+        };
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let namespace = std::sync::RwLock::new("flotilla".to_string());
+        let repository_keys_by_path = RwLock::new(HashMap::new());
+        let service = ProjectService {
+            resource_backend: &backend,
+            observed_resource_backend: &observed,
+            clock: &clock,
+            namespace: &namespace,
+            _event_sink: Arc::new(crate::event_sink::RecordingEventSink::default()),
+            repository_index: RepositoryIndex { keys_by_path: &repository_keys_by_path },
+            operations: &operations,
+        };
+
+        assert_eq!(
+            service.project_register(temp.path().to_str().expect("UTF-8 checkout path")).await.expect("register"),
+            ("app".into(), 1)
+        );
+        assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
+        let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
+        assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
+        assert_eq!(project.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
+    }
 
     #[test]
     fn omitted_repos_expand_to_current_code_members_on_each_collection() {

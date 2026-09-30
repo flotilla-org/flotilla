@@ -1258,6 +1258,8 @@ pub enum ConvoyStatusPatch {
     AdvanceWorkToReady {
         ready: BTreeMap<String, DateTime<Utc>>,
     },
+    /// `cancelled_work` is computed from non-terminal work. Apply checks that
+    /// condition again because a concurrent patch may have settled a work item.
     FailConvoy {
         cancelled_work: BTreeMap<String, DateTime<Utc>>,
         finished_at: DateTime<Utc>,
@@ -1299,6 +1301,9 @@ pub enum ConvoyStatusPatch {
         roles: BTreeSet<String>,
         message: String,
     },
+    /// One-shot work outcomes accept non-terminal input or a duplicate of the
+    /// same outcome. The apply path rejects a different terminal outcome so
+    /// its sticky finished_at cannot be misattributed to this transition.
     ForceWorkCompleted {
         work: String,
         finished_at: DateTime<Utc>,
@@ -1314,6 +1319,7 @@ pub enum ConvoyStatusPatch {
         finished_at: DateTime<Utc>,
     },
     MarkConvoyAbandoned {
+        expected_phase: ConvoyPhase,
         finished_at: DateTime<Utc>,
         authority: WorkCompletionAuthority,
         reason: String,
@@ -1399,13 +1405,15 @@ pub enum ConvoyStatusPatch {
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
-        // Abandonment is an operator-authored terminal boundary. A controller
-        // may have computed any of the patches below from an older Active
-        // resource version; optimistic retry reapplies that patch to the
-        // current status, so accepting it here would resurrect the convoy and
-        // erase its terminal history. Once stamped, the historical record is
-        // immutable, including under duplicate abandon requests.
-        if status.phase == ConvoyPhase::Abandoned && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. }) {
+        // Optimistic retry can reapply a patch computed from an older phase.
+        // Terminal outcomes reject stale and duplicate patches. An explicit
+        // abandon may override a terminal outcome only when its caller saw
+        // that exact phase. Mutation audit records remain appendable, and
+        // SetStalled may clear stale attention.
+        if status.phase.is_terminal()
+            && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. })
+            && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
+        {
             return;
         }
         match self {
@@ -1485,8 +1493,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.message = message.clone();
                 for (work, cancelled_at) in cancelled_work {
                     if let Some(state) = status.work.get_mut(work) {
-                        state.phase = WorkPhase::Cancelled;
-                        state.finished_at.get_or_insert(*cancelled_at);
+                        if !state.phase.is_terminal() {
+                            state.phase = WorkPhase::Cancelled;
+                            state.finished_at.get_or_insert(*cancelled_at);
+                        }
                     }
                 }
                 clear_operator_pending_brief(status);
@@ -1590,6 +1600,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::ForceWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Complete {
+                        return;
+                    }
                     state.phase = WorkPhase::Complete;
                     state.completion_authority = WorkCompletionAuthority::HumanOverride;
                     state.finished_at.get_or_insert(*finished_at);
@@ -1599,6 +1612,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Failed {
+                        return;
+                    }
                     state.phase = WorkPhase::Failed;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
@@ -1606,13 +1622,19 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkWorkCancelled { work, finished_at } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    if state.phase.is_terminal() && state.phase != WorkPhase::Cancelled {
+                        return;
+                    }
                     state.phase = WorkPhase::Cancelled;
                     state.finished_at.get_or_insert(*finished_at);
                 }
             }
-            Self::MarkConvoyAbandoned { finished_at, authority, reason } => {
+            Self::MarkConvoyAbandoned { expected_phase, finished_at, authority, reason } => {
+                if status.phase != *expected_phase {
+                    return;
+                }
                 status.phase = ConvoyPhase::Abandoned;
-                status.finished_at.get_or_insert(*finished_at);
+                status.finished_at = Some(*finished_at);
                 let actor = match authority {
                     WorkCompletionAuthority::CrewRollup => "crew rollup".to_string(),
                     WorkCompletionAuthority::HumanOverride => "human override".to_string(),
@@ -1987,8 +2009,13 @@ pub mod external_patches {
         ConvoyStatusPatch::MarkWorkCancelled { work, finished_at }
     }
 
-    pub fn mark_convoy_abandoned(finished_at: DateTime<Utc>, authority: WorkCompletionAuthority, reason: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkConvoyAbandoned { finished_at, authority, reason }
+    pub fn mark_convoy_abandoned(
+        expected_phase: ConvoyPhase,
+        finished_at: DateTime<Utc>,
+        authority: WorkCompletionAuthority,
+        reason: String,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkConvoyAbandoned { expected_phase, finished_at, authority, reason }
     }
 
     pub fn mark_crew_completed(

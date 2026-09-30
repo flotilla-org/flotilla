@@ -5,26 +5,29 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
-    providers::{github_api::rate_limit_reset, issue_tracker::IssueProvider},
+    providers::{
+        github_api::{core_rate_limit_reset, rate_limit_reset},
+        issue_tracker::IssueProvider,
+    },
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     DaemonEvent, DemandBackedMetadata, IssueChangeset, IssueRef, IssueRow, IssueSource, IssueState, QueryId, QueryScope,
     ResultSetCondition, ResultSetState,
 };
-use flotilla_resources::ResolvedIssueSourceBinding;
+use flotilla_resources::{ConditionValue, HostCondition, ResolvedIssueSourceBinding};
 use futures::{future::BoxFuture, stream, FutureExt, StreamExt};
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -33,6 +36,10 @@ const PAGE_SIZE: usize = 50;
 const MAX_CONCURRENT_SOURCES: usize = 8;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_JITTER: Duration = Duration::from_secs(5);
+
+fn is_github_source(source: &IssueSource) -> bool {
+    matches!(source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
+}
 
 #[async_trait]
 pub(crate) trait IssueMaterializationResolver: Send + Sync {
@@ -65,6 +72,13 @@ struct ActiveMaterialization {
     task: JoinHandle<()>,
 }
 
+struct MaterializationContext {
+    resolver: Arc<dyn IssueMaterializationResolver>,
+    state: AggregatorProjectionState,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    shared_refresh: Arc<SharedIssueRefresh>,
+}
+
 impl ActiveMaterialization {
     fn stop(self) {
         self.cancel.cancel();
@@ -77,6 +91,157 @@ pub(crate) struct IssueMaterializer {
     resolver: Arc<dyn IssueMaterializationResolver>,
     event_tx: broadcast::Sender<DaemonEvent>,
     active: HashMap<QueryId, ActiveMaterialization>,
+    shared_refresh: Arc<SharedIssueRefresh>,
+}
+
+#[derive(Default)]
+struct SharedIssueRefresh {
+    sources: StdMutex<HashMap<IssueSource, Arc<SourceRefresh>>>,
+    health: IssuePollingHealth,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IssuePollingHealth {
+    backoff: Arc<StdMutex<BudgetBackoff>>,
+}
+
+#[derive(Debug, Default)]
+struct BudgetBackoff {
+    current: Option<(DateTime<Utc>, String)>,
+}
+
+impl IssuePollingHealth {
+    pub(crate) fn note(&self, message: &str) {
+        if let Some(reset) = core_rate_limit_reset(message) {
+            let mut backoff = self.backoff.lock().expect("issue polling health lock poisoned");
+            if backoff.current.as_ref().is_none_or(|(current, _)| reset > *current) {
+                backoff.current = Some((reset, message.to_string()));
+            }
+        }
+    }
+
+    fn active_error(&self) -> Option<String> {
+        self.backoff
+            .lock()
+            .expect("issue polling health lock poisoned")
+            .current
+            .as_ref()
+            .and_then(|(reset, message)| (*reset > Utc::now()).then(|| message.clone()))
+    }
+
+    pub(crate) fn condition(&self) -> Option<HostCondition> {
+        let message = self.active_error()?;
+        Some(
+            HostCondition::builder()
+                .condition_type("Forge/GitHubRateBudget")
+                .value(ConditionValue::False)
+                .reason("LowRemainingBudget")
+                .message(message)
+                .observed_at(Utc::now())
+                .blocks_readiness(false)
+                .build(),
+        )
+    }
+}
+
+struct SourceRefresh {
+    provider: Arc<dyn IssueProvider>,
+    cursors: StdMutex<HashMap<QueryId, DateTime<Utc>>>,
+    last: Mutex<Option<SourceRefreshResult>>,
+}
+
+struct SourceRefreshResult {
+    fetched_at: tokio::time::Instant,
+    since: DateTime<Utc>,
+    next_cursor: DateTime<Utc>,
+    result: Result<IssueChangeset, String>,
+}
+
+impl SharedIssueRefresh {
+    fn register(&self, source: &IssueSource, query: &QueryId, cursor: &str, provider: &Arc<dyn IssueProvider>) {
+        let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
+        let entry = sources.entry(source.clone()).or_insert_with(|| {
+            Arc::new(SourceRefresh { provider: Arc::clone(provider), cursors: StdMutex::new(HashMap::new()), last: Mutex::new(None) })
+        });
+        let cursor = cursor.parse().expect("materializer creates RFC 3339 cursors");
+        entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor);
+    }
+
+    fn unregister(&self, query: &QueryId) {
+        let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
+        sources.retain(|_, entry| {
+            let mut cursors = entry.cursors.lock().expect("shared issue cursors lock poisoned");
+            cursors.remove(query);
+            !cursors.is_empty()
+        });
+    }
+
+    fn unregister_source(&self, source: &IssueSource, query: &QueryId) {
+        let mut sources = self.sources.lock().expect("shared issue sources lock poisoned");
+        if let Some(entry) = sources.get(source) {
+            let mut cursors = entry.cursors.lock().expect("shared issue cursors lock poisoned");
+            cursors.remove(query);
+            if cursors.is_empty() {
+                drop(cursors);
+                sources.remove(source);
+            }
+        }
+    }
+
+    fn advance(&self, source: &IssueSource, query: &QueryId, cursor: &str) {
+        if let Some(entry) = self.sources.lock().expect("shared issue sources lock poisoned").get(source) {
+            let cursor = cursor.parse().expect("materializer creates RFC 3339 cursors");
+            entry.cursors.lock().expect("shared issue cursors lock poisoned").insert(query.clone(), cursor);
+        }
+    }
+
+    async fn changed_since(&self, source: &IssueSource, query: &QueryId, since: &str) -> (String, Result<IssueChangeset, String>) {
+        if is_github_source(source) {
+            if let Some(message) = self.health.active_error() {
+                return (since.to_string(), Err(message));
+            }
+        }
+        let Some(entry) = self.sources.lock().expect("shared issue sources lock poisoned").get(source).cloned() else {
+            return (since.to_string(), Err(format!("issue source {} is no longer registered", source.scope)));
+        };
+        let since_time = match since.parse::<DateTime<Utc>>() {
+            Ok(time) => time,
+            Err(error) => return (since.to_string(), Err(format!("invalid issue refresh cursor: {error}"))),
+        };
+        let mut last = entry.last.lock().await;
+        if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < REFRESH_INTERVAL) {
+            if since_time >= cached.since {
+                if since_time >= cached.next_cursor {
+                    return (since.to_string(), Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false }));
+                }
+                if since_time == cached.since {
+                    return (cached.next_cursor.to_rfc3339(), cached.result.clone());
+                }
+                // This query loaded a newer initial page than the oldest query.
+                // Updates carry timestamps and can be filtered; closures do not.
+                // Keep its cursor so the next source poll can verify closures.
+                let mut next_cursor = cached.next_cursor.to_rfc3339();
+                let filtered = cached.result.clone().map(|mut changes| {
+                    changes.updated.retain(|issue| issue.as_of >= since_time);
+                    if !changes.closed.is_empty() {
+                        next_cursor = since.to_string();
+                    }
+                    changes.closed.clear();
+                    changes
+                });
+                return (next_cursor, filtered);
+            }
+        }
+        let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
+        let next_cursor = Utc::now();
+        let result = entry.provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
+        if let Err(message) = &result {
+            self.health.note(message);
+        }
+        *last = Some(SourceRefreshResult { fetched_at: tokio::time::Instant::now(), since: oldest, next_cursor, result: result.clone() });
+        tracing::debug!(%query, source = %source.scope, "shared issue source refresh");
+        (next_cursor.to_rfc3339(), result)
+    }
 }
 
 impl IssueMaterializer {
@@ -84,7 +249,12 @@ impl IssueMaterializer {
     where
         R: IssueMaterializationResolver + 'static,
     {
-        Self { state, resolver, event_tx, active: HashMap::new() }
+        Self { state, resolver, event_tx, active: HashMap::new(), shared_refresh: Arc::new(SharedIssueRefresh::default()) }
+    }
+
+    pub(crate) fn with_polling_health(mut self, health: IssuePollingHealth) -> Self {
+        self.shared_refresh = Arc::new(SharedIssueRefresh { sources: StdMutex::new(HashMap::new()), health });
+        self
     }
 
     /// Reconcile complete demand, including each query's materialization
@@ -100,6 +270,7 @@ impl IssueMaterializer {
         for query in stale {
             if let Some(active) = self.active.remove(&query) {
                 active.stop();
+                self.shared_refresh.unregister(&query);
             }
         }
 
@@ -112,9 +283,12 @@ impl IssueMaterializer {
             let task = tokio::spawn(run_materialization(
                 query.clone(),
                 generation,
-                Arc::clone(&self.resolver),
-                self.state.clone(),
-                self.event_tx.clone(),
+                MaterializationContext {
+                    resolver: Arc::clone(&self.resolver),
+                    state: self.state.clone(),
+                    event_tx: self.event_tx.clone(),
+                    shared_refresh: Arc::clone(&self.shared_refresh),
+                },
                 cancel.clone(),
                 intent_rx,
             ));
@@ -198,15 +372,14 @@ fn suspended_until(query: &QueryId, message: &str) -> Option<tokio::time::Instan
 async fn run_materialization(
     query: QueryId,
     generation: u64,
-    resolver: Arc<dyn IssueMaterializationResolver>,
-    state: AggregatorProjectionState,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    context: MaterializationContext,
     cancel: CancellationToken,
     mut intents: mpsc::Receiver<MaterializationIntent>,
 ) {
+    let MaterializationContext { resolver, state, event_tx, shared_refresh } = context;
     let mut window = tokio::select! {
         _ = cancel.cancelled() => return,
-        window = load_window(&query, generation, resolver.as_ref(), &state, &event_tx) => window,
+        window = load_window(&query, generation, resolver.as_ref(), &shared_refresh, &state, &event_tx) => window,
     };
     let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_INTERVAL, REFRESH_INTERVAL);
     loop {
@@ -227,7 +400,7 @@ async fn run_materialization(
                 Some(MaterializationIntent::Refresh) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = refresh_window(&query, generation, resolver.as_ref(), &mut window, &state, &event_tx) => {}
+                        _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx) => {}
                     }
                 }
                 None => return,
@@ -235,12 +408,12 @@ async fn run_materialization(
             _ = refresh.tick(), if suspended.is_none_or(|deadline| deadline <= tokio::time::Instant::now()) => {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    _ = refresh_window(&query, generation, resolver.as_ref(), &mut window, &state, &event_tx) => {}
+                    _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx) => {}
                 }
             },
             _ = tokio::time::sleep_until(suspended.unwrap_or_else(tokio::time::Instant::now)), if suspended.is_some() => {
                 window.suspended_until = None;
-                refresh_window(&query, generation, resolver.as_ref(), &mut window, &state, &event_tx).await;
+                refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx).await;
             },
         }
     }
@@ -250,6 +423,7 @@ async fn load_window(
     query: &QueryId,
     generation: u64,
     resolver: &dyn IssueMaterializationResolver,
+    shared_refresh: &SharedIssueRefresh,
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) -> MaterializedWindow {
@@ -258,11 +432,13 @@ async fn load_window(
     let bindings = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
+            shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, "query scope has no issue source")];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
         Err(message) => {
+            shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, message)];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
@@ -274,6 +450,11 @@ async fn load_window(
         let mut params = base_params.clone();
         params.match_fields = binding.filter.match_fields.into_iter().map(|(field, value)| (field, value.to_values())).collect();
         async move {
+            if is_github_source(&source) {
+                if let Some(message) = shared_refresh.health.active_error() {
+                    return Err(unavailable(Some(source), message));
+                }
+            }
             let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
             // Capture before the request. Re-reading changes is safe; skipping an
             // update that arrived during the request is not.
@@ -306,18 +487,29 @@ async fn load_window(
     let mut windows = Vec::new();
     let mut conditions = Vec::new();
     let mut suspension = None;
+    let mut failed_sources = Vec::new();
     for result in loaded {
         match result {
             Ok((window, source_rows)) => {
+                shared_refresh.register(&window.source, query, &window.refresh_cursor, &window.provider);
                 rows.extend(source_rows.into_iter().map(|row| (row.reference.clone(), row)));
                 windows.push(window);
             }
             Err(condition) => {
-                if let ResultSetCondition::IssueSourceUnavailable { message, .. } = &condition {
+                if let ResultSetCondition::IssueSourceUnavailable { source, message } = &condition {
+                    if let Some(source) = source {
+                        failed_sources.push(source.clone());
+                    }
+                    shared_refresh.health.note(message);
                     suspension = suspended_until(query, message);
                 }
                 conditions.push(condition);
             }
+        }
+    }
+    for source in failed_sources {
+        if !windows.iter().any(|window: &IssueSourceWindow| window.source == source) {
+            shared_refresh.unregister_source(&source, query);
         }
     }
     let rows = rows.into_values().collect::<Vec<_>>();
@@ -386,6 +578,7 @@ async fn refresh_window(
     query: &QueryId,
     generation: u64,
     resolver: &dyn IssueMaterializationResolver,
+    shared_refresh: &SharedIssueRefresh,
     window: &mut MaterializedWindow,
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
@@ -398,11 +591,11 @@ async fn refresh_window(
     {
         // Provider-specific fields are not all present in normalized Issues,
         // so changed-since results cannot be safely filtered client-side.
-        *window = load_window(query, generation, resolver, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
         return;
     }
     if window.sources.is_empty() || window.needs_full_reload {
-        *window = load_window(query, generation, resolver, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
         return;
     }
 
@@ -410,15 +603,15 @@ async fn refresh_window(
         .sources
         .iter()
         .enumerate()
-        .map(|(index, source)| {
-            (index, Arc::clone(&source.provider), source.source.clone(), source.refresh_cursor.clone(), Utc::now().to_rfc3339())
-        })
+        .map(|(index, source)| (index, source.source.clone(), source.refresh_cursor.clone()))
         .collect::<Vec<_>>();
-    let mut futures = Vec::<BoxFuture<'static, (usize, String, Result<IssueChangeset, String>)>>::with_capacity(requests.len());
-    for request in requests {
-        futures.push(changed_since(request).boxed());
-    }
-    let results = stream::iter(futures).buffer_unordered(MAX_CONCURRENT_SOURCES).collect::<Vec<_>>().await;
+    let results = stream::iter(requests.into_iter().map(|(index, source, since)| async move {
+        let (next_cursor, result) = shared_refresh.changed_since(&source, query, &since).await;
+        (index, next_cursor, result)
+    }))
+    .buffer_unordered(MAX_CONCURRENT_SOURCES)
+    .collect::<Vec<_>>()
+    .await;
 
     let mut changed = HashMap::<IssueRef, IssueRow>::new();
     let mut removed = HashSet::<IssueRef>::new();
@@ -470,8 +663,11 @@ async fn refresh_window(
                     }
                 }
                 source.refresh_cursor = next_cursor;
+                shared_refresh.advance(&source.source, query, &source.refresh_cursor);
             }
             Err(message) => {
+                shared_refresh.unregister_source(&source.source, query);
+                shared_refresh.health.note(&message);
                 if let Some(deadline) = suspended_until(query, &message) {
                     window.suspended_until = Some(deadline);
                 }
@@ -481,7 +677,7 @@ async fn refresh_window(
         }
     }
     if overflowed || boundary_invalidated {
-        *window = load_window(query, generation, resolver, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
         return;
     }
 
@@ -568,12 +764,6 @@ async fn query_page(
 fn issue_matches_query(issue: &flotilla_protocol::Issue, query: &QueryId) -> bool {
     let QueryId::Issues { label, .. } = query else { return false };
     label.as_ref().is_none_or(|label| issue.labels.iter().any(|candidate| candidate.eq_ignore_ascii_case(label)))
-}
-
-async fn changed_since(
-    (index, provider, source, since, next_cursor): (usize, Arc<dyn IssueProvider>, IssueSource, String, String),
-) -> (usize, String, Result<IssueChangeset, String>) {
-    (index, next_cursor, provider.list_changed_since(&source, &since, PAGE_SIZE).await)
 }
 
 #[cfg(test)]
@@ -886,6 +1076,111 @@ mod tests {
         assert_eq!(result.rows.as_issues().expect("issue rows")[0].reference, IssueRef { source, id: "WIDGET-123".into() });
         assert!(!result.state.demand.expect("demand metadata").has_more);
         assert!(result.state.conditions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_project_queries_for_one_repository_share_an_incremental_refresh() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("first-checkout");
+        let second = project_query("second-checkout");
+        let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
+        let mut changed = issue("2");
+        changed.as_of = Utc::now() + ChronoDuration::seconds(1);
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["1"], false), page(&["1"], false)], vec![IssueChangeset {
+            updated: vec![changed],
+            closed: vec![],
+            has_more: false,
+        }]));
+        let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
+        let (event_tx, mut events) = broadcast::channel(8);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let first_generation = subscribe(&state, &first);
+        let second_generation = subscribe(&state, &second);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
+        next_event(&mut events).await;
+        next_event(&mut events).await;
+
+        materializer.refresh(&first);
+        materializer.refresh(&second);
+        next_event(&mut events).await;
+        next_event(&mut events).await;
+
+        assert_eq!(provider.seen_since.lock().await.len(), 1);
+        for query in [&first, &second] {
+            let result = state.result_set_for(query).await.expect("materialized issues");
+            assert!(result.rows.as_issues().expect("issue rows").iter().any(|row| row.reference.id == "2"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_query_does_not_apply_changes_older_than_its_initial_page() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("first");
+        let second = project_query("second");
+        let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
+        let mut older = issue("1");
+        older.title = "older refresh".into();
+        let mut newer = issue("1");
+        newer.title = "newer page".into();
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["1"], false), IssueResultPage { items: vec![newer], total: None, has_more: false }],
+            vec![IssueChangeset { updated: vec![older], closed: vec![], has_more: false }],
+        ));
+        let resolver = Arc::new(FixedResolver { sources: vec![source], provider });
+        let (event_tx, mut events) = broadcast::channel(8);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let first_generation = subscribe(&state, &first);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
+        next_event(&mut events).await;
+        materializer.refresh(&first);
+        next_event(&mut events).await;
+
+        let second_generation = subscribe(&state, &second);
+        materializer.reconcile(HashMap::from([(first, first_generation), (second.clone(), second_generation)]));
+        next_event(&mut events).await;
+        materializer.refresh(&second);
+        next_event(&mut events).await;
+
+        let result = state.result_set_for(&second).await.expect("second issue window");
+        assert_eq!(result.rows.as_issues().expect("issue rows")[0].issue.title, "newer page");
+    }
+
+    #[tokio::test]
+    async fn overlapping_query_cursors_do_not_replay_stale_updates_or_closures() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("first");
+        let second = project_query("second");
+        let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
+        let mut stale = issue("1");
+        stale.title = "stale update".into();
+        let mut current = issue("1");
+        current.title = "current page".into();
+        let closed = issue("2").reference;
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["1", "2"], false), IssueResultPage { items: vec![current, issue("2")], total: None, has_more: false }],
+            vec![IssueChangeset { updated: vec![stale], closed: vec![closed], has_more: false }],
+        ));
+        let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
+        let (event_tx, mut events) = broadcast::channel(8);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let first_generation = subscribe(&state, &first);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
+        next_event(&mut events).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second_generation = subscribe(&state, &second);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
+        next_event(&mut events).await;
+
+        materializer.refresh(&first);
+        next_event(&mut events).await;
+        materializer.refresh(&second);
+        next_event(&mut events).await;
+
+        assert_eq!(provider.seen_since.lock().await.len(), 1);
+        let result = state.result_set_for(&second).await.expect("second issue window");
+        let rows = result.rows.as_issues().expect("issue rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.issue.title == "current page"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1243,7 +1538,7 @@ mod tests {
         assert!(rows.iter().all(|row| row.reference.id != "ISSUE-00"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn closed_only_refresh_advances_the_conservative_cursor() {
         let state = AggregatorProjectionState::new();
         let query = project_query("repo_closed_cursor");
@@ -1257,8 +1552,8 @@ mod tests {
 
         materializer.refresh(&query);
         let _ = next_event(&mut events).await;
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        materializer.refresh(&query);
+        std::thread::sleep(Duration::from_millis(2));
+        tokio::time::advance(REFRESH_INTERVAL + Duration::from_millis(1)).await;
         let _ = next_event(&mut events).await;
 
         let seen = provider.seen_since.lock().await;

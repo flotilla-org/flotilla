@@ -122,17 +122,29 @@ impl super::IssueProvider for GitHubIssueProvider {
 
     async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String> {
         let per_page = clamp_per_page(count);
-        let encoded_since = urlencoding::encode(since);
-        let endpoint =
-            format!("repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}", source.scope, encoded_since, per_page);
+        // Keep the URI stable so the GhApi ETag cache can validate every poll.
+        // Filter the sorted page locally and reload if relevant changes may
+        // continue onto another page.
+        let endpoint = format!("repos/{}/issues?state=all&sort=updated&direction=desc&per_page={}", source.scope, per_page);
         let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+        // GhApi serves the cached 200 body on a 304. Reapply it against the
+        // caller's cursor: a previous consumer may have failed before it
+        // committed the changes and must be able to retry without another 200.
         let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
         let as_of = Utc::now();
+        let since = since.parse::<DateTime<Utc>>().map_err(|error| format!("invalid issue refresh cursor: {error}"))?;
+        let has_more = response.has_next_page
+            && items.last().is_some_and(|item| {
+                item["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).is_none_or(|updated| updated >= since)
+            });
 
         let mut updated = Vec::new();
         let mut closed = Vec::new();
 
         for v in &items {
+            if v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).is_some_and(|updated| updated < since) {
+                continue;
+            }
             if v.as_object().map(|o| o.contains_key("pull_request")).unwrap_or(false) {
                 continue;
             }
@@ -146,10 +158,7 @@ impl super::IssueProvider for GitHubIssueProvider {
             }
         }
 
-        // A raw page containing only pull requests says nothing about later
-        // pages. Escalate whenever GitHub has another page so the caller does
-        // not advance its cursor past unseen issue changes.
-        Ok(IssueChangeset { updated, closed, has_more: response.has_next_page })
+        Ok(IssueChangeset { updated, closed, has_more })
     }
 
     async fn open_in_browser(&self, reference: &IssueRef) -> Result<(), String> {
@@ -332,6 +341,42 @@ mod tests {
         assert_eq!(changeset.updated[1].reference.id, "3");
         assert_eq!(changeset.closed, vec![IssueRef { source: source(), id: "2".into() }]);
         assert!(!changeset.has_more);
+    }
+
+    #[tokio::test]
+    async fn incremental_poll_reuses_etag_and_304_spends_no_primary_quota() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("HTTP/2 200 OK\r\nETag: \"issue-window\"\r\nX-RateLimit-Remaining: 4800\r\n\r\n[{\"number\":1,\"title\":\"Changed\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-01T00:00:10Z\"}]".into()),
+            Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\nX-RateLimit-Remaining: 4800\r\n\r\n".into()),
+        ]));
+        let api = Arc::new(crate::providers::github_api::GhApiClient::new(runner.clone()));
+        let provider = GitHubIssueProvider::new(api, runner.clone(), Path::new("/neutral"));
+
+        let first = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("first poll");
+        let second = provider.list_changed_since(&source(), "2026-07-01T00:00:20Z", 50).await.expect("conditional poll");
+
+        assert_eq!(first.updated.len(), 1);
+        assert!(second.updated.is_empty());
+        assert!(second.closed.is_empty());
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1[2], calls[1].1[2], "incremental endpoint must be stable for ETag reuse");
+        assert!(calls[1].1.contains(&"If-None-Match: \"issue-window\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn conditional_hit_replays_a_change_when_the_consumer_retries_its_cursor() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("HTTP/2 200 OK\r\nETag: \"issue-window\"\r\n\r\n[{\"number\":1,\"title\":\"Changed\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-01T00:00:10Z\"}]".into()),
+            Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\n\r\n".into()),
+        ]));
+        let api = Arc::new(crate::providers::github_api::GhApiClient::new(runner.clone()));
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/neutral"));
+
+        provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("first poll");
+        let retried = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("retry after 304");
+
+        assert_eq!(retried.updated.len(), 1, "a 304 must not discard uncommitted changes");
     }
 
     #[tokio::test]

@@ -20,13 +20,14 @@ use flotilla_resources::{
     HostStatus as ResourceHostStatus, ResourceBackend, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
-use tokio::sync::{broadcast, RwLock, RwLockReadGuard};
+use futures::future::join_all;
+use tokio::sync::{broadcast, RwLock};
 
 use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig},
     event_sink::EventSink,
-    in_process::canonical_placement_host_ref_from_sources,
+    host_resolution::canonical_placement_host_ref_from_sources,
     providers::{ChannelLabel, CommandRunner},
 };
 
@@ -148,8 +149,9 @@ impl FleetService {
         hosts.into_iter().filter_map(|host| cache.get(&host).map(|entry| (host, entry.rows.clone(), entry.result_sets.clone()))).collect()
     }
 
-    pub(crate) async fn health(&self) -> RwLockReadGuard<'_, HashMap<HostName, FleetReplicaCacheEntry>> {
-        self.fleet_replica_cache.read().await
+    pub(crate) async fn with_health<T>(&self, read: impl FnOnce(&HashMap<HostName, FleetReplicaCacheEntry>) -> T) -> T {
+        let cache = self.fleet_replica_cache.read().await;
+        read(&cache)
     }
 
     pub(crate) async fn replication_failures(&self) -> HashMap<NodeId, BTreeMap<String, String>> {
@@ -194,13 +196,13 @@ impl FleetService {
             let mut cache = self.fleet_replica_cache.write().await;
             cache.retain(|host, _| configured.contains(host));
         }
-        for (label, remote) in &hosts.hosts {
-            if remote.agentless_ssh {
-                continue;
-            }
+        let fetches = hosts.hosts.iter().filter(|(_, remote)| !remote.agentless_ssh).map(|(label, remote)| {
             let host = HostName::new(remote.expected_host_name.clone());
             let multiplex = hosts.resolved_ssh_multiplex(label);
-            let result = self.transport.fetch(remote, multiplex, Arc::clone(&runner)).await;
+            let runner = Arc::clone(&runner);
+            async move { (host, self.transport.fetch(remote, multiplex, runner).await) }
+        });
+        for (host, result) in join_all(fetches).await {
             match result {
                 Ok(parsed) => {
                     let now = Utc::now();
@@ -248,7 +250,9 @@ impl FleetService {
                 }
             }
         }
-        let _ = self.fleet_replica_tx.send(self.cached_snapshots().await);
+        if self.fleet_replica_tx.receiver_count() > 0 {
+            let _ = self.fleet_replica_tx.send(self.cached_snapshots().await);
+        }
         Ok(())
     }
 
@@ -721,6 +725,7 @@ mod tests {
 
     use flotilla_protocol::FleetReplicaSnapshot;
     use flotilla_resources::{TerminalAttention, TerminalAttentionSource};
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::providers::ProcessCommandRunner;
@@ -821,6 +826,57 @@ mod tests {
         async fn fetch(&self, _: &RemoteHostConfig, _: bool, _: Arc<dyn CommandRunner>) -> Result<ParsedFleetReplicaSnapshot, String> {
             self.0.lock().expect("transport queue").pop_front().expect("queued result")
         }
+    }
+
+    struct RendezvousTransport(Barrier);
+
+    #[async_trait]
+    impl FleetReplicaTransport for RendezvousTransport {
+        async fn fetch(&self, remote: &RemoteHostConfig, _: bool, _: Arc<dyn CommandRunner>) -> Result<ParsedFleetReplicaSnapshot, String> {
+            self.0.wait().await;
+            if remote.expected_host_name == "failed" {
+                Err("remote unavailable".into())
+            } else {
+                let mut snapshot = snapshot();
+                snapshot.host = HostName::new("healthy");
+                Ok(ParsedFleetReplicaSnapshot { snapshot, diagnostics: ReplicaParseDiagnostics::default() })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_fetches_hosts_concurrently_and_reports_each_result() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("hosts.toml"),
+            "[hosts.healthy]\nhostname = 'healthy.example'\n[hosts.failed]\nhostname = 'failed.example'\n",
+        )
+        .expect("host config");
+        let service = FleetService::new(
+            Arc::new(crate::event_sink::RecordingEventSink::default()),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()),
+            ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::observed()),
+            AggregatorProjectionState::new(),
+            HostName::new("local"),
+            None,
+            Arc::new(RendezvousTransport(Barrier::new(2))),
+        );
+        let mut subscriber = service.subscribe();
+        let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
+        tokio::time::timeout(Duration::from_secs(1), service.refresh_once("flotilla", Some(runner)))
+            .await
+            .expect("both remote fetches must start together")
+            .expect("refresh cycle");
+        let mut snapshots = subscriber.recv().await.expect("broadcast after refresh");
+        snapshots.sort_by(|left, right| left.host.cmp(&right.host));
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].host, HostName::new("failed"));
+        assert!(snapshots[0].rows.is_empty());
+        assert_eq!(snapshots[1].host, HostName::new("healthy"));
+        assert_eq!(snapshots[1].generation.as_deref(), Some("g1"));
+        let error = service.with_health(|cache| cache.get(&HostName::new("failed")).and_then(|entry| entry.last_error.clone())).await;
+        assert_eq!(error.as_deref(), Some("remote unavailable"));
     }
 
     #[tokio::test]
