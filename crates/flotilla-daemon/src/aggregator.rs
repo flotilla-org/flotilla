@@ -2229,12 +2229,12 @@ impl Aggregator {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
         let convoy_attention = status.and_then(|status| status.attention.as_ref());
-        let pending_supervisor_turn =
-            status.and_then(|status| status.turn_deliveries.values().find_map(|delivery| delivery.pending_supervisor_turn.as_ref()));
+        let pending_supervisor_turn_count = status
+            .map_or(0, |status| status.turn_deliveries.values().filter(|delivery| delivery.pending_supervisor_turn.is_some()).count());
         let surface_state = if !subject_conflicts.is_empty()
             || attention_demand.is_some()
             || convoy_attention.is_some()
-            || pending_supervisor_turn.is_some()
+            || pending_supervisor_turn_count > 0
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
             SurfaceState::NeedsYou
@@ -2275,13 +2275,17 @@ impl Aggregator {
                             )
                         })
                     })
-                    .or_else(|| match (convoy_attention, pending_supervisor_turn) {
-                        (Some(attention), Some(turn)) => {
-                            Some(format!("{}; Supervisor turn awaits terminal delivery: {}", attention.reason, turn.message.text))
+                    .or_else(|| {
+                        let pending = match pending_supervisor_turn_count {
+                            0 => None,
+                            1 => Some("Supervisor turn awaits terminal delivery".to_string()),
+                            count => Some(format!("{count} supervisor turns await terminal delivery")),
+                        };
+                        match (convoy_attention, pending) {
+                            (Some(attention), Some(pending)) => Some(format!("{}; {pending}", attention.reason)),
+                            (Some(attention), None) => Some(attention.reason.clone()),
+                            (None, pending) => pending,
                         }
-                        (Some(attention), None) => Some(attention.reason.clone()),
-                        (None, Some(turn)) => Some(format!("Supervisor turn awaits terminal delivery: {}", turn.message.text)),
-                        (None, None) => None,
                     })
                     .or_else(|| status.and_then(|status| status.message.clone())),
             )
@@ -2697,12 +2701,26 @@ mod tests {
             }),
             ..Default::default()
         });
+        let mut no_prior_attention = governor.clone();
+        no_prior_attention.metadata.name = "governor-no-prior-attention".to_string();
+        no_prior_attention.status.as_mut().expect("status").attention = None;
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(governor)).await;
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(no_prior_attention)).await;
         let result = state.result_set().await;
         let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "governor").expect("governor row");
         assert_eq!(row.surface_state, SurfaceState::NeedsYou);
         assert!(row.message.as_deref().is_some_and(|message| message.contains("Existing concern")));
         assert!(row.message.as_deref().is_some_and(|message| message.contains("Supervisor turn awaits terminal delivery")));
+        assert!(!row.message.as_deref().is_some_and(|message| message.contains("Supervise the stalled crew")));
+        let row = result
+            .rows
+            .as_convoys()
+            .expect("convoys")
+            .iter()
+            .find(|row| row.name == "governor-no-prior-attention")
+            .expect("governor row without attention");
+        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(row.message.as_deref(), Some("Supervisor turn awaits terminal delivery"));
     }
 
     #[tokio::test]

@@ -1531,6 +1531,12 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         status.turn_deliveries.remove(message_id);
                     }
                 }
+                // One-generation cleanup for attention written by the original #2285 patch.
+                if !status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some())
+                    && status.attention.as_ref().is_some_and(|attention| attention.source == "supervisor-turn-delivery")
+                {
+                    status.attention = None;
+                }
             }
             Self::WorkLaunching { work, started_at, placement } => {
                 if let Some(state) = status.work.get_mut(work) {
@@ -2094,6 +2100,39 @@ pub mod external_patches {
 #[cfg(test)]
 mod subject_tests {
     use super::*;
+    use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    #[test]
+    fn supervisor_turn_acknowledgment_clears_only_prior_generation_delivery_attention() {
+        let old_attention = ConvoyAttention {
+            source: "supervisor-turn-delivery".to_string(),
+            reason: "Pending delivery".to_string(),
+            raised_at: Utc::now(),
+        };
+        let mut status = ConvoyStatus {
+            attention: Some(old_attention.clone()),
+            turn_deliveries: BTreeMap::from([("turn-1".to_string(), TurnDeliveryStatus {
+                pending_supervisor_turn: Some(PendingSupervisorTurn {
+                    vessel: "govern".to_string(),
+                    role: "governor".to_string(),
+                    message: TerminalCrewMessage {
+                        id: "turn-1".to_string(),
+                        text: "Supervise".to_string(),
+                        sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
+                        delivery: CrewMessageDelivery::Queued,
+                    },
+                }),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
+        assert!(status.attention.is_none());
+
+        status.attention = Some(ConvoyAttention { source: "settlement".to_string(), ..old_attention });
+        ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
+        assert_eq!(status.attention.as_ref().map(|attention| attention.source.as_str()), Some("settlement"));
+    }
 
     #[test]
     fn legacy_subject_fields_decode_and_write_only_the_new_set() {
