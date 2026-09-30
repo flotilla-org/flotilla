@@ -80,7 +80,8 @@ pub use convoy::{
     SettlementMode, StallCause, StallEvidenceSource, StallNudge, StallReason, StallRung, StallSupervisor, StalledCondition,
     SubjectDiscovery, SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung,
     TurnDeliveryStatus, UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    FORCE_TEARDOWN_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
+    CONVOY_TEARDOWN_FINALIZER, FORCE_TEARDOWN_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION, VESSEL_PLACEMENTS_ANNOTATION,
+    WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
     ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch,

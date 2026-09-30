@@ -947,7 +947,7 @@ impl Reconciler for ConvoyReconciler {
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
-        Some("flotilla.work/convoy-teardown")
+        Some(super::CONVOY_TEARDOWN_FINALIZER)
     }
 
     fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<ConvoyStatusPatch> {

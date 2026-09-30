@@ -6786,8 +6786,8 @@ impl InProcessDaemon {
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
         if force {
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
-            let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
-            if convoy.metadata.annotations.get(flotilla_resources::FORCE_TEARDOWN_ANNOTATION).map(String::as_str) != Some("true") {
+            for attempt in 0..3 {
+                let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
                 let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
                 let observed_checkout = self
                     .resource_backend
@@ -6803,10 +6803,17 @@ impl InProcessDaemon {
                     });
                 let mut meta = InputMeta::from(&convoy.metadata);
                 if expected_checkout || observed_checkout {
-                    meta = meta.with_added_finalizer("flotilla.work/convoy-teardown");
+                    meta = meta.with_added_finalizer(flotilla_resources::CONVOY_TEARDOWN_FINALIZER);
                 }
                 meta.annotations.insert(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string());
-                convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await.map_err(|error| error.to_string())?;
+                if meta.annotations == convoy.metadata.annotations && meta.finalizers == convoy.metadata.finalizers {
+                    break;
+                }
+                match convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await {
+                    Ok(_) => break,
+                    Err(ResourceError::Conflict { .. }) if attempt < 2 => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         self.verify_convoy_teardown_gate(namespace, name, force).await?;

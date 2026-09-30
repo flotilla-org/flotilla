@@ -748,21 +748,34 @@ impl Vcs for FlotillaVcs {
         let snapshot_path = snapshot.to_str().ok_or_else(|| "snapshot path is not UTF-8".to_string())?;
         self.runner.run("mkdir", &["-p", archive_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
         let backend = GitCliBackend::explicit_checkout(path, &*self.runner);
-        backend.bundle_head(bundle_path).await?;
-        backend.write_patch(patch_path).await?;
-        self.runner
-            .run(
-                "tar",
-                &["-czf", snapshot_path, "-C", parent.to_str().ok_or_else(|| "archive parent is not UTF-8".to_string())?, "--", name],
-                Path::new("/"),
-                &crate::providers::ChannelLabel::Default,
-            )
-            .await?;
-        if !self.runner.path_exists(&bundle).await?
-            || !self.runner.path_exists(&patch).await?
-            || !self.runner.path_exists(&snapshot).await?
-        {
-            return Err(format!("checkout archive is incomplete at {archive_path}"));
+        let archive_result = async {
+            backend.bundle_head(bundle_path).await?;
+            backend.write_patch(patch_path).await?;
+            self.runner
+                .run(
+                    "tar",
+                    &["-czf", snapshot_path, "-C", parent.to_str().ok_or_else(|| "archive parent is not UTF-8".to_string())?, "--", name],
+                    Path::new("/"),
+                    &crate::providers::ChannelLabel::Default,
+                )
+                .await?;
+            if !self.runner.path_exists(&bundle).await?
+                || !self.runner.path_exists(&patch).await?
+                || !self.runner.path_exists(&snapshot).await?
+            {
+                return Err(format!("checkout archive is incomplete at {archive_path}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = archive_result {
+            // The checkout remains in place, so a failed archive can be retried safely.
+            if let Err(cleanup_error) =
+                self.runner.run("rm", &["-rf", archive_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await
+            {
+                return Err(format!("{error}; failed to remove partial archive at {archive_path}: {cleanup_error}"));
+            }
+            return Err(error);
         }
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
             let remove = self.controller_cli().worktree_remove(target).await?;

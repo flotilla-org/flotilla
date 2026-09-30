@@ -8555,6 +8555,11 @@ mod tests {
             branch: "feature/original".to_string(),
             target_path: target.to_str().expect("target path").to_string(),
         };
+        fs::write(target.join("uncommitted.txt"), "keep this work\n").expect("write local work");
+        let refusal = runtime.remove_checkout(&removal).await.expect_err("dirty landed checkout must be preserved");
+        assert!(refusal.contains("DirtyCheckout"));
+        assert!(target.join("uncommitted.txt").exists());
+        fs::remove_file(target.join("uncommitted.txt")).expect("clear local work");
         assert_eq!(runtime.remove_checkout(&removal).await.expect("landed removal"), CheckoutRemovalOutcome::Removed);
         assert!(!target.exists());
         let archive_parent = temp.path().join(".flotilla-archives");

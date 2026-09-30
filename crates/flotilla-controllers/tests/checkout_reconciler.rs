@@ -357,7 +357,7 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         .create(
             &InputMeta::builder()
                 .name("convoy-a".to_string())
-                .annotations(BTreeMap::from([("flotilla.work/force-teardown".to_string(), "true".to_string())]))
+                .annotations(BTreeMap::from([(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string())]))
                 .build(),
             &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
         )

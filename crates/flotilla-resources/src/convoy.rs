@@ -259,6 +259,7 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
 /// Explicit operator force on a convoy deletion. Checkout authorities use
 /// this durable metadata after replication, including while finalizers run.
 pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
+pub const CONVOY_TEARDOWN_FINALIZER: &str = "flotilla.work/convoy-teardown";
 
 /// Canonical resource name for a convoy's explicitly bound change request.
 pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
