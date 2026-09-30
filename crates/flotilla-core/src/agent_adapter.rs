@@ -1162,7 +1162,7 @@ mod tests {
         assert!(brief.contains("use only the injected `gh` token-file wrapper with `$GITHUB_TOKEN_FILE` or an injected `GH_TOKEN`"));
         assert!(brief.contains("Never use unauthenticated or anonymous GitHub API requests"));
         assert!(brief.contains("`$GITHUB_TOKEN_FILE` names a nonempty file or `GH_TOKEN` is set, and that `gh auth status` succeeds"));
-        assert!(brief.contains("wait for the injected credential to refresh and retry once"));
+        assert!(brief.contains("wait about a minute for the injected credential to refresh and retry once"));
         assert!(brief.contains("flotilla crew stall --reason infra"));
     }
 

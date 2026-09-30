@@ -255,7 +255,6 @@ struct GithubAppDelivery {
     token_file: PathBuf,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    refresh_failures: usize,
     installation_repository: Option<String>,
     scope: Option<GithubAppScope>,
 }
@@ -781,7 +780,6 @@ impl CredentialStore {
                         token_file: github_app_token_file(paths, name),
                         issued_at: self.clock.now(),
                         expires_at,
-                        refresh_failures: 0,
                         installation_repository: match &spec.consumer {
                             CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
                             _ => None,
@@ -1163,7 +1161,7 @@ impl CredentialStore {
                 let repositories = match self.resolve_github_app_scope(scope).await {
                     Ok(repositories) => repositories,
                     Err(error) => {
-                        let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                        let should_surface = self.refresh_failure_should_surface(&key, delivery.generation).await;
                         errors.push(CredentialRefreshError {
                             environment_ref: key.0.clone(),
                             credential_name: Some(key.1.clone()),
@@ -1186,7 +1184,7 @@ impl CredentialStore {
             let token = match self.mint_github_app(&mut request, delivery.installation_repository.as_deref()).await {
                 Ok(token) => token,
                 Err(error) => {
-                    let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                    let should_surface = self.refresh_failure_should_surface(&key, delivery.generation).await;
                     errors.push(CredentialRefreshError {
                         environment_ref: key.0.clone(),
                         credential_name: Some(key.1.clone()),
@@ -1197,7 +1195,7 @@ impl CredentialStore {
                 }
             };
             if let Err(error) = validate_scalar_material(&key.1, "github-app", token.value.trim_end()) {
-                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
+                let should_surface = self.refresh_failure_should_surface(&key, delivery.generation).await;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
                     credential_name: Some(key.1.clone()),
@@ -1211,13 +1209,11 @@ impl CredentialStore {
                 continue;
             };
             if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                current.refresh_failures += 1;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
                     credential_name: Some(key.1.clone()),
                     message: self.refresh_failure_message(&key.1, current.expires_at, &error),
-                    should_surface: current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
-                        || self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at,
+                    should_surface: self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at,
                 });
                 continue;
             }
@@ -1231,7 +1227,6 @@ impl CredentialStore {
             }
             current.expires_at = token.expires_at;
             current.issued_at = self.clock.now();
-            current.refresh_failures = 0;
             current.request = request;
         }
         errors
@@ -1271,14 +1266,12 @@ impl CredentialStore {
         self.github_repository_names(&repositories).await
     }
 
-    async fn record_refresh_failure(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
-        let mut deliveries = self.github_app_deliveries.lock().await;
-        let Some(current) = deliveries.get_mut(key).filter(|current| current.generation == generation) else {
+    async fn refresh_failure_should_surface(&self, key: &(String, String), generation: uuid::Uuid) -> bool {
+        let deliveries = self.github_app_deliveries.lock().await;
+        let Some(current) = deliveries.get(key).filter(|current| current.generation == generation) else {
             return false;
         };
-        current.refresh_failures += 1;
-        current.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD
-            || self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at
+        self.clock.now() + GITHUB_APP_REFRESH_MARGIN >= current.expires_at
     }
 
     async fn spec(&self, name: &str) -> Result<CredentialSpecSpec, String> {
@@ -2357,7 +2350,6 @@ mod tests {
             token_file: PathBuf::from("/state/credentials/github-app/token"),
             issued_at: now,
             expires_at: now + Duration::hours(1),
-            refresh_failures: 0,
             installation_repository: None,
             scope: None,
         });
@@ -3407,8 +3399,13 @@ interactions:
         assert!(!first_failure[0].should_surface, "one transient failure must remain retryable");
         let second_failure = store.refresh_due_github_app_tokens().await;
         assert!(!second_failure[0].should_surface, "two transient failures must remain retryable");
+        clock.advance(Duration::minutes(55));
         let third_failure = store.refresh_due_github_app_tokens().await;
-        assert!(third_failure[0].should_surface, "a repeated unrefreshable delivery must become visible");
+        assert!(third_failure[0].should_surface, "an unrefreshable delivery inside the expiry margin must become visible");
+        let late_recovery = store.refresh_due_github_app_tokens().await;
+        assert_eq!(late_recovery.len(), 1);
+        assert!(late_recovery[0].should_surface, "late recovery must remain visible for one attention pass");
+        assert!(late_recovery[0].message.contains("refresh started inside the expiry margin"));
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 9, "recovered material keeps retrying and eventually rotates");
         let token_writes = runner
