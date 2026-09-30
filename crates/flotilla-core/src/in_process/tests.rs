@@ -3826,6 +3826,7 @@ async fn duplicate_operational_entry_refusal_records_a_project_event() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
 
     daemon
+        .project_service()
         .record_project_operational_refusal("flotilla", "standing-project", "duplicate materialized WorkflowTemplate `quartermaster`")
         .await;
 
