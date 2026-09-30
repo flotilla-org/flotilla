@@ -5578,6 +5578,30 @@ impl InProcessDaemon {
                         status.ready
                     });
                     let sleeping_until = host.and_then(|host| host.status.as_ref()).and_then(|status| status.sleeping_until);
+                    // A sleeping host may queue work for its wake-up time. A host
+                    // that is simply not ready cannot be admitted, even when it
+                    // is the only fulfilment that covers the requested needs.
+                    if !host_ready && sleeping_until.is_none_or(|until| until <= self.clock.now()) {
+                        let target = placement_target_host(&self.resource_backend, namespace, policy).await?;
+                        let reason = host.and_then(|host| host.status.as_ref()).map_or_else(
+                            || {
+                                format!(
+                                    "placement `{}` host `{}` is not ready: status is unavailable",
+                                    policy.metadata.name, target.display_name
+                                )
+                            },
+                            |status| {
+                                placement_host_not_ready_reason(
+                                    &policy.metadata.name,
+                                    &target.display_name,
+                                    host_generation(Some(status)),
+                                    status,
+                                )
+                            },
+                        );
+                        rejected.push(format!("{}: {reason}", kind.metadata.name));
+                        continue;
+                    }
                     candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until });
                 }
                 Err(error) => rejected.push(format!("{}: {error}", kind.metadata.name)),

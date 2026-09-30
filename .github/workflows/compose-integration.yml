@@ -7,18 +7,30 @@ on:
   push:
     branches:
       - main
-  # Compose runs are off the PR critical path (~20 min, catches concentrated
-  # in multi-daemon PRs — see PR #1478). Opt a PR in with the `compose` label,
-  # or rely on the post-merge push run before a fleet bump.
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/compose-integration.yml
+      - src/main.rs
+      - crates/flotilla-client/**
+      - crates/flotilla-commands/src/commands/convoy.rs
+      - crates/flotilla-core/src/in_process.rs
+      - crates/flotilla-core/src/in_process/**
+      - crates/flotilla-core/src/admission.rs
+      - crates/flotilla-core/tests/in_process_daemon.rs
+      - crates/flotilla-daemon/**
+      - crates/flotilla-resources/src/host.rs
+      - crates/flotilla-resources/src/fulfilment_kind.rs
+      - crates/flotilla-resources/src/placement*.rs
+      - crates/flotilla-resources/src/convoy/**
+      - crates/flotilla-controllers/src/**
+      - tests/integration/**
 
 permissions:
   contents: read
 
 jobs:
   wedge-regressions:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'compose')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -61,7 +73,7 @@ jobs:
         run: docker compose -f tests/integration/docker-compose.yml logs --no-color
 
   hub-spoke:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'compose')
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
