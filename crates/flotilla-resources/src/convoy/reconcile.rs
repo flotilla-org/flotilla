@@ -924,13 +924,20 @@ impl Reconciler for ConvoyReconciler {
                 .await?
                 .into_values()
                 .filter(|checkout| checkout.metadata.lifecycle_authority() == Ok(Some(LifecycleAuthority::Managed)))
-                .map(|checkout| checkout.metadata.name)
+                .map(|checkout| {
+                    let mut wait = format!("teardown waiting on checkout {}", checkout.metadata.name);
+                    if let Some(message) = checkout.status.as_ref().and_then(|status| status.message.as_deref()) {
+                        if let Some((_, reason)) = message.rsplit_once(" preserved: ") {
+                            wait.push_str(&format!(": preserved ({reason})"));
+                        } else if checkout.metadata.deletion_timestamp.is_some() {
+                            wait.push_str(&format!(": {message}"));
+                        }
+                    }
+                    wait
+                })
                 .collect::<Vec<_>>();
             if !remaining.is_empty() {
-                return Err(ResourceError::other(format!(
-                    "waiting for checkout authorities to finalize convoy children: {}",
-                    remaining.join(", ")
-                )));
+                return Err(ResourceError::other(remaining.join("; ")));
             }
         }
         if let Some(collector) = &self.prepared_snapshot_gc {
@@ -941,6 +948,15 @@ impl Reconciler for ConvoyReconciler {
 
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/convoy-teardown")
+    }
+
+    fn finalizer_error_patch(&self, obj: &ResourceObject<Self::Resource>, error: &ResourceError) -> Option<ConvoyStatusPatch> {
+        let error = error.to_string();
+        let message = error.strip_prefix("teardown waiting on checkout ").map(|tail| format!("teardown waiting on checkout {tail}"))?;
+        if obj.status.as_ref().and_then(|status| status.message.as_deref()) == Some(message.as_str()) {
+            return None;
+        }
+        Some(ConvoyStatusPatch::SetTeardownWait { message })
     }
 }
 

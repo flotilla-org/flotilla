@@ -256,6 +256,10 @@ pub fn convoy_sanctions_checkout_reclaim(convoy: &crate::ResourceObject<Convoy>)
         || convoy.status.as_ref().is_some_and(|status| matches!(status.phase, ConvoyPhase::Landed | ConvoyPhase::Abandoned))
 }
 
+/// Explicit operator force on a convoy deletion. Checkout authorities use
+/// this durable metadata after replication, including while finalizers run.
+pub const FORCE_TEARDOWN_ANNOTATION: &str = "flotilla.work/force-teardown";
+
 /// Canonical resource name for a convoy's explicitly bound change request.
 pub fn bound_change_request_record_name(convoy: &crate::ResourceObject<Convoy>) -> Result<Option<String>, String> {
     let Some(bound) = &convoy.spec.change_request else { return Ok(None) };
@@ -1228,6 +1232,9 @@ pub enum ConvoyStatusPatch {
     SetStalled {
         condition: Option<StalledCondition>,
     },
+    SetTeardownWait {
+        message: String,
+    },
     RecordLifecycleMutation {
         mutation: LifecycleMutation,
     },
@@ -1407,7 +1414,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // that exact phase. Mutation audit records remain appendable, and
         // SetStalled may clear stale attention.
         if status.phase.is_terminal()
-            && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. })
+            && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. } | Self::SetTeardownWait { .. })
             && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
         {
             return;
@@ -1422,6 +1429,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::SetStalled { condition } => {
                 status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
             }
+            Self::SetTeardownWait { message } => status.message = Some(message.clone()),
             Self::RecordLifecycleMutation { mutation } => {
                 const RETAINED_MUTATIONS: usize = 32;
                 status.lifecycle_mutations.push(mutation.clone());

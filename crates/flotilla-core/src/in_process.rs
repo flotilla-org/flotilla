@@ -6784,6 +6784,31 @@ impl InProcessDaemon {
     }
 
     async fn reap_convoy_internal(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        if force {
+            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+            let convoy = convoys.get(name).await.map_err(|error| error.to_string())?;
+            if convoy.metadata.annotations.get(flotilla_resources::FORCE_TEARDOWN_ANNOTATION).map(String::as_str) != Some("true") {
+                let expected_checkout = flotilla_resources::expected_checkout_refs(&convoy).map_or(true, |refs| !refs.is_empty());
+                let observed_checkout = self
+                    .resource_backend
+                    .including_replicas::<ResourceCheckout>(namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .iter()
+                    .any(|source| {
+                        source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|label| label == name)
+                            && source.object.metadata.lifecycle_authority() == Ok(Some(LifecycleAuthority::Managed))
+                    });
+                let mut meta = InputMeta::from(&convoy.metadata);
+                if expected_checkout || observed_checkout {
+                    meta = meta.with_added_finalizer("flotilla.work/convoy-teardown");
+                }
+                meta.annotations.insert(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string());
+                convoys.update(&meta, &convoy.metadata.resource_version, &convoy.spec).await.map_err(|error| error.to_string())?;
+            }
+        }
         self.verify_convoy_teardown_gate(namespace, name, force).await?;
         self.cascade_convoy_children(namespace, name).await?;
         self.resource_backend.clone().using::<ResourceConvoy>(namespace).delete(name).await.map_err(|error| error.to_string())

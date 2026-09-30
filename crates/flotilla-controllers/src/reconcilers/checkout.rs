@@ -11,7 +11,7 @@ use flotilla_resources::{
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition,
     LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
-    TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
 use tracing::warn;
 
@@ -21,6 +21,8 @@ const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
     Worktree { clone_path: String, branch: String, target_path: String },
+    ForcedWorktree { clone_path: String, branch: String, target_path: String },
+    LandedWorktree { clone_path: String, branch: String, target_path: String },
     OrphanedWorktree { target_path: String },
     FreshClone { target_path: String },
 }
@@ -394,13 +396,25 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        let convoy = self.owning_convoy(obj).await?;
+        let forced = convoy
+            .as_ref()
+            .is_some_and(|convoy| convoy.metadata.annotations.get(FORCE_TEARDOWN_ANNOTATION).map(String::as_str) == Some("true"));
+        let landed = convoy.as_ref().is_some_and(|convoy| convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed));
         let removal = match &obj.spec {
             CheckoutSpec::Worktree(spec) => match self.clones.get(&spec.clone_ref).await {
-                Ok(clone) => CheckoutRemoval::Worktree {
-                    clone_path: clone.spec.path,
-                    branch: spec.r#ref.clone(),
-                    target_path: spec.target_path.clone(),
-                },
+                Ok(clone) => {
+                    let clone_path = clone.spec.path;
+                    let branch = spec.r#ref.clone();
+                    let target_path = spec.target_path.clone();
+                    if forced {
+                        CheckoutRemoval::ForcedWorktree { clone_path, branch, target_path }
+                    } else if landed {
+                        CheckoutRemoval::LandedWorktree { clone_path, branch, target_path }
+                    } else {
+                        CheckoutRemoval::Worktree { clone_path, branch, target_path }
+                    }
+                }
                 Err(ResourceError::NotFound { .. }) => CheckoutRemoval::OrphanedWorktree { target_path: spec.target_path.clone() },
                 Err(err) => return Err(err),
             },

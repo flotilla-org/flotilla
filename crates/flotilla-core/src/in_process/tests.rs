@@ -4170,6 +4170,48 @@ async fn convoy_teardown_removes_its_managed_presentations() {
 }
 
 #[tokio::test]
+async fn forced_convoy_delete_retains_force_intent_until_checkout_finalizes() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
+    let convoy_ref = backend
+        .using::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .and_then(|status| status.convoy_ref)
+        .expect("convoy ref");
+    backend
+        .clone()
+        .using::<ResourceCheckout>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("checkout-at-risk".to_string())
+                .labels(BTreeMap::from([
+                    (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Managed.as_label_value().to_string()),
+                    (CONVOY_LABEL.to_string(), convoy_ref.clone()),
+                ]))
+                .finalizers(vec!["flotilla.work/checkout-cleanup".to_string()])
+                .build(),
+            &ResourceCheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
+                r#ref: "feature/work".to_string(),
+                path: "/tmp/checkout-at-risk".to_string(),
+                repo_ref: RepositoryKey("repo-a".to_string()),
+                host_ref: "host-test".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout");
+
+    daemon.reap_convoy_internal("flotilla", &convoy_ref, true).await.expect("force delete");
+
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get(&convoy_ref).await.expect("convoy must await checkout");
+    assert_eq!(convoy.metadata.annotations.get(flotilla_resources::FORCE_TEARDOWN_ANNOTATION).map(String::as_str), Some("true"));
+    assert!(convoy.metadata.deletion_timestamp.is_some());
+}
+
+#[tokio::test]
 async fn abandoned_ensure_generation_survives_a_stale_reconcile_write_and_is_superseded() {
     let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial ensure");
