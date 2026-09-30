@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,6 +19,9 @@ use tokio::{
 };
 
 use crate::providers::{run, CommandRunner};
+
+// GraphQL's Author.login for the crew App omits the REST `[bot]` suffix.
+const CREW_GITHUB_LOGIN: &str = "flotilla-crew";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChangeRequestRef {
@@ -122,7 +130,47 @@ pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Re
             ObservedChecks::Pass
         }
     });
-    let actionable_at_head = value.get("reviewDecision").map(|decision| decision.as_str() == Some("CHANGES_REQUESTED"));
+    let comments = value["comments"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            value["reviewThreads"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|thread| thread["comments"]["nodes"].as_array().into_iter().flatten()),
+        )
+        .collect::<Vec<_>>();
+    let addressed = comments
+        .iter()
+        .copied()
+        .filter(|comment| comment["author"]["login"] == CREW_GITHUB_LOGIN)
+        .filter_map(|comment| comment["body"].as_str())
+        .flat_map(|body| {
+            body.split("<!--")
+                .skip(1)
+                .filter_map(|part| part.split_once("-->")?.0.trim().strip_prefix("pr-shepherd-addresses:")?.parse::<u64>().ok())
+        })
+        .collect::<HashSet<_>>();
+    let head_at = value["commits"]["nodes"][0]["commit"]["committedDate"].as_str();
+    let reviews = value["reviews"]["nodes"].as_array();
+    let actionable_at_head = value.get("reviewDecision").map(|decision| {
+        let unaddressed = |item: &serde_json::Value| {
+            item["author"]["login"].as_str() != Some(CREW_GITHUB_LOGIN) && github_comment_id(item).is_none_or(|id| !addressed.contains(&id))
+        };
+        reviews.is_some_and(|items| items.iter().any(|review| review["state"] == "CHANGES_REQUESTED" && unaddressed(review)))
+            || head_at.is_some_and(|head_at| {
+                comments.iter().copied().chain(reviews.into_iter().flatten()).any(|item| {
+                    unaddressed(item)
+                        && item["createdAt"]
+                            .as_str()
+                            .or_else(|| item["submittedAt"].as_str())
+                            .is_some_and(|created_at| created_at > head_at)
+                })
+            })
+            || (reviews.is_none() && decision.as_str() == Some("CHANGES_REQUESTED"))
+    });
     let mergeable = match value["mergeable"].as_str() {
         Some("MERGEABLE") => Some(ObservedMergeability::Mergeable),
         Some("CONFLICTING") => Some(ObservedMergeability::Conflicting),
@@ -135,6 +183,13 @@ pub(crate) fn parse_gh_observation(json: &str, observed_at: DateTime<Utc>) -> Re
         review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: actionable_at_head, observed_at } },
         mergeable: Observation { value: mergeable, observed_at },
     })
+}
+
+fn github_comment_id(comment: &serde_json::Value) -> Option<u64> {
+    comment["databaseId"]
+        .as_u64()
+        .or_else(|| comment["fullDatabaseId"].as_u64())
+        .or_else(|| comment["fullDatabaseId"].as_str()?.parse().ok())
 }
 
 fn check_failed(check: &serde_json::Value) -> bool {

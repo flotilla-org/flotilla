@@ -915,7 +915,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let fields = request.fields.as_ref().map_or_else(|| "missing".to_string(), serde_json::Value::to_string);
             let _ = writeln!(
                 output,
-                "  - {} bound={} observed={} source={} observed_at={} freshness={:?}\n    fields={}",
+                "  - {} started_for={} observed={} source={} observed_at={} freshness={:?}\n    fields={}",
                 request.name,
                 request.bound,
                 request.observed,
