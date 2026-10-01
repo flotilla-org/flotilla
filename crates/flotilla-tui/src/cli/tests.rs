@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement, ExplainedUnclaimedWork,
-    HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, TopologyResponse, TopologyRoute,
+    CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement,
+    ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState,
+    PlacementDecision, PlacementTargetHost, StreamKey, TopologyResponse, TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -164,6 +165,50 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     assert!(output.contains(
         "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
     ));
+}
+
+#[test]
+fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
+    let explanation = ConvoyExplanation {
+        namespace: "flotilla".into(),
+        convoy: "reserved-only".into(),
+        phase: "Running".into(),
+        stalled: None,
+        message: None,
+        role_needs: BTreeMap::new(),
+        allocation: Vec::new(),
+        placement: Some(PlacementDecision {
+            policy_name: "macos-scarce".into(),
+            target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("comte"), display_name: "comte".into() },
+            minimal_alternatives: Vec::new(),
+            escalation_reason: None,
+            refused_candidates: Vec::new(),
+            viable_not_selected: Vec::new(),
+            allocation: Some(FulfilmentAllocation {
+                chosen_kind: "macos-scarce".into(),
+                candidates: Vec::new(),
+                reservation_reason: Some("no unreserved capacity covers the needs".into()),
+            }),
+        }),
+        vessel_placements: BTreeMap::new(),
+        evidence_ttl_seconds: 30,
+        change_request_stale_after_seconds: 30,
+        checkouts: Vec::new(),
+        change_requests: Vec::new(),
+        subscriptions: Vec::new(),
+        crew_deliveries: Vec::new(),
+        unclaimed_work: Vec::new(),
+        decision_ledgers: Vec::new(),
+        artifacts: Vec::new(),
+        settlement: ExplainedSettlement { mode: "world_terminal".into(), satisfied: false, unmet: Vec::new() },
+        recent_events: Vec::new(),
+        lifecycle_mutations: Vec::new(),
+    };
+
+    let output = format_convoy_explanation_human(&explanation);
+    assert!(output.contains("Fulfilment: macos-scarce on comte"), "{output}");
+    assert!(output.contains("Reserved platform capacity used: no unreserved capacity covers the needs"), "{output}");
+    assert!(!output.contains("Escalation:"), "{output}");
 }
 
 #[test]

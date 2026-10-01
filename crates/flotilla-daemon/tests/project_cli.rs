@@ -19,7 +19,7 @@ use flotilla_core::{
         SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
     },
     project_declaration::{BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION},
-    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote},
+    providers::discovery::test_support::{fake_discovery, fake_discovery_on_host_os, git_process_discovery, init_git_repo_with_remote},
     repository_inspection::{LocalCheckoutInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
@@ -60,7 +60,7 @@ async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigSto
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
-        fake_discovery(false),
+        fake_discovery_on_host_os(false, "linux"),
         HostName::new("local"),
         backend.clone(),
     )

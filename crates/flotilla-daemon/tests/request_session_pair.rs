@@ -1443,8 +1443,15 @@ async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
     assert_eq!(regards.items[0].spec.principal_ref, PrincipalRef::implicit_for_namespace("dev"));
 }
 
-#[tokio::test]
-async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
+#[test]
+fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
+    with_large_test_stack(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("request runtime");
+        runtime.block_on(convoy_creation_attribution_scenario());
+    });
+}
+
+async fn convoy_creation_attribution_scenario() {
     let leader = empty_daemon_named("leader").await;
     seed_host_capacity(&leader, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
     leader

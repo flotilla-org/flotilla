@@ -113,9 +113,15 @@ impl CommandRunner for MergedPrProcessRunner {
     }
 }
 
-#[derive(Default)]
 pub struct TestEnvVars {
     vars: HashMap<String, String>,
+    host_os: String,
+}
+
+impl Default for TestEnvVars {
+    fn default() -> Self {
+        Self { vars: HashMap::new(), host_os: "linux".to_string() }
+    }
 }
 
 impl DiscoveryMockRunner {
@@ -251,13 +257,22 @@ impl TestEnvVars {
         V: Into<String>,
         I: IntoIterator<Item = (K, V)>,
     {
-        Self { vars: vars.into_iter().map(|(key, value)| (key.into(), value.into())).collect() }
+        Self { vars: vars.into_iter().map(|(key, value)| (key.into(), value.into())).collect(), ..Self::default() }
+    }
+
+    pub fn with_host_os(mut self, host_os: impl Into<String>) -> Self {
+        self.host_os = host_os.into();
+        self
     }
 }
 
 impl EnvVars for TestEnvVars {
     fn get(&self, key: &str) -> Option<String> {
         self.vars.get(key).cloned()
+    }
+
+    fn host_os(&self) -> &str {
+        &self.host_os
     }
 }
 
@@ -318,6 +333,12 @@ pub fn fake_discovery(_legacy_mode: bool) -> super::DiscoveryRuntime {
     minimal_discovery_runtime(std::sync::Arc::new(
         DiscoveryMockRunner::builder().on_run("git", &["--version"], Ok("git version 2.43.0".into())).build(),
     ))
+}
+
+pub fn fake_discovery_on_host_os(legacy_mode: bool, host_os: &str) -> super::DiscoveryRuntime {
+    let mut discovery = fake_discovery(legacy_mode);
+    discovery.env = std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]).with_host_os(host_os));
+    discovery
 }
 
 /// Build a `DiscoveryRuntime` whose local environment runs entirely through

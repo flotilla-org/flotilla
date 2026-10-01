@@ -59,7 +59,7 @@ pub fn provider_statuses_from_registries<'a>(registries: impl IntoIterator<Item 
 pub fn collect_system_info(env: &dyn EnvVars) -> SystemInfo {
     SystemInfo {
         home_dir: env.get("HOME").map(Into::into),
-        os: Some(std::env::consts::OS.to_string()),
+        os: Some(env.host_os().to_string()),
         arch: Some(std::env::consts::ARCH.to_string()),
         cpu_count: std::thread::available_parallelism().ok().and_then(|n| u16::try_from(n.get()).ok()),
         memory_total_mb: total_memory_mb(),
@@ -107,11 +107,17 @@ mod tests {
     use crate::{
         environment_manager::EnvironmentManager,
         providers::{
-            discovery::{EnvironmentAssertion, EnvironmentBag},
+            discovery::{test_support::TestEnvVars as FixtureEnvVars, EnvironmentAssertion, EnvironmentBag},
             environment::{EnvironmentHandle, ProvisionedEnvironment},
             CommandRunner,
         },
     };
+
+    #[test]
+    fn system_info_uses_fixture_host_os() {
+        let env = FixtureEnvVars::default().with_host_os("macos");
+        assert_eq!(collect_system_info(&env).os.as_deref(), Some("macos"));
+    }
 
     struct TestEnvVars;
 
@@ -121,6 +127,10 @@ mod tests {
                 "HOME" => Some("/home/tester".into()),
                 _ => None,
             }
+        }
+
+        fn host_os(&self) -> &str {
+            "linux"
         }
     }
 
