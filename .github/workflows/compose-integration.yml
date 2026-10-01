@@ -40,8 +40,8 @@ jobs:
     timeout-minutes: 30
     env:
       # Plain debug profile: flotillad sizes its own tokio worker stacks for
-      # unoptimized futures (src/bin/flotillad.rs, #2346), so no opt-level
-      # override is needed here.
+      # unoptimized futures (src/bin/flotillad.rs; issue #2346, fixed by
+      # PR #2347), so no opt-level override is needed here.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
