@@ -321,6 +321,7 @@ pub enum HostStatusPatch {
         disk_free_bytes: Option<u64>,
         admission_free_space_floor_bytes: Option<u64>,
         agent_adapter_baseline: Option<BTreeSet<String>>,
+        // Keep the in-process patch enum small; HostStatus stores the unboxed value.
         resource_store: Option<Box<ResourceStoreDiagnostics>>,
         conditions: Vec<HostCondition>,
     },
