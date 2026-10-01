@@ -599,7 +599,7 @@ fn completion_cursor(consumed: &[&str], partial: &str) -> usize {
 }
 
 /// Argument completions for palette-local commands.
-fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_space: bool, model: &TuiModel) -> Vec<PaletteCompletion> {
+fn local_arg_completions(_input: &str, command: &str, tokens: &[&str], trailing_space: bool, model: &TuiModel) -> Vec<PaletteCompletion> {
     if tokens.len() == 1 && !trailing_space {
         // Still typing the command name — no arg completions yet.
         return vec![];
@@ -609,12 +609,12 @@ fn local_arg_completions(input: &str, command: &str, tokens: &[&str], trailing_s
 
     match command {
         "target" => target_completions(partial, model),
-        _ => {
-            // Other palette-local commands (theme, search) don't have
-            // enumerated completions yet.
-            let _ = input; // suppress unused warning
-            vec![]
-        }
+        "theme" => crate::theme::available_themes()
+            .iter()
+            .filter(|(name, _)| name.starts_with(partial))
+            .map(|(name, _)| PaletteCompletion { value: (*name).to_string(), description: "color theme".to_string(), key_hint: None })
+            .collect(),
+        _ => vec![],
     }
 }
 
@@ -1074,6 +1074,14 @@ mod tests {
         let model = empty_model();
         let completions = palette_completions("target ", &model, &Default::default(), true);
         assert!(completions.is_empty(), "expected no completions with no hosts");
+    }
+
+    #[test]
+    fn theme_argument_offers_built_in_themes() {
+        let model = empty_model();
+        let completions = palette_completions("theme cat", &model, &Default::default(), true);
+        let values: Vec<&str> = completions.iter().map(|item| item.value.as_str()).collect();
+        assert_eq!(values, vec!["catppuccin-mocha"]);
     }
 
     #[test]
