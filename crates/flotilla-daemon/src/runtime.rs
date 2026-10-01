@@ -1180,7 +1180,8 @@ struct ControllerRuntimeState {
 
 /// Cargo invokes this with the rustc path as its first argument. Keeping the
 /// linker option in a wrapper leaves repository Cargo config and RUSTFLAGS to
-/// Cargo's own resolution rules instead of replacing either source.
+/// Cargo's own resolution rules instead of replacing either source. The cap is
+/// limited to x86_64 Linux, where rustc's default lld path is known here.
 const RUSTC_LINKER_WRAPPER: &str = r#"#!/bin/sh
 compiler=$1
 shift
@@ -5110,8 +5111,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         if let Some(host_ref) = host_ref {
             let jobs = self.state.rust_build_jobs(host_ref).await?;
             let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
-            // The fulfilment cap owns this variable for host-direct terminals,
-            // including Tool sessions that can run Cargo commands.
+            // The fulfilment cap owns the workspace wrapper for host-direct
+            // terminals, including Tool sessions that can run Cargo. It
+            // replaces any wrapper supplied in the terminal environment.
             env.retain(|(name, _)| !matches!(name.as_str(), "CARGO_BUILD_JOBS" | "FLOTILLA_LINKER_THREADS" | "RUSTC_WORKSPACE_WRAPPER"));
             env.extend([
                 ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),

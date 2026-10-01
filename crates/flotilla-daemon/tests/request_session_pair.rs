@@ -583,14 +583,26 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
 
 #[hegel::test]
 fn generated_paired_world_host_independence(tc: hegel::TestCase) {
-    let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-    let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
-    let remote = (home + offset) % 3;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-    runtime.block_on(async {
-        let at_home = paired_world_trace(home, home).await;
-        let remote_desk = paired_world_trace(home, remote).await;
-        assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+    // The generated three-host world has deep in-process call stacks. Give
+    // its worker room independently of the test harness's thread stack size.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn_scoped(scope, move || {
+                let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+                let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+                let remote = (home + offset) % 3;
+                let runtime =
+                    tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+                runtime.block_on(async {
+                    let at_home = paired_world_trace(home, home).await;
+                    let remote_desk = paired_world_trace(home, remote).await;
+                    assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+                });
+            })
+            .expect("spawn paired-world worker")
+            .join()
+            .expect("paired-world worker");
     });
 }
 
