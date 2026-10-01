@@ -256,6 +256,7 @@ async fn remote_session_receives_nudge_and_resume_from_convoy_home() {
             (ROLE_LABEL.to_string(), "coder".to_string()),
         ]))
         .build();
+    // Turn delivery reads the session's labels and source without resolving its environment.
     let spec = ResourceTerminalSessionSpec {
         env_ref: "placement-environment".to_string(),
         role: "coder".to_string(),
