@@ -19,6 +19,7 @@ pub enum Event {
     DaemonDisconnected,
     CommandDispatchCompleted { session_id: uuid::Uuid, result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
     AttachDispatchCompleted { session_id: uuid::Uuid, result: Result<CommandValue, String> },
+    ProjectAddressesLoaded { session_id: uuid::Uuid, result: Result<CommandValue, String> },
     FleetHealthRefreshed(Result<CommandValue, String>),
 }
 
@@ -93,6 +94,7 @@ impl EventHandler {
                     | Event::DaemonDisconnected
                     | Event::CommandDispatchCompleted { .. }
                     | Event::AttachDispatchCompleted { .. }
+                    | Event::ProjectAddressesLoaded { .. }
             ) {
                 self.retained.push_back(event);
             }

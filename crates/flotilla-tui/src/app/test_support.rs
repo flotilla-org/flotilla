@@ -257,7 +257,62 @@ impl TestWidgetHarness {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_protocol::{CommandAction, CommandValue, ProjectListResponse};
+
     use super::*;
+    use crate::app::ProjectAddressState;
+
+    #[test]
+    fn project_addresses_load_once_and_fill_the_palette_cache() {
+        let mut app = stub_app();
+        app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses, crate::widgets::AppAction::LoadProjectAddresses]);
+        let (command, _) = app.proto_commands.take_next().expect("project-list query");
+        assert!(matches!(command.action, CommandAction::QueryProjectList {}));
+        assert!(app.proto_commands.take_next().is_none(), "in-flight query is not duplicated");
+
+        let session_id = app.session_id;
+        app.handle_project_addresses_loaded(session_id, Ok(CommandValue::ProjectList(Box::new(ProjectListResponse { projects: vec![] }))));
+        assert_eq!(app.model.project_address_state, ProjectAddressState::Loaded(vec![]));
+    }
+
+    #[test]
+    fn failed_project_address_query_can_be_retried_after_reopening_palette() {
+        let mut app = stub_app();
+        app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses]);
+        let _ = app.proto_commands.take_next().expect("first project-list query");
+        app.handle_project_addresses_loaded(app.session_id, Err("offline".into()));
+        assert_eq!(app.model.project_address_state, ProjectAddressState::Failed);
+
+        app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses]);
+        let (command, _) = app.proto_commands.take_next().expect("retry project-list query");
+        assert!(matches!(command.action, CommandAction::QueryProjectList {}));
+    }
+
+    #[test]
+    fn refreshing_project_addresses_keeps_cached_choices_until_the_new_list_arrives() {
+        let mut app = stub_app();
+        let cached: flotilla_protocol::ViewAddress = "project/flotilla/roadmap".parse().expect("project address");
+        app.model.project_address_state = ProjectAddressState::Loaded(vec![cached.clone()]);
+        app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses]);
+        assert_eq!(app.model.project_address_state, ProjectAddressState::Refreshing(vec![cached]));
+        assert!(matches!(app.proto_commands.take_next(), Some((Command { action: CommandAction::QueryProjectList {}, .. }, _))));
+        app.handle_project_addresses_loaded(
+            app.session_id,
+            Ok(CommandValue::ProjectList(Box::new(ProjectListResponse { projects: vec![] }))),
+        );
+        assert_eq!(app.model.project_address_state, ProjectAddressState::Loaded(vec![]));
+    }
+
+    #[test]
+    fn failed_refresh_keeps_cached_project_addresses() {
+        let mut app = stub_app();
+        let cached: flotilla_protocol::ViewAddress = "project/flotilla/roadmap".parse().expect("project address");
+        app.model.project_address_state = ProjectAddressState::Loaded(vec![cached.clone()]);
+        app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses]);
+        let _ = app.proto_commands.take_next().expect("refresh query");
+        app.handle_project_addresses_loaded(app.session_id, Err("offline".into()));
+        assert_eq!(app.model.project_address_state, ProjectAddressState::Loaded(vec![cached]));
+    }
 
     #[test]
     fn test_widget_harness_builds_context() {

@@ -33,6 +33,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum AppAction {
     Quit,
+    LoadProjectAddresses,
     CancelCommand(u64),
     CycleTheme,
     SetTheme(String),

@@ -72,6 +72,11 @@ pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
     }
 }
 
+/// Whether input has entered the address argument of the local `open` command.
+pub fn is_open_address_completion(input: &str) -> bool {
+    matches!(input.split_once(' '), Some(("open", _)))
+}
+
 /// View-address kind prefixes offered as `open` completions (ADR 0013).
 pub const VIEW_KIND_PREFIXES: &[&str] = &["overview", "convoys/", "convoy/", "vessel/", "project/", "issues", "checkouts"];
 
@@ -311,7 +316,7 @@ pub fn palette_completions_with_availability(
 
     // Check if the first token is a palette-local command name.
     if is_palette_local_command(first) {
-        return local_arg_completions(first, &tokens, trailing_space, model);
+        return local_arg_completions(first, &tokens, trailing_space, model, namespaces);
     }
 
     // First token is a noun (or alias). Resolve to canonical noun name.
@@ -438,6 +443,8 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
         }
     }
 
+    completions.push(PaletteCompletion { value: "open".into(), description: "open or focus a view".into(), key_hint: None });
+
     rank_completions(completions, partial)
 }
 
@@ -483,8 +490,8 @@ fn rank_completions(items: Vec<PaletteCompletion>, query: &str) -> Vec<PaletteCo
 fn is_palette_local_command(token: &str) -> bool {
     let entries = all_entries();
     let is_entry = entries.iter().any(|e| e.name == token);
-    // "layout", "theme", and "target" are local commands with args.
-    is_entry || matches!(token, "layout" | "theme" | "target")
+    // These local commands take arguments, so their completions begin after a space.
+    is_entry || matches!(token, "layout" | "theme" | "target" | "open")
 }
 
 /// Resolve a token to its canonical noun name via the clap tree.
@@ -701,7 +708,13 @@ fn completion_cursor(consumed: &[&str], partial: &str) -> usize {
 }
 
 /// Argument completions for palette-local commands.
-fn local_arg_completions(command: &str, tokens: &[&str], trailing_space: bool, model: &TuiModel) -> Vec<PaletteCompletion> {
+fn local_arg_completions(
+    command: &str,
+    tokens: &[&str],
+    trailing_space: bool,
+    model: &TuiModel,
+    namespaces: &crate::app::NamespaceMap,
+) -> Vec<PaletteCompletion> {
     if tokens.len() == 1 && !trailing_space {
         // Still typing the command name — no arg completions yet.
         return vec![];
@@ -710,6 +723,7 @@ fn local_arg_completions(command: &str, tokens: &[&str], trailing_space: bool, m
     let partial = if trailing_space { "" } else { tokens.last().copied().unwrap_or("") };
 
     match command {
+        "open" => open_address_completions(partial, model, namespaces),
         "target" => target_completions(partial, model),
         "theme" => rank_completions(
             crate::theme::available_themes()
@@ -720,6 +734,53 @@ fn local_arg_completions(command: &str, tokens: &[&str], trailing_space: bool, m
         ),
         _ => vec![],
     }
+}
+
+fn open_address_completions(partial: &str, model: &TuiModel, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
+    let mut addresses = vec![ViewAddress::Overview, ViewAddress::Checkouts { scope: None }, ViewAddress::Independents { scope: None }];
+    let mut namespace_names: Vec<_> = namespaces.keys().cloned().collect();
+    if !namespace_names.iter().any(|name| name == "flotilla") {
+        namespace_names.push("flotilla".into());
+    }
+    for namespace in namespace_names {
+        addresses.push(ViewAddress::Convoys { namespace: namespace.clone(), scope: None });
+        if let Some(state) = namespaces.get(&namespace) {
+            for convoy in state.convoys.values() {
+                addresses.push(ViewAddress::Convoy { namespace: namespace.clone(), name: convoy.name.clone() });
+                for vessel in &convoy.vessels {
+                    addresses.push(ViewAddress::Vessel {
+                        namespace: namespace.clone(),
+                        convoy: convoy.name.clone(),
+                        vessel: vessel.name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    if let crate::app::ProjectAddressState::Loaded(projects) | crate::app::ProjectAddressState::Refreshing(projects) =
+        &model.project_address_state
+    {
+        for address in projects {
+            let ViewAddress::Project { namespace, name } = address else { continue };
+            let scope = flotilla_protocol::QueryScope::new(namespace.clone(), name.clone());
+            addresses.extend([
+                address.clone(),
+                ViewAddress::Convoys { namespace: namespace.clone(), scope: Some(scope.clone()) },
+                ViewAddress::Issues { scope: scope.clone() },
+                ViewAddress::Checkouts { scope: Some(scope.clone()) },
+                ViewAddress::Independents { scope: Some(scope) },
+            ]);
+        }
+    }
+    addresses.sort_by_key(ToString::to_string);
+    addresses.dedup();
+    rank_completions(
+        addresses
+            .into_iter()
+            .map(|address| PaletteCompletion { value: address.to_string(), description: address.human_label(), key_hint: None })
+            .collect(),
+        partial,
+    )
 }
 
 /// Completions for the `target` palette command, built from known hosts.
@@ -889,6 +950,33 @@ mod tests {
 
     fn empty_model() -> TuiModel {
         TuiModel::from_repo_info(vec![repo_info("/tmp/test-repo", "test-repo", RepoLabels::default())])
+    }
+
+    #[test]
+    fn open_completes_openable_view_addresses() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("repair", &["work"]);
+        let completions = palette_completions("open ", &model, &namespaces, false);
+        let values: Vec<_> = completions.iter().map(|item| item.value.as_str()).collect();
+        assert!(values.contains(&"overview"));
+        assert!(values.contains(&"convoys/flotilla"));
+        assert!(values.contains(&"convoy/flotilla/repair"));
+        assert!(values.contains(&"vessel/flotilla/repair/work"));
+        assert!(values.contains(&"checkouts"));
+        assert!(!values.iter().any(|value| value.starts_with("repo/")), "retired repo views cannot open");
+    }
+
+    #[test]
+    fn project_list_addresses_expand_to_project_scoped_views() {
+        let mut model = empty_model();
+        model.project_address_state =
+            crate::app::ProjectAddressState::Loaded(vec!["project/flotilla/road%20map".parse().expect("project address")]);
+        let completions = palette_completions("open ", &model, &Default::default(), false);
+        let project = completions.iter().find(|item| item.value == "project/flotilla/road%20map").expect("project completion");
+        assert_eq!(project.description, "project/flotilla/road map");
+        assert!(completions.iter().any(|item| item.value == "issues?project=flotilla%2Froad%20map"));
+        assert!(completions.iter().any(|item| item.value == "checkouts?project=flotilla%2Froad%20map"));
+        assert!(completions.iter().any(|item| item.value == "independents?project=flotilla%2Froad%20map"));
     }
 
     fn model_with_crs() -> TuiModel {
