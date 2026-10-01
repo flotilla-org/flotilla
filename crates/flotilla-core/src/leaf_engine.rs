@@ -1394,12 +1394,7 @@ impl ReconcilerWake {
                                                 &candidate.metadata.name,
                                             )
                                         });
-                                    if candidate.is_none() {
-                                        if let Some(project) = convoy.spec.project_ref.as_deref() {
-                                            condition.evidence.push_str(&format!("; no live {convoy_role} for project {project}"));
-                                        }
-                                    }
-                                    candidate.and_then(|candidate| {
+                                    let supervisor = candidate.and_then(|candidate| {
                                         candidate.status.as_ref().and_then(|status| {
                                             status
                                                 .crew_work
@@ -1409,7 +1404,14 @@ impl ReconcilerWake {
                                                     (candidate.metadata.name.clone(), name.clone(), role.clone(), StallRung::Governor)
                                                 })
                                         })
-                                    })
+                                    });
+                                    if supervisor.is_none() {
+                                        if let Some(project) = convoy.spec.project_ref.as_deref() {
+                                            let missing = if candidate.is_some() { " crew" } else { "" };
+                                            condition.evidence.push_str(&format!("; no live {convoy_role}{missing} for project {project}"));
+                                        }
+                                    }
+                                    supervisor
                                 }
                                 SupervisionTarget::Operator => None,
                             };
@@ -2459,6 +2461,69 @@ mod tests {
         let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
         assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-two");
         assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-two");
+    }
+
+    #[tokio::test]
+    async fn stalled_work_names_missing_governor_crew_at_operator_rung() {
+        let (backend, wake, delivery) = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active)]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let governor = convoys.get("governor-two").await.expect("governor");
+        let mut status = governor.status.expect("governor status");
+        status.crew_work.clear();
+        convoys.update_status("governor-two", &governor.metadata.resource_version, &status).await.expect("clear governor crew");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let governor = convoys.get("governor-two").await.expect("governor");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), governor)]))
+            .await
+            .expect("judge stalls");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+        assert_eq!(stalled.rung, StallRung::Operator);
+        assert!(stalled.evidence.contains("no live governor crew for project wheelhouse"), "{}", stalled.evidence);
+        assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stalled_work_ignores_terminal_ensure_attempt_and_uses_highest_live_generation() {
+        let (backend, wake, delivery) = project_supervision_case(&[
+            ("governor-one", 1, ConvoyPhase::Abandoned),
+            ("governor-two", 2, ConvoyPhase::Active),
+            ("governor-three", 3, ConvoyPhase::Active),
+        ])
+        .await;
+        let ensures = backend.using::<ConvoyEnsure>("flotilla");
+        let ensure = ensures
+            .create(
+                &InputMeta::builder().name("wheelhouse-governor".into()).build(),
+                &flotilla_resources::ConvoyEnsureSpec::builder()
+                    .project_ref("wheelhouse".into())
+                    .role("governor".into())
+                    .workflow_ref("workflow".into())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("create ensure");
+        let ensure = ensures.get(&ensure.metadata.name).await.expect("read ensure");
+        ensures
+            .update_status("wheelhouse-governor", &ensure.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
+                convoy_ref: Some("governor-one".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("set terminal owned attempt");
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let second = convoys.get("governor-two").await.expect("live governor");
+        let third = convoys.get("governor-three").await.expect("highest live governor");
+        wake.judge_stalls(
+            "flotilla",
+            &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), second), ("governor-three".into(), third)]),
+        )
+        .await
+        .expect("judge stalls");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+        assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-three");
+        assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-three");
     }
 
     #[tokio::test]
