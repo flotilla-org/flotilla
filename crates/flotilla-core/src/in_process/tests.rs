@@ -25,10 +25,33 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
         id: "42".into(),
     };
-    assert!(change_request_subjects_contain([&subject].into_iter(), &requested));
+    assert_eq!(change_request_subject_numbers([&subject].into_iter(), &requested), BTreeSet::from([42]));
     let mut unrelated = subject.clone();
     unrelated.source.scope = "team/other".into();
-    assert!(!change_request_subjects_contain([&unrelated].into_iter(), &requested));
+    assert!(change_request_subject_numbers([&unrelated].into_iter(), &requested).is_empty());
+
+    let spec = ConvoySpec::builder().workflow_ref("review".to_string()).build();
+    let mut status = ConvoyStatus::default();
+    status.discover_subject(
+        subject,
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Claim,
+        Utc::now(),
+    );
+    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+        vessels: vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .crew(Vec::new())
+            .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
+            .build()],
+    });
+    let (bound, refs) = convoy_change_request_credential_refs(&spec, Some(&status), &requested, &RepositoryKey("team-repo".into()));
+    assert_eq!(bound, BTreeSet::from([42]));
+    assert_eq!(refs[&42], BTreeSet::from(["github-crew-pr".to_string()]));
 }
 
 #[tokio::test]

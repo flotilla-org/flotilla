@@ -1,7 +1,7 @@
 pub mod forgejo;
 pub mod github;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -17,15 +17,16 @@ pub struct ChangeRequestAdmission {
 }
 
 pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
+pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA.
-    /// Crew identities are GraphQL App logins derived from the bound convoys'
-    /// credential declarations. Other forges can ignore them.
-    async fn observe_bound(&self, numbers: &[u64], crew_logins: &[String]) -> Result<BoundObservations, String> {
+    /// Crew identities are GraphQL App logins, scoped by PR number and derived
+    /// from bound convoys' credential declarations. Other forges can ignore them.
+    async fn observe_bound(&self, numbers: &[u64], crew_logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, String> {
         let _ = crew_logins;
         let mut statuses = HashMap::new();
         for number in numbers {
@@ -101,7 +102,7 @@ mod tests {
                 provider_display_name: "Fake".to_string(),
             })])
             .await;
-        let observed = provider.observe_bound(&[1, 2], &[]).await.expect("independent reads");
+        let observed = provider.observe_bound(&[1, 2], &Default::default()).await.expect("independent reads");
         assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());
         assert_eq!(
             observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR").state.value,
