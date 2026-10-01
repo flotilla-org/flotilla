@@ -107,6 +107,7 @@ pub struct CheckoutReconciler<R> {
     clones: TypedResolver<Clone>,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
+    local_root: Option<flotilla_protocol::NodeId>,
     clock: Arc<dyn Clock>,
 }
 
@@ -122,6 +123,7 @@ impl<R> CheckoutReconciler<R> {
             clones: backend.clone().using::<Clone>(namespace),
             convoys: backend.using::<Convoy>(namespace),
             federated_convoys: None,
+            local_root: backend.local_root().ok(),
             clock,
         }
     }
@@ -171,7 +173,10 @@ impl<R> CheckoutReconciler<R> {
             (convoy_ref.map_or_else(
                 || convoy_claims_checkout(&source.object, &checkout.metadata.name),
                 |convoy_ref| source.object.metadata.name == *convoy_ref,
-            ) && matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root.as_str() == origin))
+            ) && match &source.provenance {
+                ResourceProvenance::Replica { origin_root, .. } => origin_root.as_str() == origin,
+                ResourceProvenance::Local => self.local_root.as_ref().is_some_and(|root| root.as_str() == origin),
+            })
             .then_some(source.object)
         }))
     }

@@ -47,7 +47,7 @@ impl ResourceBackend {
         }
     }
 
-    pub(crate) fn local_root(&self) -> Result<NodeId, ResourceError> {
+    pub fn local_root(&self) -> Result<NodeId, ResourceError> {
         match self {
             Self::InMemory(backend) => Ok(backend.local_root()),
             Self::Sqlite(backend) => Ok(backend.local_root()),

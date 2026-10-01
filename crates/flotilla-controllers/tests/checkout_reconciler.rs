@@ -5,7 +5,10 @@ mod common;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -33,6 +36,7 @@ struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
     inspections: Mutex<usize>,
     failed_removal_target: Option<String>,
+    transient_removal_failures: AtomicUsize,
 }
 
 #[async_trait]
@@ -78,6 +82,9 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         self.removals.lock().expect("removals lock").push(removal.clone());
+        if self.transient_removal_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
+            return Err("temporary removal failure".to_string());
+        }
         let target_path = match removal {
             CheckoutRemoval::Worktree { target_path, .. }
             | CheckoutRemoval::ForcedWorktree { target_path, .. }
@@ -90,6 +97,48 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
         Ok(CheckoutRemovalOutcome::Removed)
     }
+}
+
+#[tokio::test]
+async fn deleting_checkout_retries_finalizer_without_a_status_change() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    create_deleting_checkout(&backend, "retry-cleanup", "/checkouts/retry").await;
+    let current = checkouts.get("retry-cleanup").await.expect("checkout exists");
+    checkouts
+        .update_status("retry-cleanup", &current.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Failed,
+            message: Some("checkout teardown failed: temporary removal failure".to_string()),
+            ..current.status.expect("ready status")
+        })
+        .await
+        .expect("seed previously recorded finalizer error");
+    let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(1), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: Vec::new(),
+            reconciler,
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(4), async {
+        loop {
+            if matches!(checkouts.get("retry-cleanup").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finalizer should retry without waiting for full resync");
+    assert_eq!(runtime.removals.lock().expect("removals lock").len(), 2);
+    controller.abort();
+    let _ = controller.await;
 }
 
 #[tokio::test]
@@ -670,6 +719,142 @@ async fn checkout_authority_reclaims_managed_checkout_when_replicated_convoy_is_
     assert!(matches!(deps, CheckoutPrepared::OwnerTerminal));
     assert!(matches!(outcome.actuations.as_slice(), [Actuation::DeleteCheckout { name }] if name == "remote-checkout"));
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "Landed is durable settlement evidence");
+}
+
+#[tokio::test]
+async fn annotated_checkout_finds_its_local_deleting_convoy() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("local-root"));
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    convoys
+        .create(
+            &InputMeta::builder()
+                .name("local-convoy".to_string())
+                .deletion_timestamp(chrono::Utc::now())
+                .finalizers(vec!["flotilla.work/convoy-teardown".to_string()])
+                .build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create deleting convoy");
+    let checkout = backend
+        .clone()
+        .using::<Checkout>(NAMESPACE)
+        .create(
+            &InputMeta::builder()
+                .name("local-checkout".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "local-convoy".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "local-root".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-local".to_string(),
+                r#ref: "feature/local".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/local".to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("create checkout");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE)
+        .with_federated_convoys(&backend, NAMESPACE);
+
+    assert!(matches!(reconciler.prepare(&checkout).await.expect("prepare checkout"), CheckoutPrepared::OwnerTerminal));
+}
+
+#[tokio::test]
+async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_reference() {
+    let authority_root = NodeId::new("convoy-authority");
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(authority_root.clone());
+    let checkout_host = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("checkout-authority"));
+    let convoys = authority.clone().using::<Convoy>(NAMESPACE);
+    convoys
+        .create(
+            &InputMeta::builder().name("mis-homed".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".to_string()]).build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("create parent");
+    let replicate = || async {
+        checkout_host
+            .replica_writer::<Convoy>(authority_root.clone(), NAMESPACE)
+            .replace(&convoys.list().await.expect("list parent"), chrono::Utc::now())
+            .await
+            .expect("replicate parent");
+    };
+    replicate().await;
+    let checkouts = checkout_host.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("child".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "mis-homed".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "convoy-authority".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-checkout-authority".to_string(),
+                r#ref: "feature/old-convoy".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/child".to_string(),
+                url: REPO_URL.to_string(),
+            }),
+        )
+        .await
+        .expect("create child");
+    checkouts
+        .update_status("child", &checkout.metadata.resource_version, &CheckoutStatus { phase: CheckoutPhase::Failed, ..Default::default() })
+        .await
+        .expect("mark child settled");
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: CheckoutReconciler::<RecordingCheckoutRuntime>::federated_secondary_watches(&checkout_host, NAMESPACE),
+            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), checkout_host.clone(), NAMESPACE)
+                .with_federated_convoys(&checkout_host, NAMESPACE),
+            resync_interval: Duration::from_secs(3600),
+            backend: checkout_host.clone(),
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if checkouts
+                .get("child")
+                .await
+                .expect("child survives active parent")
+                .metadata
+                .finalizers
+                .iter()
+                .any(|f| f == "flotilla.work/checkout-cleanup")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("controller started");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    convoys.delete("mis-homed").await.expect("delete parent at its home");
+    replicate().await;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(checkouts.get("child").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child home should finalize after parent deletion replicates");
+    assert_eq!(runtime.removals.lock().expect("removals lock").len(), 1);
+    controller.abort();
+    let _ = controller.await;
 }
 
 #[tokio::test]
