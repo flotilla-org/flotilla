@@ -1291,6 +1291,22 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
     };
     assert!(matches!(evaluate(&convoy).unmet.as_slice(), [UnmetSettlementExpectation::SubjectDiscoveryPending { .. }]));
     let mut scanned = convoy;
+    scanned.status.as_mut().expect("status").branch_subject_scan_error = Some("forge lookup unavailable".to_string());
+    assert!(matches!(
+        evaluate(&scanned).unmet.as_slice(),
+        [UnmetSettlementExpectation::SubjectDiscoveryPending { error: Some(error), .. }] if error == "forge lookup unavailable"
+    ));
+    scanned.status.as_mut().expect("status").discover_subject(
+        flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::provider_data::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "42".into(),
+        },
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Branch,
+        timestamp(40),
+    );
+    assert!(matches!(evaluate(&scanned).unmet.as_slice(), [UnmetSettlementExpectation::SubjectDiscoveryPending { .. }]));
     scanned.status.as_mut().expect("status").branch_subject_scan_at = Some(timestamp(40));
     assert!(!evaluate(&scanned).unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::SubjectDiscoveryPending { .. })));
 }

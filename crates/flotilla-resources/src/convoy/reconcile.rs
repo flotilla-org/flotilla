@@ -240,7 +240,7 @@ pub enum SettlementMode {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum UnmetSettlementExpectation {
     ChangeRequestNotReady { record: String, detail: String },
-    SubjectDiscoveryPending { convoy: String },
+    SubjectDiscoveryPending { convoy: String, error: Option<String> },
     InvalidExpectedCheckouts { message: String },
     ExitEntryAwaitingBinding { disposition: String, subject: String },
     MissingCheckout { checkout: String },
@@ -437,7 +437,7 @@ fn evaluate_landing_settlement_with_disposition(
             };
         }
     };
-    if !expected.is_empty()
+    let discovery_pending = !expected.is_empty()
         && convoy.status.as_ref().is_some_and(|status| {
             status.branch_subject_scan_at.is_none()
                 && status
@@ -445,14 +445,18 @@ fn evaluate_landing_settlement_with_disposition(
                     .as_ref()
                     .and_then(|snapshot| snapshot.exit.as_ref())
                     .is_some_and(|exit| matches!(exit, ExitDeclaration::Table(_)))
-        })
-        && expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty())
-    {
+                && (status.branch_subject_scan_error.is_some()
+                    || expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty()))
+        });
+    if discovery_pending {
         return LandingSettlement {
             evaluation: SettlementEvaluation {
                 mode: SettlementMode::WorldTerminal,
                 satisfied: false,
-                unmet: vec![UnmetSettlementExpectation::SubjectDiscoveryPending { convoy: convoy.metadata.name.clone() }],
+                unmet: vec![UnmetSettlementExpectation::SubjectDiscoveryPending {
+                    convoy: convoy.metadata.name.clone(),
+                    error: convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.clone()),
+                }],
             },
             disposition: None,
         };

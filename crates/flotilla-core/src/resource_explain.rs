@@ -225,10 +225,13 @@ pub(crate) fn explain_unmet_expectation(expectation: UnmetSettlementExpectation)
             subject: format!("change_request/{record}"),
             detail,
         },
-        UnmetSettlementExpectation::SubjectDiscoveryPending { convoy } => ExplainedUnmetExpectation {
+        UnmetSettlementExpectation::SubjectDiscoveryPending { convoy, error } => ExplainedUnmetExpectation {
             reason: "subject_discovery_pending".to_string(),
             subject: format!("convoy/{convoy}"),
-            detail: "The convoy's branch has not been searched for change requests".to_string(),
+            detail: error.as_ref().map_or_else(
+                || "The convoy's branch search has not completed".to_string(),
+                |error| format!("The convoy's branch search failed: {error}"),
+            ),
         },
         UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
             ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }

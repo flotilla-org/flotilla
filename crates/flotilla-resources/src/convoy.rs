@@ -420,10 +420,7 @@ pub fn select_convoy_children<T: Resource + Clone>(
 ///
 /// The convoy's declared and discovered subject set is the sole source of
 /// change-request settlement obligations.
-pub fn expected_change_request_leaves(
-    convoy: &crate::ResourceObject<Convoy>,
-    _checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
-) -> Result<Vec<Leaf>, String> {
+pub fn active_change_request_subjects(convoy: &ResourceObject<Convoy>) -> Result<Vec<Subject>, String> {
     let mut subjects = Vec::new();
     let declared = convoy.spec.declared_subjects()?;
     let discovered = convoy.status.iter().flat_map(|status| &status.subjects);
@@ -438,17 +435,27 @@ pub fn expected_change_request_leaves(
         .map(|entry| (&entry.subject, entry.relationship))
         .chain(discovered.map(|entry| (&entry.subject, entry.relationship)))
     {
-        if !matches!(relationship, Relationship::Produces | Relationship::Adopts) || superseded.contains(subject) {
+        if subject.kind != flotilla_protocol::SubjectKind::ChangeRequest
+            || !matches!(relationship, Relationship::Produces | Relationship::Adopts)
+            || superseded.contains(subject)
+        {
             continue;
         }
-        let address = subject.leaf()?;
-        if !subjects.contains(&address) {
-            subjects.push(address);
+        if !subjects.contains(subject) {
+            subjects.push(subject.clone());
         }
     }
-    subjects.retain(|address| Subject::from_leaf(address).is_none_or(|subject| !superseded.contains(&subject)));
+    Ok(subjects)
+}
 
-    Ok(subjects
+pub fn expected_change_request_leaves(
+    convoy: &crate::ResourceObject<Convoy>,
+    _checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<Vec<Leaf>, String> {
+    Ok(active_change_request_subjects(convoy)?
+        .into_iter()
+        .map(|subject| subject.leaf())
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flat_map(|address| {
             ["merged", "closed"].map(|literal| Leaf {
@@ -793,9 +800,13 @@ pub struct ConvoyStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<DiscoveredSubject>,
     /// The latest successful search of every admitted repository for this
-    /// convoy's branch. Absent on prior-generation status and before discovery.
+    /// convoy's branch. The default can be removed one fleet roll after this
+    /// field first ships, per ADR 0047.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_subject_scan_at: Option<DateTime<Utc>>,
+    /// Latest branch discovery failure. The default is a one-roll decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_subject_scan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlinked_subjects: Vec<Subject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1254,6 +1265,9 @@ pub enum ConvoyStatusPatch {
     RecordBranchSubjectScan {
         at: DateTime<Utc>,
     },
+    RecordBranchSubjectScanFailure {
+        error: String,
+    },
     UnlinkSubject {
         subject: Subject,
     },
@@ -1455,7 +1469,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);
                 }
             }
-            Self::RecordBranchSubjectScan { at } => status.branch_subject_scan_at = Some(*at),
+            Self::RecordBranchSubjectScan { at } => {
+                status.branch_subject_scan_at = Some(*at);
+                status.branch_subject_scan_error = None;
+            }
+            Self::RecordBranchSubjectScanFailure { error } => status.branch_subject_scan_error = Some(error.clone()),
             Self::UnlinkSubject { subject } => status.unlink_subject(subject),
             Self::SetStalled { condition } => {
                 status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
@@ -2277,6 +2295,7 @@ mod subject_tests {
         let prior_generation = serde_json::to_value(&status).expect("serialize status");
         let decoded: ConvoyStatus = serde_json::from_value(prior_generation).expect("decode status without branch scan");
         assert!(decoded.branch_subject_scan_at.is_none());
+        assert!(decoded.branch_subject_scan_error.is_none());
         status
             .crew_work
             .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));

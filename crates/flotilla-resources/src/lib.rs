@@ -73,8 +73,8 @@ pub use clock::{Clock, SystemClock};
 pub use clone::{Clone, CloneFailurePolicy, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use controller_retry::{ControllerRetry, ControllerRetryDisposition, RetryBackoff, RetryCeiling};
 pub use convoy::{
-    bound_change_request_record_name, change_request_address, change_request_address_with_forges, controller_patches,
-    convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion, evaluate_landing_settlement,
+    active_change_request_subjects, bound_change_request_record_name, change_request_address, change_request_address_with_forges,
+    controller_patches, convoy_sanctions_checkout_reclaim, convoy_subject_rows, evaluate_crew_completion, evaluate_landing_settlement,
     expected_change_request_leaves, expected_checkout_refs, external_patches, instantiate_exit, instantiate_turn_delivery, issue_address,
     issue_address_with_forges, observed_change_request_subjects, pinned_placement_ref, pinned_workflow_ref, provisioning_patches,
     reconcile, select_convoy_children, subject_relationship_conflicts, vessel_placement_pin, BoundChangeRequest, Convoy, ConvoyAttention,
