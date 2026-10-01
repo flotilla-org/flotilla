@@ -367,13 +367,27 @@ impl InteractiveWidget for Screen {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         self.rendered_view = Some(ctx.views.active().target.clone());
+        let status_items = if self.modal_stack.is_empty() { collect_visible_status_items(ctx.model, ctx.ui) } else { vec![] };
+        let notification_height = u16::from(!status_items.is_empty());
 
         // Scoped mode: the pane is one View — no tab bar row.
         let view_header_height = u16::from(ctx.views.active().has_history());
         let constraints = if ctx.views.is_scoped() {
-            vec![Constraint::Length(0), Constraint::Length(view_header_height), Constraint::Min(0), Constraint::Length(1)]
+            vec![
+                Constraint::Length(0),
+                Constraint::Length(view_header_height),
+                Constraint::Min(0),
+                Constraint::Length(notification_height),
+                Constraint::Length(1),
+            ]
         } else {
-            vec![Constraint::Length(1), Constraint::Length(view_header_height), Constraint::Min(0), Constraint::Length(1)]
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(view_header_height),
+                Constraint::Min(0),
+                Constraint::Length(notification_height),
+                Constraint::Length(1),
+            ]
         };
         let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
@@ -485,13 +499,6 @@ impl InteractiveWidget for Screen {
             }
         });
 
-        // 4e. Error items — only override status in Normal mode (no modals)
-        let error_items = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
-            collect_visible_status_items(ctx.model, ctx.ui)
-        } else {
-            vec![]
-        };
-
         // 4f. Mode indicators — only for Normal mode (no modals, not config or issue search)
         let mode_indicators = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
             status_bar_widget::normal_mode_indicators(ctx.ui, ctx.namespaces)
@@ -510,19 +517,19 @@ impl InteractiveWidget for Screen {
         let status_bar_area = if is_command_palette {
             ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
         } else {
-            chunks[3]
+            chunks[4]
         };
 
         self.status_bar.render_bespoke(
             status,
             key_chips,
             task,
-            error_items,
+            status_items.first().map(|item| item.text.as_str()),
             mode_indicators,
             show_keys,
-            ctx.ui.command_echo.as_deref(),
             ctx.theme,
             frame,
+            chunks[3],
             status_bar_area,
         );
 

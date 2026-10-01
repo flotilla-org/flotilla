@@ -152,7 +152,6 @@ impl App {
                 let tx = self.pm_update_tx.clone();
                 let label = target.label.clone();
                 self.report_focus(vec![target.resource_ref()]);
-                self.set_status_message(Some(format!("Opening {label} in PM...")));
                 tokio::spawn(async move {
                     let result = connector.open(&target, &working_directory).await;
                     let _ = tx.send(super::PmOpenUpdate { label, result });
