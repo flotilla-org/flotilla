@@ -1123,6 +1123,7 @@ mod tests {
             .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
                 display_name: "local".to_string(),
                 connection: Default::default(),
+                ..HostSpec::default()
             })
             .await
             .expect("host");
@@ -1168,6 +1169,7 @@ mod tests {
             .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
                 display_name: "local".to_string(),
                 connection: Default::default(),
+                ..HostSpec::default()
             })
             .await
             .expect("host");

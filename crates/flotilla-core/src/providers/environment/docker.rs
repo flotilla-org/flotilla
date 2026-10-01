@@ -148,6 +148,10 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             "-e",
             &env_id_env,
         ]);
+        let cpu_limit = opts.cpu_limit.map(|limit| limit.to_string());
+        if let Some(limit) = cpu_limit.as_deref() {
+            args.extend(["--cpus", limit]);
+        }
         #[cfg(unix)]
         args.extend(["--user", user.as_str()]);
 

@@ -7612,6 +7612,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .create(&InputMeta::builder().name(local_host_ref.clone()).build(), &HostSpec {
             display_name: daemon.host_name().to_string(),
             connection: Default::default(),
+            ..HostSpec::default()
         })
         .await
         .expect("create local host resource");

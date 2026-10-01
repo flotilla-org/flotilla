@@ -56,6 +56,7 @@ impl DockerEnvironmentActuator {
                     "1",
                     "the contained host-daemon requirement",
                 ))],
+            cpu_limit: None,
         }
     }
 }

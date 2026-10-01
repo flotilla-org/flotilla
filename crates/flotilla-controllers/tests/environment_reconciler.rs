@@ -160,6 +160,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
             .create(&InputMeta::builder().name(host.to_string()).build(), &HostSpec {
                 display_name: host.to_string(),
                 connection: Default::default(),
+                ..HostSpec::default()
             })
             .await
             .expect("create host identity");

@@ -3614,7 +3614,11 @@ async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
     let host_origin = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(driver.node_id().clone());
     let hosts = host_origin.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&driver_id), &HostSpec { display_name: "udder".to_string(), connection: Default::default() })
+        .create(&test_meta(&driver_id), &HostSpec {
+            display_name: "udder".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("driver host");
     hosts
@@ -3733,7 +3737,11 @@ async fn unavailable_declared_driver_surfaces_named_admission_conditions_without
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     hosts
-        .create(&test_meta("missing-driver"), &HostSpec { display_name: "missing-driver".to_string(), connection: Default::default() })
+        .create(&test_meta("missing-driver"), &HostSpec {
+            display_name: "missing-driver".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("known but unreachable driver");
     assert!(daemon.reconcile_convoy_ensures_once("flotilla").await.expect("unreachable driver skip").is_empty());
@@ -3754,7 +3762,11 @@ async fn declared_driver_admission_refusals_retry_indefinitely_without_strikes_o
     let driver_id = daemon.local_host_id().expect("driver host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&driver_id), &HostSpec { display_name: "local".to_string(), connection: Default::default() })
+        .create(&test_meta(&driver_id), &HostSpec {
+            display_name: "local".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("driver host");
     hosts
@@ -3975,7 +3987,11 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
     let driver_ref = daemon.canonical_local_host_id().expect("root B host identity").to_string();
     target
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&driver_ref), &HostSpec { display_name: "root-b".to_string(), connection: Default::default() })
+        .create(&test_meta(&driver_ref), &HostSpec {
+            display_name: "root-b".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("root B host resource");
     let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
@@ -4591,8 +4607,10 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
     .await;
     let host_id = daemon.local_host_id().expect("host id").to_string();
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
-    let host =
-        hosts.create(&test_meta(&host_id), &HostSpec { display_name: "udder".into(), connection: Default::default() }).await.expect("host");
+    let host = hosts
+        .create(&test_meta(&host_id), &HostSpec { display_name: "udder".into(), connection: Default::default(), ..HostSpec::default() })
+        .await
+        .expect("host");
     hosts
         .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
             heartbeat_at: Some(Utc::now()),
@@ -4608,7 +4626,7 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
         .expect("host facts");
     for name in ["collision-a", "collision-b"] {
         hosts
-            .create(&test_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default() })
+            .create(&test_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default(), ..HostSpec::default() })
             .await
             .expect("ambiguous host");
     }
@@ -4694,7 +4712,11 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .create(&test_meta(&host_id), &HostSpec {
+            display_name: "local-host".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("create host");
     hosts
@@ -4741,7 +4763,11 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
     let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
     stale_source
         .using::<ResourceHost>("flotilla")
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .create(&test_meta(&host_id), &HostSpec {
+            display_name: "local-host".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("stale self-origin host");
     backend
@@ -4752,7 +4778,11 @@ async fn self_targeted_admission_uses_live_local_host_over_stale_self_origin_rep
 
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .create(&test_meta(&host_id), &HostSpec {
+            display_name: "local-host".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("authoritative local host");
     hosts
@@ -4835,7 +4865,11 @@ async fn self_targeted_admission_resolves_display_name_policy_to_live_local_host
     let host_id = daemon.local_host_id().expect("local host identity").to_string();
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta(&host_id), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .create(&test_meta(&host_id), &HostSpec {
+            display_name: "local-host".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("authoritative local host");
     hosts
@@ -4945,7 +4979,11 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
         .expect("workflow");
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta("udder-id"), &HostSpec { display_name: "udder".to_string(), connection: Default::default() })
+        .create(&test_meta("udder-id"), &HostSpec {
+            display_name: "udder".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("remote host");
     hosts
@@ -5052,7 +5090,7 @@ async fn placement_decision_prefers_local_home_copy_over_same_name_replica() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host in ["local-host", "replica-host"] {
         hosts
-            .create(&test_meta(host), &HostSpec { display_name: host.to_string(), connection: Default::default() })
+            .create(&test_meta(host), &HostSpec { display_name: host.to_string(), connection: Default::default(), ..HostSpec::default() })
             .await
             .expect("placement host");
     }
@@ -5141,7 +5179,11 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
     let hosts = backend.using::<ResourceHost>("flotilla");
     for host_id in ["host-id-a", "host-id-b"] {
         hosts
-            .create(&test_meta(host_id), &HostSpec { display_name: "shared-name".to_string(), connection: Default::default() })
+            .create(&test_meta(host_id), &HostSpec {
+                display_name: "shared-name".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("host");
     }
@@ -5153,7 +5195,11 @@ async fn placement_target_host_rejects_ambiguous_display_name() {
 async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string(), connection: Default::default() })
+        .create(&test_meta(host_ref), &HostSpec {
+            display_name: host_ref.to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("host create");
     hosts
@@ -5179,6 +5225,7 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
                 owning_daemon: "owner-host".to_string(),
                 destination: "crew@beaufort.example".to_string(),
             },
+            ..HostSpec::default()
         })
         .await
         .expect("SSH Host");
@@ -5260,7 +5307,11 @@ async fn default_placement_prefers_local_host_referenced_by_display_name() {
     create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
     let hosts = backend.using::<ResourceHost>("flotilla");
     let local = hosts
-        .create(&test_meta("local-host-id"), &HostSpec { display_name: "local-host".to_string(), connection: Default::default() })
+        .create(&test_meta("local-host-id"), &HostSpec {
+            display_name: "local-host".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("local host");
     hosts
@@ -5440,7 +5491,11 @@ async fn fleet_list_falls_back_per_row_for_an_ambiguous_host_alias() {
     let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
     for host_id in ["shared-host-id-a", "shared-host-id-b"] {
         hosts
-            .create(&test_meta(host_id), &HostSpec { display_name: "shared-host".to_string(), connection: Default::default() })
+            .create(&test_meta(host_id), &HostSpec {
+                display_name: "shared-host".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("ambiguous host");
     }
@@ -5540,7 +5595,11 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
 async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, held_credentials: BTreeSet<String>) {
     let hosts = backend.clone().using::<ResourceHost>("flotilla");
     let host = hosts
-        .create(&test_meta(host_ref), &HostSpec { display_name: host_ref.to_string(), connection: Default::default() })
+        .create(&test_meta(host_ref), &HostSpec {
+            display_name: host_ref.to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("host create");
     hosts
@@ -5875,7 +5934,11 @@ async fn remote_placement_uses_replicated_host_capabilities() {
     let feta = ResourceBackend::InMemory(InMemoryBackend::default());
     let feta_hosts = feta.using::<ResourceHost>("flotilla");
     let fresh = feta_hosts
-        .create(&test_meta("feta-host"), &HostSpec { display_name: "feta".to_string(), connection: Default::default() })
+        .create(&test_meta("feta-host"), &HostSpec {
+            display_name: "feta".to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .expect("create fresh feta self-report");
     feta_hosts

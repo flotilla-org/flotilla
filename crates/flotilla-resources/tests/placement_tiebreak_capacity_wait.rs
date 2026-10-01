@@ -15,6 +15,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         .create(&InputMeta::builder().name("host-id".to_string()).build(), &HostSpec {
             display_name: "feta".to_string(),
             connection: Default::default(),
+            ..HostSpec::default()
         })
         .await
         .expect("host");
@@ -95,6 +96,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         .create(&InputMeta::builder().name("another-host-id".to_string()).build(), &HostSpec {
             display_name: "feta".to_string(),
             connection: Default::default(),
+            ..HostSpec::default()
         })
         .await
         .expect("second host with same display name");

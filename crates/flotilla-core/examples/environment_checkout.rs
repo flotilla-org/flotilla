@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/ref/repo",
             flotilla_core::providers::environment::ProvisionedMountMode::Ro,
         )],
+        cpu_limit: None,
     };
     let handle = provider.create(env_id, &image, opts).await?;
     let container = handle.container_name().unwrap_or("unknown");

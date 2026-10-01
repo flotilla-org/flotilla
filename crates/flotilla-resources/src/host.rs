@@ -45,12 +45,39 @@ pub fn canonical_host_id<'a>(
     Ok(Some(CanonicalHostId::resolved(host.metadata.name.clone())))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {
     #[serde(default)]
     pub display_name: String,
     #[serde(default, skip_serializing_if = "HostConnection::is_daemon")]
     pub connection: HostConnection,
+    /// Expected concurrent Rust crews on this host. This is a fulfilment
+    /// setting until capacity facts have a single source of truth (#2361).
+    /// Previous-generation Host records omit it (ADR 0047); remove this
+    /// decoder default one fleet roll after all hosts write the field.
+    #[serde(default = "default_expected_concurrent_rust_crews")]
+    pub expected_concurrent_rust_crews: u32,
+}
+
+const fn default_expected_concurrent_rust_crews() -> u32 {
+    4
+}
+
+impl Default for HostSpec {
+    fn default() -> Self {
+        Self { display_name: String::new(), connection: HostConnection::default(), expected_concurrent_rust_crews: 4 }
+    }
+}
+
+impl HostSpec {
+    pub fn rust_build_jobs(&self, host_cores: usize) -> usize {
+        let expected_crews = if self.expected_concurrent_rust_crews == 0 {
+            default_expected_concurrent_rust_crews()
+        } else {
+            self.expected_concurrent_rust_crews
+        };
+        (host_cores / expected_crews as usize).max(2)
+    }
 }
 
 /// How the owning daemon reaches this Host for actuation.
@@ -225,6 +252,28 @@ impl HostStatus {
 
     pub fn readiness_blocked(&self) -> bool {
         self.conditions.iter().any(HostCondition::blocks_readiness)
+    }
+}
+
+#[cfg(test)]
+mod build_parallelism_tests {
+    use super::HostSpec;
+
+    #[test]
+    fn host_build_share_has_two_job_floor_and_divides_available_cores() {
+        let mut host = HostSpec::default();
+        assert_eq!(host.rust_build_jobs(32), 8);
+        assert_eq!(host.rust_build_jobs(4), 2);
+        host.expected_concurrent_rust_crews = 8;
+        assert_eq!(host.rust_build_jobs(32), 4);
+        host.expected_concurrent_rust_crews = 0;
+        assert_eq!(host.rust_build_jobs(32), 8);
+    }
+
+    #[test]
+    fn previous_generation_host_keeps_default_build_share() {
+        let host: HostSpec = serde_json::from_str(r#"{"display_name":"feta"}"#).expect("decode previous host");
+        assert_eq!(host.expected_concurrent_rust_crews, 4);
     }
 }
 

@@ -32,7 +32,10 @@ use flotilla_core::{
     placement_policy::reconcile_registered_policy,
     providers::{
         discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
+        environment::{
+            CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
+            EnvironmentVariableUpdate,
+        },
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
@@ -738,6 +741,7 @@ impl DaemonRuntime {
                     local_repo_root,
                     profile.host_direct_environment_name(),
                 )
+                .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(credential_store)
                 .with_agent_material(agent_material)
@@ -1003,17 +1007,20 @@ async fn register_agentless_ssh_resources(
         return Err(format!("agentless SSH host {} shares the owning daemon's Host identity", provisioning.host_id));
     }
     let hosts = backend.clone().using::<Host>(namespace);
-    let spec = HostSpec {
+    let mut spec = HostSpec {
         display_name: provisioning.display_name.clone(),
         connection: HostConnection::AgentlessSsh { owning_daemon: owner_host_id.to_string(), destination: profile.destination.clone() },
+        ..HostSpec::default()
     };
     match hosts.get(&provisioning.host_id).await {
-        Ok(existing) if existing.spec == spec => {}
         Ok(existing) => {
-            hosts
-                .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec)
-                .await
-                .map_err(|error| error.to_string())?;
+            spec.expected_concurrent_rust_crews = existing.spec.expected_concurrent_rust_crews;
+            if existing.spec != spec {
+                hosts
+                    .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Err(ResourceError::NotFound { .. }) => {
             hosts.create(&empty_meta(&provisioning.host_id), &spec).await.map_err(|error| error.to_string())?;
@@ -1158,6 +1165,7 @@ struct ControllerRuntimeState {
     config: Arc<ConfigStore>,
     local_registry: Arc<ProviderRegistry>,
     local_host_ref: String,
+    namespace: String,
     local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
     agentless_ssh: HashMap<String, AgentlessSshProfile>,
@@ -1168,6 +1176,60 @@ struct ControllerRuntimeState {
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+}
+
+/// Cargo invokes this with the rustc path as its first argument. Keeping the
+/// linker option in a wrapper leaves repository Cargo config and RUSTFLAGS to
+/// Cargo's own resolution rules instead of replacing either source.
+const RUSTC_LINKER_WRAPPER: &str = r#"#!/bin/sh
+compiler=$1
+shift
+if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+  # rustc defaults to lld on x86_64-unknown-linux-gnu. Respect a repository
+  # that explicitly selects another linker or disables lld.
+  linker=default
+  target=host
+  target_next=0
+  for arg in "$@"; do
+    if [ "$target_next" = 1 ]; then
+      target=$arg
+      target_next=0
+    fi
+    case "$arg" in
+      --target) target_next=1 ;;
+      --target=*) target=${arg#--target=} ;;
+      *fuse-ld=lld*|*linker-features=+lld*) linker=lld ;;
+      *linker-features=-lld*|*fuse-ld=bfd*|*fuse-ld=gold*) linker=other ;;
+      *linker=*)
+        case "$arg" in *lld*) linker=lld ;; *) linker=other ;; esac ;;
+    esac
+  done
+  if { [ "$target" = host ] || [ "$target" = x86_64-unknown-linux-gnu ]; } && { [ "$linker" = default ] || [ "$linker" = lld ]; }; then
+    exec "$compiler" "$@" -C "link-arg=-Wl,--threads=${FLOTILLA_LINKER_THREADS:?}"
+  fi
+fi
+exec "$compiler" "$@"
+"#;
+
+const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
+
+fn stage_local_rustc_wrapper(state_dir: &Path) -> Result<PathBuf, String> {
+    let directory = state_dir.join("environment-tools");
+    std::fs::create_dir_all(&directory).map_err(|error| format!("create rustc wrapper directory: {error}"))?;
+    let path = directory.join("rustc-linker-cap");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(RUSTC_LINKER_WRAPPER) {
+        return Ok(path);
+    }
+    let staged = directory.join(format!("rustc-linker-cap-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&staged, RUSTC_LINKER_WRAPPER).map_err(|error| format!("stage rustc wrapper: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("mark rustc wrapper executable: {error}"))?;
+    }
+    std::fs::rename(&staged, &path).map_err(|error| format!("install rustc wrapper: {error}"))?;
+    Ok(path)
 }
 
 struct PendingTerminalDelivery {
@@ -1212,6 +1274,39 @@ impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
 }
 
 impl ControllerRuntimeState {
+    async fn rust_build_jobs(&self, host_ref: &str) -> Result<usize, String> {
+        let host_spec = match self.daemon.resource_backend().using::<Host>(&self.namespace).get(host_ref).await {
+            Ok(host) => host.spec,
+            Err(ResourceError::NotFound { .. }) if host_ref == self.local_host_ref => HostSpec::default(),
+            Err(error) => return Err(format!("read build fulfilment setting for host {host_ref}: {error}")),
+        };
+        let cores = if let Some(profile) = self.agentless_ssh.values().find(|profile| profile.provisioning.host_id == host_ref) {
+            profile
+                .runner
+                .run("getconf", &["_NPROCESSORS_ONLN"], Path::new("/"), &ChannelLabel::Default)
+                .await?
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| format!("read core count for host {host_ref}: {error}"))?
+        } else {
+            std::thread::available_parallelism().map(usize::from).map_err(|error| format!("read local core count: {error}"))?
+        };
+        Ok(host_spec.rust_build_jobs(cores))
+    }
+
+    async fn rustc_wrapper_for_environment(&self, env_ref: &str) -> Result<PathBuf, String> {
+        if let Some(profile) = self.agentless_ssh.get(env_ref) {
+            let path = PathBuf::from(format!("/tmp/flotilla-rustc-wrapper-{}", profile.provisioning.host_id));
+            profile.runner.write_file(&path, RUSTC_LINKER_WRAPPER).await?;
+            profile
+                .runner
+                .run("chmod", &["755", path.to_str().ok_or("wrapper path is not UTF-8")?], Path::new("/"), &ChannelLabel::Default)
+                .await?;
+            return Ok(path);
+        }
+        stage_local_rustc_wrapper(self.config.state_dir().as_path())
+    }
+
     fn new(
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
@@ -1227,6 +1322,7 @@ impl ControllerRuntimeState {
             config,
             local_registry,
             local_host_ref,
+            namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
             local_repo_root,
             host_direct_environment_name,
             agentless_ssh: HashMap::new(),
@@ -1242,6 +1338,11 @@ impl ControllerRuntimeState {
 
     fn with_agentless_ssh(mut self, profiles: Vec<AgentlessSshProfile>) -> Self {
         self.agentless_ssh = profiles.into_iter().map(|profile| (profile.environment_id.to_string(), profile)).collect();
+        self
+    }
+
+    fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
         self
     }
 
@@ -2031,6 +2132,7 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
                 .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &HostSpec {
                     display_name: display_name.to_string(),
                     connection: Default::default(),
+                    expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
                 })
                 .await
                 .map(|_| ())
@@ -2040,7 +2142,11 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
         Err(err) => return Err(format!("check host {host_name}: {err}")),
     }
     hosts
-        .create(&empty_meta(host_name), &HostSpec { display_name: display_name.to_string(), connection: Default::default() })
+        .create(&empty_meta(host_name), &HostSpec {
+            display_name: display_name.to_string(),
+            connection: Default::default(),
+            ..HostSpec::default()
+        })
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -3710,7 +3816,26 @@ struct DockerControllerRuntime {
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
-        let tools = self.state.environment_tools.prepare(name).await?;
+        let jobs = self.state.rust_build_jobs(&spec.host_ref).await?;
+        let wrapper_host = stage_local_rustc_wrapper(self.state.config.state_dir().as_path())?;
+        let mut tools = self.state.environment_tools.prepare(name).await?;
+        tools.push(
+            EnvironmentTool::new("rust-build-limits", CONTAINED_RUSTC_WRAPPER_PATH)
+                .with_asset(EnvironmentToolAsset::new(
+                    wrapper_host,
+                    CONTAINED_RUSTC_WRAPPER_PATH,
+                    EnvironmentToolAssetKind::File,
+                    EnvironmentToolAssetAccess::ReadOnly,
+                    "the Rust linker cap",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set(
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    CONTAINED_RUSTC_WRAPPER_PATH,
+                    "the Rust linker cap",
+                ))
+                .with_environment(EnvironmentVariableUpdate::set("CARGO_BUILD_JOBS", jobs.to_string(), "the Rust build share"))
+                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_LINKER_THREADS", jobs.to_string(), "the Rust linker cap")),
+        );
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -3838,6 +3963,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 provisioned_mounts,
                 tools,
                 docker_config_dir,
+                cpu_limit: Some(jobs),
             })
             .await
         {
@@ -4948,6 +5074,25 @@ impl TerminalRuntime for TerminalControllerRuntime {
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
+        if is_agent_session {
+            let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
+                Some(self.state.local_host_ref.as_str())
+            } else {
+                self.state.agentless_ssh.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
+            };
+            if let Some(host_ref) = host_ref {
+                let jobs = self.state.rust_build_jobs(host_ref).await?;
+                let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
+                env.retain(|(name, _)| {
+                    !matches!(name.as_str(), "CARGO_BUILD_JOBS" | "FLOTILLA_LINKER_THREADS" | "RUSTC_WORKSPACE_WRAPPER")
+                });
+                env.extend([
+                    ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),
+                    ("FLOTILLA_LINKER_THREADS".to_string(), jobs.to_string()),
+                    ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
+                ]);
+            }
+        }
         // A dead generation may retain a recording with the old ID. Keep that
         // recording for recovery and launch into the current generation under
         // a fresh ID so cleat cannot resolve the name ambiguously. #2254
@@ -5234,6 +5379,56 @@ mod tests {
             Arc,
         },
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linker_cap_wrapper_preserves_repo_cargo_config_and_rustflags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("source directory");
+        fs::create_dir_all(repo.join(".cargo")).expect("cargo config directory");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"linker-cap-check\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
+        )
+        .expect("manifest");
+        fs::write(repo.join(".cargo/config.toml"), "[build]\nrustflags = [\"--cfg\", \"repo_config_flag\"]\n").expect("repo cargo config");
+        let wrapper = super::stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
+        let compiler_probe = temp.path().join("compiler-probe");
+        let compiler_log = temp.path().join("compiler-args");
+        fs::write(&compiler_probe, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$FLOTILLA_RUSTC_ARG_LOG\"\nexec rustc \"$@\"\n")
+            .expect("compiler probe");
+        fs::set_permissions(&compiler_probe, fs::Permissions::from_mode(0o755)).expect("executable compiler probe");
+        let build = |rustflags: Option<&str>| {
+            let mut command = ProcessCommand::new("cargo");
+            command
+                .args(["build", "--offline", "--manifest-path", repo.join("Cargo.toml").to_str().expect("UTF-8 manifest")])
+                .current_dir(&repo)
+                .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
+                .env("RUSTC", &compiler_probe)
+                .env("FLOTILLA_RUSTC_ARG_LOG", &compiler_log)
+                .env("FLOTILLA_LINKER_THREADS", "2")
+                .env("CARGO_TARGET_DIR", temp.path().join("target"))
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_RUSTFLAGS")
+                .env_remove("RUSTFLAGS");
+            if let Some(flags) = rustflags {
+                command.env("RUSTFLAGS", flags);
+            }
+            let output = command.output().expect("run cargo");
+            assert!(output.status.success(), "cargo build failed: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        fs::write(repo.join("src/main.rs"), "#[cfg(not(repo_config_flag))] compile_error!(\"repo config lost\");\nfn main() {}\n")
+            .expect("repo source");
+        build(None);
+        fs::write(repo.join("src/main.rs"), "#[cfg(not(repo_env_flag))] compile_error!(\"RUSTFLAGS lost\");\nfn main() {}\n")
+            .expect("repo source");
+        build(Some("--cfg repo_env_flag"));
+        let compiler_args = fs::read_to_string(&compiler_log).expect("recorded rustc arguments");
+        assert!(compiler_args.contains("link-arg=-Wl,--threads=2"), "linker cap did not reach rustc: {compiler_args}");
+    }
 
     use flotilla_core::{
         agent_adapter::AgentAdapterRegistry,
@@ -6003,7 +6198,11 @@ mod tests {
         let kiwi_store = ResourceBackend::InMemory(Default::default());
         let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
         kiwi_hosts
-            .create(&empty_meta("kiwi-host"), &HostSpec { display_name: "kiwi".to_string(), connection: Default::default() })
+            .create(&empty_meta("kiwi-host"), &HostSpec {
+                display_name: "kiwi".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("kiwi holds a replicable Host");
 
@@ -7203,7 +7402,24 @@ mod tests {
             compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment,
             "tool environment belongs to the tool description; crew Git identity is a container baseline"
         );
-        assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat"]);
+        assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat", "rust-build-limits"]);
+        let jobs = opts.cpu_limit.expect("container CPU quota");
+        assert!(jobs >= 2);
+        assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
+            "CARGO_BUILD_JOBS",
+            jobs.to_string(),
+            "the Rust build share"
+        )));
+        assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
+            "FLOTILLA_LINKER_THREADS",
+            jobs.to_string(),
+            "the Rust linker cap"
+        )));
+        assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
+            "RUSTC_WORKSPACE_WRAPPER",
+            CONTAINED_RUSTC_WRAPPER_PATH,
+            "the Rust linker cap"
+        )));
         assert_eq!(opts.tools[0].executable.as_path(), Path::new(ENVIRONMENT_FLOTILLA_PATH));
         assert_eq!(opts.tools[0].assets[2].environment_path.as_path(), Path::new(ENVIRONMENT_DAEMON_SOCKET_PATH));
         assert_eq!(
@@ -12163,14 +12379,18 @@ mod tests {
         backend
             .clone()
             .using::<Host>(NAMESPACE)
-            .create(&empty_meta(host_id), &HostSpec { display_name: "udder".into(), connection: Default::default() })
+            .create(&empty_meta(host_id), &HostSpec { display_name: "udder".into(), connection: Default::default(), ..HostSpec::default() })
             .await
             .expect("seed host");
         for name in ["collision-a", "collision-b"] {
             backend
                 .clone()
                 .using::<Host>(NAMESPACE)
-                .create(&empty_meta(name), &HostSpec { display_name: "collision".into(), connection: Default::default() })
+                .create(&empty_meta(name), &HostSpec {
+                    display_name: "collision".into(),
+                    connection: Default::default(),
+                    ..HostSpec::default()
+                })
                 .await
                 .expect("seed ambiguous host");
         }
@@ -13194,6 +13414,11 @@ mod tests {
             "ungranted host-direct crew must remain credential-less"
         );
         assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
+        assert!(coder_launch
+            .env_vars
+            .iter()
+            .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs >= 2)));
+        assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
         let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
         assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
         drop(ensured);

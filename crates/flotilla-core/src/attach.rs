@@ -1129,7 +1129,11 @@ mod tests {
         let local_host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&local_host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .create(&test_meta(&local_host), &HostSpec {
+                display_name: "standing-test".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "governor-env", &local_host).await;
@@ -1192,7 +1196,11 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .create(&test_meta(&host), &HostSpec {
+                display_name: "standing-test".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;
@@ -1236,7 +1244,11 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .create(&test_meta(&host), &HostSpec {
+                display_name: "standing-test".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;
@@ -1280,7 +1292,11 @@ mod tests {
         let host = daemon.local_host_id().expect("local host identity").to_string();
         backend
             .using::<ResourceHost>("flotilla")
-            .create(&test_meta(&host), &HostSpec { display_name: "standing-test".to_string(), connection: Default::default() })
+            .create(&test_meta(&host), &HostSpec {
+                display_name: "standing-test".to_string(),
+                connection: Default::default(),
+                ..HostSpec::default()
+            })
             .await
             .expect("local host resource");
         let environment = create_test_environment(&daemon, "coder-env", &host).await;
