@@ -280,9 +280,20 @@ async fn inspect_landed(
     // failure to do so leaves the condition unknown.
     let comparison = compare_branch_to_base(providers.vcs, base_ref).await;
     let args = match change_request_id {
-        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable"],
+        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable,headRefOid"],
         None => {
-            vec!["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt,baseRefName,mergeable", "--limit", "1"]
+            vec![
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,mergeable,headRefOid",
+                "--limit",
+                "1",
+            ]
         }
     };
     match providers.runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
@@ -319,12 +330,39 @@ async fn inspect_landed(
                             .maybe_target_ref(target_ref.map(str::to_string))
                             .observed_at(observed_at.to_string())
                             .build();
-                        if state != ChangeRequestState::Open {
-                            let outcome = if state == ChangeRequestState::Closed { "closed" } else { "merged" };
+                        let landing = match state {
+                            ChangeRequestState::Closed => Some(("closed", ConditionValue::True, format!("PR #{number} closed"), false)),
+                            ChangeRequestState::Merged => {
+                                let merged_head =
+                                    item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                                let revision_check = match merged_head {
+                                    Some(head) => providers.vcs.head_in_history_of(head).await,
+                                    None => Err("merged PR head revision is unavailable".to_string()),
+                                };
+                                let (value, detail, head_verified) = match revision_check {
+                                    Ok(true) => {
+                                        (ConditionValue::True, format!("PR #{number} merged; checkout HEAD is in merged PR head"), true)
+                                    }
+                                    Ok(false) => (
+                                        ConditionValue::False,
+                                        format!("PR #{number} merged, but checkout HEAD is not in merged PR head"),
+                                        false,
+                                    ),
+                                    Err(error) => (
+                                        ConditionValue::Unknown,
+                                        format!("PR #{number} merged; checkout revision could not be verified: {error}"),
+                                        false,
+                                    ),
+                                };
+                                Some(("merged", value, detail, head_verified))
+                            }
+                            ChangeRequestState::Open => None,
+                        };
+                        if let Some((outcome, value, detail, head_verified)) = landing {
                             (
                                 IntegrationCondition::builder()
-                                    .value(ConditionValue::True)
-                                    .details(vec![format!("PR #{number} {outcome}")])
+                                    .value(value)
+                                    .details(vec![detail])
                                     .observed_at(observed_at.to_string())
                                     .build(),
                                 Some(
@@ -332,6 +370,7 @@ async fn inspect_landed(
                                         .change_request_id(number)
                                         .maybe_merged_at(merged_at.map(str::to_string))
                                         .maybe_target_ref(if outcome == "merged" { target_ref.map(str::to_string) } else { None })
+                                        .checkout_head_in_merged_head(head_verified)
                                         .build(),
                                 ),
                                 Some(observation),
@@ -738,7 +777,9 @@ mod tests {
     async fn bound_change_request_landing_is_keyed_by_id_instead_of_branch() {
         let runner = Arc::new(MockRunner::new(vec![
             Ok("0".into()),
-            Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main"}"#.into()),
+            Ok(r#"{"number":1071,"state":"MERGED","mergedAt":"2026-07-27T12:00:00Z","baseRefName":"main","headRefOid":"merged-head"}"#
+                .into()),
+            Ok(String::new()),
         ]));
         let vcs = test_vcs(runner.clone());
         let (landed, evidence, change_request) = inspect_landed(
@@ -763,7 +804,7 @@ mod tests {
                 "view".to_string(),
                 "1071".to_string(),
                 "--json".to_string(),
-                "number,state,mergedAt,baseRefName,mergeable".to_string(),
+                "number,state,mergedAt,baseRefName,mergeable,headRefOid".to_string(),
             ],)
         );
     }
@@ -792,12 +833,80 @@ mod tests {
 
     #[tokio::test]
     async fn merged_change_request_is_landed() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main", "headRefOid": "merged-head"}]"#.into()),
+            Ok(String::new()),
+        ]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, evidence, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
+        assert_eq!(landed.value, ConditionValue::True);
+        assert!(evidence.expect("merged landing evidence").checkout_head_in_merged_head);
+        assert_eq!(runner.calls()[2].1, vec!["merge-base", "--is-ancestor", "HEAD", "merged-head"]);
+    }
+
+    #[tokio::test]
+    async fn merged_change_request_does_not_land_commit_added_after_merge() {
+        let landed = landed_with_responses(vec![
+            Ok("3".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main", "headRefOid": "merged-head"}]"#.into()),
+            Err(String::new()), // `git merge-base --is-ancestor` exits 1 without stderr.
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::False);
+    }
+
+    #[tokio::test]
+    async fn missing_merged_pr_head_is_unknown() {
         let landed = landed_with_responses(vec![
             Ok("2".into()),
             Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main"}]"#.into()),
         ])
         .await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
+    }
+
+    #[tokio::test]
+    async fn unavailable_merged_pr_commit_is_unknown() {
+        let landed = landed_with_responses(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "headRefOid": "missing-head"}]"#.into()),
+            Err("fatal: Not a valid commit name missing-head".into()),
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
+        assert!(landed.details[0].contains("could not be verified"));
+    }
+
+    #[tokio::test]
+    async fn closed_unmerged_change_request_keeps_landed_without_verified_head() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "CLOSED", "mergedAt": null, "baseRefName": "main"}]"#.into()),
+        ]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, evidence, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
         assert_eq!(landed.value, ConditionValue::True);
+        assert!(!evidence.expect("closed change request evidence").checkout_head_in_merged_head);
+        assert_eq!(runner.calls().len(), 2, "closed PR must not trigger a Git ancestry check");
     }
 
     #[tokio::test]

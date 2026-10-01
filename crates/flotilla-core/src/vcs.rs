@@ -506,6 +506,9 @@ pub trait Vcs: Send + Sync {
     async fn unpushed_commits(&self, _merged_head: Option<&str>) -> VcsCheck {
         VcsCheck::Unknown(vec!["unpushed commit inspection is unavailable".into()])
     }
+    async fn head_in_history_of(&self, _revision: &str) -> Result<bool, String> {
+        Err("checkout revision ancestry inspection is unavailable".into())
+    }
     async fn current_branch(&self) -> Result<String, String> {
         Err("current branch inspection is unavailable".into())
     }
@@ -835,6 +838,19 @@ impl Vcs for FlotillaVcs {
             _ => return self.unpushed_without_upstream().await,
         };
         self.parse_unpushed_count(self.cli().unpushed_count(Some(&upstream)).await)
+    }
+
+    async fn head_in_history_of(&self, revision: &str) -> Result<bool, String> {
+        let result = self.cli().head_is_ancestor_of(revision).await?;
+        if result.success {
+            Ok(true)
+        } else if result.stderr.trim().is_empty() {
+            // `git merge-base --is-ancestor` exits 1 without diagnostics when
+            // the commits exist but HEAD is not an ancestor.
+            Ok(false)
+        } else {
+            Err(result.stderr.trim().to_string())
+        }
     }
 
     async fn current_branch(&self) -> Result<String, String> {

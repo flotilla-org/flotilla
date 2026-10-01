@@ -200,6 +200,13 @@ pub struct LandedEvidence {
     pub merged_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_ref: Option<String>,
+    /// True only when the checkout HEAD was verified in the merged PR head.
+    /// Missing in the previous stored generation, so old evidence cannot
+    /// authorize the merged-PR teardown shortcut. Remove the serde default
+    /// after the next fleet roll.
+    #[serde(default)]
+    #[builder(default)]
+    pub checkout_head_in_merged_head: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

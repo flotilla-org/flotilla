@@ -8883,7 +8883,9 @@ impl InProcessDaemon {
             let landed_by_merged_change_request = condition_is_true(&integration.landed)
                 && integration.change_request.as_ref().is_some_and(|change_request| {
                     change_request.state == flotilla_resources::ChangeRequestState::Merged
-                        && integration.landed_evidence.as_ref().is_some_and(|evidence| evidence.change_request_id == change_request.id)
+                        && integration.landed_evidence.as_ref().is_some_and(|evidence| {
+                            evidence.change_request_id == change_request.id && evidence.checkout_head_in_merged_head
+                        })
                 });
             let required = if is_adopted {
                 vec![("Landed", &integration.landed)]
