@@ -2380,6 +2380,30 @@ mod tests {
         (backend, wake, delivery)
     }
 
+    async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
+        let ensures = backend.using::<ConvoyEnsure>("flotilla");
+        let created = ensures
+            .create(
+                &InputMeta::builder().name("wheelhouse-governor".into()).build(),
+                &flotilla_resources::ConvoyEnsureSpec::builder()
+                    .project_ref("wheelhouse".into())
+                    .role("governor".into())
+                    .workflow_ref("workflow".into())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("create ensure");
+        let created = ensures.get(&created.metadata.name).await.expect("read ensure");
+        ensures
+            .update_status("wheelhouse-governor", &created.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
+                convoy_ref: Some(convoy_ref.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("set owned attempt");
+    }
+
     #[tokio::test]
     async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
         let (backend, wake, delivery) =
@@ -2427,27 +2451,7 @@ mod tests {
     async fn stalled_work_prefers_governor_owned_by_ensure_over_higher_live_generation() {
         let (backend, wake, delivery) =
             project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
-        let ensures = backend.using::<ConvoyEnsure>("flotilla");
-        let ensure = ensures
-            .create(
-                &InputMeta::builder().name("wheelhouse-governor".into()).build(),
-                &flotilla_resources::ConvoyEnsureSpec::builder()
-                    .project_ref("wheelhouse".into())
-                    .role("governor".into())
-                    .workflow_ref("workflow".into())
-                    .repositories(Vec::new())
-                    .build(),
-            )
-            .await
-            .expect("create ensure");
-        let ensure = ensures.get(&ensure.metadata.name).await.expect("read ensure");
-        ensures
-            .update_status("wheelhouse-governor", &ensure.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
-                convoy_ref: Some("governor-two".into()),
-                ..Default::default()
-            })
-            .await
-            .expect("set owned attempt");
+        create_governor_ensure(&backend, "governor-two").await;
         let convoys = backend.using::<Convoy>("flotilla");
         let source = convoys.get("stalled-work").await.expect("source");
         let second = convoys.get("governor-two").await.expect("owned governor");
@@ -2490,27 +2494,7 @@ mod tests {
             ("governor-three", 3, ConvoyPhase::Active),
         ])
         .await;
-        let ensures = backend.using::<ConvoyEnsure>("flotilla");
-        let ensure = ensures
-            .create(
-                &InputMeta::builder().name("wheelhouse-governor".into()).build(),
-                &flotilla_resources::ConvoyEnsureSpec::builder()
-                    .project_ref("wheelhouse".into())
-                    .role("governor".into())
-                    .workflow_ref("workflow".into())
-                    .repositories(Vec::new())
-                    .build(),
-            )
-            .await
-            .expect("create ensure");
-        let ensure = ensures.get(&ensure.metadata.name).await.expect("read ensure");
-        ensures
-            .update_status("wheelhouse-governor", &ensure.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
-                convoy_ref: Some("governor-one".into()),
-                ..Default::default()
-            })
-            .await
-            .expect("set terminal owned attempt");
+        create_governor_ensure(&backend, "governor-one").await;
         let convoys = backend.using::<Convoy>("flotilla");
         let source = convoys.get("stalled-work").await.expect("source");
         let second = convoys.get("governor-two").await.expect("live governor");
