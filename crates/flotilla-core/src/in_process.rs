@@ -222,6 +222,18 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
     }
 }
 
+fn change_request_subjects_contain<'a>(
+    subjects: impl Iterator<Item = &'a flotilla_protocol::Subject>,
+    requested: &ChangeRequestRef,
+) -> bool {
+    subjects.into_iter().any(|bound| {
+        bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
+            && bound.source.service == requested.service
+            && bound.source.scope == requested.scope
+            && bound.id.parse::<u64>().ok() == Some(requested.number)
+    })
+}
+
 impl ProviderChangeRequestObservationSource {
     fn new(daemon: Arc<OnceLock<Weak<InProcessDaemon>>>) -> Self {
         Self { daemon, cache: Mutex::new(HashMap::new()) }
@@ -268,26 +280,35 @@ impl ProviderChangeRequestObservationSource {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
             }
-            let bound_numbers = convoy
+            if let Some(bound) =
+                convoy.object.spec.change_request.as_ref().filter(|bound| bound.repository_ref == repository.object.spec.key())
+            {
+                if let Ok(number) = bound.id.parse() {
+                    numbers.insert(number);
+                }
+            }
+            let bound_to_subject = change_request_subjects_contain(
+                convoy
+                    .object
+                    .spec
+                    .subjects
+                    .iter()
+                    .map(|entry| &entry.subject)
+                    .chain(convoy.object.status.iter().flat_map(|status| &status.subjects).map(|entry| &entry.subject)),
+                subject,
+            ) || convoy
                 .object
                 .spec
-                .declared_subjects()?
-                .into_iter()
-                .map(|entry| entry.subject)
-                .chain(convoy.object.status.iter().flat_map(|status| &status.subjects).map(|entry| entry.subject.clone()))
-                .filter(|bound| {
-                    bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
-                        && bound.source.service == subject.service
-                        && bound.source.scope == subject.scope
-                })
-                .filter_map(|bound| bound.id.parse::<u64>().ok())
-                .collect::<Vec<_>>();
-            if !bound_numbers.is_empty() {
-                numbers.extend(bound_numbers);
+                .change_request
+                .as_ref()
+                .is_some_and(|bound| bound.repository_ref == repository.object.spec.key() && bound.id == subject.number.to_string());
+            if bound_to_subject {
                 if let Some(snapshot) = convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) {
                     for vessel in &snapshot.vessels {
                         credential_refs.extend(vessel.credential_refs.iter().cloned());
                     }
+                } else {
+                    tracing::warn!(convoy = %convoy.object.metadata.name, "bound change request has no frozen workflow for crew credential identity");
                 }
             }
         }
@@ -316,16 +337,16 @@ impl ProviderChangeRequestObservationSource {
             .items
         {
             if credential_refs.contains(&credential.object.metadata.name) {
-                if let Some(login) = credential.object.spec.consumer.github_actor_login() {
+                if let Some(login) = credential.object.spec.consumer.github_graphql_actor_login() {
                     crew_logins.insert(login.to_string());
+                } else if matches!(credential.object.spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                    tracing::warn!(credential = %credential.object.metadata.name, "granted GitHub App credential has no actor_login; crew address markers cannot be recognized");
                 }
             }
         }
-        if crew_logins.len() > 1 {
-            return Err(format!("bound change requests for {} have conflicting crew GitHub App identities", subject.scope));
-        }
         let provider = daemon.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
-        let result = provider.observe_bound_with_crew_identity(&numbers, crew_logins.first().map(String::as_str)).await;
+        let crew_logins = crew_logins.into_iter().collect::<Vec<_>>();
+        let result = provider.observe_bound(&numbers, &crew_logins).await;
         let delay = result
             .as_ref()
             .err()

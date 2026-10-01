@@ -20,15 +20,13 @@ pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
-    async fn observe_bound_with_crew_identity(&self, numbers: &[u64], crew_login: Option<&str>) -> Result<BoundObservations, String> {
-        let _ = crew_login;
-        self.observe_bound(numbers).await
-    }
-
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA.
-    async fn observe_bound(&self, numbers: &[u64]) -> Result<BoundObservations, String> {
+    /// Crew identities are GraphQL App logins derived from the bound convoys'
+    /// credential declarations. Other forges can ignore them.
+    async fn observe_bound(&self, numbers: &[u64], crew_logins: &[String]) -> Result<BoundObservations, String> {
+        let _ = crew_logins;
         let mut statuses = HashMap::new();
         for number in numbers {
             let (_, request) = match self.get_change_request(&number.to_string()).await {
@@ -103,7 +101,7 @@ mod tests {
                 provider_display_name: "Fake".to_string(),
             })])
             .await;
-        let observed = provider.observe_bound(&[1, 2]).await.expect("independent reads");
+        let observed = provider.observe_bound(&[1, 2], &[]).await.expect("independent reads");
         assert!(observed.get(&1).expect("missing PR result").as_ref().is_err());
         assert_eq!(
             observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR").state.value,

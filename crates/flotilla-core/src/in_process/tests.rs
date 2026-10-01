@@ -17,6 +17,20 @@ use flotilla_resources::{
 
 use super::*;
 
+#[test]
+fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
+    let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
+        id: "42".into(),
+    };
+    assert!(change_request_subjects_contain([&subject].into_iter(), &requested));
+    let mut unrelated = subject.clone();
+    unrelated.source.scope = "team/other".into();
+    assert!(!change_request_subjects_contain([&unrelated].into_iter(), &requested));
+}
+
 #[tokio::test]
 async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());

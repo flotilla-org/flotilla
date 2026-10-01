@@ -80,6 +80,11 @@ impl CredentialConsumer {
         }
     }
 
+    /// GraphQL reports an App actor by its slug, without REST's `[bot]` suffix.
+    pub fn github_graphql_actor_login(&self) -> Option<&str> {
+        self.github_actor_login().map(|login| login.strip_suffix("[bot]").unwrap_or(login))
+    }
+
     pub fn adapter_name(&self) -> &'static str {
         match self {
             Self::Gh => "gh",
@@ -367,6 +372,7 @@ mod tests {
             serde_json::from_str(r#"{"adapter":"github-app","installation_id":42,"actor_login":"crew-app[bot]"}"#)
                 .expect("configured App declaration");
         assert_eq!(configured.github_actor_login(), Some("crew-app[bot]"));
+        assert_eq!(configured.github_graphql_actor_login(), Some("crew-app"));
     }
 
     #[test]
