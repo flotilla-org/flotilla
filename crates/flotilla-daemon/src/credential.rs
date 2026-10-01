@@ -244,6 +244,7 @@ pub(crate) struct CredentialStore {
 
 const GITHUB_APP_REFRESH_MARGIN: Duration = Duration::minutes(5);
 const GITHUB_APP_MIN_REFRESH_LEAD: Duration = Duration::minutes(15);
+const GITHUB_APP_INITIAL_REFRESH_BACKOFF: Duration = Duration::seconds(30);
 const GITHUB_APP_MAX_REFRESH_BACKOFF: Duration = Duration::minutes(5);
 
 fn github_app_refresh_at(issued_at: DateTime<Utc>, expires_at: DateTime<Utc>) -> DateTime<Utc> {
@@ -268,14 +269,20 @@ struct GithubAppDelivery {
 impl GithubAppDelivery {
     fn record_refresh_failure(&mut self, now: DateTime<Utc>) -> bool {
         self.refresh_failures += 1;
-        let delay = if now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at {
-            Duration::seconds(30)
+        let inside_margin = now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at;
+        if inside_margin {
+            self.next_refresh_attempt_at = None;
         } else {
-            let exponent = self.refresh_failures.saturating_sub(1).min(4) as u32;
-            (Duration::seconds(30) * (1 << exponent)).min(GITHUB_APP_MAX_REFRESH_BACKOFF)
-        };
-        self.next_refresh_attempt_at = Some(now + delay);
-        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || now + GITHUB_APP_REFRESH_MARGIN >= self.expires_at
+            let mut delay = GITHUB_APP_INITIAL_REFRESH_BACKOFF.min(GITHUB_APP_MAX_REFRESH_BACKOFF);
+            for _ in 1..self.refresh_failures {
+                if delay >= GITHUB_APP_MAX_REFRESH_BACKOFF {
+                    break;
+                }
+                delay = (delay * 2).min(GITHUB_APP_MAX_REFRESH_BACKOFF);
+            }
+            self.next_refresh_attempt_at = Some(now + delay);
+        }
+        self.refresh_failures >= GITHUB_APP_REFRESH_FAILURE_THRESHOLD || inside_margin
     }
 }
 
