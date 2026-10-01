@@ -256,6 +256,7 @@ impl ProviderChangeRequestObservationSource {
                     })
                 })
                 .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
+        let mut credential_refs = BTreeSet::new();
         for convoy in daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)
@@ -267,11 +268,26 @@ impl ProviderChangeRequestObservationSource {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
             }
-            if let Some(bound) =
-                convoy.object.spec.change_request.as_ref().filter(|bound| bound.repository_ref == repository.object.spec.key())
-            {
-                if let Ok(number) = bound.id.parse() {
-                    numbers.insert(number);
+            let bound_numbers = convoy
+                .object
+                .spec
+                .declared_subjects()?
+                .into_iter()
+                .map(|entry| entry.subject)
+                .chain(convoy.object.status.iter().flat_map(|status| &status.subjects).map(|entry| entry.subject.clone()))
+                .filter(|bound| {
+                    bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                        && bound.source.service == subject.service
+                        && bound.source.scope == subject.scope
+                })
+                .filter_map(|bound| bound.id.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            if !bound_numbers.is_empty() {
+                numbers.extend(bound_numbers);
+                if let Some(snapshot) = convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()) {
+                    for vessel in &snapshot.vessels {
+                        credential_refs.extend(vessel.credential_refs.iter().cloned());
+                    }
                 }
             }
         }
@@ -290,8 +306,26 @@ impl ProviderChangeRequestObservationSource {
             }
         }
         let numbers = queried.iter().copied().collect::<Vec<_>>();
+        let mut crew_logins = BTreeSet::new();
+        for credential in daemon
+            .resource_backend
+            .including_replicas::<CredentialSpec>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+        {
+            if credential_refs.contains(&credential.object.metadata.name) {
+                if let Some(login) = credential.object.spec.consumer.github_actor_login() {
+                    crew_logins.insert(login.to_string());
+                }
+            }
+        }
+        if crew_logins.len() > 1 {
+            return Err(format!("bound change requests for {} have conflicting crew GitHub App identities", subject.scope));
+        }
         let provider = daemon.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
-        let result = provider.observe_bound(&numbers).await;
+        let result = provider.observe_bound_with_crew_identity(&numbers, crew_logins.first().map(String::as_str)).await;
         let delay = result
             .as_ref()
             .err()

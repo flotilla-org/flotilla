@@ -5827,6 +5827,7 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
         .definitions::<CredentialSpec>("flotilla")
         .create(&test_meta("github-app"), &CredentialSpecSpec {
             consumer: CredentialConsumer::GithubApp {
+                actor_login: None,
                 installation_id: Some(1),
                 installation_repository: None,
                 permissions: Some(BTreeMap::from([

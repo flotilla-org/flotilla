@@ -21,8 +21,6 @@ use tokio::{
 
 use crate::providers::{run, CommandRunner};
 
-// GraphQL's Author.login for the crew App omits the REST `[bot]` suffix.
-const CREW_GITHUB_LOGIN: &str = "flotilla-crew";
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -131,6 +129,18 @@ pub(crate) fn parse_gh_observation_with_identity(
     review_bot_login: &str,
     operator_login: Option<&str>,
 ) -> Result<ChangeRequestStatus, String> {
+    parse_gh_observation_with_crew_identity(json, observed_at, review_bot_login, operator_login, None)
+}
+
+pub(crate) fn parse_gh_observation_with_crew_identity(
+    json: &str,
+    observed_at: DateTime<Utc>,
+    review_bot_login: &str,
+    operator_login: Option<&str>,
+    crew_login: Option<&str>,
+) -> Result<ChangeRequestStatus, String> {
+    // REST identifies an App actor as `slug[bot]`; GraphQL uses `slug`.
+    let crew_login = crew_login.map(|login| login.strip_suffix("[bot]").unwrap_or(login));
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| format!("decode gh pr observation: {error}"))?;
     let state = match value["state"].as_str() {
         Some("OPEN") if value["isDraft"] == true => Some(ObservedChangeRequestState::Draft),
@@ -165,7 +175,7 @@ pub(crate) fn parse_gh_observation_with_identity(
     let addressed = comments
         .iter()
         .copied()
-        .filter(|comment| comment["author"]["login"] == CREW_GITHUB_LOGIN)
+        .filter(|comment| comment["author"]["login"].as_str().is_some_and(|login| crew_login == Some(login)))
         .filter_map(|comment| comment["body"].as_str())
         .flat_map(|body| {
             body.split("<!--")
@@ -179,7 +189,7 @@ pub(crate) fn parse_gh_observation_with_identity(
     let reviews = value["reviews"]["nodes"].as_array();
     let actionable_at_head = value.get("reviewDecision").map(|decision| {
         let unaddressed = |item: &serde_json::Value| {
-            actionable_author(item, value["author"]["login"].as_str(), review_bot_login)
+            actionable_author(item, value["author"]["login"].as_str(), review_bot_login, crew_login)
                 && github_comment_id(item).is_none_or(|id| !addressed.contains(&id))
         };
         let mut latest_formal = HashMap::new();
@@ -261,9 +271,9 @@ pub(crate) fn parse_gh_observation_with_identity(
     })
 }
 
-fn actionable_author(item: &serde_json::Value, pr_author: Option<&str>, review_bot_login: &str) -> bool {
+fn actionable_author(item: &serde_json::Value, pr_author: Option<&str>, review_bot_login: &str, crew_login: Option<&str>) -> bool {
     let Some(login) = item["author"]["login"].as_str() else { return false };
-    if login == CREW_GITHUB_LOGIN || Some(login) == pr_author {
+    if Some(login) == crew_login || Some(login) == pr_author {
         return false;
     }
     // Only the configured review bot may contribute bot feedback.
@@ -835,6 +845,35 @@ mod tests {
                 .value,
             Some(true)
         );
+    }
+
+    #[test]
+    fn crew_markers_are_accepted_only_from_configured_credential_actor() {
+        let mut request = serde_json::json!({
+            "reviewDecision": null, "author": {"login": "author"},
+            "commits": {"nodes": [{"commit": {"committedDate": "2026-09-30T10:00:00Z"}}]},
+            "reviews": {"nodes": [{"fullDatabaseId": "77", "submittedAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "state": "COMMENTED", "body": "Please fix"}]},
+            "comments": {"nodes": [{"databaseId": 88, "createdAt": "2026-09-30T12:00:00Z",
+                "author": {"login": "other-app"}, "body": "<!-- pr-shepherd-addresses:77 -->"}]}
+        });
+        let observed_at = "2026-09-30T13:00:00Z".parse().expect("time");
+        let observe = |request: &serde_json::Value| {
+            parse_gh_observation_with_crew_identity(
+                &request.to_string(),
+                observed_at,
+                DEFAULT_REVIEW_BOT_LOGIN,
+                None,
+                Some("crew-app[bot]"),
+            )
+            .expect("parse")
+            .review
+            .actionable_at_head
+            .value
+        };
+        assert_eq!(observe(&request), Some(true));
+        request["comments"]["nodes"][0]["author"]["login"] = "crew-app".into();
+        assert_eq!(observe(&request), Some(false));
     }
 
     #[test]

@@ -20,6 +20,11 @@ pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
+    async fn observe_bound_with_crew_identity(&self, numbers: &[u64], crew_login: Option<&str>) -> Result<BoundObservations, String> {
+        let _ = crew_login;
+        self.observe_bound(numbers).await
+    }
+
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA.

@@ -298,6 +298,14 @@ review_bot_login = "review-helper"
 
 Only comments from that bot identity are treated as bot review feedback. Other bot comments do not wake a crew.
 
+The crew App identity is separate from `review_bot_login`. Set `consumer.actor_login`
+on the GitHub App `CredentialSpec` to its REST bot login, such as
+`example-crew[bot]`. The credential adapter exports that value as
+`PR_SHEPHERD_AS` to crews, and change-request observation uses the same
+declaration to recognize their address markers. Project-map credential
+manifests that author GitHub App credentials must add this field in the same
+roll; old stored specs still decode without it.
+
 To observe whether review is requested from the operator, set the operator's forge login in the same section:
 
 ```toml

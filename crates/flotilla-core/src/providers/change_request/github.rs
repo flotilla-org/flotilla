@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::{
-    change_request_observer::{parse_gh_observation_with_identity, DEFAULT_REVIEW_BOT_LOGIN},
+    change_request_observer::{parse_gh_observation_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
         gh_api_get, gh_api_get_with_headers,
         github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, GhApi},
@@ -105,6 +105,14 @@ impl GitHubChangeRequest {
 #[async_trait]
 impl super::ChangeRequestTracker for GitHubChangeRequest {
     async fn observe_bound(&self, numbers: &[u64]) -> Result<super::BoundObservations, String> {
+        self.observe_bound_with_crew_identity(numbers, None).await
+    }
+
+    async fn observe_bound_with_crew_identity(
+        &self,
+        numbers: &[u64],
+        crew_login: Option<&str>,
+    ) -> Result<super::BoundObservations, String> {
         if numbers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -160,11 +168,12 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
             statuses.insert(
                 *number,
-                Ok(parse_gh_observation_with_identity(
+                Ok(parse_gh_observation_with_crew_identity(
                     &request.to_string(),
                     observed_at,
                     &self.review_bot_login,
                     self.operator_login.as_deref(),
+                    crew_login,
                 )?),
             );
         }
@@ -378,7 +387,7 @@ mod tests {
         let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        let statuses = provider.observe_bound_with_crew_identity(&[1], Some("flotilla-crew[bot]")).await.expect("observe PR");
         assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
     }
 
@@ -445,8 +454,8 @@ mod tests {
         };
         let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let first = provider.observe_bound(&[1]).await.expect("unaddressed review");
-        let second = provider.observe_bound(&[1]).await.expect("addressed review");
+        let first = provider.observe_bound_with_crew_identity(&[1], Some("flotilla-crew[bot]")).await.expect("unaddressed review");
+        let second = provider.observe_bound_with_crew_identity(&[1], Some("flotilla-crew[bot]")).await.expect("addressed review");
         assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
         assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
     }
@@ -475,8 +484,8 @@ mod tests {
         };
         let runner = Arc::new(MockRunner::new(vec![Ok(response(false)), Ok(response(true))]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
-        let first = provider.observe_bound(&[1]).await.expect("unaddressed formal review");
-        let second = provider.observe_bound(&[1]).await.expect("addressed formal review");
+        let first = provider.observe_bound_with_crew_identity(&[1], Some("flotilla-crew[bot]")).await.expect("unaddressed formal review");
+        let second = provider.observe_bound_with_crew_identity(&[1], Some("flotilla-crew[bot]")).await.expect("addressed formal review");
         assert_eq!(first[&1].as_ref().expect("first status").review.actionable_at_head.value, Some(true));
         assert_eq!(second[&1].as_ref().expect("second status").review.actionable_at_head.value, Some(false));
     }

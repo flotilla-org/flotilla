@@ -1042,7 +1042,7 @@ impl CredentialStore {
     ) -> Result<PathBuf, String> {
         let spec = self.spec(credential_name).await?;
         let (
-            CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+            CredentialConsumer::GithubApp { installation_id, installation_repository, permissions, .. },
             CredentialSource::GithubApp { app_id_path, private_key_path },
         ) = (&spec.consumer, &spec.source)
         else {
@@ -1419,7 +1419,7 @@ impl CredentialStore {
     ) -> Result<ResolvedMaterial, String> {
         let result = match (&spec.consumer, &spec.source) {
             (
-                CredentialConsumer::GithubApp { installation_id, installation_repository, permissions },
+                CredentialConsumer::GithubApp { installation_id, installation_repository, permissions, .. },
                 CredentialSource::GithubApp { app_id_path, private_key_path },
             ) => {
                 if spec.lifecycle != CredentialLifecycle::Refreshable {
@@ -1669,6 +1669,9 @@ impl CredentialStore {
                     .await
                     .map_err(|error| format!("installation authentication preflight failed: {error}"))?;
                 env.insert("GITHUB_TOKEN_FILE".to_string(), token_file.clone());
+                if let Some(actor_login) = spec.consumer.github_actor_login() {
+                    env.insert("PR_SHEPHERD_AS".to_string(), actor_login.to_string());
+                }
                 env.insert("PATH".to_string(), format!("{}:{path}", credential_dir.to_string_lossy()));
                 git_credential = Some(GitCredentialContribution {
                     fragment: git_credential_fragment(
@@ -2287,6 +2290,7 @@ mod tests {
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
                 consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
                     installation_id: Some(9876),
                     installation_repository: None,
                     permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
@@ -2561,6 +2565,7 @@ mod tests {
         );
         let spec = CredentialSpecSpec {
             consumer: CredentialConsumer::GithubApp {
+                actor_login: None,
                 installation_id: Some(9876),
                 installation_repository: None,
                 permissions: Some(BTreeMap::from([("contents".to_string(), "write".to_string())])),
@@ -2621,7 +2626,12 @@ mod tests {
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -3067,6 +3077,7 @@ mod tests {
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
                 consumer: CredentialConsumer::GithubApp {
+                    actor_login: Some("configured-crew[bot]".to_string()),
                     installation_id: None,
                     installation_repository: Some("flotilla-org/flotilla".to_string()),
                     permissions: None,
@@ -3124,7 +3135,8 @@ interactions:
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
-        store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
+        let delivered = store.prepare_scoped("env-a", &refs, &scopes, runner.clone()).await.expect("first preparation");
+        assert!(delivered.contains(&("PR_SHEPHERD_AS".to_string(), "configured-crew[bot]".to_string())));
         store.prepare_scoped("env-a", &refs, &scopes, runner).await.expect("second preparation after invalidation");
         session.assert_complete();
     }
@@ -3184,7 +3196,12 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
                 source: CredentialSource::GithubApp {
                     app_id_path: app_id_path.to_string_lossy().into_owned(),
                     private_key_path: private_key_path.to_string_lossy().into_owned(),
@@ -3284,6 +3301,7 @@ interactions:
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
                 consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
                     installation_id: Some(9876),
                     installation_repository: None,
                     permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
@@ -3492,7 +3510,12 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -3653,7 +3676,12 @@ interactions:
             .clone()
             .definitions::<CredentialSpec>("flotilla")
             .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
                 source: CredentialSource::GithubApp {
                     app_id_path: "/host-only/github-app.id".to_string(),
                     private_key_path: "/host-only/github-app.pem".to_string(),
@@ -3711,7 +3739,12 @@ interactions:
             PathBuf::from("/tmp/flotilla-test-state"),
         );
         let spec = CredentialSpecSpec {
-            consumer: CredentialConsumer::GithubApp { installation_id: Some(9876), installation_repository: None, permissions: None },
+            consumer: CredentialConsumer::GithubApp {
+                actor_login: None,
+                installation_id: Some(9876),
+                installation_repository: None,
+                permissions: None,
+            },
             source: CredentialSource::GithubApp {
                 app_id_path: "/not-read/github-app.id".to_string(),
                 private_key_path: "/not-read/github-app.pem".to_string(),
