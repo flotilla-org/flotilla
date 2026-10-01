@@ -320,6 +320,10 @@ pub enum HostStatusPatch {
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
         admission_free_space_floor_bytes: Option<u64>,
+        agent_adapter_baseline: Option<BTreeSet<String>>,
+        // Keep the in-process patch enum small; HostStatus stores the unboxed value.
+        resource_store: Option<Box<ResourceStoreDiagnostics>>,
+        conditions: Vec<HostCondition>,
     },
     SleepInhibition {
         health: SleepInhibitionHealth,
@@ -344,15 +348,30 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 daemon_started_at,
                 disk_free_bytes,
                 admission_free_space_floor_bytes,
+                agent_adapter_baseline,
+                resource_store,
+                conditions,
             } => {
                 status.capabilities = capabilities.clone();
                 status.heartbeat_at = Some(*heartbeat_at);
-                status.ready = *ready;
+                // Sleep inhibition has its own writer. Apply heartbeat conditions to
+                // the latest status so a concurrent sleep update survives a retry.
+                let sleep_conditions = status
+                    .conditions
+                    .iter()
+                    .filter(|condition| condition.condition_type == SLEEP_INHIBITION_CONDITION_TYPE)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                status.conditions.clone_from(conditions);
+                status.conditions.extend(sleep_conditions);
+                status.ready = *ready && !status.readiness_blocked();
                 status.daemon_generation.clone_from(daemon_generation);
                 status.daemon_version.clone_from(daemon_version);
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
                 status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
+                status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
+                status.resource_store = resource_store.as_deref().cloned();
             }
             Self::SleepInhibition { health, observed_at } => {
                 status.sleep_inhibition.clone_from(health);

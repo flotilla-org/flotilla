@@ -880,6 +880,9 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
         daemon_started_at: None,
         disk_free_bytes: None,
         admission_free_space_floor_bytes: None,
+        agent_adapter_baseline: None,
+        resource_store: None,
+        conditions: Vec::new(),
     }
     .apply(&mut status);
     hosts.update_status(name, &created.metadata.resource_version, &status).await.expect("host status update should succeed");
