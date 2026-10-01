@@ -32,6 +32,8 @@ pub struct CreateOpts {
     pub tools: Vec<EnvironmentTool>,
     pub image_pull_policy: ImagePullPolicy,
     pub docker_config_dir: Option<DaemonHostPath>,
+    /// CPU quota for this vessel. None leaves the provider's default.
+    pub cpu_limit: Option<usize>,
 }
 
 /// A host-side tool that an environment provider must make invokable inside a

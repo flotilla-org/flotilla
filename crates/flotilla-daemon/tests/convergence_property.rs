@@ -206,6 +206,7 @@ impl Harness {
             .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
                 display_name: "stale-self-copy".into(),
                 connection: Default::default(),
+                ..HostSpec::default()
             })
             .await
             .expect("create stale self-origin fixture");
@@ -235,7 +236,7 @@ impl Harness {
             .using::<Host>(NAMESPACE)
             .create(
                 &InputMeta::builder().name("host-2".to_string()).finalizers(vec!["abandoned.example/finalizer".into()]).build(),
-                &HostSpec { display_name: "abandoned-finalizer".into(), connection: Default::default() },
+                &HostSpec { display_name: "abandoned-finalizer".into(), connection: Default::default(), ..HostSpec::default() },
             )
             .await
             .expect("seed abandoned finalizer");
@@ -291,6 +292,7 @@ impl Harness {
                         .create(&InputMeta::builder().name(name).build(), &HostSpec {
                             display_name: format!("created-by-{}", self.seed),
                             connection: Default::default(),
+                            ..HostSpec::default()
                         })
                         .await
                         .map_err(|error| error.to_string())?;
@@ -304,6 +306,7 @@ impl Harness {
                         .update(&InputMeta::builder().name(name).build(), &current.metadata.resource_version, &HostSpec {
                             display_name: format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version),
                             connection: Default::default(),
+                            ..HostSpec::default()
                         })
                         .await
                         .map_err(|error| error.to_string())?;
@@ -483,6 +486,7 @@ impl Harness {
             .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
                 display_name: "watch-shadow".to_string(),
                 connection: Default::default(),
+                ..HostSpec::default()
             })
             .await
             .map_err(|error| error.to_string())?;

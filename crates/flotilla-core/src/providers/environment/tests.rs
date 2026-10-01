@@ -279,6 +279,7 @@ async fn create_returns_handle() {
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let id = EnvironmentId::new("test-env-1");
@@ -333,6 +334,7 @@ async fn create_runs_container_as_the_host_user() {
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("host-user"), &image, opts).await.expect("create environment as host user");
@@ -361,6 +363,7 @@ async fn create_removes_container_when_image_digest_cannot_be_resolved() {
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let error = match provider.create(EnvironmentId::new("invalid-digest"), &image, opts).await {
@@ -392,6 +395,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
             provisioned_mounts: Vec::new(),
             image_pull_policy: policy,
             docker_config_dir: None,
+            cpu_limit: Some(8),
         };
 
         provider.create(EnvironmentId::new(docker_value), &image, opts).await.expect("image policy should create an environment");
@@ -400,6 +404,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
         assert_eq!(calls.len(), 2);
         let (_, args, _) = &calls[0];
         assert!(args.windows(2).any(|pair| pair == ["--pull", docker_value]));
+        assert!(args.windows(2).any(|pair| pair == ["--cpus", "8"]));
         assert!(!calls.iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "pull")));
     }
 }
@@ -418,6 +423,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
         docker_config_dir: Some(DaemonHostPath::new("/run/flotilla/registry-auth")),
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("private-registry"), &image, opts).await.expect("create authenticated environment");
@@ -444,6 +450,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let id = EnvironmentId::new("test-env-metadata");
@@ -483,6 +490,7 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
         )],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let error = provider
@@ -516,6 +524,7 @@ async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
         provisioned_mounts: vec![ProvisionedMount::new("/host/replacement-flotilla", "/usr/local/bin/flotilla", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let error = provider
@@ -559,6 +568,7 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
         tools: vec![tool],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("tool-delivery"), &image, opts).await.expect("Docker should lower provider-neutral tool assets");
@@ -599,6 +609,7 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
         tools: vec![tool],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("upgrade-visible"), &image, opts).await.expect("create environment");
@@ -631,6 +642,7 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         ],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
@@ -667,6 +679,7 @@ async fn protected_git_mount_rejects_a_comma_in_its_path() {
         provisioned_mounts: vec![ProvisionedMount::new("/host/a,b/.git/config", "/host/a,b/.git/config", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
     let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
     assert!(error.contains("comma"), "{error}");
@@ -698,6 +711,7 @@ async fn list_preserves_provisioned_mount_metadata() {
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list"), &image, opts).await.expect("create");
@@ -748,6 +762,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
@@ -774,6 +789,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     provider.create(EnvironmentId::new("test-env-list-missing"), &image, opts).await.expect("create");
@@ -796,6 +812,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let handle = provider.create(EnvironmentId::new("test-env-runner"), &image, opts).await.expect("create");
@@ -822,6 +839,7 @@ async fn status_returns_running() {
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let id = EnvironmentId::new("test-env-status");
@@ -854,6 +872,7 @@ async fn env_vars_parses_output() {
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let id = EnvironmentId::new("test-env-vars");
@@ -888,6 +907,7 @@ async fn destroy_calls_docker_rm() {
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         docker_config_dir: None,
+        cpu_limit: None,
     };
 
     let id = EnvironmentId::new("test-env-destroy");
