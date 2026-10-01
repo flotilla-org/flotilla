@@ -26,7 +26,7 @@ use flotilla_resources::{
     InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority, RepositoryKey, ResourceBackend, ResourceError, ResourceObject,
     StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
 };
-use tokio::time::timeout;
+use tokio::{sync::watch, time::timeout};
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
@@ -34,6 +34,7 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
 #[derive(Default)]
 struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
+    removal_attempts: Mutex<Option<watch::Sender<usize>>>,
     inspections: Mutex<usize>,
     failed_removal_target: Option<String>,
     transient_removal_failures: AtomicUsize,
@@ -81,7 +82,14 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.removals.lock().expect("removals lock").push(removal.clone());
+        let attempts = {
+            let mut removals = self.removals.lock().expect("removals lock");
+            removals.push(removal.clone());
+            removals.len()
+        };
+        if let Some(sender) = self.removal_attempts.lock().expect("attempts lock").as_ref() {
+            sender.send_replace(attempts);
+        }
         if self.transient_removal_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
             return Err("temporary removal failure".to_string());
         }
@@ -147,6 +155,8 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/backoff").await;
     let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(7), ..Default::default() });
+    let (attempt_sender, mut attempt_receiver) = watch::channel(0);
+    *runtime.removal_attempts.lock().expect("attempts lock") = Some(attempt_sender);
     let controller = tokio::spawn(
         ControllerLoop {
             primary: checkouts.clone(),
@@ -157,20 +167,14 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
         }
         .run(),
     );
-    async fn wait_for_attempts(runtime: &RecordingCheckoutRuntime, count: usize) {
-        for _ in 0..100 {
-            if runtime.removals.lock().expect("removals lock").len() == count {
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-                return;
-            }
-            tokio::task::yield_now().await;
+    async fn wait_for_attempts(receiver: &mut watch::Receiver<usize>, count: usize) {
+        while *receiver.borrow_and_update() < count {
+            receiver.changed().await.expect("controller should report a removal attempt");
         }
-        panic!("expected {count} removal attempts");
+        assert_eq!(*receiver.borrow(), count, "unexpected extra removal attempt");
     }
 
-    wait_for_attempts(&runtime, 1).await;
+    wait_for_attempts(&mut attempt_receiver, 1).await;
     assert_eq!(runtime.removals.lock().expect("removals lock").len(), 1, "status watch must not bypass the first delay");
     for (index, delay) in [1, 2, 4, 8, 16, 32, 32].into_iter().enumerate() {
         if delay > 1 {
@@ -178,14 +182,14 @@ async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds(
             assert_eq!(runtime.removals.lock().expect("removals lock").len(), index + 1, "retry must respect backoff window");
         }
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_attempts(&runtime, index + 2).await;
+        wait_for_attempts(&mut attempt_receiver, index + 2).await;
     }
     assert!(matches!(checkouts.get("backoff-cleanup").await, Err(ResourceError::NotFound { .. })));
     runtime.transient_removal_failures.store(1, Ordering::SeqCst);
     create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/recreated").await;
-    wait_for_attempts(&runtime, 9).await;
+    wait_for_attempts(&mut attempt_receiver, 9).await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    wait_for_attempts(&runtime, 10).await;
+    wait_for_attempts(&mut attempt_receiver, 10).await;
     assert!(matches!(checkouts.get("backoff-cleanup").await, Err(ResourceError::NotFound { .. })));
     controller.abort();
     let _ = controller.await;

@@ -698,15 +698,17 @@ impl<R: Reconciler> ControllerLoop<R> {
         })
     }
 
-    async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<(), ResourceError> {
+    async fn resync_all(primary: &TypedResolver<R::Resource>, sender: &WorkQueueSender) -> Result<HashSet<String>, ResourceError> {
         let listed = primary.list().await?;
+        let mut live_names = HashSet::with_capacity(listed.items.len());
         for object in listed.items {
+            live_names.insert(object.metadata.name.clone());
             sender
                 .send(object.metadata.name)
                 .await
                 .map_err(|_| ResourceError::other("controller queue closed while forwarding resync item"))?;
         }
-        Ok(())
+        Ok(live_names)
     }
 
     fn accept_restartable_watch_exit(result: Result<(), ResourceError>) -> Result<(), ResourceError> {
@@ -1017,7 +1019,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                     pending.push_front(name);
                 }
                 _ = resync.tick() => {
-                    Self::resync_all(&primary, &sender).await?;
+                    let live_names = Self::resync_all(&primary, &sender).await?;
+                    finalizer_failures.retain(|name, _| live_names.contains(name));
                 }
                 Some(exited) = watch_exited_rx.recv() => {
                     match exited {
@@ -1034,7 +1037,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                             Self::accept_restartable_watch_exit(result)?;
                             // Relisting a secondary can enqueue objects that still exist, but
                             // cannot reveal a deletion missed while its watch was expired.
-                            Self::resync_all(&primary, &sender).await?;
+                            let live_names = Self::resync_all(&primary, &sender).await?;
+                            finalizer_failures.retain(|name, _| live_names.contains(name));
                             let _respawn = Self::spawn_secondary_watch(
                                 index,
                                 secondary_templates[index].clone(),
