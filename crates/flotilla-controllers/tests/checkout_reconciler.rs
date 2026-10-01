@@ -82,7 +82,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         self.removals.lock().expect("removals lock").push(removal.clone());
-        if self.transient_removal_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
+        if self.transient_removal_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
             return Err("temporary removal failure".to_string());
         }
         let target_path = match removal {
