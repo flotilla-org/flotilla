@@ -24,24 +24,39 @@ pub struct ForgejoChangeRequestProvider {
     operator_login: Option<String>,
 }
 
-fn review_decision(value: &serde_json::Value) -> Option<ObservedReviewDecision> {
+fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecision> {
     let mut latest_by_reviewer = HashMap::<String, (i64, ObservedReviewDecision)>::new();
-    for review in value.as_array()? {
+    for review in reviews {
+        // A stale approval or dismissed changes request does not decide the current PR.
         if review["stale"] == true || review["dismissed"] == true {
             continue;
         }
-        let decision = match review["state"].as_str()? {
+        let Some(state) = review["state"].as_str() else {
+            tracing::warn!("Forgejo review is missing a state");
+            return None;
+        };
+        let decision = match state {
             "APPROVED" => ObservedReviewDecision::Approved,
             "REQUEST_CHANGES" => ObservedReviewDecision::ChangesRequested,
             "REQUEST_REVIEW" => ObservedReviewDecision::Required,
             "COMMENT" | "PENDING" => continue,
-            _ => return None,
+            _ => {
+                tracing::warn!(state, "Unknown Forgejo review state");
+                return None;
+            }
         };
         let reviewer = review["user"]["login"]
             .as_str()
             .map(|login| format!("user:{}", login.to_ascii_lowercase()))
-            .or_else(|| review["team"]["id"].as_i64().map(|id| format!("team:{id}")))?;
-        let id = review["id"].as_i64()?;
+            .or_else(|| review["team"]["id"].as_i64().map(|id| format!("team:{id}")));
+        let Some(reviewer) = reviewer else {
+            tracing::warn!(state, "Forgejo review is missing a reviewer");
+            return None;
+        };
+        let Some(id) = review["id"].as_i64() else {
+            tracing::warn!(state, "Forgejo review is missing an id");
+            return None;
+        };
         let entry = latest_by_reviewer.entry(reviewer).or_insert((id, decision));
         if id > entry.0 {
             *entry = (id, decision);
@@ -150,26 +165,34 @@ impl ForgejoChangeRequestProvider {
 
     async fn read_review_decision(&self, number: u64) -> Result<Option<ObservedReviewDecision>, String> {
         const PAGE_SIZE: usize = 50;
+        const MAX_PAGES: usize = 100;
         let mut reviews = Vec::new();
-        let mut page = 1;
-        loop {
-            let value = self
-                .execute(
-                    reqwest::Method::GET,
-                    &format!("pulls/{number}/reviews"),
-                    &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
-                    None,
-                )
-                .await?;
-            let batch = value.as_array().ok_or("Forgejo review response was not an array")?;
-            let batch_len = batch.len();
-            reviews.extend(batch.iter().cloned());
-            if batch_len < PAGE_SIZE {
-                break;
+        for page in 1..=MAX_PAGES {
+            let request = self.request(
+                reqwest::Method::GET,
+                &format!("pulls/{number}/reviews"),
+                &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
+                None,
+            )?;
+            let response = http_execute!(self.http, request)?;
+            if !response.status().is_success() {
+                return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
             }
-            page += 1;
+            // Forgejo reports the total count on this endpoint. If a proxy
+            // strips it, an empty page still terminates the scan safely.
+            let total =
+                response.headers().get("x-total-count").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<usize>().ok());
+            let batch: Vec<serde_json::Value> =
+                serde_json::from_slice(response.body()).map_err(|error| format!("Forgejo review response was not an array: {error}"))?;
+            if batch.is_empty() {
+                return Ok(review_decision(&reviews));
+            }
+            reviews.extend(batch);
+            if total.is_some_and(|total| reviews.len() >= total) {
+                return Ok(review_decision(&reviews));
+            }
         }
-        Ok(review_decision(&serde_json::Value::Array(reviews)))
+        Err(format!("Forgejo review page limit ({MAX_PAGES}) reached for pull request {number}"))
     }
 
     fn parse(&self, value: &serde_json::Value) -> Option<(String, ChangeRequest)> {
@@ -314,6 +337,10 @@ mod tests {
         ChannelLabel,
     };
 
+    fn parse_review_decision(value: &serde_json::Value) -> Option<ObservedReviewDecision> {
+        review_decision(value.as_array()?)
+    }
+
     struct MockHttp {
         responses: Mutex<VecDeque<http::Response<bytes::Bytes>>>,
         urls: Mutex<Vec<String>>,
@@ -338,6 +365,14 @@ mod tests {
         http::Response::builder()
             .status(200)
             .body(bytes::Bytes::from(serde_json::to_vec(value).expect("serialize value")))
+            .expect("response")
+    }
+
+    fn review_response(value: &serde_json::Value, total: usize) -> http::Response<bytes::Bytes> {
+        http::Response::builder()
+            .status(200)
+            .header("x-total-count", total.to_string())
+            .body(bytes::Bytes::from(serde_json::to_vec(value).expect("serialize reviews")))
             .expect("response")
     }
 
@@ -390,19 +425,41 @@ mod tests {
             {"id": 3, "user": {"login": "bob"}, "state": "APPROVED", "dismissed": true},
             {"id": 4, "user": {"login": "carol"}, "state": "REQUEST_CHANGES", "stale": true}
         ]);
-        assert_eq!(review_decision(&reviews), Some(ObservedReviewDecision::Approved));
+        assert_eq!(parse_review_decision(&reviews), Some(ObservedReviewDecision::Approved));
         let requested = serde_json::json!([
             {"id": 1, "user": {"login": "alice"}, "state": "APPROVED"},
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_REVIEW"}
         ]);
-        assert_eq!(review_decision(&requested), Some(ObservedReviewDecision::Required));
+        assert_eq!(parse_review_decision(&requested), Some(ObservedReviewDecision::Required));
         let changes = serde_json::json!([
             {"id": 1, "user": {"login": "alice"}, "state": "APPROVED"},
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_CHANGES"}
         ]);
-        assert_eq!(review_decision(&changes), Some(ObservedReviewDecision::ChangesRequested));
-        assert_eq!(review_decision(&serde_json::json!([])), Some(ObservedReviewDecision::None));
-        assert_eq!(review_decision(&serde_json::json!({"invalid": true})), None);
+        assert_eq!(parse_review_decision(&changes), Some(ObservedReviewDecision::ChangesRequested));
+        assert_eq!(parse_review_decision(&serde_json::json!([])), Some(ObservedReviewDecision::None));
+        assert_eq!(
+            parse_review_decision(&serde_json::json!([
+                {"id": 1, "user": {"login": "alice"}, "state": "PENDING"},
+                {"id": 2, "user": {"login": "bob"}, "state": "COMMENT"}
+            ])),
+            Some(ObservedReviewDecision::None)
+        );
+        assert_eq!(
+            parse_review_decision(&serde_json::json!([{"id": 1, "team": {"id": 42}, "state": "REQUEST_REVIEW"}])),
+            Some(ObservedReviewDecision::Required)
+        );
+        assert_eq!(
+            parse_review_decision(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED", "stale": true}])),
+            Some(ObservedReviewDecision::None)
+        );
+        assert_eq!(
+            parse_review_decision(
+                &serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "REQUEST_CHANGES", "dismissed": true}])
+            ),
+            Some(ObservedReviewDecision::None)
+        );
+        assert_eq!(parse_review_decision(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "NEW_STATE"}])), None);
+        assert_eq!(parse_review_decision(&serde_json::json!({"invalid": true})), None);
     }
 
     #[tokio::test]
@@ -414,6 +471,7 @@ mod tests {
             responses: Mutex::new(VecDeque::from([
                 json_response(&first_page),
                 json_response(&serde_json::json!([{"id": 51, "user": {"login": "alice"}, "state": "APPROVED"}])),
+                json_response(&serde_json::json!([])),
             ])),
             urls: Mutex::new(Vec::new()),
         });
@@ -429,9 +487,53 @@ mod tests {
         );
         assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::Approved));
         let urls = http.urls.lock().expect("urls");
-        assert_eq!(urls.len(), 2);
+        assert_eq!(urls.len(), 3);
         assert!(urls[0].contains("page=1"));
         assert!(urls[1].contains("page=2"));
+        assert!(urls[2].contains("page=3"));
+    }
+
+    #[tokio::test]
+    async fn review_read_continues_after_short_pages() {
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([
+                json_response(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}])),
+                json_response(&serde_json::json!([{"id": 2, "user": {"login": "bob"}, "state": "REQUEST_CHANGES"}])),
+                json_response(&serde_json::json!([])),
+            ])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
+            "team/repo".into(),
+        );
+        assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::ChangesRequested));
+        assert_eq!(http.urls.lock().expect("urls").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn review_read_stops_at_page_limit() {
+        let page = serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}]);
+        let http =
+            Arc::new(MockHttp { responses: Mutex::new((0..101).map(|_| json_response(&page)).collect()), urls: Mutex::new(Vec::new()) });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
+            "team/repo".into(),
+        );
+        assert!(provider.read_review_decision(7).await.expect_err("page limit").contains("page limit"));
+        assert_eq!(http.urls.lock().expect("urls").len(), 100);
     }
 
     #[tokio::test]
@@ -470,7 +572,7 @@ mod tests {
         let http = Arc::new(MockHttp {
             responses: Mutex::new(VecDeque::from([
                 json_response(&serde_json::json!({"number": 7, "title": "PR", "state": "open"})),
-                json_response(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}])),
+                review_response(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}]), 1),
                 json_response(&serde_json::json!({"number": 8, "title": "Another PR", "state": "open"})),
             ])),
             urls: Mutex::new(Vec::new()),
