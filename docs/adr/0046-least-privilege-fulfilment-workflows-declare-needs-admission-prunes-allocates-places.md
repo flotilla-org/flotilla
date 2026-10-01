@@ -93,10 +93,10 @@ ADR 0007 already makes placement requirements-first, with `VesselRequirement` as
   - Incomparable candidates (a macOS VM against a Windows host) are separated by the needs themselves.
 - **Ties among minimal candidates go to cost and availability.** That is the placement tie-breaker's allocation judgement:
   - owned idle capacity first, then subscription-included, then metered;
-  - scarce platform capacity reserved for work that names it;
+  - scarce platform capacity (macOS, Windows) reserved for work that names it, **relative to what is available**: it is held back only while an unreserved candidate also covers the needs. When reserved capacity is the only cover, admission uses it without an escalation and records the fallback in the admission decision (amended 2026-10-01, #2395);
   - live availability counts, for example a host that sleeps on a schedule.
 
-  The placement tie-breaker is a pluggable decider for an already selected workflow. The fleet-wide Quartermaster proposed in #1394 remains future work.
+  The placement tie-breaker is a pluggable decider for an already selected workflow. The fleet-wide Quartermaster proposed in #1394 remains future work. Reservation judgement that looks beyond the current admission, such as holding scarce capacity for a known upcoming need, belongs to the Quartermaster, not to the tie-breaker.
 - **An escalation is choosing a non-minimal candidate,** and it must carry a reason (§1).
 
 ### 5. Amendments
