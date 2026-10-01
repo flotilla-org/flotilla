@@ -139,6 +139,21 @@ measurement from silently disabling admission.
 Set the floor to `0` only when an external system provides an equivalent
 capacity guard.
 
+## Forced checkout archives
+
+Forced checkout removal saves a Git bundle and patch under `.flotilla-archives/`
+beside the base clone. A `worktree.tar.gz` is written only when the checkout has
+modified or untracked files that Git does not ignore. The
+`excluded-ignored.txt` manifest lists ignored top-level paths and their sizes
+in KiB. `flotilla events` shows the archive path in a `CheckoutArchived` event.
+
+The hourly retention sweep removes archives older than 14 days by default.
+Set the age in each host's `~/.config/flotilla/daemon.toml`:
+
+```toml
+checkout_archive_retention_days = 30
+```
+
 ## Event relay
 
 To receive change-request hints, configure each daemon separately in its

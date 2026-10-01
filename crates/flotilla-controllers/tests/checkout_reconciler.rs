@@ -6,7 +6,7 @@ mod common;
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -22,11 +22,14 @@ use flotilla_resources::{
     apply_status_patch,
     controller::{Actuation, ControllerLoop, Reconciler},
     repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clone, ClonePhase,
-    CloneSpec, CloneStatus, CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, FreshCloneCheckoutSpec,
+    CloneSpec, CloneStatus, CloneStatusPatch, ConditionValue, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Event, FreshCloneCheckoutSpec,
     InMemoryBackend, InputMeta, IntegrationCondition, LifecycleAuthority, RepositoryKey, ResourceBackend, ResourceError, ResourceObject,
     StatusPatch, VirtualClock, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
 };
-use tokio::{sync::watch, time::timeout};
+use tokio::{
+    sync::{watch, Notify},
+    time::timeout,
+};
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
@@ -38,6 +41,10 @@ struct RecordingCheckoutRuntime {
     inspections: Mutex<usize>,
     failed_removal_target: Option<String>,
     transient_removal_failures: AtomicUsize,
+    blocked_removal_target: Option<String>,
+    release_removal: Arc<Notify>,
+    removal_blocked: Arc<Notify>,
+    archive_path: Option<String>,
 }
 
 #[async_trait]
@@ -82,6 +89,17 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        let target_path = match removal {
+            CheckoutRemoval::Worktree { target_path, .. }
+            | CheckoutRemoval::ForcedWorktree { target_path, .. }
+            | CheckoutRemoval::LandedWorktree { target_path, .. }
+            | CheckoutRemoval::OrphanedWorktree { target_path }
+            | CheckoutRemoval::FreshClone { target_path } => target_path,
+        };
+        if self.blocked_removal_target.as_deref() == Some(target_path) {
+            self.removal_blocked.notify_one();
+            self.release_removal.notified().await;
+        }
         let attempts = {
             let mut removals = self.removals.lock().expect("removals lock");
             removals.push(removal.clone());
@@ -97,15 +115,11 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
                 Err(observed) => remaining = observed,
             }
         }
-        let target_path = match removal {
-            CheckoutRemoval::Worktree { target_path, .. }
-            | CheckoutRemoval::ForcedWorktree { target_path, .. }
-            | CheckoutRemoval::LandedWorktree { target_path, .. }
-            | CheckoutRemoval::OrphanedWorktree { target_path }
-            | CheckoutRemoval::FreshClone { target_path } => target_path,
-        };
         if self.failed_removal_target.as_deref() == Some(target_path) {
             return Err("permission denied removing root-owned debris".to_string());
+        }
+        if let Some(archive_path) = &self.archive_path {
+            return Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path: archive_path.clone() });
         }
         Ok(CheckoutRemovalOutcome::Removed)
     }
@@ -489,14 +503,103 @@ async fn forced_convoy_deletion_directs_checkout_authority_to_archive_before_rem
         )
         .await
         .expect("create checkout");
-    let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+    let runtime = Arc::new(RecordingCheckoutRuntime { archive_path: Some("/archives/work-123".to_string()), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
 
-    reconciler.run_finalizer(&checkout).await.expect("forced finalizer");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match reconciler.run_finalizer(&checkout).await {
+                Ok(()) => break,
+                Err(ResourceError::FinalizerPending) => tokio::task::yield_now().await,
+                Err(error) => panic!("forced finalizer: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("forced finalizer should finish");
 
     assert!(
         matches!(runtime.removals.lock().expect("removals lock").as_slice(), [CheckoutRemoval::ForcedWorktree { branch, .. }] if branch == "feature/cleanup")
     );
+    let events = backend.using::<Event>(NAMESPACE).list().await.expect("events");
+    assert!(events
+        .items
+        .iter()
+        .any(|event| { event.spec.reason == "CheckoutArchived" && event.spec.message.contains("/archives/work-123") }));
+}
+
+#[tokio::test]
+async fn slow_forced_archive_does_not_stop_other_checkout_or_controller_heartbeat() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    convoys
+        .create(
+            &InputMeta::builder()
+                .name("convoy-slow".to_string())
+                .annotations(BTreeMap::from([(flotilla_resources::FORCE_TEARDOWN_ANNOTATION.to_string(), "true".to_string())]))
+                .build(),
+            &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build(),
+        )
+        .await
+        .expect("forced convoy");
+    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    for name in ["slow", "fast"] {
+        checkouts
+            .create(
+                &common::controller_meta()
+                    .name(name)
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-slow".to_string())]))
+                    .finalizers(vec!["flotilla.work/checkout-cleanup".to_string()])
+                    .deletion_timestamp(chrono::Utc::now())
+                    .call(),
+                &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                    repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                    env_ref: "host-direct-a".to_string(),
+                    r#ref: format!("feature/{name}"),
+                    base_ref: Some("main".to_string()),
+                    target_path: format!("/checkouts/{name}"),
+                    clone_ref: "clone-a".to_string(),
+                }),
+            )
+            .await
+            .expect("deleting checkout");
+    }
+    let runtime = Arc::new(RecordingCheckoutRuntime { blocked_removal_target: Some("/checkouts/slow".to_string()), ..Default::default() });
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: Vec::new(),
+            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run_with_heartbeat(Arc::clone(&heartbeat)),
+    );
+    timeout(Duration::from_secs(2), runtime.removal_blocked.notified()).await.expect("slow archive started");
+    let before = heartbeat.load(Ordering::Relaxed);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(checkouts.get("fast").await, Err(ResourceError::NotFound { .. })) && heartbeat.load(Ordering::Relaxed) > before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fast checkout and heartbeat must progress while archive waits");
+    assert!(checkouts.get("slow").await.is_ok(), "slow checkout remains until archive completes");
+    runtime.release_removal.notify_one();
+    timeout(Duration::from_secs(3), async {
+        while checkouts.get("slow").await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("slow checkout finalizes after archive completes");
+    controller.abort();
+    let _ = controller.await;
 }
 
 #[tokio::test]

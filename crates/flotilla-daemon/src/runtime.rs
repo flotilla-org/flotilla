@@ -573,6 +573,22 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
+        let host_direct_environment_name = format!("host-direct-{}", profile.host_id);
+        let mut archive_roots = vec![CheckoutArchiveRoot {
+            env_ref: host_direct_environment_name.clone(),
+            path: PathBuf::from(&profile.repo_default_dir).join(".flotilla-archives"),
+        }];
+        match config.load_observation_roots() {
+            Ok(roots) => {
+                archive_roots.extend(roots.into_iter().filter_map(|root| {
+                    root.as_path().parent().map(|parent| CheckoutArchiveRoot {
+                        env_ref: host_direct_environment_name.clone(),
+                        path: parent.join(".flotilla-archives"),
+                    })
+                }));
+            }
+            Err(error) => warn!(%error, "checkout archive sweep could not load observation roots"),
+        }
         let ssh_profiles = discover_agentless_ssh_profiles(&daemon, &config).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
@@ -632,7 +648,18 @@ impl DaemonRuntime {
                 config.state_dir().as_path().join("probe-cwd"),
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
-            tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
+            tokio::spawn(run_artifact_gc(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                Arc::clone(&blob_store),
+                CheckoutArchiveSweep {
+                    daemon: Arc::clone(&daemon),
+                    catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
+                    host_direct_environment_name,
+                    roots: archive_roots,
+                    retention_days: daemon_config.checkout_archive_retention_days,
+                },
+            )),
             spawn_blob_sync_status_task(
                 Arc::clone(&blob_store),
                 daemon.resource_backend(),
@@ -804,7 +831,29 @@ pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str)
     declared_root == local_root
 }
 
-async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize)]
+struct CheckoutArchiveRoot {
+    env_ref: String,
+    path: PathBuf,
+}
+
+struct CheckoutArchiveSweep {
+    daemon: Arc<InProcessDaemon>,
+    catalog_path: PathBuf,
+    host_direct_environment_name: String,
+    roots: Vec<CheckoutArchiveRoot>,
+    retention_days: u64,
+}
+
+async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<CheckoutArchiveRoot>, String> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| format!("decode {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, archive_sweep: CheckoutArchiveSweep) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -817,6 +866,49 @@ async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc
                 }
             }
             Err(error) => warn!(%error, "artifact retention sweep failed"),
+        }
+        {
+            let mut roots = archive_sweep.roots.iter().cloned().collect::<BTreeSet<_>>();
+            match load_checkout_archive_roots(&archive_sweep.catalog_path).await {
+                Ok(recorded) => roots.extend(recorded),
+                Err(error) => warn!(%error, "checkout archive sweep could not load archive roots"),
+            }
+            match backend.clone().using::<Clone>(&namespace).list().await {
+                Ok(clones) => {
+                    for clone in clones.items {
+                        if let Some(parent) = Path::new(&clone.spec.path).parent() {
+                            roots.insert(CheckoutArchiveRoot { env_ref: clone.spec.env_ref, path: parent.join(".flotilla-archives") });
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, "checkout archive sweep could not list clones"),
+            }
+            match backend.clone().using::<Checkout>(&namespace).list().await {
+                Ok(checkouts) => {
+                    for checkout in checkouts.items {
+                        if let Some(parent) = checkout.spec.target_path().and_then(|path| Path::new(path).parent()) {
+                            if let Some(env_ref) = checkout.spec.env_ref() {
+                                roots.insert(CheckoutArchiveRoot { env_ref: env_ref.to_string(), path: parent.join(".flotilla-archives") });
+                            }
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, "checkout archive sweep could not list checkouts"),
+            }
+            for root in roots {
+                let runner = if root.env_ref == archive_sweep.host_direct_environment_name {
+                    archive_sweep.daemon.local_command_runner()
+                } else {
+                    archive_sweep.daemon.command_runner_for_environment(&EnvironmentId::new(&root.env_ref))
+                };
+                if let Some(runner) = runner {
+                    if let Err(error) =
+                        flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
+                    {
+                        warn!(archive_root = %root.path.display(), env_ref = %root.env_ref, %error, "checkout archive retention sweep failed");
+                    }
+                }
+            }
         }
     }
 }
@@ -1176,6 +1268,7 @@ struct ControllerRuntimeState {
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    archive_catalog_lock: Mutex<()>,
 }
 
 /// Cargo invokes this with the rustc path as its first argument. Keeping the
@@ -1362,7 +1455,32 @@ impl ControllerRuntimeState {
             provisioned_environments: Mutex::new(HashMap::new()),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            archive_catalog_lock: Mutex::new(()),
         }
+    }
+
+    async fn register_checkout_archive_roots(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<(), String> {
+        let (clone_path, target_path) = match removal {
+            CheckoutRemoval::ForcedWorktree { clone_path, target_path, .. }
+            | CheckoutRemoval::LandedWorktree { clone_path, target_path, .. } => (clone_path, target_path),
+            _ => return Ok(()),
+        };
+        let _guard = self.archive_catalog_lock.lock().await;
+        let catalog = self.config.state_dir().as_path().join("checkout-archive-roots.json");
+        let mut roots = load_checkout_archive_roots(&catalog).await?;
+        for source in [clone_path, target_path] {
+            if let Some(parent) = Path::new(source).parent() {
+                roots.insert(CheckoutArchiveRoot { env_ref: env_ref.to_string(), path: parent.join(".flotilla-archives") });
+            }
+        }
+        tokio::fs::create_dir_all(catalog.parent().expect("catalog has parent"))
+            .await
+            .map_err(|error| format!("create checkout archive catalog parent: {error}"))?;
+        let temporary = catalog.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let bytes = serde_json::to_vec(&roots).map_err(|error| format!("encode checkout archive catalog: {error}"))?;
+        tokio::fs::write(&temporary, bytes).await.map_err(|error| format!("write checkout archive catalog: {error}"))?;
+        tokio::fs::rename(&temporary, &catalog).await.map_err(|error| format!("replace checkout archive catalog: {error}"))?;
+        Ok(())
     }
 
     fn with_agentless_ssh(mut self, profiles: Vec<AgentlessSshProfile>) -> Self {
@@ -4645,7 +4763,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.runtime_for(&self.state.host_direct_environment_name, removal_source_path(removal)).await?.remove_checkout(removal).await
+        self.remove_checkout_in(&self.state.host_direct_environment_name, removal).await
     }
 
     async fn create_worktree_in(
@@ -4681,6 +4799,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        self.state.register_checkout_archive_roots(env_ref, removal).await?;
         self.runtime_for(env_ref, removal_source_path(removal)).await?.remove_checkout(removal).await
     }
 }
@@ -4821,7 +4940,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     flotilla_core::vcs::CheckoutRemoval::Removed => Ok(CheckoutRemovalOutcome::Removed),
                     flotilla_core::vcs::CheckoutRemoval::ArchivedAndRemoved { archive_path } => {
                         tracing::warn!(checkout = %target_path, archive = %archive_path, "checkout archive saved before forced removal");
-                        Ok(CheckoutRemovalOutcome::Removed)
+                        Ok(CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path })
                     }
                     flotilla_core::vcs::CheckoutRemoval::PreservedBranch { branch, reason } => {
                         let reason = match reason {
@@ -8880,12 +8999,57 @@ mod tests {
         assert!(refusal.contains("DirtyCheckout"));
         assert!(target.join("uncommitted.txt").exists());
         fs::remove_file(target.join("uncommitted.txt")).expect("clear local work");
-        assert_eq!(runtime.remove_checkout(&removal).await.expect("landed removal"), CheckoutRemovalOutcome::Removed);
+        assert!(matches!(
+            runtime.remove_checkout(&removal).await.expect("landed removal"),
+            CheckoutRemovalOutcome::ArchivedAndRemoved { .. }
+        ));
         assert!(!target.exists());
         let archive_parent = temp.path().join(".flotilla-archives");
         assert!(fs::read_dir(archive_parent)
             .expect("archive directory")
             .any(|entry| { entry.expect("entry").file_name().to_string_lossy().starts_with("work-") }));
+    }
+
+    #[tokio::test]
+    async fn checkout_archive_catalog_keeps_custom_roots_after_checkout_resources_are_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-catalog-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+        let state = ControllerRuntimeState::new(
+            daemon,
+            Arc::clone(&config),
+            passthrough_registry(),
+            None,
+            "test-host".to_string(),
+            None,
+            "host-direct-test-host".to_string(),
+        );
+        let custom_root = temp.path().join("custom/.flotilla-archives");
+        let expired = custom_root.join("expired");
+        let recent = custom_root.join("recent");
+        std::fs::create_dir_all(&expired).expect("expired archive");
+        std::fs::create_dir(&recent).expect("recent archive");
+        let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
+        assert!(std::process::Command::new("touch").args(["-t", &past]).arg(&expired).status().expect("age archive").success());
+        state
+            .register_checkout_archive_roots("host-direct-test-host", &CheckoutRemoval::ForcedWorktree {
+                clone_path: temp.path().join("custom/base").display().to_string(),
+                branch: "feature/work".to_string(),
+                target_path: temp.path().join("checkouts/work").display().to_string(),
+            })
+            .await
+            .expect("record archive root before removal");
+        drop(state);
+        let roots = load_checkout_archive_roots(&config.state_dir().as_path().join("checkout-archive-roots.json"))
+            .await
+            .expect("restore archive roots after controller restart");
+        assert!(roots.contains(&CheckoutArchiveRoot { env_ref: "host-direct-test-host".to_string(), path: custom_root.clone() }));
+        for root in roots {
+            flotilla_core::vcs::prune_checkout_archives(&ProcessCommandRunner, &root.path, 14).await.expect("retention sweep");
+        }
+        assert!(!expired.exists());
+        assert!(recent.exists());
     }
 
     #[tokio::test]

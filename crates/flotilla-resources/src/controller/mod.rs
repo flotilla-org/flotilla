@@ -821,6 +821,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                                 }
                                 attempted_finalizer = true;
                                 if let Err(err) = reconciler.run_finalizer(&object).await {
+                                    if matches!(err, ResourceError::FinalizerPending) {
+                                        return Err(err);
+                                    }
                                     if let Some(patch) = reconciler.finalizer_error_patch(&object, &err) {
                                         if let Err(patch_error) =
                                             Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await
@@ -908,6 +911,18 @@ impl<R: Reconciler> ControllerLoop<R> {
                 }
                 .await;
                 match result {
+                    Err(ResourceError::FinalizerPending) => {
+                        let mut scheduled = scheduled_requeues.lock().await;
+                        if scheduled.insert(name.clone()) {
+                            let scheduled_requeues = Arc::clone(&scheduled_requeues);
+                            let sender = sender.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                scheduled_requeues.lock().await.remove(&name);
+                                let _ = sender.send(name).await;
+                            });
+                        }
+                    }
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
                     }

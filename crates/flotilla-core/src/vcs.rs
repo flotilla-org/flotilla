@@ -365,6 +365,27 @@ pub enum CheckoutRemoval {
     PreservedCheckout { path: String, reason: CheckoutPreservationReason },
 }
 
+/// Prune complete checkout archives beneath one Flotilla-owned archive root.
+pub async fn prune_checkout_archives(runner: &dyn CommandRunner, archive_root: &Path, retention_days: u64) -> Result<(), String> {
+    if !runner.path_exists(archive_root).await? {
+        return Ok(());
+    }
+    let root = archive_root.to_str().ok_or_else(|| "archive root is not UTF-8".to_string())?;
+    let minutes = retention_days.saturating_mul(24 * 60).to_string();
+    let expired = runner
+        .run(
+            "find",
+            &[root, "!", "-path", root, "-type", "d", "-prune", "-mmin", &format!("+{minutes}"), "-print0"],
+            Path::new("/"),
+            &crate::providers::ChannelLabel::Default,
+        )
+        .await?;
+    for path in expired.split('\0').filter(|path| !path.is_empty()) {
+        runner.run("rm", &["-rf", "--", path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
+    }
+    Ok(())
+}
+
 /// Read operations needed while discovering and inspecting a checkout.
 pub enum VcsQuery<'a> {
     TopLevel,
@@ -778,6 +799,8 @@ impl Vcs for FlotillaVcs {
         let bundle = archive.join("history.bundle");
         let patch = archive.join("changes.patch");
         let snapshot = archive.join("worktree.tar.gz");
+        let paths = archive.join("snapshot-paths.nul");
+        let ignored_manifest = archive.join("excluded-ignored.txt");
         let bundle_path = bundle.to_str().ok_or_else(|| "bundle path is not UTF-8".to_string())?;
         let patch_path = patch.to_str().ok_or_else(|| "patch path is not UTF-8".to_string())?;
         let snapshot_path = snapshot.to_str().ok_or_else(|| "snapshot path is not UTF-8".to_string())?;
@@ -786,19 +809,53 @@ impl Vcs for FlotillaVcs {
         let archive_result = async {
             backend.bundle_head(bundle_path).await?;
             backend.write_patch(patch_path).await?;
-            self.runner
-                .run(
-                    "tar",
-                    &["-czf", snapshot_path, "-C", parent.to_str().ok_or_else(|| "archive parent is not UTF-8".to_string())?, "--", name],
-                    Path::new("/"),
-                    &crate::providers::ChannelLabel::Default,
-                )
-                .await?;
+            let changed = backend.run(&["diff", "--name-only", "--diff-filter=ACMRTUXB", "-z", "HEAD"]).await?;
+            let untracked = backend.run(&["ls-files", "--others", "--exclude-standard", "-z"]).await?;
+            let ignored = backend.run(&["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]).await?;
+            let mut manifest = String::from("# Ignored paths excluded from checkout snapshot; sizes in KiB\n");
+            for ignored_path in ignored.split('\0').filter(|entry| !entry.is_empty()) {
+                let size = self.runner.run("du", &["-sk", "--", ignored_path], path, &crate::providers::ChannelLabel::Default).await?;
+                manifest.push_str(size.trim());
+                manifest.push('\n');
+            }
+            self.runner.write_file(&ignored_manifest, &manifest).await?;
+            let mut selected = changed;
+            selected.push_str(&untracked);
+            if !selected.is_empty() {
+                self.runner.write_file(&paths, &selected).await?;
+                self.runner
+                    .run(
+                        "tar",
+                        &[
+                            "-czf",
+                            snapshot_path,
+                            "-C",
+                            target,
+                            "--null",
+                            "-T",
+                            paths.to_str().ok_or_else(|| "path list is not UTF-8".to_string())?,
+                        ],
+                        Path::new("/"),
+                        &crate::providers::ChannelLabel::Default,
+                    )
+                    .await?;
+            }
             if !self.runner.path_exists(&bundle).await?
                 || !self.runner.path_exists(&patch).await?
-                || !self.runner.path_exists(&snapshot).await?
+                || !self.runner.path_exists(&ignored_manifest).await?
+                || (!selected.is_empty() && !self.runner.path_exists(&snapshot).await?)
             {
                 return Err(format!("checkout archive is incomplete at {archive_path}"));
+            }
+            if !selected.is_empty() {
+                self.runner
+                    .run(
+                        "rm",
+                        &["-f", paths.to_str().ok_or_else(|| "path list is not UTF-8".to_string())?],
+                        Path::new("/"),
+                        &crate::providers::ChannelLabel::Default,
+                    )
+                    .await?;
             }
             Ok::<(), String>(())
         }
@@ -1977,6 +2034,9 @@ mod tests {
         git(Path::new(target), &["add", "README.md"]);
         git(Path::new(target), &["commit", "-m", "unpushed work"]);
         std::fs::write(Path::new(target).join("README.md"), "uncommitted\n").expect("dirty tracked file");
+        std::fs::write(Path::new(target).join(".gitignore"), "target/\n").expect("ignore build output");
+        std::fs::create_dir(Path::new(target).join("target")).expect("build directory");
+        std::fs::write(Path::new(target).join("target/big.bin"), vec![42; 1024 * 1024]).expect("build output");
 
         let outcome = vcs.force_remove_materialised_checkout("convoy/work", target).await.expect("forced removal");
         let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive of work at risk") };
@@ -1995,8 +2055,74 @@ mod tests {
         let snapshot =
             std::process::Command::new("tar").arg("-tzf").arg(archive.join("worktree.tar.gz")).output().expect("inspect saved worktree");
         assert!(snapshot.status.success());
-        assert!(String::from_utf8_lossy(&snapshot.stdout).contains("checkout/new.txt"));
+        assert!(String::from_utf8_lossy(&snapshot.stdout).contains("new.txt"));
+        assert!(!String::from_utf8_lossy(&snapshot.stdout).contains("target/big.bin"));
+        assert!(std::fs::read_to_string(archive.join("excluded-ignored.txt")).expect("ignored manifest").contains("target/"));
         assert!(!Path::new(target).exists());
+    }
+
+    #[tokio::test]
+    async fn forced_clean_checkout_saves_history_without_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let remote = root.join("remote.git");
+        let source = root.join("source");
+        let target = root.join("checkout");
+        git(root, &["init", "--bare", remote.to_str().expect("remote path")]);
+        std::fs::create_dir(&source).expect("source directory");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "Test"]);
+        std::fs::write(source.join("README.md"), "initial\n").expect("initial file");
+        std::fs::write(source.join(".gitignore"), "target/\n").expect("ignore build output");
+        git(&source, &["add", "README.md", ".gitignore"]);
+        git(&source, &["commit", "-m", "initial"]);
+        git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
+        git(&source, &["push", "origin", "main"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(&source, runner, true);
+        let target = target.to_str().expect("target path");
+        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        std::fs::create_dir(Path::new(target).join("target")).expect("build directory");
+        let ignored_output = Path::new(target).join("target/big.bin");
+        if let Some(gib) = std::env::var("FLOTILLA_ARCHIVE_LIVE_GIB").ok().and_then(|size| size.parse::<u64>().ok()) {
+            let allocated = std::process::Command::new("fallocate")
+                .args(["-l", &format!("{gib}G")])
+                .arg(&ignored_output)
+                .status()
+                .expect("allocate live build output");
+            assert!(allocated.success());
+        } else {
+            std::fs::write(&ignored_output, vec![42; 1024 * 1024]).expect("build output");
+        }
+        let started = std::time::Instant::now();
+        let outcome = vcs.force_remove_materialised_checkout("convoy/work", target).await.expect("forced removal");
+        if std::env::var_os("FLOTILLA_ARCHIVE_LIVE_GIB").is_some() {
+            println!("forced clean checkout teardown with large ignored target finished in {:?}", started.elapsed());
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "large ignored output must not delay teardown");
+        }
+        let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive") };
+        let archive = Path::new(&archive_path);
+        assert!(archive.join("history.bundle").exists());
+        assert!(std::fs::read_to_string(archive.join("excluded-ignored.txt")).expect("ignored manifest").contains("target/"));
+        assert!(!archive.join("worktree.tar.gz").exists());
+        assert!(!Path::new(target).exists());
+    }
+
+    #[tokio::test]
+    async fn archive_retention_removes_expired_directories_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive_root = dir.path().join(".flotilla-archives");
+        let old = archive_root.join("old");
+        let recent = archive_root.join("recent");
+        std::fs::create_dir_all(&old).expect("old archive");
+        std::fs::create_dir(&recent).expect("recent archive");
+        let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
+        let touched = std::process::Command::new("touch").args(["-t", &past]).arg(&old).status().expect("age archive");
+        assert!(touched.success());
+        prune_checkout_archives(&crate::providers::ProcessCommandRunner, &archive_root, 14).await.expect("prune archive root");
+        assert!(!old.exists());
+        assert!(recent.exists());
     }
 
     #[tokio::test]

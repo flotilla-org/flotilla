@@ -184,7 +184,7 @@ async fn write_resource_error(stream: &mut UnixStream, error: ResourceError) -> 
         ResourceError::Conflict { .. } => 409,
         ResourceError::FieldOwnership { .. } => 409,
         ResourceError::Unauthorized { .. } => 403,
-        ResourceError::Other { .. } => 500,
+        ResourceError::Other { .. } | ResourceError::FinalizerPending => 500,
     };
     write_error(stream, status, &error.to_string()).await
 }
