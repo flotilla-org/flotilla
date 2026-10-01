@@ -25,12 +25,8 @@ pub struct ForgejoChangeRequestProvider {
 }
 
 fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecision> {
-    let mut latest_by_reviewer = HashMap::<String, (i64, ObservedReviewDecision)>::new();
+    let mut latest_by_reviewer = HashMap::<String, (i64, Option<ObservedReviewDecision>)>::new();
     for review in reviews {
-        // A stale approval or dismissed changes request does not decide the current PR.
-        if review["stale"] == true || review["dismissed"] == true {
-            continue;
-        }
         let Some(state) = review["state"].as_str() else {
             tracing::warn!("Forgejo review is missing a state");
             return None;
@@ -57,12 +53,15 @@ fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecisi
             tracing::warn!(state, "Forgejo review is missing an id");
             return None;
         };
+        // A stale or dismissed latest review suppresses an older decision from
+        // the same reviewer; it does not revive that older review.
+        let decision = (review["stale"] != true && review["dismissed"] != true).then_some(decision);
         let entry = latest_by_reviewer.entry(reviewer).or_insert((id, decision));
         if id > entry.0 {
             *entry = (id, decision);
         }
     }
-    let decisions: Vec<_> = latest_by_reviewer.values().map(|(_, decision)| *decision).collect();
+    let decisions: Vec<_> = latest_by_reviewer.values().filter_map(|(_, decision)| *decision).collect();
     if decisions.contains(&ObservedReviewDecision::ChangesRequested) {
         Some(ObservedReviewDecision::ChangesRequested)
     } else if decisions.contains(&ObservedReviewDecision::Required) {
@@ -178,8 +177,9 @@ impl ForgejoChangeRequestProvider {
             if !response.status().is_success() {
                 return Err(format!("Forgejo HTTP {}: {}", response.status(), String::from_utf8_lossy(response.body())));
             }
-            // Forgejo reports the total count on this endpoint. If a proxy
-            // strips it, an empty page still terminates the scan safely.
+            // Forgejo counts all returned reviews, including stale and
+            // dismissed ones. If a proxy strips the header, an empty page
+            // still terminates the scan safely.
             let total =
                 response.headers().get("x-total-count").and_then(|value| value.to_str().ok()).and_then(|value| value.parse::<usize>().ok());
             let batch: Vec<serde_json::Value> =
@@ -346,6 +346,19 @@ mod tests {
         urls: Mutex<Vec<String>>,
     }
 
+    fn provider(http: Arc<MockHttp>) -> ForgejoChangeRequestProvider {
+        ForgejoChangeRequestProvider::new(
+            http,
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
+            "team/repo".into(),
+        )
+    }
+
     #[async_trait]
     impl HttpClient for MockHttp {
         async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
@@ -366,6 +379,10 @@ mod tests {
             .status(200)
             .body(bytes::Bytes::from(serde_json::to_vec(value).expect("serialize value")))
             .expect("response")
+    }
+
+    fn error_response(status: u16) -> http::Response<bytes::Bytes> {
+        http::Response::builder().status(status).body(bytes::Bytes::from_static(b"review read failed")).expect("error response")
     }
 
     fn review_response(value: &serde_json::Value, total: usize) -> http::Response<bytes::Bytes> {
@@ -391,17 +408,8 @@ mod tests {
 
     #[test]
     fn parses_pull_presentation_fields_from_existing_response() {
-        let mut provider = ForgejoChangeRequestProvider::new(
-            Arc::new(MockHttp { responses: Mutex::new(VecDeque::new()), urls: Mutex::new(Vec::new()) }),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        )
-        .with_operator_login("owner".into());
+        let mut provider = provider(Arc::new(MockHttp { responses: Mutex::new(VecDeque::new()), urls: Mutex::new(Vec::new()) }))
+            .with_operator_login("owner".into());
         let raw = serde_json::json!({
             "title": "Keep metadata current", "state": "open", "draft": true,
             "user": {"login": "contributor"}, "requested_reviewers": [{"login": "owner"}],
@@ -436,6 +444,16 @@ mod tests {
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_CHANGES"}
         ]);
         assert_eq!(parse_review_decision(&changes), Some(ObservedReviewDecision::ChangesRequested));
+        let dismissed_latest = serde_json::json!([
+            {"id": 1, "user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
+            {"id": 2, "user": {"login": "alice"}, "state": "APPROVED", "dismissed": true}
+        ]);
+        assert_eq!(parse_review_decision(&dismissed_latest), Some(ObservedReviewDecision::None));
+        let stale_latest = serde_json::json!([
+            {"id": 1, "user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
+            {"id": 2, "user": {"login": "alice"}, "state": "APPROVED", "stale": true}
+        ]);
+        assert_eq!(parse_review_decision(&stale_latest), Some(ObservedReviewDecision::None));
         assert_eq!(parse_review_decision(&serde_json::json!([])), Some(ObservedReviewDecision::None));
         assert_eq!(
             parse_review_decision(&serde_json::json!([
@@ -475,16 +493,7 @@ mod tests {
             ])),
             urls: Mutex::new(Vec::new()),
         });
-        let provider = ForgejoChangeRequestProvider::new(
-            http.clone(),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        );
+        let provider = provider(http.clone());
         assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::Approved));
         let urls = http.urls.lock().expect("urls");
         assert_eq!(urls.len(), 3);
@@ -503,16 +512,7 @@ mod tests {
             ])),
             urls: Mutex::new(Vec::new()),
         });
-        let provider = ForgejoChangeRequestProvider::new(
-            http.clone(),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        );
+        let provider = provider(http.clone());
         assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::ChangesRequested));
         assert_eq!(http.urls.lock().expect("urls").len(), 3);
     }
@@ -522,16 +522,7 @@ mod tests {
         let page = serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}]);
         let http =
             Arc::new(MockHttp { responses: Mutex::new((0..101).map(|_| json_response(&page)).collect()), urls: Mutex::new(Vec::new()) });
-        let provider = ForgejoChangeRequestProvider::new(
-            http.clone(),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        );
+        let provider = provider(http.clone());
         assert!(provider.read_review_decision(7).await.expect_err("page limit").contains("page limit"));
         assert_eq!(http.urls.lock().expect("urls").len(), 100);
     }
@@ -548,17 +539,7 @@ mod tests {
             ])),
             urls: Mutex::new(Vec::new()),
         });
-        let provider = ForgejoChangeRequestProvider::new(
-            http.clone(),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        )
-        .with_operator_login("owner".into());
+        let provider = provider(http.clone()).with_operator_login("owner".into());
         let observed = provider.observe_bound(&[7]).await.expect("observe bound request");
         let status = observed[&7].as_ref().expect("status");
         assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
@@ -574,19 +555,11 @@ mod tests {
                 json_response(&serde_json::json!({"number": 7, "title": "PR", "state": "open"})),
                 review_response(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "APPROVED"}]), 1),
                 json_response(&serde_json::json!({"number": 8, "title": "Another PR", "state": "open"})),
+                error_response(500),
             ])),
             urls: Mutex::new(Vec::new()),
         });
-        let provider = ForgejoChangeRequestProvider::new(
-            http.clone(),
-            Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
-            "team/repo".into(),
-        );
+        let provider = provider(http.clone());
         let observed = provider.observe_bound(&[7, 8]).await.expect("observe bound requests");
         assert_eq!(observed[&7].as_ref().expect("status").review_decision.value, Some(ObservedReviewDecision::Approved));
         let failed_review = observed[&8].as_ref().expect("status survives review failure");
