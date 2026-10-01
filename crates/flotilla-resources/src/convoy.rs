@@ -1777,6 +1777,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_stall_for_crew(status, vessel, role);
             }
             Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
+                // A completion claim is settled work. A late stall cannot turn a
+                // world-owned landing wait back into a crew obligation.
+                if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_some_and(|state| state.phase == CrewWorkPhase::Done) {
+                    return;
+                }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.phase = CrewWorkPhase::Stalled;
                     state.finished_at = None;

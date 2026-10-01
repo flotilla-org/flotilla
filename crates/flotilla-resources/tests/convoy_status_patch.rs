@@ -491,6 +491,40 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
 }
 
 #[test]
+fn stall_after_completion_preserves_done_and_landing() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        ..Default::default()
+    };
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(20),
+        Some("https://github.com/flotilla-org/flotilla/pull/1".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
+    let completed = status.clone();
+    assert_eq!(completed.phase, ConvoyPhase::Landing);
+
+    external_patches::mark_crew_stalled(
+        "convoy".to_string(),
+        "implement".to_string(),
+        "coder".to_string(),
+        ts(21),
+        flotilla_protocol::StallReason::Scope,
+        None,
+        "settlement waits for change request merge".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status, completed);
+}
+
+#[test]
 fn crew_failure_records_terminal_state_and_message() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
