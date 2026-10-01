@@ -75,7 +75,7 @@ pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
         return vec![];
     }
     match cmd {
-        "open" => VIEW_KIND_PREFIXES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
+        "open" => VIEW_KIND_PREFIXES.iter().filter(|v| match_rank(v, rest.trim()).is_some()).copied().collect(),
         _ => vec![],
     }
 }
@@ -326,20 +326,19 @@ pub fn palette_completions_with_availability(
 /// Vessel-name completions for `convoy <id> work <Tab>` / partial.
 fn convoy_vessel_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
     // Single-namespace MVP: search the "flotilla" namespace.
-    let lower = partial.to_lowercase();
     let Some(model) = namespaces.get("flotilla") else { return vec![] };
     let Some(convoy) = model.convoys.values().find(|convoy| convoy.name == convoy_id) else { return vec![] };
-    convoy
+    let completions = convoy
         .vessels
         .iter()
-        .filter(|t| lower.is_empty() || t.name.to_lowercase().starts_with(&lower))
+        .filter(|t| match_rank(&t.name, partial).is_some())
         .map(|t| PaletteCompletion { value: t.name.clone(), description: format!("{:?}", t.phase), key_hint: None })
-        .collect()
+        .collect();
+    rank_completions(completions, partial)
 }
 
 /// Completions at the root level: noun names, aliases, and palette-local entries.
 fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl Fn(Action) -> bool) -> Vec<PaletteCompletion> {
-    let lower = partial.to_lowercase();
     let mut completions = Vec::new();
 
     // Noun names and aliases from the clap tree.
@@ -353,21 +352,21 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
             continue;
         }
         let desc = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
-        if lower.is_empty() || name.starts_with(&lower) {
-            completions.push(PaletteCompletion { value: name.to_string(), description: desc.clone(), key_hint: None });
-        }
-        for alias in sub.get_visible_aliases() {
-            if !has_repo_context && REPO_SCOPED_NOUNS.contains(&name) {
-                continue;
-            }
-            if lower.is_empty() || alias.starts_with(&lower) {
-                completions.push(PaletteCompletion { value: alias.to_string(), description: desc.clone(), key_hint: None });
-            }
+        let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+        let chosen = std::iter::once(name)
+            .chain(aliases.iter().copied())
+            .filter_map(|candidate| match_rank(candidate, partial).map(|rank| (rank, candidate)))
+            .min_by_key(|(rank, candidate)| (*rank, candidate.len()));
+        if let Some((_, value)) = chosen {
+            let other_names: Vec<&str> =
+                std::iter::once(name).chain(aliases.iter().copied()).filter(|candidate| *candidate != value).collect();
+            let description = if other_names.is_empty() { desc } else { format!("{} ({})", desc, other_names.join(", ")) };
+            completions.push(PaletteCompletion { value: value.to_string(), description, key_hint: None });
         }
     }
 
     // "host" noun (not in NounCommand — added separately).
-    if (has_repo_context || !REPO_SCOPED_NOUNS.contains(&"host")) && (lower.is_empty() || "host".starts_with(&lower)) {
+    if (has_repo_context || !REPO_SCOPED_NOUNS.contains(&"host")) && match_rank("host", partial).is_some() {
         completions.push(PaletteCompletion {
             value: "host".to_string(),
             description: "Manage and route to hosts".to_string(),
@@ -378,7 +377,7 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
     // Palette-local entries.
     let entries = all_entries();
     for entry in entries {
-        if is_available(entry.action) && (lower.is_empty() || entry.name.to_lowercase().starts_with(&lower)) {
+        if is_available(entry.action) && match_rank(entry.name, partial).is_some() {
             completions.push(PaletteCompletion {
                 value: entry.name.to_string(),
                 description: entry.description.to_string(),
@@ -387,7 +386,43 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
         }
     }
 
-    completions
+    rank_completions(completions, partial)
+}
+
+/// Rank exact, prefix, substring, then ordered-subsequence matches. This follows
+/// the same broad priority used by fuzzy command pickers while keeping ties stable.
+fn match_rank(value: &str, query: &str) -> Option<(u8, usize)> {
+    let value = value.to_lowercase();
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return Some((0, 0));
+    }
+    if value == query {
+        return Some((0, 0));
+    }
+    if value.starts_with(&query) {
+        return Some((1, value.len() - query.len()));
+    }
+    if let Some(position) = value.find(&query) {
+        return Some((2, position));
+    }
+    let mut positions = value.char_indices();
+    let mut first = None;
+    let mut last = 0;
+    for wanted in query.chars() {
+        let (index, _) = positions.find(|(_, actual)| *actual == wanted)?;
+        first.get_or_insert(index);
+        last = index;
+    }
+    Some((3, last - first.unwrap_or(0)))
+}
+
+fn rank_completions(mut items: Vec<PaletteCompletion>, query: &str) -> Vec<PaletteCompletion> {
+    items.retain(|item| match_rank(&item.value, query).is_some());
+    items.sort_by(|left, right| {
+        match_rank(&left.value, query).cmp(&match_rank(&right.value, query)).then_with(|| left.value.cmp(&right.value))
+    });
+    items
 }
 
 /// Check whether a token matches a palette-local command name.
@@ -414,7 +449,7 @@ fn resolve_noun_name(token: &str) -> Option<String> {
 
 /// Subject completions for a given noun, drawn from model data.
 fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
-    let lower = partial.strip_prefix('@').unwrap_or(partial).to_lowercase();
+    let partial = partial.strip_prefix('@').unwrap_or(partial);
     let items: Vec<(String, String)> = match noun {
         "convoy" => {
             // Single-namespace MVP: list convoys in "flotilla".
@@ -511,15 +546,16 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: 
         _ => vec![],
     };
 
-    items
+    let completions = items
         .into_iter()
-        .filter(|(value, _)| lower.is_empty() || value.to_lowercase().starts_with(&lower))
+        .filter(|(value, _)| match_rank(value, partial).is_some())
         .map(|(value, description)| {
             let value = flotilla_commands::SubjectNoun::from_command_name(noun)
                 .map_or(value.clone(), |noun| flotilla_commands::address_subject_for_cli(noun, &value));
             PaletteCompletion { value, description, key_hint: None }
         })
-        .collect()
+        .collect();
+    rank_completions(completions, partial)
 }
 
 /// Verb completions for a noun (with no verbs consumed yet).
@@ -545,11 +581,12 @@ fn verb_completions_after(noun: &str, consumed: &[&str], partial: &str) -> Vec<P
 
     // Collect valid next tokens.
     let items: Vec<CompletionItem> =
-        flotilla_commands::complete::complete(&cmd, &format_completion_line(consumed, partial), completion_cursor(consumed, partial));
-    items
+        flotilla_commands::complete::complete(&cmd, &format_completion_line(consumed, ""), completion_cursor(consumed, ""));
+    let completions = items
         .into_iter()
         .map(|item| PaletteCompletion { value: item.value, description: item.description.unwrap_or_default(), key_hint: None })
-        .collect()
+        .collect();
+    rank_completions(completions, partial)
 }
 
 /// Build a clap Command tree for a noun, suitable for completion walking.
@@ -609,11 +646,14 @@ fn local_arg_completions(_input: &str, command: &str, tokens: &[&str], trailing_
 
     match command {
         "target" => target_completions(partial, model),
-        "theme" => crate::theme::available_themes()
-            .iter()
-            .filter(|(name, _)| name.starts_with(partial))
-            .map(|(name, _)| PaletteCompletion { value: (*name).to_string(), description: "color theme".to_string(), key_hint: None })
-            .collect(),
+        "theme" => rank_completions(
+            crate::theme::available_themes()
+                .iter()
+                .filter(|(name, _)| match_rank(name, partial).is_some())
+                .map(|(name, _)| PaletteCompletion { value: (*name).to_string(), description: "color theme".to_string(), key_hint: None })
+                .collect(),
+            partial,
+        ),
         _ => vec![],
     }
 }
@@ -637,7 +677,7 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
 
         // @<hostname> — bare host target
         let bare = format!("@{hostname}");
-        if partial.is_empty() || bare.starts_with(partial) {
+        if match_rank(&bare, partial).is_some() {
             completions.push(PaletteCompletion { value: bare, description: "bare host".to_string(), key_hint: None });
         }
 
@@ -645,7 +685,7 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
         for provider in &summary.providers {
             if provider.category == "environment_provider" && !provider.implementation.is_empty() {
                 let value = format!("+{}@{hostname}", provider.implementation);
-                if partial.is_empty() || value.starts_with(partial) {
+                if match_rank(&value, partial).is_some() {
                     let description = format!("new {} environment", provider.name);
                     completions.push(PaletteCompletion { value, description, key_hint: None });
                 }
@@ -658,13 +698,13 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
                 continue;
             };
             let value = format!("={}@{hostname}", id);
-            if partial.is_empty() || value.starts_with(partial) {
+            if match_rank(&value, partial).is_some() {
                 completions.push(PaletteCompletion { value, description: "existing environment".to_string(), key_hint: None });
             }
         }
     }
 
-    completions
+    rank_completions(completions, partial)
 }
 
 #[cfg(test)]
@@ -981,6 +1021,35 @@ mod tests {
         let completions = palette_completions("pr", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"pr"), "expected 'pr' alias in {values:?}");
+    }
+
+    #[test]
+    fn aliases_share_one_root_completion_and_use_the_matching_name() {
+        let model = empty_model();
+        let all = palette_completions("", &model, &Default::default(), true);
+        assert_eq!(all.iter().filter(|item| item.value == "cr" || item.value == "pr").count(), 1);
+        let matches = palette_completions("pr", &model, &Default::default(), true);
+        assert_eq!(matches.iter().filter(|item| item.value == "pr").count(), 1);
+        assert!(matches.iter().any(|item| item.value == "pr" && item.description.contains("cr")));
+    }
+
+    #[test]
+    fn root_matches_fuzzy_names_and_ranks_prefix_before_fuzzy() {
+        let model = empty_model();
+        let values: Vec<String> = palette_completions("re", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
+        assert_eq!(values.first().map(String::as_str), Some("repo"));
+        assert!(values.contains(&"refresh".to_string()));
+        assert!(values.iter().position(|value| value == "repo") < values.iter().position(|value| value == "crew"));
+        let fuzzy: Vec<String> = palette_completions("rfh", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
+        assert!(fuzzy.contains(&"refresh".to_string()));
+    }
+
+    #[test]
+    fn subject_completions_match_fuzzy_names() {
+        let model = model_with_hosts();
+        let values: Vec<String> =
+            palette_completions("host fta", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
+        assert!(values.contains(&"feta".to_string()));
     }
 
     #[test]
