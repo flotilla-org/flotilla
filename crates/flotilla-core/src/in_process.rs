@@ -304,14 +304,26 @@ impl ProviderChangeRequestObservationSource {
                 })
                 .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
-        for convoy in daemon
+        let convoys = daemon
             .resource_backend
             .including_replicas::<ResourceConvoy>(&subject.namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
-            .items
-        {
+            .items;
+        let missing_snapshots = convoys
+            .iter()
+            .filter(|convoy| {
+                !convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+                    && convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_none()
+            })
+            .map(|convoy| convoy.object.metadata.name.as_str())
+            .collect::<HashSet<_>>();
+        self.warned_missing_snapshot
+            .lock()
+            .await
+            .retain(|(namespace, name)| namespace != &subject.namespace || missing_snapshots.contains(name.as_str()));
+        for convoy in convoys {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
             }
@@ -355,14 +367,30 @@ impl ProviderChangeRequestObservationSource {
         }
         let numbers = queried.iter().copied().collect::<Vec<_>>();
         let mut crew_logins = BTreeMap::<u64, BTreeSet<String>>::new();
-        for credential in daemon
-            .resource_backend
-            .including_replicas::<CredentialSpec>(&subject.namespace)
-            .list()
+        let credentials = if credential_refs_by_number.is_empty() {
+            Vec::new()
+        } else {
+            daemon
+                .resource_backend
+                .including_replicas::<CredentialSpec>(&subject.namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+        };
+        let missing_actors = credentials
+            .iter()
+            .filter(|credential| {
+                matches!(credential.object.spec.consumer, CredentialConsumer::GithubApp { .. })
+                    && credential.object.spec.consumer.github_actor_login().is_none()
+            })
+            .map(|credential| credential.object.metadata.name.as_str())
+            .collect::<HashSet<_>>();
+        self.warned_missing_identity
+            .lock()
             .await
-            .map_err(|error| error.to_string())?
-            .items
-        {
+            .retain(|(namespace, name)| namespace != &subject.namespace || missing_actors.contains(name.as_str()));
+        for credential in credentials {
             for (number, refs) in &credential_refs_by_number {
                 if refs.contains(&credential.object.metadata.name) {
                     if let Some(login) = credential.object.spec.consumer.github_graphql_actor_login() {
