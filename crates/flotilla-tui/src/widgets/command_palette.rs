@@ -11,6 +11,7 @@ use ratatui::{
     Frame,
 };
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
+use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
@@ -477,7 +478,8 @@ impl InteractiveWidget for CommandPaletteWidget {
             PaletteInputState::Incomplete => "incomplete",
             PaletteInputState::Unavailable => "CLI only",
         };
-        let indicator_x = cursor_x.saturating_add(2);
+        let input_end_x = overlay.status_row.x.saturating_add(1).saturating_add(self.input.value().width() as u16);
+        let indicator_x = input_end_x.saturating_add(2);
         if indicator_x.saturating_add(indicator.len() as u16) <= overlay.status_row.right() {
             frame.render_widget(
                 Paragraph::new(indicator).style(Style::default().fg(theme.muted).bg(theme.bar_bg)),
@@ -612,5 +614,66 @@ mod tests {
         assert!(matches!(outcome, Outcome::Consumed));
         assert_eq!(widget.input_value(), format!("{expected} "));
         assert!(harness.commands.take_next().is_none());
+    }
+
+    #[test]
+    fn clicking_below_last_completion_keeps_input() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("theme cat"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let body = widget.overlay.expect("rendered overlay").body;
+        let outcome = widget.handle_mouse(left_click(body.x + 2, body.y + 3), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.input_value(), "theme cat");
+    }
+
+    #[test]
+    fn clicking_scrolled_completion_fills_visible_row() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from(""), 2, 2);
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            false,
+        );
+        let expected = widget.completions(&harness.model, &harness.namespaces, false, interactions)[2].value.clone();
+        let body = widget.overlay.expect("rendered overlay").body;
+        let outcome = widget.handle_mouse(left_click(body.x + 2, body.y), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.input_value(), format!("{expected} "));
+    }
+
+    #[test]
+    fn readiness_indicator_preserves_input_when_cursor_moves_left() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("refresh"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        for _ in 0..4 {
+            widget.handle_raw_key(KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE), &mut harness.ctx());
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
+        let mut ui = crate::app::UiState::new(&[]);
+        let theme = crate::theme::Theme::classic();
+        terminal
+            .draw(|frame| {
+                let status_row = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16).status_row;
+                frame.render_widget(Paragraph::new(":refresh"), status_row);
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+        let status_row = widget.overlay.expect("rendered overlay").status_row;
+        let buffer = terminal.backend().buffer();
+        let input: String = (0..8).map(|x| buffer[(x, status_row.y)].symbol()).collect();
+        assert_eq!(input, ":refresh");
     }
 }
