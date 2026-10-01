@@ -15,13 +15,14 @@ use flotilla_protocol::{
     ProjectListRepository, ProjectListResponse, ViewAddress,
 };
 use flotilla_resources::{
-    bound_change_request_record_name, evaluate_landing_settlement, expected_change_request_leaves, expected_checkout_refs,
-    repository_display_labels, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus,
-    CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, FulfilmentGrant, FulfilmentKind,
-    FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, ManifestRoot, Project, ReadResourceObject, Repository,
-    RepositoryKey, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
+    expected_checkout_refs, repository_display_labels, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
+    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, Forge, FulfilmentGrant,
+    FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, ManifestRoot, Project,
+    ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode,
+    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use tracing::warn;
 
@@ -619,6 +620,41 @@ impl ReadProjections<'_> {
             .ok_or_else(|| format!("no convoy matches `{name}`"))?;
         let convoy = convoy_source.object.clone();
         let now = self.clock.now();
+        let forges = self
+            .backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+        let reference_context = flotilla_protocol::ReferenceContext {
+            repositories: convoy
+                .spec
+                .repositories
+                .iter()
+                .filter_map(|repository| {
+                    let address = flotilla_resources::change_request_address_with_forges(&repository.url, "1", &forges).ok()?;
+                    let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
+                    let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
+                    let web_base = forges
+                        .iter()
+                        .find(|forge| forge.forge_id == service)
+                        .map(|forge| forge.https_url.clone())
+                        .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
+                    let forge_alias = (service != "github.com").then(|| service.clone());
+                    Some(flotilla_protocol::RepositoryAlias {
+                        project: convoy.spec.project_ref.clone(),
+                        alias: scope.rsplit('/').next()?.to_string(),
+                        source: flotilla_protocol::IssueSource { service, scope },
+                        web_base,
+                        forge_alias,
+                    })
+                })
+                .collect(),
+        };
+        let subjects = convoy_subject_rows(&convoy, &reference_context);
         let change_request_stale_after = self.leaf_subscriptions.change_request_stale_after();
 
         let checkout_sources =
@@ -895,6 +931,7 @@ impl ReadProjections<'_> {
             evidence_ttl_seconds: LANDING_EVIDENCE_TTL.as_secs(),
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),
             checkouts,
+            subjects,
             change_requests,
             subscriptions,
             crew_deliveries,

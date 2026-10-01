@@ -15,21 +15,21 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     result_set::{
-        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, ConvoySubjectRow, CrewMemberSummary, IndependentRow,
-        ProjectRepositoriesRow, ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase,
-        StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
+        CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
+        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow,
+        SurfaceState, VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
     ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, change_request_address, produced_subject_conflicts, repository_display_labels, Checkout, CheckoutSpec, Convoy,
-    ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
-    DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy,
-    ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList,
-    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase,
-    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    api_version, change_request_address, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout,
+    CheckoutSpec, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand,
+    DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
+    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
+    ResourceList, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
@@ -2223,9 +2223,8 @@ impl Aggregator {
 
     fn summarize(&self, resource: &ResourceRef, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
-        let change_request = self.convoy_change_requests.get(resource).cloned();
         let status = convoy.status.as_ref();
-        let subject_conflicts = produced_subject_conflicts(convoy);
+        let subject_conflicts = subject_relationship_conflicts(convoy);
         let reference_context = flotilla_protocol::ReferenceContext {
             repositories: convoy
                 .spec
@@ -2258,29 +2257,9 @@ impl Aggregator {
                 })
                 .collect(),
         };
-        let mut subjects = convoy
-            .spec
-            .declared_subjects()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|entry| ConvoySubjectRow {
-                url: entry.subject.url(&reference_context),
-                short: entry.subject.short(&reference_context),
-                subject: entry.subject,
-                relationship: entry.relationship,
-                declared: true,
-            })
-            .collect::<Vec<_>>();
-        for entry in status.into_iter().flat_map(|status| &status.subjects) {
-            if !subjects.iter().any(|existing| existing.subject == entry.subject && existing.relationship == entry.relationship) {
-                subjects.push(ConvoySubjectRow {
-                    url: entry.subject.url(&reference_context),
-                    short: entry.subject.short(&reference_context),
-                    subject: entry.subject.clone(),
-                    relationship: entry.relationship,
-                    declared: false,
-                });
-            }
+        let mut subjects = convoy_subject_rows(convoy, &reference_context);
+        for entry in &mut subjects {
+            entry.repository_key = self.convoy_subject_repository_key(convoy, &entry.subject);
         }
         let phase = status.map(|status| status.phase).unwrap_or_default();
         let vessels: Vec<VesselRow> = status
@@ -2356,12 +2335,10 @@ impl Aggregator {
                             .cloned()
                     })
                     .or_else(|| {
-                        subject_conflicts.first().map(|(left, right)| {
-                            format!(
-                                "conflicting produced change requests {} and {}",
-                                left.short(&reference_context),
-                                right.short(&reference_context)
-                            )
+                        (!subject_conflicts.is_empty()).then(|| {
+                            let details =
+                                subject_conflicts.iter().map(|subject| subject.short(&reference_context)).collect::<Vec<_>>().join(", ");
+                            format!("conflicting relationships for {details}")
                         })
                     })
                     .or_else(|| {
@@ -2397,7 +2374,6 @@ impl Aggregator {
                     .collect(),
             )
             .subjects(subjects)
-            .maybe_change_request(change_request)
             .vessels(vessels)
             .surface_state(surface_state)
             .build()
@@ -2409,6 +2385,27 @@ impl Aggregator {
             .sole_repository()
             .and_then(|snapshot| self.repositories.get(&snapshot.repo_ref))
             .map(|repository| repository.spec.repo_fact_value())
+    }
+
+    fn convoy_subject_repository_key(
+        &self,
+        convoy: &ResourceObject<Convoy>,
+        subject: &flotilla_protocol::Subject,
+    ) -> Option<RepositoryKey> {
+        convoy.spec.repositories.iter().find_map(|repository| {
+            let matches = match self.repositories.get(&repository.repo_ref).map(|record| record.spec.identity()) {
+                Some(ResourceRepositoryIdentity::Forge { forge_ref, owner, repo_name }) => {
+                    forge_ref == &subject.source.service && format!("{owner}/{repo_name}") == subject.source.scope
+                }
+                _ => match change_request_address(&repository.url, "1").ok()? {
+                    flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } => {
+                        service == subject.source.service && scope == subject.source.scope
+                    }
+                    _ => false,
+                },
+            };
+            matches.then(|| repository.repo_ref.clone())
+        })
     }
 
     fn summarize_vessel(
@@ -3061,7 +3058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conflicting_produced_subjects_raise_attention_until_superseded() {
+    async fn multiple_produced_subjects_do_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
@@ -3085,9 +3082,8 @@ mod tests {
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoys")[0];
-        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
-        let message = row.message.as_deref().expect("conflict message");
-        assert!(message.contains("281") && message.contains("282"), "{message}");
+        assert_ne!(row.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(row.subjects.len(), 2);
 
         let replacement = convoy.status.as_ref().expect("status").subjects[1].subject.clone();
         convoy.status.as_mut().expect("status").discover_subject(
@@ -3100,6 +3096,7 @@ mod tests {
         let result = state.result_set().await;
         let row = &result.rows.as_convoys().expect("convoys")[0];
         assert_ne!(row.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(row.subjects.len(), 3);
     }
 
     #[tokio::test]
@@ -4949,23 +4946,18 @@ mod tests {
             branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
-        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let mut aggregator =
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
         let mut convoy = convoy_with_branch("convoy-a").await;
 
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
         let DaemonEvent::ResultSet(initial) = event_rx.recv().await.expect("initial result set") else {
             panic!("expected initial result set");
         };
-        assert!(initial.rows.as_convoys().expect("convoy rows")[0].change_request.is_none());
+        assert!(initial.rows.as_convoys().expect("convoy rows")[0].subjects.is_empty());
 
         apply_next_change_request_resolution(&mut aggregator).await;
-        let DaemonEvent::ResultDelta(initial_change_request) = event_rx.recv().await.expect("initial change request delta") else {
-            panic!("expected initial change request delta");
-        };
-        assert_eq!(
-            initial_change_request.changes.as_convoys().expect("convoy changes")[0].change_request.as_ref().expect("change request").status,
-            flotilla_protocol::ChangeRequestStatus::Open
-        );
+        assert!(state.result_set().await.rows.as_convoys().expect("convoy rows")[0].subjects.is_empty());
 
         convoy.status =
             Some(ConvoyStatus { phase: ResourceConvoyPhase::Landed, disposition: Some("shipped".to_string()), ..Default::default() });
@@ -4976,7 +4968,7 @@ mod tests {
         let phase_row = &phase_delta.changes.as_convoys().expect("convoy changes")[0];
         assert_eq!(phase_row.phase, ConvoyPhase::Landed);
         assert_eq!(phase_row.disposition.as_deref(), Some("shipped"));
-        assert_eq!(phase_row.change_request.as_ref().expect("cached change request").status, flotilla_protocol::ChangeRequestStatus::Open);
+        assert!(phase_row.subjects.is_empty());
 
         assert!(!aggregator.change_request_refresh_tasks.contains_key(&aggregator.convoy_ref("flotilla", "convoy-a")));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
@@ -4999,19 +4991,10 @@ mod tests {
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
         let _ = event_rx.recv().await.expect("initial result set");
         apply_next_change_request_resolution(&mut aggregator).await;
-        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("bound PR delta") else {
-            panic!("expected result delta");
-        };
-
-        assert_eq!(delta.changes.as_convoys().expect("convoy changes")[0].change_request.as_ref().expect("bound PR").id, "1071");
         let result_set = state.result_set().await;
-        let bound = result_set.rows.as_convoys().expect("convoy result rows")[0]
-            .change_request
-            .as_ref()
-            .expect("bound PR remains in the aggregator result set");
-        assert_eq!(bound.id, "1071");
-        assert_eq!(bound.repository_key, RepositoryKey("repo_flotilla".to_string()));
-        assert_eq!(bound.status, flotilla_protocol::ChangeRequestStatus::Open);
+        let bound = &result_set.rows.as_convoys().expect("convoy result rows")[0].subjects[0];
+        assert_eq!(bound.subject.id, "1071");
+        assert_eq!(bound.relationship, flotilla_protocol::Relationship::Adopts);
         assert_eq!(resolver.calls.lock().await.as_slice(), &[(
             vec![RepositoryKey("repo_flotilla".to_string())],
             "feat/convoy".to_string(),
@@ -5041,14 +5024,10 @@ mod tests {
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
         assert!(matches!(event_rx.recv().await.expect("initial result set"), DaemonEvent::ResultSet(_)));
         apply_next_change_request_resolution(&mut aggregator).await;
-        assert!(matches!(event_rx.recv().await.expect("initial change request delta"), DaemonEvent::ResultDelta(_)));
 
         convoy.spec.r#ref = Some("feat/rebased".into());
         aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
-        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("association removal delta") else {
-            panic!("expected result delta");
-        };
-        assert!(delta.changes.as_convoys().expect("convoy changes")[0].change_request.is_none());
+        assert!(aggregator.convoy_change_requests.is_empty());
         tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
         apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.branches.lock().await.as_slice(), ["feat/convoy", "feat/rebased"]);
@@ -5142,8 +5121,7 @@ mod tests {
             () = async {
                 let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 assert!(matches!(initial, DaemonEvent::ResultSet(_)));
-                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await;
-                assert!(matches!(initial_change_request, DaemonEvent::ResultDelta(_)));
+                tokio::task::yield_now().await;
                 event_tx
                     .send(DaemonEvent::RepoRefreshCompleted {
                         repo_identity: flotilla_protocol::RepoIdentity {
@@ -5204,10 +5182,7 @@ mod tests {
                     recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await,
                     DaemonEvent::ResultSet(_)
                 ));
-                assert!(matches!(
-                    recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await,
-                    DaemonEvent::ResultDelta(_)
-                ));
+                tokio::task::yield_now().await;
                 for repo_identity in [
                     RepoIdentity { authority: "gitlab.com".into(), path: "other/widgets".into() },
                     RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
@@ -5439,8 +5414,7 @@ mod tests {
             () = async {
                 let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 assert!(matches!(initial, DaemonEvent::ResultSet(_)));
-                let initial_change_request = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial change request delta").await;
-                assert!(matches!(initial_change_request, DaemonEvent::ResultDelta(_)));
+                tokio::task::yield_now().await;
                 tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
                 let mut providers = flotilla_protocol::ProviderData::default();
                 providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
@@ -5466,16 +5440,11 @@ mod tests {
                     })))
                     .expect("publish repo snapshot");
 
-                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "refreshed convoy delta").await;
-                let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
-                assert_eq!(
-                    delta.changes.as_convoys().expect("convoy changes")[0]
-                        .change_request
-                        .as_ref()
-                        .expect("change request")
-                        .status,
-                    flotilla_protocol::ChangeRequestStatus::Closed
-                );
+                tokio::task::yield_now().await;
+                tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
             } => {}
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);

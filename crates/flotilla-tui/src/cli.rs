@@ -632,7 +632,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     } else {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Surface", "Attention", "Host", "Placement", "Staleness"]);
+        table.set_header(vec!["Convoy", "Subjects", "Vessel", "Crew", "State", "Surface", "Attention", "Host", "Placement", "Staleness"]);
         for row in &response.rows {
             let vessel = match &row.authority {
                 Some(authority) => format!("{} ({authority})", row.vessel),
@@ -640,6 +640,17 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
             };
             table.add_row(vec![
                 Cell::new(&row.convoy),
+                Cell::new({
+                    let mut grouped = std::collections::BTreeMap::<flotilla_protocol::Relationship, Vec<&str>>::new();
+                    for subject in &row.subjects {
+                        grouped.entry(subject.relationship).or_default().push(&subject.short);
+                    }
+                    grouped
+                        .into_iter()
+                        .map(|(relationship, references)| format!("{} {}", relationship.as_str().replace('_', " "), references.join(", ")))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                }),
                 Cell::new(vessel),
                 Cell::new(&row.crew),
                 Cell::new(&row.crew_state),
@@ -908,6 +919,26 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             ]);
         }
         let _ = writeln!(output, "{table}");
+    }
+
+    output.push_str("\nSubjects:\n");
+    if explanation.subjects.is_empty() {
+        output.push_str("  (none)\n");
+    } else {
+        let mut grouped =
+            std::collections::BTreeMap::<flotilla_protocol::Relationship, Vec<&flotilla_protocol::result_set::ConvoySubjectRow>>::new();
+        for subject in &explanation.subjects {
+            grouped.entry(subject.relationship).or_default().push(subject);
+        }
+        for (relationship, subjects) in grouped {
+            let references = subjects.iter().map(|subject| subject.short.as_str()).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(output, "  {} {references}", relationship.as_str().replace('_', " "));
+            for subject in subjects {
+                if let Some(url) = &subject.url {
+                    let _ = writeln!(output, "    {} {url}", subject.short);
+                }
+            }
+        }
     }
 
     output.push_str("\nChange requests:\n");

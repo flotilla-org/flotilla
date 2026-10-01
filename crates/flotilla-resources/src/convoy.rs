@@ -82,6 +82,70 @@ impl ConvoySpec {
     }
 }
 
+/// The presentation and settlement consumers read the same persisted links.
+pub fn convoy_subject_rows(
+    convoy: &ResourceObject<Convoy>,
+    context: &flotilla_protocol::ReferenceContext,
+) -> Vec<flotilla_protocol::result_set::ConvoySubjectRow> {
+    let mut rows = Vec::new();
+    for entry in convoy.spec.declared_subjects().unwrap_or_default() {
+        rows.push(flotilla_protocol::result_set::ConvoySubjectRow {
+            url: entry.subject.url(context),
+            short: entry.subject.short(context),
+            repository_key: None,
+            subject: entry.subject,
+            relationship: entry.relationship,
+            declared: true,
+        });
+    }
+    for entry in convoy.status.iter().flat_map(|status| &status.subjects) {
+        if !rows.iter().any(|row| row.subject == entry.subject && row.relationship == entry.relationship) {
+            rows.push(flotilla_protocol::result_set::ConvoySubjectRow {
+                url: entry.subject.url(context),
+                short: entry.subject.short(context),
+                repository_key: None,
+                subject: entry.subject.clone(),
+                relationship: entry.relationship,
+                declared: false,
+            });
+        }
+    }
+    rows
+}
+
+/// Different production histories for the same request need an operator's
+/// judgement. Distinct requests, including two in one repository, do not.
+pub fn subject_relationship_conflicts(convoy: &ResourceObject<Convoy>) -> Vec<Subject> {
+    let mut relationships = BTreeMap::<Subject, BTreeSet<Relationship>>::new();
+    let declared = convoy.spec.declared_subjects().unwrap_or_default();
+    let adopted = declared
+        .iter()
+        .filter(|entry| entry.relationship == Relationship::Adopts)
+        .map(|entry| entry.subject.clone())
+        .collect::<BTreeSet<_>>();
+    for entry in declared {
+        relationships.entry(entry.subject).or_default().insert(entry.relationship);
+    }
+    for entry in convoy.status.iter().flat_map(|status| &status.subjects) {
+        if entry.relationship == Relationship::Produces
+            && adopted.contains(&entry.subject)
+            && entry.sources.iter().all(|source| source.source == SubjectDiscoverySource::Branch)
+        {
+            continue;
+        }
+        relationships.entry(entry.subject.clone()).or_default().insert(entry.relationship);
+    }
+    relationships
+        .into_iter()
+        .filter_map(|(subject, relationships)| {
+            (subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                && relationships.contains(&Relationship::Produces)
+                && relationships.contains(&Relationship::Adopts))
+            .then_some(subject)
+        })
+        .collect()
+}
+
 /// One-generation decoder for the pre-subject `issues` and `change_request`
 /// fields. Remove those two read-only fields after the next fleet roll.
 #[derive(Serialize, Deserialize)]
@@ -247,6 +311,13 @@ pub fn observed_change_request_subjects(
     forges: &[crate::ForgeSpec],
 ) -> Result<Vec<Subject>, String> {
     let expected = expected_checkout_refs(convoy)?;
+    let adopted = convoy
+        .spec
+        .declared_subjects()?
+        .into_iter()
+        .filter(|entry| entry.relationship == Relationship::Adopts)
+        .map(|entry| entry.subject)
+        .collect::<BTreeSet<_>>();
     let mut subjects = Vec::new();
     for name in expected {
         let Some(checkout) = checkouts.get(&name) else { continue };
@@ -264,7 +335,7 @@ pub fn observed_change_request_subjects(
             .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
         let address = change_request_address_with_forges(&repository.url, &observed.id, forges)?;
         if let Some(subject) = Subject::from_leaf(&address) {
-            if !subjects.contains(&subject) {
+            if !adopted.contains(&subject) && !subjects.contains(&subject) {
                 subjects.push(subject);
             }
         }
@@ -347,60 +418,10 @@ pub fn select_convoy_children<T: Resource + Clone>(
 
 /// Hardwired world-terminal leaves armed while a convoy is Landing.
 ///
-/// Change-request identity is durable on an explicitly bound convoy, or is
-/// learned from a checkout authority's stored integration observation. The
-/// latter lets the convoy authority derive the same leaves from replicated
-/// checkout evidence after a restart.
-pub fn expected_change_request_leaves(
-    convoy: &crate::ResourceObject<Convoy>,
-    checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
-) -> Result<Vec<Leaf>, String> {
+/// The convoy's declared and discovered subject set is the sole source of
+/// change-request settlement obligations.
+pub fn active_change_request_subjects(convoy: &ResourceObject<Convoy>) -> Result<Vec<Subject>, String> {
     let mut subjects = Vec::new();
-    if let Some(bound) = &convoy.spec.change_request {
-        let repository = convoy
-            .spec
-            .repositories
-            .iter()
-            .find(|repository| repository.repo_ref == bound.repository_ref)
-            .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
-        let address = change_request_address(&repository.url, &bound.id)?;
-        if !subjects.contains(&address) {
-            subjects.push(address);
-        }
-    }
-    for checkout_name in expected_checkout_refs(convoy)? {
-        let Some(checkout) = checkouts.get(&checkout_name) else { continue };
-        let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
-            continue;
-        };
-        let repository =
-            convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()).ok_or_else(|| {
-                format!("checkout {} repository {} is absent from convoy", checkout.metadata.name, checkout.spec.repo_ref())
-            })?;
-        let address = change_request_address(&repository.url, &observed.id)?;
-        if !subjects.contains(&address) {
-            subjects.push(address);
-        }
-    }
-    if let Some(status) = &convoy.status {
-        for work in status.crew_work.values().flat_map(BTreeMap::values) {
-            let message = if work.phase == CrewWorkPhase::Done {
-                work.message.as_deref()
-            } else {
-                work.completion_refusal.as_ref().and_then(|refusal| refusal.message.as_deref())
-            };
-            let Some(message) = message else { continue };
-            for repository in &convoy.spec.repositories {
-                if let Some(id) = change_request_id_from_completion_message(message, &repository.url) {
-                    let address = change_request_address(&repository.url, &id)?;
-                    if !subjects.contains(&address) {
-                        subjects.push(address);
-                    }
-                }
-            }
-        }
-    }
-
     let declared = convoy.spec.declared_subjects()?;
     let discovered = convoy.status.iter().flat_map(|status| &status.subjects);
     let superseded = declared
@@ -414,17 +435,27 @@ pub fn expected_change_request_leaves(
         .map(|entry| (&entry.subject, entry.relationship))
         .chain(discovered.map(|entry| (&entry.subject, entry.relationship)))
     {
-        if !matches!(relationship, Relationship::Produces | Relationship::Adopts) || superseded.contains(subject) {
+        if subject.kind != flotilla_protocol::SubjectKind::ChangeRequest
+            || !matches!(relationship, Relationship::Produces | Relationship::Adopts)
+            || superseded.contains(subject)
+        {
             continue;
         }
-        let address = subject.leaf()?;
-        if !subjects.contains(&address) {
-            subjects.push(address);
+        if !subjects.contains(subject) {
+            subjects.push(subject.clone());
         }
     }
-    subjects.retain(|address| Subject::from_leaf(address).is_none_or(|subject| !superseded.contains(&subject)));
+    Ok(subjects)
+}
 
-    Ok(subjects
+pub fn expected_change_request_leaves(
+    convoy: &crate::ResourceObject<Convoy>,
+    _checkouts: &BTreeMap<String, crate::ResourceObject<crate::Checkout>>,
+) -> Result<Vec<Leaf>, String> {
+    Ok(active_change_request_subjects(convoy)?
+        .into_iter()
+        .map(|subject| subject.leaf())
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .flat_map(|address| {
             ["merged", "closed"].map(|literal| Leaf {
@@ -435,17 +466,6 @@ pub fn expected_change_request_leaves(
             })
         })
         .collect())
-}
-
-pub fn change_request_id_from_completion_message(message: &str, repository_url: &str) -> Option<String> {
-    let repository_url = repository_url.trim().trim_end_matches('/').trim_end_matches(".git");
-    ["pull", "pulls"].into_iter().find_map(|segment| {
-        let prefix = format!("{repository_url}/{segment}/");
-        message.match_indices(&prefix).find_map(|(start, _)| {
-            let id = message[start + prefix.len()..].chars().take_while(char::is_ascii_digit).collect::<String>();
-            (!id.is_empty()).then_some(id)
-        })
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -737,52 +757,6 @@ impl ConvoyStatus {
     }
 }
 
-/// Conflicting produced PRs within one repository require an operator choice.
-pub fn produced_subject_conflicts(convoy: &ResourceObject<Convoy>) -> Vec<(Subject, Subject)> {
-    let mut produced = convoy
-        .spec
-        .subjects
-        .iter()
-        .filter(|entry| entry.relationship == Relationship::Produces)
-        .map(|entry| entry.subject.clone())
-        .chain(
-            convoy
-                .status
-                .iter()
-                .flat_map(|status| &status.subjects)
-                .filter(|entry| entry.relationship == Relationship::Produces)
-                .map(|entry| entry.subject.clone()),
-        )
-        .filter(|subject| subject.kind == flotilla_protocol::SubjectKind::ChangeRequest)
-        .collect::<Vec<_>>();
-    produced.sort();
-    produced.dedup();
-    let superseded = convoy
-        .spec
-        .subjects
-        .iter()
-        .filter(|entry| entry.relationship == Relationship::Supersedes)
-        .map(|entry| &entry.subject)
-        .chain(
-            convoy
-                .status
-                .iter()
-                .flat_map(|status| &status.subjects)
-                .filter(|entry| entry.relationship == Relationship::Supersedes)
-                .map(|entry| &entry.subject),
-        )
-        .collect::<BTreeSet<_>>();
-    let mut conflicts = Vec::new();
-    for (index, left) in produced.iter().enumerate() {
-        for right in produced.iter().skip(index + 1) {
-            if left.source == right.source && !superseded.contains(left) && !superseded.contains(right) {
-                conflicts.push((left.clone(), right.clone()));
-            }
-        }
-    }
-    conflicts
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueSnapshot {
     pub title: String,
@@ -825,6 +799,14 @@ pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<DiscoveredSubject>,
+    /// The latest successful search of every admitted repository for this
+    /// convoy's branch. The default can be removed one fleet roll after this
+    /// field first ships, per ADR 0047.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_subject_scan_at: Option<DateTime<Utc>>,
+    /// Latest branch discovery failure. The default is a one-roll decoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_subject_scan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unlinked_subjects: Vec<Subject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1280,6 +1262,12 @@ pub enum ConvoyStatusPatch {
         source: SubjectDiscoverySource,
         at: DateTime<Utc>,
     },
+    RecordBranchSubjectScan {
+        at: DateTime<Utc>,
+    },
+    RecordBranchSubjectScanFailure {
+        error: String,
+    },
     UnlinkSubject {
         subject: Subject,
     },
@@ -1481,6 +1469,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);
                 }
             }
+            Self::RecordBranchSubjectScan { at } => {
+                status.branch_subject_scan_at = Some(*at);
+                status.branch_subject_scan_error = None;
+            }
+            Self::RecordBranchSubjectScanFailure { error } => status.branch_subject_scan_error = Some(error.clone()),
             Self::UnlinkSubject { subject } => status.unlink_subject(subject),
             Self::SetStalled { condition } => {
                 status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
@@ -2228,8 +2221,81 @@ mod subject_tests {
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
 
     #[test]
+    fn settlement_uses_every_active_change_request_subject() {
+        let request = |scope: &str, id: &str| Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: scope.into() },
+            id: id.into(),
+        };
+        let first = request("flotilla-org/flotilla", "2372");
+        let followup = request("flotilla-org/flotilla", "2394");
+        let other_repo = request("flotilla-org/cleat", "281");
+        let superseded = request("flotilla-org/flotilla", "2339");
+        let mut status = ConvoyStatus::default();
+        for subject in [&first, &followup, &other_repo, &superseded] {
+            status.discover_subject(subject.clone(), Relationship::Produces, SubjectDiscoverySource::Claim, Utc::now());
+        }
+        status.discover_subject(superseded.clone(), Relationship::Supersedes, SubjectDiscoverySource::Operator, Utc::now());
+        let convoy = ResourceObject::<Convoy> {
+            metadata: crate::ObjectMeta {
+                name: "multi-cr".into(),
+                namespace: "default".into(),
+                resource_version: "1".into(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+                merge: None,
+            },
+            spec: ConvoySpec::builder().workflow_ref("interactive".to_string()).build(),
+            status: Some(status),
+        };
+        let addresses = expected_change_request_leaves(&convoy, &BTreeMap::new())
+            .expect("subject leaves")
+            .into_iter()
+            .map(|leaf| leaf.address)
+            .collect::<Vec<_>>();
+        assert_eq!(addresses.len(), 6);
+        for subject in [&first, &followup, &other_repo] {
+            assert!(addresses.contains(&subject.leaf().expect("subject address")));
+        }
+        assert!(subject_relationship_conflicts(&convoy).is_empty(), "plural production is normal");
+        let mut conflicting = convoy.clone();
+        conflicting.status.as_mut().expect("status").discover_subject(
+            first.clone(),
+            Relationship::Adopts,
+            SubjectDiscoverySource::Operator,
+            Utc::now(),
+        );
+        assert_eq!(subject_relationship_conflicts(&conflicting), vec![first]);
+        let mut unlinked = convoy.clone();
+        let status = unlinked.status.as_mut().expect("status");
+        status.subjects.clear();
+        status.crew_work.insert(
+            "work".into(),
+            BTreeMap::from([(
+                "coder".into(),
+                CrewWorkState::builder()
+                    .phase(CrewWorkPhase::Done)
+                    .message("https://github.com/flotilla-org/flotilla/pull/2372".to_string())
+                    .build(),
+            )]),
+        );
+        assert!(
+            expected_change_request_leaves(&unlinked, &BTreeMap::new()).expect("subject leaves").is_empty(),
+            "a claim message alone cannot bypass the persisted subject set"
+        );
+    }
+
+    #[test]
     fn proposed_stall_disposition_round_trips_and_old_status_decodes() {
         let mut status = ConvoyStatus::default();
+        let prior_generation = serde_json::to_value(&status).expect("serialize status");
+        let decoded: ConvoyStatus = serde_json::from_value(prior_generation).expect("decode status without branch scan");
+        assert!(decoded.branch_subject_scan_at.is_none());
+        assert!(decoded.branch_subject_scan_error.is_none());
         status
             .crew_work
             .insert("work".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));

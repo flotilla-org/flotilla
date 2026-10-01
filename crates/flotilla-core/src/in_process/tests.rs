@@ -1738,8 +1738,9 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     })
     .await
     .expect("claim discovery");
-    let conflicted = convoys.get("multi-repo").await.expect("conflicted convoy");
-    assert_eq!(flotilla_resources::produced_subject_conflicts(&conflicted).len(), 1);
+    let with_followup = convoys.get("multi-repo").await.expect("convoy with follow-up");
+    let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &BTreeMap::new()).expect("subject leaves");
+    assert_eq!(leaves.len(), 6, "all three produced change requests require terminal observations");
     assert!(daemon
         .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
         .await
@@ -1759,8 +1760,9 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
         .await
         .expect("operator resolution");
-    let resolved = convoys.get("multi-repo").await.expect("resolved convoy");
-    assert!(flotilla_resources::produced_subject_conflicts(&resolved).is_empty());
+    let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
+    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &BTreeMap::new()).expect("subject leaves");
+    assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
 }
 
 #[tokio::test]
@@ -2383,6 +2385,12 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     };
     let first = claim().await.expect_err("conflicting PR must refuse claim");
     assert!(first.contains("cr/github.com/flotilla-org/flotilla/2200") && first.contains(".ready"), "{first}");
+    let refused_status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+    assert!(
+        refused_status.subjects.iter().any(|entry| entry.subject.id == "2200"),
+        "the rejected completion still discovered a PR in the convoy's repository"
+    );
+    assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")
         .get(&change_request_record_name("github.com", "flotilla-org/flotilla", 2200))

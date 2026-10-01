@@ -384,6 +384,9 @@ pub struct FleetListRow {
     /// `convoy`, which is the role address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<crate::result_set::ConvoySubjectRow>,
     pub vessel: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<String>,

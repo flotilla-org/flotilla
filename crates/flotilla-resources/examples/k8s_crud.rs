@@ -124,6 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let updated_convoy = convoy_resolver
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
             subjects: Vec::new(),
+            branch_subject_scan_at: None,
+            branch_subject_scan_error: None,
             unlinked_subjects: Vec::new(),
             stalled: None,
             provisioning: None,

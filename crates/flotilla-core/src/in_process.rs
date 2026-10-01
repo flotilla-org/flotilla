@@ -2009,12 +2009,14 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
 fn associated_change_request_name_without_checkout_status(
     convoy: &ResourceObject<ResourceConvoy>,
     checkout: &ResourceObject<ResourceCheckout>,
+    forges: &[flotilla_resources::ForgeSpec],
 ) -> Result<Option<String>, String> {
     let Some(repository) = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref()) else {
         return Ok(None);
     };
-    if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout) {
-        let LeafAddress::ChangeRequest { service, scope, number } = change_request_address(&repository.url, &id)? else {
+    if let Some(id) = convoy_change_request_id_for_checkout(convoy, checkout, forges) {
+        let LeafAddress::ChangeRequest { service, scope, number } = change_request_address_with_forges(&repository.url, &id, forges)?
+        else {
             unreachable!("change_request_address always returns a change-request address")
         };
         return Ok(Some(change_request_record_name(&service, &scope, number)));
@@ -2022,7 +2024,7 @@ fn associated_change_request_name_without_checkout_status(
 
     // A produced subject can retain PR identity after checkout status is gone.
     // Require exactly one current PR for the repository if nothing singles one out.
-    let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address(&repository.url, "1")? else {
+    let LeafAddress::ChangeRequest { service, scope, .. } = change_request_address_with_forges(&repository.url, "1", forges)? else {
         unreachable!("change_request_address always returns a change-request address")
     };
     let names = expected_change_request_leaves(convoy, &BTreeMap::new())?
@@ -3458,6 +3460,15 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?;
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
         for checkout in checkouts.list().await.map_err(|error| error.to_string())?.items {
             if checkout.metadata.lifecycle_authority().map_err(|error| error.to_string())? != Some(LifecycleAuthority::Adopted) {
                 continue;
@@ -3494,7 +3505,7 @@ impl InProcessDaemon {
                     (origin_matches && association_matches).then_some(source.object)
                 });
             let integration = if let Some(convoy) = convoy.as_ref() {
-                let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout);
+                let change_request_id = convoy_change_request_id_for_checkout(convoy, &checkout, &forges);
                 inspect_convoy_checkout_integration(
                     &*runner,
                     vcs.as_ref(),
@@ -4194,9 +4205,20 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let mut subjects = Vec::new();
         let mut errors = Vec::new();
+        let adopted = convoy
+            .spec
+            .declared_subjects()?
+            .into_iter()
+            .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Adopts)
+            .map(|entry| entry.subject)
+            .collect::<BTreeSet<_>>();
+        let should_discover = |subject: &flotilla_protocol::Subject| {
+            !adopted.contains(subject)
+                && !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject))
+        };
         let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
         for subject in &observed_subjects {
-            if !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject)) {
+            if should_discover(subject) {
                 subjects.push((subject.clone(), flotilla_protocol::Relationship::Produces));
             }
         }
@@ -4215,11 +4237,7 @@ impl InProcessDaemon {
                 Some(Ok(Some(request))) if request.repository_key == repository.repo_ref => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
-                        {
+                        if should_discover(&subject) {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
                     }
@@ -4229,18 +4247,18 @@ impl InProcessDaemon {
                 // retried by the aggregator; repeating it per repository here
                 // would spend extra provider quota. A match in another repository
                 // falls through to this repository's individual lookup.
-                Some(Ok(None) | Err(_)) => continue,
+                Some(Ok(None)) => continue,
+                Some(Err(error)) => {
+                    errors.push(error.clone());
+                    continue;
+                }
                 _ => {}
             }
             match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
                 Ok(Some(request)) => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
-                        {
+                        if should_discover(&subject) {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
                     }
@@ -4258,7 +4276,24 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?;
         }
+        if errors.is_empty()
+            && convoy
+                .status
+                .as_ref()
+                .is_some_and(|status| status.branch_subject_scan_at.is_none() || status.branch_subject_scan_error.is_some())
+        {
+            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScan { at: self.clock.now() })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(error) = errors.into_iter().next() {
+            if convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.as_deref()) != Some(error.as_str()) {
+                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScanFailure {
+                    error: error.clone(),
+                })
+                .await
+                .map_err(|patch_error| patch_error.to_string())?;
+            }
             return Err(error);
         }
         Ok(())
@@ -8467,19 +8502,6 @@ impl InProcessDaemon {
             return Ok(flotilla_protocol::CommandValue::Ok);
         }
         if forced_by.is_none() && !existing_claim_is_admitted {
-            // Include the candidate claim while deriving PR subjects. Accepted
-            // claims persist this message, so later settlement derives the
-            // same leaves from the stored crew work.
-            let mut claim_convoy = convoy.clone();
-            if let Some(work) = claim_convoy
-                .status
-                .as_mut()
-                .and_then(|status| status.crew_work.get_mut(&context.vessel))
-                .and_then(|crew| crew.get_mut(&context.caller_role))
-            {
-                work.phase = CrewWorkPhase::Done;
-                work.message = message.clone();
-            }
             let checkout_sources =
                 self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
             let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
@@ -8504,7 +8526,7 @@ impl InProcessDaemon {
             let mut observation_errors = Vec::new();
             if requires_change_request {
                 let mut subjects = BTreeSet::new();
-                for leaf in expected_change_request_leaves(&claim_convoy, &checkouts)? {
+                for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
                     if let Some(subject) = crate::change_request_observer::ChangeRequestRef::from_address(namespace, &leaf.address) {
                         subjects.insert((subject.service, subject.scope, subject.number));
                     }
@@ -8544,7 +8566,7 @@ impl InProcessDaemon {
                 }
             }
             let unmet = evaluate_crew_completion(
-                &claim_convoy,
+                &convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
                 &checkouts,
                 &change_requests,
@@ -8900,6 +8922,16 @@ impl InProcessDaemon {
             BTreeSet::new()
         };
 
+        let forges = self
+            .resource_backend
+            .definitions::<Forge>(namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|forge| forge.spec)
+            .collect::<Vec<_>>();
+
         let mut refusals = Vec::new();
         for checkout in checkout_list
             .iter()
@@ -8908,7 +8940,7 @@ impl InProcessDaemon {
         {
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
-                let merged_for_checkout = associated_change_request_name_without_checkout_status(convoy, checkout)?
+                let merged_for_checkout = associated_change_request_name_without_checkout_status(convoy, checkout, &forges)?
                     .is_some_and(|name| merged_change_requests.contains(&name));
                 if merged_for_checkout {
                     continue;

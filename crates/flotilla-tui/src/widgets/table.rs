@@ -615,16 +615,20 @@ mod tests {
                 Some("workspace launch failed"),
             ),
         ];
-        convoys[1].change_request = Some(flotilla_protocol::ConvoyChangeRequest {
-            id: "815".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            repository_key: flotilla_protocol::RepositoryKey("repo_flotilla".into()),
-        });
-        convoys[2].change_request = Some(flotilla_protocol::ConvoyChangeRequest {
-            id: "812".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Merged,
-            repository_key: flotilla_protocol::RepositoryKey("repo_flotilla".into()),
-        });
+        for (index, id) in [(1, "815"), (2, "812")] {
+            convoys[index].subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+                subject: flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                    source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                    id: id.into(),
+                },
+                relationship: flotilla_protocol::Relationship::Produces,
+                declared: false,
+                short: format!("flotilla!{id}"),
+                url: Some(format!("https://github.com/flotilla-org/flotilla/pull/{id}")),
+                repository_key: Some(flotilla_protocol::RepositoryKey("repo_flotilla".into())),
+            });
+        }
         let rows = convoys.iter().collect::<Vec<_>>();
         table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
             convoys: rows,

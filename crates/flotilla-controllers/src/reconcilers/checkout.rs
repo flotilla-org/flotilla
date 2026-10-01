@@ -9,7 +9,7 @@ use flotilla_resources::{
     apply_status_patch,
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, IntegrationCondition,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
     LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
     TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
@@ -106,6 +106,7 @@ pub struct CheckoutReconciler<R> {
     checkouts: TypedResolver<Checkout>,
     clones: TypedResolver<Clone>,
     convoys: TypedResolver<Convoy>,
+    forges: flotilla_resources::DefinitionResolver<Forge>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     local_root: Option<flotilla_protocol::NodeId>,
     clock: Arc<dyn Clock>,
@@ -128,7 +129,8 @@ impl<R> CheckoutReconciler<R> {
             runtime,
             checkouts: backend.clone().using::<Checkout>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
-            convoys: backend.using::<Convoy>(namespace),
+            convoys: backend.clone().using::<Convoy>(namespace),
+            forges: backend.definitions::<Forge>(namespace),
             federated_convoys: None,
             local_root,
             clock,
@@ -263,11 +265,17 @@ where
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
             let delete_evidence = convoy_needs_delete_evidence(convoy.as_ref());
             let refresh_after = if delete_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
-            let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj));
+            let forges = self.forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
+            let expected_change_request_id = convoy.as_ref().and_then(|convoy| convoy_change_request_id_for_checkout(convoy, obj, &forges));
             if obj.status.as_ref().is_some_and(|status| {
                 status.phase == CheckoutPhase::Ready
                     && (!integration_is_fresh(status, self.clock.now(), refresh_after)
-                        || (delete_evidence && checkout_observation_lacks_convoy_association(&status.integration))
+                        || (delete_evidence
+                            && checkout_observation_lacks_convoy_association(&status.integration)
+                            && convoy.as_ref().is_some_and(|convoy| {
+                                convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some())
+                                    || expected_change_request_id.is_some()
+                            }))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))

@@ -53,6 +53,7 @@ So a crew publishing from a branch other than `spec.ref` never shows a PR in the
   - relay hints (ADR 0041) for watched or branch-matching subjects;
   - `flotilla convoy link <convoy> <ref> --as <relationship>` and `unlink`.
 - Additions are idempotent: the same subject and relationship refreshes its source list.
+- A claim can reveal a subject even when its completion is refused. The subject remains discovered evidence; refusal affects the crew claim, and a later valid claim can use the subject.
 
 ### 4. Disagreement surfaces
 

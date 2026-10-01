@@ -97,6 +97,8 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
     RealConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
+        branch_subject_scan_error: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -324,6 +326,8 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     RealConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
+        branch_subject_scan_error: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -430,6 +434,8 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     RealConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
+        branch_subject_scan_error: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,

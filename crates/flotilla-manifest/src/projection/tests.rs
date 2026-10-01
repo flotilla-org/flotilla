@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessLink, AwarenessNode, AwarenessState, CrewMemberSummary},
-    ChangeRequestStatus, ConvoyChangeRequest, HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
+    HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
 
 use super::*;
@@ -121,11 +121,18 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         .phase(ConvoyPhase::Active)
         .project_ref("project/dev/platform")
         .repo(RepoKey("github.com:flotilla-org/flotilla".to_owned()))
-        .change_request(ConvoyChangeRequest {
-            id: "1044".to_owned(),
-            status: ChangeRequestStatus::Open,
-            repository_key: RepositoryKey("repo-flotilla".to_owned()),
-        })
+        .subjects(vec![flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "1044".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            declared: false,
+            short: "flotilla!1044".into(),
+            url: Some("https://github.com/flotilla-org/flotilla/pull/1044".into()),
+            repository_key: Some(RepositoryKey("repo-flotilla".to_owned())),
+        }])
         .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-cutover-coder").call()])
         .build();
 
@@ -149,7 +156,7 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
     assert_eq!(text(convoy_patch, SEGMENT_PROJECT), "dev/platform@kiwi");
     assert_eq!(text(convoy_patch, SEGMENT_REPO), "github.com:flotilla-org/flotilla");
     assert_eq!(text(convoy_patch, KEY_CONVOY), "dev/cutover@kiwi");
-    assert_eq!(text(convoy_patch, KEY_CHANGE_REQUEST_NUMBER), "1044");
+    assert!(!convoy_patch.set.contains_key(KEY_CHANGE_REQUEST_NUMBER));
     assert_eq!(text(vessel_patch, KEY_VESSEL), "dev/cutover/coder@feta");
     assert_eq!(
         text(convoy_patch, KEY_PRIMARY_ACTION_TARGET),
