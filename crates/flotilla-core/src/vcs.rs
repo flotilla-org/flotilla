@@ -175,12 +175,16 @@ fn allowed_shared_config_key(key: &str) -> bool {
             | "user.name"
             | "user.email"
             | "worktrunk.default-branch"
-    ) || ["url", "fetch", "pushurl", "push", "mirror", "prune", "tagopt"]
+            | "worktrunk.history"
+    ) || key.starts_with("worktrunk.hints.")
+        || ["url", "fetch", "pushurl", "push", "mirror", "prune", "tagopt"]
         .iter()
         .any(|suffix| key.starts_with("remote.") && key.ends_with(&format!(".{suffix}")))
-        || ["remote", "merge", "rebase", "pushremote", "description", "flotilla.issues.issues"]
+        || ["remote", "merge", "rebase", "pushremote", "description"]
             .iter()
             .any(|suffix| key.starts_with("branch.") && key.ends_with(&format!(".{suffix}")))
+        // Flotilla's own issue links: `branch.<branch>.flotilla.issues.<provider>`.
+        || key.starts_with("branch.") && key.rsplit_once('.').is_some_and(|(prefix, _provider)| prefix.ends_with(".flotilla.issues"))
 }
 
 pub(crate) async fn guard_host_git_config_async(cmd: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
@@ -215,7 +219,13 @@ mod git_config_guard_tests {
         git(repo.path(), &["config", "branch.main.remote", "origin"]);
         git(repo.path(), &["config", "core.autocrlf", "false"]);
         guard_host_git_config("git", &["status"], repo.path()).expect("clean repository");
-        let hooks = repo.path().join(".git/hooks");
+        // Keys flotilla and worktrunk write into the host clone as ordinary state.
+        git(repo.path(), &["config", "branch.fix/a.b.flotilla.issues.github", "42"]);
+        git(repo.path(), &["config", "worktrunk.history", "fix/a.b"]);
+        git(repo.path(), &["config", "worktrunk.hints.worktree-path", "true"]);
+        guard_host_git_config("git", &["status"], repo.path()).expect("flotilla issue links and worktrunk state");
+        // Canonical spelling: macOS temp dirs sit behind the `/var` symlink, which the guard rejects.
+        let hooks = repo.path().canonicalize().expect("canonical repository path").join(".git/hooks");
         git(repo.path(), &["config", "core.hooksPath", hooks.to_str().expect("UTF-8 path")]);
         guard_host_git_config("git", &["status"], repo.path()).expect("host's default hooks path");
     }
