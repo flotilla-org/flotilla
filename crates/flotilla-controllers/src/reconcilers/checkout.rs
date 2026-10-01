@@ -117,13 +117,20 @@ impl<R> CheckoutReconciler<R> {
     }
 
     pub fn with_clock(runtime: Arc<R>, backend: ResourceBackend, namespace: &str, clock: Arc<dyn Clock>) -> Self {
+        let local_root = match backend.local_root() {
+            Ok(root) => Some(root),
+            Err(error) => {
+                warn!(%error, "checkout reconciler cannot resolve local authority root");
+                None
+            }
+        };
         Self {
             runtime,
             checkouts: backend.clone().using::<Checkout>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
             convoys: backend.using::<Convoy>(namespace),
             federated_convoys: None,
-            local_root: backend.local_root().ok(),
+            local_root,
             clock,
         }
     }

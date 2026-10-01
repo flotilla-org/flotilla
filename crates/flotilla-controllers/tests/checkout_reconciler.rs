@@ -838,7 +838,6 @@ async fn remote_convoy_deletion_queues_labeled_checkout_without_snapshot_referen
     })
     .await
     .expect("controller started");
-    tokio::time::sleep(Duration::from_millis(50)).await;
     convoys.delete("mis-homed").await.expect("delete parent at its home");
     replicate().await;
 
