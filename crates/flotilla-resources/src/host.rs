@@ -55,6 +55,8 @@ pub struct HostSpec {
     /// setting until capacity facts have a single source of truth (#2361).
     /// Previous-generation Host records omit it (ADR 0047); remove this
     /// decoder default one fleet roll after all hosts write the field.
+    /// Zero is treated as the four-crew default so an invalid value does not
+    /// silently remove the build cap.
     #[serde(default = "default_expected_concurrent_rust_crews")]
     pub expected_concurrent_rust_crews: u32,
 }

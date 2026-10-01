@@ -1199,13 +1199,13 @@ if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
       --target) target_next=1 ;;
       --target=*) target=${arg#--target=} ;;
       *fuse-ld=lld*|*linker-features=+lld*) linker=lld ;;
-      *linker-features=-lld*|*fuse-ld=bfd*|*fuse-ld=gold*) linker=other ;;
+      *linker-features=-lld*|*fuse-ld=*) linker=other ;;
       *linker=*)
         case "$arg" in *lld*) linker=lld ;; *) linker=other ;; esac ;;
     esac
   done
-  if { [ "$target" = host ] || [ "$target" = x86_64-unknown-linux-gnu ]; } && { [ "$linker" = default ] || [ "$linker" = lld ]; }; then
-    exec "$compiler" "$@" -C "link-arg=-Wl,--threads=${FLOTILLA_LINKER_THREADS:?}"
+  if [ -n "${FLOTILLA_LINKER_THREADS:-}" ] && { [ "$target" = host ] || [ "$target" = x86_64-unknown-linux-gnu ]; } && { [ "$linker" = default ] || [ "$linker" = lld ]; }; then
+    exec "$compiler" "$@" -C "link-arg=-Wl,--threads=$FLOTILLA_LINKER_THREADS"
   fi
 fi
 exec "$compiler" "$@"
@@ -1229,6 +1229,37 @@ fn stage_local_rustc_wrapper(state_dir: &Path) -> Result<PathBuf, String> {
             .map_err(|error| format!("mark rustc wrapper executable: {error}"))?;
     }
     std::fs::rename(&staged, &path).map_err(|error| format!("install rustc wrapper: {error}"))?;
+    Ok(path)
+}
+
+async fn stage_local_rustc_wrapper_async(state_dir: PathBuf) -> Result<PathBuf, String> {
+    tokio::task::spawn_blocking(move || stage_local_rustc_wrapper(&state_dir))
+        .await
+        .map_err(|error| format!("stage rustc wrapper task: {error}"))?
+}
+
+async fn stage_remote_rustc_wrapper(runner: &dyn CommandRunner, base: &Path) -> Result<PathBuf, String> {
+    let directory = base.join("environment-tools");
+    let directory_text = directory.to_str().ok_or("remote wrapper directory is not UTF-8")?;
+    runner.run("mkdir", &["-p", directory_text], Path::new("/"), &ChannelLabel::Default).await?;
+    runner.run("chmod", &["700", directory_text], Path::new("/"), &ChannelLabel::Default).await?;
+
+    let path = directory.join("rustc-linker-cap");
+    let path_text = path.to_str().ok_or("remote wrapper path is not UTF-8")?;
+    let current = runner.run("cat", &[path_text], Path::new("/"), &ChannelLabel::Default).await.ok();
+    if current.as_deref() == Some(RUSTC_LINKER_WRAPPER)
+        && runner.run("test", &["-x", path_text], Path::new("/"), &ChannelLabel::Default).await.is_ok()
+    {
+        return Ok(path);
+    }
+
+    // The runner's write_file is atomic, and the final rename publishes only
+    // a complete executable. Concurrent launches may race safely.
+    let staged = directory.join(format!(".rustc-linker-cap-{}", uuid::Uuid::new_v4()));
+    let staged_text = staged.to_str().ok_or("staged remote wrapper path is not UTF-8")?;
+    runner.write_file(&staged, RUSTC_LINKER_WRAPPER).await?;
+    runner.run("chmod", &["700", staged_text], Path::new("/"), &ChannelLabel::Default).await?;
+    runner.run("mv", &["-f", staged_text, path_text], Path::new("/"), &ChannelLabel::Default).await?;
     Ok(path)
 }
 
@@ -1288,23 +1319,20 @@ impl ControllerRuntimeState {
                 .trim()
                 .parse::<usize>()
                 .map_err(|error| format!("read core count for host {host_ref}: {error}"))?
-        } else {
+        } else if host_ref == self.local_host_ref {
             std::thread::available_parallelism().map(usize::from).map_err(|error| format!("read local core count: {error}"))?
+        } else {
+            return Err(format!("no core count source for host {host_ref}"));
         };
         Ok(host_spec.rust_build_jobs(cores))
     }
 
     async fn rustc_wrapper_for_environment(&self, env_ref: &str) -> Result<PathBuf, String> {
         if let Some(profile) = self.agentless_ssh.get(env_ref) {
-            let path = PathBuf::from(format!("/tmp/flotilla-rustc-wrapper-{}", profile.provisioning.host_id));
-            profile.runner.write_file(&path, RUSTC_LINKER_WRAPPER).await?;
-            profile
-                .runner
-                .run("chmod", &["755", path.to_str().ok_or("wrapper path is not UTF-8")?], Path::new("/"), &ChannelLabel::Default)
-                .await?;
-            return Ok(path);
+            let base = profile.runner.writable_config_base(None, self.config.state_dir().as_path()).await?;
+            return stage_remote_rustc_wrapper(profile.runner.as_ref(), &base).await;
         }
-        stage_local_rustc_wrapper(self.config.state_dir().as_path())
+        stage_local_rustc_wrapper_async(self.config.state_dir().as_path().to_path_buf()).await
     }
 
     fn new(
@@ -3817,7 +3845,7 @@ struct DockerControllerRuntime {
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let jobs = self.state.rust_build_jobs(&spec.host_ref).await?;
-        let wrapper_host = stage_local_rustc_wrapper(self.state.config.state_dir().as_path())?;
+        let wrapper_host = stage_local_rustc_wrapper_async(self.state.config.state_dir().as_path().to_path_buf()).await?;
         let mut tools = self.state.environment_tools.prepare(name).await?;
         tools.push(
             EnvironmentTool::new("rust-build-limits", CONTAINED_RUSTC_WRAPPER_PATH)
@@ -5074,24 +5102,22 @@ impl TerminalRuntime for TerminalControllerRuntime {
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
 
         let is_agent_session = matches!(spec.source, TerminalSessionSource::Agent { .. });
-        if is_agent_session {
-            let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
-                Some(self.state.local_host_ref.as_str())
-            } else {
-                self.state.agentless_ssh.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
-            };
-            if let Some(host_ref) = host_ref {
-                let jobs = self.state.rust_build_jobs(host_ref).await?;
-                let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
-                env.retain(|(name, _)| {
-                    !matches!(name.as_str(), "CARGO_BUILD_JOBS" | "FLOTILLA_LINKER_THREADS" | "RUSTC_WORKSPACE_WRAPPER")
-                });
-                env.extend([
-                    ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),
-                    ("FLOTILLA_LINKER_THREADS".to_string(), jobs.to_string()),
-                    ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
-                ]);
-            }
+        let host_ref = if spec.env_ref == self.state.host_direct_environment_name {
+            Some(self.state.local_host_ref.as_str())
+        } else {
+            self.state.agentless_ssh.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
+        };
+        if let Some(host_ref) = host_ref {
+            let jobs = self.state.rust_build_jobs(host_ref).await?;
+            let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
+            // The fulfilment cap owns this variable for host-direct terminals,
+            // including Tool sessions that can run Cargo commands.
+            env.retain(|(name, _)| !matches!(name.as_str(), "CARGO_BUILD_JOBS" | "FLOTILLA_LINKER_THREADS" | "RUSTC_WORKSPACE_WRAPPER"));
+            env.extend([
+                ("CARGO_BUILD_JOBS".to_string(), jobs.to_string()),
+                ("FLOTILLA_LINKER_THREADS".to_string(), jobs.to_string()),
+                ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
+            ]);
         }
         // A dead generation may retain a recording with the old ID. Keep that
         // recording for recovery and launch into the current generation under
@@ -5428,6 +5454,59 @@ mod tests {
         build(Some("--cfg repo_env_flag"));
         let compiler_args = fs::read_to_string(&compiler_log).expect("recorded rustc arguments");
         assert!(compiler_args.contains("link-arg=-Wl,--threads=2"), "linker cap did not reach rustc: {compiler_args}");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linker_cap_wrapper_respects_explicit_linker_and_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let wrapper = super::stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
+        let compiler = temp.path().join("fake-rustc");
+        fs::write(&compiler, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("fake rustc");
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).expect("executable fake rustc");
+        for (args, cap) in [
+            (vec!["--crate-name", "sample"], true),
+            (vec!["-C", "link-arg=-fuse-ld=lld"], true),
+            (vec!["-C", "link-arg=-fuse-ld=mold"], false),
+            (vec!["-C", "link-arg=-fuse-ld=bfd"], false),
+            (vec!["-C", "link-arg=-fuse-ld=gold"], false),
+            (vec!["-C", "link-arg=-fuse-ld=wild"], false),
+            (vec!["-C", "linker=/usr/bin/ld"], false),
+            (vec!["-C", "linker-features=-lld"], false),
+            (vec!["--target", "aarch64-unknown-linux-gnu"], false),
+            (vec!["--target=aarch64-unknown-linux-gnu"], false),
+        ] {
+            let output =
+                ProcessCommand::new(&wrapper).arg(&compiler).args(&args).env("FLOTILLA_LINKER_THREADS", "2").output().expect("run wrapper");
+            assert!(output.status.success(), "wrapper failed for {args:?}");
+            let output = String::from_utf8(output.stdout).expect("UTF-8 arguments");
+            assert_eq!(output.contains("link-arg=-Wl,--threads=2"), cap, "wrong cap for {args:?}: {output}");
+        }
+        let output =
+            ProcessCommand::new(&wrapper).arg(&compiler).env_remove("FLOTILLA_LINKER_THREADS").output().expect("run wrapper without cap");
+        assert!(output.status.success(), "missing optional cap must not fail rustc");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("--threads="));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_rustc_wrapper_stages_once_in_a_private_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runner = ProcessCommandRunner;
+        let path = super::stage_remote_rustc_wrapper(&runner, temp.path()).await.expect("stage remote wrapper");
+        assert_eq!(path.parent().expect("wrapper parent").parent(), Some(temp.path()));
+        assert_eq!(fs::metadata(path.parent().expect("wrapper parent")).expect("directory metadata").permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&path).expect("wrapper metadata").permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::read_to_string(&path).expect("wrapper contents"), super::RUSTC_LINKER_WRAPPER);
+
+        let inode = fs::metadata(&path).expect("wrapper metadata").ino();
+        let second = super::stage_remote_rustc_wrapper(&runner, temp.path()).await.expect("reuse remote wrapper");
+        assert_eq!(second, path);
+        assert_eq!(fs::metadata(&path).expect("wrapper metadata").ino(), inode, "unchanged wrapper should not be replaced");
     }
 
     use flotilla_core::{
@@ -6491,6 +6570,10 @@ mod tests {
 
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
             ProcessCommandRunner.exists(cmd, args).await
+        }
+
+        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            ProcessCommandRunner.write_file(path, content).await
         }
     }
 
@@ -13421,6 +13504,11 @@ mod tests {
         assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
         let watcher_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-watcher")).expect("watcher launch");
         assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "CARGO_INCREMENTAL" && value == "0"));
+        assert!(watcher_launch
+            .env_vars
+            .iter()
+            .any(|(key, value)| key == "CARGO_BUILD_JOBS" && value.parse::<usize>().is_ok_and(|jobs| jobs >= 2)));
+        assert!(watcher_launch.env_vars.iter().any(|(key, value)| key == "RUSTC_WORKSPACE_WRAPPER" && Path::new(value).is_file()));
         drop(ensured);
 
         let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };
