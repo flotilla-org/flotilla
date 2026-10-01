@@ -370,13 +370,13 @@ impl ProviderChangeRequestObservationSource {
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
         } else {
-            daemon
-                .resource_backend
-                .including_replicas::<CredentialSpec>(&subject.namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
+            match daemon.resource_backend.including_replicas::<CredentialSpec>(&subject.namespace).list().await {
+                Ok(credentials) => credentials.items,
+                Err(error) => {
+                    tracing::warn!(%error, "could not list crew credential declarations; change request markers remain unverified");
+                    Vec::new()
+                }
+            }
         };
         let missing_actors = credentials
             .iter()
