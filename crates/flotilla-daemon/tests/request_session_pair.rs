@@ -581,39 +581,33 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
     trace
 }
 
-fn with_large_test_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn_scoped(scope, f)
-            .expect("spawn generated-world worker")
-            .join()
-            .expect("generated-world worker")
-    })
+#[test]
+fn cross_host_request_fits_one_megabyte_stack() {
+    // One MiB leaves headroom below the default 2 MiB test stack on macOS.
+    // If this fails on another target, measure the debug dispatch poll frames
+    // before changing the budget.
+    std::thread::Builder::new()
+        .name("cross-host-stack-regression".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+            runtime.block_on(async { paired_world_trace(0, 1).await });
+        })
+        .expect("spawn reduced-stack worker")
+        .join()
+        .expect("cross-host request exceeded the 1 MB worker stack");
 }
 
 #[hegel::test]
 fn generated_paired_world_host_independence(tc: hegel::TestCase) {
-    // The generated three-host world has deep in-process call stacks. Give
-    // its worker room independently of the test harness's thread stack size.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn_scoped(scope, move || {
-                let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-                let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
-                let remote = (home + offset) % 3;
-                let runtime =
-                    tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-                runtime.block_on(async {
-                    let at_home = paired_world_trace(home, home).await;
-                    let remote_desk = paired_world_trace(home, remote).await;
-                    assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
-                });
-            })
-            .expect("spawn paired-world worker")
-            .join()
-            .expect("paired-world worker");
+    let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+    let remote = (home + offset) % 3;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let at_home = paired_world_trace(home, home).await;
+        let remote_desk = paired_world_trace(home, remote).await;
+        assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
     });
 }
 
@@ -632,54 +626,52 @@ async fn three_host_request_mesh_connects_every_client_and_peer() {
 
 #[test]
 fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
-    with_large_test_stack(|| {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-        runtime.block_on(async {
-            // Dropping the mesh cuts peer sessions; rebuilding sub-meshes models a
-            // stable network partition and a fresh request runtime, not packet loss.
-            let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
-            let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
-            let name = "deleted-during-partition";
-            hosts[0]
-                .resource_backend()
-                .using::<Host>("flotilla")
-                .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
-                .await
-                .expect("create home resource");
-            wait_for_host_resource_visibility(&hosts, name, true).await;
-            drop(mesh);
-            let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[0])]).await.expect("isolated authority client");
-            let other_component = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[1]), Arc::clone(&hosts[2])])
-                .await
-                .expect("connected peers behind partition");
-            let mut events = hosts[0].subscribe();
-            let command_id = isolated.clients[0]
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ResourceDelete {
-                            namespace: "flotilla".to_string(),
-                            kind: "hosts".to_string(),
-                            name: name.to_string(),
-                            replica_origin: None,
-                        })
-                        .build(),
-                )
-                .await
-                .expect("delete at authority while partitioned");
-            assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ResourceDeleted(_)));
-            drop(isolated);
-            drop(other_component);
-            let healed = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal full mesh");
-            wait_for_host_resource_visibility(&hosts, name, false).await;
-            drop(healed);
-            let restarted = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart request runtimes");
-            for host in &restarted.hosts {
-                assert!(matches!(
-                    host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
-                    Err(ResourceError::NotFound { .. })
-                ));
-            }
-        });
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        // Dropping the mesh cuts peer sessions; rebuilding sub-meshes models a
+        // stable network partition and a fresh request runtime, not packet loss.
+        let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
+        let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
+        let name = "deleted-during-partition";
+        hosts[0]
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create home resource");
+        wait_for_host_resource_visibility(&hosts, name, true).await;
+        drop(mesh);
+        let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[0])]).await.expect("isolated authority client");
+        let other_component = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[1]), Arc::clone(&hosts[2])])
+            .await
+            .expect("connected peers behind partition");
+        let mut events = hosts[0].subscribe();
+        let command_id = isolated.clients[0]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".to_string(),
+                        kind: "hosts".to_string(),
+                        name: name.to_string(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("delete at authority while partitioned");
+        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ResourceDeleted(_)));
+        drop(isolated);
+        drop(other_component);
+        let healed = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal full mesh");
+        wait_for_host_resource_visibility(&hosts, name, false).await;
+        drop(healed);
+        let restarted = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart request runtimes");
+        for host in &restarted.hosts {
+            assert!(matches!(
+                host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
+                Err(ResourceError::NotFound { .. })
+            ));
+        }
     });
 }
 
@@ -692,109 +684,106 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
     let step_count = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
     let transitions = (0..step_count).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-    with_large_test_stack(move || {
-        runtime.block_on(async {
-            let hosts = vec![
-                empty_daemon_named("transition-a").await,
-                empty_daemon_named("transition-b").await,
-                empty_daemon_named("transition-c").await,
-            ];
-            let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("initial mesh");
-            let name = "transition-tombstone";
+    runtime.block_on(async {
+        let hosts = vec![
+            empty_daemon_named("transition-a").await,
+            empty_daemon_named("transition-b").await,
+            empty_daemon_named("transition-c").await,
+        ];
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("initial mesh");
+        let name = "transition-tombstone";
+        hosts[home_index]
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create at home");
+        wait_for_host_resource_visibility(&hosts, name, true).await;
+        if restart_before_delete {
+            drop(mesh);
+            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
+        }
+        drop(mesh);
+        let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
+        let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+        let other_component = spawn_in_memory_request_mesh(others).await.expect("other component");
+        let mut events = hosts[home_index].subscribe();
+        let id = isolated.clients[0]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".into(),
+                        kind: "hosts".into(),
+                        name: name.into(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("delete during partition");
+        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
+        drop(isolated);
+        drop(other_component);
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
+        wait_for_host_resource_visibility(&hosts, name, false).await;
+        for (step, partition_again) in transitions.into_iter().enumerate() {
+            let step_name = format!("transition-step-{step}");
             hosts[home_index]
                 .resource_backend()
                 .using::<Host>("flotilla")
-                .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+                .create(&InputMeta::builder().name(step_name.clone()).build(), &HostSpec::default())
                 .await
-                .expect("create at home");
-            wait_for_host_resource_visibility(&hosts, name, true).await;
-            if restart_before_delete {
-                drop(mesh);
-                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
-            }
+                .expect("create next resource at home");
+            wait_for_host_resource_visibility(&hosts, &step_name, true).await;
             drop(mesh);
-            let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
-            let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
-            let other_component = spawn_in_memory_request_mesh(others).await.expect("other component");
-            let mut events = hosts[home_index].subscribe();
-            let id = isolated.clients[0]
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ResourceDelete {
-                            namespace: "flotilla".into(),
-                            kind: "hosts".into(),
-                            name: name.into(),
-                            replica_origin: None,
-                        })
-                        .build(),
-                )
-                .await
-                .expect("delete during partition");
-            assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
-            drop(isolated);
-            drop(other_component);
-            let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
-            wait_for_host_resource_visibility(&hosts, name, false).await;
-            for (step, partition_again) in transitions.into_iter().enumerate() {
-                let step_name = format!("transition-step-{step}");
-                hosts[home_index]
-                    .resource_backend()
-                    .using::<Host>("flotilla")
-                    .create(&InputMeta::builder().name(step_name.clone()).build(), &HostSpec::default())
+            if partition_again {
+                let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
+                let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+                let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
+                let mut events = hosts[home_index].subscribe();
+                let id = isolated.clients[0]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
                     .await
-                    .expect("create next resource at home");
-                wait_for_host_resource_visibility(&hosts, &step_name, true).await;
-                drop(mesh);
-                if partition_again {
-                    let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
-                    let others =
-                        hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
-                    let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
-                    let mut events = hosts[home_index].subscribe();
-                    let id = isolated.clients[0]
-                        .execute(
-                            Command::builder()
-                                .action(CommandAction::ResourceDelete {
-                                    namespace: "flotilla".into(),
-                                    kind: "hosts".into(),
-                                    name: step_name.clone(),
-                                    replica_origin: None,
-                                })
-                                .build(),
-                        )
-                        .await
-                        .expect("delete during repeated partition");
-                    assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
-                    drop(isolated);
-                    drop(other_component);
-                    mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal repeated partition");
-                } else {
-                    mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart full mesh");
-                    let mut events = hosts[home_index].subscribe();
-                    let id = mesh.clients[home_index]
-                        .execute(
-                            Command::builder()
-                                .action(CommandAction::ResourceDelete {
-                                    namespace: "flotilla".into(),
-                                    kind: "hosts".into(),
-                                    name: step_name.clone(),
-                                    replica_origin: None,
-                                })
-                                .build(),
-                        )
-                        .await
-                        .expect("delete after restart");
-                    let (node, result) = await_command_finished(&mut events, id).await;
-                    assert_eq!(node, *hosts[home_index].node_id());
-                    assert!(matches!(result, CommandValue::ResourceDeleted(_)));
-                }
-                wait_for_host_resource_visibility(&hosts, &step_name, false).await;
-                wait_for_host_resource_visibility(&hosts, name, false).await;
-                assert_no_orphaned_finalizers(&hosts).await;
+                    .expect("delete during repeated partition");
+                assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
+                drop(isolated);
+                drop(other_component);
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal repeated partition");
+            } else {
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart full mesh");
+                let mut events = hosts[home_index].subscribe();
+                let id = mesh.clients[home_index]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("delete after restart");
+                let (node, result) = await_command_finished(&mut events, id).await;
+                assert_eq!(node, *hosts[home_index].node_id());
+                assert!(matches!(result, CommandValue::ResourceDeleted(_)));
             }
-            drop(mesh);
-        })
-    });
+            wait_for_host_resource_visibility(&hosts, &step_name, false).await;
+            wait_for_host_resource_visibility(&hosts, name, false).await;
+            assert_no_orphaned_finalizers(&hosts).await;
+        }
+        drop(mesh);
+    })
 }
 
 #[test]
@@ -1026,164 +1015,155 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
     let issuing_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let deleting_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
-    with_large_test_stack(move || {
-        runtime.block_on(async {
-            let hosts = vec![empty_daemon_named("host-a").await, empty_daemon_named("host-b").await, empty_daemon_named("host-c").await];
-            let placement = Arc::clone(&hosts[placement_index]);
-            seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
-            placement.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
-            let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
-            let host_id = placement.local_host_id().expect("placement host identity").to_string();
-            let policy_name = format!("host-direct-{host_id}");
-            let policy = PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: host_id.clone(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build();
-            placement
-                .resource_backend()
-                .using::<PlacementPolicy>("flotilla")
-                .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
-                .await
-                .expect("placement policy");
-            placement
-                .resource_backend()
-                .using::<FulfilmentKind>("flotilla")
-                .create(
-                    &InputMeta::builder().name(policy_name.clone()).build(),
-                    &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
-                )
-                .await
-                .expect("fulfilment kind");
-            for host in &mesh.hosts {
-                seed_trusted_remote_convoy_project(host, "flotilla").await;
-            }
-            eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
-                let issuer = mesh.hosts[issuing_index].resource_backend();
-                issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
-                    && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
-                    && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
-            })
-            .await;
-            let mut events = mesh.hosts[issuing_index].subscribe();
-            let command_id = mesh.clients[issuing_index]
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ConvoyStart {
-                            intent: Box::new(
-                                ConvoyStartIntent::builder()
-                                    .project_ref("flotilla".to_string())
-                                    .name("generated-work".to_string())
-                                    .branch("test/generated-work".to_string())
-                                    .placement_policy(policy_name)
-                                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                                    .build(),
-                            ),
-                        })
-                        .build(),
-                )
-                .await
-                .expect("dispatch admission");
-            let result = await_command_result(&mut events, command_id).await;
-            assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission failed: {result:?}");
-            for (index, host) in mesh.hosts.iter().enumerate() {
-                let count = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("local convoys").items.len();
-                assert_eq!(
-                    count,
-                    usize::from(index == placement_index),
-                    "issuer={issuing_index}, placement={placement_index}, host={index}"
-                );
-            }
-            let convoy_name = convoy_record_name(&placement.resource_backend(), "generated-work").await;
-            for (index, host) in mesh.hosts.iter().enumerate() {
-                if index != placement_index {
-                    apply_convoy_replica_feed(host, "flotilla", &convoy_name, placement.host_name().clone()).await;
-                }
-            }
-            let delivery_steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
-            for _ in 0..delivery_steps {
-                let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
-                let nudge = tc.draw(gs::booleans());
-                let (prompt, vessel, role) =
-                    if nudge { ("nudge", Some("work".to_string()), Some("coder".to_string())) } else { ("resume", None, None) };
-                let mut events = mesh.hosts[issuer].subscribe();
-                let command_id = mesh.clients[issuer]
-                    .execute(
-                        Command::builder()
-                            .action(CommandAction::ConvoyResume {
-                                namespace: Some("flotilla".to_string()),
-                                name: convoy_name.clone(),
-                                prompt: prompt.to_string(),
-                                vessel,
-                                role,
-                            })
-                            .build(),
-                    )
-                    .await
-                    .expect("dispatch resume or nudge");
-                let (node_id, result) = await_command_finished(&mut events, command_id).await;
-                assert_eq!(node_id, *placement.node_id(), "{prompt} ran away from the convoy home");
-                assert!(matches!(result, CommandValue::Error { .. }), "the no-crew case should refuse at home: {result:?}");
-            }
-            eventually(Duration::from_secs(5), Duration::from_millis(10), "all hosts see the convoy before deletion", || async {
-                let mut visible_everywhere = true;
-                for host in &mesh.hosts {
-                    visible_everywhere &= host.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy_name).await.is_ok();
-                }
-                visible_everywhere
-            })
-            .await;
-            let mut delete_events = mesh.hosts[deleting_index].subscribe();
-            let delete_id = mesh.clients[deleting_index]
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: convoy_name.clone(), force: true })
-                        .build(),
-                )
-                .await
-                .expect("dispatch forced delete");
-            assert_eq!(await_command_result(&mut delete_events, delete_id).await, CommandValue::Ok);
-            assert!(matches!(
-                placement.resource_backend().using::<Convoy>("flotilla").get(&convoy_name).await,
-                Err(ResourceError::NotFound { .. })
-            ));
-            let resource_name = "generated-resource";
-            placement
-                .resource_backend()
-                .using::<Host>("flotilla")
-                .create(&InputMeta::builder().name(resource_name.to_string()).build(), &HostSpec::default())
-                .await
-                .expect("create resource at home");
-            eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees home resource", || async {
-                mesh.hosts[deleting_index].resource_backend().including_replicas::<Host>("flotilla").get(resource_name).await.is_ok()
-            })
-            .await;
-            let mut resource_events = mesh.hosts[deleting_index].subscribe();
-            let resource_delete_id = mesh.clients[deleting_index]
-                .execute(
-                    Command::builder()
-                        .action(CommandAction::ResourceDelete {
-                            namespace: "flotilla".to_string(),
-                            kind: "hosts".to_string(),
-                            name: resource_name.to_string(),
-                            replica_origin: None,
-                        })
-                        .build(),
-                )
-                .await
-                .expect("dispatch resource delete");
-            let (node_id, result) = await_command_finished(&mut resource_events, resource_delete_id).await;
-            assert_eq!(node_id, *placement.node_id(), "resource delete must execute at the resource home");
-            assert!(matches!(result, CommandValue::ResourceDeleted(_)), "resource delete failed: {result:?}");
-            assert!(matches!(
-                placement.resource_backend().using::<Host>("flotilla").get(resource_name).await,
-                Err(ResourceError::NotFound { .. })
-            ));
-            assert_no_orphaned_finalizers(&mesh.hosts).await;
+    runtime.block_on(async {
+        let hosts = vec![empty_daemon_named("host-a").await, empty_daemon_named("host-b").await, empty_daemon_named("host-c").await];
+        let placement = Arc::clone(&hosts[placement_index]);
+        seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+        placement.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+        let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+        let host_id = placement.local_host_id().expect("placement host identity").to_string();
+        let policy_name = format!("host-direct-{host_id}");
+        let policy = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+            .build();
+        placement
+            .resource_backend()
+            .using::<PlacementPolicy>("flotilla")
+            .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+            .await
+            .expect("placement policy");
+        placement
+            .resource_backend()
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name(policy_name.clone()).build(),
+                &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
+            )
+            .await
+            .expect("fulfilment kind");
+        for host in &mesh.hosts {
+            seed_trusted_remote_convoy_project(host, "flotilla").await;
+        }
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
+            let issuer = mesh.hosts[issuing_index].resource_backend();
+            issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+                && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+                && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
         })
-    });
+        .await;
+        let mut events = mesh.hosts[issuing_index].subscribe();
+        let command_id = mesh.clients[issuing_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(
+                            ConvoyStartIntent::builder()
+                                .project_ref("flotilla".to_string())
+                                .name("generated-work".to_string())
+                                .branch("test/generated-work".to_string())
+                                .placement_policy(policy_name)
+                                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                                .build(),
+                        ),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch admission");
+        let result = await_command_result(&mut events, command_id).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission failed: {result:?}");
+        for (index, host) in mesh.hosts.iter().enumerate() {
+            let count = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("local convoys").items.len();
+            assert_eq!(count, usize::from(index == placement_index), "issuer={issuing_index}, placement={placement_index}, host={index}");
+        }
+        let convoy_name = convoy_record_name(&placement.resource_backend(), "generated-work").await;
+        for (index, host) in mesh.hosts.iter().enumerate() {
+            if index != placement_index {
+                apply_convoy_replica_feed(host, "flotilla", &convoy_name, placement.host_name().clone()).await;
+            }
+        }
+        let delivery_steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        for _ in 0..delivery_steps {
+            let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let nudge = tc.draw(gs::booleans());
+            let (prompt, vessel, role) =
+                if nudge { ("nudge", Some("work".to_string()), Some("coder".to_string())) } else { ("resume", None, None) };
+            let mut events = mesh.hosts[issuer].subscribe();
+            let command_id = mesh.clients[issuer]
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ConvoyResume {
+                            namespace: Some("flotilla".to_string()),
+                            name: convoy_name.clone(),
+                            prompt: prompt.to_string(),
+                            vessel,
+                            role,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("dispatch resume or nudge");
+            let (node_id, result) = await_command_finished(&mut events, command_id).await;
+            assert_eq!(node_id, *placement.node_id(), "{prompt} ran away from the convoy home");
+            assert!(matches!(result, CommandValue::Error { .. }), "the no-crew case should refuse at home: {result:?}");
+        }
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "all hosts see the convoy before deletion", || async {
+            let mut visible_everywhere = true;
+            for host in &mesh.hosts {
+                visible_everywhere &= host.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy_name).await.is_ok();
+            }
+            visible_everywhere
+        })
+        .await;
+        let mut delete_events = mesh.hosts[deleting_index].subscribe();
+        let delete_id = mesh.clients[deleting_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: convoy_name.clone(), force: true })
+                    .build(),
+            )
+            .await
+            .expect("dispatch forced delete");
+        assert_eq!(await_command_result(&mut delete_events, delete_id).await, CommandValue::Ok);
+        assert!(matches!(
+            placement.resource_backend().using::<Convoy>("flotilla").get(&convoy_name).await,
+            Err(ResourceError::NotFound { .. })
+        ));
+        let resource_name = "generated-resource";
+        placement
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(resource_name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create resource at home");
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees home resource", || async {
+            mesh.hosts[deleting_index].resource_backend().including_replicas::<Host>("flotilla").get(resource_name).await.is_ok()
+        })
+        .await;
+        let mut resource_events = mesh.hosts[deleting_index].subscribe();
+        let resource_delete_id = mesh.clients[deleting_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".to_string(),
+                        kind: "hosts".to_string(),
+                        name: resource_name.to_string(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch resource delete");
+        let (node_id, result) = await_command_finished(&mut resource_events, resource_delete_id).await;
+        assert_eq!(node_id, *placement.node_id(), "resource delete must execute at the resource home");
+        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "resource delete failed: {result:?}");
+        assert!(matches!(
+            placement.resource_backend().using::<Host>("flotilla").get(resource_name).await,
+            Err(ResourceError::NotFound { .. })
+        ));
+        assert_no_orphaned_finalizers(&mesh.hosts).await;
+    })
 }
 
 #[tokio::test]
@@ -1445,10 +1425,8 @@ async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
 
 #[test]
 fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
-    with_large_test_stack(|| {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("request runtime");
-        runtime.block_on(convoy_creation_attribution_scenario());
-    });
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("request runtime");
+    runtime.block_on(convoy_creation_attribution_scenario());
 }
 
 async fn convoy_creation_attribution_scenario() {
