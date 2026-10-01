@@ -1241,12 +1241,28 @@ fn frame_crew_message(sender: &CrewMessageSender, body: &str) -> String {
     format!("[{}]\n\n{body}", crew_message_header(sender))
 }
 
+fn turn_delivery_text(request: &crate::leaf_engine::TurnDeliveryRequest, status: &flotilla_resources::ConvoyStatus) -> String {
+    if matches!(request.sender, CrewMessageSender::FlotillaNudge)
+        && status
+            .crew_work
+            .get(&request.vessel)
+            .and_then(|crew| crew.get(&request.role))
+            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Stalled)
+    {
+        "[flotilla · nudge · declared stall recorded]\n\nYour stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you."
+            .to_string()
+    } else {
+        frame_crew_message(&request.sender, &request.brief)
+    }
+}
+
 fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMessage {
     TerminalCrewMessage {
         id: uuid::Uuid::new_v4().to_string(),
         text: frame_crew_message(&sender, body),
         sender,
         delivery: CrewMessageDelivery::Queued,
+        following: Vec::new(),
     }
 }
 
@@ -1310,16 +1326,34 @@ async fn queue_pending_crew_message(
     sender: CrewMessageSender,
     message: &str,
 ) -> Result<(), String> {
-    let mut spec = existing.spec.clone();
-    let TerminalSessionSource::Agent { message: pending, .. } = &mut spec.source else {
-        return Err(format!("crew target `{}` is not an agent session", existing.spec.role));
-    };
-    *pending = Some(pending_crew_message(sender, message));
-    sessions
-        .update(&input_meta_from_resource(existing), &existing.metadata.resource_version, &spec)
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+    queue_crew_message_object(sessions, existing, pending_crew_message(sender, message)).await
+}
+
+async fn queue_crew_message_object(
+    sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
+    existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    next: TerminalCrewMessage,
+) -> Result<(), String> {
+    let mut current = existing.clone();
+    for _ in 0..8 {
+        let mut spec = current.spec.clone();
+        let TerminalSessionSource::Agent { message: pending, .. } = &mut spec.source else {
+            return Err(format!("crew target `{}` is not an agent session", current.spec.role));
+        };
+        if let Some(head) = pending {
+            head.append(next.clone());
+        } else {
+            *pending = Some(next.clone());
+        }
+        match sessions.update(&input_meta_from_resource(&current), &current.metadata.resource_version, &spec).await {
+            Ok(_) => return Ok(()),
+            Err(ResourceError::Conflict { .. }) => {
+                current = sessions.get(&current.metadata.name).await.map_err(|error| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!("crew message contention persisted for session `{}`", existing.metadata.name))
 }
 
 #[derive(bon::Builder)]
@@ -9190,11 +9224,13 @@ impl InProcessDaemon {
             let turn = flotilla_resources::PendingSupervisorTurn {
                 vessel: context.vessel.clone(),
                 role: target.to_string(),
+                queued_order: 0,
                 message: TerminalCrewMessage {
                     id: format!("crew-handoff:{}", uuid::Uuid::new_v4().simple()),
                     text: frame_crew_message(&sender, message),
                     sender,
                     delivery: CrewMessageDelivery::Queued,
+                    following: Vec::new(),
                 },
             };
             if let Err(error) =
@@ -9430,24 +9466,22 @@ impl InProcessDaemon {
         if session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Failed) {
             return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
         }
+        let resume_message = pending_crew_message(sender.clone(), prompt);
         let reopened = apply_resource_status_patch(
             &convoys,
             name,
-            &convoy_external_patches::resume_crew_work(vessel.clone(), role.clone(), chrono::Utc::now(), prompt.to_string()),
+            &convoy_external_patches::resume_crew_work(
+                vessel.clone(),
+                role.clone(),
+                chrono::Utc::now(),
+                prompt.to_string(),
+                Some(resume_message.id.clone()),
+            ),
         )
         .await
         .map_err(|err| err.to_string())?;
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
-            let turn = flotilla_resources::PendingSupervisorTurn {
-                vessel,
-                role,
-                message: TerminalCrewMessage {
-                    id: format!("operator-resume:{}", uuid::Uuid::new_v4().simple()),
-                    text: frame_crew_message(&sender, prompt),
-                    sender,
-                    delivery: CrewMessageDelivery::Queued,
-                },
-            };
+            let turn = flotilla_resources::PendingSupervisorTurn { vessel, role, message: resume_message, queued_order: 0 };
             if let Err(error) = apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueSupervisorTurn { turn }).await {
                 return Err(self
                     .restore_crew_work_after_delivery_failure(
@@ -9466,15 +9500,15 @@ impl InProcessDaemon {
         let delivery_result: Result<(), String> = async {
             match session.status.as_ref().map(|status| status.phase) {
                 Some(ResourceTerminalSessionPhase::Running) => {
-                    queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?
+                    queue_crew_message_object(&sessions, &session, resume_message.clone()).await?
                 }
                 Some(ResourceTerminalSessionPhase::Stopped) => {
-                    queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?;
+                    queue_crew_message_object(&sessions, &session, resume_message.clone()).await?;
                     apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
                         .await
                         .map_err(|err| err.to_string())?;
                 }
-                _ => queue_pending_crew_message(&sessions, &session, sender.clone(), prompt).await?,
+                _ => queue_crew_message_object(&sessions, &session, resume_message.clone()).await?,
             }
             Ok(())
         }
@@ -9484,7 +9518,7 @@ impl InProcessDaemon {
                 .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
                 .await);
         }
-        Ok(ConvoyResumeOutcome::Delivered { displaced })
+        Ok(ConvoyResumeOutcome::Queued { displaced })
     }
 
     pub async fn convoy_withdraw_pending_brief_internal(&self, namespace: &str, name: &str) -> Result<Option<String>, String> {
@@ -9539,12 +9573,6 @@ impl InProcessDaemon {
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
         };
-        let mut delivery_message = TerminalCrewMessage {
-            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
-            text: frame_crew_message(&request.sender, &request.brief),
-            sender: request.sender.clone(),
-            delivery: CrewMessageDelivery::Queued,
-        };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
         let previous_status = convoys
@@ -9553,6 +9581,20 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?
             .status
             .ok_or_else(|| format!("convoy `{}` has no status", request.convoy))?;
+        let delivery_message = TerminalCrewMessage {
+            id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
+            text: turn_delivery_text(request, &previous_status),
+            sender: request.sender.clone(),
+            delivery: CrewMessageDelivery::Queued,
+            following: Vec::new(),
+        };
+        let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+        if message.as_ref().is_some_and(|head| head.delivered_through(delivered_id, &delivery_message.id)) {
+            return Ok(match plan {
+                TurnDeliverySessionPlan::QueueWarm => TurnDeliveryRung::WarmSession,
+                TurnDeliverySessionPlan::QueueFresh | TurnDeliverySessionPlan::RestartFresh => TurnDeliveryRung::FreshAgent,
+            });
+        }
         let reopened = apply_resource_status_patch(
             &convoys,
             &request.convoy,
@@ -9561,6 +9603,7 @@ impl InProcessDaemon {
                 request.role.clone(),
                 chrono::Utc::now(),
                 request.brief.clone(),
+                None,
             ),
         )
         .await
@@ -9576,13 +9619,23 @@ impl InProcessDaemon {
         .await?;
         match plan {
             TurnDeliverySessionPlan::QueueWarm | TurnDeliverySessionPlan::QueueFresh => {
-                *message = Some(delivery_message);
+                if let Some(head) = message {
+                    head.append(delivery_message);
+                } else {
+                    *message = Some(delivery_message);
+                }
             }
             TurnDeliverySessionPlan::RestartFresh => {
-                delivery_message.delivery = CrewMessageDelivery::LaunchBrief;
-                brief.content = delivery_message.text.clone();
-                brief.artifact_digest = None;
-                *message = Some(delivery_message);
+                if let Some(head) = message {
+                    head.append(delivery_message);
+                } else {
+                    *message = Some(delivery_message);
+                }
+                if let Some(head) = message {
+                    brief.content =
+                        head.mark_next_for_launch(delivered_id).ok_or_else(|| "turn delivery has no pending message".to_string())?;
+                    brief.artifact_digest = None;
+                }
             }
         }
         if let Err(error) = sessions.update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec).await {
@@ -9650,13 +9703,27 @@ impl InProcessDaemon {
             // an owning session confirms delivery.
             TurnDeliverySessionPlan::QueueFresh
         };
+        let convoy = self
+            .resource_backend
+            .clone()
+            .using::<ResourceConvoy>(&request.namespace)
+            .get(&request.convoy)
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{}` has no status", request.convoy))?;
         let message = TerminalCrewMessage {
             id: format!("turn-delivery:{}:{}", request.source, request.subject_revision),
-            text: frame_crew_message(&request.sender, &request.brief),
+            text: turn_delivery_text(request, status),
             sender: request.sender.clone(),
             delivery: CrewMessageDelivery::Queued,
+            following: Vec::new(),
         };
-        let turn = flotilla_resources::PendingSupervisorTurn { vessel: request.vessel.clone(), role: request.role.clone(), message };
+        let turn = flotilla_resources::PendingSupervisorTurn {
+            vessel: request.vessel.clone(),
+            role: request.role.clone(),
+            message,
+            queued_order: 0,
+        };
         apply_resource_status_patch(
             &self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace),
             &request.convoy,
@@ -9686,35 +9753,37 @@ impl InProcessDaemon {
         };
         let Some(status) = convoy.object.status else { return Ok(()) };
         let delivered = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+        let delivered_through = |id: &str| match &session.spec.source {
+            TerminalSessionSource::Agent { message: Some(head), .. } => head.delivered_through(delivered, id),
+            _ => false,
+        };
         let Some(turn) = status
             .turn_deliveries
             .values()
             .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref())
-            .find(|turn| turn.vessel == *vessel && turn.role == *role && delivered != Some(turn.message.id.as_str()))
+            .filter(|turn| turn.vessel == *vessel && turn.role == *role && !delivered_through(&turn.message.id))
+            .min_by_key(|turn| turn.queued_order)
         else {
             return Ok(());
         };
         let mut spec = session.spec.clone();
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else { return Ok(()) };
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), vessel, role)?;
-        if message.as_ref().is_some_and(|current| current.id == turn.message.id) {
-            if plan == TurnDeliverySessionPlan::RestartFresh {
-                apply_resource_status_patch(sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+        if message.as_ref().is_some_and(|current| current.contains_id(&turn.message.id)) && plan != TurnDeliverySessionPlan::RestartFresh {
             return Ok(());
         }
-        if message.as_ref().is_some_and(|current| delivered != Some(current.id.as_str())) {
-            return Ok(());
+        let queued = turn.message.clone();
+        if let Some(head) = message {
+            head.append(queued);
+        } else {
+            *message = Some(queued);
         }
-        let mut queued = turn.message.clone();
         if plan == TurnDeliverySessionPlan::RestartFresh {
-            queued.delivery = CrewMessageDelivery::LaunchBrief;
-            brief.content = queued.text.clone();
-            brief.artifact_digest = None;
+            if let Some(head) = message {
+                brief.content = head.mark_next_for_launch(delivered).ok_or_else(|| "supervisor turn has no pending message".to_string())?;
+                brief.artifact_digest = None;
+            }
         }
-        *message = Some(queued);
         sessions
             .update(&input_meta_from_resource(session), &session.metadata.resource_version, &spec)
             .await
@@ -9759,7 +9828,11 @@ impl InProcessDaemon {
                     }
                 };
                 let delivered = visible.items.iter().any(|session| {
-                    session.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) == Some(message_id.as_str())
+                    let delivered_id = session.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+                    match &session.object.spec.source {
+                        TerminalSessionSource::Agent { message: Some(head), .. } => head.delivered_through(delivered_id, &message_id),
+                        _ => delivered_id == Some(message_id.as_str()),
+                    }
                 });
                 if delivered {
                     if let Err(error) =

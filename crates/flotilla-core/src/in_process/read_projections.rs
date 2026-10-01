@@ -780,6 +780,17 @@ impl ReadProjections<'_> {
                     }
                     _ => None,
                 },
+                pending_briefs: match &source.object.spec.source {
+                    TerminalSessionSource::Agent { message: Some(message), .. } => message
+                        .pending_after(source.object.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()))
+                        .into_iter()
+                        .filter(|message| {
+                            matches!(message.sender, CrewMessageSender::OperatorResume { .. } | CrewMessageSender::OperatorFollowUp { .. })
+                        })
+                        .map(|message| message.text.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                },
                 delivered_message_id: source.object.status.and_then(|status| status.delivered_message_id),
             })
             .collect::<Vec<_>>();

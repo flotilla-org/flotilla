@@ -262,6 +262,8 @@ pub struct ExplainedCrewDelivery {
     pub delivered_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<crate::CrewMessageSender>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_briefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

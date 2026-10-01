@@ -2779,6 +2779,7 @@ mod tests {
         });
         status.turn_deliveries.insert("supervision-1".to_string(), flotilla_resources::TurnDeliveryStatus {
             pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
+                queued_order: 0,
                 vessel: "govern".to_string(),
                 role: "governor".to_string(),
                 message: flotilla_resources::TerminalCrewMessage {
@@ -2786,6 +2787,7 @@ mod tests {
                     text: "Supervise the stalled crew".to_string(),
                     sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
                     delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    following: Vec::new(),
                 },
             }),
             ..Default::default()

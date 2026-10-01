@@ -260,9 +260,10 @@ pub enum TerminalPrepared {
 
 fn launch_brief_message_id(source: &TerminalSessionSource) -> Option<&str> {
     match source {
-        TerminalSessionSource::Agent { message: Some(message), .. } if message.delivery == CrewMessageDelivery::LaunchBrief => {
-            Some(&message.id)
-        }
+        TerminalSessionSource::Agent { message: Some(message), .. } => std::iter::once(message)
+            .chain(message.following.iter())
+            .find(|message| message.delivery == CrewMessageDelivery::LaunchBrief)
+            .map(|message| message.id.as_str()),
         _ => None,
     }
 }
@@ -315,8 +316,8 @@ where
             if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Failed(message));
             }
-            if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
-                if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
+            if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
+                if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.reason == "DeliveryUnconfirmed" && condition.message_id.as_deref() == Some(message.id.as_str())
                     }) {

@@ -1040,6 +1040,10 @@ pub struct PendingSupervisorTurn {
     pub vessel: String,
     pub role: String,
     pub message: crate::TerminalCrewMessage,
+    /// Order assigned when the convoy authority accepts the turn. Older
+    /// stored turns decode with zero; remove this default one roll later.
+    #[serde(default)]
+    pub queued_order: u64,
 }
 
 pub const PENDING_BRIEF_DELIVERY_SOURCE: &str = "operator";
@@ -1190,6 +1194,15 @@ impl WorkCompletionAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewWorkState {
     pub phase: CrewWorkPhase,
+    /// A resumed stalled crew is in grace until its new brief is delivered and
+    /// a later idle observation ends that turn. The default decodes prior
+    /// stored statuses; remove it one fleet roll after this change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
+    /// ID of the operator brief that opened this turn. Older stored statuses
+    /// omit it; remove the compatibility default one roll after deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_brief_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1412,6 +1425,7 @@ pub enum ConvoyStatusPatch {
         role: String,
         resumed_at: DateTime<Utc>,
         prompt: String,
+        brief_id: Option<String>,
     },
     SetPendingBrief {
         pending_brief: PendingBrief,
@@ -1582,7 +1596,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::QueueSupervisorTurn { turn } => {
-                status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(turn.clone());
+                let existing_order = status
+                    .turn_deliveries
+                    .get(&turn.message.id)
+                    .and_then(|delivery| delivery.pending_supervisor_turn.as_ref())
+                    .map(|turn| turn.queued_order);
+                let next_order = status
+                    .turn_deliveries
+                    .values()
+                    .filter_map(|delivery| delivery.pending_supervisor_turn.as_ref().map(|turn| turn.queued_order))
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                let mut queued = turn.clone();
+                queued.queued_order = existing_order.unwrap_or(next_order);
+                status.turn_deliveries.entry(turn.message.id.clone()).or_default().pending_supervisor_turn = Some(queued);
             }
             Self::AcknowledgeSupervisorTurn { message_id } => {
                 if let Some(delivery) = status.turn_deliveries.get_mut(message_id) {
@@ -1834,7 +1862,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     clear_pending_brief_for(status, vessel, sender_role);
                 }
             }
-            Self::ResumeCrewWork { vessel, role, resumed_at, prompt } => {
+            Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id } => {
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -1843,6 +1871,13 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    if brief_id.is_some() {
+                        state.resumed_at = Some(*resumed_at);
+                        state.resume_brief_id = brief_id.clone();
+                    } else {
+                        state.resumed_at = None;
+                        state.resume_brief_id = None;
+                    }
                     state.phase = CrewWorkPhase::Working;
                     state.started_at.get_or_insert(*resumed_at);
                     state.finished_at = None;
@@ -2129,8 +2164,14 @@ pub mod external_patches {
         ConvoyStatusPatch::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message }
     }
 
-    pub fn resume_crew_work(vessel: String, role: String, resumed_at: DateTime<Utc>, prompt: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt }
+    pub fn resume_crew_work(
+        vessel: String,
+        role: String,
+        resumed_at: DateTime<Utc>,
+        prompt: String,
+        brief_id: Option<String>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id }
     }
 
     pub fn set_pending_brief(pending_brief: PendingBrief) -> ConvoyStatusPatch {
@@ -2235,6 +2276,7 @@ mod subject_tests {
             attention: Some(old_attention.clone()),
             turn_deliveries: BTreeMap::from([("turn-1".to_string(), TurnDeliveryStatus {
                 pending_supervisor_turn: Some(PendingSupervisorTurn {
+                    queued_order: 0,
                     vessel: "govern".to_string(),
                     role: "governor".to_string(),
                     message: TerminalCrewMessage {
@@ -2242,6 +2284,7 @@ mod subject_tests {
                         text: "Supervise".to_string(),
                         sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
                         delivery: CrewMessageDelivery::Queued,
+                        following: Vec::new(),
                     },
                 }),
                 ..Default::default()
@@ -2254,6 +2297,30 @@ mod subject_tests {
         status.attention = Some(ConvoyAttention { source: "settlement".to_string(), ..old_attention });
         ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);
         assert_eq!(status.attention.as_ref().map(|attention| attention.source.as_str()), Some("settlement"));
+    }
+
+    #[test]
+    fn supervisor_turns_keep_enqueue_order_independent_of_message_ids() {
+        let mut status = ConvoyStatus::default();
+        for id in ["z-first", "a-second"] {
+            ConvoyStatusPatch::QueueSupervisorTurn {
+                turn: PendingSupervisorTurn {
+                    vessel: "work".into(),
+                    role: "coder".into(),
+                    message: TerminalCrewMessage {
+                        id: id.into(),
+                        text: id.into(),
+                        sender: CrewMessageSender::FlotillaNudge,
+                        delivery: CrewMessageDelivery::Queued,
+                        following: Vec::new(),
+                    },
+                    queued_order: 0,
+                },
+            }
+            .apply(&mut status);
+        }
+        assert_eq!(status.turn_deliveries["z-first"].pending_supervisor_turn.as_ref().expect("first").queued_order, 1);
+        assert_eq!(status.turn_deliveries["a-second"].pending_supervisor_turn.as_ref().expect("second").queued_order, 2);
     }
 
     #[test]
