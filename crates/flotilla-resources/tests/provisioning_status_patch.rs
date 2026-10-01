@@ -2,9 +2,10 @@ use chrono::{TimeZone, Utc};
 use flotilla_protocol::{CanonicalHostId, PlacementDecision, PlacementTargetHost, SleepInhibitionHealth};
 use flotilla_resources::{
     CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus,
-    CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch,
-    InnerCommandStatus, IntegrationCondition, LandedEvidence, PresentationPhase, PresentationStatus, PresentationStatusPatch, Stance,
-    StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
+    CloneStatusPatch, ConditionValue, EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, Host, HostCondition, HostSpec,
+    HostStatus, HostStatusPatch, InMemoryBackend, InnerCommandStatus, InputMeta, IntegrationCondition, LandedEvidence, PresentationPhase,
+    PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, Stance, StatusPatch, TerminalSessionPhase,
+    TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
 };
 
 #[test]
@@ -20,6 +21,9 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         daemon_started_at: None,
         disk_free_bytes: None,
         admission_free_space_floor_bytes: None,
+        agent_adapter_baseline: None,
+        resource_store: None,
+        conditions: Vec::new(),
     }
     .apply(&mut status);
 
@@ -50,6 +54,58 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     HostStatusPatch::SleepInhibition { health: SleepInhibitionHealth::Held, observed_at: observed_at + chrono::Duration::minutes(2) }
         .apply(&mut status);
     assert!(status.conditions.is_empty(), "successful acquisition should clear the condition");
+}
+
+#[tokio::test]
+async fn heartbeat_patch_preserves_independent_status_after_another_writer_updates_it() {
+    let observed_at = Utc.with_ymd_and_hms(2026, 9, 30, 12, 40, 0).single().expect("valid timestamp");
+    let hosts = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Host>("flotilla");
+    let meta = InputMeta::builder().name("host-a".to_string()).build();
+    let stale = hosts.create(&meta, &HostSpec::default()).await.expect("create host");
+    let sleep_patch = HostStatusPatch::SleepInhibition {
+        health: SleepInhibitionHealth::Failed { consecutive_failures: 1, message: "inhibitor unavailable".to_string() },
+        observed_at,
+    };
+    let status = flotilla_resources::apply_status_patch(&hosts, "host-a", &sleep_patch)
+        .await
+        .expect("concurrent sleep writer")
+        .status
+        .expect("status");
+    let sleep_condition = status.conditions[0].clone();
+    assert!(matches!(
+        hosts.update_status("host-a", &stale.metadata.resource_version, &HostStatus::default()).await,
+        Err(ResourceError::Conflict { .. })
+    ));
+    let heartbeat_condition = HostCondition::builder()
+        .condition_type("ResourceStore/DecodeQuarantine")
+        .value(ConditionValue::False)
+        .reason("DecodeFailed")
+        .message("one record failed to decode")
+        .observed_at(observed_at)
+        .build();
+    let patch = HostStatusPatch::Heartbeat {
+        capabilities: Default::default(),
+        heartbeat_at: observed_at,
+        ready: true,
+        daemon_generation: None,
+        daemon_version: None,
+        daemon_started_at: None,
+        disk_free_bytes: None,
+        admission_free_space_floor_bytes: None,
+        agent_adapter_baseline: Some(["codex".to_string()].into()),
+        resource_store: None,
+        conditions: vec![heartbeat_condition.clone()],
+    };
+    let status = flotilla_resources::apply_status_patch(&hosts, "host-a", &patch)
+        .await
+        .expect("heartbeat applies to current status")
+        .status
+        .expect("status");
+
+    assert_eq!(status.conditions, vec![heartbeat_condition, sleep_condition]);
+    assert!(!status.ready, "concurrent sleep-inhibition failure still blocks readiness");
+    assert_eq!(status.agent_adapter_baseline, Some(["codex".to_string()].into()));
+    assert!(matches!(status.sleep_inhibition, SleepInhibitionHealth::Failed { .. }));
 }
 
 #[test]

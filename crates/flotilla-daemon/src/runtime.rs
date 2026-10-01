@@ -53,8 +53,7 @@ use flotilla_resources::{
     VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
-    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, SLEEP_INHIBITION_CONDITION_TYPE,
-    TRANSPORT_CAPABILITY,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -3173,12 +3172,6 @@ async fn apply_host_heartbeat_with_credentials(
     let disk_free_bytes = daemon.admission_free_space_bytes().await?;
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
-    let observed_facts = runtime_health.fulfilment_facts.read().await.clone();
-    let fulfilment_facts = if observed_facts.is_empty() {
-        host.status.as_ref().map(|status| status.fulfilment_facts.clone()).unwrap_or_default()
-    } else {
-        observed_facts
-    };
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
@@ -3193,32 +3186,22 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
         conditions.push(condition);
     }
-    if let Some(condition) = host
-        .status
-        .as_ref()
-        .and_then(|status| status.conditions.iter().find(|condition| condition.condition_type == SLEEP_INHIBITION_CONDITION_TYPE))
-    {
-        conditions.push(condition.clone());
-    }
-    let status = HostStatus {
+    let ready = !conditions.iter().any(HostCondition::blocks_readiness);
+    flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::Heartbeat {
         capabilities: host_capabilities(&summary, profile, &held_credentials, &credential_expiry),
-        fulfilment_facts,
-        model_probes: host.status.as_ref().map(|status| status.model_probes.clone()).unwrap_or_default(),
         agent_adapter_baseline: Some(adapter_assessment.baseline),
-        heartbeat_at: Some(Utc::now()),
-        ready: !conditions.iter().any(HostCondition::blocks_readiness),
-        sleeping_until: host.status.as_ref().and_then(|status| status.sleeping_until),
-        resource_store,
-        blob_sync: host.status.as_ref().and_then(|status| status.blob_sync.clone()),
+        heartbeat_at: Utc::now(),
+        ready,
+        resource_store: resource_store.map(Box::new),
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
         disk_free_bytes,
         admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
         conditions,
-        sleep_inhibition: host.status.as_ref().map(|status| status.sleep_inhibition.clone()).unwrap_or_default(),
-    };
-    hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map_err(|err| err.to_string())?;
+    })
+    .await
+    .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -11947,10 +11930,17 @@ mod tests {
         assert!(status.fulfilment_facts.is_empty());
 
         release.notify_one();
-        *runtime_health.fulfilment_facts.write().await = probe.await.expect("probe task");
+        let observed_facts = probe.await.expect("probe task");
+        *runtime_health.fulfilment_facts.write().await = observed_facts.clone();
+        flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::FulfilmentFacts {
+            facts: observed_facts,
+            model_probes: ModelProbeState::default(),
+        })
+        .await
+        .expect("publish independently observed facts");
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
             .await
-            .expect("publish observed facts");
+            .expect("heartbeat preserves independently observed facts");
         let status = hosts.get(&host_id).await.expect("host").status.expect("status");
         assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
 
@@ -12047,7 +12037,7 @@ mod tests {
         assert!(status.disk_free_bytes.is_some());
         assert!(matches!(status.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, .. }));
         assert_eq!(status.conditions.len(), 1);
-        assert_eq!(status.conditions[0].condition_type, SLEEP_INHIBITION_CONDITION_TYPE);
+        assert_eq!(status.conditions[0].condition_type, flotilla_resources::SLEEP_INHIBITION_CONDITION_TYPE);
         assert!(status.conditions[0].message.contains("polkit denied"));
         assert!(
             status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
