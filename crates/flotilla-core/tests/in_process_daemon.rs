@@ -2450,7 +2450,32 @@ async fn capability_admission_refuses_unready_host_without_sleep_intent() {
 }
 
 #[tokio::test]
-async fn capability_admission_reserves_macos_for_explicit_platform_needs() {
+async fn capability_admission_prefers_linux_when_macos_is_reserved() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
+    let kinds = backend.using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get("macos-scarce").await.expect("macOS kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
+    create_test_host_direct_policy(&backend, "linux-available", "feta", 0, BTreeSet::from(["codex".to_string()])).await;
+
+    let started = start_capability_convoy(&daemon, "reserved-unpinned", |intent| {
+        intent.needs.push("host_account_reach".to_string());
+    })
+    .await;
+    assert!(matches!(started, CommandValue::ConvoyStarted { .. }), "{started:?}");
+    let convoy = admitted_convoy(&backend, "reserved-unpinned").await;
+    let decision = convoy.status.expect("status").placement_decision.expect("placement");
+    assert_eq!(decision.policy_name, "linux-available");
+    assert_eq!(decision.allocation.expect("allocation").reservation_reason, None);
+}
+
+#[tokio::test]
+async fn capability_admission_uses_only_macos_without_escalation_and_explains_fallback() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
@@ -2462,11 +2487,34 @@ async fn capability_admission_reserves_macos_for_explicit_platform_needs() {
     spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
 
-    let refused = start_capability_convoy(&daemon, "reserved-unpinned", |intent| {
+    let started = start_capability_convoy(&daemon, "reserved-only", |intent| {
         intent.needs.push("host_account_reach".to_string());
     })
     .await;
-    assert!(matches!(&refused, CommandValue::Error { message } if message.contains("reserved macOS or Windows capacity")), "{refused:?}");
+    assert!(matches!(started, CommandValue::ConvoyStarted { .. }), "{started:?}");
+    let convoy = admitted_convoy(&backend, "reserved-only").await;
+    let decision = convoy.status.expect("status").placement_decision.expect("placement");
+    assert_eq!(decision.policy_name, "macos-scarce");
+    assert_eq!(decision.escalation_reason, None);
+    let allocation = decision.allocation.expect("allocation");
+    assert_eq!(allocation.chosen_kind, "macos-scarce");
+    assert_eq!(allocation.reservation_reason.as_deref(), Some("no unreserved capacity covers the needs"));
+    assert!(allocation.candidates.iter().any(|candidate| candidate.kind == "macos-scarce" && candidate.reserved_for_platform));
+}
+
+#[tokio::test]
+async fn capability_admission_pin_to_macos_requires_escalation_when_linux_exists() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "macos-scarce", "comte", 0, BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_policy(&backend, "linux-available", "feta", 0, BTreeSet::from(["codex".to_string()])).await;
+    let kinds = backend.using::<FulfilmentKind>("flotilla");
+    let kind = kinds.get("macos-scarce").await.expect("macOS kind");
+    let mut spec = kind.spec.clone();
+    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
 
     let pinned = start_capability_convoy(&daemon, "reserved-pinned", |intent| {
         intent.needs.push("host_account_reach".to_string());

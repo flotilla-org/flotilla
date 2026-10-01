@@ -83,6 +83,10 @@ pub struct PlacementDecision {
 pub struct FulfilmentAllocation {
     pub chosen_kind: String,
     pub candidates: Vec<FulfilmentAllocationCandidate>,
+    /// Why admission used reserved platform capacity without escalation.
+    /// Absent in previous-generation convoy statuses (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,4 +100,16 @@ pub struct FulfilmentAllocationCandidate {
     pub reserved_for_platform: bool,
     pub minimal: bool,
     pub available: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FulfilmentAllocation;
+
+    #[test]
+    fn previous_generation_allocation_decodes_without_reservation_reason() {
+        let allocation: FulfilmentAllocation =
+            serde_json::from_str(r#"{"chosen_kind":"linux","candidates":[]}"#).expect("previous generation allocation");
+        assert_eq!(allocation.reservation_reason, None);
+    }
 }

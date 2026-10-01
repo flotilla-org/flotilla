@@ -47,6 +47,7 @@ async fn convoy_waits_for_selected_minimal_kind_with_legacy_host_alias_and_resum
         viable_not_selected: Vec::new(),
         allocation: Some(FulfilmentAllocation {
             chosen_kind: "linux-docker".to_string(),
+            reservation_reason: None,
             candidates: vec![FulfilmentAllocationCandidate {
                 kind: "linux-docker".to_string(),
                 host: "feta".to_string(),

@@ -5674,14 +5674,11 @@ impl InProcessDaemon {
             return Err(format!("no fulfilment kind covers {}; candidates: {}", role_needs.join(", "), rejected.join("; ")));
         }
         let placement_tiebreak = PlacementTieBreak { needs, now: self.clock.now() };
-        // A scarce platform is not a fallback for work that did not ask for it.
-        // Pins still require an explicit escalation reason through the normal path.
+        // Hold scarce platform capacity only when unreserved capacity also covers the needs.
+        let has_unreserved = candidates.iter().any(|candidate| !placement_tiebreak.reserved(candidate));
         let mut reserved = Vec::new();
-        if pin.is_none() {
+        if pin.is_none() && has_unreserved {
             (candidates, reserved) = candidates.into_iter().partition(|candidate| !placement_tiebreak.reserved(candidate));
-            if candidates.is_empty() {
-                return Err("no fulfilment kind covers needs without consuming reserved macOS or Windows capacity".to_string());
-            }
         }
         let minimal = candidates
             .iter()
@@ -5705,8 +5702,10 @@ impl InProcessDaemon {
             None => candidates.iter().position(|candidate| minimal.contains(&candidate.kind.metadata.name)).expect("nonempty minimal set"),
         };
         let chosen_kind = candidates[index].kind.metadata.name.clone();
+        let selected_reserved = placement_tiebreak.reserved(&candidates[index]);
         let allocation = FulfilmentAllocation {
             chosen_kind,
+            reservation_reason: (selected_reserved && !has_unreserved).then(|| "no unreserved capacity covers the needs".to_string()),
             candidates: candidates
                 .iter()
                 .chain(reserved.iter())
@@ -5729,7 +5728,7 @@ impl InProcessDaemon {
                 .collect(),
         };
         let mut selected = candidates.remove(index);
-        if placement_tiebreak.reserved(&selected) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
+        if selected_reserved && has_unreserved && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
             return Err(format!(
                 "fulfilment `{}` reserves scarce platform capacity; supply --escalation-reason to pin it for work without a platform need",
                 selected.kind.metadata.name

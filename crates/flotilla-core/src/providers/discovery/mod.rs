@@ -236,6 +236,10 @@ impl EnvironmentBag {
 
 pub trait EnvVars: Send + Sync {
     fn get(&self, key: &str) -> Option<String>;
+
+    fn host_os(&self) -> &str {
+        std::env::consts::OS
+    }
 }
 
 pub struct ProcessEnvVars;

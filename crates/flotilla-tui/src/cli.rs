@@ -773,6 +773,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let _ = writeln!(output, "Escalation: {reason}");
         }
         if let Some(allocation) = &placement.allocation {
+            if let Some(reason) = &allocation.reservation_reason {
+                let _ = writeln!(output, "Reserved platform capacity used: {reason}");
+            }
             for candidate in &allocation.candidates {
                 let _ = writeln!(
                     output,
