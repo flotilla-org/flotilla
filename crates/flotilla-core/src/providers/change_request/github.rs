@@ -6,7 +6,7 @@ use chrono::Utc;
 use crate::{
     change_request_observer::{parse_gh_observation_with_review_bot, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
-        gh_api_get,
+        gh_api_get, gh_api_get_with_headers,
         github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, GhApi},
         run, run_output,
         types::*,
@@ -17,6 +17,8 @@ use crate::{
 fn execution_root() -> &'static Path {
     Path::new("/")
 }
+
+const MAX_BRANCH_LOOKUP_PAGES: usize = 10;
 
 pub struct GitHubChangeRequest {
     provider_name: String,
@@ -171,14 +173,24 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
-        let endpoint = format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug);
-        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
-        let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| error.to_string())?;
-        Ok(items
-            .iter()
-            .filter_map(Self::parse_pull_request)
-            .find(|pull_request| pull_request.head_ref_name == branch)
-            .map(|pull_request| self.gh_pr_to_change_request(&pull_request)))
+        for page in 1..=MAX_BRANCH_LOOKUP_PAGES {
+            let endpoint = if page == 1 {
+                format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug)
+            } else {
+                format!("repos/{}/pulls?state=all&per_page=100&page={page}", self.repo_slug)
+            };
+            let response = gh_api_get_with_headers!(self.api, &endpoint, execution_root())?;
+            let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+            if let Some(pull_request) =
+                items.iter().filter_map(Self::parse_pull_request).find(|pull_request| pull_request.head_ref_name == branch)
+            {
+                return Ok(Some(self.gh_pr_to_change_request(&pull_request)));
+            }
+            if !response.has_next_page {
+                return Ok(None);
+            }
+        }
+        Err(format!("GitHub pull request lookup for branch {branch} exceeded {MAX_BRANCH_LOOKUP_PAGES} pages"))
     }
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -232,6 +244,67 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 mod tests {
     use super::*;
     use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, testing::MockRunner};
+
+    fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
+        let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };
+        format!("HTTP/2 200 OK\r\n{link}\r\n{items}")
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_finds_merged_request_on_later_page_and_stops() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(branch_lookup_page(
+                serde_json::json!([{
+                    "number": 9, "title": "Other", "head": {"ref": "other"}, "state": "closed", "merged_at": null
+                }]),
+                true,
+            )),
+            Ok(branch_lookup_page(
+                serde_json::json!([{
+                    "number": 7, "title": "Wanted", "head": {"ref": "feature/wanted"},
+                    "state": "closed", "merged_at": "2026-09-01T00:00:00Z"
+                }]),
+                true,
+            )),
+        ]));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+
+        let found = provider.find_change_request_by_branch("feature/wanted").await.expect("lookup").expect("later-page request");
+        assert_eq!(found.0, "7");
+        assert_eq!(found.1.status, ChangeRequestStatus::Merged);
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.iter().any(|arg| arg == "repos/team/one/pulls?state=all&per_page=100"));
+        assert!(calls[1].1.iter().any(|arg| arg.contains("per_page=100&page=2")));
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_stops_when_github_has_no_next_page() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(branch_lookup_page(
+            serde_json::json!([{
+                "number": 9, "title": "Other", "head": {"ref": "other"}, "state": "open"
+            }]),
+            false,
+        ))]));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+
+        assert!(provider.find_change_request_by_branch("feature/wanted").await.expect("lookup").is_none());
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_reports_when_page_budget_cannot_prove_absence() {
+        let page = branch_lookup_page(serde_json::json!([]), true);
+        let runner = Arc::new(MockRunner::new(vec![Ok(page); MAX_BRANCH_LOOKUP_PAGES]));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+
+        let error = provider.find_change_request_by_branch("feature/wanted").await.expect_err("lookup cannot prove absence");
+        assert!(error.contains("exceeded 10 pages"), "{error}");
+        assert_eq!(runner.calls().len(), MAX_BRANCH_LOOKUP_PAGES);
+    }
 
     #[tokio::test]
     async fn bot_comment_after_head_is_actionable() {
