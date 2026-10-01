@@ -1,3 +1,6 @@
+// async_trait's generated futures trigger Clippy 1.99's redundant must-use lint.
+#![allow(clippy::double_must_use)]
+
 //! Publication and raw-stream contracts for ordinary local services.
 //!
 //! A transport adapter authenticates the caller and the pinned host before
