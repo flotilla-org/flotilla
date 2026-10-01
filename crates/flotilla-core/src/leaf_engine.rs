@@ -14,13 +14,13 @@ use flotilla_resources::{
     controller::{SecondaryWatch, WorkQueueSender},
     evaluate_leaf, expected_change_request_leaves, external_patches, instantiate_exit, instantiate_turn_delivery,
     produced_subject_conflicts, select_convoy_children, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Checkout,
-    CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit,
-    Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung, StallSupervisor,
-    StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
-    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    CheckoutSpec, ControllerRetry, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct,
+    InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung,
+    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -877,6 +877,8 @@ impl ReconcilerWake {
         let backend = &self.subscriptions.inner.backend;
         let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let available_convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let available_ensures =
+            backend.including_replicas::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let sessions = backend.including_replicas::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let observations = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
@@ -1366,15 +1368,33 @@ impl ReconcilerWake {
                                         .find(|(name, crew)| (vessel.is_empty() || *name == vessel) && crew.contains_key(role));
                                     found.map(|(name, _)| (convoy.metadata.name.clone(), name.clone(), role.clone(), StallRung::Bosun))
                                 }
-                                SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => available_convoys
-                                    .iter()
-                                    .map(|source| &source.object)
-                                    .find(|candidate| {
-                                        candidate.spec.project_ref == convoy.spec.project_ref
-                                            && candidate.spec.role == *convoy_role
-                                            && candidate.metadata.name != convoy.metadata.name
-                                    })
-                                    .and_then(|candidate| {
+                                SupervisionTarget::ProjectCrew { convoy_role, vessel, role } => {
+                                    let owned = available_ensures
+                                        .iter()
+                                        .map(|source| &source.object)
+                                        .find(|ensure| {
+                                            Some(ensure.spec.project_ref.as_str()) == convoy.spec.project_ref.as_deref()
+                                                && ensure.spec.role == *convoy_role
+                                        })
+                                        .and_then(|ensure| ensure.status.as_ref())
+                                        .and_then(|status| status.convoy_ref.as_deref());
+                                    let candidate = available_convoys
+                                        .iter()
+                                        .map(|source| &source.object)
+                                        .filter(|candidate| {
+                                            candidate.spec.project_ref == convoy.spec.project_ref
+                                                && candidate.spec.role == *convoy_role
+                                                && candidate.metadata.name != convoy.metadata.name
+                                                && candidate.status.as_ref().is_some_and(|status| !status.phase.is_terminal())
+                                        })
+                                        .max_by_key(|candidate| {
+                                            (
+                                                Some(candidate.metadata.name.as_str()) == owned,
+                                                candidate.spec.generation,
+                                                &candidate.metadata.name,
+                                            )
+                                        });
+                                    let supervisor = candidate.and_then(|candidate| {
                                         candidate.status.as_ref().and_then(|status| {
                                             status
                                                 .crew_work
@@ -1384,7 +1404,15 @@ impl ReconcilerWake {
                                                     (candidate.metadata.name.clone(), name.clone(), role.clone(), StallRung::Governor)
                                                 })
                                         })
-                                    }),
+                                    });
+                                    if supervisor.is_none() {
+                                        if let Some(project) = convoy.spec.project_ref.as_deref() {
+                                            let missing = if candidate.is_some() { " crew" } else { "" };
+                                            condition.evidence.push_str(&format!("; no live {convoy_role}{missing} for project {project}"));
+                                        }
+                                    }
+                                    supervisor
+                                }
                                 SupervisionTarget::Operator => None,
                             };
                             if let Some((target_convoy, target_vessel, target_role, rung)) = candidate {
@@ -2266,6 +2294,220 @@ mod tests {
         let convoys = backend.using::<Convoy>("flotilla");
         let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &convoy_spec()).await.expect("create convoy");
         convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("write convoy status");
+    }
+
+    async fn project_supervision_case(
+        governors: &[(&str, u64, ConvoyPhase)],
+    ) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let (event_tx, _) = broadcast::channel(16);
+        let refresher = ChangeRequestRefresher::new(
+            backend.clone(),
+            "test-host".into(),
+            Arc::new(UnavailableChangeRequests),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let wake = ReconcilerWake {
+            subscriptions: LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher),
+            _marker: PhantomData,
+        };
+        let delivery = Arc::new(RecordingTurnDelivery::default());
+        wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys
+            .create(
+                &InputMeta::builder().name("stalled-work".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("wheelhouse".into()).build(),
+            )
+            .await
+            .expect("create work convoy");
+        convoys
+            .update_status("stalled-work", &source.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("needs decision".into()).build(),
+                    )]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("stall work convoy");
+        for (name, generation, phase) in governors {
+            let created = convoys
+                .create(
+                    &InputMeta::builder().name((*name).to_string()).build(),
+                    &ConvoySpec::builder()
+                        .workflow_ref("workflow".into())
+                        .project_ref("wheelhouse".into())
+                        .role("governor".into())
+                        .generation(*generation)
+                        .build(),
+                )
+                .await
+                .expect("create governor convoy");
+            convoys
+                .update_status(name, &created.metadata.resource_version, &ConvoyStatus {
+                    phase: *phase,
+                    crew_work: BTreeMap::from([(
+                        "govern".into(),
+                        BTreeMap::from([("governor".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                    )]),
+                    ..Default::default()
+                })
+                .await
+                .expect("set governor phase");
+        }
+        let leaf = Leaf {
+            address: LeafAddress::Work { convoy: "stalled-work".into(), work: "work".into() },
+            field_path: ".crew.coder.phase".into(),
+            operator: LeafOperator::Equal,
+            literal: "Done".into(),
+        };
+        let id = uuid::Uuid::new_v4();
+        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![leaf],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "stalled-work".into() },
+            maker: LeafMaker::Actor { vessel: "work".into(), role: "coder".into() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        });
+        (backend, wake, delivery)
+    }
+
+    async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
+        let ensures = backend.using::<ConvoyEnsure>("flotilla");
+        let created = ensures
+            .create(
+                &InputMeta::builder().name("wheelhouse-governor".into()).build(),
+                &flotilla_resources::ConvoyEnsureSpec::builder()
+                    .project_ref("wheelhouse".into())
+                    .role("governor".into())
+                    .workflow_ref("workflow".into())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("create ensure");
+        let created = ensures.get(&created.metadata.name).await.expect("read ensure");
+        ensures
+            .update_status("wheelhouse-governor", &created.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
+                convoy_ref: Some(convoy_ref.into()),
+                ..Default::default()
+            })
+            .await
+            .expect("set owned attempt");
+    }
+
+    #[tokio::test]
+    async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
+        let (backend, wake, delivery) =
+            project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned), ("governor-two", 2, ConvoyPhase::Active)]).await;
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        let objects = HashMap::from([
+            ("stalled-work".into(), source),
+            ("governor-two".into(), backend.using::<Convoy>("flotilla").get("governor-two").await.expect("live governor")),
+        ]);
+        wake.judge_stalls("flotilla", &objects).await.expect("judge stalls");
+        let stalled = backend
+            .using::<Convoy>("flotilla")
+            .get("stalled-work")
+            .await
+            .expect("source")
+            .status
+            .expect("status")
+            .stalled
+            .expect("stalled");
+        assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-two");
+        assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-two");
+    }
+
+    #[tokio::test]
+    async fn stalled_work_without_live_governor_names_reason_at_operator_rung() {
+        let (backend, wake, delivery) = project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned)]).await;
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge stalls");
+        let stalled = backend
+            .using::<Convoy>("flotilla")
+            .get("stalled-work")
+            .await
+            .expect("source")
+            .status
+            .expect("status")
+            .stalled
+            .expect("stalled");
+        assert_eq!(stalled.rung, StallRung::Operator);
+        assert!(stalled.supervision_exhausted);
+        assert!(stalled.evidence.contains("no live governor for project wheelhouse"), "{}", stalled.evidence);
+        assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stalled_work_prefers_governor_owned_by_ensure_over_higher_live_generation() {
+        let (backend, wake, delivery) =
+            project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active), ("governor-three", 3, ConvoyPhase::Active)]).await;
+        create_governor_ensure(&backend, "governor-two").await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let second = convoys.get("governor-two").await.expect("owned governor");
+        let third = convoys.get("governor-three").await.expect("higher generation");
+        wake.judge_stalls(
+            "flotilla",
+            &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), second), ("governor-three".into(), third)]),
+        )
+        .await
+        .expect("judge stalls");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+        assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-two");
+        assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-two");
+    }
+
+    #[tokio::test]
+    async fn stalled_work_names_missing_governor_crew_at_operator_rung() {
+        let (backend, wake, delivery) = project_supervision_case(&[("governor-two", 2, ConvoyPhase::Active)]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let governor = convoys.get("governor-two").await.expect("governor");
+        let mut status = governor.status.expect("governor status");
+        status.crew_work.clear();
+        convoys.update_status("governor-two", &governor.metadata.resource_version, &status).await.expect("clear governor crew");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let governor = convoys.get("governor-two").await.expect("governor");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), governor)]))
+            .await
+            .expect("judge stalls");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+        assert_eq!(stalled.rung, StallRung::Operator);
+        assert!(stalled.evidence.contains("no live governor crew for project wheelhouse"), "{}", stalled.evidence);
+        assert!(delivery.requests.lock().expect("deliveries").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stalled_work_ignores_terminal_ensure_attempt_and_uses_highest_live_generation() {
+        let (backend, wake, delivery) = project_supervision_case(&[
+            ("governor-one", 1, ConvoyPhase::Abandoned),
+            ("governor-two", 2, ConvoyPhase::Active),
+            ("governor-three", 3, ConvoyPhase::Active),
+        ])
+        .await;
+        create_governor_ensure(&backend, "governor-one").await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let second = convoys.get("governor-two").await.expect("live governor");
+        let third = convoys.get("governor-three").await.expect("highest live governor");
+        wake.judge_stalls(
+            "flotilla",
+            &HashMap::from([("stalled-work".into(), source), ("governor-two".into(), second), ("governor-three".into(), third)]),
+        )
+        .await
+        .expect("judge stalls");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stalled");
+        assert_eq!(stalled.supervisor.expect("supervisor").convoy, "governor-three");
+        assert_eq!(delivery.requests.lock().expect("deliveries")[0].convoy, "governor-three");
     }
 
     #[tokio::test]
