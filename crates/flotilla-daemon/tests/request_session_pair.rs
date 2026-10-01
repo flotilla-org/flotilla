@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
     sync::Arc,
     time::Duration,
 };
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_core::{
+    command_target::TargetHost,
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
@@ -19,7 +21,7 @@ use flotilla_core::{
 use flotilla_daemon::{
     blob_store::TieredBlobStore,
     server::test_support::{
-        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
+        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_mesh, spawn_in_memory_request_topology,
         spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
         spawn_in_memory_request_topology_stateful_with_caller_and_blob_store, spawn_in_memory_request_topology_stateful_with_surface,
         InMemoryRequestTopology,
@@ -33,16 +35,18 @@ use flotilla_protocol::{
     SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, controller::ControllerLoop, Artifact, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec,
-    ConvoyStatus, CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle,
-    CredentialPlacementRequirements, CredentialSource, CredentialSpec, CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, FulfilmentKind, FulfilmentKindSpec, Host, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, PlacementPolicy, PlacementPolicySpec, Regard,
+    api_version, controller::ControllerLoop, list_resource_kind, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
+    ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
+    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
+    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec,
+    FulfilmentKind, FulfilmentKindSpec, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey,
     Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY,
-    PROJECT_LABEL, ROLE_LABEL,
+    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS, ROLE_LABEL,
 };
+use hegel::generators as gs;
 
 struct TeardownCheckoutRuntime;
 
@@ -181,31 +185,19 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
         .replace(&convoys.list().await.expect("list deleting parent"), Utc::now())
         .await
         .expect("replicate deletion to child home");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if matches!(checkouts.get("old-child").await, Err(ResourceError::NotFound { .. })) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(3), Duration::from_millis(10), "child home runs checkout finalizer", || async {
+        matches!(checkouts.get("old-child").await, Err(ResourceError::NotFound { .. }))
     })
-    .await
-    .expect("child home runs checkout finalizer");
+    .await;
     parent_backend
         .replica_writer::<Checkout>(child_root, namespace)
         .replace(&checkouts.list().await.expect("list drained child"), Utc::now())
         .await
         .expect("replicate drained child to parent home");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if matches!(convoys.get("old-convoy").await, Err(ResourceError::NotFound { .. })) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(3), Duration::from_millis(10), "parent finalizer completes after child home cleanup", || async {
+        matches!(convoys.get("old-convoy").await, Err(ResourceError::NotFound { .. }))
     })
-    .await
-    .expect("parent finalizer completes after child home cleanup");
+    .await;
     child_controller.abort();
     parent_controller.abort();
 }
@@ -268,51 +260,31 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
 }
 
 async fn await_host_capacity(daemon: &Arc<InProcessDaemon>, host_id: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let capacity_available = daemon
-                .resource_backend()
-                .including_replicas::<Host>("flotilla")
-                .list()
-                .await
-                .expect("list federated hosts")
-                .items
-                .into_iter()
-                .any(|source| {
-                    source.object.metadata.name == host_id
-                        && source.object.status.is_some_and(|status| status.admission_free_space_floor_bytes.is_some())
-                });
-            if capacity_available {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "host capacity should replicate", || async {
+        daemon.resource_backend().including_replicas::<Host>("flotilla").list().await.expect("list federated hosts").items.into_iter().any(
+            |source| {
+                source.object.metadata.name == host_id
+                    && source.object.status.is_some_and(|status| status.admission_free_space_floor_bytes.is_some())
+            },
+        )
     })
-    .await
-    .expect("host capacity should replicate");
+    .await;
 }
 
 async fn await_placement_workflow(topology: &InMemoryRequestTopology, name: &str, adapter: Option<&str>) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let workflow = topology.follower.resource_backend().definitions::<WorkflowTemplate>("flotilla").get(name).await;
-            let project_ready =
-                topology.follower.resource_backend().definitions::<flotilla_resources::Project>("flotilla").get("flotilla").await.is_ok();
-            if project_ready
-                && workflow.is_ok_and(|workflow| {
-                    matches!(
-                        &workflow.spec.vessels[0].crew[0].source,
-                        flotilla_resources::CrewSource::Agent { selector, .. } if selector.adapter.as_deref() == adapter
-                    )
-                })
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "placement host should see the admitted workflow", || async {
+        let workflow = topology.follower.resource_backend().definitions::<WorkflowTemplate>("flotilla").get(name).await;
+        let project_ready =
+            topology.follower.resource_backend().definitions::<flotilla_resources::Project>("flotilla").get("flotilla").await.is_ok();
+        project_ready
+            && workflow.is_ok_and(|workflow| {
+                matches!(
+                    &workflow.spec.vessels[0].crew[0].source,
+                    flotilla_resources::CrewSource::Agent { selector, .. } if selector.adapter.as_deref() == adapter
+                )
+            })
     })
-    .await
-    .expect("placement host should see the admitted workflow");
+    .await;
 }
 
 async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namespace: &str, policy_name: &str) {
@@ -336,18 +308,11 @@ async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namesp
         )
         .await
         .expect("placement host should register its fulfilment kind");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok()
-                && topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "home-authored placement policy should replicate to origin", || async {
+        topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok()
+            && topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
     })
-    .await
-    .expect("home-authored placement policy should replicate to origin");
+    .await;
 }
 
 fn convoy_spec(workflow_ref: &str, role: &str) -> ConvoySpec {
@@ -371,17 +336,813 @@ fn convoy_meta(record_name: &str, role: &str) -> InputMeta {
 }
 
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
+    await_command_finished(rx, command_id).await.1
+}
+
+async fn await_command_finished(
+    rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    command_id: u64,
+) -> (flotilla_protocol::NodeId, CommandValue) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let DaemonEvent::CommandFinished { command_id: id, result, .. } = rx.recv().await.expect("daemon event") {
+            if let DaemonEvent::CommandFinished { command_id: id, node_id, result, .. } = rx.recv().await.expect("daemon event") {
                 if id == command_id {
-                    return result;
+                    return (node_id, result);
                 }
             }
         }
     })
     .await
     .expect("timed out waiting for command result")
+}
+
+async fn eventually<F, Fut>(timeout: Duration, interval: Duration, failure_message: &str, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    tokio::time::timeout(timeout, async {
+        loop {
+            if predicate().await {
+                break;
+            }
+            tokio::time::sleep(interval).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{failure_message}"));
+}
+
+async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
+    for (host_index, host) in hosts.iter().enumerate() {
+        let backend = host.resource_backend();
+        for kind in REGISTERED_RESOURCE_KINDS {
+            let listed = list_resource_kind(&backend, "flotilla", kind.plural).await.expect("list registered kind");
+            for item in listed.value["items"].as_array().expect("resource list items") {
+                let metadata = &item["metadata"];
+                let deleting = !metadata["deletionTimestamp"].is_null();
+                let finalizers = metadata["finalizers"].as_array();
+                assert!(
+                    !deleting || finalizers.is_none_or(Vec::is_empty),
+                    "orphaned finalizers on host {host_index}, {} {}: {metadata}",
+                    kind.kind,
+                    metadata["name"],
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name: &str, should_exist: bool) {
+    let failure_message = format!("Host {name} did not become {} on every host", if should_exist { "visible" } else { "absent" });
+    eventually(Duration::from_secs(5), Duration::from_millis(10), &failure_message, || async {
+        for host in hosts {
+            let read = host.resource_backend().including_replicas::<Host>("flotilla").get(name).await;
+            let matches_expected = if should_exist { read.is_ok() } else { matches!(read, Err(ResourceError::NotFound { .. })) };
+            if !matches_expected {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn finalizer_oracle_detects_a_stuck_registered_resource() {
+    let host = empty_daemon_named("orphaned-finalizer").await;
+    let hosts = vec![Arc::clone(&host)];
+    let resources = host.resource_backend().using::<Host>("flotilla");
+    resources
+        .create(&InputMeta::builder().name("stuck".to_string()).finalizers(vec!["test/stuck".to_string()]).build(), &HostSpec::default())
+        .await
+        .expect("create resource with finalizer");
+    resources.delete("stuck").await.expect("mark deleting");
+    let detected = tokio::spawn(async move { assert_no_orphaned_finalizers(&hosts).await }).await;
+    assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");
+}
+
+async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<String> {
+    let hosts = vec![empty_daemon_named("pair-a").await, empty_daemon_named("pair-b").await, empty_daemon_named("pair-c").await];
+    let home = Arc::clone(&hosts[home_index]);
+    seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+    home.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("paired world mesh");
+    let host_id = home.local_host_id().expect("home id").to_string();
+    let policy_name = format!("host-direct-{host_id}");
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
+    home.resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+        .await
+        .expect("pair policy");
+    home.resource_backend()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&InputMeta::builder().name(policy_name.clone()).build(), &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"))
+        .await
+        .expect("pair kind");
+    for host in &mesh.hosts {
+        seed_trusted_remote_convoy_project(host, "flotilla").await;
+    }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "pair placement visible", || async {
+        let issuer = mesh.hosts[issuer_index].resource_backend();
+        issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+            && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+            && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
+    })
+    .await;
+    let mut trace = Vec::new();
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("paired-work".to_string())
+                            .branch("test/paired-work".to_string())
+                            .placement_policy(policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("pair start dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    let started_name = match result {
+        CommandValue::ConvoyStarted { name, attach_plan, binding } => {
+            trace.push(format!("started:attach_plan={}:binding={}", attach_plan.is_some(), binding.is_some()));
+            name
+        }
+        other => panic!("admission failed: {other:?}"),
+    };
+    for host in &mesh.hosts {
+        let convoys = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys");
+        trace.push(format!(
+            "authored={:?}",
+            convoys
+                .items
+                .iter()
+                .map(|convoy| (
+                    convoy.metadata.labels.get(ROLE_LABEL).cloned(),
+                    convoy.status.as_ref().map(|status| format!("{:?}", status.phase)),
+                ))
+                .collect::<Vec<_>>()
+        ));
+    }
+    let name = convoy_record_name(&home.resource_backend(), "paired-work").await;
+    trace.push(format!("started-name={started_name}"));
+    for (index, host) in mesh.hosts.iter().enumerate() {
+        if index != home_index {
+            apply_convoy_replica_feed(host, "flotilla", &name, home.host_name().clone()).await;
+        }
+    }
+    for nudge in [false, true] {
+        let mut events = mesh.hosts[issuer_index].subscribe();
+        let id = mesh.clients[issuer_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyResume {
+                        namespace: Some("flotilla".into()),
+                        name: name.clone(),
+                        prompt: "continue".into(),
+                        vessel: nudge.then(|| "work".to_string()),
+                        role: nudge.then(|| "coder".to_string()),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("pair delivery dispatch");
+        let (node, result) = await_command_finished(&mut events, id).await;
+        assert_eq!(node, *home.node_id());
+        let message = match result {
+            CommandValue::Error { message } => message,
+            other => panic!("delivery unexpectedly succeeded: {other:?}"),
+        };
+        trace.push(format!("{}: {}", if nudge { "nudge" } else { "resume" }, message.replace(&name, "<convoy>")));
+    }
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: name.clone(), force: true })
+                .build(),
+        )
+        .await
+        .expect("pair convoy delete dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    assert_eq!(result, CommandValue::Ok);
+    trace.push("convoy deleted".into());
+    assert!(matches!(home.resource_backend().using::<Convoy>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+    home.resource_backend()
+        .using::<Host>("flotilla")
+        .create(&InputMeta::builder().name("pair-resource".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("pair resource");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "pair resource visible", || async {
+        mesh.hosts[issuer_index].resource_backend().including_replicas::<Host>("flotilla").get("pair-resource").await.is_ok()
+    })
+    .await;
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".into(),
+                    kind: "hosts".into(),
+                    name: "pair-resource".into(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("pair resource delete dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    let deleted = match result {
+        CommandValue::ResourceDeleted(deleted) => deleted,
+        other => panic!("resource deletion failed: {other:?}"),
+    };
+    trace.push(format!("resource-deleted:{}:{}:{}", deleted.kind, deleted.namespace, deleted.value["metadata"]["name"]));
+    for host in &mesh.hosts {
+        let remaining = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("remaining convoys");
+        trace.push(format!("remaining-convoys={}", remaining.items.len()));
+    }
+    wait_for_host_resource_visibility(&mesh.hosts, "pair-resource", false).await;
+    assert_no_orphaned_finalizers(&mesh.hosts).await;
+    trace
+}
+
+#[hegel::test]
+fn generated_paired_world_host_independence(tc: hegel::TestCase) {
+    let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+    let remote = (home + offset) % 3;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let at_home = paired_world_trace(home, home).await;
+        let remote_desk = paired_world_trace(home, remote).await;
+        assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+    });
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn three_host_request_mesh_connects_every_client_and_peer() {
+    let hosts = vec![empty_daemon_named("desk").await, empty_daemon_named("placement").await, empty_daemon_named("other").await];
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("connect three-host mesh");
+    assert_eq!(mesh.hosts.len(), 3);
+    assert_eq!(mesh.clients.len(), 3);
+    for (index, host) in mesh.hosts.iter().enumerate() {
+        let routes = host.get_topology().await.expect("host topology").routes;
+        assert_eq!(routes.iter().filter(|route| route.connected).count(), 2, "host {index} has a full mesh");
+        assert_eq!(mesh.clients[index].get_topology().await.expect("client topology").routes.len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
+    // Dropping the mesh cuts peer sessions; rebuilding sub-meshes models a
+    // stable network partition and a fresh request runtime, not packet loss.
+    let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
+    let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
+    let name = "deleted-during-partition";
+    hosts[0]
+        .resource_backend()
+        .using::<Host>("flotilla")
+        .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+        .await
+        .expect("create home resource");
+    wait_for_host_resource_visibility(&hosts, name, true).await;
+    drop(mesh);
+    let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[0])]).await.expect("isolated authority client");
+    let other_component =
+        spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[1]), Arc::clone(&hosts[2])]).await.expect("connected peers behind partition");
+    let mut events = hosts[0].subscribe();
+    let command_id = isolated.clients[0]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".to_string(),
+                    kind: "hosts".to_string(),
+                    name: name.to_string(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("delete at authority while partitioned");
+    assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ResourceDeleted(_)));
+    drop(isolated);
+    drop(other_component);
+    let healed = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal full mesh");
+    wait_for_host_resource_visibility(&hosts, name, false).await;
+    drop(healed);
+    let restarted = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart request runtimes");
+    for host in &restarted.hosts {
+        assert!(matches!(
+            host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
+            Err(ResourceError::NotFound { .. })
+        ));
+    }
+}
+
+#[hegel::test]
+fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
+    // Each drawn step authors and deletes a new record across either a cut
+    // peer session or a full-mesh runtime restart.
+    let home_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let restart_before_delete = tc.draw(gs::booleans());
+    let step_count = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+    let transitions = (0..step_count).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let hosts = vec![
+            empty_daemon_named("transition-a").await,
+            empty_daemon_named("transition-b").await,
+            empty_daemon_named("transition-c").await,
+        ];
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("initial mesh");
+        let name = "transition-tombstone";
+        hosts[home_index]
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create at home");
+        wait_for_host_resource_visibility(&hosts, name, true).await;
+        if restart_before_delete {
+            drop(mesh);
+            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
+        }
+        drop(mesh);
+        let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
+        let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+        let other_component = spawn_in_memory_request_mesh(others).await.expect("other component");
+        let mut events = hosts[home_index].subscribe();
+        let id = isolated.clients[0]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".into(),
+                        kind: "hosts".into(),
+                        name: name.into(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("delete during partition");
+        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
+        drop(isolated);
+        drop(other_component);
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
+        wait_for_host_resource_visibility(&hosts, name, false).await;
+        for (step, partition_again) in transitions.into_iter().enumerate() {
+            let step_name = format!("transition-step-{step}");
+            hosts[home_index]
+                .resource_backend()
+                .using::<Host>("flotilla")
+                .create(&InputMeta::builder().name(step_name.clone()).build(), &HostSpec::default())
+                .await
+                .expect("create next resource at home");
+            wait_for_host_resource_visibility(&hosts, &step_name, true).await;
+            drop(mesh);
+            if partition_again {
+                let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
+                let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+                let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
+                let mut events = hosts[home_index].subscribe();
+                let id = isolated.clients[0]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("delete during repeated partition");
+                assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
+                drop(isolated);
+                drop(other_component);
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal repeated partition");
+            } else {
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart full mesh");
+                let mut events = hosts[home_index].subscribe();
+                let id = mesh.clients[home_index]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("delete after restart");
+                let (node, result) = await_command_finished(&mut events, id).await;
+                assert_eq!(node, *hosts[home_index].node_id());
+                assert!(matches!(result, CommandValue::ResourceDeleted(_)));
+            }
+            wait_for_host_resource_visibility(&hosts, &step_name, false).await;
+            wait_for_host_resource_visibility(&hosts, name, false).await;
+            assert_no_orphaned_finalizers(&hosts).await;
+        }
+        drop(mesh);
+    });
+}
+
+#[test]
+fn generated_session_lookup_covers_remote_home_for_local_only_fault_model() {
+    // Generator coverage control: a local-only lookup fails for a drawn remote home.
+    // The request-level session rows exercise production routing separately.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hegel::Hegel::new(|tc: hegel::TestCase| {
+            let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+            runtime.block_on(async {
+                let hosts = vec![
+                    empty_daemon_named("session-a").await,
+                    empty_daemon_named("session-b").await,
+                    empty_daemon_named("session-c").await,
+                ];
+                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+                let name = "remote-session";
+                mesh.hosts[home]
+                    .resource_backend()
+                    .using::<TerminalSession>("flotilla")
+                    .create(
+                        &InputMeta::builder().name(name.to_string()).build(),
+                        &TerminalSessionSpec::builder()
+                            .env_ref(mesh.hosts[home].local_environment_id().to_string())
+                            .role("coder".to_string())
+                            .source(TerminalSessionSource::Tool { command: "shell".to_string() })
+                            .cwd("/tmp".to_string())
+                            .pool("cleat".to_string())
+                            .build(),
+                    )
+                    .await
+                    .expect("home session");
+                eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees federated session", || async {
+                    mesh.hosts[issuer].resource_backend().including_replicas::<TerminalSession>("flotilla").get(name).await.is_ok()
+                })
+                .await;
+                let local_only = mesh.hosts[issuer].resource_backend().using::<TerminalSession>("flotilla").get(name).await.is_ok();
+                assert!(local_only, "local-only TerminalSession lookup missed a session homed on {home} from issuer {issuer}");
+            });
+        })
+        .settings(hegel::Settings::new().test_cases(12).seed(Some(2318)))
+        .run();
+    }));
+    assert!(failure.is_err(), "the local-only TerminalSession fault escaped the generated CI budget");
+}
+
+#[test]
+fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
+    // Generator coverage control: origin-first targeting differs from production
+    // placement targeting for a drawn remote issuer.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hegel::Hegel::new(|tc: hegel::TestCase| {
+            let placement_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let issuer_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+            runtime.block_on(async {
+                let hosts = vec![
+                    empty_daemon_named("admission-a").await,
+                    empty_daemon_named("admission-b").await,
+                    empty_daemon_named("admission-c").await,
+                ];
+                let placement = Arc::clone(&hosts[placement_index]);
+                seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+                let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+                let host_id = placement.local_host_id().expect("placement host id").to_string();
+                let policy_name = format!("host-direct-{host_id}");
+                let policy = PlacementPolicySpec::builder()
+                    .pool("cleat".to_string())
+                    .host_direct(HostDirectPlacementPolicySpec {
+                        host_ref: host_id.clone(),
+                        checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                    })
+                    .build();
+                placement
+                    .resource_backend()
+                    .using::<PlacementPolicy>("flotilla")
+                    .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+                    .await
+                    .expect("placement policy");
+                eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
+                    let issuer = mesh.hosts[issuer_index].resource_backend();
+                    issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+                        && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+                })
+                .await;
+                let action = CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("ordering-fault".to_string())
+                            .branch("test/ordering-fault".to_string())
+                            .placement_policy(policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                };
+                let issuer = &mesh.hosts[issuer_index];
+                let correct = issuer.resolve_command_target(&action, None).await.expect("placement target").host;
+                let origin_first =
+                    issuer.resource_mutation_origin(&action).await.expect("origin lookup").map_or(TargetHost::Local, TargetHost::Node);
+                assert_eq!(origin_first, correct, "origin-first ordering lost placement {placement_index} from issuer {issuer_index}");
+            });
+        })
+        .settings(hegel::Settings::new().test_cases(12).seed(Some(2335)))
+        .run();
+    }));
+    assert!(failure.is_err(), "the #2335 origin-first fault escaped the generated CI budget");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
+    let hosts = vec![empty_daemon_named("home-a").await, empty_daemon_named("checkout-b").await, empty_daemon_named("desk-c").await];
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+    let namespace = "flotilla";
+    let convoy_name = "cross-home-convoy";
+    mesh.hosts[0]
+        .resource_backend()
+        .using::<Convoy>(namespace)
+        .create(
+            &{
+                let mut meta = convoy_meta(convoy_name, convoy_name);
+                meta.finalizers.push(flotilla_resources::CONVOY_TEARDOWN_FINALIZER.to_string());
+                meta
+            },
+            &ConvoySpec::builder()
+                .workflow_ref("scratch".to_string())
+                .project_ref("flotilla".to_string())
+                .role(convoy_name.to_string())
+                .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("test-repo".to_string()), "checkout-on-b".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("convoy on A");
+    mesh.hosts[1]
+        .resource_backend()
+        .using::<Checkout>(namespace)
+        .create(
+            &InputMeta::builder()
+                .name("checkout-on-b".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), mesh.hosts[0].node_id().to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                r#ref: "test/cross-home".to_string(),
+                target_path: "/tmp/cross-home".to_string(),
+                repo_ref: RepositoryKey("test-repo".to_string()),
+                env_ref: "host-direct-checkout-b".to_string(),
+                base_ref: Some("main".to_string()),
+                url: "https://example.test/repo".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout on B");
+    let checkout = mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await.expect("checkout");
+    mesh.hosts[1]
+        .resource_backend()
+        .using::<Checkout>(namespace)
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/tmp/cross-home".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("ready checkout");
+    let checkout_backend = mesh.hosts[1].resource_backend();
+    let checkout_controller = ControllerLoop {
+        primary: checkout_backend.using::<Checkout>(namespace),
+        secondaries: CheckoutReconciler::<TeardownCheckoutRuntime>::federated_secondary_watches(&checkout_backend, namespace),
+        reconciler: CheckoutReconciler::new(Arc::new(TeardownCheckoutRuntime), checkout_backend.clone(), namespace)
+            .with_federated_convoys(&checkout_backend, namespace),
+        resync_interval: Duration::from_millis(20),
+        backend: checkout_backend,
+    };
+    let checkout_task = tokio::spawn(checkout_controller.run());
+    let convoy_backend = mesh.hosts[0].resource_backend();
+    let convoy_controller = ControllerLoop {
+        primary: convoy_backend.using::<Convoy>(namespace),
+        secondaries: ConvoyReconciler::federated_secondary_watches(&convoy_backend, namespace),
+        reconciler: ConvoyReconciler::new(convoy_backend.definitions::<WorkflowTemplate>(namespace))
+            .with_checkouts(convoy_backend.using::<Checkout>(namespace))
+            .with_federated_checkouts(convoy_backend.including_replicas::<Checkout>(namespace)),
+        resync_interval: Duration::from_millis(20),
+        backend: convoy_backend,
+    };
+    let convoy_task = tokio::spawn(convoy_controller.run());
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "desk sees convoy", || async {
+        let checkout = mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await;
+        checkout.is_ok_and(|checkout| checkout.metadata.finalizers.iter().any(|finalizer| finalizer == "flotilla.work/checkout-cleanup"))
+            && mesh.hosts[2].resource_backend().including_replicas::<Convoy>(namespace).get(convoy_name).await.is_ok()
+            && mesh.hosts[1].resource_backend().including_replicas::<Convoy>(namespace).get(convoy_name).await.is_ok()
+            && mesh.hosts[0].resource_backend().including_replicas::<Checkout>(namespace).get("checkout-on-b").await.is_ok()
+    })
+    .await;
+    let collector = OwnerGarbageCollector::new(mesh.hosts[1].resource_backend(), namespace);
+    let collector_task = tokio::spawn(async move { collector.run(Duration::from_millis(20)).await });
+    apply_convoy_replica_feed(&mesh.hosts[2], namespace, convoy_name, mesh.hosts[0].host_name().clone()).await;
+    let mut events = mesh.hosts[2].subscribe();
+    let command_id = mesh.clients[2]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true })
+                .build(),
+        )
+        .await
+        .expect("dispatch forced teardown");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "#2343: checkout on B and convoy on A must both finalize", || async {
+        matches!(
+            mesh.hosts[1].resource_backend().using::<Checkout>(namespace).get("checkout-on-b").await,
+            Err(ResourceError::NotFound { .. })
+        ) && matches!(
+            mesh.hosts[0].resource_backend().using::<Convoy>(namespace).get(convoy_name).await,
+            Err(ResourceError::NotFound { .. })
+        )
+    })
+    .await;
+    assert_no_orphaned_finalizers(&mesh.hosts).await;
+    collector_task.abort();
+    checkout_task.abort();
+    convoy_task.abort();
+}
+
+#[hegel::test]
+fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
+    let placement_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let issuing_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let deleting_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let hosts = vec![empty_daemon_named("host-a").await, empty_daemon_named("host-b").await, empty_daemon_named("host-c").await];
+        let placement = Arc::clone(&hosts[placement_index]);
+        seed_host_capacity(&placement, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+        placement.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+        let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
+        let host_id = placement.local_host_id().expect("placement host identity").to_string();
+        let policy_name = format!("host-direct-{host_id}");
+        let policy = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+            .build();
+        placement
+            .resource_backend()
+            .using::<PlacementPolicy>("flotilla")
+            .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+            .await
+            .expect("placement policy");
+        placement
+            .resource_backend()
+            .using::<FulfilmentKind>("flotilla")
+            .create(
+                &InputMeta::builder().name(policy_name.clone()).build(),
+                &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
+            )
+            .await
+            .expect("fulfilment kind");
+        for host in &mesh.hosts {
+            seed_trusted_remote_convoy_project(host, "flotilla").await;
+        }
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees placement", || async {
+            let issuer = mesh.hosts[issuing_index].resource_backend();
+            issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+                && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+                && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
+        })
+        .await;
+        let mut events = mesh.hosts[issuing_index].subscribe();
+        let command_id = mesh.clients[issuing_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyStart {
+                        intent: Box::new(
+                            ConvoyStartIntent::builder()
+                                .project_ref("flotilla".to_string())
+                                .name("generated-work".to_string())
+                                .branch("test/generated-work".to_string())
+                                .placement_policy(policy_name)
+                                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                                .build(),
+                        ),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch admission");
+        let result = await_command_result(&mut events, command_id).await;
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission failed: {result:?}");
+        for (index, host) in mesh.hosts.iter().enumerate() {
+            let count = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("local convoys").items.len();
+            assert_eq!(count, usize::from(index == placement_index), "issuer={issuing_index}, placement={placement_index}, host={index}");
+        }
+        let convoy_name = convoy_record_name(&placement.resource_backend(), "generated-work").await;
+        for (index, host) in mesh.hosts.iter().enumerate() {
+            if index != placement_index {
+                apply_convoy_replica_feed(host, "flotilla", &convoy_name, placement.host_name().clone()).await;
+            }
+        }
+        let delivery_steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        for _ in 0..delivery_steps {
+            let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+            let nudge = tc.draw(gs::booleans());
+            let (prompt, vessel, role) =
+                if nudge { ("nudge", Some("work".to_string()), Some("coder".to_string())) } else { ("resume", None, None) };
+            let mut events = mesh.hosts[issuer].subscribe();
+            let command_id = mesh.clients[issuer]
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ConvoyResume {
+                            namespace: Some("flotilla".to_string()),
+                            name: convoy_name.clone(),
+                            prompt: prompt.to_string(),
+                            vessel,
+                            role,
+                        })
+                        .build(),
+                )
+                .await
+                .expect("dispatch resume or nudge");
+            let (node_id, result) = await_command_finished(&mut events, command_id).await;
+            assert_eq!(node_id, *placement.node_id(), "{prompt} ran away from the convoy home");
+            assert!(matches!(result, CommandValue::Error { .. }), "the no-crew case should refuse at home: {result:?}");
+        }
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "all hosts see the convoy before deletion", || async {
+            let mut visible_everywhere = true;
+            for host in &mesh.hosts {
+                visible_everywhere &= host.resource_backend().including_replicas::<Convoy>("flotilla").get(&convoy_name).await.is_ok();
+            }
+            visible_everywhere
+        })
+        .await;
+        let mut delete_events = mesh.hosts[deleting_index].subscribe();
+        let delete_id = mesh.clients[deleting_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: convoy_name.clone(), force: true })
+                    .build(),
+            )
+            .await
+            .expect("dispatch forced delete");
+        assert_eq!(await_command_result(&mut delete_events, delete_id).await, CommandValue::Ok);
+        assert!(matches!(
+            placement.resource_backend().using::<Convoy>("flotilla").get(&convoy_name).await,
+            Err(ResourceError::NotFound { .. })
+        ));
+        let resource_name = "generated-resource";
+        placement
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(resource_name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create resource at home");
+        eventually(Duration::from_secs(5), Duration::from_millis(10), "issuer sees home resource", || async {
+            mesh.hosts[deleting_index].resource_backend().including_replicas::<Host>("flotilla").get(resource_name).await.is_ok()
+        })
+        .await;
+        let mut resource_events = mesh.hosts[deleting_index].subscribe();
+        let resource_delete_id = mesh.clients[deleting_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".to_string(),
+                        kind: "hosts".to_string(),
+                        name: resource_name.to_string(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("dispatch resource delete");
+        let (node_id, result) = await_command_finished(&mut resource_events, resource_delete_id).await;
+        assert_eq!(node_id, *placement.node_id(), "resource delete must execute at the resource home");
+        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "resource delete failed: {result:?}");
+        assert!(matches!(
+            placement.resource_backend().using::<Host>("flotilla").get(resource_name).await,
+            Err(ResourceError::NotFound { .. })
+        ));
+        assert_no_orphaned_finalizers(&mesh.hosts).await;
+    });
 }
 
 #[tokio::test]
@@ -545,16 +1306,10 @@ async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect()
 
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect kiwi and feta");
     let action = CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: name.to_string(), force: true };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "feta-homed convoy should replicate to kiwi", || async {
+        kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await.is_ok()
     })
-    .await
-    .expect("feta-homed convoy should replicate to kiwi");
+    .await;
     apply_convoy_replica_feed(&kiwi, namespace, name, HostName::new("feta")).await;
     assert_eq!(
         kiwi.resolve_existing_convoy_target(&action).await.expect("resolve replica home").expect("remote target").home,
@@ -565,22 +1320,14 @@ async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect()
     let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch convoy delete from kiwi");
     assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let absent_at_home =
-                matches!(feta.resource_backend().using::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. }));
-            let absent_from_peer = matches!(
-                kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await,
-                Err(ResourceError::NotFound { .. })
-            );
-            if absent_at_home && absent_from_peer {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "home deletion should propagate to kiwi", || async {
+        let absent_at_home =
+            matches!(feta.resource_backend().using::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. }));
+        let absent_from_peer =
+            matches!(kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. }));
+        absent_at_home && absent_from_peer
     })
-    .await
-    .expect("home deletion should propagate to kiwi");
+    .await;
 
     drop(topology);
     let reconnected = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect kiwi and feta");
@@ -596,16 +1343,10 @@ async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect()
         )
         .await
         .expect("create convergence marker");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if kiwi.resource_backend().including_replicas::<Convoy>(namespace).get("after-reconnect").await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "reconnected replication should converge", || async {
+        kiwi.resource_backend().including_replicas::<Convoy>(namespace).get("after-reconnect").await.is_ok()
     })
-    .await
-    .expect("reconnected replication should converge");
+    .await;
     assert!(
         matches!(kiwi.resource_backend().including_replicas::<Convoy>(namespace).get(name).await, Err(ResourceError::NotFound { .. })),
         "the deleted convoy must not resurrect after federation reconnects"
@@ -1447,20 +2188,17 @@ async fn assert_convoy_start_routes_through_peer_session(caller: Option<CommandC
         backend: placement.clone(),
     };
     let controller_task = tokio::spawn(controller.run());
-    let vessel_result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let vessels = placement.using::<Vessel>(namespace).list().await.expect("feta Vessels");
-            if !vessels.items.is_empty() {
-                assert_eq!(vessels.items.len(), 1, "one Vessel is authored at its actuation host");
-                assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "feta authors its Vessel", || async {
+        let vessels = placement.using::<Vessel>(namespace).list().await.expect("feta Vessels");
+        if !vessels.items.is_empty() {
+            assert_eq!(vessels.items.len(), 1, "one Vessel is authored at its actuation host");
+            assert_eq!(vessels.items[0].spec.convoy_ref, convoy.metadata.name);
+            return true;
         }
+        false
     })
     .await;
     controller_task.abort();
-    vessel_result.expect("feta authors its Vessel");
     assert_eq!(placement.using::<Vessel>(namespace).list().await.expect("feta Vessels").items.len(), 1);
     assert!(dispatcher.using::<Vessel>(namespace).list().await.expect("kiwi Vessels").items.is_empty());
 }
@@ -1595,34 +2333,28 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let namespace = "flotilla";
     let placement_policy = format!("host-direct-{remote_host_id}");
     seed_target_placement_policy(&topology, namespace, &placement_policy).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let sources = topology
-                .leader
-                .resource_backend()
-                .including_replicas::<Host>(namespace)
-                .list()
-                .await
-                .expect("list kiwi host view")
-                .items
-                .into_iter()
-                .filter(|source| source.object.metadata.name == remote_host_id)
-                .collect::<Vec<_>>();
-            let fresh_replica = sources.iter().any(|source| {
-                matches!(source.provenance, ResourceProvenance::Replica { .. })
-                    && source.object.status.as_ref().is_some_and(|status| {
-                        status.daemon_generation.as_deref() == Some("feta-fresh-generation")
-                            && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
-                    })
-            });
-            if sources.len() == 1 && fresh_replica {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "kiwi should read feta's single home-authored Host replica", || async {
+        let sources = topology
+            .leader
+            .resource_backend()
+            .including_replicas::<Host>(namespace)
+            .list()
+            .await
+            .expect("list kiwi host view")
+            .items
+            .into_iter()
+            .filter(|source| source.object.metadata.name == remote_host_id)
+            .collect::<Vec<_>>();
+        let fresh_replica = sources.iter().any(|source| {
+            matches!(source.provenance, ResourceProvenance::Replica { .. })
+                && source.object.status.as_ref().is_some_and(|status| {
+                    status.daemon_generation.as_deref() == Some("feta-fresh-generation")
+                        && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
+                })
+        });
+        sources.len() == 1 && fresh_replica
     })
-    .await
-    .expect("kiwi should read feta's single home-authored Host replica");
+    .await;
 
     seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
     let workflows = topology.leader.resource_backend().using::<WorkflowTemplate>(namespace);
@@ -1663,19 +2395,12 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
         .expect("grant Claude credential to trusted workflow");
 
     await_placement_workflow(&topology, "remote-workflow", Some("claude-code")).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let backend = topology.follower.resource_backend();
-            if backend.definitions::<CredentialSpec>(namespace).get("claude-max").await.is_ok()
-                && backend.definitions::<CredentialGrant>(namespace).get("claude-max-trusted").await.is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "placement host should see credential declarations", || async {
+        let backend = topology.follower.resource_backend();
+        backend.definitions::<CredentialSpec>(namespace).get("claude-max").await.is_ok()
+            && backend.definitions::<CredentialGrant>(namespace).get("claude-max-trusted").await.is_ok()
     })
-    .await
-    .expect("placement host should see credential declarations");
+    .await;
 
     let mut events = topology.leader.subscribe();
     let command_id = topology

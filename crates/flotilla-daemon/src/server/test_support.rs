@@ -61,6 +61,122 @@ impl Drop for InMemoryRequestTopology {
     }
 }
 
+/// A full mesh of in-memory peer sessions with a request client on every host.
+/// The clients exercise the same request dispatcher and remote router as a
+/// socket client, while tests may inspect each host's authoritative store.
+pub struct InMemoryRequestMesh {
+    pub hosts: Vec<Arc<InProcessDaemon>>,
+    pub clients: Vec<Arc<SocketDaemon>>,
+    pub shutdown_txs: Vec<watch::Sender<bool>>,
+    _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for InMemoryRequestMesh {
+    fn drop(&mut self) {
+        for task in &self._tasks {
+            task.abort();
+        }
+    }
+}
+
+pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    if hosts.is_empty() {
+        return Err("request mesh needs at least one host".into());
+    }
+    let peer_managers: Vec<_> = hosts.iter().map(|host| Arc::new(Mutex::new(PeerManager::new(host.node_id().clone())))).collect();
+    for (index, peer_manager) in peer_managers.iter().enumerate() {
+        for (other_index, other) in hosts.iter().enumerate() {
+            if index != other_index {
+                peer_manager.lock().await.store_host_summary(other.local_host_summary().await);
+            }
+        }
+    }
+    for left in 0..hosts.len() {
+        for right in (left + 1)..hosts.len() {
+            let (left_transport, right_transport) = channel_transport_pair_with_nodes(
+                NodeInfo::new(hosts[left].node_id().clone(), hosts[left].host_name().to_string()),
+                NodeInfo::new(hosts[right].node_id().clone(), hosts[right].host_name().to_string()),
+            );
+            peer_managers[left].lock().await.add_configured_target(
+                flotilla_protocol::ConfigLabel(hosts[right].host_name().to_string()),
+                hosts[right].host_name().clone(),
+                None,
+                Box::new(left_transport),
+            );
+            peer_managers[right].lock().await.add_configured_target(
+                flotilla_protocol::ConfigLabel(hosts[left].host_name().to_string()),
+                hosts[left].host_name().clone(),
+                None,
+                Box::new(right_transport),
+            );
+        }
+    }
+
+    let mut clients = Vec::with_capacity(hosts.len());
+    let mut shutdown_txs = Vec::with_capacity(hosts.len());
+    let mut tasks = Vec::with_capacity(hosts.len() * 2);
+    for (host, peer_manager) in hosts.iter().zip(&peer_managers) {
+        let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
+        let router = build_remote_command_router(host, peer_manager);
+        let (runtime, _connected_tx) = spawn_peer_networking_runtime(
+            Arc::clone(host),
+            Arc::clone(peer_manager),
+            Some(inbound_peer_rx),
+            inbound_peer_tx.clone(),
+            router.clone(),
+            None,
+        );
+        tasks.push(runtime);
+
+        let (client_session, server_session) = flotilla_transport::message::message_session_pair();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_request_tx, _shutdown_request_rx) = mpsc::unbounded_channel();
+        let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_notify = Arc::new(Notify::new());
+        let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let host = Arc::clone(host);
+        let peer_manager = Arc::clone(peer_manager);
+        tasks.push(tokio::spawn(async move {
+            super::handle_client_session_with_caller(
+                server_session,
+                host,
+                shutdown_request_tx,
+                shutdown_rx,
+                inbound_peer_tx,
+                peer_manager,
+                router,
+                client_count,
+                client_notify,
+                peer_connected_tx,
+                flotilla_core::agents::shared_in_memory_agent_state_store(),
+                None,
+                None,
+            )
+            .await;
+        }));
+        clients.push(SocketDaemon::from_session_stateful(client_session).await?);
+        shutdown_txs.push(shutdown_tx);
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut ready = true;
+            for host in &hosts {
+                let topology = host.get_topology().await.map_err(|error| error.to_string())?;
+                ready &= topology.routes.iter().filter(|route| route.connected).count() == hosts.len() - 1;
+            }
+            if ready {
+                return Ok::<(), String>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "timed out waiting for in-memory request mesh to connect".to_string())??;
+
+    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks })
+}
+
 pub async fn spawn_in_memory_request_topology(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,

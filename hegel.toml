@@ -1,0 +1,11 @@
+[profiles.development]
+test_cases = 12
+seed = 2368
+
+[profiles.ci]
+extends = "development"
+
+[profiles.nightly]
+extends = "ci"
+test_cases = 40
+seed = "none"
