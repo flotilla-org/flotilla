@@ -6,19 +6,29 @@ use crate::in_process::{ExistingConvoyTarget, InProcessDaemon};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetReason {
+    /// A new Convoy is admitted by the selected primary placement host.
     Admission,
+    /// An existing Convoy or resource is changed at its authoritative home.
     RecordHome,
+    /// A session operation is executed where that session is stored.
     CrewSessionHome,
+    /// The caller selected a node for an action without an inferred home.
     Explicit,
+    /// A read uses the dispatching daemon's query view.
     LocalRead,
+    /// An action without a known remote home executes on the dispatching daemon.
     LocalMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetHost {
+    /// Execute on the dispatching daemon.
     Local,
+    /// Execute on an addressed node or known resource origin.
     Node(NodeId),
+    /// Resolve a placement host identity to its connected node for delivery.
     Placement(HostId),
+    /// Execute at a Convoy's home, retaining its last-seen context for errors.
     ConvoyHome(ExistingConvoyTarget),
 }
 
@@ -40,6 +50,7 @@ pub enum TargetError {
     Admission(String),
     RecordHome(String),
     CrewSessionHome(String),
+    /// Produced by delivery when the resolved host has no usable route.
     Unreachable(String),
 }
 

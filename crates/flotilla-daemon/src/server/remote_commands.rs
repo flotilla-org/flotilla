@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
-    command_target::{RemoteDelivery, TargetError, TargetHost},
+    command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason},
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
@@ -223,7 +223,7 @@ impl RemoteCommandRouter {
         self.blob_store.get().cloned().ok_or_else(|| "blob store is not running".to_string())
     }
 
-    async fn target_node_id(&self, target: &TargetHost) -> Result<NodeId, TargetError> {
+    pub(super) async fn target_node_id(&self, target: &TargetHost) -> Result<NodeId, TargetError> {
         match target {
             TargetHost::Local => Ok(self.daemon.node_id().clone()),
             TargetHost::Node(node) => Ok(node.clone()),
@@ -286,7 +286,7 @@ impl RemoteCommandRouter {
             }
         }
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
-        command.node_id = Some(target_node_id.clone());
+        command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
         let local = self.daemon.node_id();
         let desc = command.description();
         let action = command_action_name(&command);
@@ -333,8 +333,11 @@ impl RemoteCommandRouter {
                     None => self.send_routed_to(&target_node_id, routed).await,
                 }
                 .map_err(|error| match &target.host {
-                    TargetHost::Node(origin) if target.reason == flotilla_core::command_target::TargetReason::RecordHome => {
+                    TargetHost::Node(origin) if target.reason == TargetReason::RecordHome => {
                         format!("resource origin {origin} is unreachable: {error}")
+                    }
+                    TargetHost::Node(origin) if target.reason == TargetReason::CrewSessionHome => {
+                        format!("session origin {origin} is unreachable: {error}")
                     }
                     _ => error,
                 });
@@ -383,7 +386,7 @@ impl RemoteCommandRouter {
             _ => None,
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
-        command.node_id = Some(target_node_id.clone());
+        command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
 
         if target_node_id == *self.daemon.node_id() {
             return self.execute_projected_query(command, session_id).await;

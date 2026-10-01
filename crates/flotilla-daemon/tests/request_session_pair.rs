@@ -221,32 +221,52 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
 async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
     // Each row traverses the request dispatcher, an in-memory peer session
     // when needed, and the actual remote command router.
+    #[derive(Clone, Copy)]
+    enum Home {
+        Desk,
+        Placement,
+    }
+    #[derive(Clone, Copy)]
+    enum RequestedTarget {
+        Unspecified,
+        StaleDesk,
+    }
+    #[derive(Clone, Copy)]
+    enum Mutation {
+        Delete,
+        Abandon,
+    }
     let scenarios = [
-        ("delete-at-home", false, false, false),
-        ("delete-from-desk", true, false, false),
-        ("delete-with-stale-target", true, true, false),
-        ("abandon-at-home", false, false, true),
-        ("abandon-from-desk", true, false, true),
+        ("delete-at-home", Home::Desk, RequestedTarget::Unspecified, Mutation::Delete),
+        ("delete-from-desk", Home::Placement, RequestedTarget::Unspecified, Mutation::Delete),
+        ("delete-with-stale-target", Home::Placement, RequestedTarget::StaleDesk, Mutation::Delete),
+        ("abandon-at-home", Home::Desk, RequestedTarget::Unspecified, Mutation::Abandon),
+        ("abandon-from-desk", Home::Placement, RequestedTarget::Unspecified, Mutation::Abandon),
     ];
-    for (name, remote_home, stale_target, abandon) in scenarios {
+    for (name, home, requested_target, mutation) in scenarios {
         let leader = empty_daemon_named("desk").await;
         let follower = empty_daemon_named("placement").await;
         let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect router scenario hosts");
         let namespace = "flotilla";
-        let home = if remote_home { &topology.follower } else { &topology.leader };
+        let remote_home = matches!(home, Home::Placement);
+        let home = match home {
+            Home::Desk => &topology.leader,
+            Home::Placement => &topology.follower,
+        };
         let home_convoys = home.resource_backend().using::<Convoy>(namespace);
         home_convoys.create(&convoy_meta(name, name), &convoy_spec("scratch", name)).await.expect("seed convoy at its home");
         if remote_home {
             apply_convoy_replica_feed(&topology.leader, namespace, name, topology.follower_host.clone()).await;
         }
 
-        let action = if abandon {
-            CommandAction::ConvoyAbandon { namespace: Some(namespace.into()), name: name.into(), reason: "accepted loss".into() }
-        } else {
-            CommandAction::ConvoyDelete { namespace: Some(namespace.into()), name: name.into(), force: true }
+        let action = match mutation {
+            Mutation::Abandon => {
+                CommandAction::ConvoyAbandon { namespace: Some(namespace.into()), name: name.into(), reason: "accepted loss".into() }
+            }
+            Mutation::Delete => CommandAction::ConvoyDelete { namespace: Some(namespace.into()), name: name.into(), force: true },
         };
         let mut command = Command::builder().action(action).build();
-        if stale_target {
+        if matches!(requested_target, RequestedTarget::StaleDesk) {
             command.node_id = Some(topology.leader.node_id().clone());
         }
         let mut events = topology.leader.subscribe();
@@ -265,7 +285,7 @@ async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
         })
         .await
         .expect("scenario completes");
-        if abandon {
+        if matches!(mutation, Mutation::Abandon) {
             assert!(matches!(result, CommandValue::ConvoyAbandoned { .. }), "{name}: {result:?}");
             assert_eq!(
                 home_convoys.get(name).await.expect("abandoned home record").status.expect("abandoned status").phase,

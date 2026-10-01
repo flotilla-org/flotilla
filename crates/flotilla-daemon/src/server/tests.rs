@@ -2031,9 +2031,37 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
         .resolve_command_target(&CommandAction::ArchiveSession { session_id: "external-session".into() }, Some(&remote))
         .await
         .expect("explicit archive target");
-    assert_eq!(legacy_session.host, TargetHost::Node(remote));
+    assert_eq!(legacy_session.host, TargetHost::Node(remote.clone()));
     assert_eq!(legacy_session.reason, TargetReason::Explicit);
     assert_eq!(legacy_session.delivery, RemoteDelivery::Steps);
+
+    let admission = daemon
+        .resolve_command_target(
+            &CommandAction::ConvoyCreate {
+                name: "new-work".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+            Some(&remote),
+        )
+        .await
+        .expect("resolve admission with a local primary host");
+    assert_eq!(admission.host, TargetHost::Local, "the caller cannot override admission placement");
+    assert_eq!(admission.reason, TargetReason::Admission);
+    assert_eq!(admission.delivery, RemoteDelivery::Command);
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+    let router = empty_remote_command_router(&daemon, &peer_manager);
+    let unreachable = router
+        .target_node_id(&TargetHost::Placement(flotilla_protocol::qualified_path::HostId::new("missing-host")))
+        .await
+        .expect_err("disconnected placement host has no delivery route");
+    assert!(matches!(unreachable, TargetError::Unreachable(_)));
 
     let unresolved = daemon
         .resolve_command_target(
