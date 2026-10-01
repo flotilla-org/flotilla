@@ -32,6 +32,9 @@ pub enum Action {
     ToggleMultiSelect,
     ToggleDebug,
     ToggleStatusBarKeys,
+    ToggleNotifications,
+    ClearSelectedNotification,
+    ClearAllNotifications,
     CycleHost,
     CycleTheme,
     OpenActionMenu,
@@ -68,6 +71,7 @@ impl Action {
                 | Action::CycleHost
                 | Action::ToggleDebug
                 | Action::ToggleStatusBarKeys
+                | Action::ToggleNotifications
                 | Action::Refresh
         )
     }
@@ -93,6 +97,9 @@ impl Action {
             "toggle_multi_select" => Action::ToggleMultiSelect,
             "toggle_debug" => Action::ToggleDebug,
             "toggle_status_bar_keys" => Action::ToggleStatusBarKeys,
+            "toggle_notifications" => Action::ToggleNotifications,
+            "clear_selected_notification" => Action::ClearSelectedNotification,
+            "clear_all_notifications" => Action::ClearAllNotifications,
             "cycle_host" => Action::CycleHost,
             "cycle_theme" => Action::CycleTheme,
             "open_action_menu" => Action::OpenActionMenu,
@@ -133,6 +140,9 @@ impl Action {
             Action::ToggleMultiSelect => "toggle_multi_select",
             Action::ToggleDebug => "toggle_debug",
             Action::ToggleStatusBarKeys => "toggle_status_bar_keys",
+            Action::ToggleNotifications => "toggle_notifications",
+            Action::ClearSelectedNotification => "clear_selected_notification",
+            Action::ClearAllNotifications => "clear_all_notifications",
             Action::CycleHost => "cycle_host",
             Action::CycleTheme => "cycle_theme",
             Action::OpenActionMenu => "open_action_menu",
@@ -169,6 +179,9 @@ impl Action {
             Action::ToggleMultiSelect => "Toggle multi-select",
             Action::ToggleDebug => "Toggle debug panel",
             Action::ToggleStatusBarKeys => "Toggle status bar key hints",
+            Action::ToggleNotifications => "Show notification history",
+            Action::ClearSelectedNotification => "Clear selected notification",
+            Action::ClearAllNotifications => "Clear all notifications",
             Action::CycleHost => "Cycle host filter",
             Action::CycleTheme => "Cycle colour theme",
             Action::OpenActionMenu => "Open action menu",
@@ -223,6 +236,7 @@ impl Keymap {
             compiled: CompiledBindings::from_table_with_no_shared_fallback(BINDINGS, &[
                 BindingModeId::CommandPalette,
                 BindingModeId::FilePicker,
+                BindingModeId::Notifications,
             ]),
         }
     }
@@ -245,6 +259,7 @@ impl Keymap {
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.dispatch_confirm, BindingModeId::DispatchConfirm),
             (&config.command_palette, BindingModeId::CommandPalette),
+            (&config.notifications, BindingModeId::Notifications),
             (&config.file_picker, BindingModeId::FilePicker),
         ];
 
@@ -338,24 +353,57 @@ impl Keymap {
                 Action::OpenFilePicker,
                 Action::Refresh,
                 Action::ToggleStatusBarKeys,
+                Action::ToggleNotifications,
             ]),
             ("Multi-select (issues)", &[Action::ToggleMultiSelect]),
             ("Repos", &[Action::PrevTab, Action::NextTab, Action::MoveTabLeft, Action::MoveTabRight]),
             ("General", &[Action::ToggleDebug, Action::CycleTheme, Action::ToggleHelp, Action::Dismiss, Action::Quit]),
         ];
 
-        section_defs
+        let mut sections: Vec<HelpSection> = section_defs
             .iter()
             .map(|(title, actions)| {
                 let bindings = actions.iter().filter_map(&make_binding).collect();
                 HelpSection { title, bindings }
             })
-            .collect()
+            .collect();
+
+        let mut notification_keys: std::collections::HashMap<Action, Vec<String>> = std::collections::HashMap::new();
+        if let Some(bindings) = self.compiled.key_map.get(&BindingModeId::Notifications) {
+            for (key, action) in bindings {
+                notification_keys.entry(*action).or_default().push(key.to_string());
+            }
+        }
+        let bindings =
+            [Action::SelectNext, Action::SelectPrev, Action::ClearSelectedNotification, Action::ClearAllNotifications, Action::Dismiss]
+                .into_iter()
+                .filter_map(|action| {
+                    let keys = notification_keys.get_mut(&action)?;
+                    keys.sort();
+                    keys.dedup();
+                    Some(HelpBinding { key_display: keys.join(" / "), description: action.description() })
+                })
+                .collect();
+        sections.push(HelpSection { title: "Notifications", bindings });
+        sections
     }
 
     fn parse_binding(key_str: &str, action_str: &str) -> Option<(KeyCombination, Action)> {
         let combo: KeyCombination = key_str.parse().ok()?;
         let action = Action::from_config_str(action_str)?;
         Some((combo, action))
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[test]
+    fn help_lists_notification_history_controls() {
+        let sections = Keymap::defaults().help_sections();
+        let notifications = sections.iter().find(|section| section.title == "Notifications").expect("notification help section");
+        assert!(notifications.bindings.iter().any(|binding| binding.description == "Clear selected notification"));
+        assert!(notifications.bindings.iter().any(|binding| binding.description == "Clear all notifications"));
     }
 }

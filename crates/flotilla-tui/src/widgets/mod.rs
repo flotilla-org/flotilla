@@ -40,6 +40,7 @@ pub enum AppAction {
     SetTarget(String),
     ToggleDebug,
     ToggleStatusBarKeys,
+    ToggleNotifications,
     StatusBarKeyPress {
         code: crossterm::event::KeyCode,
         modifiers: crossterm::event::KeyModifiers,

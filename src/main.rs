@@ -1093,7 +1093,7 @@ fn restore_tui_handoff(app: &mut app::App) {
     match handoff {
         Ok(handoff) => {
             app.restore_handoff(handoff);
-            app.ui.command_echo = Some("Re-executed and reconnected to daemon".to_string());
+            app.ui.notifications.push(app::ui_state::NotificationKind::Info, "Re-executed and reconnected to daemon".to_string());
         }
         Err(error) => tracing::warn!(%error, path = %path.display(), "could not restore TUI re-exec handoff"),
     }

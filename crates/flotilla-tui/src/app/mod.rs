@@ -27,8 +27,8 @@ pub use open_views::{OpenView, OpenViews, ViewTarget};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tui_input::Input;
-use ui_state::PendingStatus;
 pub use ui_state::{DirEntry, ProjectIssueStartContext, TabId, UiState};
+use ui_state::{NotificationKind, Notifications, PendingStatus};
 
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
@@ -392,10 +392,7 @@ struct PmOpenUpdate {
 pub struct VisibleStatusItem {
     pub id: usize,
     pub text: String,
-}
-
-fn error_status_item(message: &str) -> VisibleStatusItem {
-    VisibleStatusItem { id: 0, text: format!("ERROR {}", message) }
+    pub kind: NotificationKind,
 }
 
 fn peer_status_item(index: usize, host: &TuiHostState) -> Option<VisibleStatusItem> {
@@ -406,14 +403,21 @@ fn peer_status_item(index: usize, host: &TuiHostState) -> Option<VisibleStatusIt
         PeerStatus::Connected => return None,
         PeerStatus::Rejected => "HOST REJECTED",
     };
-    Some(VisibleStatusItem { id: index + 1, text: format!("{label} {}", host.host_name) })
+    Some(VisibleStatusItem { id: index + 1, text: format!("{label} {}", host.host_name), kind: NotificationKind::Error })
 }
 
 pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<VisibleStatusItem> {
     let mut items = vec![];
 
-    if let Some(message) = &model.status_message {
-        items.push(error_status_item(message));
+    if let Some(notification) = ui.notifications.latest() {
+        let normalized = notification.text.lines().collect::<Vec<_>>().join(" · ");
+        let text = match notification.kind {
+            NotificationKind::Info => normalized,
+            NotificationKind::Error => format!("ERROR {normalized}"),
+        };
+        let more = ui.notifications.entries().len().saturating_sub(1);
+        let text = if more > 0 { format!("{text}  (+{more} more · n history)") } else { format!("{text}  (n history)") };
+        items.push(VisibleStatusItem { id: 0, text, kind: notification.kind });
     }
 
     let mut peers: Vec<_> = model.hosts.values().filter(|h| !h.is_local).collect();
@@ -557,7 +561,12 @@ pub struct AppHandoff {
     dismissed_status_ids: HashSet<usize>,
     show_debug: bool,
     help_scroll: u16,
-    command_echo: Option<String>,
+    /// Reads the previous handoff shape. Remove one roll after this change.
+    #[serde(default, rename = "command_echo", skip_serializing)]
+    _previous_command_echo: Option<String>,
+    /// Added with the notification stack; one-generation handoffs omit it.
+    #[serde(default)]
+    notifications: Notifications,
     event_log: Vec<crate::event_log::HandoffLogEntry>,
 }
 
@@ -570,7 +579,8 @@ impl App {
             dismissed_status_ids: self.ui.status_bar.dismissed_status_ids.clone(),
             show_debug: self.ui.show_debug,
             help_scroll: self.ui.help_scroll,
-            command_echo: self.ui.command_echo.clone(),
+            _previous_command_echo: None,
+            notifications: self.ui.notifications.clone(),
             event_log: crate::event_log::handoff_entries(),
         }
     }
@@ -582,7 +592,7 @@ impl App {
         self.ui.status_bar.dismissed_status_ids = handoff.dismissed_status_ids;
         self.ui.show_debug = handoff.show_debug;
         self.ui.help_scroll = handoff.help_scroll;
-        self.ui.command_echo = handoff.command_echo;
+        self.ui.notifications = handoff.notifications;
         crate::event_log::restore_handoff_entries(handoff.event_log);
         self.subscriptions_dirty = true;
         self.sync_active_view();
@@ -738,7 +748,7 @@ impl App {
         self.pending_cancel = None;
         self.subscriptions_dirty = true;
 
-        self.ui.command_echo = Some("Reconnected to daemon".to_string());
+        self.set_status_message(Some("Reconnected to daemon".to_string()));
     }
 
     /// Construct an `App` in scoped mode: exactly the one View at `address`,
@@ -859,7 +869,11 @@ impl App {
                 }
             }
         }
-        self.set_status_message(Some(message));
+        if rejected > 0 {
+            self.set_error_message(message);
+        } else {
+            self.set_status_message(Some(message));
+        }
         if pending == 0 {
             self.project_issue_start_batches.remove(&batch_id);
         }
@@ -990,23 +1004,26 @@ impl App {
         self.ui.status_bar.dismissed_status_ids.insert(id);
     }
 
-    /// The only sanctioned way to write `model.status_message`. A dismissed
-    /// error chip stays hidden only while the message is unchanged; any new
-    /// message un-dismisses so it becomes visible. Writing the field directly
-    /// bypasses that and leaves new errors invisible after one dismissal —
-    /// which is how convoy admission errors vanished during the #796 dogfood.
+    /// Record a user-visible information message and retain it in history.
     pub(crate) fn set_status_message(&mut self, status_message: Option<String>) {
-        if self.model.status_message != status_message {
+        if let Some(message) = &status_message {
+            self.ui.notifications.push(NotificationKind::Info, message.clone());
             self.ui.status_bar.dismissed_status_ids.remove(&0);
         }
         self.model.status_message = status_message;
+    }
+
+    pub(crate) fn set_error_message(&mut self, message: String) {
+        self.ui.notifications.push(NotificationKind::Error, message.clone());
+        self.model.status_message = Some(message);
+        self.ui.status_bar.dismissed_status_ids.remove(&0);
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
         while let Ok(update) = self.pm_update_rx.try_recv() {
             match update.result {
                 Ok(()) => self.set_status_message(Some(format!("Opened {} in PM", update.label))),
-                Err(error) => self.set_status_message(Some(format!("Could not open {} in PM: {error}", update.label))),
+                Err(error) => self.set_error_message(format!("Could not open {} in PM: {error}", update.label)),
             }
         }
     }
@@ -1082,11 +1099,11 @@ impl App {
                     match result {
                         Ok(target) => match self.validate_provisioning_target(&target) {
                             Ok(()) => self.ui.provisioning_target = target,
-                            Err(msg) => self.set_status_message(Some(msg)),
+                            Err(msg) => self.set_error_message(msg),
                         },
                         Err(e) => {
                             tracing::warn!(%name, %e, "invalid provisioning target");
-                            self.set_status_message(Some(format!("invalid target: {name}")));
+                            self.set_error_message(format!("invalid target: {name}"));
                         }
                     }
                 }
@@ -1095,6 +1112,9 @@ impl App {
                 }
                 AppAction::ToggleStatusBarKeys => {
                     self.ui.status_bar.show_keys = !self.ui.status_bar.show_keys;
+                }
+                AppAction::ToggleNotifications => {
+                    self.ui.notifications.expanded = !self.ui.notifications.expanded;
                 }
                 AppAction::StatusBarKeyPress { code, modifiers } => {
                     self.handle_key(crossterm::event::KeyEvent::new(code, modifiers));
@@ -1183,11 +1203,11 @@ impl App {
                     } else if let Some(repo) = self.model.active_repo_root_opt().cloned() {
                         self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
                     } else {
-                        self.set_status_message(Some("No active repo".into()));
+                        self.set_error_message("No active repo".into());
                     }
                 }
                 AppAction::ShowStatus(message) => {
-                    self.set_status_message(Some(message));
+                    self.set_error_message(message);
                 }
             }
         }
@@ -1273,7 +1293,7 @@ impl App {
                         }
                         StepStatus::Failed { ref message } => {
                             tracing::warn!(%command_id, %node_id, step = %step_label, %description, error = %message, "step failed");
-                            self.set_status_message(Some(format!("{description}: {message}")));
+                            self.set_error_message(format!("{description}: {message}"));
                         }
                     }
                 }
@@ -1553,6 +1573,32 @@ fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
 #[cfg(test)]
 mod command_effect_tests {
     use super::*;
+
+    #[test]
+    fn command_results_remain_reviewable_after_next_status() {
+        let mut app = crate::app::test_support::stub_app();
+        app.set_status_message(Some("Convoy created".into()));
+        app.set_status_message(None);
+        app.set_status_message(Some("Project refreshed".into()));
+
+        let messages = app.ui.notifications.entries().iter().map(|entry| entry.text.as_str()).collect::<Vec<_>>();
+        assert_eq!(messages, ["Project refreshed", "Convoy created"]);
+        assert_eq!(app.visible_status_items()[0].text, "Project refreshed  (+1 more · n history)");
+    }
+
+    #[test]
+    fn previous_handoff_decodes_without_notifications() {
+        let app = crate::app::test_support::stub_app();
+        let mut old = serde_json::to_value(app.handoff()).expect("serialize handoff");
+        let object = old.as_object_mut().expect("handoff object");
+        object.remove("notifications");
+        object.insert("command_echo".into(), serde_json::json!("old confirmation"));
+
+        let decoded: AppHandoff = serde_json::from_value(old).expect("decode previous handoff");
+        assert!(decoded.notifications.entries().is_empty());
+        let current = serde_json::to_value(decoded).expect("serialize new handoff");
+        assert!(current.get("command_echo").is_none());
+    }
 
     fn broadcast_convoy_start(app: &mut App) {
         let repo_identity = app.model.repos.keys().next().expect("stub repo").clone();

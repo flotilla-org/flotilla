@@ -4,8 +4,9 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::ViewAddress;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
     text::Line,
-    widgets::Paragraph,
+    widgets::{Block, Clear, Paragraph},
     Frame,
 };
 
@@ -18,8 +19,8 @@ use super::{
     AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{collect_visible_status_items, view_kind, ViewTarget},
-    binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
+    app::{collect_visible_status_items, ui_state::NotificationKind, view_kind, ViewTarget},
+    binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     status_bar::StatusBarAction,
     ui_helpers,
@@ -223,6 +224,10 @@ impl InteractiveWidget for Screen {
             }
             Action::ToggleStatusBarKeys => {
                 ctx.app_actions.push(AppAction::ToggleStatusBarKeys);
+                return Outcome::Consumed;
+            }
+            Action::ToggleNotifications => {
+                ctx.app_actions.push(AppAction::ToggleNotifications);
                 return Outcome::Consumed;
             }
             Action::Refresh => {
@@ -447,6 +452,8 @@ impl InteractiveWidget for Screen {
         let address = ctx.views.active().address();
         let (binding_mode, fragment) = if let Some(modal) = self.modal_stack.last() {
             (modal.binding_mode(), modal.status_fragment())
+        } else if ctx.ui.notifications.expanded {
+            (BindingModeId::Notifications.into(), StatusFragment { status: Some(StatusContent::Label("NOTIFICATIONS".into())) })
         } else {
             // Kind-level modes come from the page widget when it carries
             // state (overview and modals), from `view_kind` otherwise; the
@@ -492,7 +499,7 @@ impl InteractiveWidget for Screen {
         // 4d. Task spinner — fragment progress takes priority over in-flight commands.
         //     Only Normal/Overview modes show in-flight tasks.
         let task = status_bar_widget::resolve_task_from_fragment(&fragment).or_else(|| {
-            if self.modal_stack.is_empty() {
+            if self.modal_stack.is_empty() && !ctx.ui.notifications.expanded {
                 status_bar_widget::active_task(ctx.model, ctx.in_flight)
             } else {
                 None
@@ -524,7 +531,7 @@ impl InteractiveWidget for Screen {
             status,
             key_chips,
             task,
-            status_items.first().map(|item| item.text.as_str()),
+            status_items.first(),
             mode_indicators,
             show_keys,
             ctx.theme,
@@ -532,6 +539,44 @@ impl InteractiveWidget for Screen {
             chunks[3],
             status_bar_area,
         );
+
+        if ctx.ui.notifications.expanded {
+            let available = frame.area();
+            let width = available.width.saturating_sub(2).min(80);
+            let height = available.height.saturating_sub(2).min((ctx.ui.notifications.entries().len() + 2).max(3) as u16);
+            if width > 2 && height > 2 {
+                let popup =
+                    Rect::new(available.x + (available.width - width) / 2, available.y + (available.height - height) / 2, width, height);
+                let rows = (height - 2) as usize;
+                let selected = ctx.ui.notifications.selected();
+                let start = selected.saturating_sub(rows - 1);
+                let mut lines = ctx
+                    .ui
+                    .notifications
+                    .entries()
+                    .iter()
+                    .skip(start)
+                    .take(rows)
+                    .enumerate()
+                    .map(|(offset, notification)| {
+                        let color = match notification.kind {
+                            NotificationKind::Info => ctx.theme.info,
+                            NotificationKind::Error => ctx.theme.status_error,
+                        };
+                        let marker = if start + offset == selected { "▶" } else { " " };
+                        Line::styled(
+                            format!("{marker} {}", notification.text.lines().collect::<Vec<_>>().join(" · ")),
+                            Style::default().fg(color),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push(Line::from(" No notifications"));
+                }
+                frame.render_widget(Clear, popup);
+                frame.render_widget(Paragraph::new(lines).block(Block::bordered().title("Notifications")), popup);
+            }
+        }
 
         // 4. Modals on top
         for modal in &mut self.modal_stack {

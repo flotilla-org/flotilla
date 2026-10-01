@@ -7,6 +7,36 @@ use crossterm::event::KeyCode;
 use flotilla_protocol::{qualified_path::HostId, CommandAction, EnvironmentId, HostName, NodeId, NodeInfo, RepoSelector, ViewAddress};
 
 use super::*;
+
+#[test]
+fn notification_history_can_be_opened_navigated_and_cleared() {
+    let mut app = crate::app::test_support::stub_app();
+    app.set_status_message(Some("First".into()));
+    app.set_error_message("Second".into());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE));
+    assert!(app.ui.notifications.expanded);
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::NONE));
+    assert_eq!(app.ui.notifications.selected(), 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE));
+    assert_eq!(app.ui.notifications.entries().len(), 1);
+    app.handle_key(KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::SHIFT));
+    assert!(app.ui.notifications.entries().is_empty());
+}
+
+#[test]
+fn notification_history_uses_configured_binding() {
+    let mut app = crate::app::test_support::stub_app();
+    let mut keys = flotilla_core::config::KeysConfig::default();
+    keys.notifications.insert("ctrl-j".into(), "select_next".into());
+    app.keymap = crate::keymap::Keymap::from_config(&keys);
+    app.set_status_message(Some("First".into()));
+    app.set_status_message(Some("Second".into()));
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('n'), crossterm::event::KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), crossterm::event::KeyModifiers::CONTROL));
+    assert_eq!(app.ui.notifications.selected(), 1);
+}
 use crate::{
     app::{
         test_support::{key, stub_app},

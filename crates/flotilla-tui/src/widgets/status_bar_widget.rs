@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{InFlightCommand, NamespaceMap, TuiModel, UiState},
+    app::{ui_state::NotificationKind, InFlightCommand, NamespaceMap, TuiModel, UiState, VisibleStatusItem},
     binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
@@ -55,7 +55,7 @@ impl StatusBarWidget {
         status: StatusSection,
         key_chips: Vec<KeyChip>,
         task: Option<TaskSection>,
-        notification: Option<&str>,
+        notification: Option<&VisibleStatusItem>,
         mode_indicators: Vec<ModeIndicator>,
         show_keys: bool,
         theme: &Theme,
@@ -68,8 +68,12 @@ impl StatusBarWidget {
         self.dismiss_targets.clear();
 
         if let Some(notification) = notification {
+            let color = match notification.kind {
+                NotificationKind::Info => theme.info,
+                NotificationKind::Error => theme.status_error,
+            };
             frame.render_widget(
-                Paragraph::new(Line::styled(format!(" {notification}"), Style::default().fg(theme.status_error))),
+                Paragraph::new(Line::styled(format!(" {}", notification.text), Style::default().fg(color))),
                 notification_area,
             );
         }
@@ -310,7 +314,7 @@ mod tests {
                     StatusSection::plain(": for commands"),
                     vec![],
                     None,
-                    Some("ERROR failed"),
+                    Some(&VisibleStatusItem { id: 0, text: "ERROR failed".into(), kind: NotificationKind::Error }),
                     vec![],
                     false,
                     &Theme::classic(),
