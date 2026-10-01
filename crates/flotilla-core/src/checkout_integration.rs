@@ -332,30 +332,30 @@ async fn inspect_landed(
                             .build();
                         if state != ChangeRequestState::Open {
                             let outcome = if state == ChangeRequestState::Closed { "closed" } else { "merged" };
-                            let merged_head = item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
-                            let revision_check = if state == ChangeRequestState::Merged {
-                                match merged_head {
+                            let (value, detail, head_verified) = if state == ChangeRequestState::Closed {
+                                (ConditionValue::True, format!("PR #{number} {outcome}"), false)
+                            } else {
+                                let merged_head =
+                                    item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                                let revision_check = match merged_head {
                                     Some(head) => providers.vcs.head_in_history_of(head).await,
                                     None => Err("merged PR head revision is unavailable".to_string()),
+                                };
+                                match revision_check {
+                                    Ok(true) => {
+                                        (ConditionValue::True, format!("PR #{number} {outcome}; checkout HEAD is in merged PR head"), true)
+                                    }
+                                    Ok(false) => (
+                                        ConditionValue::False,
+                                        format!("PR #{number} {outcome}, but checkout HEAD is not in merged PR head"),
+                                        false,
+                                    ),
+                                    Err(error) => (
+                                        ConditionValue::Unknown,
+                                        format!("PR #{number} {outcome}; checkout revision could not be verified: {error}"),
+                                        false,
+                                    ),
                                 }
-                            } else {
-                                Ok(false)
-                            };
-                            let (value, detail, head_verified) = match revision_check {
-                                Ok(true) => {
-                                    (ConditionValue::True, format!("PR #{number} {outcome}; checkout HEAD is in merged PR head"), true)
-                                }
-                                Ok(false) if state == ChangeRequestState::Merged => (
-                                    ConditionValue::False,
-                                    format!("PR #{number} {outcome}, but checkout HEAD is not in merged PR head"),
-                                    false,
-                                ),
-                                Ok(false) => (ConditionValue::True, format!("PR #{number} {outcome}"), false),
-                                Err(error) => (
-                                    ConditionValue::Unknown,
-                                    format!("PR #{number} {outcome}; checkout revision could not be verified: {error}"),
-                                    false,
-                                ),
                             };
                             (
                                 IntegrationCondition::builder()
@@ -857,10 +857,54 @@ mod tests {
         let landed = landed_with_responses(vec![
             Ok("3".into()),
             Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main", "headRefOid": "merged-head"}]"#.into()),
-            Err("HEAD is not in merged head".into()),
+            Err(String::new()), // `git merge-base --is-ancestor` exits 1 without stderr.
         ])
         .await;
         assert_eq!(landed.value, ConditionValue::False);
+    }
+
+    #[tokio::test]
+    async fn missing_merged_pr_head_is_unknown() {
+        let landed = landed_with_responses(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "baseRefName": "main"}]"#.into()),
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
+    }
+
+    #[tokio::test]
+    async fn unavailable_merged_pr_commit_is_unknown() {
+        let landed = landed_with_responses(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "MERGED", "mergedAt": "2026-07-27T00:00:00Z", "headRefOid": "missing-head"}]"#.into()),
+            Err("fatal: Not a valid commit name missing-head".into()),
+        ])
+        .await;
+        assert_eq!(landed.value, ConditionValue::Unknown);
+        assert!(landed.details[0].contains("could not be verified"));
+    }
+
+    #[tokio::test]
+    async fn closed_unmerged_change_request_keeps_landed_without_verified_head() {
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok("2".into()),
+            Ok(r#"[{"number": 1162, "state": "CLOSED", "mergedAt": null, "baseRefName": "main"}]"#.into()),
+        ]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, evidence, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
+        assert_eq!(landed.value, ConditionValue::True);
+        assert!(!evidence.expect("closed change request evidence").checkout_head_in_merged_head);
+        assert_eq!(runner.calls().len(), 2, "closed PR must not trigger a Git ancestry check");
     }
 
     #[tokio::test]

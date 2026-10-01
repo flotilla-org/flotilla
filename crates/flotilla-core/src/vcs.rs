@@ -841,7 +841,16 @@ impl Vcs for FlotillaVcs {
     }
 
     async fn head_in_history_of(&self, revision: &str) -> Result<bool, String> {
-        Ok(self.cli().head_is_ancestor_of(revision).await?.success)
+        let result = self.cli().head_is_ancestor_of(revision).await?;
+        if result.success {
+            Ok(true)
+        } else if result.stderr.trim().is_empty() {
+            // `git merge-base --is-ancestor` exits 1 without diagnostics when
+            // the commits exist but HEAD is not an ancestor.
+            Ok(false)
+        } else {
+            Err(result.stderr.trim().to_string())
+        }
     }
 
     async fn current_branch(&self) -> Result<String, String> {
