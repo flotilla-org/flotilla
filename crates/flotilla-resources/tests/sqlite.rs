@@ -415,10 +415,16 @@ async fn undecodable_replica_partition_is_dropped_and_forces_full_resync() {
     let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend"));
     let replicas = reopened.including_replicas::<Convoy>("flotilla").list().await.expect("quarantine invalid replica cache");
     assert!(replicas.items.is_empty(), "an invalid cache partition must contribute no partial rows");
-    assert!(
-        reopened.replica_writer::<Convoy>(origin.clone(), "flotilla").cursor().await.expect("read cursor").is_none(),
-        "dropping the cursor makes the replicator relist the origin"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if reopened.replica_writer::<Convoy>(origin.clone(), "flotilla").cursor().await.expect("read cursor").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping the cursor makes the replicator relist the origin");
 
     reopened
         .replica_writer::<Convoy>(origin, "flotilla")
@@ -630,6 +636,20 @@ async fn objects_and_resource_versions_survive_restart() {
     assert_eq!(updated.metadata.resource_version, "2");
 }
 
+async fn wait_for_decode_quarantine(backend: &ResourceBackend) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("asynchronous corrupt-row cleanup records the quarantine");
+}
+
 #[tokio::test]
 async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
     let dir = tempdir().expect("tempdir");
@@ -656,7 +676,7 @@ async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
     let convoys = backend.using::<Convoy>("flotilla");
     assert!(convoys.list().await.expect("quarantine corrupt object").items.is_empty());
-    assert_eq!(backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len(), 1);
+    wait_for_decode_quarantine(&backend).await;
 
     convoys.create(&convoy_meta("poisoned"), &convoy_spec("template-b")).await.expect("recreate quarantined object");
 
@@ -691,7 +711,7 @@ async fn deleting_a_quarantined_object_clears_its_decode_diagnosis() {
 
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
     assert!(backend.using::<Convoy>("flotilla").list().await.expect("quarantine corrupt object").items.is_empty());
-    assert_eq!(backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").decode_quarantines.len(), 1);
+    wait_for_decode_quarantine(&backend).await;
 
     delete_resource_kind(&backend, "flotilla", Convoy::API_PATHS.kind, "poisoned")
         .await
@@ -728,6 +748,7 @@ async fn deleting_a_non_replicated_quarantined_object_clears_its_decode_diagnosi
 
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
     assert!(backend.using::<WorkflowTemplate>("flotilla").list().await.expect("quarantine corrupt object").items.is_empty());
+    wait_for_decode_quarantine(&backend).await;
 
     let deleted = delete_resource_kind(&backend, "flotilla", WorkflowTemplate::API_PATHS.kind, "poisoned")
         .await

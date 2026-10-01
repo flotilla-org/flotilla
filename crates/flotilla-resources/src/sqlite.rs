@@ -1,14 +1,14 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
-use rusqlite::{params, Connection as RusqliteConnection, OptionalExtension};
+use rusqlite::{params, Connection as RusqliteConnection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
@@ -30,6 +30,11 @@ type WatchSender = mpsc::UnboundedSender<StoredEvent>;
 type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
 type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
+type CleanupKey = (StoreKey, &'static str);
+
+const READ_DEADLINE: Duration = Duration::from_secs(2);
+const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const SLOW_STORE_OPERATION: Duration = Duration::from_millis(100);
 
 #[derive(bon::Builder)]
 struct ReplicaMutation {
@@ -44,10 +49,12 @@ struct ReplicaMutation {
 #[builder(builder_type(vis = "pub(in crate::sqlite)"))]
 pub struct SqliteBackend {
     connection: Connection,
+    read_connection: Option<Connection>,
     // Mutations notify and watches register from the connection thread so a
     // committed event cannot land between replay and live delivery.
     watchers: Arc<Mutex<WatchersByStore>>,
     replica_watchers: Arc<Mutex<ReplicaWatchersByStore>>,
+    pending_cleanups: Arc<Mutex<HashSet<CleanupKey>>>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
 }
@@ -56,6 +63,19 @@ pub struct SqliteBackend {
 struct StoredEvent {
     kind: StoredEventKind,
     object: Value,
+}
+
+struct CleanupClaim {
+    key: CleanupKey,
+    pending: Arc<Mutex<HashSet<CleanupKey>>>,
+}
+
+impl Drop for CleanupClaim {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.key);
+        }
+    }
 }
 
 struct ReplayedEvents<T: Resource> {
@@ -100,7 +120,7 @@ impl SqliteBackend {
         let group = T::API_PATHS.group.to_string();
         let version = T::API_PATHS.version.to_string();
         let kind = T::API_PATHS.kind.to_string();
-        self.call(move |connection| {
+        self.read_call("list namespaces", move |connection| {
             let mut statement = connection
                 .prepare(
                     "SELECT DISTINCT namespace FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 ORDER BY namespace",
@@ -118,7 +138,7 @@ impl SqliteBackend {
         let group = T::API_PATHS.group.to_string();
         let version = T::API_PATHS.version.to_string();
         let kind = T::API_PATHS.kind.to_string();
-        self.call(move |connection| {
+        self.read_call("list all namespaces", move |connection| {
             let mut statement = connection
                 .prepare(
                     "SELECT namespace FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3
@@ -140,13 +160,29 @@ impl SqliteBackend {
 
     pub fn open_with_event_retention(path: impl AsRef<Path>, event_retention: EventRetention) -> Result<Self, ResourceError> {
         let connection =
-            RusqliteConnection::open(path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
-        Self::from_connection(connection, event_retention)
+            RusqliteConnection::open(&path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        let mut backend = Self::from_connection(connection, event_retention)?;
+        let read = RusqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
+        read.busy_timeout(READ_BUSY_TIMEOUT)
+            .map_err(|err| ResourceError::other(format!("configure sqlite resource read busy timeout: {err}")))?;
+        backend.read_connection = Some(read.into());
+        Ok(backend)
     }
 
     pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
-        let connection = Connection::open(path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
-        Self::from_async_connection(connection, EventRetention::default()).await
+        let connection = Connection::open(&path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        let mut backend = Self::from_async_connection(connection, EventRetention::default()).await?;
+        let read = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
+        read.call(|connection| {
+            connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| ResourceError::other(format!("configure sqlite read timeout: {err}")))
+        })
+        .await
+        .map_err(Self::map_connection_error)?;
+        backend.read_connection = Some(read);
+        Ok(backend)
     }
 
     pub fn open_in_memory() -> Result<Self, ResourceError> {
@@ -163,8 +199,10 @@ impl SqliteBackend {
         Self::initialize_connection(&mut connection, event_retention)?;
         Ok(Self {
             connection: connection.into(),
+            read_connection: None,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
         })
@@ -177,8 +215,10 @@ impl SqliteBackend {
             .map_err(Self::map_connection_error)?;
         Ok(Self {
             connection,
+            read_connection: None,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
         })
@@ -414,12 +454,64 @@ impl SqliteBackend {
         watchers.lock().map_err(|_| ResourceError::other("sqlite resource watch lock poisoned"))
     }
 
-    async fn call<R, F>(&self, operation: F) -> Result<R, ResourceError>
+    async fn call<R, F>(&self, operation_name: &'static str, operation: F) -> Result<R, ResourceError>
     where
         R: Send + 'static,
         F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
     {
-        self.connection.call(operation).await.map_err(Self::map_connection_error)
+        let started = Instant::now();
+        let result = self.connection.call(operation).await.map_err(Self::map_connection_error);
+        if started.elapsed() >= SLOW_STORE_OPERATION {
+            tracing::warn!(operation = operation_name, elapsed_ms = started.elapsed().as_millis(), "slow sqlite store operation");
+        }
+        result
+    }
+
+    async fn read_call<R, F>(&self, operation_name: &'static str, operation: F) -> Result<R, ResourceError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
+    {
+        let started = Instant::now();
+        let connection = self.read_connection.as_ref().unwrap_or(&self.connection);
+        // A timeout bounds the caller, but tokio-rusqlite still runs a queued
+        // closure. SQLite's busy timeout bounds lock waits once it reaches the
+        // worker; a stalled worker can still leave later reads queued.
+        let result = tokio::time::timeout(READ_DEADLINE, connection.call(operation)).await;
+        if started.elapsed() >= SLOW_STORE_OPERATION {
+            tracing::warn!(operation = operation_name, elapsed_ms = started.elapsed().as_millis(), "slow sqlite store read");
+        }
+        match result {
+            Ok(result) => result.map_err(Self::map_connection_error),
+            Err(_) => Err(ResourceError::other("resource store busy: read deadline exceeded")),
+        }
+    }
+
+    fn cleanup_call<F>(&self, store_key: StoreKey, operation_name: &'static str, operation: F)
+    where
+        F: FnOnce(&mut RusqliteConnection) -> Result<(), ResourceError> + Send + 'static,
+    {
+        let key = (store_key, operation_name);
+        let Ok(mut pending) = self.pending_cleanups.lock() else {
+            tracing::warn!(operation = operation_name, "sqlite cleanup queue lock poisoned");
+            return;
+        };
+        if !pending.insert(key.clone()) {
+            // A pending cleanup will recheck the row body before changing it.
+            // A later read can schedule another pass after that task finishes.
+            return;
+        }
+        drop(pending);
+        let claim = CleanupClaim { key, pending: Arc::clone(&self.pending_cleanups) };
+        let backend = self.clone();
+        // Cleanup uses the writer, which may be waiting on fsync. Do not hold
+        // up a successful read while the writer drains its queue.
+        tokio::spawn(async move {
+            let _claim = claim;
+            if let Err(error) = backend.call(operation_name, operation).await {
+                tracing::warn!(operation = operation_name, %error, "sqlite store cleanup failed");
+            }
+        });
     }
 
     fn map_connection_error(error: tokio_rusqlite::Error<ResourceError>) -> ResourceError {
@@ -431,7 +523,7 @@ impl SqliteBackend {
 
     pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
         let event_retention = self.event_retention;
-        self.call(move |connection| Self::diagnostics_from_connection(connection, event_retention)).await
+        self.call("read diagnostics", move |connection| Self::diagnostics_from_connection(connection, event_retention)).await
     }
 
     fn diagnostics_from_connection(
@@ -532,7 +624,7 @@ impl SqliteBackend {
         let body = serde_json::to_string(&violation)
             .map_err(|error| ResourceError::decode(format!("encode field ownership violation: {error}")))?;
         let observed_at = violation.observed_at.to_rfc3339();
-        self.call(move |connection| {
+        self.call("record field ownership violation", move |connection| {
             connection
                 .execute("INSERT INTO field_ownership_violations (body_json, observed_at) VALUES (?1, ?2)", rusqlite::params![
                     body,
@@ -777,63 +869,91 @@ impl SqliteBackend {
 
     pub(crate) async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        self.call(move |connection| {
-            let mut statement = connection
-                .prepare(
-                    r#"
+        let cleanup_key = key.clone();
+        let (items, invalid_partitions) = self
+            .read_call("list replicas", move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        r#"
                     SELECT o.origin_root, o.name, o.last_synced_at, o.body_json
                     FROM replica_objects o
                     WHERE o.group_name = ?1 AND o.version = ?2 AND o.kind = ?3 AND o.namespace = ?4
                     ORDER BY o.origin_root, o.name
                     "#,
-                )
-                .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica list"))?;
-            let rows = statement
-                .query_map(params![key.0, key.1, key.2, key.3], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
-                })
-                .map_err(|err| Self::map_sqlite(err, "query sqlite replica list"))?;
-            let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite replica list row"))?;
-            drop(statement);
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica list"))?;
+                let rows = statement
+                    .query_map(params![key.0, key.1, key.2, key.3], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                    })
+                    .map_err(|err| Self::map_sqlite(err, "query sqlite replica list"))?;
+                let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite replica list row"))?;
+                drop(statement);
 
-            let mut items = Vec::new();
-            let mut invalid_partitions = BTreeMap::<String, Vec<(String, String)>>::new();
-            for (origin_root, name, last_synced_at, body) in rows {
-                let identity = format!("kind={} namespace={} name={} origin={}", T::API_PATHS.kind, key.3, name, origin_root);
-                let decoded = serde_json::from_str(&body)
-                    .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                    .and_then(|value| Self::decode_object(value).map_err(|err| format!("decode cached replica object {identity}: {err}")))
-                    .and_then(|object| {
-                        DateTime::parse_from_rfc3339(&last_synced_at)
-                            .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
-                            .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
-                    });
-                match decoded {
-                    Ok((object, last_synced_at)) => items.push((origin_root.clone(), ReadResourceObject {
-                        object,
-                        provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
-                    })),
-                    Err(error) => invalid_partitions.entry(origin_root).or_default().push((name, error)),
+                let mut items = Vec::new();
+                let mut invalid_partitions = BTreeMap::<String, Vec<(String, String, String)>>::new();
+                for (origin_root, name, last_synced_at, body) in rows {
+                    let identity = format!("kind={} namespace={} name={} origin={}", T::API_PATHS.kind, key.3, name, origin_root);
+                    let decoded = serde_json::from_str(&body)
+                        .map_err(|err| format!("decode cached replica object {identity}: {err}"))
+                        .and_then(|value| {
+                            Self::decode_object(value).map_err(|err| format!("decode cached replica object {identity}: {err}"))
+                        })
+                        .and_then(|object| {
+                            DateTime::parse_from_rfc3339(&last_synced_at)
+                                .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
+                                .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
+                        });
+                    match decoded {
+                        Ok((object, last_synced_at)) => items.push((origin_root.clone(), ReadResourceObject {
+                            object,
+                            provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
+                        })),
+                        Err(error) => invalid_partitions.entry(origin_root).or_default().push((name, body, error)),
+                    }
                 }
-            }
-            if !invalid_partitions.is_empty() {
+                Ok((items, invalid_partitions))
+            })
+            .await?;
+        let items =
+            items.into_iter().filter_map(|(origin_root, item)| (!invalid_partitions.contains_key(&origin_root)).then_some(item)).collect();
+        if !invalid_partitions.is_empty() {
+            self.cleanup_call(cleanup_key.clone(), "drop invalid replica partition", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
                 for (origin_root, failures) in &invalid_partitions {
+                    // A changed bad row no longer justifies deleting its partition.
+                    // If one unchanged bad row remains, dropping the whole origin
+                    // matches the existing full-resync behavior.
+                    let still_invalid = failures.iter().try_fold(false, |found, (name, body, _)| {
+                        let unchanged = tx
+                            .query_row(
+                                "SELECT 1 FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6 AND body_json = ?7",
+                                params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3, name, body],
+                                |_| Ok(()),
+                            )
+                            .optional()
+                            .map_err(|err| Self::map_sqlite(err, "recheck invalid replica object"))?
+                            .is_some();
+                        Ok::<_, ResourceError>(found || unchanged)
+                    })?;
+                    if !still_invalid {
+                        continue;
+                    }
                     for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
                         tx.execute(
                             &format!(
                                 "DELETE FROM {table}
                                  WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"
                             ),
-                            params![origin_root, key.0, key.1, key.2, key.3],
+                            params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3],
                         )
                         .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
                     }
-                    for (name, error) in failures {
+                    for (name, _, error) in failures {
                         tracing::warn!(
                             origin = %origin_root,
                             kind = T::API_PATHS.kind,
-                            namespace = %key.3,
+                            namespace = %cleanup_key.3,
                             %name,
                             %error,
                             "dropping undecodable cached replica partition; origin will be fully resynced"
@@ -841,13 +961,10 @@ impl SqliteBackend {
                     }
                 }
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))?;
-            }
-            Ok(items
-                .into_iter()
-                .filter_map(|(origin_root, item)| (!invalid_partitions.contains_key(&origin_root)).then_some(item))
-                .collect())
-        })
-        .await
+                Ok(())
+            });
+        }
+        Ok(items)
     }
 
     pub(crate) async fn get_replicas_typed<T: Resource>(
@@ -856,70 +973,88 @@ impl SqliteBackend {
         name: &str,
     ) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
+        let cleanup_key = key.clone();
         let requested_name = name.to_string();
-        self.call(move |connection| {
-            let rows = {
-                let mut statement = connection
-                    .prepare(
-                        r#"
+        let (items, invalid) = self
+            .read_call("get replicas", move |connection| {
+                let rows = {
+                    let mut statement = connection
+                        .prepare(
+                            r#"
                         SELECT o.origin_root, o.last_synced_at, o.body_json
                         FROM replica_objects o
                         WHERE o.group_name = ?1 AND o.version = ?2 AND o.kind = ?3 AND o.namespace = ?4 AND o.name = ?5
                         ORDER BY o.origin_root
                         "#,
-                    )
-                    .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica point lookup"))?;
-                let rows = statement
-                    .query_map(params![key.0, key.1, key.2, key.3, requested_name], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                    })
-                    .map_err(|err| Self::map_sqlite(err, "query sqlite replica point lookup"))?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite replica point lookup row"))?
-            };
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica point lookup"))?;
+                    let rows = statement
+                        .query_map(params![key.0, key.1, key.2, key.3, requested_name], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                        })
+                        .map_err(|err| Self::map_sqlite(err, "query sqlite replica point lookup"))?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite replica point lookup row"))?
+                };
 
-            let mut items = Vec::new();
-            for (origin_root, last_synced_at, body) in rows {
-                let identity = format!("kind={} namespace={} name={} origin={}", T::API_PATHS.kind, key.3, requested_name, origin_root);
-                let decoded = serde_json::from_str(&body)
-                    .map_err(|err| format!("decode cached replica object {identity}: {err}"))
-                    .and_then(|value| Self::decode_object(value).map_err(|err| format!("decode cached replica object {identity}: {err}")))
-                    .and_then(|object| {
-                        DateTime::parse_from_rfc3339(&last_synced_at)
-                            .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
-                            .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
-                    });
-                match decoded {
-                    Ok((object, last_synced_at)) => items.push(ReadResourceObject {
-                        object,
-                        provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
-                    }),
-                    Err(error) => {
-                        let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
-                        for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
-                            tx.execute(
-                                &format!(
-                                    "DELETE FROM {table}
-                                     WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"
-                                ),
-                                params![origin_root, key.0, key.1, key.2, key.3],
-                            )
-                            .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
+                let mut items = Vec::new();
+                let mut invalid = Vec::new();
+                for (origin_root, last_synced_at, body) in rows {
+                    let identity = format!("kind={} namespace={} name={} origin={}", T::API_PATHS.kind, key.3, requested_name, origin_root);
+                    let decoded = serde_json::from_str(&body)
+                        .map_err(|err| format!("decode cached replica object {identity}: {err}"))
+                        .and_then(|value| {
+                            Self::decode_object(value).map_err(|err| format!("decode cached replica object {identity}: {err}"))
+                        })
+                        .and_then(|object| {
+                            DateTime::parse_from_rfc3339(&last_synced_at)
+                                .map(|last_synced_at| (object, last_synced_at.with_timezone(&Utc)))
+                                .map_err(|err| format!("decode cached replica sync timestamp {identity}: {err}"))
+                        });
+                    match decoded {
+                        Ok((object, last_synced_at)) => items.push(ReadResourceObject {
+                            object,
+                            provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
+                        }),
+                        Err(error) => {
+                            invalid.push((origin_root, body, error));
                         }
-                        tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))?;
-                        tracing::warn!(
-                            origin = %origin_root,
-                            kind = T::API_PATHS.kind,
-                            namespace = %key.3,
-                            name = %requested_name,
-                            %error,
-                            "dropping undecodable cached replica partition; origin will be fully resynced"
-                        );
                     }
                 }
-            }
-            Ok(items)
-        })
-        .await
+                Ok((items, invalid))
+            })
+            .await?;
+        if !invalid.is_empty() {
+            let requested_name = name.to_string();
+            self.cleanup_call(cleanup_key.clone(), "drop invalid replica partition", move |connection| {
+                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
+                for (origin_root, body, error) in invalid {
+                    // Preserve full-partition resync only while the bad row is unchanged.
+                    let unchanged = tx
+                        .query_row(
+                            "SELECT 1 FROM replica_objects WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6 AND body_json = ?7",
+                            params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3, requested_name, body],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|err| Self::map_sqlite(err, "recheck invalid replica object"))?
+                        .is_some();
+                    if !unchanged {
+                        continue;
+                    }
+                    for table in ["replica_objects", "replica_tombstones", "replica_cursors"] {
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5"),
+                            params![origin_root, cleanup_key.0, cleanup_key.1, cleanup_key.2, cleanup_key.3],
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "drop undecodable sqlite replica partition"))?;
+                    }
+                    tracing::warn!(origin = %origin_root, kind = T::API_PATHS.kind, namespace = %cleanup_key.3, name = %requested_name, %error,
+                        "dropping undecodable cached replica partition; origin will be fully resynced");
+                }
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))
+            });
+        }
+        Ok(items)
     }
 
     pub(crate) async fn watch_replicas_typed<T: Resource>(
@@ -985,7 +1120,7 @@ impl SqliteBackend {
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;
         let events = self
-            .call(move |connection| {
+            .call("replace replica snapshot", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica replacement"))?;
                 let old = {
                     let mut statement = tx
@@ -1133,7 +1268,7 @@ impl SqliteBackend {
             serde_json::to_string(&value).map_err(|err| ResourceError::decode(format!("encode sqlite replica event JSON: {err}")))?;
         let synced = synced_at.to_rfc3339();
         let changed = self
-            .call(move |connection| {
+            .call("apply replica event", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica event"))?;
                 let existing = tx
                     .query_row(
@@ -1252,7 +1387,7 @@ impl SqliteBackend {
     ) -> Result<Option<ReplicaCursor>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let origin = origin_root.to_string();
-        self.call(move |connection| {
+        self.read_call("read replica cursor", move |connection| {
             connection
                 .query_row(
                     r#"
@@ -1271,7 +1406,7 @@ impl SqliteBackend {
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let name = name.to_string();
-        self.call(move |connection| {
+        self.read_call("get resource", move |connection| {
             let body: String = connection
                 .query_row(
                     r#"
@@ -1292,23 +1427,28 @@ impl SqliteBackend {
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
+        let quarantine_key = key.clone();
         let namespace = namespace.to_string();
         let (listed, failures) = self
-            .call(move |connection| {
-                let mut statement = connection
-                    .prepare(
-                        r#"
+            .read_call("list resources", move |connection| {
+                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource list snapshot"))?;
+                let rows = {
+                    let mut statement = tx
+                        .prepare(
+                            r#"
                         SELECT name, body_json FROM resource_objects
                         WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
                         ORDER BY name
                         "#,
-                    )
-                    .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
-                let rows = statement
-                    .query_map(params![key.0, key.1, key.2, key.3], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                    .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
-                let rows = rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?;
-                drop(statement);
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
+                    let rows = statement
+                        .query_map(params![key.0, key.1, key.2, key.3], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                        .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?
+                };
+                let resource_version = Self::current_version(&tx, &key)?.to_string();
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource list snapshot"))?;
                 let mut items = Vec::new();
                 let mut failures = Vec::new();
                 for (name, body) in rows {
@@ -1320,48 +1460,53 @@ impl SqliteBackend {
                         Err(error) => failures.push((name, body, error.to_string())),
                     }
                 }
-                if !failures.is_empty() {
-                    let quarantined_at = Utc::now();
-                    let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
-                    for (name, body, error) in &failures {
-                        tx.execute(
-                            r#"
-                            INSERT INTO resource_decode_quarantine
-                                (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                            ON CONFLICT(group_name, version, kind, namespace, name)
-                            DO UPDATE SET body_json = excluded.body_json,
-                                          error = excluded.error,
-                                          quarantined_at = excluded.quarantined_at
-                            "#,
-                            params![key.0, key.1, key.2, key.3, name, body, error, quarantined_at.to_rfc3339()],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "persist sqlite resource decode quarantine"))?;
-                        tx.execute(
-                            r#"
-                            DELETE FROM resource_objects
-                            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                            "#,
-                            params![key.0, key.1, key.2, key.3, name],
-                        )
-                        .map_err(|err| Self::map_sqlite(err, "remove quarantined sqlite resource object"))?;
-                    }
-                    tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource decode quarantine"))?;
-                }
                 let warnings: Vec<_> = failures.iter().map(|(name, _, error)| (name.clone(), error.clone())).collect();
-                Ok((
-                    ResourceList { items, resource_version: Self::current_version(connection, &key)?.to_string(), generation: None },
-                    warnings,
-                ))
+                Ok((ResourceList { items, resource_version, generation: None }, (failures, warnings)))
             })
             .await?;
+        let (invalid, failures) = failures;
+        if !invalid.is_empty() {
+            self.cleanup_call(quarantine_key.clone(), "quarantine invalid resource", move |connection| {
+                let quarantined_at = Utc::now();
+                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
+                for (name, body, error) in &invalid {
+                    let unchanged = tx
+                        .query_row(
+                            "SELECT 1 FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5 AND body_json = ?6",
+                            params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(|err| Self::map_sqlite(err, "recheck invalid sqlite resource object"))?
+                        .is_some();
+                    if !unchanged {
+                        continue;
+                    }
+                    tx.execute(
+                        "INSERT INTO resource_decode_quarantine
+                         (group_name, version, kind, namespace, name, body_json, error, quarantined_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(group_name, version, kind, namespace, name)
+                         DO UPDATE SET body_json = excluded.body_json, error = excluded.error, quarantined_at = excluded.quarantined_at",
+                        params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body, error, quarantined_at.to_rfc3339()],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "persist sqlite resource decode quarantine"))?;
+                    tx.execute(
+                        "DELETE FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5 AND body_json = ?6",
+                        params![quarantine_key.0, quarantine_key.1, quarantine_key.2, quarantine_key.3, name, body],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "remove quarantined sqlite resource object"))?;
+                }
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource decode quarantine"))
+            });
+        }
         for (name, error) in failures {
             tracing::warn!(
                 kind = T::API_PATHS.kind,
                 namespace = %namespace,
                 %name,
                 %error,
-                "quarantined undecodable stored resource object"
+                "excluded undecodable stored resource object; quarantine queued"
             );
         }
         Ok(listed)
@@ -1418,7 +1563,7 @@ impl SqliteBackend {
         let spec = spec.clone();
         let watchers = Arc::clone(&self.watchers);
         let event_retention = self.event_retention;
-        self.call(move |connection| {
+        self.call("create resource", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource create"))?;
             let exists = tx
                 .query_row(
@@ -1515,7 +1660,7 @@ impl SqliteBackend {
         let spec = spec.clone();
         let watchers = Arc::clone(&self.watchers);
         let event_retention = self.event_retention;
-        self.call(move |connection| {
+        self.call("update resource", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource update"))?;
             let existing = Self::select_existing::<T>(&tx, &key, &meta.name)?;
             let mut object = existing.ok_or_else(|| ResourceError::not_found(&meta.name))?;
@@ -1582,7 +1727,7 @@ impl SqliteBackend {
         let status = status.clone();
         let watchers = Arc::clone(&self.watchers);
         let event_retention = self.event_retention;
-        self.call(move |connection| {
+        self.call("update resource status", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource status update"))?;
             let existing = Self::select_existing::<T>(&tx, &key, &name)?;
             let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
@@ -1614,7 +1759,7 @@ impl SqliteBackend {
         let name = name.to_string();
         let watchers = Arc::clone(&self.watchers);
         let event_retention = self.event_retention;
-        self.call(move |connection| {
+        self.call("delete resource", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
             let existing = Self::select_existing::<T>(&tx, &key, &name)?;
             let Some(mut object) = existing else {
@@ -1663,7 +1808,7 @@ impl SqliteBackend {
     pub(crate) async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let name = name.to_string();
-        self.call(move |connection| {
+        self.call("delete resource quarantine", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource quarantine delete"))?;
             if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
                 return Err(ResourceError::conflict(&name, "cannot delete quarantine while a live resource exists"));
@@ -1693,7 +1838,7 @@ impl SqliteBackend {
                 })
             })
             .transpose()?;
-        self.call(move |connection| {
+        self.call("tombstone resource", move |connection| {
             let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource tombstone"))?;
             if Self::select_existing::<T>(&tx, &key, &name)?.is_some() {
                 return Err(ResourceError::conflict(&name, "cannot tombstone an existing resource by name"));
@@ -1758,7 +1903,7 @@ impl SqliteBackend {
         let (sender, receiver) = mpsc::unbounded_channel();
         let watchers = Arc::clone(&self.watchers);
         let replay = self
-            .call(move |connection| {
+            .call("watch resource replay", move |connection| {
                 let replay = match replay_from {
                     Some(version) => Self::replay_events::<T>(connection, &key, version)?,
                     None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
@@ -1930,6 +2075,221 @@ impl SqliteBackend {
         let quarantines =
             failures.into_iter().map(|(event_version, name, _, error)| EventDecodeWarning { event_version, name, error }).collect();
         Ok(ReplayedEvents { events, quarantines })
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use super::SqliteBackend;
+    use crate::{Host, HostSpec, HostStatus, InputMeta, Resource, ResourceBackend};
+
+    #[tokio::test]
+    async fn read_completes_while_writer_is_stalled_in_fake_fsync() {
+        let directory = tempfile::tempdir().expect("store directory");
+        let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
+        let hosts = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("create host");
+        let writer_connection = backend.connection.clone();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = tokio::spawn(async move {
+            backend
+                .connection
+                .call(move |_| {
+                    entered_tx.send(()).expect("announce fake fsync");
+                    release_rx.recv().expect("release fake fsync");
+                    Ok::<_, crate::ResourceError>(())
+                })
+                .await
+                .expect("fake fsync completes");
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered fake fsync")).await.expect("wait for writer");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), writer_connection.call(|_| Ok::<_, crate::ResourceError>(()))).await.is_err(),
+            "an operation queued on the writer connection must wait for fake fsync"
+        );
+
+        let read = tokio::time::timeout(Duration::from_millis(250), async {
+            let host = hosts.get("feta").await?;
+            let listed = hosts.list().await?;
+            Ok::<_, crate::ResourceError>((host, listed))
+        })
+        .await;
+        release_tx.send(()).expect("release writer");
+        writer.await.expect("writer task");
+        let (host, listed) = read.expect("reads must not queue behind writer durability").expect("read hosts");
+        assert_eq!(host.metadata.name, "feta");
+        assert_eq!(listed.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn busy_read_returns_an_error_before_client_timeout() {
+        let backend = SqliteBackend::open_in_memory().expect("open in-memory store");
+        let hosts = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = tokio::spawn(async move {
+            backend
+                .connection
+                .call(move |_| {
+                    entered_tx.send(()).expect("announce blocked writer");
+                    release_rx.recv().expect("release blocked writer");
+                    Ok::<_, crate::ResourceError>(())
+                })
+                .await
+                .expect("blocked writer completes");
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered")).await.expect("wait for writer");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), hosts.get("feta")).await;
+        release_tx.send(()).expect("release writer");
+        writer.await.expect("writer task");
+        assert!(result
+            .expect("read must answer before client timeout")
+            .expect_err("store must report busy")
+            .to_string()
+            .contains("store busy"));
+    }
+
+    #[tokio::test]
+    async fn file_backed_read_reports_busy_when_its_read_worker_is_blocked() {
+        let directory = tempfile::tempdir().expect("store directory");
+        let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
+        let hosts = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        let read_connection = backend.read_connection.clone().expect("file-backed read connection");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked_read = tokio::spawn(async move {
+            read_connection
+                .call(move |_| {
+                    entered_tx.send(()).expect("announce blocked read");
+                    release_rx.recv().expect("release blocked read");
+                    Ok::<_, crate::ResourceError>(())
+                })
+                .await
+                .expect("blocked read completes");
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("read entered")).await.expect("wait for read");
+
+        let result = tokio::time::timeout(Duration::from_secs(3), hosts.list()).await;
+        release_tx.send(()).expect("release read");
+        blocked_read.await.expect("read task");
+        assert!(result
+            .expect("read must answer before client timeout")
+            .expect_err("store must report busy")
+            .to_string()
+            .contains("store busy"));
+    }
+
+    #[tokio::test]
+    async fn list_returns_valid_items_without_waiting_or_queueing_duplicate_cleanups() {
+        let directory = tempfile::tempdir().expect("store directory");
+        let path = directory.path().join("resources.sqlite");
+        let backend = SqliteBackend::open(&path).expect("open store");
+        let hosts = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        for name in ["healthy", "repaired"] {
+            hosts.create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default()).await.expect("create host");
+        }
+        let original_body = backend
+            .connection
+            .call(|connection| {
+                connection
+                    .query_row(
+                        "SELECT body_json FROM resource_objects WHERE kind = ?1 AND name = 'repaired'",
+                        [Host::API_PATHS.kind],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| crate::ResourceError::other(error.to_string()))
+            })
+            .await
+            .expect("read original body");
+        backend
+            .connection
+            .call(|connection| {
+                connection
+                    .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = 'repaired'", [Host::API_PATHS.kind])
+                    .map_err(|error| crate::ResourceError::other(error.to_string()))?;
+                Ok::<_, crate::ResourceError>(())
+            })
+            .await
+            .expect("corrupt row");
+
+        let writer_connection = backend.connection.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked_writer = tokio::spawn(async move {
+            writer_connection
+                .call(move |_| {
+                    entered_tx.send(()).expect("announce blocked writer");
+                    release_rx.recv().expect("release blocked writer");
+                    Ok::<_, crate::ResourceError>(())
+                })
+                .await
+                .expect("blocked writer completes");
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered")).await.expect("wait for writer");
+
+        let listed = tokio::time::timeout(Duration::from_secs(1), hosts.list())
+            .await
+            .expect("list returns without waiting for writer cleanup")
+            .expect("valid item survives queued cleanup");
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].metadata.name, "healthy");
+        for _ in 0..3 {
+            assert_eq!(hosts.list().await.expect("repeat list").items.len(), 1);
+        }
+        assert_eq!(backend.pending_cleanups.lock().expect("cleanup set").len(), 1);
+
+        let repair = rusqlite::Connection::open(&path).expect("open independent writer");
+        repair
+            .execute("UPDATE resource_objects SET body_json = ?1 WHERE kind = ?2 AND name = 'repaired'", rusqlite::params![
+                original_body,
+                Host::API_PATHS.kind
+            ])
+            .expect("repair row before queued cleanup");
+        release_tx.send(()).expect("release writer");
+        blocked_writer.await.expect("writer task");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !backend.pending_cleanups.lock().expect("cleanup set").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued cleanup finishes");
+        assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
+        assert_eq!(hosts.get("repaired").await.expect("repaired row remains").metadata.name, "repaired");
+    }
+
+    #[tokio::test]
+    async fn list_version_matches_its_object_snapshot_during_status_writes() {
+        let directory = tempfile::tempdir().expect("store directory");
+        let backend = SqliteBackend::open(directory.path().join("resources.sqlite")).expect("open store");
+        let readers = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        let writers = ResourceBackend::Sqlite(backend).using::<Host>("flotilla");
+        let created =
+            readers.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("create host");
+        let writer = tokio::spawn(async move {
+            let mut current = created;
+            for iteration in 0..100 {
+                current = writers
+                    .update_status("feta", &current.metadata.resource_version, &HostStatus {
+                        ready: iteration % 2 == 0,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("update status");
+            }
+        });
+        for _ in 0..100 {
+            let listed = readers.list().await.expect("list host");
+            assert_eq!(listed.items.len(), 1);
+            assert_eq!(listed.resource_version, listed.items[0].metadata.resource_version);
+        }
+        writer.await.expect("writer task");
     }
 }
 
