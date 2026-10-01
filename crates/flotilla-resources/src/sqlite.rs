@@ -457,6 +457,9 @@ impl SqliteBackend {
     {
         let started = Instant::now();
         let connection = self.read_connection.as_ref().unwrap_or(&self.connection);
+        // A timeout bounds the caller, but tokio-rusqlite still runs a queued
+        // closure. SQLite's busy timeout bounds lock waits once it reaches the
+        // worker; a stalled worker can still leave later reads queued.
         let result = tokio::time::timeout(READ_DEADLINE, connection.call(operation)).await;
         if started.elapsed() >= SLOW_STORE_OPERATION {
             tracing::warn!(operation = operation_name, elapsed_ms = started.elapsed().as_millis(), "slow sqlite store read");

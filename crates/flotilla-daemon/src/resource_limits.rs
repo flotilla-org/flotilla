@@ -84,7 +84,6 @@ fn parse_io_pressure(raw: &str) -> Option<serde_json::Value> {
     Some(serde_json::json!({
         "some_avg10": avg10("some ")?,
         "full_avg10": avg10("full ")?,
-        "raw": raw.trim(),
     }))
 }
 
