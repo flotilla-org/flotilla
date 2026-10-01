@@ -656,7 +656,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         lifecycle_mutations: Vec::new(),
     };
 
-    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string())
+    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string(), None)
         .apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Active);

@@ -7759,7 +7759,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .convoy_resume_internal("flotilla", "idle-convoy", "Start the review", Some("review"), Some("qa"))
         .await
         .expect("resume unrelated crew");
-    assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Delivered { displaced: None });
+    assert_eq!(unrelated, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: None });
     assert_eq!(
         convoys
             .get("idle-convoy")
@@ -7786,9 +7786,7 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
         .await
         .expect("deliver brief to idle crew");
 
-    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Delivered {
-        displaced: Some("Finish the current turn".to_string())
-    });
+    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Finish the current turn".to_string()) });
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
     let review_session = sessions.get("idle-review-session").await.expect("read queued review session");
     let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {

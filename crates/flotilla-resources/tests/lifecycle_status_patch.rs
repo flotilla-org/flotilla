@@ -258,6 +258,8 @@ fn work_state(phase: WorkPhase, started_at: Option<DateTime<Utc>>, finished_at: 
 fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> CrewWorkState {
     CrewWorkState {
         phase,
+        resumed_at: None,
+        resume_brief_id: None,
         started_at,
         finished_at,
         message: None,
@@ -919,6 +921,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     role: "coder".to_string(),
                     resumed_at: ts(30),
                     prompt: "rebase onto main".to_string(),
+                    brief_id: None,
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))

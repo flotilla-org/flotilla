@@ -118,6 +118,7 @@ async fn dead_generation_is_lost_then_recreated() {
                     text: "PR #2185 is conflicting; rebase and rerun the gates".into(),
                     sender: Default::default(),
                     delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    following: Vec::new(),
                 }),
             },
             cwd: "/workspace".into(),
@@ -1357,6 +1358,7 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
                     text: text.into(),
                     sender: flotilla_resources::CrewMessageSender::FlotillaTurn { source: "conflicting".into() },
                     delivery: flotilla_resources::CrewMessageDelivery::LaunchBrief,
+                    following: Vec::new(),
                 }),
             },
             cwd: "/workspace".into(),
@@ -1440,6 +1442,13 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
                     text: "Review the amended commit".into(),
                     sender: Default::default(),
                     delivery: Default::default(),
+                    following: vec![flotilla_resources::TerminalCrewMessage {
+                        id: "nudge-after-brief".into(),
+                        text: "Check the result".into(),
+                        sender: flotilla_resources::CrewMessageSender::FlotillaNudge,
+                        delivery: Default::default(),
+                        following: Vec::new(),
+                    }],
                 }),
             },
             cwd: "/workspace".to_string(),
@@ -1484,9 +1493,23 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let acknowledged =
         sessions.update_status("term-a", &session.metadata.resource_version, &acknowledged_status).await.expect("acknowledge message");
 
-    let deps = reconciler.prepare(&acknowledged).await.expect("observe acknowledged message");
+    let deps = reconciler.prepare(&acknowledged).await.expect("deliver nudge after brief");
+    let outcome = reconciler.reconcile(&acknowledged, &deps, Utc::now());
+    assert!(matches!(
+        &outcome.patch,
+        Some(flotilla_resources::TerminalSessionStatusPatch::MarkMessageDelivered { message_id }) if message_id == "nudge-after-brief"
+    ));
+    {
+        let delivered = runtime.delivered.lock().expect("delivered mutex");
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[1].1, "Check the result");
+    }
+    let mut status = acknowledged.status.clone().expect("status");
+    outcome.patch.expect("nudge acknowledgment").apply(&mut status);
+    let acknowledged =
+        sessions.update_status("term-a", &acknowledged.metadata.resource_version, &status).await.expect("nudge acknowledged");
+    let deps = reconciler.prepare(&acknowledged).await.expect("observe completed queue");
     assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
-    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
 }
 
 #[tokio::test]
@@ -1517,6 +1540,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
                     text: "Review the amended commit".into(),
                     sender: Default::default(),
                     delivery: Default::default(),
+                    following: Vec::new(),
                 }),
             },
             cwd: "/workspace".to_string(),

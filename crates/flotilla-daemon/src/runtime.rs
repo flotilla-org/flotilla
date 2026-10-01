@@ -10091,6 +10091,7 @@ mod tests {
                 "coder".to_string(),
                 Utc::now(),
                 "follow-up".to_string(),
+                None,
             ),
         )
         .await
@@ -13339,8 +13340,25 @@ mod tests {
         assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
     }
 
-    #[tokio::test]
-    async fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_runs_handoffs() {
+    #[test]
+    fn crew_provisioning_recovers_lost_session_after_in_process_daemon_restart_and_runs_handoffs() {
+        // This full provisioning scenario builds a large async state machine.
+        // Give its test thread enough stack without changing daemon workers.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(crew_provisioning_recovery_scenario());
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread completed");
+    }
+
+    async fn crew_provisioning_recovery_scenario() {
         let temp = TempDir::new().expect("tempdir");
         let repo = TestGitRepo::init(temp.path().join("repo"))
             .with_initial_commit()

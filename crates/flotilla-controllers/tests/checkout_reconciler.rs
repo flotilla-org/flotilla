@@ -90,7 +90,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         if let Some(sender) = self.removal_attempts.lock().expect("attempts lock").as_ref() {
             sender.send_replace(attempts);
         }
-        if self.transient_removal_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
+        if self.transient_removal_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
             return Err("temporary removal failure".to_string());
         }
         let target_path = match removal {

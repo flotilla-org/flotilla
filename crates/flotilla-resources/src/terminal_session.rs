@@ -151,6 +151,65 @@ pub struct TerminalCrewMessage {
     /// after the next fleet roll.
     #[serde(default)]
     pub delivery: CrewMessageDelivery,
+    /// Messages after this one, in delivery order. Older stored sessions had
+    /// only the head message; remove the compatibility default after one roll.
+    #[serde(default)]
+    pub following: Vec<TerminalCrewMessage>,
+}
+
+impl TerminalCrewMessage {
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.id == id || self.following.iter().any(|message| message.id == id)
+    }
+
+    pub fn next_after(&self, delivered_id: Option<&str>) -> Option<&Self> {
+        match delivered_id {
+            Some(id) if id == self.id => self.following.first(),
+            Some(id) => {
+                self.following.iter().position(|message| message.id == id).map_or(Some(self), |index| self.following.get(index + 1))
+            }
+            None => Some(self),
+        }
+    }
+
+    pub fn pending_after(&self, delivered_id: Option<&str>) -> Vec<&Self> {
+        let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
+        let start = delivered_id.and_then(|id| messages.iter().position(|message| message.id == id).map(|index| index + 1)).unwrap_or(0);
+        messages[start..].to_vec()
+    }
+
+    pub fn append(&mut self, message: Self) {
+        if !self.contains_id(&message.id) {
+            self.following.push(message);
+        }
+    }
+
+    pub fn mark_next_for_launch(&mut self, delivered_id: Option<&str>) -> Option<String> {
+        let next_index = match delivered_id {
+            Some(id) if id == self.id => Some(0),
+            Some(id) => self.following.iter().position(|message| message.id == id).map(|index| index + 1),
+            None => None,
+        };
+        if self.delivery == CrewMessageDelivery::LaunchBrief {
+            self.delivery = CrewMessageDelivery::Queued;
+        }
+        for message in self.following.iter_mut() {
+            if message.delivery == CrewMessageDelivery::LaunchBrief {
+                message.delivery = CrewMessageDelivery::Queued;
+            }
+        }
+        let next = if let Some(index) = next_index { self.following.get_mut(index) } else { Some(self) }?;
+        next.delivery = CrewMessageDelivery::LaunchBrief;
+        Some(next.text.clone())
+    }
+
+    pub fn delivered_through(&self, delivered_id: Option<&str>, target_id: &str) -> bool {
+        let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
+        let Some(delivered_index) = messages.iter().position(|message| Some(message.id.as_str()) == delivered_id) else {
+            return false;
+        };
+        messages[..=delivered_index].iter().any(|message| message.id == target_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +474,9 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.delivered_message_id = Some(message_id.clone());
                 status.message = None;
                 status.degraded = None;
+                // A fresh idle observation must follow delivery before stall
+                // supervision treats the agent as having finished this turn.
+                status.attention = None;
             }
             Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
                 status.message = Some(message.clone());
@@ -519,6 +581,20 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
+
+    #[test]
+    fn previous_generation_message_decodes_and_new_message_writes_queue_shape() {
+        let old = serde_json::json!({
+            "id": "operator-1",
+            "text": "Continue",
+            "sender": {"kind": "unknown"},
+            "delivery": "queued"
+        });
+        let message: TerminalCrewMessage = serde_json::from_value(old).expect("old stored message");
+        assert!(message.following.is_empty());
+        let written = serde_json::to_value(message).expect("serialize current message");
+        assert_eq!(written["following"], serde_json::json!([]));
+    }
 
     fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("valid timestamp");
