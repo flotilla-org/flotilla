@@ -21,7 +21,7 @@ pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
     /// Observe bound requests together. The default uses individual provider
-    /// reads and reports only the state; GitHub overrides this with one query
+    /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA.
     async fn observe_bound(&self, numbers: &[u64]) -> Result<BoundObservations, String> {
         let mut statuses = HashMap::new();
@@ -43,6 +43,10 @@ pub trait ChangeRequestTracker: Send + Sync {
             statuses.insert(
                 *number,
                 Ok(ChangeRequestStatus {
+                    title: Observation::known(request.title, observed_at),
+                    author: Observation::unknown(observed_at),
+                    review_decision: Observation::unknown(observed_at),
+                    review_requested_from_owner: Observation::unknown(observed_at),
                     state: Observation::known(state, observed_at),
                     head_sha: Observation::unknown(observed_at),
                     checks: Observation::unknown(observed_at),
@@ -100,5 +104,9 @@ mod tests {
             observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR").state.value,
             Some(ObservedChangeRequestState::Open)
         );
+        let status = observed.get(&2).expect("healthy PR result").as_ref().expect("healthy PR");
+        assert_eq!(status.author.observed_at, status.state.observed_at);
+        assert_eq!(status.review_decision.observed_at, status.state.observed_at);
+        assert_eq!(status.review_requested_from_owner.observed_at, status.state.observed_at);
     }
 }

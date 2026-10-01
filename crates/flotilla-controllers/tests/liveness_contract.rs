@@ -279,6 +279,10 @@ struct ConvoyWorldBuilder {
 
 fn change_request_status(state: ObservedChangeRequestState, observed_at: DateTime<Utc>) -> ChangeRequestStatus {
     ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
         state: Observation::known(state, observed_at),
         head_sha: Observation::known("abc123".to_string(), observed_at),
         checks: Observation::known(ObservedChecks::Pass, observed_at),

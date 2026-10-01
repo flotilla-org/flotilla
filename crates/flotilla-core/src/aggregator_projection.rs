@@ -529,6 +529,7 @@ mod tests {
                 body: None,
                 state: IssueState::Open,
                 labels: vec![],
+                assignees: vec![],
                 as_of: Utc::now(),
                 observed_at: None,
                 provider_name: "github".into(),

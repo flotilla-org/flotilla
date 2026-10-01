@@ -442,6 +442,8 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             let now = Utc::now();
             Ok(IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
                 state: Observation::known(ObservedIssueState::Open, now),
                 labels: Observation::known(vec!["ready".into()], now),
                 updated_at: Observation::known(now, now),
@@ -469,6 +471,8 @@ mod tests {
         let old = Utc::now() - chrono::Duration::hours(1);
         records
             .update_status(&name, &created.metadata.resource_version, &IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
                 state: flotilla_resources::Observation::known(ObservedIssueState::Open, old),
                 labels: flotilla_resources::Observation::known(vec![], old),
                 updated_at: flotilla_resources::Observation::known(old, old),
@@ -518,6 +522,8 @@ mod tests {
         let now = Utc::now();
         records
             .update_status(&name, &created.metadata.resource_version, &IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
                 state: Observation::known(ObservedIssueState::Open, now),
                 labels: Observation::known(vec![], now),
                 updated_at: Observation::known(now, now),

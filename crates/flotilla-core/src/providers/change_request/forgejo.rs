@@ -1,6 +1,8 @@
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use chrono::Utc;
+use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState};
 
 use super::{ChangeRequestAdmission, ChangeRequestTracker};
 use crate::providers::{
@@ -17,12 +19,50 @@ pub struct ForgejoChangeRequestProvider {
     client: reqwest::Client,
     config: ForgejoIssueProviderConfig,
     repo_slug: String,
+    operator_login: Option<String>,
 }
 
 impl ForgejoChangeRequestProvider {
     pub fn new(http: Arc<dyn HttpClient>, runner: Arc<dyn CommandRunner>, config: ForgejoIssueProviderConfig, repo_slug: String) -> Self {
         let client = crate::tls::client_builder().build().expect("build Forgejo request client");
-        Self { http, runner, client, config, repo_slug }
+        Self { http, runner, client, config, repo_slug, operator_login: None }
+    }
+
+    pub fn with_operator_login(mut self, login: String) -> Self {
+        self.operator_login = Some(login);
+        self
+    }
+
+    fn observed_status(&self, value: &serde_json::Value) -> ObservedStatus {
+        let observed_at = Utc::now();
+        let state = if value["merged"].as_bool() == Some(true) || !value["merged_at"].is_null() {
+            Some(ObservedChangeRequestState::Merged)
+        } else if value["state"] == "closed" {
+            Some(ObservedChangeRequestState::Closed)
+        } else if value["draft"].as_bool() == Some(true) {
+            Some(ObservedChangeRequestState::Draft)
+        } else if value["state"] == "open" {
+            Some(ObservedChangeRequestState::Open)
+        } else {
+            None
+        };
+        let requested = self.operator_login.as_deref().and_then(|operator| {
+            value["requested_reviewers"].as_array().map(|reviewers| {
+                reviewers.iter().any(|reviewer| reviewer["login"].as_str().is_some_and(|login| login.eq_ignore_ascii_case(operator)))
+            })
+        });
+        ObservedStatus {
+            title: Observation { value: value["title"].as_str().map(str::to_string), observed_at },
+            author: Observation { value: value["user"]["login"].as_str().map(str::to_string), observed_at },
+            // The standard Forgejo pull response has no aggregate review decision.
+            review_decision: Observation::unknown(observed_at),
+            review_requested_from_owner: Observation { value: requested, observed_at },
+            state: Observation { value: state, observed_at },
+            head_sha: Observation { value: value["head"]["sha"].as_str().map(str::to_string), observed_at },
+            checks: Observation::unknown(observed_at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(observed_at) },
+            mergeable: Observation::unknown(observed_at),
+        }
     }
 
     fn request(
@@ -121,6 +161,18 @@ impl ForgejoChangeRequestProvider {
 
 #[async_trait]
 impl ChangeRequestTracker for ForgejoChangeRequestProvider {
+    /// The trait default converts only the presentation snapshot. Read the
+    /// same pull endpoint once per bound number to retain its author and
+    /// requested-reviewer facts without another request.
+    async fn observe_bound(&self, numbers: &[u64]) -> Result<super::BoundObservations, String> {
+        let mut statuses = std::collections::HashMap::new();
+        for number in numbers {
+            let result =
+                self.execute(reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await.map(|value| self.observed_status(&value));
+            statuses.insert(*number, result);
+        }
+        Ok(statuses)
+    }
     async fn list_change_requests(&self, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String> {
         Ok(self.list("open", limit).await?.iter().filter_map(|value| self.parse(value)).collect())
     }
@@ -228,6 +280,60 @@ mod tests {
         crate::providers::issue_tracker::forgejo::ForgejoAuth { token, token_path }
     }
 
+    #[test]
+    fn parses_pull_presentation_fields_from_existing_response() {
+        let mut provider = ForgejoChangeRequestProvider::new(
+            Arc::new(MockHttp { responses: Mutex::new(VecDeque::new()), urls: Mutex::new(Vec::new()) }),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
+            "team/repo".into(),
+        )
+        .with_operator_login("owner".into());
+        let raw = serde_json::json!({
+            "title": "Keep metadata current", "state": "open", "draft": true,
+            "user": {"login": "contributor"}, "requested_reviewers": [{"login": "owner"}],
+            "head": {"sha": "abc"}
+        });
+        let status = provider.observed_status(&raw);
+        assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
+        assert_eq!(status.author.value.as_deref(), Some("contributor"));
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Draft));
+        assert_eq!(status.review_decision.value, None);
+        assert_eq!(status.review_requested_from_owner.value, Some(true));
+        provider.operator_login = None;
+        assert_eq!(provider.observed_status(&raw).review_requested_from_owner.value, None);
+    }
+
+    #[tokio::test]
+    async fn bound_observation_uses_one_existing_pull_read_per_number() {
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!({
+                "number": 7, "title": "Keep metadata current", "state": "open", "draft": false,
+                "user": {"login": "contributor"}, "requested_reviewers": [{"login": "owner"}]
+            }))])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new(
+                "https://forgejo.example".into(),
+                None,
+                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
+            ),
+            "team/repo".into(),
+        )
+        .with_operator_login("owner".into());
+        let observed = provider.observe_bound(&[7]).await.expect("observe bound request");
+        let status = observed[&7].as_ref().expect("status");
+        assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
+        assert_eq!(status.review_requested_from_owner.value, Some(true));
+        assert_eq!(http.urls.lock().expect("urls").len(), 1);
+    }
     #[tokio::test]
     async fn record_replay_lists_forgejo_pull_requests() {
         let auth = auth();

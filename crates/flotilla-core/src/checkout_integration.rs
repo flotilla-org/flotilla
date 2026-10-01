@@ -539,6 +539,10 @@ mod tests {
     fn merged_change_request(head_sha: &str) -> ChangeRequestStatus {
         let observed_at = "2026-08-04T12:00:00Z".parse().expect("valid timestamp");
         ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(ObservedChangeRequestState::Merged, observed_at),
             head_sha: flotilla_resources::Observation::known(head_sha.to_string(), observed_at),
             checks: flotilla_resources::Observation::unknown(observed_at),

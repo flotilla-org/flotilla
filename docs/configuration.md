@@ -297,3 +297,12 @@ review_bot_login = "review-helper"
 ```
 
 Only comments from that bot identity are treated as bot review feedback. Other bot comments do not wake a crew.
+
+To observe whether review is requested from the operator, set the operator's forge login in the same section:
+
+```toml
+[change_request]
+operator_login = "your-login"
+```
+
+When this is unset, `review_requested_from_owner` remains Unknown rather than assuming that the repository owner is the operator.

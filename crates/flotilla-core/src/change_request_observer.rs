@@ -11,7 +11,8 @@ use flotilla_protocol::LeafAddress;
 use flotilla_relay_protocol::{Subject, SubjectKind};
 use flotilla_resources::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, InputMeta,
-    Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ResourceBackend, ResourceProvenance,
+    Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision, ResourceBackend,
+    ResourceProvenance,
 };
 use tokio::{
     sync::{Mutex, Notify},
@@ -121,6 +122,15 @@ pub(crate) fn parse_gh_observation_with_review_bot(
     observed_at: DateTime<Utc>,
     review_bot_login: &str,
 ) -> Result<ChangeRequestStatus, String> {
+    parse_gh_observation_with_identity(json, observed_at, review_bot_login, None)
+}
+
+pub(crate) fn parse_gh_observation_with_identity(
+    json: &str,
+    observed_at: DateTime<Utc>,
+    review_bot_login: &str,
+    operator_login: Option<&str>,
+) -> Result<ChangeRequestStatus, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| format!("decode gh pr observation: {error}"))?;
     let state = match value["state"].as_str() {
         Some("OPEN") if value["isDraft"] == true => Some(ObservedChangeRequestState::Draft),
@@ -211,7 +221,38 @@ pub(crate) fn parse_gh_observation_with_review_bot(
         Some("CONFLICTING") => Some(ObservedMergeability::Conflicting),
         _ => None,
     };
+    let review_decision = match value["reviewDecision"].as_str() {
+        Some("APPROVED") => Some(ObservedReviewDecision::Approved),
+        Some("CHANGES_REQUESTED") => Some(ObservedReviewDecision::ChangesRequested),
+        Some("REVIEW_REQUIRED") => Some(ObservedReviewDecision::Required),
+        // An explicit null means GitHub has no review decision; an absent field
+        // means the provider did not observe that fact.
+        None if value.get("reviewDecision").is_some() => Some(ObservedReviewDecision::None),
+        _ => None,
+    };
+    let requested = value["reviewRequests"]["nodes"].as_array();
+    let review_requested_from_owner = operator_login.and_then(|operator| {
+        let requests = requested?;
+        if value["reviewRequests"]["pageInfo"]["hasNextPage"] == true {
+            return None;
+        }
+        let mut unidentified_reviewer = false;
+        for request in requests {
+            let login = request["requestedReviewer"]["login"].as_str();
+            match login {
+                Some(login) if login.eq_ignore_ascii_case(operator) => return Some(true),
+                Some(_) => {}
+                // A team request does not reveal whether the operator belongs to it.
+                None => unidentified_reviewer = true,
+            }
+        }
+        (!unidentified_reviewer).then_some(false)
+    });
     Ok(ChangeRequestStatus {
+        title: Observation { value: value["title"].as_str().map(str::to_string), observed_at },
+        author: Observation { value: value["author"]["login"].as_str().map(str::to_string), observed_at },
+        review_decision: Observation { value: review_decision, observed_at },
+        review_requested_from_owner: Observation { value: review_requested_from_owner, observed_at },
         state: Observation { value: state, observed_at },
         head_sha: Observation { value: head_sha, observed_at },
         checks: Observation { value: checks, observed_at },
@@ -839,6 +880,10 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             let observed_at = Utc::now();
             Ok(ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: Observation::known(ObservedChangeRequestState::Open, observed_at),
                 head_sha: Observation::known("abc".to_string(), observed_at),
                 checks: Observation::known(ObservedChecks::Pass, observed_at),
@@ -859,6 +904,46 @@ mod tests {
         assert_eq!(status.checks.value, Some(ObservedChecks::Pass));
         assert_eq!(status.review.actionable_at_head.value, Some(true));
         assert_eq!(status.mergeable.value, Some(ObservedMergeability::Conflicting));
+    }
+
+    #[test]
+    fn observes_presentation_fields_and_configured_operator_request() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let status = parse_gh_observation_with_identity(
+            r#"{"title":"Keep metadata current","state":"OPEN","isDraft":true,"author":{"login":"contributor"},"reviewDecision":"APPROVED","reviewRequests":{"nodes":[{"requestedReviewer":{"login":"owner"}}]}}"#,
+            observed_at,
+            DEFAULT_REVIEW_BOT_LOGIN,
+            Some("OWNER"),
+        )
+        .expect("parse");
+        assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
+        assert_eq!(status.author.value.as_deref(), Some("contributor"));
+        assert_eq!(status.state.value, Some(ObservedChangeRequestState::Draft));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::Approved));
+        assert_eq!(status.review_requested_from_owner.value, Some(true));
+        assert_eq!(status.title.observed_at, observed_at);
+    }
+
+    #[test]
+    fn operator_request_is_unknown_without_identity_or_with_team_request() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let request = r#"{"state":"OPEN","reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"Team"}}]}}"#;
+        let unset = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, None).expect("parse");
+        assert_eq!(unset.review_requested_from_owner.value, None);
+        let team = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, Some("owner")).expect("parse");
+        assert_eq!(team.review_requested_from_owner.value, None);
+    }
+
+    #[test]
+    fn review_decision_distinguishes_changes_requested_from_review_required() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        for (decision, expected) in
+            [("CHANGES_REQUESTED", ObservedReviewDecision::ChangesRequested), ("REVIEW_REQUIRED", ObservedReviewDecision::Required)]
+        {
+            let request = serde_json::json!({"state": "OPEN", "reviewDecision": decision});
+            let status = parse_gh_observation(&request.to_string(), observed_at).expect("parse");
+            assert_eq!(status.review_decision.value, Some(expected));
+        }
     }
 
     #[test]
@@ -889,6 +974,9 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(status.review.actionable_at_head.value, Some(false));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::None));
+        let absent = parse_gh_observation(r#"{"state":"OPEN"}"#, "2026-08-03T20:00:00Z".parse().expect("time")).expect("parse");
+        assert_eq!(absent.review_decision.value, None);
     }
 
     #[tokio::test]

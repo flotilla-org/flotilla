@@ -48,6 +48,13 @@ impl<T> Observation<T> {
     }
 }
 
+impl<T> Default for Observation<T> {
+    fn default() -> Self {
+        // A previous-generation record cannot supply a time for a newly added fact.
+        Self::unknown(DateTime::<Utc>::UNIX_EPOCH)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedChangeRequestState {
@@ -72,6 +79,15 @@ pub enum ObservedMergeability {
     Conflicting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedReviewDecision {
+    Approved,
+    ChangesRequested,
+    Required,
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeRequestReviewObservation {
     pub actionable_at_head: Observation<bool>,
@@ -79,6 +95,15 @@ pub struct ChangeRequestReviewObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeRequestStatus {
+    /// Previous-generation status compatibility; remove serde defaults after the next fleet roll.
+    #[serde(default)]
+    pub title: Observation<String>,
+    #[serde(default)]
+    pub author: Observation<String>,
+    #[serde(default)]
+    pub review_decision: Observation<ObservedReviewDecision>,
+    #[serde(default)]
+    pub review_requested_from_owner: Observation<bool>,
     pub state: Observation<ObservedChangeRequestState>,
     pub head_sha: Observation<String>,
     pub checks: Observation<ObservedChecks>,
@@ -111,8 +136,22 @@ mod tests {
     use super::*;
     use crate::{InMemoryBackend, InputMeta, ResourceBackend, SqliteBackend};
 
+    #[test]
+    fn previous_generation_status_decodes_without_presentation_fields() {
+        let stored = r#"{"state":{"value":"open","observed_at":"2026-08-03T20:00:00Z"},"head_sha":{"value":"abc","observed_at":"2026-08-03T20:00:00Z"},"checks":{"value":"pass","observed_at":"2026-08-03T20:00:00Z"},"review":{"actionable_at_head":{"value":false,"observed_at":"2026-08-03T20:00:00Z"}},"mergeable":{"value":"mergeable","observed_at":"2026-08-03T20:00:00Z"}}"#;
+        let status: ChangeRequestStatus = serde_json::from_str(stored).expect("decode previous stored status");
+        assert_eq!(status.title.value, None);
+        assert_eq!(status.author.value, None);
+        assert_eq!(status.review_decision.value, None);
+        assert_eq!(status.review_requested_from_owner.value, None);
+    }
+
     fn status(state: ObservedChangeRequestState, observed_at: DateTime<Utc>) -> ChangeRequestStatus {
         ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: Observation::known(state, observed_at),
             head_sha: Observation::known("abc".to_string(), observed_at),
             checks: Observation::known(ObservedChecks::Pass, observed_at),

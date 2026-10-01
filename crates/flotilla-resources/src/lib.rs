@@ -1,3 +1,8 @@
+// async_trait generates #[must_use] on boxed futures; Clippy 1.99 also treats
+// those future return types as must-use. The generated annotation is redundant.
+// Remove when async_trait or Clippy stops producing this warning.
+#![allow(clippy::double_must_use)]
+
 mod artifact;
 mod backend;
 mod change_request;
@@ -54,7 +59,7 @@ pub use artifact::{artifact_record_name, Artifact, ArtifactSpec};
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use change_request::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
-    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
 };
 pub use checkout::{
     latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,

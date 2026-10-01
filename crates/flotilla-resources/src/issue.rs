@@ -40,6 +40,11 @@ pub enum ObservedIssueState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueStatus {
+    /// Previous-generation status compatibility; remove serde defaults after the next fleet roll.
+    #[serde(default)]
+    pub title: Observation<String>,
+    #[serde(default)]
+    pub assignees: Observation<Vec<String>>,
     pub state: Observation<ObservedIssueState>,
     pub labels: Observation<Vec<String>>,
     pub updated_at: Observation<DateTime<Utc>>,
@@ -64,4 +69,17 @@ pub fn issue_record_name(service: &str, scope: &str, number: u64) -> String {
     }
     let (service, scope) = flotilla_relay_protocol::Subject::normalize_scope(service, scope);
     format!("issue-{}-{}-{number}", hex(&service), hex(&scope))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_generation_status_decodes_without_presentation_fields() {
+        let stored = r#"{"state":{"value":"open","observed_at":"2026-08-03T20:00:00Z"},"labels":{"value":[],"observed_at":"2026-08-03T20:00:00Z"},"updated_at":{"value":"2026-08-03T20:00:00Z","observed_at":"2026-08-03T20:00:00Z"}}"#;
+        let status: IssueStatus = serde_json::from_str(stored).expect("decode previous stored status");
+        assert_eq!(status.title.value, None);
+        assert_eq!(status.assignees.value, None);
+    }
 }

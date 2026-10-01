@@ -5585,6 +5585,10 @@ mod tests {
         let observed_at = Utc::now();
         records
             .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
                 head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
