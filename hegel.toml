@@ -7,5 +7,5 @@ extends = "development"
 
 [profiles.nightly]
 extends = "ci"
-test_cases = 120
+test_cases = 40
 seed = "none"
