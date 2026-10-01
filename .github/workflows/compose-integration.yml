@@ -31,11 +31,76 @@ permissions:
   contents: read
 
 jobs:
-  wedge-regressions:
+  # Compile the binaries once on the runner, where Swatinem/rust-cache keeps
+  # incremental dependency artifacts, instead of a from-scratch release build
+  # inside Docker for every compose job. The compose jobs package them with the
+  # base Dockerfile's thin `dev` target.
+  build-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # A plain debug flotillad overflows tokio's 2 MiB worker stacks during
+      # the wedge regressions (unoptimized futures are huge); opt-level 1
+      # shrinks them while building far faster than release.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "compose-integration"
+          # PR caches are branch-scoped and only churn the shared pool; main
+          # pushes keep the dependency cache warm for every PR.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build flotilla binaries
+        run: cargo build --locked --bin flotilla --bin flotillad
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flotilla-binaries
+          path: |
+            target/debug/flotilla
+            target/debug/flotillad
+          if-no-files-found: error
+          retention-days: 1
+
+  # The compose jobs use the thin `dev` image, so build the cargo-in-Docker
+  # `full` target nightly to keep the local default's builder stages working.
+  # No layer cache: a whole-workspace build cache would crowd the repo's cache
+  # pool for a job that runs once a day.
+  full-image:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build full integration base image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: tests/integration/docker/base/Dockerfile
+          target: full
+          push: false
+
+  wedge-regressions:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Read by the compose files, so the fixtures' own `docker compose build`
+      # packages the downloaded binaries instead of compiling in Docker.
+      FLOTILLA_BASE_TARGET: dev
+      FLOTILLA_BIN_DIR: target/debug
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: flotilla-binaries
+          path: ${{ env.FLOTILLA_BIN_DIR }}
+      - name: Restore executable bits
+        run: chmod +x "$FLOTILLA_BIN_DIR/flotilla" "$FLOTILLA_BIN_DIR/flotillad"
       - uses: docker/setup-docker-action@v4
         with:
           daemon-config: |
@@ -52,11 +117,12 @@ jobs:
         with:
           context: .
           file: tests/integration/docker/base/Dockerfile
-          target: full
+          target: ${{ env.FLOTILLA_BASE_TARGET }}
+          build-args: FLOTILLA_BIN_DIR=${{ env.FLOTILLA_BIN_DIR }}
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-wedge
-          cache-to: type=gha,mode=max,scope=compose-integration-wedge
+          cache-from: type=gha,scope=compose-integration-wedge-dev
+          cache-to: type=gha,mode=max,scope=compose-integration-wedge-dev
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -75,10 +141,23 @@ jobs:
 
   hub-spoke:
     if: github.event_name != 'pull_request'
+    needs: build-binary
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Read by the compose files, so the fixtures' own `docker compose build`
+      # packages the downloaded binaries instead of compiling in Docker.
+      FLOTILLA_BASE_TARGET: dev
+      FLOTILLA_BIN_DIR: target/debug
     steps:
       - uses: actions/checkout@v4
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: flotilla-binaries
+          path: ${{ env.FLOTILLA_BIN_DIR }}
+      - name: Restore executable bits
+        run: chmod +x "$FLOTILLA_BIN_DIR/flotilla" "$FLOTILLA_BIN_DIR/flotillad"
       - uses: docker/setup-docker-action@v4
         with:
           daemon-config: |
@@ -97,11 +176,12 @@ jobs:
         with:
           context: .
           file: tests/integration/docker/base/Dockerfile
-          target: full
+          target: ${{ env.FLOTILLA_BASE_TARGET }}
+          build-args: FLOTILLA_BIN_DIR=${{ env.FLOTILLA_BIN_DIR }}
           tags: flotilla-base
           load: true
-          cache-from: type=gha,scope=compose-integration-hub-spoke
-          cache-to: type=gha,mode=max,scope=compose-integration-hub-spoke
+          cache-from: type=gha,scope=compose-integration-hub-spoke-dev
+          cache-to: type=gha,mode=max,scope=compose-integration-hub-spoke-dev
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

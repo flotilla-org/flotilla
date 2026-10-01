@@ -56,7 +56,9 @@ FROM runtime-base AS full
 COPY --from=builder /app/target/release/flotilla /usr/local/bin/flotilla
 COPY --from=builder /app/target/release/flotillad /usr/local/bin/flotillad
 
-# --- Dev target: pre-built binary from host ---
+# --- Dev target: pre-built binaries from host ---
+# FLOTILLA_BIN_DIR is relative to the build context (e.g. target/debug).
 FROM runtime-base AS dev
-COPY target/release/flotilla /usr/local/bin/flotilla
-COPY target/release/flotillad /usr/local/bin/flotillad
+ARG FLOTILLA_BIN_DIR=target/release
+COPY ${FLOTILLA_BIN_DIR}/flotilla /usr/local/bin/flotilla
+COPY ${FLOTILLA_BIN_DIR}/flotillad /usr/local/bin/flotillad
