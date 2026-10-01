@@ -501,18 +501,16 @@ mod tests {
         let http = Arc::new(MockHttp {
             responses: Mutex::new(VecDeque::from([
                 json_response(&first_page),
-                json_response(&serde_json::json!([{"id": 51, "user": {"login": "alice"}, "state": "APPROVED"}])),
-                json_response(&serde_json::json!([])),
+                review_response(&serde_json::json!([{"id": 51, "user": {"login": "alice"}, "state": "APPROVED"}]), 51),
             ])),
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone());
         assert_eq!(provider.read_review_decision(7).await.expect("reviews"), Some(ObservedReviewDecision::Approved));
         let urls = http.urls.lock().expect("urls");
-        assert_eq!(urls.len(), 3);
+        assert_eq!(urls.len(), 2);
         assert!(urls[0].contains("page=1"));
         assert!(urls[1].contains("page=2"));
-        assert!(urls[2].contains("page=3"));
     }
 
     #[tokio::test]
@@ -562,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_observation_reads_reviews_and_preserves_pull_when_review_read_fails() {
+    async fn bound_observation_isolates_review_failure_per_pull() {
         let http = Arc::new(MockHttp {
             responses: Mutex::new(VecDeque::from([
                 json_response(&serde_json::json!({"number": 7, "title": "PR", "state": "open"})),
