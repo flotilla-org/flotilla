@@ -17,12 +17,11 @@ use crate::{
     app::{file_picker_start_dir, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
-    palette::{self, PaletteCompletion, PaletteEntry, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
+    palette::{self, PaletteCompletion, PaletteInputState, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
 };
 
 pub struct CommandPaletteWidget {
     input: Input,
-    entries: &'static [PaletteEntry],
     selected: usize,
     scroll_top: usize,
     target_node_id: Option<NodeId>,
@@ -35,28 +34,21 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id: None }
+        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, entries: palette::all_entries(), selected, scroll_top, target_node_id: None }
+        Self { input, selected, scroll_top, target_node_id: None }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self { input: Input::from(text.as_ref()), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id }
+        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id }
     }
 
     /// Current input text (for tests / introspection).
     pub fn input_value(&self) -> &str {
         self.input.value()
-    }
-
-    fn filtered(&self, interactions: crate::interaction::InteractionContext<'_>) -> Vec<&'static PaletteEntry> {
-        palette::filter_entries(self.entries, self.input.value())
-            .into_iter()
-            .filter(|entry| interactions.is_available(entry.action))
-            .collect()
     }
 
     /// Compute position-aware completions using model context.
@@ -106,25 +98,14 @@ impl CommandPaletteWidget {
 
     fn confirm(&mut self, ctx: &mut WidgetContext) -> Outcome {
         let text = self.input.value().to_string();
+        if palette::palette_input_state(&text) != PaletteInputState::Ready {
+            return Outcome::Consumed;
+        }
 
         match palette::parse_palette_input(&text) {
             Ok(PaletteParseResult::Local(local)) => self.dispatch_local(local, ctx),
             Ok(PaletteParseResult::Resolved(resolved)) => self.dispatch_resolved(resolved, ctx),
-            Err(err) => {
-                // If parse failed, fall back to the selected entry's action (fuzzy match)
-                let interactions = crate::interaction::InteractionContext::for_active_view(
-                    ctx.views.active_address(),
-                    ctx.views.active_table_state().selected(),
-                    ctx.model.active_repo_identity_opt().is_some(),
-                );
-                let filtered = self.filtered(interactions);
-                if let Some(entry) = filtered.get(self.selected) {
-                    let action = entry.action;
-                    return self.dispatch_palette_action(action, ctx);
-                }
-                ctx.app_actions.push(AppAction::ShowStatus(err));
-                Outcome::Finished
-            }
+            Err(_) => Outcome::Consumed,
         }
     }
 
@@ -463,6 +444,18 @@ impl InteractiveWidget for CommandPaletteWidget {
 
         // Cursor on the status bar row (computed via the same overlay layout)
         let cursor_x = overlay.status_row.x + 1 + self.input.visual_cursor() as u16;
+        let indicator = match palette::palette_input_state(self.input.value()) {
+            PaletteInputState::Ready => "ready",
+            PaletteInputState::Incomplete => "incomplete",
+            PaletteInputState::Unavailable => "CLI only",
+        };
+        let indicator_x = cursor_x.saturating_add(2);
+        if indicator_x.saturating_add(indicator.len() as u16) <= overlay.status_row.right() {
+            frame.render_widget(
+                Paragraph::new(indicator).style(Style::default().fg(theme.muted).bg(theme.bar_bg)),
+                Rect::new(indicator_x, overlay.status_row.y, indicator.len() as u16, 1),
+            );
+        }
         frame.set_cursor_position((cursor_x, overlay.status_row.y));
     }
 
@@ -528,5 +521,14 @@ mod tests {
         assert_eq!(widget.selected, count - 1);
         widget.handle_action(Action::SelectNext, &mut harness.ctx());
         assert_eq!(widget.selected, 0);
+    }
+
+    #[test]
+    fn incomplete_input_keeps_palette_open_without_dispatch() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("cr"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        let outcome = widget.handle_action(Action::Confirm, &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(harness.commands.take_next().is_none());
     }
 }

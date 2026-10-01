@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use clap::Subcommand;
 use flotilla_commands::{complete::CompletionItem, NounCommand, Resolved};
-use flotilla_protocol::EnvironmentInfo;
+use flotilla_protocol::{CommandAction, EnvironmentInfo, ViewAddress};
 
 use crate::{app::TuiModel, keymap::Action};
 
@@ -206,6 +206,62 @@ pub fn parse_palette_input(input: &str) -> Result<PaletteParseResult<'_>, String
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteInputState {
+    Ready,
+    Incomplete,
+    Unavailable,
+}
+
+/// Whether Enter can dispatch this input and whether the resulting command has
+/// a visible effect in the TUI. Query output intended for the CLI is excluded.
+pub fn palette_input_state(input: &str) -> PaletteInputState {
+    match parse_palette_input(input) {
+        Ok(PaletteParseResult::Local(PaletteLocalResult::SetTheme(name)))
+            if !crate::theme::available_themes().iter().any(|(candidate, _)| candidate.eq_ignore_ascii_case(name)) =>
+        {
+            PaletteInputState::Incomplete
+        }
+        Ok(PaletteParseResult::Local(PaletteLocalResult::OpenView(address))) if address.parse::<ViewAddress>().is_err() => {
+            PaletteInputState::Incomplete
+        }
+        Ok(PaletteParseResult::Local(_)) => PaletteInputState::Ready,
+        Ok(PaletteParseResult::Resolved(resolved)) if resolved_is_tui_actionable(&resolved) => PaletteInputState::Ready,
+        Ok(PaletteParseResult::Resolved(_)) => PaletteInputState::Unavailable,
+        Err(_) => PaletteInputState::Incomplete,
+    }
+}
+
+fn resolved_is_tui_actionable(resolved: &Resolved) -> bool {
+    let action = match resolved {
+        Resolved::HostQuery { .. } => return false,
+        Resolved::Ready(command) | Resolved::NeedsContext { command, .. } => &command.action,
+    };
+    !matches!(
+        action,
+        CommandAction::FetchCheckoutStatus { .. }
+            | CommandAction::GenerateBranchName { .. }
+            | CommandAction::QueryIssues { .. }
+            | CommandAction::QueryIssueFetchByIds { .. }
+            | CommandAction::QueryRepoProviders { .. }
+            | CommandAction::QueryHostList { .. }
+            | CommandAction::QueryProjectList { .. }
+            | CommandAction::QueryDispatchQueue { .. }
+            | CommandAction::QueryHostStatus { .. }
+            | CommandAction::QueryHostProviders { .. }
+            | CommandAction::QueryFleetHealth { .. }
+            | CommandAction::QueryFulfilmentList { .. }
+            | CommandAction::QueryFleetList { .. }
+            | CommandAction::QueryCrewList { .. }
+            | CommandAction::QueryFleetReplicaSnapshot { .. }
+            | CommandAction::QueryDaemonLogs { .. }
+            | CommandAction::QueryExplainConvoy { .. }
+            | CommandAction::QueryResourceList { .. }
+            | CommandAction::QueryResourceGet { .. }
+            | CommandAction::ResourceWatch { .. }
+    )
+}
+
 /// A single completion item for the palette dropdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteCompletion {
@@ -217,6 +273,8 @@ pub struct PaletteCompletion {
 
 /// Nouns that require an active repo context. Hidden on the overview tab.
 const REPO_SCOPED_NOUNS: &[&str] = &["checkout", "cr", "issue", "agent", "workspace"];
+/// These registry nouns only return data consumed by the CLI output renderer.
+const CLI_ONLY_NOUNS: &[&str] = &["dispatch", "fulfilment"];
 
 /// Compute position-aware completions for the palette input.
 ///
@@ -344,7 +402,7 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
     // Noun names and aliases from the clap tree.
     let tmp = <NounCommand as Subcommand>::augment_subcommands(clap::Command::new("tmp"));
     for sub in tmp.get_subcommands() {
-        if sub.is_hide_set() {
+        if sub.is_hide_set() || CLI_ONLY_NOUNS.contains(&sub.get_name()) {
             continue;
         }
         let name = sub.get_name();
@@ -585,8 +643,17 @@ fn verb_completions_after(noun: &str, consumed: &[&str], partial: &str) -> Vec<P
     let completions = items
         .into_iter()
         .map(|item| PaletteCompletion { value: item.value, description: item.description.unwrap_or_default(), key_hint: None })
+        .filter(|item| verb_is_tui_actionable(noun, consumed, &item.value))
         .collect();
     rank_completions(completions, partial)
+}
+
+fn verb_is_tui_actionable(noun: &str, consumed: &[&str], candidate: &str) -> bool {
+    let tail = consumed.iter().copied().chain(std::iter::once(candidate)).collect::<Vec<_>>().join(" ");
+    let with_subject = format!("{noun} __palette_subject__ {tail}");
+    let without_subject = format!("{noun} {tail}");
+    let states = [palette_input_state(&with_subject), palette_input_state(&without_subject)];
+    states.contains(&PaletteInputState::Ready) || !states.contains(&PaletteInputState::Unavailable)
 }
 
 /// Build a clap Command tree for a noun, suitable for completion walking.
@@ -1050,6 +1117,30 @@ mod tests {
         let values: Vec<String> =
             palette_completions("host fta", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
         assert!(values.contains(&"feta".to_string()));
+    }
+
+    #[test]
+    fn palette_validation_distinguishes_ready_incomplete_and_tui_irrelevant_commands() {
+        assert_eq!(palette_input_state("refresh"), PaletteInputState::Ready);
+        assert_eq!(palette_input_state("cr"), PaletteInputState::Incomplete);
+        assert_eq!(palette_input_state("host kiwi list"), PaletteInputState::Unavailable);
+    }
+
+    #[test]
+    fn host_completion_hides_cli_only_list_query() {
+        let model = model_with_hosts();
+        let values: Vec<String> =
+            palette_completions("host feta ", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
+        assert!(!values.contains(&"list".to_string()));
+        assert!(values.contains(&"refresh".to_string()));
+    }
+
+    #[test]
+    fn query_only_noun_is_absent_from_palette_root() {
+        let model = empty_model();
+        let values: Vec<String> = palette_completions("", &model, &Default::default(), true).into_iter().map(|item| item.value).collect();
+        assert!(!values.contains(&"fulfilment".to_string()));
+        assert!(!values.contains(&"dispatch".to_string()));
     }
 
     #[test]
