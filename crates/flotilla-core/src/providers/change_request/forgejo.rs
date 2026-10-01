@@ -24,6 +24,8 @@ pub struct ForgejoChangeRequestProvider {
     operator_login: Option<String>,
 }
 
+// None means the list cannot be interpreted; Some(ObservedReviewDecision::None)
+// means a complete list with no decisive review.
 fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecision> {
     let mut latest_by_reviewer = HashMap::<String, (i64, Option<ObservedReviewDecision>)>::new();
     for review in reviews {
@@ -53,9 +55,11 @@ fn review_decision(reviews: &[serde_json::Value]) -> Option<ObservedReviewDecisi
             tracing::warn!(state, "Forgejo review is missing an id");
             return None;
         };
-        // A stale or dismissed latest review suppresses an older decision from
-        // the same reviewer; it does not revive that older review.
-        let decision = (review["stale"] != true && review["dismissed"] != true).then_some(decision);
+        // A dismissed latest review suppresses an older decision. Forgejo's
+        // merge check still counts stale change requests, while stale approvals
+        // may be ignored under branch protection settings.
+        let active = review["dismissed"] != true && !(review["stale"] == true && decision == ObservedReviewDecision::Approved);
+        let decision = active.then_some(decision);
         let entry = latest_by_reviewer.entry(reviewer).or_insert((id, decision));
         if id > entry.0 {
             *entry = (id, decision);
@@ -433,7 +437,7 @@ mod tests {
             {"id": 3, "user": {"login": "bob"}, "state": "APPROVED", "dismissed": true},
             {"id": 4, "user": {"login": "carol"}, "state": "REQUEST_CHANGES", "stale": true}
         ]);
-        assert_eq!(parse_review_decision(&reviews), Some(ObservedReviewDecision::Approved));
+        assert_eq!(parse_review_decision(&reviews), Some(ObservedReviewDecision::ChangesRequested));
         let requested = serde_json::json!([
             {"id": 1, "user": {"login": "alice"}, "state": "APPROVED"},
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_REVIEW"}
@@ -458,7 +462,7 @@ mod tests {
             {"id": 1, "user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
             {"id": 2, "user": {"login": "alice"}, "state": "APPROVED", "stale": true}
         ]);
-        assert_eq!(parse_review_decision(&stale_latest), Some(ObservedReviewDecision::None));
+        assert_eq!(parse_review_decision(&stale_latest), Some(ObservedReviewDecision::ChangesRequested));
         assert_eq!(parse_review_decision(&serde_json::json!([])), Some(ObservedReviewDecision::None));
         assert_eq!(
             parse_review_decision(&serde_json::json!([
