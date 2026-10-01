@@ -51,7 +51,8 @@ fn daemon_runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
         // Debug builds retain large async frames during peer reconnect and resource
         // replication. Tokio's 2 MiB default worker stack overflows in the compose
-        // transport-recovery suite; reserve 8 MiB for daemon workers in every profile.
+        // transport-recovery suite; reserve 8 MiB (4x the default) for daemon
+        // workers in every profile. The extra address space is committed as used.
         .thread_stack_size(WORKER_STACK_SIZE)
         .enable_all()
         .build()
@@ -89,8 +90,10 @@ mod tests {
                     let mut attributes = attributes.assume_init();
                     let mut stack_address = std::ptr::null_mut();
                     let mut stack_size = 0;
-                    assert_eq!(libc::pthread_attr_getstack(&attributes, &mut stack_address, &mut stack_size), 0);
-                    assert_eq!(libc::pthread_attr_destroy(&mut attributes), 0);
+                    let stack_status = libc::pthread_attr_getstack(&attributes, &mut stack_address, &mut stack_size);
+                    let destroy_status = libc::pthread_attr_destroy(&mut attributes);
+                    assert_eq!(stack_status, 0);
+                    assert_eq!(destroy_status, 0);
                     stack_size
                 }
             })
