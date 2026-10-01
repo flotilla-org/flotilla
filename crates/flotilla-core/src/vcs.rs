@@ -41,10 +41,8 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
         } else {
             directory.join(path)
         }
-    } else if let Some(path) = directory.ancestors().map(|ancestor| ancestor.join(".git")).find(|path| path.exists()) {
+    } else if let Some(path) = directory.ancestors().find_map(discovered_git_entry) {
         path
-    } else if directory.join("HEAD").exists() && directory.join("config").exists() {
-        directory.clone() // bare repository
     } else {
         return Ok(());
     };
@@ -100,6 +98,18 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
         }
     }
     Ok(())
+}
+
+/// Git discovery checks each directory level in turn: a `.git` entry first,
+/// then the directory itself as a bare repository, before moving up. A bare
+/// repository nested inside a checkout must resolve to its own config.
+fn discovered_git_entry(directory: &Path) -> Option<PathBuf> {
+    let dot_git = directory.join(".git");
+    if dot_git.exists() {
+        return Some(dot_git);
+    }
+    let bare = ["HEAD", "config", "objects", "refs"].iter().all(|entry| directory.join(entry).exists());
+    bare.then(|| directory.to_path_buf())
 }
 
 fn git_command_location(args: &[&str], cwd: &Path, inherited_git_dir: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
@@ -237,6 +247,18 @@ mod git_config_guard_tests {
         git(repo.path(), &["config", "core.fsmonitor", "true"]);
         let error = guard_host_git_config("git", &["show-ref"], repo.path()).expect_err("bare config drift");
         assert!(error.contains("core.fsmonitor"));
+    }
+
+    #[test]
+    fn bare_repository_nested_in_a_checkout_is_inspected_itself() {
+        let outer = tempfile::tempdir().expect("temporary checkout");
+        git(outer.path(), &["init", "-q"]);
+        let bare = outer.path().join("nested.git");
+        git(outer.path(), &["init", "--bare", "-q", bare.to_str().expect("UTF-8 path")]);
+        git(&bare, &["config", "core.fsmonitor", "true"]);
+        let error = guard_host_git_config("git", &["show-ref"], &bare).expect_err("nested bare config drift");
+        assert!(error.contains("core.fsmonitor"), "{error}");
+        assert!(error.contains("nested.git"), "{error}");
     }
 
     #[test]
