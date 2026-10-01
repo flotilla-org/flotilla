@@ -34,16 +34,16 @@ use flotilla_protocol::{
     SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, controller::ControllerLoop, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
+    api_version, controller::ControllerLoop, list_resource_kind, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
     ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec,
     FulfilmentKind, FulfilmentKindSpec, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
     InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey,
-    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext,
-    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
-    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, ROLE_LABEL,
+    Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
+    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS, ROLE_LABEL,
 };
 use hegel::generators as gs;
 
@@ -394,6 +394,197 @@ async fn await_command_finished(
     .expect("timed out waiting for command result")
 }
 
+async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
+    for (host_index, host) in hosts.iter().enumerate() {
+        let backend = host.resource_backend();
+        for kind in REGISTERED_RESOURCE_KINDS {
+            let listed = list_resource_kind(&backend, "flotilla", kind.plural).await.expect("list registered kind");
+            for item in listed.value["items"].as_array().expect("resource list items") {
+                let metadata = &item["metadata"];
+                let deleting = !metadata["deletionTimestamp"].is_null();
+                let finalizers = metadata["finalizers"].as_array();
+                assert!(
+                    !deleting || finalizers.is_none_or(Vec::is_empty),
+                    "orphaned finalizers on host {host_index}, {} {}: {metadata}",
+                    kind.kind,
+                    metadata["name"],
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn finalizer_oracle_detects_a_stuck_registered_resource() {
+    let host = empty_daemon_named("orphaned-finalizer").await;
+    let hosts = vec![Arc::clone(&host)];
+    let resources = host.resource_backend().using::<Host>("flotilla");
+    resources
+        .create(&InputMeta::builder().name("stuck".to_string()).finalizers(vec!["test/stuck".to_string()]).build(), &HostSpec::default())
+        .await
+        .expect("create resource with finalizer");
+    resources.delete("stuck").await.expect("mark deleting");
+    let detected = tokio::spawn(async move { assert_no_orphaned_finalizers(&hosts).await }).await;
+    assert!(detected.is_err_and(|error| error.is_panic()), "orphaned finalizer escaped registry scan");
+}
+
+async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<String> {
+    let hosts = vec![empty_daemon_named("pair-a").await, empty_daemon_named("pair-b").await, empty_daemon_named("pair-c").await];
+    let home = Arc::clone(&hosts[home_index]);
+    seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+    home.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("paired world mesh");
+    let host_id = home.local_host_id().expect("home id").to_string();
+    let policy_name = format!("host-direct-{host_id}");
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".to_string())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
+    home.resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .create(&InputMeta::builder().name(policy_name.clone()).build(), &policy)
+        .await
+        .expect("pair policy");
+    home.resource_backend()
+        .using::<FulfilmentKind>("flotilla")
+        .create(&InputMeta::builder().name(policy_name.clone()).build(), &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"))
+        .await
+        .expect("pair kind");
+    for host in &mesh.hosts {
+        seed_trusted_remote_convoy_project(host, "flotilla").await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let issuer = mesh.hosts[issuer_index].resource_backend();
+            if issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+                && issuer.including_replicas::<PlacementPolicy>("flotilla").get(&policy_name).await.is_ok()
+                && issuer.including_replicas::<FulfilmentKind>("flotilla").get(&policy_name).await.is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pair placement visible");
+    let mut trace = Vec::new();
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".to_string())
+                            .name("paired-work".to_string())
+                            .branch("test/paired-work".to_string())
+                            .placement_policy(policy_name)
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("pair start dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    trace.push("started".into());
+    for host in &mesh.hosts {
+        trace.push(host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys").items.len().to_string());
+    }
+    let name = convoy_record_name(&home.resource_backend(), "paired-work").await;
+    for (index, host) in mesh.hosts.iter().enumerate() {
+        if index != home_index {
+            apply_convoy_replica_feed(host, "flotilla", &name, home.host_name().clone()).await;
+        }
+    }
+    for nudge in [false, true] {
+        let mut events = mesh.hosts[issuer_index].subscribe();
+        let id = mesh.clients[issuer_index]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ConvoyResume {
+                        namespace: Some("flotilla".into()),
+                        name: name.clone(),
+                        prompt: "continue".into(),
+                        vessel: nudge.then(|| "work".to_string()),
+                        role: nudge.then(|| "coder".to_string()),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("pair delivery dispatch");
+        let (node, result) = await_command_finished(&mut events, id).await;
+        assert_eq!(node, *home.node_id());
+        assert!(matches!(result, CommandValue::Error { .. }), "{result:?}");
+        trace.push(if nudge { "nudge refused at home" } else { "resume refused at home" }.into());
+    }
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: name.clone(), force: true })
+                .build(),
+        )
+        .await
+        .expect("pair convoy delete dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    assert_eq!(result, CommandValue::Ok);
+    trace.push("convoy deleted".into());
+    assert!(matches!(home.resource_backend().using::<Convoy>("flotilla").get(&name).await, Err(ResourceError::NotFound { .. })));
+    home.resource_backend()
+        .using::<Host>("flotilla")
+        .create(&InputMeta::builder().name("pair-resource".to_string()).build(), &HostSpec::default())
+        .await
+        .expect("pair resource");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if mesh.hosts[issuer_index].resource_backend().including_replicas::<Host>("flotilla").get("pair-resource").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("pair resource visible");
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceDelete {
+                    namespace: "flotilla".into(),
+                    kind: "hosts".into(),
+                    name: "pair-resource".into(),
+                    replica_origin: None,
+                })
+                .build(),
+        )
+        .await
+        .expect("pair resource delete dispatch");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
+    trace.push("resource deleted".into());
+    assert_no_orphaned_finalizers(&mesh.hosts).await;
+    trace
+}
+
+#[hegel::test(seed = Some(236801))]
+fn generated_paired_world_host_independence(tc: hegel::TestCase) {
+    let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
+    let remote = (home + offset) % 3;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let at_home = paired_world_trace(home, home).await;
+        let remote_desk = paired_world_trace(home, remote).await;
+        assert_eq!(remote_desk, at_home, "home={home}, remote={remote}");
+    });
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn three_host_request_mesh_connects_every_client_and_peer() {
     let hosts = vec![empty_daemon_named("desk").await, empty_daemon_named("placement").await, empty_daemon_named("other").await];
@@ -479,6 +670,106 @@ async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent
             Err(ResourceError::NotFound { .. })
         ));
     }
+}
+
+#[hegel::test(seed = Some(236802))]
+fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
+    let home_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+    let restart_before_delete = tc.draw(gs::booleans());
+    let step_count = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let transitions = (0..step_count).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    runtime.block_on(async {
+        let hosts = vec![
+            empty_daemon_named("transition-a").await,
+            empty_daemon_named("transition-b").await,
+            empty_daemon_named("transition-c").await,
+        ];
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("initial mesh");
+        let name = "transition-tombstone";
+        hosts[home_index]
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create at home");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut visible = true;
+                for host in &hosts {
+                    visible &= host.resource_backend().including_replicas::<Host>("flotilla").get(name).await.is_ok();
+                }
+                if visible {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resource visible before partition");
+        if restart_before_delete {
+            drop(mesh);
+            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
+        }
+        drop(mesh);
+        let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
+        let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+        let other_component = spawn_in_memory_request_mesh(others).await.expect("other component");
+        let mut events = hosts[home_index].subscribe();
+        let id = isolated.clients[0]
+            .execute(
+                Command::builder()
+                    .action(CommandAction::ResourceDelete {
+                        namespace: "flotilla".into(),
+                        kind: "hosts".into(),
+                        name: name.into(),
+                        replica_origin: None,
+                    })
+                    .build(),
+            )
+            .await
+            .expect("delete during partition");
+        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
+        drop(isolated);
+        drop(other_component);
+        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut absent = true;
+                for host in &hosts {
+                    absent &= matches!(
+                        host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
+                        Err(ResourceError::NotFound { .. })
+                    );
+                }
+                if absent {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tombstone converges after heal");
+        for partition_again in transitions {
+            drop(mesh);
+            if partition_again {
+                let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
+                let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
+                let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
+                drop(isolated);
+                drop(other_component);
+            }
+            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal or restart");
+            for host in &hosts {
+                assert!(matches!(
+                    host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
+                    Err(ResourceError::NotFound { .. })
+                ));
+            }
+            assert_no_orphaned_finalizers(&hosts).await;
+        }
+        drop(mesh);
+    });
 }
 
 #[test]
@@ -599,45 +890,7 @@ fn generated_admission_oracle_detects_origin_before_placement_fault() {
     assert!(failure.is_err(), "the #2335 origin-first fault escaped the generated CI budget");
 }
 
-struct TeardownCheckoutRuntime;
-
-#[async_trait]
-impl CheckoutRuntime for TeardownCheckoutRuntime {
-    async fn create_worktree(
-        &self,
-        _clone_path: &str,
-        _branch: &str,
-        _base_ref: Option<&str>,
-        _target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        Err("checkout is already ready".into())
-    }
-
-    async fn create_fresh_clone(
-        &self,
-        _repo_url: &str,
-        _branch: &str,
-        _base_ref: Option<&str>,
-        _target_path: &str,
-    ) -> Result<PreparedCheckout, String> {
-        Err("checkout is already ready".into())
-    }
-
-    async fn inspect_integration(
-        &self,
-        _checkout: &ResourceObject<Checkout>,
-        _convoy: Option<&ResourceObject<Convoy>>,
-    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
-        Ok(flotilla_resources::CheckoutIntegrationStatus::default())
-    }
-
-    async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        Ok(CheckoutRemovalOutcome::Removed)
-    }
-}
-
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "#2343: cross-home forced teardown must delete checkout on another host"]
 async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     let hosts = vec![empty_daemon_named("home-a").await, empty_daemon_named("checkout-b").await, empty_daemon_named("desk-c").await];
     let mesh = spawn_in_memory_request_mesh(hosts).await.expect("request mesh");
@@ -759,6 +1012,7 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     })
     .await
     .expect("#2343: checkout on B and convoy on A must both finalize");
+    assert_no_orphaned_finalizers(&mesh.hosts).await;
     collector_task.abort();
     checkout_task.abort();
     convoy_task.abort();
@@ -937,6 +1191,7 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
             placement.resource_backend().using::<Host>("flotilla").get(resource_name).await,
             Err(ResourceError::NotFound { .. })
         ));
+        assert_no_orphaned_finalizers(&mesh.hosts).await;
     });
 }
 
