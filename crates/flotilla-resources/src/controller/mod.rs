@@ -144,6 +144,18 @@ struct ObjectFailure {
     terminal: bool,
 }
 
+struct FinalizerFailure {
+    creation_timestamp: DateTime<Utc>,
+    consecutive_failures: u32,
+    retry_at: Instant,
+}
+
+impl FinalizerFailure {
+    fn delay(consecutive_failures: u32) -> Duration {
+        Duration::from_secs(1).saturating_mul(1_u32 << consecutive_failures.saturating_sub(1).min(5))
+    }
+}
+
 pub struct ReconcileOutcome<T: Resource> {
     pub patch: Option<T::StatusPatch>,
     pub actuations: Vec<Actuation>,
@@ -384,7 +396,8 @@ impl ReplicaConvoyCheckoutWatch {
                 .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
         }
         // Older and adopted convoys may lack a frozen checkout reference.
-        // The checkout's convoy label remains enough to wake its home controller.
+        // Listing locally labeled checkouts on each convoy event is acceptable
+        // at current scale and avoids another watch-side index to maintain.
         let selector = BTreeMap::from([(crate::CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]);
         for checkout in checkouts.list_matching_labels(&selector).await?.items {
             sender
@@ -747,6 +760,7 @@ impl<R: Reconciler> ControllerLoop<R> {
         let mut pending: VecDeque<String> = VecDeque::new();
         let scheduled_requeues = Arc::new(Mutex::new(HashSet::new()));
         let mut object_failures = BTreeMap::<String, ObjectFailure>::new();
+        let mut finalizer_failures = BTreeMap::<String, FinalizerFailure>::new();
 
         loop {
             if let Some(heartbeat) = &heartbeat {
@@ -758,6 +772,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Ok(object) => object,
                     Err(ResourceError::NotFound { .. }) => {
                         object_failures.remove(&name);
+                        finalizer_failures.remove(&name);
                         continue;
                     }
                     Err(err) => {
@@ -770,6 +785,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                         continue;
                     }
                 };
+                if finalizer_failures.get(&name).is_some_and(|failure| failure.creation_timestamp != object.metadata.creation_timestamp) {
+                    finalizer_failures.remove(&name);
+                }
                 let mut attempted_reconcile = false;
                 let mut attempted_finalizer = false;
                 let result = async {
@@ -788,6 +806,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                             && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
                         {
                             if lifecycle_owned {
+                                if finalizer_failures.get(&name).is_some_and(|failure| Instant::now() < failure.retry_at) {
+                                    return Ok(());
+                                }
                                 attempted_finalizer = true;
                                 if let Err(err) = reconciler.run_finalizer(&object).await {
                                     if let Some(patch) = reconciler.finalizer_error_patch(&object, &err) {
@@ -880,6 +901,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Ok(()) if attempted_reconcile => {
                         object_failures.remove(&name);
                     }
+                    Ok(()) if attempted_finalizer => {
+                        finalizer_failures.remove(&name);
+                    }
                     Ok(()) => {}
                     Err(err) => {
                         if attempted_reconcile {
@@ -891,10 +915,20 @@ impl<R: Reconciler> ControllerLoop<R> {
                             }
                         }
                         let mut terminal = false;
-                        // A finalizer error may produce no status write (for example,
-                        // the same failure was recorded on an earlier attempt). It
-                        // still needs its own retry instead of waiting for resync.
-                        let mut retry_after = attempted_finalizer.then_some(Duration::from_secs(1));
+                        // A finalizer or its removal write may fail without
+                        // changing status. Retry it with bounded backoff instead
+                        // of waiting for resync or spinning on a watch event.
+                        let mut retry_after = attempted_finalizer.then(|| {
+                            let consecutive_failures =
+                                finalizer_failures.get(&name).map_or(1, |failure| failure.consecutive_failures.saturating_add(1));
+                            let delay = FinalizerFailure::delay(consecutive_failures);
+                            finalizer_failures.insert(name.clone(), FinalizerFailure {
+                                creation_timestamp: object.metadata.creation_timestamp,
+                                consecutive_failures,
+                                retry_at: Instant::now() + delay,
+                            });
+                            delay
+                        });
                         if attempted_reconcile {
                             if let Some(policy) = reconciler.reconcile_error_policy() {
                                 let message = err.to_string();
