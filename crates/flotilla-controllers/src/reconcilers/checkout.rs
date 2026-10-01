@@ -267,7 +267,12 @@ where
             if obj.status.as_ref().is_some_and(|status| {
                 status.phase == CheckoutPhase::Ready
                     && (!integration_is_fresh(status, self.clock.now(), refresh_after)
-                        || (delete_evidence && checkout_observation_lacks_convoy_association(&status.integration))
+                        || (delete_evidence
+                            && checkout_observation_lacks_convoy_association(&status.integration)
+                            && convoy.as_ref().is_some_and(|convoy| {
+                                convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some())
+                                    || expected_change_request_id.is_some()
+                            }))
                         || expected_change_request_id.as_ref().is_some_and(|expected| {
                             status.integration.change_request.as_ref().is_some_and(|observed| &observed.id != expected)
                         }))

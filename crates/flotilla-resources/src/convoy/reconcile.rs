@@ -29,8 +29,8 @@ use crate::{
     terminal_session::TerminalSession,
     vessel::{Vessel, VesselPhase},
     workflow_template::{
-        validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ValidationError,
-        WorkflowTemplate,
+        validate, visit_template_tokens, ArtifactSubjectBinding, CompletionCondition, CrewSource, CrewSpec, ExitDeclaration,
+        ValidationError, WorkflowTemplate,
     },
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
     InputMeta, InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource,
@@ -240,6 +240,7 @@ pub enum SettlementMode {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum UnmetSettlementExpectation {
     ChangeRequestNotReady { record: String, detail: String },
+    SubjectDiscoveryPending { convoy: String },
     InvalidExpectedCheckouts { message: String },
     ExitEntryAwaitingBinding { disposition: String, subject: String },
     MissingCheckout { checkout: String },
@@ -355,11 +356,7 @@ fn evaluate_declared_completion_condition(
         }
         CompletionCondition::ChangeRequest { field_path, operator, literal, optional_when_absent } => {
             let leaves = change_request_leaves()?;
-            if leaves.is_empty()
-                && *optional_when_absent
-                && expected_checkout_refs(convoy)?.is_empty()
-                && convoy.spec.change_request.is_none()
-            {
+            if leaves.is_empty() && *optional_when_absent && expected_checkout_refs(convoy)?.is_empty() {
                 return Ok(None);
             }
             if leaves.is_empty() {
@@ -440,6 +437,26 @@ fn evaluate_landing_settlement_with_disposition(
             };
         }
     };
+    if !expected.is_empty()
+        && convoy.status.as_ref().is_some_and(|status| {
+            status.branch_subject_scan_at.is_none()
+                && status
+                    .workflow_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.exit.as_ref())
+                    .is_some_and(|exit| matches!(exit, ExitDeclaration::Table(_)))
+        })
+        && expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty())
+    {
+        return LandingSettlement {
+            evaluation: SettlementEvaluation {
+                mode: SettlementMode::WorldTerminal,
+                satisfied: false,
+                unmet: vec![UnmetSettlementExpectation::SubjectDiscoveryPending { convoy: convoy.metadata.name.clone() }],
+            },
+            disposition: None,
+        };
+    }
     let exit = match instantiate_exit(convoy, checkouts) {
         Ok(exit) => exit,
         Err(message) => {
@@ -472,12 +489,53 @@ fn evaluate_landing_settlement_with_disposition(
         InstantiatedExit::Table(entries) => entries,
     };
 
+    let evaluate_terminal = |leaf: &flotilla_protocol::Leaf| {
+        let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+            return Err(UnmetSettlementExpectation::InvalidCondition {
+                subject: convoy.metadata.name.clone(),
+                message: "exit table leaf did not address a change request".to_string(),
+            });
+        };
+        let name = crate::change_request_record_name(service, scope, *number);
+        let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
+            change_request,
+            now,
+            stale_after: change_request_stale_after,
+        });
+        match crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None) {
+            Ok(evaluation) if evaluation.result == ThreeValue::True => Ok(()),
+            Ok(evaluation) => match change_requests.get(&name) {
+                None => Err(UnmetSettlementExpectation::MissingChangeRequest { record: name }),
+                Some(record) => {
+                    let observed_at = record.status.as_ref().map(|status| status.state.observed_at);
+                    if observed_at
+                        .and_then(|at| now.signed_duration_since(at).to_std().ok())
+                        .is_none_or(|age| age > change_request_stale_after)
+                    {
+                        Err(UnmetSettlementExpectation::StaleChangeRequest { record: name, observed_at })
+                    } else {
+                        Err(UnmetSettlementExpectation::ChangeRequestConditionFalse {
+                            record: name,
+                            value: evaluation.value.map(|value| value.to_string()),
+                        })
+                    }
+                }
+            },
+            Err(message) => Err(UnmetSettlementExpectation::InvalidCondition { subject: name, message }),
+        }
+    };
     let mut table_unmet = Vec::new();
     let mut disposition = None;
-    for entry in entries {
+    let mut addresses = Vec::new();
+    for leaf in entries.iter().flat_map(|entry| &entry.leaves) {
+        if !addresses.contains(&leaf.address) {
+            addresses.push(leaf.address.clone());
+        }
+    }
+    if addresses.is_empty() {
         // A checkout with landed evidence predates a bound change-request
         // record. The default merged entry remains its concrete exit.
-        if entry.leaves.is_empty() {
+        for entry in entries {
             if entry.template.field_path == ".state"
                 && entry.template.operator == flotilla_protocol::LeafOperator::Equal
                 && entry.template.literal == "merged"
@@ -487,56 +545,34 @@ fn evaluate_landing_settlement_with_disposition(
             }
             table_unmet
                 .push(UnmetSettlementExpectation::ExitEntryAwaitingBinding { disposition: entry.disposition, subject: "$cr".to_string() });
-            continue;
         }
-
-        let mut entry_unmet = Vec::new();
-        for leaf in &entry.leaves {
-            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
-                entry_unmet.push(UnmetSettlementExpectation::InvalidCondition {
-                    subject: convoy.metadata.name.clone(),
-                    message: "exit table leaf did not address a change request".to_string(),
-                });
-                continue;
-            };
-            let name = crate::change_request_record_name(service, scope, *number);
-            let subject = change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject {
-                change_request,
-                now,
-                stale_after: change_request_stale_after,
-            });
-            match crate::evaluate_leaf(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject), None) {
-                Ok(evaluation) if evaluation.result == ThreeValue::True => {}
-                Ok(evaluation) => match change_requests.get(&name) {
-                    None => entry_unmet.push(UnmetSettlementExpectation::MissingChangeRequest { record: name }),
-                    Some(record) => {
-                        let observed_at = record.status.as_ref().map(|status| status.state.observed_at);
-                        if observed_at
-                            .and_then(|at| now.signed_duration_since(at).to_std().ok())
-                            .is_none_or(|age| age > change_request_stale_after)
-                        {
-                            entry_unmet.push(UnmetSettlementExpectation::StaleChangeRequest { record: name, observed_at });
-                        } else {
-                            entry_unmet.push(UnmetSettlementExpectation::ChangeRequestConditionFalse {
-                                record: name,
-                                value: evaluation.value.map(|value| value.to_string()),
-                            });
-                        }
+    } else {
+        let mut highest_matched_entry = None;
+        for address in &addresses {
+            let mut failures = Vec::new();
+            let mut matched = None;
+            for (index, entry) in entries.iter().enumerate() {
+                let Some(leaf) = entry.leaves.iter().find(|leaf| &leaf.address == address) else { continue };
+                match evaluate_terminal(leaf) {
+                    Ok(()) => {
+                        matched = Some(index);
+                        break;
                     }
-                },
-                Err(message) => {
-                    entry_unmet.push(UnmetSettlementExpectation::InvalidCondition { subject: name, message });
+                    Err(expectation) => failures.push(expectation),
+                }
+            }
+            if let Some(index) = matched {
+                highest_matched_entry = Some(highest_matched_entry.map_or(index, |highest: usize| highest.max(index)));
+            } else {
+                for expectation in failures {
+                    if !table_unmet.contains(&expectation) {
+                        table_unmet.push(expectation);
+                    }
                 }
             }
         }
-        if entry_unmet.is_empty() {
-            disposition = Some(entry.disposition);
-            break;
-        }
-        for expectation in entry_unmet {
-            if !table_unmet.contains(&expectation) {
-                table_unmet.push(expectation);
-            }
+        if table_unmet.is_empty() {
+            disposition = highest_matched_entry.map(|index| entries[index].disposition.clone());
         }
     }
 
@@ -877,6 +913,23 @@ impl Reconciler for ConvoyReconciler {
                 };
             }
         }
+        let missing = prepared
+            .observed_subjects
+            .iter()
+            .filter(|subject| {
+                !obj.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(*subject) || status.produces(subject))
+            })
+            .cloned()
+            .map(|subject| (subject, Relationship::Produces))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return ControllerReconcileOutcome {
+                patch: Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now }),
+                actuations: Vec::new(),
+                events: Vec::new(),
+                requeue_after: None,
+            };
+        }
         let mut outcome = reconcile_internal(
             obj,
             prepared.template.as_ref(),
@@ -886,21 +939,6 @@ impl Reconciler for ConvoyReconciler {
             LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
         );
-        if outcome.patch.is_none() {
-            let missing = prepared
-                .observed_subjects
-                .iter()
-                .filter(|subject| {
-                    !obj.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(*subject) || status.produces(subject))
-                })
-                .cloned()
-                .map(|subject| (subject, Relationship::Produces))
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                outcome.patch =
-                    Some(ConvoyStatusPatch::DiscoverSubjects { subjects: missing, source: SubjectDiscoverySource::Branch, at: now });
-            }
-        }
         if outcome.patch.is_none() {
             if let Some(attention) = &prepared.settlement_attention {
                 let changed = obj

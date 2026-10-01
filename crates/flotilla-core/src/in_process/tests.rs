@@ -1738,8 +1738,9 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     })
     .await
     .expect("claim discovery");
-    let conflicted = convoys.get("multi-repo").await.expect("conflicted convoy");
-    assert_eq!(flotilla_resources::produced_subject_conflicts(&conflicted).len(), 1);
+    let with_followup = convoys.get("multi-repo").await.expect("convoy with follow-up");
+    let leaves = flotilla_resources::expected_change_request_leaves(&with_followup, &BTreeMap::new()).expect("subject leaves");
+    assert_eq!(leaves.len(), 6, "all three produced change requests require terminal observations");
     assert!(daemon
         .link_convoy_subject("flotilla", "multi-repo", "wheelhouze/cleat!12", Some(flotilla_protocol::Relationship::Produces))
         .await
@@ -1759,8 +1760,9 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .link_convoy_subject("flotilla", "multi-repo", "lab:robert/ghostty-ops!18", Some(flotilla_protocol::Relationship::Supersedes))
         .await
         .expect("operator resolution");
-    let resolved = convoys.get("multi-repo").await.expect("resolved convoy");
-    assert!(flotilla_resources::produced_subject_conflicts(&resolved).is_empty());
+    let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
+    let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &BTreeMap::new()).expect("subject leaves");
+    assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::Utc;
-use flotilla_manifest::keys::{KEY_CHANGE_REQUEST_NUMBER, KEY_CONVOY_NAME};
+use flotilla_manifest::keys::KEY_CONVOY_NAME;
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
     AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
@@ -241,9 +241,6 @@ fn repo_fact_annotations(repo: Option<&flotilla_protocol::RepoKey>) -> HashMap<S
 fn convoy_annotations(convoy: &ConvoyRow) -> HashMap<String, String> {
     let mut annotations = repo_fact_annotations(convoy.repo.as_ref());
     annotations.insert(KEY_CONVOY_NAME.to_owned(), convoy.name.clone());
-    if let Some(change_request) = &convoy.change_request {
-        annotations.insert(KEY_CHANGE_REQUEST_NUMBER.to_owned(), change_request.id.clone());
-    }
     annotations
 }
 
@@ -375,10 +372,12 @@ fn project_ref_key(default_namespace: &str, value: &str) -> GroupKey {
 }
 
 fn convoy_label(convoy: &ConvoyRow) -> String {
-    convoy
-        .change_request
-        .as_ref()
-        .map_or_else(|| convoy.name.clone(), |change_request| format!("{} · PR #{}", convoy.name, change_request.id))
+    let subjects = convoy.subjects.iter().map(|entry| entry.short.as_str()).collect::<Vec<_>>();
+    if subjects.is_empty() {
+        convoy.name.clone()
+    } else {
+        format!("{} · {}", convoy.name, subjects.join(", "))
+    }
 }
 
 fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
@@ -466,10 +465,7 @@ fn entry_is_terminal(entry: &AwarenessEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
-    use flotilla_protocol::{
-        ChangeRequestStatus, ConvoyChangeRequest, HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef,
-        SessionPhase,
-    };
+    use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
     use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
 
     use super::*;
@@ -538,10 +534,17 @@ mod tests {
     #[test]
     fn composed_labels_retain_granular_convoy_annotations() {
         let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
-        convoy.change_request = Some(ConvoyChangeRequest {
-            id: "1044".into(),
-            status: ChangeRequestStatus::Open,
-            repository_key: RepositoryKey("repo-a".into()),
+        convoy.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "1044".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            declared: false,
+            short: "flotilla!1044".into(),
+            url: Some("https://github.com/flotilla-org/flotilla/pull/1044".into()),
+            repository_key: Some(RepositoryKey("repo-a".into())),
         });
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
@@ -550,9 +553,9 @@ mod tests {
         });
 
         let convoy = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Convoy).expect("convoy entry");
-        assert_eq!(convoy.label, "ship-it · PR #1044");
+        assert_eq!(convoy.label, "ship-it · flotilla!1044");
         assert_eq!(convoy.annotations.get("flotilla.convoy.name").map(String::as_str), Some("ship-it"));
-        assert_eq!(convoy.annotations.get("change_request.number").map(String::as_str), Some("1044"));
+        assert!(!convoy.annotations.contains_key("change_request.number"));
     }
 
     #[test]

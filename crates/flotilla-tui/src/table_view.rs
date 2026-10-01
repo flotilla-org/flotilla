@@ -12,9 +12,8 @@ use std::{
 use flotilla_protocol::{
     issue_query::READY_ISSUE_LABEL,
     result_set::{SurfaceState, Timestamp},
-    AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow,
-    IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase,
-    ViewAddress,
+    AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId,
+    QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -627,16 +626,9 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel_count: convoy.vessels.len(),
                 vessel: vessel.clone(),
             });
-            let title = match (produced_change_request_subject(convoy), &convoy.change_request) {
-                (Some(subject), Some(change_request)) if change_request.id == subject.subject.id => {
-                    format!("Convoy · {} · PR #{} {}", convoy.name, subject.subject.id, change_request.status)
-                }
-                (Some(subject), _) => format!("Convoy · {} · PR #{}", convoy.name, subject.subject.id),
-                (None, Some(change_request)) => {
-                    format!("Convoy · {} · PR #{} {}", convoy.name, change_request.id, change_request.status)
-                }
-                (None, None) => format!("Convoy · {}", convoy.name),
-            };
+            let subjects = convoy_subjects_label(&convoy.subjects, false);
+            let title =
+                if subjects.is_empty() { format!("Convoy · {}", convoy.name) } else { format!("Convoy · {} · {subjects}", convoy.name) };
             Ok(vessel_spec().project(title, rows))
         }
         ViewAddress::Vessel { namespace, convoy, vessel } => {
@@ -1145,28 +1137,31 @@ fn convoy_progress(row: &ConvoySummary) -> CellValue {
 }
 
 fn convoy_change_request(row: &ConvoySummary) -> CellValue {
-    if let Some(subject) = produced_change_request_subject(row) {
-        if row.change_request.as_ref().is_none_or(|cached| cached.id != subject.subject.id) {
-            return CellValue::plain(format!("#{}", subject.subject.id));
-        }
-    }
-    let Some(change_request) = &row.change_request else {
-        return CellValue::plain("");
-    };
-    let tone = match change_request.status {
-        ChangeRequestStatus::Open => CellTone::Success,
-        ChangeRequestStatus::Draft => CellTone::Warning,
-        ChangeRequestStatus::Merged => CellTone::Success,
-        ChangeRequestStatus::Closed => CellTone::Muted,
-    };
-    CellValue::toned(format!("#{} {}", change_request.id, change_request.status), tone)
+    let requests =
+        row.subjects.iter().filter(|entry| entry.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest).collect::<Vec<_>>();
+    let one_repository = requests.first().is_some_and(|first| requests.iter().all(|entry| entry.subject.source == first.subject.source));
+    CellValue::plain(
+        requests
+            .iter()
+            .map(|entry| if one_repository { format!("!{}", entry.subject.id) } else { entry.short.clone() })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
-fn produced_change_request_subject(row: &ConvoySummary) -> Option<&flotilla_protocol::result_set::ConvoySubjectRow> {
-    row.subjects.iter().find(|entry| {
-        entry.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
-            && entry.relationship == flotilla_protocol::Relationship::Produces
-    })
+fn convoy_subjects_label(subjects: &[flotilla_protocol::result_set::ConvoySubjectRow], change_requests_only: bool) -> String {
+    let mut grouped = std::collections::BTreeMap::<flotilla_protocol::Relationship, Vec<&str>>::new();
+    for entry in subjects {
+        if change_requests_only && entry.subject.kind != flotilla_protocol::SubjectKind::ChangeRequest {
+            continue;
+        }
+        grouped.entry(entry.relationship).or_default().push(&entry.short);
+    }
+    grouped
+        .into_iter()
+        .map(|(relationship, references)| format!("{} {}", relationship.as_str().replace('_', " "), references.join(", ")))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn convoy_scope(row: &ConvoySummary) -> CellValue {
@@ -1212,9 +1207,6 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
             });
         }
     }
-    if let Some(change_request) = &row.change_request {
-        fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
-    }
     if !row.subjects.is_empty() {
         fields.push(DetailField {
             label: "Subjects",
@@ -1222,8 +1214,8 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
                 .subjects
                 .iter()
                 .map(|entry| {
-                    let reference = entry.url.as_deref().unwrap_or(&entry.short);
-                    format!("{} {reference}", entry.relationship.as_str().replace('_', " "))
+                    let url = entry.url.as_deref().unwrap_or(&entry.short);
+                    format!("{} {} · {url}", entry.relationship.as_str().replace('_', " "), entry.short)
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1239,10 +1231,14 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
 }
 
 fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
-    let change_request = row.change_request.as_ref()?;
+    let change_request = row.subjects.iter().find(|entry| {
+        entry.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+            && matches!(entry.relationship, flotilla_protocol::Relationship::Produces | flotilla_protocol::Relationship::Adopts)
+            && entry.repository_key.is_some()
+    })?;
     Some(TableIntent::OpenChangeRequest {
-        id: change_request.id.clone(),
-        repository_key: change_request.repository_key.clone(),
+        id: change_request.subject.id.clone(),
+        repository_key: change_request.repository_key.clone()?,
         host: row.origin_host.clone(),
     })
 }
@@ -1510,7 +1506,6 @@ mod tests {
             project_ref: Some("flotilla".into()),
             issues: Vec::new(),
             subjects: Vec::new(),
-            change_request: None,
             vessels,
             started_at: None,
             finished_at: None,
@@ -1681,18 +1676,28 @@ mod tests {
     fn convoy_projection_shows_change_request_and_exposes_open_action() {
         let mut row = convoy(vec![]);
         row.origin_host = Some(HostName::new("kiwi"));
-        row.change_request = Some(flotilla_protocol::ConvoyChangeRequest {
-            id: "815".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            repository_key: RepositoryKey("repo_flotilla".into()),
+        row.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "815".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            declared: false,
+            short: "flotilla!815".into(),
+            url: Some("https://github.com/flotilla-org/flotilla/pull/815".into()),
+            repository_key: Some(RepositoryKey("repo_flotilla".into())),
         });
 
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
         let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
-        assert_eq!(view.rows[0].cells[pr_index], CellValue::toned("#815 open", CellTone::Success));
+        assert_eq!(view.rows[0].cells[pr_index], CellValue::plain("!815"));
         assert!(view.rows[0].describe.contains(&DetailField { label: "Dispatcher", value: "flotilla/implicit".into() }));
-        assert!(view.rows[0].describe.contains(&DetailField { label: "Pull request", value: "#815 · open".into() }));
+        assert!(view.rows[0].describe.contains(&DetailField {
+            label: "Subjects",
+            value: "produces flotilla!815 · https://github.com/flotilla-org/flotilla/pull/815".into(),
+        }));
         assert_eq!(
             view.rows[0].actions.iter().find(|action| action.id == "open_pr"),
             Some(&AvailableAction {
@@ -1706,7 +1711,7 @@ mod tests {
                 },
             })
         );
-        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · PR #815 open");
+        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · produces flotilla!815");
     }
 
     #[test]
@@ -1722,12 +1727,13 @@ mod tests {
             declared: false,
             short: "flotilla!2301".into(),
             url: Some("https://github.com/flotilla-org/flotilla/pull/2301".into()),
+            repository_key: Some(RepositoryKey("repo_flotilla".into())),
         });
 
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
         let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
-        assert_eq!(view.rows[0].cells[pr_index].text, "#2301");
-        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · PR #2301");
+        assert_eq!(view.rows[0].cells[pr_index].text, "!2301");
+        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · produces flotilla!2301");
     }
 
     #[test]

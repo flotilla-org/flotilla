@@ -743,9 +743,6 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     ]);
     facts.extend(label_tier_facts(&convoy.name));
     facts.extend(surface_facts(convoy.surface_state));
-    if let Some(change_request) = &convoy.change_request {
-        facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(change_request.id.clone())));
-    }
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));
     }

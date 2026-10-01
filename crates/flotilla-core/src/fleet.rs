@@ -476,6 +476,17 @@ impl FleetService {
             );
         }
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local, source);
+        let subjects_by_convoy = result_sets
+            .iter()
+            .filter_map(|result_set| result_set.rows.as_convoys())
+            .flatten()
+            .map(|convoy| ((convoy.resource.namespace.clone(), convoy.resource.name.clone()), convoy.subjects.clone()))
+            .collect::<HashMap<_, _>>();
+        for row in &mut rows {
+            if let Some(convoy_ref) = &row.convoy_ref {
+                row.subjects = subjects_by_convoy.get(&(row.namespace.clone(), convoy_ref.clone())).cloned().unwrap_or_default();
+            }
+        }
         if matches!(source, FleetRowSource::IncludingReplicas) {
             let reports = replicated_host_reports(&host_sources.items, host_registry, &HashMap::new()).await;
             for row in &mut rows {

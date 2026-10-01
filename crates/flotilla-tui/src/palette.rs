@@ -913,7 +913,6 @@ mod tests {
             project_ref: None,
             issues: Vec::new(),
             subjects: Vec::new(),
-            change_request: None,
             vessels: vessels
                 .iter()
                 .map(|t| VesselSummary {

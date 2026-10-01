@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     time::Duration,
@@ -73,33 +73,48 @@ pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>
 
 /// Resolve the change request associated with one of a convoy's checkouts.
 ///
-/// The checkout authority uses this before probing so a replicated convoy's
-/// completion message can supply the forge identity even when the checkout
-/// itself predates that association.
+/// A checkout can probe one change request only when the convoy's subject set
+/// identifies exactly one active request in its repository.
 pub fn convoy_change_request_id_for_checkout(convoy: &ResourceObject<Convoy>, checkout: &ResourceObject<Checkout>) -> Option<String> {
     if let Some(id) = checkout.metadata.labels.get(CHANGE_REQUEST_ID_LABEL) {
         return Some(id.clone());
     }
-    if let Some(change_request) =
-        convoy.spec.change_request.as_ref().filter(|change_request| change_request.repository_ref == *checkout.spec.repo_ref())
-    {
-        return Some(change_request.id.clone());
-    }
-
     let repository = convoy.spec.repositories.iter().find(|repository| repository.repo_ref == *checkout.spec.repo_ref())?;
-    convoy
-        .status
-        .as_ref()?
-        .crew_work
-        .values()
-        .flat_map(BTreeMap::values)
-        .filter(|work| work.phase == CrewWorkPhase::Done)
-        .filter_map(|work| {
-            let id = flotilla_resources::change_request_id_from_completion_message(work.message.as_deref()?, &repository.url)?;
-            Some((work.finished_at, id))
+    let flotilla_protocol::LeafAddress::ChangeRequest { scope, .. } =
+        flotilla_resources::change_request_address(&repository.url, "1").ok()?
+    else {
+        return None;
+    };
+    let declared = convoy.spec.declared_subjects().ok()?;
+    let discovered = convoy.status.iter().flat_map(|status| &status.subjects);
+    let superseded = declared
+        .iter()
+        .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Supersedes)
+        .map(|entry| entry.subject.clone())
+        .chain(
+            discovered
+                .clone()
+                .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Supersedes)
+                .map(|entry| entry.subject.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let ids = declared
+        .iter()
+        .map(|entry| (&entry.subject, entry.relationship))
+        .chain(discovered.map(|entry| (&entry.subject, entry.relationship)))
+        .filter(|(subject, relationship)| {
+            subject.kind == flotilla_protocol::SubjectKind::ChangeRequest
+                && subject.source.scope == scope
+                && matches!(relationship, flotilla_protocol::Relationship::Produces | flotilla_protocol::Relationship::Adopts)
+                && !superseded.contains(*subject)
         })
-        .max_by_key(|(finished_at, _)| *finished_at)
-        .map(|(_, id)| id)
+        .map(|(subject, _)| subject.id.clone())
+        .collect::<BTreeSet<_>>();
+    if ids.len() == 1 {
+        ids.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// Extract forge PR references carried by a crew claim or ledger text.
@@ -192,7 +207,7 @@ pub async fn inspect_convoy_checkout_integration(
         spec,
         change_request_id,
         observed_change_request,
-        true,
+        convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_some()) || change_request_id.is_some(),
         observe_remote_ref,
     )
     .await
@@ -268,34 +283,20 @@ async fn inspect_pushed(vcs: &dyn Vcs, observed_change_request: Option<&ChangeRe
 async fn inspect_landed(
     providers: IntegrationProviders<'_>,
     checkout_path: &Path,
-    branch: &str,
+    _branch: &str,
     base_ref: Option<&str>,
     change_request_id: Option<&str>,
     convoy_association_complete: bool,
     observed_at: &str,
 ) -> (IntegrationCondition, Option<LandedEvidence>, Option<ChangeRequestObservation>) {
-    // Git evidence alone cannot prove that no change request remains
-    // outstanding. In particular, a crew may publish its work from a branch
-    // other than the checkout's provisioned ref. Always consult the forge;
-    // failure to do so leaves the condition unknown.
+    // The convoy's branch discovery records whether it searched the forge.
+    // Checkout inspection probes only a request already named by its subject
+    // set; it never searches the checkout branch for an identity of its own.
     let comparison = compare_branch_to_base(providers.vcs, base_ref).await;
-    let args = match change_request_id {
-        Some(id) => vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable,headRefOid"],
-        None => {
-            vec![
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt,baseRefName,mergeable,headRefOid",
-                "--limit",
-                "1",
-            ]
-        }
+    let Some(id) = change_request_id else {
+        return (landed_without_change_request(&comparison, convoy_association_complete, observed_at), None, None);
     };
+    let args = vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable,headRefOid"];
     match providers.runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
         Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
@@ -683,7 +684,7 @@ mod tests {
             Path::new("/checkout"),
             "feature/x",
             Some("main"),
-            None,
+            Some("1162"),
             true,
             "2026-07-27T00:00:00Z",
         )
@@ -692,8 +693,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untouched_branch_is_landed_after_forge_reports_no_change_request() {
-        let runner = Arc::new(MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]));
+    async fn untouched_branch_is_landed_after_convoy_branch_scan_found_no_change_request() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("0".into())]));
         let vcs = test_vcs(runner.clone());
         let (landed, _, _) = inspect_landed(
             IntegrationProviders { runner: &*runner, vcs: &vcs },
@@ -707,7 +708,7 @@ mod tests {
         .await;
 
         assert_eq!(landed.value, ConditionValue::True);
-        assert_eq!(runner.calls()[1].0, "gh");
+        assert_eq!(runner.calls().len(), 1, "checkout inspection does not search for a PR");
     }
 
     #[tokio::test]
@@ -734,14 +735,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untouched_branch_is_unknown_when_forge_cannot_be_consulted() {
+    async fn named_change_request_is_unknown_when_forge_cannot_be_consulted() {
         let landed = landed_with_responses(vec![Ok("0".into()), Err("authentication unavailable".into())]).await;
         assert_eq!(landed.value, ConditionValue::Unknown);
     }
 
     #[tokio::test]
     async fn checkout_only_lookup_cannot_prove_that_the_convoy_has_no_change_request() {
-        let runner = Arc::new(MockRunner::new(vec![Ok("0".into()), Ok("[]".into())]));
+        let runner = Arc::new(MockRunner::new(vec![Ok("0".into())]));
         let vcs = test_vcs(runner.clone());
         let (landed, _, _) = inspect_landed(
             IntegrationProviders { runner: &*runner, vcs: &vcs },
@@ -759,11 +760,20 @@ mod tests {
 
     #[tokio::test]
     async fn commits_beyond_base_without_change_request_is_not_landed() {
-        // The branch has commits and gh finds no PR: work exists that no
-        // visible change request accounts for — the observation may simply
-        // predate the change request, so the branch must not count as landed.
-        let landed = landed_with_responses(vec![Ok("2".into()), Ok("[]".into())]).await;
+        let runner = Arc::new(MockRunner::new(vec![Ok("2".into())]));
+        let vcs = test_vcs(runner.clone());
+        let (landed, _, _) = inspect_landed(
+            IntegrationProviders { runner: &*runner, vcs: &vcs },
+            Path::new("/checkout"),
+            "feature/x",
+            Some("main"),
+            None,
+            true,
+            "2026-07-27T00:00:00Z",
+        )
+        .await;
         assert_eq!(landed.value, ConditionValue::False);
+        assert_eq!(runner.calls().len(), 1);
         assert!(landed.details.iter().any(|detail| detail.contains("2 commits beyond origin/main")), "details: {:?}", landed.details);
     }
 
@@ -826,7 +836,7 @@ mod tests {
             Path::new("/checkout"),
             "feature/x",
             Some("main"),
-            None,
+            Some("1162"),
             true,
             "2026-07-27T00:00:00Z",
         )
@@ -848,7 +858,7 @@ mod tests {
             Path::new("/checkout"),
             "feature/x",
             Some("main"),
-            None,
+            Some("1162"),
             true,
             "2026-07-27T00:00:00Z",
         )
@@ -903,7 +913,7 @@ mod tests {
             Path::new("/checkout"),
             "feature/x",
             Some("main"),
-            None,
+            Some("1162"),
             true,
             "2026-07-27T00:00:00Z",
         )
@@ -915,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn indeterminate_base_without_change_request_is_unknown() {
-        let runner = Arc::new(MockRunner::new(vec![Err("fatal: ambiguous argument".into()), Ok("[]".into())]));
+        let runner = Arc::new(MockRunner::new(vec![Err("fatal: ambiguous argument".into())]));
         let vcs = test_vcs(runner.clone());
         let (landed, _, _) = inspect_landed(
             IntegrationProviders { runner: &*runner, vcs: &vcs },

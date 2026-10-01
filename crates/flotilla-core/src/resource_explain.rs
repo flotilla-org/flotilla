@@ -225,6 +225,11 @@ pub(crate) fn explain_unmet_expectation(expectation: UnmetSettlementExpectation)
             subject: format!("change_request/{record}"),
             detail,
         },
+        UnmetSettlementExpectation::SubjectDiscoveryPending { convoy } => ExplainedUnmetExpectation {
+            reason: "subject_discovery_pending".to_string(),
+            subject: format!("convoy/{convoy}"),
+            detail: "The convoy's branch has not been searched for change requests".to_string(),
+        },
         UnmetSettlementExpectation::InvalidExpectedCheckouts { message } => {
             ExplainedUnmetExpectation { reason: "invalid_expected_checkouts".to_string(), subject: "convoy".to_string(), detail: message }
         }

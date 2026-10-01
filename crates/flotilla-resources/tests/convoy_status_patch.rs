@@ -220,6 +220,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -387,6 +388,7 @@ fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -454,6 +456,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -529,6 +532,7 @@ fn crew_failure_records_terminal_state_and_message() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -574,6 +578,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -629,6 +634,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -675,6 +681,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -718,6 +725,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -798,6 +806,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -853,6 +862,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -916,6 +926,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -949,6 +960,7 @@ fn forced_work_completion_claim_enters_landing() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -992,6 +1004,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,
@@ -1039,6 +1052,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,

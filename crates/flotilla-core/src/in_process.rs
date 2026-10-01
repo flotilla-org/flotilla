@@ -4194,9 +4194,18 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let mut subjects = Vec::new();
         let mut errors = Vec::new();
+        let adopted = convoy
+            .spec
+            .declared_subjects()?
+            .into_iter()
+            .filter(|entry| entry.relationship == flotilla_protocol::Relationship::Adopts)
+            .map(|entry| entry.subject)
+            .collect::<BTreeSet<_>>();
         let observed_subjects = observed_change_request_subjects(&convoy, &checkouts, &forges)?;
         for subject in &observed_subjects {
-            if !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject)) {
+            if !adopted.contains(subject)
+                && !convoy.status.as_ref().is_some_and(|status| status.unlinked_subjects.contains(subject) || status.produces(subject))
+            {
                 subjects.push((subject.clone(), flotilla_protocol::Relationship::Produces));
             }
         }
@@ -4215,10 +4224,11 @@ impl InProcessDaemon {
                 Some(Ok(Some(request))) if request.repository_key == repository.repo_ref => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        if !adopted.contains(&subject)
+                            && !convoy
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
                         {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
@@ -4229,17 +4239,22 @@ impl InProcessDaemon {
                 // retried by the aggregator; repeating it per repository here
                 // would spend extra provider quota. A match in another repository
                 // falls through to this repository's individual lookup.
-                Some(Ok(None) | Err(_)) => continue,
+                Some(Ok(None)) => continue,
+                Some(Err(error)) => {
+                    errors.push(error.clone());
+                    continue;
+                }
                 _ => {}
             }
             match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
                 Ok(Some(request)) => {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if !convoy
-                            .status
-                            .as_ref()
-                            .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
+                        if !adopted.contains(&subject)
+                            && !convoy
+                                .status
+                                .as_ref()
+                                .is_some_and(|status| status.unlinked_subjects.contains(&subject) || status.produces(&subject))
                         {
                             subjects.push((subject, flotilla_protocol::Relationship::Produces));
                         }
@@ -4257,6 +4272,11 @@ impl InProcessDaemon {
             })
             .await
             .map_err(|error| error.to_string())?;
+        }
+        if errors.is_empty() && convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_at.is_none()) {
+            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScan { at: self.clock.now() })
+                .await
+                .map_err(|error| error.to_string())?;
         }
         if let Some(error) = errors.into_iter().next() {
             return Err(error);
@@ -8467,19 +8487,6 @@ impl InProcessDaemon {
             return Ok(flotilla_protocol::CommandValue::Ok);
         }
         if forced_by.is_none() && !existing_claim_is_admitted {
-            // Include the candidate claim while deriving PR subjects. Accepted
-            // claims persist this message, so later settlement derives the
-            // same leaves from the stored crew work.
-            let mut claim_convoy = convoy.clone();
-            if let Some(work) = claim_convoy
-                .status
-                .as_mut()
-                .and_then(|status| status.crew_work.get_mut(&context.vessel))
-                .and_then(|crew| crew.get_mut(&context.caller_role))
-            {
-                work.phase = CrewWorkPhase::Done;
-                work.message = message.clone();
-            }
             let checkout_sources =
                 self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?;
             let checkouts = flotilla_resources::select_convoy_children(&convoy, &checkout_sources.items);
@@ -8504,7 +8511,7 @@ impl InProcessDaemon {
             let mut observation_errors = Vec::new();
             if requires_change_request {
                 let mut subjects = BTreeSet::new();
-                for leaf in expected_change_request_leaves(&claim_convoy, &checkouts)? {
+                for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
                     if let Some(subject) = crate::change_request_observer::ChangeRequestRef::from_address(namespace, &leaf.address) {
                         subjects.insert((subject.service, subject.scope, subject.number));
                     }
@@ -8544,7 +8551,7 @@ impl InProcessDaemon {
                 }
             }
             let unmet = evaluate_crew_completion(
-                &claim_convoy,
+                &convoy,
                 CrewCompletionClaim { vessel: &context.vessel, role: &context.caller_role },
                 &checkouts,
                 &change_requests,

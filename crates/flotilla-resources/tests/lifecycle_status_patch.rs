@@ -129,7 +129,9 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
-        ConvoyStatusPatch::DiscoverSubjects { .. } | ConvoyStatusPatch::UnlinkSubject { .. } => {
+        ConvoyStatusPatch::DiscoverSubjects { .. }
+        | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
+        | ConvoyStatusPatch::UnlinkSubject { .. } => {
             panic!("subject patches are outside this lifecycle contract")
         }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
@@ -286,6 +288,7 @@ fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
+        branch_subject_scan_at: None,
         stalled: None,
         provisioning: None,
         placement_decision: None,

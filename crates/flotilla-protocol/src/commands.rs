@@ -330,6 +330,8 @@ pub struct ConvoyExplanation {
     pub evidence_ttl_seconds: u64,
     pub change_request_stale_after_seconds: u64,
     pub checkouts: Vec<ExplainedCheckout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<crate::result_set::ConvoySubjectRow>,
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,

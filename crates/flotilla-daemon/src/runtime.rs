@@ -10971,20 +10971,35 @@ mod tests {
             )
             .await
             .expect("create authority convoy");
+        let mut landing_status = ConvoyStatus {
+            phase: ConvoyPhase::Landing,
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+                turn_delivery: Default::default(),
+                vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+            }),
+            work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
+            observed_workflow_ref: Some("review-and-fix".to_string()),
+            ..Default::default()
+        };
+        landing_status.branch_subject_scan_at = Some(chrono::Utc::now());
+        landing_status.discover_subject(
+            flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::provider_data::IssueSource {
+                    service: "github.com".to_string(),
+                    scope: "flotilla-org/flotilla".to_string(),
+                },
+                id: "1367".to_string(),
+            },
+            flotilla_protocol::Relationship::Produces,
+            flotilla_resources::SubjectDiscoverySource::Branch,
+            chrono::Utc::now(),
+        );
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landing,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
-                }),
-                work: BTreeMap::from([("work".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Complete).build())]),
-                observed_workflow_ref: Some("review-and-fix".to_string()),
-                ..Default::default()
-            })
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &landing_status)
             .await
             .expect("mark authority convoy Landing");
         checkout_host
@@ -11969,6 +11984,7 @@ mod tests {
             None
         };
 
+        record_successful_empty_branch_scan(&backend, "convoy-a").await;
         daemon
             .execute(
                 Command::builder()
@@ -12047,6 +12063,16 @@ mod tests {
         Fut: std::future::Future<Output = bool>,
     {
         wait_until_with_timeout(Duration::from_secs(5), condition).await;
+    }
+
+    async fn record_successful_empty_branch_scan(backend: &ResourceBackend, convoy: &str) {
+        flotilla_resources::apply_status_patch(
+            &backend.clone().using::<Convoy>(NAMESPACE),
+            convoy,
+            &flotilla_resources::ConvoyStatusPatch::RecordBranchSubjectScan { at: chrono::Utc::now() },
+        )
+        .await
+        .expect("record empty branch discovery for test provider");
     }
 
     async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
@@ -13911,6 +13937,7 @@ mod tests {
         )
         .await
         .expect("record observed absence of a change request");
+        record_successful_empty_branch_scan(&backend, &crew_record).await;
         let final_review_id = daemon
             .execute(
                 Command::builder()
@@ -14119,6 +14146,7 @@ mod tests {
         .await;
 
         daemon.reconcile_adopted_checkouts(NAMESPACE).await.expect("adopted checkout integration observation should succeed");
+        record_successful_empty_branch_scan(&backend, &adopted_record).await;
         let complete_id = daemon
             .execute(
                 Command::builder()

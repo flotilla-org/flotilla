@@ -391,6 +391,7 @@ async fn reconcile_with_observed_change_request(
     let checkouts = backend.clone().using::<Checkout>("flotilla");
     let mut status = bootstrapped_convoy_status();
     status.phase = phase;
+    status.branch_subject_scan_at = Some(timestamp(40));
     for work in status.work.values_mut() {
         work.phase = WorkPhase::Complete;
     }
@@ -1176,6 +1177,124 @@ fn missing_change_request_is_reported_once_across_terminal_exit_entries() {
     );
 }
 
+#[test]
+fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
+    let now = timestamp(40);
+    let request = |scope: &str, id: &str| flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: scope.into() },
+        id: id.into(),
+    };
+    let subjects = [
+        (request("flotilla-org/flotilla", "2372"), flotilla_protocol::Relationship::Produces),
+        (request("flotilla-org/flotilla", "2394"), flotilla_protocol::Relationship::Produces),
+        (request("flotilla-org/cleat", "281"), flotilla_protocol::Relationship::Adopts),
+        (request("flotilla-org/flotilla", "2339"), flotilla_protocol::Relationship::Produces),
+        (request("flotilla-org/flotilla", "2339"), flotilla_protocol::Relationship::Supersedes),
+    ];
+    let spec = flotilla_resources::ConvoySpec::builder()
+        .workflow_ref("interactive".to_string())
+        .subjects(
+            subjects
+                .into_iter()
+                .map(|(subject, relationship)| flotilla_resources::DeclaredSubject {
+                    subject,
+                    relationship,
+                    issue: None,
+                    change_request: None,
+                })
+                .collect(),
+        )
+        .build();
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        workflow_snapshot: Some(WorkflowSnapshot {
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+            turn_delivery: Default::default(),
+            vessels: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    let convoy = convoy_object("multi-cr", spec, Some(status));
+    let mut records = BTreeMap::new();
+    for (scope, number, state) in [
+        ("flotilla-org/flotilla", 2372, ObservedChangeRequestState::Merged),
+        ("flotilla-org/flotilla", 2394, ObservedChangeRequestState::Closed),
+        ("flotilla-org/cleat", 281, ObservedChangeRequestState::Merged),
+    ] {
+        let name = change_request_record_name("github.com", scope, number);
+        let mut status = merged_change_request_status(now);
+        status.state = Observation::known(state, now);
+        records.insert(name.clone(), flotilla_resources::ResourceObject::<ChangeRequest> {
+            metadata: common::object_meta(&name, "flotilla", "1"),
+            spec: ChangeRequestSpec::builder()
+                .service("github.com".to_string())
+                .scope(scope.to_string())
+                .number(number)
+                .observing_authority("host-a".to_string())
+                .build(),
+            status: Some(status),
+        });
+    }
+    let evaluate = |records: &BTreeMap<_, _>| {
+        evaluate_landing_settlement(
+            &convoy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            records,
+            Duration::from_secs(180),
+            Duration::from_secs(180),
+            now,
+        )
+    };
+    assert!(evaluate(&records).satisfied, "mixed merged and closed subjects are all terminal");
+    records.remove(&change_request_record_name("github.com", "flotilla-org/cleat", 281));
+    assert!(!evaluate(&records).satisfied, "a second repository still blocks landing");
+}
+
+#[test]
+fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr() {
+    let mut spec = valid_convoy_spec();
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec::builder()
+        .url("https://github.com/flotilla-org/flotilla".to_string())
+        .repo_ref(RepositoryKey("repo-a".to_string()))
+        .source_ref("feature/no-pr".to_string())
+        .target_ref("main".to_string())
+        .workspace_slug("flotilla".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    spec.adopted_checkout_refs.insert(RepositoryKey("repo-a".to_string()), "checkout-a".to_string());
+    let status = ConvoyStatus {
+        phase: ConvoyPhase::Landing,
+        workflow_snapshot: Some(WorkflowSnapshot {
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
+            turn_delivery: Default::default(),
+            vessels: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    let convoy = convoy_object("no-pr", spec, Some(status));
+    let evaluate = |convoy: &flotilla_resources::ResourceObject<Convoy>| {
+        evaluate_landing_settlement(
+            convoy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Duration::from_secs(180),
+            Duration::from_secs(180),
+            timestamp(40),
+        )
+    };
+    assert!(matches!(evaluate(&convoy).unmet.as_slice(), [UnmetSettlementExpectation::SubjectDiscoveryPending { .. }]));
+    let mut scanned = convoy;
+    scanned.status.as_mut().expect("status").branch_subject_scan_at = Some(timestamp(40));
+    assert!(!evaluate(&scanned).unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::SubjectDiscoveryPending { .. })));
+}
+
 #[tokio::test]
 async fn landing_discharges_checkout_without_change_request_despite_false_landed_condition() {
     let outcome = reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::False), None, timestamp(40)).await;
@@ -1521,7 +1640,19 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
             serde_json::json!(BTreeMap::from([(RepositoryKey("repo-a".to_string()), "remote-checkout".to_string())])),
         )]),
     });
-    let source = convoy_object("cross-host", valid_convoy_spec(), Some(status));
+    let mut spec = valid_convoy_spec();
+    spec.r#ref = Some("feature/open-pr".to_string());
+    spec.repositories.push(
+        flotilla_resources::ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(RepositoryKey("repo-a".to_string()))
+            .source_ref("feature/open-pr".to_string())
+            .target_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build(),
+    );
+    let source = convoy_object("cross-host", spec, Some(status));
     let created = convoys.create(&convoy_meta("cross-host"), &source.spec).await.expect("create authority convoy");
     convoys
         .update_status("cross-host", &created.metadata.resource_version, source.status.as_ref().expect("convoy status"))
@@ -1578,7 +1709,20 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .with_federated_checkouts(authority.including_replicas::<Checkout>("flotilla"));
     let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
     let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
-
+    let Some(ConvoyStatusPatch::DiscoverSubjects { subjects, .. }) = outcome.patch else {
+        panic!("remote checkout evidence must be persisted before settlement");
+    };
+    assert_eq!(subjects.len(), 1);
+    flotilla_resources::apply_status_patch(&convoys, "cross-host", &ConvoyStatusPatch::DiscoverSubjects {
+        subjects,
+        source: flotilla_resources::SubjectDiscoverySource::Branch,
+        at: timestamp(40),
+    })
+    .await
+    .expect("persist discovered request");
+    let current = convoys.get("cross-host").await.expect("convoy with discovered request");
+    let deps = reconciler.prepare(&current).await.expect("resolve federated dependencies");
+    let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
     assert_eq!(outcome.patch, None, "an open remote change request must hold Landing");
 }
 
