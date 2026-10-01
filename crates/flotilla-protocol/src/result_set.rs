@@ -1316,6 +1316,7 @@ mod tests {
                         body: None,
                         state: IssueState::Open,
                         labels: vec!["protocol".into()],
+                        assignees: vec![],
                         as_of: Utc.with_ymd_and_hms(2026, 7, 15, 9, 30, 0).unwrap(),
                         observed_at: None,
                         provider_name: "linear".into(),

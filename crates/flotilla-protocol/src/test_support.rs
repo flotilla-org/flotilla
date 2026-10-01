@@ -169,6 +169,7 @@ impl TestIssue {
             body: None,
             state: IssueState::Open,
             labels: self.labels,
+            assignees: vec![],
             as_of: "2026-07-15T09:30:00Z".parse().expect("valid test issue timestamp"),
             observed_at: None,
             provider_name: String::new(),

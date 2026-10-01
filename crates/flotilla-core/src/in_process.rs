@@ -207,6 +207,8 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
         let issue = daemon.fetch_issue_by_ref(&reference).await?;
         let observed_at = chrono::Utc::now();
         Ok(flotilla_resources::IssueStatus {
+            title: flotilla_resources::Observation::known(issue.title, observed_at),
+            assignees: flotilla_resources::Observation::known(issue.assignees, observed_at),
             state: flotilla_resources::Observation::known(
                 match issue.state {
                     flotilla_protocol::IssueState::Open => flotilla_resources::ObservedIssueState::Open,

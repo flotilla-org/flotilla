@@ -74,6 +74,9 @@ impl Factory for GitHubChangeRequestFactory {
         if let Some(login) = config.load_config().change_request.review_bot_login {
             provider = provider.with_review_bot_login(login);
         }
+        if let Some(login) = config.load_config().change_request.operator_login {
+            provider = provider.with_operator_login(login);
+        }
         Ok(Arc::new(provider))
     }
 }
@@ -165,7 +168,11 @@ impl Factory for ForgejoChangeRequestFactory {
         }
         let provider_config = forgejo_provider_config(env, config)?;
         let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
-        Ok(Arc::new(ForgejoChangeRequestProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config, slug)))
+        let mut provider = ForgejoChangeRequestProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config, slug);
+        if let Some(login) = config.load_config().change_request.operator_login {
+            provider = provider.with_operator_login(login);
+        }
+        Ok(Arc::new(provider))
     }
 }
 

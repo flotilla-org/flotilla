@@ -115,6 +115,10 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
             .observing_authority("test".to_string())
             .build(),
         status: Some(ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: Observation::known(state, now),
             head_sha: Observation::known("abc".to_string(), now),
             checks: Observation::known(checks, now),
@@ -181,6 +185,10 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
             .observing_authority("test".to_string())
             .build(),
         status: Some(ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: Observation::known(ObservedChangeRequestState::Open, now),
             head_sha: Observation::known(head.to_string(), now),
             checks: Observation::known(ObservedChecks::Pass, now),
@@ -358,6 +366,10 @@ impl Clock for FixedClock {
 
 fn merged_change_request_status(observed_at: chrono::DateTime<chrono::Utc>) -> ChangeRequestStatus {
     ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
         state: Observation::known(ObservedChangeRequestState::Merged, observed_at),
         head_sha: Observation::known("abc123".to_string(), observed_at),
         checks: Observation::known(ObservedChecks::Pass, observed_at),

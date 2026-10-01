@@ -44,6 +44,10 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
         .as_array()
         .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
+    let assignees = v["assignees"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|item| item["login"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     let id = number.to_string();
     let as_of = v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
     let reference = IssueRef { source: source.clone(), id: id.clone() };
@@ -54,6 +58,7 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
             .maybe_body(body)
             .state(state)
             .labels(labels)
+            .assignees(assignees)
             .as_of(as_of)
             .observed_at(fetched_at)
             .provider_name("github".into())
@@ -172,6 +177,18 @@ mod tests {
     use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    fn parses_issue_title_and_assignees_from_existing_rest_response() {
+        let source = IssueSource { service: "github.com".into(), scope: "team/repo".into() };
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let raw =
+            serde_json::json!({"number": 7, "title": "Fix refresh", "state": "open", "assignees": [{"login": "alice"}, {"login": "bob"}]});
+        let issue = parse_issue(&source, &raw, observed_at).expect("parse issue");
+        assert_eq!(issue.title, "Fix refresh");
+        assert_eq!(issue.assignees, ["alice", "bob"]);
+        assert_eq!(issue.observed_at, Some(observed_at));
+    }
     use crate::providers::{
         github_api::{GhApi, GhApiResponse},
         github_test_support::{build_api_and_runner, repo_root_for_recording},

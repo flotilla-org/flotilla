@@ -566,6 +566,10 @@ mod tests {
                 .observing_authority("feta".to_string())
                 .build(),
             status: Some(crate::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: crate::Observation::known(crate::ObservedChangeRequestState::Merged, observed_at),
                 head_sha: crate::Observation::known("abc".to_string(), observed_at),
                 checks: crate::Observation::known(crate::ObservedChecks::Pass, observed_at),
@@ -614,6 +618,10 @@ mod tests {
                 .observing_authority("feta".to_string())
                 .build(),
             status: Some(crate::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: crate::Observation::known(crate::ObservedChangeRequestState::Open, observed_at),
                 head_sha: crate::Observation::known("abc".to_string(), observed_at),
                 checks: crate::Observation::known(crate::ObservedChecks::Pass, observed_at),

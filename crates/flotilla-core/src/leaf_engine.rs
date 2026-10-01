@@ -2215,6 +2215,10 @@ mod tests {
                 flotilla_resources::ObservedChangeRequestState::Open
             };
             Ok(flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(state, observed_at),
                 head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -2235,6 +2239,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let observed_at = Utc::now();
             Ok(flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
                 head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -2930,6 +2938,10 @@ mod tests {
 
         let mut record_version = record.metadata.resource_version;
         let stale_status = flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, base),
             head_sha: flotilla_resources::Observation::known("stale".to_string(), base),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, base),
@@ -2958,6 +2970,10 @@ mod tests {
             }
             let observed_at = claim_at + chrono::Duration::seconds(1);
             let cr_status = flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
                 head_sha: flotilla_resources::Observation::known(head.to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Fail, observed_at),
@@ -3363,6 +3379,10 @@ mod tests {
         let observed_at = Utc::now();
         remote_records
             .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
                 head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -3520,6 +3540,10 @@ mod tests {
         let observed_at = Utc::now();
         records
             .update_status(&created.metadata.name, &created.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                title: Default::default(),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
                 head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
                 checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -3703,6 +3727,10 @@ mod tests {
                 .build()
         };
         let status = |state, observed_at| flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(state, observed_at),
             head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -3821,6 +3849,10 @@ mod tests {
             number: 2053,
         };
         let status = |observed_at| flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, observed_at),
             head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -3919,6 +3951,10 @@ mod tests {
             .expect("create owner record");
         let old = Utc::now() - chrono::Duration::seconds(3);
         let old_status = flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, old),
             head_sha: flotilla_resources::Observation::known("old".to_string(), old),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, old),
@@ -4019,12 +4055,16 @@ mod tests {
         let created = records.get(&name).await.expect("demand creates record");
         let now = Utc::now();
         let status = flotilla_resources::IssueStatus {
+            title: Default::default(),
+            assignees: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Open, now),
             labels: flotilla_resources::Observation::known(vec!["ready".into()], now),
             updated_at: flotilla_resources::Observation::known(now, now),
         };
         let opened = records.update_status(&name, &created.metadata.resource_version, &status).await.expect("open issue");
         let closed = flotilla_resources::IssueStatus {
+            title: Default::default(),
+            assignees: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, Utc::now()),
             ..status
         };
@@ -4053,6 +4093,8 @@ mod tests {
             .expect("issue");
         let old = Utc::now() - chrono::Duration::seconds(5);
         let stale = flotilla_resources::IssueStatus {
+            title: Default::default(),
+            assignees: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, old),
             labels: flotilla_resources::Observation::known(vec![], old),
             updated_at: flotilla_resources::Observation::known(old, old),
@@ -4087,6 +4129,8 @@ mod tests {
         let now = Utc::now();
         records
             .update_status(&name, &created.metadata.resource_version, &flotilla_resources::IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
                 labels: flotilla_resources::Observation::known(vec![], now),
                 updated_at: flotilla_resources::Observation::known(now, now),
@@ -4200,6 +4244,8 @@ mod tests {
         let changed_at = Utc::now();
         records
             .update_status(&name, &issue.metadata.resource_version, &flotilla_resources::IssueStatus {
+                title: Default::default(),
+                assignees: Default::default(),
                 state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, changed_at),
                 labels: flotilla_resources::Observation::known(vec!["done".into()], changed_at),
                 updated_at: flotilla_resources::Observation::known(changed_at, changed_at),

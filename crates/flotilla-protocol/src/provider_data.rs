@@ -114,6 +114,9 @@ pub struct Issue {
     pub body: Option<String>,
     pub state: IssueState,
     pub labels: Vec<String>,
+    #[serde(default)]
+    #[builder(default)]
+    pub assignees: Vec<String>,
     /// When the external source last changed the issue.
     pub as_of: DateTime<Utc>,
     /// When Flotilla observed this exact snapshot.

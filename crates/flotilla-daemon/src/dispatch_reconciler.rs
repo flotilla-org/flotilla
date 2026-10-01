@@ -440,6 +440,7 @@ mod tests {
             body: body.map(str::to_string),
             state,
             labels: labels.iter().map(|label| (*label).to_string()).collect(),
+            assignees: vec![],
             as_of: "2026-08-04T12:00:00Z".parse().expect("timestamp"),
             observed_at: Some("2026-08-04T12:01:00Z".parse().expect("timestamp")),
             provider_name: "fake".to_string(),

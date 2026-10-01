@@ -126,6 +126,10 @@ fn parse_issue(source: &IssueSource, value: &serde_json::Value, fetched_at: Date
         .as_array()
         .map(|labels| labels.iter().filter_map(|label| label["name"].as_str().map(str::to_string)).collect())
         .unwrap_or_default();
+    let assignees = value["assignees"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|item| item["login"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     let as_of = value["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
     let id = number.to_string();
     Some(
@@ -135,6 +139,7 @@ fn parse_issue(source: &IssueSource, value: &serde_json::Value, fetched_at: Date
             .maybe_body(body)
             .state(state)
             .labels(labels)
+            .assignees(assignees)
             .as_of(as_of)
             .observed_at(fetched_at)
             .provider_name("forgejo".into())
@@ -243,6 +248,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn parses_issue_title_and_assignees_from_existing_rest_response() {
+        let source = IssueSource { service: "https://forgejo.example".into(), scope: "team/repo".into() };
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let raw = serde_json::json!({"number": 7, "title": "Fix refresh", "state": "open", "assignees": [{"login": "alice"}]});
+        let issue = parse_issue(&source, &raw, observed_at).expect("parse issue");
+        assert_eq!(issue.title, "Fix refresh");
+        assert_eq!(issue.assignees, ["alice"]);
+        assert_eq!(issue.observed_at, Some(observed_at));
+    }
     use crate::providers::{
         issue_tracker::{tests::assert_provider_contract, IssueProvider},
         replay::{self, Masks},

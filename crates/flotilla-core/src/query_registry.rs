@@ -293,6 +293,7 @@ mod tests {
                 body: None,
                 state: IssueState::Open,
                 labels: Vec::new(),
+                assignees: vec![],
                 as_of: Utc::now(),
                 observed_at: None,
                 provider_name: "github".into(),

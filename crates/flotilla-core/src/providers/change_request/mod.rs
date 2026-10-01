@@ -43,6 +43,10 @@ pub trait ChangeRequestTracker: Send + Sync {
             statuses.insert(
                 *number,
                 Ok(ChangeRequestStatus {
+                    title: Observation::known(request.title, observed_at),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
                     state: Observation::known(state, observed_at),
                     head_sha: Observation::unknown(observed_at),
                     checks: Observation::unknown(observed_at),

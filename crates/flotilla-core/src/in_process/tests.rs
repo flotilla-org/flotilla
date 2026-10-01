@@ -1870,6 +1870,10 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     let observed_at = Utc::now();
     change_requests
         .update_status(&observation.metadata.name, &observation.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(ObservedChangeRequestState::Open, observed_at),
             head_sha: flotilla_resources::Observation::unknown(observed_at),
             checks: flotilla_resources::Observation::unknown(observed_at),
@@ -6503,6 +6507,10 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
     let fresh = Utc::now();
     records
         .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, fresh),
             head_sha: flotilla_resources::Observation::known("head".into(), fresh),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, fresh),
@@ -6604,6 +6612,10 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
     let old = Utc::now() - chrono::Duration::hours(1);
     records
         .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, old),
             head_sha: flotilla_resources::Observation::known("old".into(), old),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pending, old),

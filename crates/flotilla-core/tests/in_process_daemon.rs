@@ -994,6 +994,10 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
         .expect("create change request");
     change_requests
         .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
             head_sha: flotilla_resources::Observation::known("abc123".to_string(), observed_at),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
@@ -2148,6 +2152,10 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
     let at = chrono::Utc::now();
     records
         .update_status(&name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Open, at),
             head_sha: flotilla_resources::Observation::unknown(at),
             checks: flotilla_resources::Observation::unknown(at),
@@ -4207,6 +4215,10 @@ async fn landed_convoy_teardown_accepts_merged_produced_subject_when_checkout_st
     let now = chrono::Utc::now();
     changes
         .update_status(&record_name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
             state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, now),
             head_sha: flotilla_resources::Observation::known("abc".to_string(), now),
             checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, now),

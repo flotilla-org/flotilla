@@ -54,7 +54,7 @@ pub use artifact::{artifact_record_name, Artifact, ArtifactSpec};
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use change_request::{
     change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
-    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
 };
 pub use checkout::{
     latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,
