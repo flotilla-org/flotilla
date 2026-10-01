@@ -7927,6 +7927,23 @@ async fn crew_completion_delivers_the_pending_brief_as_the_next_turn() {
     let status = convoys.get("turn-boundary").await.expect("read settled convoy").status.expect("status");
     assert_eq!(status.phase, ConvoyPhase::Landing);
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
+    let stall_error = daemon
+        .crew_stall_internal(
+            &flotilla_protocol::CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".to_string()),
+                convoy: Some("turn-boundary".to_string()),
+                vessel_ref: Some("work-vessel".to_string()),
+                role: Some("coder".to_string()),
+            },
+            flotilla_protocol::StallReason::Scope,
+            None,
+            "settlement waits for the change request to merge".to_string(),
+        )
+        .await
+        .expect_err("completed crew cannot stall during landing");
+    assert!(stall_error.contains("already complete") && stall_error.contains("change request"), "{stall_error}");
+    assert_eq!(convoys.get("turn-boundary").await.expect("read convoy after stall").status.expect("status after stall"), status);
 }
 
 #[tokio::test]

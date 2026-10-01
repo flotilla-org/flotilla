@@ -11,7 +11,7 @@ use common::{
 use flotilla_resources::{
     change_request_record_name,
     controller::{Actuation, Reconciler},
-    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, implement_review_workflow_spec,
+    controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
     interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation,
     ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase,
@@ -1177,6 +1177,47 @@ async fn landing_with_settled_change_request_becomes_landed() {
         reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
+}
+
+#[tokio::test]
+async fn completed_crew_cannot_stall_landing_while_change_request_merges() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        work: BTreeMap::from([("implement".to_string(), flotilla_resources::WorkState::builder().phase(WorkPhase::Running).build())]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([("coder".to_string(), flotilla_resources::CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+        )]),
+        ..Default::default()
+    };
+    external_patches::mark_crew_completed(
+        "implement".to_string(),
+        "coder".to_string(),
+        timestamp(20),
+        Some("https://github.com/flotilla-org/flotilla/pull/42".to_string()),
+        None,
+        None,
+    )
+    .apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landing);
+
+    external_patches::mark_crew_stalled(
+        "convoy-a".to_string(),
+        "implement".to_string(),
+        "coder".to_string(),
+        timestamp(21),
+        flotilla_protocol::StallReason::Scope,
+        None,
+        "settlement awaits change request merge".to_string(),
+    )
+    .apply(&mut status);
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
+    assert!(status.stalled.is_none());
+
+    let merged =
+        reconcile_with_observed_change_request(ConvoyPhase::Landing, Some(ConditionValue::True), Some("main"), timestamp(40)).await;
+    merged.patch.expect("merged change request settles landing").apply(&mut status);
+    assert_eq!(status.phase, ConvoyPhase::Landed);
 }
 
 #[tokio::test]

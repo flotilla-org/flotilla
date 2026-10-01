@@ -8628,6 +8628,17 @@ impl InProcessDaemon {
         if status.phase.is_terminal() {
             return Err("cannot stall crew work in a terminal convoy".to_string());
         }
+        if status
+            .crew_work
+            .get(&context.vessel)
+            .and_then(|crew| crew.get(&context.caller_role))
+            .is_some_and(|state| state.phase == CrewWorkPhase::Done)
+        {
+            return Err(
+                "crew work is already complete; pending change request merge and convoy landing are world conditions, not a crew stall"
+                    .to_string(),
+            );
+        }
         if !status
             .crew_work
             .get(&context.vessel)
