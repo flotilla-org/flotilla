@@ -149,6 +149,7 @@ impl LocalBlobStore {
         };
         let mut hash = Sha256::new();
         let mut size = 0_u64;
+        // This buffer lives across reads; keep it off the async poll stack.
         let mut chunk = vec![0_u8; 65536];
         loop {
             let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;
@@ -752,6 +753,7 @@ async fn digest_file(path: &Path) -> Result<(BlobDigest, u64), String> {
     let mut file = tokio::fs::File::open(path).await.map_err(|error| error.to_string())?;
     let mut hash = Sha256::new();
     let mut size = 0_u64;
+    // This buffer lives across reads; keep it off the async poll stack.
     let mut chunk = vec![0_u8; 65536];
     loop {
         let read = file.read(&mut chunk).await.map_err(|error| error.to_string())?;

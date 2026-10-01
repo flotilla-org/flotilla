@@ -583,6 +583,9 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
 
 #[test]
 fn cross_host_request_fits_one_megabyte_stack() {
+    // One MiB leaves headroom below the default 2 MiB test stack on macOS.
+    // If this fails on another target, measure the debug dispatch poll frames
+    // before changing the budget.
     std::thread::Builder::new()
         .name("cross-host-stack-regression".into())
         .stack_size(1024 * 1024)

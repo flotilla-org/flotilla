@@ -321,12 +321,12 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_shutdown(&self, id: u64, request: Request) -> Message {
-        let Request::Shutdown = request else { unreachable!("Shutdown request selected the wrong handler") };
+        let Request::Shutdown = request else { return Message::error_response(id, "Shutdown request selected the wrong handler") };
         Message::ok_response(id, Response::Shutdown)
     }
 
     async fn dispatch_request_list_repos(&self, id: u64, request: Request) -> Message {
-        let Request::ListRepos = request else { unreachable!("ListRepos request selected the wrong handler") };
+        let Request::ListRepos = request else { return Message::error_response(id, "ListRepos request selected the wrong handler") };
         match self.daemon.list_repos().await {
             Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
             Err(e) => Message::error_response(id, e),
@@ -335,7 +335,7 @@ impl<'a> RequestDispatcher<'a> {
 
     async fn dispatch_request_artifact_put(&self, id: u64, request: Request) -> Message {
         let Request::ArtifactPut { kind, subject, mut summary, media_type, source_path } = request else {
-            unreachable!("ArtifactPut request selected the wrong handler")
+            return Message::error_response(id, "ArtifactPut request selected the wrong handler");
         };
         let result = Box::pin(async {
             let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
@@ -480,7 +480,7 @@ impl<'a> RequestDispatcher<'a> {
 
     async fn dispatch_request_artifact_get(&self, id: u64, request: Request) -> Message {
         let Request::ArtifactGet { reference, destination_path } = request else {
-            unreachable!("ArtifactGet request selected the wrong handler")
+            return Message::error_response(id, "ArtifactGet request selected the wrong handler");
         };
         let result = Box::pin(async {
             let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
@@ -516,7 +516,7 @@ impl<'a> RequestDispatcher<'a> {
 
     async fn dispatch_request_artifact_list(&self, id: u64, request: Request) -> Message {
         let Request::ArtifactList { convoy, kind, subject } = request else {
-            unreachable!("ArtifactList request selected the wrong handler")
+            return Message::error_response(id, "ArtifactList request selected the wrong handler");
         };
         let result = Box::pin(async {
             let blobs = self.remote_command_router.blob_store()?;
@@ -545,7 +545,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_execute(&self, id: u64, request: Request) -> Message {
-        let Request::Execute { command } = request else { unreachable!("Execute request selected the wrong handler") };
+        let Request::Execute { command } = request else {
+            return Message::error_response(id, "Execute request selected the wrong handler");
+        };
         if command.action.is_query() {
             // Query commands: execute synchronously (local or remote)
             // and return the result directly as a QueryResult.
@@ -570,7 +572,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_cancel(&self, id: u64, request: Request) -> Message {
-        let Request::Cancel { command_id } = request else { unreachable!("Cancel request selected the wrong handler") };
+        let Request::Cancel { command_id } = request else {
+            return Message::error_response(id, "Cancel request selected the wrong handler");
+        };
         match self.remote_command_router.dispatch_cancel(command_id).await {
             Ok(()) => Message::ok_response(id, Response::Cancel),
             Err(e) => Message::error_response(id, e),
@@ -578,7 +582,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_refresh(&self, id: u64, request: Request) -> Message {
-        let Request::Refresh { repo } = request else { unreachable!("Refresh request selected the wrong handler") };
+        let Request::Refresh { repo } = request else { return Message::error_response(id, "Refresh request selected the wrong handler") };
         let command = Command {
             node_id: None,
             provisioning_target: None,
@@ -592,7 +596,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_add_repo(&self, id: u64, request: Request) -> Message {
-        let Request::AddRepo { path } = request else { unreachable!("AddRepo request selected the wrong handler") };
+        let Request::AddRepo { path } = request else { return Message::error_response(id, "AddRepo request selected the wrong handler") };
         let command =
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
         match self.daemon.execute(command).await {
@@ -602,7 +606,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_remove_repo(&self, id: u64, request: Request) -> Message {
-        let Request::RemoveRepo { path } = request else { unreachable!("RemoveRepo request selected the wrong handler") };
+        let Request::RemoveRepo { path } = request else {
+            return Message::error_response(id, "RemoveRepo request selected the wrong handler");
+        };
         let command = Command {
             node_id: None,
             provisioning_target: None,
@@ -616,7 +622,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_replay_since(&self, id: u64, request: Request) -> Message {
-        let Request::ReplaySince { last_seen } = request else { unreachable!("ReplaySince request selected the wrong handler") };
+        let Request::ReplaySince { last_seen } = request else {
+            return Message::error_response(id, "ReplaySince request selected the wrong handler");
+        };
         let last_seen = last_seen.into_iter().map(|entry| (entry.stream, entry.seq)).collect();
         match self.daemon.replay_since(&last_seen).await {
             Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
@@ -625,7 +633,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_subscribe_queries(&self, id: u64, request: Request) -> Message {
-        let Request::SubscribeQueries { queries } = request else { unreachable!("SubscribeQueries request selected the wrong handler") };
+        let Request::SubscribeQueries { queries } = request else {
+            return Message::error_response(id, "SubscribeQueries request selected the wrong handler");
+        };
         // Register interest before computing the replay so no event
         // between the two is dropped; the client ignores any stale
         // delta that races ahead of the replayed result set.
@@ -640,7 +650,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_fetch_more(&self, id: u64, request: Request) -> Message {
-        let Request::FetchMore { query } = request else { unreachable!("FetchMore request selected the wrong handler") };
+        let Request::FetchMore { query } = request else {
+            return Message::error_response(id, "FetchMore request selected the wrong handler");
+        };
         let subscribed = self.query_subscriptions.read().expect("query subscriptions lock poisoned").contains(&query);
         if !subscribed {
             Message::error_response(id, format!("query is not subscribed on this connection: {query}"))
@@ -653,7 +665,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_observe_focus(&self, id: u64, request: Request) -> Message {
-        let Request::ObserveFocus { targets } = request else { unreachable!("ObserveFocus request selected the wrong handler") };
+        let Request::ObserveFocus { targets } = request else {
+            return Message::error_response(id, "ObserveFocus request selected the wrong handler");
+        };
         match self.daemon.observe_surface_focus(self.session_id, targets).await {
             Ok(()) => Message::ok_response(id, Response::ObserveFocus),
             Err(error) => Message::error_response(id, error),
@@ -661,7 +675,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_subscribe_wait(&self, id: u64, request: Request) -> Message {
-        let Request::SubscribeWait { subscription } = request else { unreachable!("SubscribeWait request selected the wrong handler") };
+        let Request::SubscribeWait { subscription } = request else {
+            return Message::error_response(id, "SubscribeWait request selected the wrong handler");
+        };
         match self.daemon.subscribe_wait(self.session_id, subscription).await {
             Ok(subscription_id) => Message::ok_response(id, Response::WaitSubscribed { subscription_id }),
             Err(error) => Message::error_response(id, error),
@@ -669,7 +685,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_get_status(&self, id: u64, request: Request) -> Message {
-        let Request::GetStatus = request else { unreachable!("GetStatus request selected the wrong handler") };
+        let Request::GetStatus = request else { return Message::error_response(id, "GetStatus request selected the wrong handler") };
         match self.daemon.get_status().await {
             Ok(status) => Message::ok_response(id, Response::GetStatus(status)),
             Err(e) => Message::error_response(id, e),
@@ -677,7 +693,7 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_get_topology(&self, id: u64, request: Request) -> Message {
-        let Request::GetTopology = request else { unreachable!("GetTopology request selected the wrong handler") };
+        let Request::GetTopology = request else { return Message::error_response(id, "GetTopology request selected the wrong handler") };
         match self.daemon.get_topology().await {
             Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
             Err(e) => Message::error_response(id, e),
@@ -685,7 +701,9 @@ impl<'a> RequestDispatcher<'a> {
     }
 
     async fn dispatch_request_agent_hook(&self, id: u64, request: Request) -> Message {
-        let Request::AgentHook { event } = request else { unreachable!("AgentHook request selected the wrong handler") };
+        let Request::AgentHook { event } = request else {
+            return Message::error_response(id, "AgentHook request selected the wrong handler");
+        };
         match self.handle_agent_hook(event).await {
             Ok(()) => Message::ok_response(id, Response::AgentHook),
             Err(e) => {
