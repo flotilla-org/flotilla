@@ -19,6 +19,16 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
         app.set_status_message(None);
     }
 
+    if matches!(&cmd.action, CommandAction::QueryProjectList {}) {
+        let daemon = app.daemon.clone();
+        let session_id = app.session_id;
+        tokio::spawn(async move {
+            let result = daemon.execute_query(cmd, session_id).await;
+            let _ = event_tx.send(Event::ProjectAddressesLoaded { session_id, result });
+        });
+        return;
+    }
+
     // Pane attach is a query that resolves a command for the TUI process to
     // run temporarily outside raw mode. It must not go through the ordinary
     // command lifecycle (`execute` rejects query commands).

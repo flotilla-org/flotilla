@@ -30,7 +30,6 @@ pub struct OpenView {
     pub table_state: TableState,
     pub project_table_state: ProjectTableState,
     /// Addresses left behind by in-place drill navigation in this tab.
-    /// History is ephemeral and deliberately not persisted.
     pub(crate) history: Vec<NavigationFrame>,
 }
 
@@ -47,12 +46,23 @@ impl OpenView {
             Ok(address) => ViewTarget::View(address),
             Err(error) => ViewTarget::Broken { raw: entry.address, error },
         };
+        let history = entry
+            .history
+            .into_iter()
+            .map(|raw| {
+                let target = match raw.parse::<ViewAddress>() {
+                    Ok(address) => ViewTarget::View(address),
+                    Err(error) => ViewTarget::Broken { raw, error },
+                };
+                NavigationFrame { target, table_state: TableState::default(), project_table_state: ProjectTableState::default() }
+            })
+            .collect();
         Self {
             target,
             label_override: entry.label,
             table_state: TableState::default(),
             project_table_state: ProjectTableState::default(),
-            history: Vec::new(),
+            history,
         }
     }
 
@@ -266,14 +276,15 @@ impl OpenViews {
         repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>,
         landing: Option<(RepoIdentity, ViewAddress)>,
     ) -> Self {
-        let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None }, OpenViewEntry {
+        let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None, history: vec![] }, OpenViewEntry {
             address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
             label: None,
+            history: vec![],
         }];
         let _ = repos.into_iter().count();
         if let Some((_, address)) = &landing {
             if !matches!(address, ViewAddress::Repo { .. }) {
-                entries.push(OpenViewEntry { address: address.to_string(), label: None });
+                entries.push(OpenViewEntry { address: address.to_string(), label: None, history: vec![] });
             }
         }
         let mut views = Self::from_entries(entries);
@@ -386,7 +397,21 @@ impl OpenViews {
     }
 
     pub fn to_entries(&self) -> Vec<OpenViewEntry> {
-        self.views.iter().map(|view| OpenViewEntry { address: view.persisted_address(), label: view.label_override.clone() }).collect()
+        self.views
+            .iter()
+            .map(|view| OpenViewEntry {
+                address: view.persisted_address(),
+                label: view.label_override.clone(),
+                history: view
+                    .history
+                    .iter()
+                    .map(|frame| match &frame.target {
+                        ViewTarget::View(address) => address.to_string(),
+                        ViewTarget::Broken { raw, .. } => raw.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -578,7 +603,7 @@ mod tests {
     }
 
     fn entry(address: &str) -> OpenViewEntry {
-        OpenViewEntry { address: address.to_string(), label: None }
+        OpenViewEntry { address: address.to_string(), label: None, history: vec![] }
     }
 
     fn three_tabs() -> OpenViews {
@@ -780,6 +805,30 @@ mod tests {
         views.switch_to(1);
         assert!(views.back());
         assert_eq!(views.active_address(), Some(&addr("convoys/flotilla")));
+    }
+
+    #[test]
+    fn persisted_drill_restores_current_address_and_back_history() {
+        let mut views = three_tabs();
+        views.switch_to(2);
+        assert!(views.drill(addr("issues?project=flotilla%2Froadmap")));
+        let entries = views.to_entries();
+        let mut restored = OpenViews::from_entries(entries);
+        restored.switch_to(2);
+        assert_eq!(restored.active_address(), Some(&addr("issues?project=flotilla%2Froadmap")));
+        assert!(restored.back());
+        assert_eq!(restored.active_address(), Some(&addr("project/flotilla/roadmap")));
+    }
+
+    #[test]
+    fn malformed_persisted_history_stays_visible_as_a_broken_back_target() {
+        let mut broken = entry("issues?project=flotilla%2Froadmap");
+        broken.history.push("unknown/not-a-view".into());
+        let mut views = OpenViews::from_entries(vec![entry("overview"), broken]);
+        views.switch_to(1);
+        assert!(views.back());
+        assert!(matches!(&views.active().target, ViewTarget::Broken { raw, .. } if raw == "unknown/not-a-view"));
+        assert_eq!(views.to_entries()[1].address, "unknown/not-a-view");
     }
 
     #[test]

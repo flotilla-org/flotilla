@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{file_picker_start_dir, TuiModel},
+    app::{file_picker_start_dir, ProjectAddressState, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     palette::{self, PaletteCompletion, PaletteInputState, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
@@ -27,6 +27,15 @@ pub struct CommandPaletteWidget {
     scroll_top: usize,
     target_node_id: Option<NodeId>,
     overlay: Option<crate::ui_helpers::BottomAnchoredOverlayLayout>,
+    project_load_requested: bool,
+}
+
+fn completion_display_text(completion: &PaletteCompletion, showing_addresses: bool) -> &str {
+    if showing_addresses {
+        completion.description.as_str()
+    } else {
+        completion.value.as_str()
+    }
 }
 impl Default for CommandPaletteWidget {
     fn default() -> Self {
@@ -36,16 +45,29 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None, overlay: None }
+        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None, overlay: None, project_load_requested: false }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, selected, scroll_top, target_node_id: None, overlay: None }
+        Self { input, selected, scroll_top, target_node_id: None, overlay: None, project_load_requested: false }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id, overlay: None }
+        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id, overlay: None, project_load_requested: false }
+    }
+
+    fn request_project_addresses(&mut self, ctx: &mut WidgetContext<'_>) {
+        if palette::is_open_address_completion(self.input.value())
+            && !self.project_load_requested
+            && matches!(
+                ctx.model.project_address_state,
+                ProjectAddressState::Unloaded | ProjectAddressState::Loaded(_) | ProjectAddressState::Failed
+            )
+        {
+            self.project_load_requested = true;
+            ctx.app_actions.push(AppAction::LoadProjectAddresses);
+        }
     }
 
     /// Current input text (for tests / introspection).
@@ -364,6 +386,7 @@ impl InteractiveWidget for CommandPaletteWidget {
                 let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
                 if let Some(completion) = completions.get(self.selected) {
                     self.fill_completion(completion);
+                    self.request_project_addresses(ctx);
                 }
                 Outcome::Consumed
             }
@@ -393,6 +416,7 @@ impl InteractiveWidget for CommandPaletteWidget {
         }
 
         self.input.handle_event(&crossterm::event::Event::Key(key));
+        self.request_project_addresses(ctx);
 
         self.selected = 0;
         self.scroll_top = 0;
@@ -420,6 +444,7 @@ impl InteractiveWidget for CommandPaletteWidget {
             if let Some(completion) = completions.get(index) {
                 self.selected = index;
                 self.fill_completion(completion);
+                self.request_project_addresses(ctx);
             }
         }
         Outcome::Consumed
@@ -441,7 +466,9 @@ impl InteractiveWidget for CommandPaletteWidget {
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
 
-        let name_width = completions.iter().map(|c| c.value.len()).max().unwrap_or(0).min(20);
+        let showing_addresses = palette::is_open_address_completion(self.input.value());
+        let name_width =
+            completions.iter().map(|completion| completion_display_text(completion, showing_addresses).width()).max().unwrap_or(0).min(20);
         let hint_width: u16 = 7;
 
         for (i, completion) in completions.iter().skip(self.scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
@@ -457,8 +484,14 @@ impl InteractiveWidget for CommandPaletteWidget {
             let row_area = Rect::new(area.x, row_y, area.width, 1);
             frame.render_widget(Block::default().style(row_style), row_area);
 
-            let name_span = Span::styled(format!("  {:<width$}", completion.value, width = name_width), row_style.fg(theme.text));
-            let desc_span = Span::styled(format!("  {}", completion.description), row_style.fg(theme.muted));
+            let name_span = Span::styled(
+                format!("  {:<width$}", completion_display_text(completion, showing_addresses), width = name_width),
+                row_style.fg(theme.text),
+            );
+            let desc_span = Span::styled(
+                if showing_addresses { String::new() } else { format!("  {}", completion.description) },
+                row_style.fg(theme.muted),
+            );
 
             let line = Line::from(vec![name_span, desc_span]);
             frame.render_widget(Paragraph::new(line), Rect::new(area.x, row_y, area.width.saturating_sub(hint_width), 1));
@@ -587,6 +620,92 @@ mod tests {
         let outcome = widget.handle_action(Action::Confirm, &mut harness.ctx());
         assert!(matches!(outcome, Outcome::Consumed));
         assert!(harness.commands.take_next().is_none());
+    }
+
+    #[test]
+    fn engaging_open_completion_requests_project_addresses_lazily() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+        widget.handle_raw_key(KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE), &mut ctx);
+        assert!(ctx.app_actions.iter().any(|action| matches!(action, AppAction::LoadProjectAddresses)));
+    }
+
+    #[test]
+    fn failed_project_load_retries_only_in_a_new_palette() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+        widget.handle_raw_key(KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE), &mut ctx);
+        assert_eq!(ctx.app_actions.len(), 1);
+        drop(ctx);
+
+        harness.model.project_address_state = crate::app::ProjectAddressState::Failed;
+        let mut ctx = harness.ctx();
+        widget.handle_raw_key(KeyEvent::new(KeyCode::Char('p'), crossterm::event::KeyModifiers::NONE), &mut ctx);
+        assert!(ctx.app_actions.is_empty(), "the same palette does not retry on each keypress");
+        drop(ctx);
+
+        let mut reopened = CommandPaletteWidget::with_state(Input::from("open"), 0, 0);
+        let mut ctx = harness.ctx();
+        reopened.handle_raw_key(KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE), &mut ctx);
+        assert!(ctx.app_actions.iter().any(|action| matches!(action, AppAction::LoadProjectAddresses)));
+    }
+
+    #[test]
+    fn a_new_palette_refreshes_cached_project_addresses() {
+        let mut harness = TestWidgetHarness::new();
+        harness.model.project_address_state =
+            ProjectAddressState::Loaded(vec!["project/flotilla/roadmap".parse().expect("project address")]);
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open"), 0, 0);
+        let mut ctx = harness.ctx();
+        widget.handle_raw_key(KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE), &mut ctx);
+        assert!(ctx.app_actions.iter().any(|action| matches!(action, AppAction::LoadProjectAddresses)));
+    }
+
+    #[test]
+    fn open_address_rows_render_decoded_human_labels() {
+        let mut harness = TestWidgetHarness::new();
+        harness.model.project_address_state =
+            ProjectAddressState::Loaded(vec!["project/flotilla/r%C3%A9sum%C3%A9".parse().expect("project address")]);
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open project/"), 0, 0);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
+        let mut ui = crate::app::UiState::new(&[]);
+        let theme = crate::theme::Theme::classic();
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("project/flotilla/résumé"));
+        assert!(!rendered.contains("r%C3%A9sum%C3%A9"));
+    }
+
+    #[test]
+    fn selecting_open_completion_dispatches_canonical_address() {
+        let mut harness = TestWidgetHarness::new();
+        harness.model.project_address_state =
+            ProjectAddressState::Loaded(vec!["project/flotilla/road%20map".parse().expect("project address")]);
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open road"), 0, 0);
+        let mut ctx = harness.ctx();
+        assert!(matches!(widget.handle_action(Action::FillSelected, &mut ctx), Outcome::Consumed));
+        assert_eq!(widget.input_value(), "open project/flotilla/road%20map ");
+        assert!(matches!(widget.handle_action(Action::Confirm, &mut ctx), Outcome::Finished));
+        assert!(ctx
+            .app_actions
+            .iter()
+            .any(|action| matches!(action, AppAction::OpenView(address) if address.to_string() == "project/flotilla/road%20map")));
     }
 
     #[test]

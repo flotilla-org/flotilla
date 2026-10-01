@@ -148,6 +148,9 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::AttachDispatchCompleted { session_id, result } => {
                     app::executor::handle_attach_dispatch_completion(session_id, result, &mut app);
                 }
+                Event::ProjectAddressesLoaded { session_id, result } => {
+                    app.handle_project_addresses_loaded(session_id, result);
+                }
                 Event::FleetHealthRefreshed(result) => {
                     fleet_health_refresh_in_flight = false;
                     match result {

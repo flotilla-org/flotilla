@@ -115,6 +115,8 @@ pub struct TuiRepoModel {
 /// `DaemonHandle::list_repos()` and updated by daemon snapshot events.
 pub struct TuiModel {
     pub repos: HashMap<RepoIdentity, TuiRepoModel>,
+    /// View addresses from the lazy project-list query used by palette completion.
+    pub project_address_state: ProjectAddressState,
     /// Registration/listing order of tracked repos (daemon list order).
     /// This is NOT tab order — tabs are `App::views` (`OpenViews`, ADR 0013).
     pub repo_order: Vec<RepoIdentity>,
@@ -158,6 +160,7 @@ impl TuiModel {
         }
         Self {
             repos,
+            project_address_state: ProjectAddressState::Unloaded,
             repo_order: order,
             active_repo: None,
             provider_statuses: HashMap::new(),
@@ -263,6 +266,16 @@ impl TuiModel {
     pub fn home_dir_for_host(&self, host: &HostName) -> Option<&std::path::Path> {
         self.resolve_host(host).ok().and_then(|h| h.summary.system.home_dir.as_deref())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectAddressState {
+    Unloaded,
+    Loading,
+    Loaded(Vec<ViewAddress>),
+    /// Cached addresses remain available while a new palette refreshes them.
+    Refreshing(Vec<ViewAddress>),
+    Failed,
 }
 
 /// Alias for the per-namespace map stored on `App` and passed into `RenderContext`.
@@ -1068,6 +1081,17 @@ impl App {
         for action in actions {
             match action {
                 AppAction::Quit => self.should_quit = true,
+                AppAction::LoadProjectAddresses => {
+                    let next = match &self.model.project_address_state {
+                        ProjectAddressState::Unloaded | ProjectAddressState::Failed => Some(ProjectAddressState::Loading),
+                        ProjectAddressState::Loaded(addresses) => Some(ProjectAddressState::Refreshing(addresses.clone())),
+                        ProjectAddressState::Loading | ProjectAddressState::Refreshing(_) => None,
+                    };
+                    if let Some(next) = next {
+                        self.model.project_address_state = next;
+                        self.proto_commands.push(self.command(CommandAction::QueryProjectList {}));
+                    }
+                }
                 AppAction::CancelCommand(id) => self.pending_cancel = Some(id),
                 AppAction::CycleTheme => {
                     let themes = crate::theme::available_themes();
@@ -1210,6 +1234,33 @@ impl App {
                     self.set_error_message(message);
                 }
             }
+        }
+    }
+
+    pub fn handle_project_addresses_loaded(&mut self, session_id: uuid::Uuid, result: Result<CommandValue, String>) {
+        if session_id != self.session_id {
+            return;
+        }
+        match result {
+            Ok(CommandValue::ProjectList(response)) => {
+                self.model.project_address_state =
+                    ProjectAddressState::Loaded(response.projects.into_iter().map(|project| project.address).collect());
+            }
+            Ok(CommandValue::Error { message }) | Err(message) => {
+                self.restore_cached_project_addresses_after_error();
+                self.set_error_message(message);
+            }
+            Ok(other) => {
+                self.restore_cached_project_addresses_after_error();
+                self.set_error_message(format!("Unexpected project list response: {other:?}"));
+            }
+        }
+    }
+
+    fn restore_cached_project_addresses_after_error(&mut self) {
+        let previous = std::mem::replace(&mut self.model.project_address_state, ProjectAddressState::Failed);
+        if let ProjectAddressState::Refreshing(addresses) = previous {
+            self.model.project_address_state = ProjectAddressState::Loaded(addresses);
         }
     }
 

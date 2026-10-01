@@ -82,9 +82,10 @@ fn open_views_roundtrip_and_parse_failures() {
 
     assert!(store.load_open_views().is_none());
 
-    let views = vec![OpenViewEntry { address: "overview".to_string(), label: None }, OpenViewEntry {
+    let views = vec![OpenViewEntry { address: "overview".to_string(), label: None, history: vec![] }, OpenViewEntry {
         address: "repo/github.com/o/r".to_string(),
         label: Some("mine".to_string()),
+        history: vec![],
     }];
     store.save_open_views(&views);
     assert_eq!(store.load_open_views(), Some(views));
@@ -99,7 +100,7 @@ fn save_open_views_creates_base_dir() {
     let base = dir.path().join("new/config/dir");
     let store = ConfigStore::with_base(&base);
 
-    store.save_open_views(&[OpenViewEntry { address: "overview".to_string(), label: None }]);
+    store.save_open_views(&[OpenViewEntry { address: "overview".to_string(), label: None, history: vec![] }]);
     assert!(base.join("open-views.toml").exists());
 }
 
