@@ -29,14 +29,14 @@ Meanwhile ADR 0049's **subjects** (since #2321, discovered at the convoy's home 
 
 Raw observed facts, each with its observation time so managers can show staleness:
 - **`change_request`:**
-  - identity, short form `repo!n` and external URL;
+  - identity: `scope` and `number`, an edge to its **forge** entity, and the short form `repo!n`;
   - **title**;
   - state (open, draft, merged, closed);
   - checks (pass, fail, pending), mergeability, head SHA;
   - review: whether there is actionable feedback at head (#2300) and the review decision (approved, changes requested, none);
   - **author**, and whether review is requested from the owner.
 - **`issue`:**
-  - identity, short form `repo#n` and external URL;
+  - identity: `scope` and `number`, an edge to its **forge** entity, and the short form `repo#n`;
   - **title**;
   - state;
   - labels (including triage state);
@@ -44,6 +44,8 @@ Raw observed facts, each with its observation time so managers can show stalenes
   - updated-at.
 
 Bold fields are new to observation.
+
+**URLs are constructable, not repeated.** Each forge appears once as a **`forge`** entity, derived from the `Forge` resources. It carries its kind (GitHub, Forgejo), its web base URL, and URL templates for change requests and issues (for example `{web_url}/{scope}/pull/{number}` for GitHub and `{web_url}/{scope}/pulls/{number}` for Forgejo). A manager builds a change request's or issue's URL from the forge plus `scope` and `number`. The stream carries only small identity facts, and facts are sent when they change, so the forge entity costs nothing after the first sync.
 
 ### 3. Flotilla derives readiness
 
@@ -74,6 +76,7 @@ When a new attempt replaces the old one, the role entity re-points, so a sidebar
 - **Forward edges on the convoy,** one fact per relationship kind: `flotilla.subject.produces`, `flotilla.subject.adopts`, `flotilla.subject.works_on`, `flotilla.subject.supersedes`, `flotilla.subject.references`.
 - **Reverse edges on the change request or issue:** `flotilla.subject_of` (the convoys and roles linking it), with the relationship.
 - **Role edges:** `flotilla.role.current_attempt` and `flotilla.role.attempts`.
+- **Forge edge:** `flotilla.forge` on each change request and issue, pointing at its `forge` entity.
 - **Group paths stay** for the containment tree that managers use for layout.
 - **Coordinated rollout:** wire formats change freely (ADR 0047), but andamento's connector and wheelhouse read this stream, so their changes ship in the same roll and are tracked on their own trackers.
 
