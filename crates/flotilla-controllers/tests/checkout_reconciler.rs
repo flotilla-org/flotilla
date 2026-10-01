@@ -121,7 +121,7 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
             secondaries: Vec::new(),
             reconciler,
             resync_interval: Duration::from_secs(3600),
-            backend,
+            backend: backend.clone(),
         }
         .run(),
     );
@@ -137,6 +137,56 @@ async fn deleting_checkout_retries_finalizer_without_a_status_change() {
     .await
     .expect("finalizer should retry without waiting for full resync");
     assert_eq!(runtime.removals.lock().expect("removals lock").len(), 2);
+    controller.abort();
+    let _ = controller.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn finalizer_backoff_ignores_early_wakes_and_grows_until_cleanup_succeeds() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/backoff").await;
+    let runtime = Arc::new(RecordingCheckoutRuntime { transient_removal_failures: AtomicUsize::new(7), ..Default::default() });
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: Vec::new(),
+            reconciler: CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE),
+            resync_interval: Duration::from_secs(3600),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+    async fn wait_for_attempts(runtime: &RecordingCheckoutRuntime, count: usize) {
+        for _ in 0..100 {
+            if runtime.removals.lock().expect("removals lock").len() == count {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("expected {count} removal attempts");
+    }
+
+    wait_for_attempts(&runtime, 1).await;
+    assert_eq!(runtime.removals.lock().expect("removals lock").len(), 1, "status watch must not bypass the first delay");
+    for (index, delay) in [1, 2, 4, 8, 16, 32, 32].into_iter().enumerate() {
+        if delay > 1 {
+            tokio::time::advance(Duration::from_secs(delay - 1)).await;
+            assert_eq!(runtime.removals.lock().expect("removals lock").len(), index + 1, "retry must respect backoff window");
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_attempts(&runtime, index + 2).await;
+    }
+    assert!(matches!(checkouts.get("backoff-cleanup").await, Err(ResourceError::NotFound { .. })));
+    runtime.transient_removal_failures.store(1, Ordering::SeqCst);
+    create_deleting_checkout(&backend, "backoff-cleanup", "/checkouts/recreated").await;
+    wait_for_attempts(&runtime, 9).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wait_for_attempts(&runtime, 10).await;
+    assert!(matches!(checkouts.get("backoff-cleanup").await, Err(ResourceError::NotFound { .. })));
     controller.abort();
     let _ = controller.await;
 }

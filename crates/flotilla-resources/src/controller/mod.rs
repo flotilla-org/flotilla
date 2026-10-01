@@ -792,6 +792,14 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let mut attempted_finalizer = false;
                 let result = async {
                     let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
+                    if !lifecycle_owned
+                        || object.metadata.deletion_timestamp.is_none()
+                        || reconciler
+                            .finalizer_name()
+                            .is_none_or(|finalizer| object.metadata.finalizers.iter().all(|existing| existing != finalizer))
+                    {
+                        finalizer_failures.remove(&name);
+                    }
                     if let Some(finalizer_name) = reconciler.finalizer_name() {
                         if object.metadata.deletion_timestamp.is_none()
                             && object.metadata.finalizers.iter().all(|finalizer| finalizer != finalizer_name)
