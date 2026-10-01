@@ -128,6 +128,10 @@ mod tests {
                 _ => None,
             }
         }
+
+        fn host_os(&self) -> &str {
+            "linux"
+        }
     }
 
     struct TestProvisionedEnvironment {
