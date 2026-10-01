@@ -2385,6 +2385,12 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     };
     let first = claim().await.expect_err("conflicting PR must refuse claim");
     assert!(first.contains("cr/github.com/flotilla-org/flotilla/2200") && first.contains(".ready"), "{first}");
+    let refused_status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+    assert!(
+        refused_status.subjects.iter().any(|entry| entry.subject.id == "2200"),
+        "the rejected completion still discovered a PR in the convoy's repository"
+    );
+    assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")
         .get(&change_request_record_name("github.com", "flotilla-org/flotilla", 2200))

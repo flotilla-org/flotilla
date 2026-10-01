@@ -216,6 +216,17 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
 }
 
 #[test]
+fn successful_branch_scan_clears_a_stale_lookup_error() {
+    let mut status = ConvoyStatus::default();
+    ConvoyStatusPatch::RecordBranchSubjectScan { at: ts(10) }.apply(&mut status);
+    ConvoyStatusPatch::RecordBranchSubjectScanFailure { error: "forge temporarily unavailable".into() }.apply(&mut status);
+    assert_eq!(status.branch_subject_scan_error.as_deref(), Some("forge temporarily unavailable"));
+    ConvoyStatusPatch::RecordBranchSubjectScan { at: ts(20) }.apply(&mut status);
+    assert_eq!(status.branch_subject_scan_at, Some(ts(20)));
+    assert!(status.branch_subject_scan_error.is_none());
+}
+
+#[test]
 fn abandon_convoy_stamps_convoy_and_open_work() {
     let mut status = ConvoyStatus {
         unlinked_subjects: Vec::new(),
