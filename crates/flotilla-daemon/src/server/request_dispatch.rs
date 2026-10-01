@@ -315,345 +315,406 @@ impl<'a> RequestDispatcher<'a> {
                     Err(_) => Message::error_response(id, "resource store busy: interactive request deadline exceeded"),
                 }
             } else {
-                self.dispatch_inner(id, request).await
+                Box::pin(self.dispatch_inner(id, request)).await
             }
         })
     }
 
-    async fn dispatch_inner(&self, id: u64, request: Request) -> Message {
-        match request {
-            Request::Shutdown => Message::ok_response(id, Response::Shutdown),
-            Request::ListRepos => match self.daemon.list_repos().await {
-                Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
-                Err(e) => Message::error_response(id, e),
-            },
-            Request::ArtifactPut { kind, subject, mut summary, media_type, source_path } => {
-                let result = Box::pin(async {
-                    let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
-                    let subject = if kind == "decision-ledger" && subject.is_empty() { caller.convoy.clone() } else { subject };
-                    let config = self.daemon.config_store();
-                    let settings = config.load_daemon_config()?;
-                    let blobs = self.remote_command_router.blob_store()?;
-                    let backend = self.daemon.resource_backend();
-                    let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-                    let session = service.caller_session(caller).await?;
-                    let runner = self
-                        .daemon
-                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
-                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
-                    let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
-                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-                    runner.read_file_to(&source_path, temporary.path()).await?;
-                    if kind == "decision-ledger" {
-                        if subject != caller.convoy {
-                            return Err("decision ledger subject must be its convoy".to_string());
-                        }
-                        if !summary.is_empty() {
-                            return Err("decision ledger summary is daemon-owned".to_string());
-                        }
-                        // Validation runs before the forge write; a path is never treated as content.
-                        let body = crate::artifact::read_decision_ledger(temporary.path())?;
-                        let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
-                        let comment_url = project_decision_ledger_once(
-                            &backend,
-                            &namespace,
-                            &caller.convoy,
-                            &session.spec.role,
-                            &body,
-                            runner.as_ref(),
-                            Path::new(&session.spec.cwd),
-                            &delivery_env,
+    async fn dispatch_request_shutdown(&self, id: u64, request: Request) -> Message {
+        let Request::Shutdown = request else { unreachable!("Shutdown request selected the wrong handler") };
+        Message::ok_response(id, Response::Shutdown)
+    }
+
+    async fn dispatch_request_list_repos(&self, id: u64, request: Request) -> Message {
+        let Request::ListRepos = request else { unreachable!("ListRepos request selected the wrong handler") };
+        match self.daemon.list_repos().await {
+            Ok(repos) => Message::ok_response(id, Response::ListRepos(repos)),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_artifact_put(&self, id: u64, request: Request) -> Message {
+        let Request::ArtifactPut { kind, subject, mut summary, media_type, source_path } = request else {
+            unreachable!("ArtifactPut request selected the wrong handler")
+        };
+        let result = Box::pin(async {
+            let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
+            let subject = if kind == "decision-ledger" && subject.is_empty() { caller.convoy.clone() } else { subject };
+            let config = self.daemon.config_store();
+            let settings = config.load_daemon_config()?;
+            let blobs = self.remote_command_router.blob_store()?;
+            let backend = self.daemon.resource_backend();
+            let namespace = self.daemon.provisioning_namespace().await;
+            let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+            let session = service.caller_session(caller).await?;
+            let runner = self
+                .daemon
+                .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+            let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
+            let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+            runner.read_file_to(&source_path, temporary.path()).await?;
+            if kind == "decision-ledger" {
+                if subject != caller.convoy {
+                    return Err("decision ledger subject must be its convoy".to_string());
+                }
+                if !summary.is_empty() {
+                    return Err("decision ledger summary is daemon-owned".to_string());
+                }
+                // Validation runs before the forge write; a path is never treated as content.
+                let body = crate::artifact::read_decision_ledger(temporary.path())?;
+                let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
+                let comment_url = project_decision_ledger_once(
+                    &backend,
+                    &namespace,
+                    &caller.convoy,
+                    &session.spec.role,
+                    &body,
+                    runner.as_ref(),
+                    Path::new(&session.spec.cwd),
+                    &delivery_env,
+                )
+                .await
+                .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
+                if let Some(comment_url) = comment_url {
+                    summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url));
+                }
+            }
+            let input = ArtifactPutInput::builder()
+                .kind(kind)
+                .subject(subject)
+                .summary(summary)
+                .media_type(media_type)
+                .body(ArtifactBody::File(temporary.path().to_path_buf()))
+                .build();
+            let target = self
+                .daemon
+                .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
+                    namespace: Some(namespace.clone()),
+                    name: caller.convoy.clone(),
+                })
+                .await?;
+            match target {
+                Some(target) if target.node_id != *self.daemon.node_id() => {
+                    let (name, spec, owner) = service
+                        .prepare_put(caller, input, &settings.artifact_retention_days)
+                        .await
+                        .map_err(|error| format!("artifact put failed: {error}"))?;
+                    let digest = spec.digest.clone();
+                    let document = serde_json::json!({
+                        "apiVersion": "flotilla.work/v1",
+                        "kind": "Artifact",
+                        "metadata": { "name": name, "ownerReferences": [owner] },
+                        "spec": spec,
+                    });
+                    let mut events = self.daemon.subscribe();
+                    let command_id = self
+                        .remote_command_router
+                        .dispatch_execute_for_caller(
+                            Command {
+                                node_id: Some(target.node_id),
+                                provisioning_target: None,
+                                context_repo: None,
+                                action: CommandAction::ResourceApply { namespace, document },
+                            },
+                            Some(self.caller.clone()),
                         )
                         .await
-                        .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
-                        if let Some(comment_url) = comment_url {
-                            summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url));
-                        }
-                    }
-                    let input = ArtifactPutInput::builder()
-                        .kind(kind)
-                        .subject(subject)
-                        .summary(summary)
-                        .media_type(media_type)
-                        .body(ArtifactBody::File(temporary.path().to_path_buf()))
-                        .build();
-                    let target = self
-                        .daemon
-                        .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
-                            namespace: Some(namespace.clone()),
-                            name: caller.convoy.clone(),
-                        })
-                        .await?;
-                    match target {
-                        Some(target) if target.node_id != *self.daemon.node_id() => {
-                            let (name, spec, owner) = service
-                                .prepare_put(caller, input, &settings.artifact_retention_days)
-                                .await
-                                .map_err(|error| format!("artifact put failed: {error}"))?;
-                            let digest = spec.digest.clone();
-                            let document = serde_json::json!({
-                                "apiVersion": "flotilla.work/v1",
-                                "kind": "Artifact",
-                                "metadata": { "name": name, "ownerReferences": [owner] },
-                                "spec": spec,
-                            });
-                            let mut events = self.daemon.subscribe();
-                            let command_id = self
-                                .remote_command_router
-                                .dispatch_execute_for_caller(
-                                    Command {
-                                        node_id: Some(target.node_id),
-                                        provisioning_target: None,
-                                        context_repo: None,
-                                        action: CommandAction::ResourceApply { namespace, document },
-                                    },
-                                    Some(self.caller.clone()),
-                                )
-                                .await
-                                .map_err(|error| format!("artifact storage dispatch failed: {error}"))?;
-                            let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                                loop {
-                                    match events.recv().await {
-                                        Ok(DaemonEvent::CommandFinished { command_id: finished, result, .. }) if finished == command_id => {
-                                            break Ok(result);
-                                        }
-                                        Ok(_) => {}
-                                        Err(error) => break Err(format!("artifact home command event unavailable: {error}")),
-                                    }
+                        .map_err(|error| format!("artifact storage dispatch failed: {error}"))?;
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        loop {
+                            match events.recv().await {
+                                Ok(DaemonEvent::CommandFinished { command_id: finished, result, .. }) if finished == command_id => {
+                                    break Ok(result);
                                 }
-                            })
-                            .await
-                            .map_err(|_| "artifact home command timed out".to_string())??;
-                            match result {
-                                CommandValue::ResourceObject(_) => Ok(Response::ArtifactPut {
-                                    address: format!("artifact/{name}"),
-                                    view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
-                                    digest,
-                                }),
-                                CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
-                                other => Err(format!("unexpected artifact home result: {other:?}")),
+                                Ok(_) => {}
+                                Err(error) => break Err(format!("artifact home command event unavailable: {error}")),
                             }
                         }
-                        Some(_) => {
-                            let object = service
-                                .put(caller, input, &settings.artifact_retention_days)
-                                .await
-                                .map_err(|error| format!("artifact put failed: {error}"))?;
-                            Ok(Response::ArtifactPut {
-                                address: format!("artifact/{}", object.metadata.name),
-                                view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
-                                digest: object.spec.digest,
-                            })
-                        }
-                        None => {
-                            if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
-                                return Err("convoy home is unavailable for artifact put".to_string());
-                            }
-                            let object = service
-                                .put(caller, input, &settings.artifact_retention_days)
-                                .await
-                                .map_err(|error| format!("artifact put failed: {error}"))?;
-                            Ok(Response::ArtifactPut {
-                                address: format!("artifact/{}", object.metadata.name),
-                                view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
-                                digest: object.spec.digest,
-                            })
-                        }
+                    })
+                    .await
+                    .map_err(|_| "artifact home command timed out".to_string())??;
+                    match result {
+                        CommandValue::ResourceObject(_) => Ok(Response::ArtifactPut {
+                            address: format!("artifact/{name}"),
+                            view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
+                            digest,
+                        }),
+                        CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
+                        other => Err(format!("unexpected artifact home result: {other:?}")),
                     }
-                })
-                .await;
-                match result {
-                    Ok(response) => Message::ok_response(id, response),
-                    Err(error) => Message::error_response(id, error),
+                }
+                Some(_) => {
+                    let object = service
+                        .put(caller, input, &settings.artifact_retention_days)
+                        .await
+                        .map_err(|error| format!("artifact put failed: {error}"))?;
+                    Ok(Response::ArtifactPut {
+                        address: format!("artifact/{}", object.metadata.name),
+                        view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
+                        digest: object.spec.digest,
+                    })
+                }
+                None => {
+                    if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
+                        return Err("convoy home is unavailable for artifact put".to_string());
+                    }
+                    let object = service
+                        .put(caller, input, &settings.artifact_retention_days)
+                        .await
+                        .map_err(|error| format!("artifact put failed: {error}"))?;
+                    Ok(Response::ArtifactPut {
+                        address: format!("artifact/{}", object.metadata.name),
+                        view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
+                        digest: object.spec.digest,
+                    })
                 }
             }
-            Request::ArtifactGet { reference, destination_path } => {
-                let result = Box::pin(async {
-                    let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
-                    let blobs = self.remote_command_router.blob_store()?;
-                    let backend = self.daemon.resource_backend();
-                    let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-                    let session = service.caller_session(caller).await?;
-                    let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
-                    let artifact = service.artifact_for_reference(&reference).await?;
-                    let view_url = artifact
-                        .as_ref()
-                        .and_then(|artifact| flotilla_core::config::artifact_view_url(&artifact.spec, &stores))
-                        .or_else(|| {
-                            crate::blob_store::BlobDigest::parse(&reference)
-                                .ok()
-                                .and_then(|digest| flotilla_core::config::artifact_view_url_for_digest(digest.as_str(), &stores))
-                        });
-                    let runner = self
-                        .daemon
-                        .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
-                        .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
-                    let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
-                    let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-                    let size = service.get_to_file(&reference, temporary.path()).await?;
-                    runner.write_file_from(temporary.path(), &destination_path).await?;
-                    Ok::<_, String>(Response::ArtifactGet { size, view_url })
-                })
-                .await;
-                match result {
-                    Ok(response) => Message::ok_response(id, response),
-                    Err(error) => Message::error_response(id, error),
-                }
-            }
-            Request::ArtifactList { convoy, kind, subject } => {
-                let result = Box::pin(async {
-                    let blobs = self.remote_command_router.blob_store()?;
-                    let backend = self.daemon.resource_backend();
-                    let namespace = self.daemon.provisioning_namespace().await;
-                    let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-                    let items = service.list(convoy.as_deref(), kind.as_deref(), subject.as_deref()).await?;
-                    let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
-                    let items = items
-                        .into_iter()
-                        .map(|item| {
-                            let mut value = serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string())?;
-                            if let Some(url) = flotilla_core::config::artifact_view_url(&item.spec, &stores) {
-                                value["view_url"] = serde_json::Value::String(url);
-                            }
-                            Ok::<_, String>(value)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok::<_, String>(Response::ArtifactList { items })
-                })
-                .await;
-                match result {
-                    Ok(response) => Message::ok_response(id, response),
-                    Err(error) => Message::error_response(id, error),
-                }
-            }
+        })
+        .await;
+        match result {
+            Ok(response) => Message::ok_response(id, response),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
 
-            Request::Execute { command } => {
-                if command.action.is_query() {
-                    // Query commands: execute synchronously (local or remote)
-                    // and return the result directly as a QueryResult.
-                    match self.remote_command_router.dispatch_query(command, self.session_id).await {
-                        Ok(value) => Message::ok_response(id, Response::QueryResult { command_id: 0, value }),
-                        Err(e) => Message::error_response(id, e),
-                    }
-                } else {
-                    // Non-query commands: existing dispatch path
-                    match self.daemon.principal_for_surface(self.session_id) {
-                        Ok(principal_ref) => {
-                            let mut caller = self.caller.clone();
-                            caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
-                            match self.remote_command_router.dispatch_execute_for_caller(command, Some(caller)).await {
-                                Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
-                                Err(e) => Message::error_response(id, e),
-                            }
-                        }
-                        Err(e) => Message::error_response(id, e),
-                    }
-                }
-            }
+    async fn dispatch_request_artifact_get(&self, id: u64, request: Request) -> Message {
+        let Request::ArtifactGet { reference, destination_path } = request else {
+            unreachable!("ArtifactGet request selected the wrong handler")
+        };
+        let result = Box::pin(async {
+            let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
+            let blobs = self.remote_command_router.blob_store()?;
+            let backend = self.daemon.resource_backend();
+            let namespace = self.daemon.provisioning_namespace().await;
+            let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+            let session = service.caller_session(caller).await?;
+            let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
+            let artifact = service.artifact_for_reference(&reference).await?;
+            let view_url =
+                artifact.as_ref().and_then(|artifact| flotilla_core::config::artifact_view_url(&artifact.spec, &stores)).or_else(|| {
+                    crate::blob_store::BlobDigest::parse(&reference)
+                        .ok()
+                        .and_then(|digest| flotilla_core::config::artifact_view_url_for_digest(digest.as_str(), &stores))
+                });
+            let runner = self
+                .daemon
+                .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+            let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
+            let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+            let size = service.get_to_file(&reference, temporary.path()).await?;
+            runner.write_file_from(temporary.path(), &destination_path).await?;
+            Ok::<_, String>(Response::ArtifactGet { size, view_url })
+        })
+        .await;
+        match result {
+            Ok(response) => Message::ok_response(id, response),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
 
-            Request::Cancel { command_id } => match self.remote_command_router.dispatch_cancel(command_id).await {
-                Ok(()) => Message::ok_response(id, Response::Cancel),
+    async fn dispatch_request_artifact_list(&self, id: u64, request: Request) -> Message {
+        let Request::ArtifactList { convoy, kind, subject } = request else {
+            unreachable!("ArtifactList request selected the wrong handler")
+        };
+        let result = Box::pin(async {
+            let blobs = self.remote_command_router.blob_store()?;
+            let backend = self.daemon.resource_backend();
+            let namespace = self.daemon.provisioning_namespace().await;
+            let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
+            let items = service.list(convoy.as_deref(), kind.as_deref(), subject.as_deref()).await?;
+            let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
+            let items = items
+                .into_iter()
+                .map(|item| {
+                    let mut value = serde_json::to_value(item.to_k8s_object()).map_err(|error| error.to_string())?;
+                    if let Some(url) = flotilla_core::config::artifact_view_url(&item.spec, &stores) {
+                        value["view_url"] = serde_json::Value::String(url);
+                    }
+                    Ok::<_, String>(value)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, String>(Response::ArtifactList { items })
+        })
+        .await;
+        match result {
+            Ok(response) => Message::ok_response(id, response),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
+
+    async fn dispatch_request_execute(&self, id: u64, request: Request) -> Message {
+        let Request::Execute { command } = request else { unreachable!("Execute request selected the wrong handler") };
+        if command.action.is_query() {
+            // Query commands: execute synchronously (local or remote)
+            // and return the result directly as a QueryResult.
+            match self.remote_command_router.dispatch_query(command, self.session_id).await {
+                Ok(value) => Message::ok_response(id, Response::QueryResult { command_id: 0, value }),
                 Err(e) => Message::error_response(id, e),
-            },
-
-            Request::Refresh { repo } => {
-                let command = Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
-                };
-                match self.daemon.execute(command).await {
-                    Ok(_) => Message::ok_response(id, Response::Refresh),
-                    Err(e) => Message::error_response(id, e),
-                }
             }
-
-            Request::AddRepo { path } => {
-                let command =
-                    Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
-                match self.daemon.execute(command).await {
-                    Ok(_) => Message::ok_response(id, Response::AddRepo),
-                    Err(e) => Message::error_response(id, e),
-                }
-            }
-
-            Request::RemoveRepo { path } => {
-                let command = Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },
-                };
-                match self.daemon.execute(command).await {
-                    Ok(_) => Message::ok_response(id, Response::RemoveRepo),
-                    Err(e) => Message::error_response(id, e),
-                }
-            }
-
-            Request::ReplaySince { last_seen } => {
-                let last_seen = last_seen.into_iter().map(|entry| (entry.stream, entry.seq)).collect();
-                match self.daemon.replay_since(&last_seen).await {
-                    Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
-                    Err(e) => Message::error_response(id, e),
-                }
-            }
-
-            Request::SubscribeQueries { queries } => {
-                // Register interest before computing the replay so no event
-                // between the two is dropped; the client ignores any stale
-                // delta that races ahead of the replayed result set.
-                {
-                    let mut subscriptions = self.query_subscriptions.write().expect("query subscriptions lock poisoned");
-                    *subscriptions = queries.iter().map(|cursor| cursor.query.clone()).collect();
-                }
-                match self.daemon.subscribe_queries(self.session_id, &queries).await {
-                    Ok(events) => Message::ok_response(id, Response::SubscribeQueries(events)),
-                    Err(e) => Message::error_response(id, e),
-                }
-            }
-
-            Request::FetchMore { query } => {
-                let subscribed = self.query_subscriptions.read().expect("query subscriptions lock poisoned").contains(&query);
-                if !subscribed {
-                    Message::error_response(id, format!("query is not subscribed on this connection: {query}"))
-                } else {
-                    match self.daemon.fetch_more(&query).await {
-                        Ok(()) => Message::ok_response(id, Response::FetchMore),
+        } else {
+            // Non-query commands: existing dispatch path
+            match self.daemon.principal_for_surface(self.session_id) {
+                Ok(principal_ref) => {
+                    let mut caller = self.caller.clone();
+                    caller.principal_ref = principal_ref.unwrap_or_else(|| self.caller.principal_ref.clone());
+                    match self.remote_command_router.dispatch_execute_for_caller(command, Some(caller)).await {
+                        Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
                         Err(e) => Message::error_response(id, e),
                     }
                 }
+                Err(e) => Message::error_response(id, e),
             }
+        }
+    }
 
-            Request::ObserveFocus { targets } => match self.daemon.observe_surface_focus(self.session_id, targets).await {
-                Ok(()) => Message::ok_response(id, Response::ObserveFocus),
-                Err(error) => Message::error_response(id, error),
-            },
+    async fn dispatch_request_cancel(&self, id: u64, request: Request) -> Message {
+        let Request::Cancel { command_id } = request else { unreachable!("Cancel request selected the wrong handler") };
+        match self.remote_command_router.dispatch_cancel(command_id).await {
+            Ok(()) => Message::ok_response(id, Response::Cancel),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
 
-            Request::SubscribeWait { subscription } => match self.daemon.subscribe_wait(self.session_id, subscription).await {
-                Ok(subscription_id) => Message::ok_response(id, Response::WaitSubscribed { subscription_id }),
-                Err(error) => Message::error_response(id, error),
-            },
+    async fn dispatch_request_refresh(&self, id: u64, request: Request) -> Message {
+        let Request::Refresh { repo } = request else { unreachable!("Refresh request selected the wrong handler") };
+        let command = Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
+        };
+        match self.daemon.execute(command).await {
+            Ok(_) => Message::ok_response(id, Response::Refresh),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
 
-            Request::GetStatus => match self.daemon.get_status().await {
-                Ok(status) => Message::ok_response(id, Response::GetStatus(status)),
+    async fn dispatch_request_add_repo(&self, id: u64, request: Request) -> Message {
+        let Request::AddRepo { path } = request else { unreachable!("AddRepo request selected the wrong handler") };
+        let command =
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
+        match self.daemon.execute(command).await {
+            Ok(_) => Message::ok_response(id, Response::AddRepo),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_remove_repo(&self, id: u64, request: Request) -> Message {
+        let Request::RemoveRepo { path } = request else { unreachable!("RemoveRepo request selected the wrong handler") };
+        let command = Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },
+        };
+        match self.daemon.execute(command).await {
+            Ok(_) => Message::ok_response(id, Response::RemoveRepo),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_replay_since(&self, id: u64, request: Request) -> Message {
+        let Request::ReplaySince { last_seen } = request else { unreachable!("ReplaySince request selected the wrong handler") };
+        let last_seen = last_seen.into_iter().map(|entry| (entry.stream, entry.seq)).collect();
+        match self.daemon.replay_since(&last_seen).await {
+            Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_subscribe_queries(&self, id: u64, request: Request) -> Message {
+        let Request::SubscribeQueries { queries } = request else { unreachable!("SubscribeQueries request selected the wrong handler") };
+        // Register interest before computing the replay so no event
+        // between the two is dropped; the client ignores any stale
+        // delta that races ahead of the replayed result set.
+        {
+            let mut subscriptions = self.query_subscriptions.write().expect("query subscriptions lock poisoned");
+            *subscriptions = queries.iter().map(|cursor| cursor.query.clone()).collect();
+        }
+        match self.daemon.subscribe_queries(self.session_id, &queries).await {
+            Ok(events) => Message::ok_response(id, Response::SubscribeQueries(events)),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_fetch_more(&self, id: u64, request: Request) -> Message {
+        let Request::FetchMore { query } = request else { unreachable!("FetchMore request selected the wrong handler") };
+        let subscribed = self.query_subscriptions.read().expect("query subscriptions lock poisoned").contains(&query);
+        if !subscribed {
+            Message::error_response(id, format!("query is not subscribed on this connection: {query}"))
+        } else {
+            match self.daemon.fetch_more(&query).await {
+                Ok(()) => Message::ok_response(id, Response::FetchMore),
                 Err(e) => Message::error_response(id, e),
-            },
+            }
+        }
+    }
 
-            Request::GetTopology => match self.daemon.get_topology().await {
-                Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
-                Err(e) => Message::error_response(id, e),
-            },
+    async fn dispatch_request_observe_focus(&self, id: u64, request: Request) -> Message {
+        let Request::ObserveFocus { targets } = request else { unreachable!("ObserveFocus request selected the wrong handler") };
+        match self.daemon.observe_surface_focus(self.session_id, targets).await {
+            Ok(()) => Message::ok_response(id, Response::ObserveFocus),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
 
-            Request::AgentHook { event } => match self.handle_agent_hook(event).await {
-                Ok(()) => Message::ok_response(id, Response::AgentHook),
-                Err(e) => {
-                    warn!(err = %e, "failed to process agent hook event");
-                    Message::error_response(id, e)
-                }
-            },
+    async fn dispatch_request_subscribe_wait(&self, id: u64, request: Request) -> Message {
+        let Request::SubscribeWait { subscription } = request else { unreachable!("SubscribeWait request selected the wrong handler") };
+        match self.daemon.subscribe_wait(self.session_id, subscription).await {
+            Ok(subscription_id) => Message::ok_response(id, Response::WaitSubscribed { subscription_id }),
+            Err(error) => Message::error_response(id, error),
+        }
+    }
+
+    async fn dispatch_request_get_status(&self, id: u64, request: Request) -> Message {
+        let Request::GetStatus = request else { unreachable!("GetStatus request selected the wrong handler") };
+        match self.daemon.get_status().await {
+            Ok(status) => Message::ok_response(id, Response::GetStatus(status)),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_get_topology(&self, id: u64, request: Request) -> Message {
+        let Request::GetTopology = request else { unreachable!("GetTopology request selected the wrong handler") };
+        match self.daemon.get_topology().await {
+            Ok(topology) => Message::ok_response(id, Response::GetTopology(topology)),
+            Err(e) => Message::error_response(id, e),
+        }
+    }
+
+    async fn dispatch_request_agent_hook(&self, id: u64, request: Request) -> Message {
+        let Request::AgentHook { event } = request else { unreachable!("AgentHook request selected the wrong handler") };
+        match self.handle_agent_hook(event).await {
+            Ok(()) => Message::ok_response(id, Response::AgentHook),
+            Err(e) => {
+                warn!(err = %e, "failed to process agent hook event");
+                Message::error_response(id, e)
+            }
+        }
+    }
+
+    async fn dispatch_inner(&self, id: u64, request: Request) -> Message {
+        match request {
+            request @ Request::Shutdown => Box::pin(self.dispatch_request_shutdown(id, request)).await,
+            request @ Request::ListRepos => Box::pin(self.dispatch_request_list_repos(id, request)).await,
+            request @ Request::ArtifactPut { .. } => Box::pin(self.dispatch_request_artifact_put(id, request)).await,
+            request @ Request::ArtifactGet { .. } => Box::pin(self.dispatch_request_artifact_get(id, request)).await,
+            request @ Request::ArtifactList { .. } => Box::pin(self.dispatch_request_artifact_list(id, request)).await,
+            request @ Request::Execute { .. } => Box::pin(self.dispatch_request_execute(id, request)).await,
+            request @ Request::Cancel { .. } => Box::pin(self.dispatch_request_cancel(id, request)).await,
+            request @ Request::Refresh { .. } => Box::pin(self.dispatch_request_refresh(id, request)).await,
+            request @ Request::AddRepo { .. } => Box::pin(self.dispatch_request_add_repo(id, request)).await,
+            request @ Request::RemoveRepo { .. } => Box::pin(self.dispatch_request_remove_repo(id, request)).await,
+            request @ Request::ReplaySince { .. } => Box::pin(self.dispatch_request_replay_since(id, request)).await,
+            request @ Request::SubscribeQueries { .. } => Box::pin(self.dispatch_request_subscribe_queries(id, request)).await,
+            request @ Request::FetchMore { .. } => Box::pin(self.dispatch_request_fetch_more(id, request)).await,
+            request @ Request::ObserveFocus { .. } => Box::pin(self.dispatch_request_observe_focus(id, request)).await,
+            request @ Request::SubscribeWait { .. } => Box::pin(self.dispatch_request_subscribe_wait(id, request)).await,
+            request @ Request::GetStatus => Box::pin(self.dispatch_request_get_status(id, request)).await,
+            request @ Request::GetTopology => Box::pin(self.dispatch_request_get_topology(id, request)).await,
+            request @ Request::AgentHook { .. } => Box::pin(self.dispatch_request_agent_hook(id, request)).await,
         }
     }
 

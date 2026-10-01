@@ -257,6 +257,79 @@ impl RemoteCommandRouter {
         self.dispatch_execute_for_caller(command, caller).await
     }
 
+    async fn dispatch_remote_command(
+        &self,
+        command: Command,
+        caller: Option<flotilla_protocol::CommandCaller>,
+        target: &flotilla_core::command_target::CommandTarget,
+        crew_completion: Option<PendingCrewCompletionRoute>,
+        target_node_id: NodeId,
+    ) -> Result<u64, String> {
+        let existing_convoy_target = match &target.host {
+            TargetHost::ConvoyHome(home) => Some(home.clone()),
+            _ => None,
+        };
+        if let (Some(completion), Some(target)) = (&crew_completion, &existing_convoy_target) {
+            self.persist_crew_completion(completion, &target.home, &format!("authority acknowledgement pending for {}", completion.convoy))
+                .await;
+        }
+        let request_id = {
+            let mut pm = self.peer_manager.lock().await;
+            pm.next_request_id()
+        };
+        let command_id = self.next_remote_command_id.fetch_add(1, Ordering::Relaxed);
+        self.pending_remote_commands.lock().await.insert(
+            request_id,
+            PendingRemoteCommand::builder()
+                .command_id(command_id)
+                .target_node_id(target_node_id.clone())
+                .maybe_repo_identity(extract_command_repo_identity(&command))
+                .finished_via_event(false)
+                .maybe_crew_completion(crew_completion.clone())
+                .build(),
+        );
+
+        let routed = RoutedPeerMessage::CommandRequest {
+            request_id,
+            requester_node_id: self.daemon.node_id().clone(),
+            target_node_id: target_node_id.clone(),
+            remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+            command: Box::new(command),
+            caller: caller.map(Box::new),
+            session_id: None,
+        };
+        let send_result = match &existing_convoy_target {
+            Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
+            None => self.send_routed_to(&target_node_id, routed).await,
+        }
+        .map_err(|error| match &target.host {
+            TargetHost::Node(origin) if target.reason == TargetReason::RecordHome => {
+                format!("resource origin {origin} is unreachable: {error}")
+            }
+            TargetHost::Node(origin) if target.reason == TargetReason::CrewSessionHome => {
+                format!("session origin {origin} is unreachable: {error}")
+            }
+            _ => error,
+        });
+
+        match send_result {
+            Ok(()) => Ok(command_id),
+            Err(err) => {
+                self.pending_remote_commands.lock().await.remove(&request_id);
+                match (crew_completion, existing_convoy_target) {
+                    (Some(completion), Some(target)) => {
+                        let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
+                        self.persist_crew_completion(&completion, &target.home, &message).await;
+                        self.spawn_crew_completion_retry(completion);
+                        Err(format!("completion pending: {message}"))
+                    }
+                    (_, Some(target)) => Err(target.unreachable_message(&err)),
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
     pub(super) async fn dispatch_execute_for_caller(
         &self,
         mut command: Command,
@@ -295,75 +368,13 @@ impl RemoteCommandRouter {
         info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, reason = ?target.reason, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
             if target.delivery == RemoteDelivery::Command {
-                if let (Some(completion), Some(target)) = (&crew_completion, &existing_convoy_target) {
-                    self.persist_crew_completion(
-                        completion,
-                        &target.home,
-                        &format!("authority acknowledgement pending for {}", completion.convoy),
-                    )
-                    .await;
-                }
-                let request_id = {
-                    let mut pm = self.peer_manager.lock().await;
-                    pm.next_request_id()
-                };
-                let command_id = self.next_remote_command_id.fetch_add(1, Ordering::Relaxed);
-                self.pending_remote_commands.lock().await.insert(
-                    request_id,
-                    PendingRemoteCommand::builder()
-                        .command_id(command_id)
-                        .target_node_id(target_node_id.clone())
-                        .maybe_repo_identity(extract_command_repo_identity(&command))
-                        .finished_via_event(false)
-                        .maybe_crew_completion(crew_completion.clone())
-                        .build(),
-                );
-
-                let routed = RoutedPeerMessage::CommandRequest {
-                    request_id,
-                    requester_node_id: self.daemon.node_id().clone(),
-                    target_node_id: target_node_id.clone(),
-                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                    command: Box::new(command),
-                    caller: caller.map(Box::new),
-                    session_id: None,
-                };
-                let send_result = match &existing_convoy_target {
-                    Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
-                    None => self.send_routed_to(&target_node_id, routed).await,
-                }
-                .map_err(|error| match &target.host {
-                    TargetHost::Node(origin) if target.reason == TargetReason::RecordHome => {
-                        format!("resource origin {origin} is unreachable: {error}")
-                    }
-                    TargetHost::Node(origin) if target.reason == TargetReason::CrewSessionHome => {
-                        format!("session origin {origin} is unreachable: {error}")
-                    }
-                    _ => error,
-                });
-
-                match send_result {
-                    Ok(()) => Ok(command_id),
-                    Err(err) => {
-                        self.pending_remote_commands.lock().await.remove(&request_id);
-                        match (crew_completion, existing_convoy_target) {
-                            (Some(completion), Some(target)) => {
-                                let message = self.authority_unreachable_message(&completion.convoy, &target.home, &err);
-                                self.persist_crew_completion(&completion, &target.home, &message).await;
-                                self.spawn_crew_completion_retry(completion);
-                                Err(format!("completion pending: {message}"))
-                            }
-                            (_, Some(target)) => Err(target.unreachable_message(&err)),
-                            _ => Err(err),
-                        }
-                    }
-                }
+                Box::pin(self.dispatch_remote_command(command, caller, &target, crew_completion, target_node_id)).await
             } else {
                 let remote_executor: Arc<dyn RemoteStepExecutor> = Arc::new(self.clone());
-                self.daemon.execute_with_remote_executor(command, remote_executor).await
+                Box::pin(self.daemon.execute_with_remote_executor(command, remote_executor)).await
             }
         } else {
-            self.daemon.execute_for_caller(command, caller).await
+            Box::pin(self.daemon.execute_for_caller(command, caller)).await
         }
     }
 

@@ -10132,66 +10132,14 @@ impl InProcessDaemon {
         result
     }
 
-    // This executor has many async arms. Box substantial nested futures below
-    // so their combined state fits on the default Tokio test-thread stack.
-    async fn execute_impl(
+    async fn execute_action_resource_apply(
         &self,
-        command: Command,
-        remote_executor: Arc<dyn RemoteStepExecutor>,
-        allow_remote_host: bool,
-        caller: Option<flotilla_protocol::CommandCaller>,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
     ) -> Result<u64, String> {
-        let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
-        let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
-        debug!(
-            %command_node_id, local_node = %self.node_id, %allow_remote_host,
-            desc = %command.description(), "execute_impl"
-        );
-        if !allow_remote_host && command_node_id != self.node_id {
-            return Err(format!("remote command routing not implemented yet for node {command_node_id}"));
-        }
-
-        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
-
-        if command.action.is_query() {
-            // Query commands should be dispatched through `execute_query`,
-            // not through `execute`. Return an error to surface misrouting.
-            let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
-            let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
-            return Ok(id);
-        }
-
-        if let Some(origin) = Box::pin(self.resource_mutation_origin(&command.action)).await? {
-            if origin != self.node_id {
-                let empty_identity = self.start_context_free_command(id, command.description().to_string());
-                let host =
-                    self.host_registry.host_name_for_node(&origin).await.map(|name| name.to_string()).unwrap_or_else(|| origin.to_string());
-                let result = CommandValue::Error {
-                    message: format!(
-                        "resource is a replica on {}; its origin is {host} ({origin}). \
-                         Retry when the origin is reachable",
-                        self.host_name
-                    ),
-                };
-                self.finish_context_free_command(id, empty_identity, result);
-                return Ok(id);
-            }
-        }
-
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match apply_resource_document(&self.resource_backend, namespace, document.clone()).await {
@@ -10207,7 +10155,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ResourceApply action selected the wrong handler")
+    }
 
+    async fn execute_action_repository_remote_remove(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::RepositoryRemoteRemove { namespace, name, remote } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let repositories = self.resource_backend.clone().using::<Repository>(namespace);
@@ -10227,7 +10185,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("RepositoryRemoteRemove action selected the wrong handler")
+    }
 
+    async fn execute_action_resource_manifest_resolve(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceManifestResolve { namespace, kind, name, resolution, requested_by } =
             &command.action
         {
@@ -10239,7 +10207,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ResourceManifestResolve action selected the wrong handler")
+    }
 
+    async fn execute_action_resource_reconcile_now(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceReconcileNow { namespace, kind, name } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.operator_reconciler.read().await.clone() {
@@ -10252,7 +10230,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ResourceReconcileNow action selected the wrong handler")
+    }
 
+    async fn execute_action_resource_status_patch(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result =
@@ -10269,7 +10257,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ResourceStatusPatch action selected the wrong handler")
+    }
 
+    async fn execute_action_resource_delete(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceDelete { namespace, kind, name, replica_origin } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = if let Some(origin_root) = replica_origin {
@@ -10312,9 +10310,20 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ResourceDelete action selected the wrong handler")
+    }
 
+    async fn execute_action_resource_watch(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let command_node_id = command_node_id.clone();
         if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, name, include_replicas, replica_sources, cursor } =
-            command.action
+            command.action.clone()
         {
             let repo_identity = empty_repo_identity();
             let description = format!("watch resource {namespace}/{kind}");
@@ -10364,7 +10373,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ResourceWatch action selected the wrong handler")
+    }
 
+    async fn execute_action_refresh_all(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
             let repo_paths = {
                 let repos = self.repos.read().await;
@@ -10409,7 +10428,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("Refresh action selected the wrong handler")
+    }
 
+    async fn execute_action_crew_handoff(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match Box::pin(self.crew_handoff_internal(context, target, message)).await {
@@ -10419,7 +10448,19 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("CrewHandoff action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_resume(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
@@ -10453,7 +10494,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ConvoyResume action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_withdraw_pending_brief(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { namespace, name } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
@@ -10467,7 +10518,19 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ConvoyWithdrawPendingBrief action selected the wrong handler")
+    }
 
+    async fn execute_action_crew_complete(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::CrewComplete { context, message, disposition, decision_ledger_ref, force } =
             &command.action
         {
@@ -10497,7 +10560,18 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("CrewComplete action selected the wrong handler")
+    }
 
+    async fn execute_action_crew_fail(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
         if let flotilla_protocol::CommandAction::CrewFail { context, message, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let operator =
@@ -10509,7 +10583,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("CrewFail action selected the wrong handler")
+    }
 
+    async fn execute_action_crew_stall(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::CrewStall { context, reason, proposed_disposition, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_stall_internal(context, *reason, *proposed_disposition, message.clone()).await {
@@ -10519,7 +10603,19 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("CrewStall action selected the wrong handler")
+    }
 
+    async fn execute_action_crew_supervise(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, vessel, role, operation, message, actor_crew_id } =
             &command.action
         {
@@ -10559,7 +10655,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("CrewSupervise action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_link(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ConvoyLink { namespace, name, reference, relationship } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
@@ -10577,6 +10683,17 @@ impl InProcessDaemon {
             );
             return Ok(id);
         }
+        unreachable!("ConvoyLink action selected the wrong handler")
+    }
+
+    async fn execute_action_convoy_unlink(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ConvoyUnlink { namespace, name, reference } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
@@ -10594,7 +10711,18 @@ impl InProcessDaemon {
             );
             return Ok(id);
         }
+        unreachable!("ConvoyUnlink action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_delete(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
         if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
@@ -10616,7 +10744,19 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ConvoyDelete action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_abandon(
+        &self,
+        id: u64,
+        command: &Command,
+        caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let caller = caller.clone();
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
@@ -10639,7 +10779,17 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ConvoyAbandon action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_work_force_complete(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
@@ -10682,7 +10832,18 @@ impl InProcessDaemon {
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
+        unreachable!("ConvoyWorkForceComplete action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_start(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let acting_namespace = self.provisioning_namespace().await;
@@ -10721,7 +10882,18 @@ impl InProcessDaemon {
             }
             return Ok(id);
         }
+        unreachable!("ConvoyStart action selected the wrong handler")
+    }
 
+    async fn execute_action_convoy_create(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
+        let dispatching_principal_ref = dispatching_principal_ref.clone();
         if let flotilla_protocol::CommandAction::ConvoyCreate {
             name,
             workflow_ref,
@@ -11090,7 +11262,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ConvoyCreate action selected the wrong handler")
+    }
 
+    async fn execute_action_workflow_template_apply(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -11126,7 +11308,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("WorkflowTemplateApply action selected the wrong handler")
+    }
 
+    async fn execute_action_project_add(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -11149,7 +11341,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ProjectAdd action selected the wrong handler")
+    }
 
+    async fn execute_action_project_apply(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -11206,7 +11408,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ProjectApply action selected the wrong handler")
+    }
 
+    async fn execute_action_project_register(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectRegister { target } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -11229,7 +11441,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ProjectRegister action selected the wrong handler")
+    }
 
+    async fn execute_action_project_refresh(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectRefresh { name } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -11254,7 +11476,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("ProjectRefresh action selected the wrong handler")
+    }
 
+    async fn execute_action_track_repo_path(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::TrackRepoPath { path } = &command.action {
             let description = command.description().to_string();
             let repo_path = path.clone();
@@ -11283,7 +11515,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("TrackRepoPath action selected the wrong handler")
+    }
 
+    async fn execute_action_untrack_repo(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::UntrackRepo { repo } = &command.action {
             let repo_path = match self.resolve_repo_selector(repo).await {
                 Ok(path) => path,
@@ -11311,7 +11553,17 @@ impl InProcessDaemon {
             });
             return Ok(id);
         }
+        unreachable!("UntrackRepo action selected the wrong handler")
+    }
 
+    async fn execute_action_refresh_repo(
+        &self,
+        id: u64,
+        command: &Command,
+        _caller: &Option<flotilla_protocol::CommandCaller>,
+        _dispatching_principal_ref: &Option<PrincipalRef>,
+        _command_node_id: &NodeId,
+    ) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } = &command.action {
             let repo_path = self.resolve_repo_selector(selector).await?;
             let description = command.description().to_string();
@@ -11339,6 +11591,296 @@ impl InProcessDaemon {
                 result,
             });
             return Ok(id);
+        }
+        unreachable!("Refresh action selected the wrong handler")
+    }
+
+    // This executor has many async arms. Box substantial nested futures below
+    // so their combined state fits on the default Tokio test-thread stack.
+    async fn execute_impl(
+        &self,
+        command: Command,
+        remote_executor: Arc<dyn RemoteStepExecutor>,
+        allow_remote_host: bool,
+        caller: Option<flotilla_protocol::CommandCaller>,
+    ) -> Result<u64, String> {
+        let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
+        let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
+        debug!(
+            %command_node_id, local_node = %self.node_id, %allow_remote_host,
+            desc = %command.description(), "execute_impl"
+        );
+        if !allow_remote_host && command_node_id != self.node_id {
+            return Err(format!("remote command routing not implemented yet for node {command_node_id}"));
+        }
+
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+
+        if command.action.is_query() {
+            // Query commands should be dispatched through `execute_query`,
+            // not through `execute`. Return an error to surface misrouting.
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let Some(origin) = Box::pin(self.resource_mutation_origin(&command.action)).await? {
+            if origin != self.node_id {
+                let empty_identity = self.start_context_free_command(id, command.description().to_string());
+                let host =
+                    self.host_registry.host_name_for_node(&origin).await.map(|name| name.to_string()).unwrap_or_else(|| origin.to_string());
+                let result = CommandValue::Error {
+                    message: format!(
+                        "resource is a replica on {}; its origin is {host} ({origin}). \
+                         Retry when the origin is reachable",
+                        self.host_name
+                    ),
+                };
+                self.finish_context_free_command(id, empty_identity, result);
+                return Ok(id);
+            }
+        }
+
+        match &command.action {
+            flotilla_protocol::CommandAction::ResourceApply { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_apply(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::RepositoryRemoteRemove { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_repository_remote_remove(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ResourceManifestResolve { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_manifest_resolve(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ResourceReconcileNow { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_reconcile_now(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ResourceStatusPatch { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_status_patch(id, &command, &caller, &dispatching_principal_ref, &command_node_id))
+                        .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ResourceDelete { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_delete(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ResourceWatch { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_resource_watch(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::Refresh { repo: None } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_refresh_all(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::CrewHandoff { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_crew_handoff(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyResume { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_resume(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyWithdrawPendingBrief { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_withdraw_pending_brief(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::CrewComplete { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_crew_complete(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::CrewFail { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_crew_fail(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::CrewStall { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_crew_stall(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::CrewSupervise { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyLink { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_link(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyUnlink { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_unlink(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyDelete { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_delete(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyAbandon { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_abandon(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_work_force_complete(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyStart { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_start(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ConvoyCreate { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_convoy_create(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::WorkflowTemplateApply { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_workflow_template_apply(
+                        id,
+                        &command,
+                        &caller,
+                        &dispatching_principal_ref,
+                        &command_node_id,
+                    ))
+                    .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ProjectAdd { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_project_add(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ProjectApply { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_project_apply(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ProjectRegister { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_project_register(id, &command, &caller, &dispatching_principal_ref, &command_node_id))
+                        .await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::ProjectRefresh { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_project_refresh(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::TrackRepoPath { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_track_repo_path(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::UntrackRepo { .. } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_untrack_repo(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            flotilla_protocol::CommandAction::Refresh { repo: Some(_) } => {
+                return Box::pin(async {
+                    Box::pin(self.execute_action_refresh_repo(id, &command, &caller, &dispatching_principal_ref, &command_node_id)).await
+                })
+                .await
+            }
+            _ => {}
         }
 
         // Gather what the spawned task needs — validate repo before broadcasting
