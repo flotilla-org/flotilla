@@ -169,6 +169,8 @@ pub struct KeysConfig {
     #[serde(default)]
     pub command_palette: HashMap<String, String>,
     #[serde(default)]
+    pub notifications: HashMap<String, String>,
+    #[serde(default)]
     pub file_picker: HashMap<String, String>,
 }
 

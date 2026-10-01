@@ -39,7 +39,7 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
             }
             PendingActionTarget::TableRow(row_ctx) => {
                 if let Err(message) = app.views.begin_pending_row(row_ctx, ctx.description.clone()) {
-                    app.set_status_message(Some(message));
+                    app.set_error_message(message);
                     return;
                 }
             }
@@ -111,7 +111,7 @@ pub fn handle_dispatch_completion(
                 }
             }
             if !handled_by_project_batch {
-                app.set_status_message(Some(message));
+                app.set_error_message(message);
             }
         }
     }
@@ -130,10 +130,10 @@ pub fn handle_attach_dispatch_completion(session_id: uuid::Uuid, result: Result<
             app.pending_attach_plan = Some(plan);
         }
         Ok(CommandValue::Error { message }) | Err(message) => {
-            app.set_status_message(Some(message));
+            app.set_error_message(message);
         }
         Ok(other) => {
-            app.set_status_message(Some(format!("unexpected attach response: {other:?}")));
+            app.set_error_message(format!("unexpected attach response: {other:?}"));
         }
     }
 }
@@ -168,7 +168,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         }
         CommandValue::BranchNameGenerated { .. } => tracing::warn!("unexpected branch-name result reached UI handler"),
         CommandValue::Error { message } => {
-            app.set_status_message(Some(message));
+            app.set_error_message(message);
         }
         CommandValue::Cancelled => {
             app.set_status_message(Some("Command cancelled".into()));
@@ -335,7 +335,7 @@ mod tests {
         assert!(app.pending_attach_plan.is_none());
 
         handle_attach_dispatch_completion(old_session, Err("old daemon failed".into()), &mut app);
-        assert!(app.model.status_message.is_none());
+        assert_eq!(app.model.status_message.as_deref(), Some("Reconnected to daemon"));
     }
 
     #[tokio::test]

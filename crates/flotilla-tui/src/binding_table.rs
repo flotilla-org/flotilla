@@ -45,6 +45,7 @@ pub enum BindingModeId {
     FindInput,
     CommandPalette,
     FilePicker,
+    Notifications,
 }
 
 /// What widgets return from `binding_mode()`.
@@ -134,6 +135,7 @@ pub static BINDINGS: &[Binding] = &[
     // ── TabPage — app-global tab-level bindings, composed by all top-level tabs ──
     h(BindingModeId::TabPage, "q", Action::Quit, "Quit"),
     h(BindingModeId::TabPage, "h", Action::ToggleHelp, "Help"),
+    h(BindingModeId::TabPage, "n", Action::ToggleNotifications, "Notices"),
     h(BindingModeId::TabPage, "?", Action::OpenContextualPalette, "Ctx"),
     b(BindingModeId::TabPage, "S-T", Action::CycleTheme),
     b(BindingModeId::TabPage, "S-D", Action::ToggleDebug),
@@ -214,6 +216,17 @@ pub static BINDINGS: &[Binding] = &[
     hk(BindingModeId::FilePicker, "enter", "ENT", Action::Confirm, "Select"),
     hk(BindingModeId::FilePicker, "esc", "ESC", Action::Dismiss, "Cancel"),
     hk(BindingModeId::FilePicker, "tab", "TAB", Action::FillSelected, "Complete"),
+    // ── Notification history ──
+    h(BindingModeId::Notifications, "j", Action::SelectNext, "Down"),
+    b(BindingModeId::Notifications, "down", Action::SelectNext),
+    h(BindingModeId::Notifications, "k", Action::SelectPrev, "Up"),
+    b(BindingModeId::Notifications, "up", Action::SelectPrev),
+    h(BindingModeId::Notifications, "x", Action::ClearSelectedNotification, "Clear"),
+    b(BindingModeId::Notifications, "delete", Action::ClearSelectedNotification),
+    h(BindingModeId::Notifications, "S-X", Action::ClearAllNotifications, "Clear all"),
+    hk(BindingModeId::Notifications, "esc", "ESC", Action::Dismiss, "Close"),
+    b(BindingModeId::Notifications, "n", Action::Dismiss),
+    b(BindingModeId::Notifications, "q", Action::Dismiss),
 ];
 
 // ── Compiled bindings ────────────────────────────────────────────────
@@ -455,6 +468,7 @@ fn parse_key_string(s: &str) -> KeyCombination {
         "space" => KeyCode::Char(' '),
         "tab" => KeyCode::Tab,
         "backtab" => KeyCode::BackTab,
+        "delete" => KeyCode::Delete,
         "up" => KeyCode::Up,
         "down" => KeyCode::Down,
         "left" => KeyCode::Left,

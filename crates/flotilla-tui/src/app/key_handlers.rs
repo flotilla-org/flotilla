@@ -42,8 +42,19 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // Clear the transient command echo on every key press.
-        self.ui.command_echo = None;
+        if self.ui.notifications.expanded {
+            let action = self.keymap.resolve(&KeyBindingMode::from(BindingModeId::Notifications), crokey::KeyCombination::from(key));
+            match action {
+                Some(Action::Dismiss | Action::ToggleNotifications) => self.ui.notifications.expanded = false,
+                Some(Action::SelectNext) => self.ui.notifications.select_next(),
+                Some(Action::SelectPrev) => self.ui.notifications.select_previous(),
+                Some(Action::ClearSelectedNotification) => self.ui.notifications.clear_selected(),
+                Some(Action::ClearAllNotifications) => self.ui.notifications.clear_all(),
+                Some(Action::Quit) => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
 
         // Determine the topmost widget's mode. Screen delegates to the
         // top modal (if any) for mode_id / captures_raw_keys.
@@ -94,6 +105,12 @@ impl App {
     // ── Mouse handling ──
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.ui.notifications.expanded {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.ui.notifications.expanded = false;
+            }
+            return;
+        }
         // Dispatch to Screen, which handles modal routing internally.
         let mut screen = std::mem::take(&mut self.screen);
         let app_actions = {
@@ -122,7 +139,7 @@ impl App {
         match self.panel_target_node(host) {
             Ok(node_id) => Ok(node_id),
             Err(message) => {
-                self.set_status_message(Some(message));
+                self.set_error_message(message);
                 Err(())
             }
         }
@@ -137,11 +154,11 @@ impl App {
                     .is_some_and(|home| home == &HostName::local() || self.model.my_host().is_some_and(|local| home == local));
                 if !locally_homed {
                     let home = target.host.as_ref().map_or_else(|| "unknown host".to_string(), ToString::to_string);
-                    self.set_status_message(Some(format!("{} is not reachable from this PM yet (homed on {home})", target.label)));
+                    self.set_error_message(format!("{} is not reachable from this PM yet (homed on {home})", target.label));
                     return;
                 }
                 let Some(connector) = self.pm_connector.clone() else {
-                    self.set_status_message(Some("No presentation manager is connected".to_string()));
+                    self.set_error_message("No presentation manager is connected".to_string());
                     return;
                 };
                 let working_directory = self
@@ -152,7 +169,6 @@ impl App {
                 let tx = self.pm_update_tx.clone();
                 let label = target.label.clone();
                 self.report_focus(vec![target.resource_ref()]);
-                self.set_status_message(Some(format!("Opening {label} in PM...")));
                 tokio::spawn(async move {
                     let result = connector.open(&target, &working_directory).await;
                     let _ = tx.send(super::PmOpenUpdate { label, result });
@@ -161,7 +177,7 @@ impl App {
             }
             TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
                 let Some(repo_identity) = self.table_action_repo(repo_hint.as_ref()) else {
-                    self.set_status_message(Some("Cannot attach workspace: the convoy does not identify a tracked repository".to_string()));
+                    self.set_error_message("Cannot attach workspace: the convoy does not identify a tracked repository".to_string());
                     return;
                 };
                 (self.repo_command_for_identity(repo_identity, CommandAction::SelectWorkspace { ws_ref: workspace_ref }), host)
@@ -182,7 +198,7 @@ impl App {
                     self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone(), force: false });
                 command.node_id = node_id;
                 let Some(address) = self.views.active_address().cloned() else {
-                    self.set_status_message(Some("Cannot delete convoy: active view has no address".into()));
+                    self.set_error_message("Cannot delete convoy: active view has no address".into());
                     return;
                 };
                 let panel = matches!(&address, flotilla_protocol::ViewAddress::Project { .. })
@@ -201,7 +217,7 @@ impl App {
                     .iter()
                     .find_map(|(identity, repo)| (repo.repository_key.as_ref() == Some(&repository_key)).then(|| identity.clone()))
                 else {
-                    self.set_status_message(Some("Cannot open PR: repository is not tracked".to_string()));
+                    self.set_error_message("Cannot open PR: repository is not tracked".to_string());
                     return;
                 };
                 let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
@@ -223,7 +239,7 @@ impl App {
         let node_id = match self.panel_target_node(&host) {
             Ok(node_id) => node_id,
             Err(message) => {
-                self.set_status_message(Some(message));
+                self.set_error_message(message);
                 return;
             }
         };

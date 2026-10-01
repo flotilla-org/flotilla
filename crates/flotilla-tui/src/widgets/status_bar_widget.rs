@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{InFlightCommand, NamespaceMap, TuiModel, UiState},
+    app::{ui_state::NotificationKind, InFlightCommand, NamespaceMap, TuiModel, UiState, VisibleStatusItem},
     binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
@@ -28,7 +28,7 @@ use crate::{
 /// for the bottom status strip.
 ///
 /// This is a pure renderer: all content resolution (status text, key chips,
-/// task spinner, error items, mode indicators) is performed by `Screen`
+/// task spinner, mode indicators) is performed by `Screen`
 /// before calling `render_bespoke`.
 #[derive(Default)]
 pub struct StatusBarWidget {
@@ -55,28 +55,34 @@ impl StatusBarWidget {
         status: StatusSection,
         key_chips: Vec<KeyChip>,
         task: Option<TaskSection>,
-        error_items: Vec<crate::app::VisibleStatusItem>,
+        notification: Option<&VisibleStatusItem>,
         mode_indicators: Vec<ModeIndicator>,
         show_keys: bool,
-        command_echo: Option<&str>,
         theme: &Theme,
         frame: &mut Frame,
+        notification_area: Rect,
         area: Rect,
     ) {
         self.area = area;
         self.key_targets.clear();
         self.dismiss_targets.clear();
 
-        // Error items take priority over the fragment's status.
-        let status_section =
-            if let Some(item) = error_items.into_iter().next() { StatusSection::error(item.id, &item.text) } else { status };
+        if let Some(notification) = notification {
+            let color = match notification.kind {
+                NotificationKind::Info => theme.info,
+                NotificationKind::Error => theme.status_error,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" {}", notification.text), Style::default().fg(color))),
+                notification_area,
+            );
+        }
 
-        let status_section_clone = status_section.clone();
         let status_model = StatusBarModel::build(StatusBarInput {
             width: area.width as usize,
             preferred_status_width: DEFAULT_STATUS_WIDTH_BUDGET.min(area.width as usize),
             keys_visible: show_keys,
-            status: status_section,
+            status,
             task,
             keys: key_chips,
             mode_indicators,
@@ -87,31 +93,11 @@ impl StatusBarWidget {
         let mut spans = Vec::new();
         let mut x = 0usize;
 
-        // Command echo: dim text at the far left, before the status section.
-        if let Some(echo) = command_echo {
-            if !echo.is_empty() {
-                let echo_style = Style::default().fg(theme.muted).bg(theme.bar_bg);
-                let echo_text = format!(" {echo} ");
-                let echo_width = echo_text.width();
-                spans.push(Span::styled(echo_text, echo_style));
-                x += echo_width;
-            }
-        }
-
-        let status_style = match status_section_clone {
-            StatusSection::Error { .. } => Style::default().fg(theme.status_error).bg(theme.bar_bg).bold(),
-            StatusSection::Plain(_) => Style::default().fg(theme.text).bg(theme.bar_bg),
-        };
+        let status_style = Style::default().fg(theme.text).bg(theme.bar_bg);
 
         if !status_model.status_text.is_empty() {
             let status_width = status_model.status_text.width();
             spans.push(Span::styled(status_model.status_text.clone(), status_style));
-            if let Some(id) = status_section_clone.dismiss_id() {
-                self.dismiss_targets.push(StatusBarTarget::new(
-                    Rect::new(area.x + status_width.saturating_sub(1) as u16, area.y, 1, 1),
-                    StatusBarAction::ClearError(id),
-                ));
-            }
             x += status_width;
         }
 
@@ -316,6 +302,34 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::*;
+
+    #[test]
+    fn notification_does_not_replace_command_hint() {
+        let backend = ratatui::backend::TestBackend::new(80, 2);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        let mut widget = StatusBarWidget::new();
+        terminal
+            .draw(|frame| {
+                widget.render_bespoke(
+                    StatusSection::plain(": for commands"),
+                    vec![],
+                    None,
+                    Some(&VisibleStatusItem { id: 0, text: "ERROR failed".into(), kind: NotificationKind::Error }),
+                    vec![],
+                    false,
+                    &Theme::classic(),
+                    frame,
+                    Rect::new(0, 0, 80, 1),
+                    Rect::new(0, 1, 80, 1),
+                );
+            })
+            .expect("render status bar");
+        let cells = terminal.backend().buffer();
+        let notification = (0..80).map(|x| cells[(x, 0)].symbol()).collect::<String>();
+        let command = (0..80).map(|x| cells[(x, 1)].symbol()).collect::<String>();
+        assert!(notification.contains("ERROR failed"), "{notification}");
+        assert!(command.contains(": for commands"), "{command}");
+    }
     use crate::{
         app::{test_support::repo_info, NamespaceModel},
         convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary},

@@ -212,7 +212,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
             terminal_title = None;
             events.resume_terminal_input();
             if let Err(message) = result {
-                app.set_status_message(Some(message));
+                app.set_error_message(message);
             }
         }
         app.drain_background_updates();

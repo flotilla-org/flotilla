@@ -27,7 +27,7 @@ impl App {
     /// tab set — the pane stays one View (ADR 0013).
     pub fn open_view(&mut self, address: ViewAddress) {
         if matches!(address, ViewAddress::Repo { .. }) {
-            self.set_status_message(Some("Repo views have been retired; open a project or checkout view".into()));
+            self.set_error_message("Repo views have been retired; open a project or checkout view".into());
             return;
         }
         self.dismiss_modals();
