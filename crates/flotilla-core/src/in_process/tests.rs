@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::TimeZone;
-use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
-    controller::{Actuation, Reconciler},
     controller_patches, ConvoyEnsureStatus, ConvoyProvisioningState, ConvoyStatus, CredentialConsumer, CredentialExpiry, CredentialGrant,
     CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
@@ -190,7 +188,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
 }
 
 #[tokio::test]
-async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
+async fn remote_session_receives_nudge_and_resume_from_convoy_home() {
     let home = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("home store"))
         .with_local_root(NodeId::new("home"));
     let placement = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("placement store"))
@@ -250,70 +248,37 @@ async fn reconciled_session_receives_nudge_and_resume_from_convoy_home() {
         })
         .await
         .expect("working crew");
-    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate convoy for vessel reconciliation").await;
-    home.using::<PlacementPolicy>("flotilla")
-        .create(
-            &test_meta("placement-policy"),
-            &PlacementPolicySpec::builder()
-                .pool("cleat".to_string())
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "placement-host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-        )
-        .await
-        .expect("placement policy");
-    replicate_turn_delivery_resources::<PlacementPolicy>(&home, &placement, "home", "replicate placement policy").await;
-    let environments = placement.clone().using::<ResourceEnvironment>("flotilla");
-    let environment = environments
-        .create(&test_meta("host-direct-placement-host"), &ResourceEnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: "placement-host".to_string(),
-                repo_default_dir: "/workspace".to_string(),
-            }),
-            docker: None,
-        })
-        .await
-        .expect("placement environment");
-    environments
-        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &ResourceEnvironmentStatus {
-            phase: EnvironmentPhase::Ready,
-            ready: true,
-            ..Default::default()
-        })
-        .await
-        .expect("ready environment");
-    let vessel = placement
-        .using::<Vessel>("flotilla")
-        .create(
-            &InputMeta::builder()
-                .name("nudge-convoy-work".to_string())
-                .annotations(BTreeMap::from([(flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "home".to_string())]))
-                .build(),
-            &VesselSpec {
-                convoy_ref: "nudge-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "placement-policy".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
+    let meta = InputMeta::builder()
+        .name("nudge-convoy-work-coder".to_string())
+        .labels(BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "nudge-convoy".to_string()),
+            (VESSEL_LABEL.to_string(), "work".to_string()),
+            (ROLE_LABEL.to_string(), "coder".to_string()),
+        ]))
+        .build();
+    let spec = ResourceTerminalSessionSpec {
+        env_ref: "placement-environment".to_string(),
+        role: "coder".to_string(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: flotilla_resources::TerminalBrief {
+                path: "brief.md".to_string(),
+                content: "Initial".to_string(),
+                artifact_digest: None,
+                copies: Vec::new(),
             },
-        )
-        .await
-        .expect("placement vessel");
-    let reconciler = VesselReconciler::new(placement.clone(), "flotilla")
-        .with_federated_dependencies(&placement, flotilla_protocol::CanonicalHostId::resolved("placement-host"));
-    let dependencies = reconciler.prepare(&vessel).await.expect("vessel dependencies");
-    let outcome = reconciler.reconcile(&vessel, &dependencies, Utc::now());
-    let (meta, spec) = outcome
-        .actuations
-        .into_iter()
-        .find_map(|actuation| match actuation {
-            Actuation::CreateTerminalSession { meta, spec } => Some((meta, spec)),
-            _ => None,
-        })
-        .expect("vessel reconciler creates crew terminal");
+            context: Box::new(flotilla_resources::TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "nudge-convoy".to_string(),
+                vessel_ref: "nudge-convoy-work".to_string(),
+            }),
+            message: None,
+        },
+        cwd: "/workspace".to_string(),
+        pool: "cleat".to_string(),
+    };
     let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.create(&meta, &spec).await.expect("persist reconciled terminal");
+    let session = sessions.create(&meta, &spec).await.expect("persist remote terminal");
     let convoy = convoys.get("nudge-convoy").await.expect("working convoy");
     let mut status = convoy.status.expect("working status");
     status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
