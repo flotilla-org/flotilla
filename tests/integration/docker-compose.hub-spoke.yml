@@ -8,7 +8,9 @@ services:
     build:
       context: ../..
       dockerfile: tests/integration/docker/base/Dockerfile
-      target: full
+      target: ${FLOTILLA_BASE_TARGET:-full}
+      args:
+        FLOTILLA_BIN_DIR: ${FLOTILLA_BIN_DIR:-target/release}
     image: flotilla-base
 
   workstation:
