@@ -9780,7 +9780,7 @@ impl InProcessDaemon {
         }
         if plan == TurnDeliverySessionPlan::RestartFresh {
             if let Some(head) = message {
-                brief.content = head.mark_next_for_launch(delivered).expect("new turn is pending");
+                brief.content = head.mark_next_for_launch(delivered).ok_or_else(|| "supervisor turn has no pending message".to_string())?;
                 brief.artifact_digest = None;
             }
         }
