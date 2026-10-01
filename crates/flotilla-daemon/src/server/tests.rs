@@ -2010,6 +2010,48 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
 }
 
 #[tokio::test]
+async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery() {
+    use flotilla_core::command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason};
+
+    let (_tmp, daemon) = empty_daemon().await;
+    let read = daemon.resolve_command_target(&CommandAction::QueryHostList {}, None).await.expect("resolve read");
+    assert_eq!(read.host, TargetHost::Local);
+    assert_eq!(read.reason, TargetReason::LocalRead);
+
+    let remote = node("feta");
+    let mutation = daemon
+        .resolve_command_target(&CommandAction::TrackRepoPath { path: "/tmp/repo".into() }, Some(&remote))
+        .await
+        .expect("resolve explicit remote mutation");
+    assert_eq!(mutation.host, TargetHost::Node(remote.clone()));
+    assert_eq!(mutation.reason, TargetReason::Explicit);
+    assert_eq!(mutation.delivery, RemoteDelivery::Steps);
+
+    let legacy_session = daemon
+        .resolve_command_target(&CommandAction::ArchiveSession { session_id: "external-session".into() }, Some(&remote))
+        .await
+        .expect("explicit archive target");
+    assert_eq!(legacy_session.host, TargetHost::Node(remote));
+    assert_eq!(legacy_session.reason, TargetReason::Explicit);
+    assert_eq!(legacy_session.delivery, RemoteDelivery::Steps);
+
+    let unresolved = daemon
+        .resolve_command_target(
+            &CommandAction::CrewComplete {
+                context: CrewCommandContext::default(),
+                message: None,
+                disposition: None,
+                decision_ledger_ref: None,
+                force: false,
+            },
+            None,
+        )
+        .await
+        .expect_err("crew settlement needs a convoy home");
+    assert!(matches!(unresolved, TargetError::RecordHome(_)));
+}
+
+#[tokio::test]
 async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;

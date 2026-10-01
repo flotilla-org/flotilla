@@ -218,6 +218,130 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
 }
 
 #[tokio::test]
+async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
+    // Each row traverses the request dispatcher, an in-memory peer session
+    // when needed, and the actual remote command router.
+    let scenarios = [
+        ("delete-at-home", false, false, false),
+        ("delete-from-desk", true, false, false),
+        ("delete-with-stale-target", true, true, false),
+        ("abandon-at-home", false, false, true),
+        ("abandon-from-desk", true, false, true),
+    ];
+    for (name, remote_home, stale_target, abandon) in scenarios {
+        let leader = empty_daemon_named("desk").await;
+        let follower = empty_daemon_named("placement").await;
+        let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect router scenario hosts");
+        let namespace = "flotilla";
+        let home = if remote_home { &topology.follower } else { &topology.leader };
+        let home_convoys = home.resource_backend().using::<Convoy>(namespace);
+        home_convoys.create(&convoy_meta(name, name), &convoy_spec("scratch", name)).await.expect("seed convoy at its home");
+        if remote_home {
+            apply_convoy_replica_feed(&topology.leader, namespace, name, topology.follower_host.clone()).await;
+        }
+
+        let action = if abandon {
+            CommandAction::ConvoyAbandon { namespace: Some(namespace.into()), name: name.into(), reason: "accepted loss".into() }
+        } else {
+            CommandAction::ConvoyDelete { namespace: Some(namespace.into()), name: name.into(), force: true }
+        };
+        let mut command = Command::builder().action(action).build();
+        if stale_target {
+            command.node_id = Some(topology.leader.node_id().clone());
+        }
+        let mut events = topology.leader.subscribe();
+        let command_id = topology.client.execute(command).await.expect("dispatch scenario");
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id: id, node_id, result, .. } =
+                    events.recv().await.expect("command result event")
+                {
+                    if id == command_id {
+                        assert_eq!(node_id, *home.node_id(), "{name} ran away from its home");
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("scenario completes");
+        if abandon {
+            assert!(matches!(result, CommandValue::ConvoyAbandoned { .. }), "{name}: {result:?}");
+            assert_eq!(
+                home_convoys.get(name).await.expect("abandoned home record").status.expect("abandoned status").phase,
+                ResourceConvoyPhase::Abandoned,
+                "{name}"
+            );
+        } else {
+            assert_eq!(result, CommandValue::Ok, "{name}");
+            assert!(matches!(home_convoys.get(name).await, Err(ResourceError::NotFound { .. })), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
+    let scenarios = [
+        ("resume", CommandAction::ConvoyResume {
+            namespace: Some("flotilla".into()),
+            name: "remote-work".into(),
+            prompt: "continue".into(),
+            vessel: None,
+            role: None,
+        }),
+        ("nudge", CommandAction::ConvoyResume {
+            namespace: Some("flotilla".into()),
+            name: "remote-work".into(),
+            prompt: "check in".into(),
+            vessel: Some("work".into()),
+            role: Some("coder".into()),
+        }),
+        ("supervise", CommandAction::CrewSupervise {
+            namespace: Some("flotilla".into()),
+            convoy: "remote-work".into(),
+            vessel: "work".into(),
+            role: "coder".into(),
+            operation: flotilla_protocol::CrewSupervisionAction::Resume,
+            message: "continue".into(),
+            actor_crew_id: None,
+        }),
+    ];
+    for (name, action) in scenarios {
+        let leader = empty_daemon_named("desk").await;
+        let follower = empty_daemon_named("placement").await;
+        let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect scenario hosts");
+        topology
+            .follower
+            .resource_backend()
+            .using::<Convoy>("flotilla")
+            .create(&convoy_meta("remote-work", "remote-work"), &convoy_spec("scratch", "remote-work"))
+            .await
+            .expect("seed remote authority");
+        apply_convoy_replica_feed(&topology.leader, "flotilla", "remote-work", topology.follower_host.clone()).await;
+
+        let mut events = topology.leader.subscribe();
+        let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch scenario");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id: id, node_id, result, .. } =
+                    events.recv().await.expect("command result event")
+                {
+                    if id == command_id {
+                        assert_eq!(node_id, *topology.follower.node_id(), "{name} ran away from the convoy authority");
+                        // No crew session was seeded: the authority should reject
+                        // the request after delivery, rather than the desk doing so.
+                        assert!(matches!(result, CommandValue::Error { .. }), "{name}: {result:?}");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("remote authority responds");
+    }
+}
+
+#[tokio::test]
 async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect() {
     let kiwi = empty_daemon_named("kiwi").await;
     let feta = empty_daemon_named("feta").await;

@@ -6,6 +6,7 @@ pub mod attachable;
 pub mod awareness_projection;
 pub mod change_request_observer;
 pub mod checkout_integration;
+pub mod command_target;
 pub mod config;
 pub mod convert;
 pub mod daemon;
