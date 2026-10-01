@@ -1,0 +1,9 @@
+[profiles.development]
+test_cases = 12
+
+[profiles.ci]
+test_cases = 12
+
+[profiles.nightly]
+extends = "ci"
+test_cases = 120

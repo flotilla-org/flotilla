@@ -46,6 +46,7 @@ http = "1"
 libc = "0.2"
 
 [dev-dependencies]
+hegeltest = "=0.48.1"
 bytes = "1"
 http = "1"
 flotilla-test-support = { path = "../flotilla-test-support" }
