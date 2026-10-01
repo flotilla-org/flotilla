@@ -372,10 +372,23 @@ pub struct ReplicaConvoyCheckoutWatch {
 }
 
 impl ReplicaConvoyCheckoutWatch {
-    async fn enqueue_checkouts(sender: &WorkQueueSender, convoy: &ResourceObject<crate::Convoy>) -> Result<(), ResourceError> {
+    async fn enqueue_checkouts(
+        sender: &WorkQueueSender,
+        checkouts: &TypedResolver<crate::Checkout>,
+        convoy: &ResourceObject<crate::Convoy>,
+    ) -> Result<(), ResourceError> {
         for checkout_name in crate::expected_checkout_refs(convoy).unwrap_or_default() {
             sender
                 .send(checkout_name)
+                .await
+                .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
+        }
+        // Older and adopted convoys may lack a frozen checkout reference.
+        // The checkout's convoy label remains enough to wake its home controller.
+        let selector = BTreeMap::from([(crate::CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]);
+        for checkout in checkouts.list_matching_labels(&selector).await?.items {
+            sender
+                .send(checkout.metadata.name)
                 .await
                 .map_err(|_| ResourceError::other("controller queue closed while forwarding federated convoy checkout event"))?;
         }
@@ -392,15 +405,16 @@ impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
 
     fn spawn(
         self: Box<Self>,
-        _backend: ResourceBackend,
-        _namespace: String,
+        backend: ResourceBackend,
+        namespace: String,
         sender: WorkQueueSender,
     ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
         Box::pin(async move {
+            let checkouts = backend.using::<crate::Checkout>(&namespace);
             let mut watch = self.resolver.watch().await?;
             let listed = self.resolver.list().await?;
             for source in &listed.items {
-                Self::enqueue_checkouts(&sender, &source.object).await?;
+                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
             }
             while let Some(event) = watch.next().await {
                 let source = match event? {
@@ -409,7 +423,7 @@ impl SecondaryWatch for ReplicaConvoyCheckoutWatch {
                     | crate::ReadWatchEvent::Deleted(source) => source,
                     crate::ReadWatchEvent::DeletedByName { .. } => continue,
                 };
-                Self::enqueue_checkouts(&sender, &source.object).await?;
+                Self::enqueue_checkouts(&sender, &checkouts, &source.object).await?;
             }
             Ok(())
         })
@@ -757,6 +771,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                 };
                 let mut attempted_reconcile = false;
+                let mut attempted_finalizer = false;
                 let result = async {
                     let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
                     if let Some(finalizer_name) = reconciler.finalizer_name() {
@@ -773,6 +788,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                             && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
                         {
                             if lifecycle_owned {
+                                attempted_finalizer = true;
                                 if let Err(err) = reconciler.run_finalizer(&object).await {
                                     if let Some(patch) = reconciler.finalizer_error_patch(&object, &err) {
                                         if let Err(patch_error) =
@@ -875,7 +891,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                             }
                         }
                         let mut terminal = false;
-                        let mut retry_after = None;
+                        // A finalizer error may produce no status write (for example,
+                        // the same failure was recorded on an earlier attempt). It
+                        // still needs its own retry instead of waiting for resync.
+                        let mut retry_after = attempted_finalizer.then_some(Duration::from_secs(1));
                         if attempted_reconcile {
                             if let Some(policy) = reconciler.reconcile_error_policy() {
                                 let message = err.to_string();

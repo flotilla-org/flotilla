@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -42,6 +43,172 @@ use flotilla_resources::{
     WorkState, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY,
     PROJECT_LABEL, ROLE_LABEL,
 };
+
+struct TeardownCheckoutRuntime;
+
+#[async_trait]
+impl CheckoutRuntime for TeardownCheckoutRuntime {
+    async fn create_worktree(&self, _: &str, _: &str, _: Option<&str>, _: &str) -> Result<PreparedCheckout, String> {
+        Err("unexpected provisioning".into())
+    }
+
+    async fn create_fresh_clone(&self, _: &str, _: &str, _: Option<&str>, _: &str) -> Result<PreparedCheckout, String> {
+        Err("unexpected provisioning".into())
+    }
+
+    async fn inspect_integration(
+        &self,
+        _: &flotilla_resources::ResourceObject<flotilla_resources::Checkout>,
+        _: Option<&flotilla_resources::ResourceObject<Convoy>>,
+    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
+        Ok(Default::default())
+    }
+
+    async fn remove_checkout(&self, _: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        Ok(CheckoutRemovalOutcome::Removed)
+    }
+}
+
+#[tokio::test]
+async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
+    use flotilla_core::command_target::TargetHost;
+    use flotilla_resources::{
+        Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, FreshCloneCheckoutSpec, LifecycleAuthority, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+        CONVOY_LABEL,
+    };
+
+    let topology =
+        spawn_in_memory_request_topology_stateful(empty_daemon_named("convoy-home").await, empty_daemon_named("checkout-home").await)
+            .await
+            .expect("spawn two-home router");
+    let namespace = "flotilla";
+    let parent_backend = topology.leader.resource_backend();
+    let child_backend = topology.follower.resource_backend();
+    let parent_root = topology.leader.node_id().clone();
+    let child_root = topology.follower.node_id().clone();
+    let convoys = parent_backend.clone().using::<Convoy>(namespace);
+    convoys
+        .create(
+            &InputMeta::builder().name("old-convoy".to_string()).finalizers(vec!["flotilla.work/convoy-teardown".into()]).build(),
+            &convoy_spec("scratch", "old-convoy"),
+        )
+        .await
+        .expect("create parent on dispatcher host");
+    let checkouts = child_backend.clone().using::<Checkout>(namespace);
+    let child = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("old-child".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "old-convoy".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), parent_root.to_string())]))
+                .finalizers(vec!["flotilla.work/checkout-cleanup".into()])
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
+                env_ref: "host-direct-checkout-home".into(),
+                r#ref: "feature/old-child".into(),
+                base_ref: Some("main".into()),
+                target_path: "/checkouts/old-child".into(),
+                url: "https://github.com/flotilla-org/flotilla".into(),
+            }),
+        )
+        .await
+        .expect("create child at placement home");
+    checkouts
+        .update_status("old-child", &child.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("settle child before teardown");
+    child_backend
+        .replica_writer::<Convoy>(parent_root.clone(), namespace)
+        .replace(&convoys.list().await.expect("list parent"), Utc::now())
+        .await
+        .expect("replicate parent to child home");
+    parent_backend
+        .replica_writer::<Checkout>(child_root.clone(), namespace)
+        .replace(&checkouts.list().await.expect("list child"), Utc::now())
+        .await
+        .expect("replicate child to parent home");
+    let child_delete = CommandAction::ResourceDelete {
+        namespace: namespace.into(),
+        kind: "Checkout".into(),
+        name: "old-child".into(),
+        replica_origin: None,
+    };
+    assert_eq!(
+        topology.leader.resolve_command_target(&child_delete, None).await.expect("resolve child home").host,
+        TargetHost::Node(child_root.clone()),
+        "explicit child deletion routes to the checkout's home, not its parent's home",
+    );
+    let child_controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: CheckoutReconciler::<TeardownCheckoutRuntime>::federated_secondary_watches(&child_backend, namespace),
+            reconciler: CheckoutReconciler::new(Arc::new(TeardownCheckoutRuntime), child_backend.clone(), namespace)
+                .with_federated_convoys(&child_backend, namespace),
+            resync_interval: Duration::from_secs(3600),
+            backend: child_backend.clone(),
+        }
+        .run(),
+    );
+    let parent_controller = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: ConvoyReconciler::federated_secondary_watches(&parent_backend, namespace),
+            reconciler: ConvoyReconciler::new(parent_backend.definitions::<WorkflowTemplate>(namespace))
+                .with_federated_checkouts(parent_backend.including_replicas::<Checkout>(namespace)),
+            resync_interval: Duration::from_secs(3600),
+            backend: parent_backend.clone(),
+        }
+        .run(),
+    );
+    let mut events = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyDelete { namespace: Some(namespace.into()), name: "old-convoy".into(), force: true })
+                .build(),
+        )
+        .await
+        .expect("route parent delete");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::Ok);
+    child_backend
+        .replica_writer::<Convoy>(parent_root, namespace)
+        .replace(&convoys.list().await.expect("list deleting parent"), Utc::now())
+        .await
+        .expect("replicate deletion to child home");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(checkouts.get("old-child").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child home runs checkout finalizer");
+    parent_backend
+        .replica_writer::<Checkout>(child_root, namespace)
+        .replace(&checkouts.list().await.expect("list drained child"), Utc::now())
+        .await
+        .expect("replicate drained child to parent home");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(convoys.get("old-convoy").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parent finalizer completes after child home cleanup");
+    child_controller.abort();
+    parent_controller.abort();
+}
 
 async fn convoy_record_name(backend: &ResourceBackend, role: &str) -> String {
     backend
