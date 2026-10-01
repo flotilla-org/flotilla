@@ -69,6 +69,25 @@ pub(crate) fn open_file_descriptor_count() -> Option<u64> {
     }
 }
 
+pub(crate) fn io_pressure_snapshot() -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string("/proc/pressure/io").ok()?;
+    parse_io_pressure(&raw)
+}
+
+fn parse_io_pressure(raw: &str) -> Option<serde_json::Value> {
+    let avg10 = |kind: &str| {
+        raw.lines()
+            .find(|line| line.starts_with(kind))?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("avg10=").and_then(|value| value.parse::<f64>().ok()))
+    };
+    Some(serde_json::json!({
+        "some_avg10": avg10("some ")?,
+        "full_avg10": avg10("full ")?,
+        "raw": raw.trim(),
+    }))
+}
+
 #[cfg(unix)]
 fn nofile_limits() -> Result<(u64, u64), String> {
     let mut limits = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -125,5 +144,14 @@ mod tests {
         assert_eq!(condition.condition_type, "FileDescriptors");
         assert_eq!(condition.reason, "FileDescriptorPressure");
         assert!(condition.message.contains("820 of 1024"));
+    }
+
+    #[test]
+    fn linux_io_pressure_snapshot_preserves_full_stall_fraction() {
+        let snapshot =
+            parse_io_pressure("some avg10=63.20 avg60=20.10 avg300=5.00 total=100\nfull avg10=49.80 avg60=15.00 avg300=3.00 total=90\n")
+                .expect("valid PSI snapshot");
+        assert_eq!(snapshot["full_avg10"], 49.8);
+        assert_eq!(snapshot["some_avg10"], 63.2);
     }
 }
