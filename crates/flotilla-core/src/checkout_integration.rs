@@ -330,33 +330,35 @@ async fn inspect_landed(
                             .maybe_target_ref(target_ref.map(str::to_string))
                             .observed_at(observed_at.to_string())
                             .build();
-                        if state != ChangeRequestState::Open {
-                            let outcome = if state == ChangeRequestState::Closed { "closed" } else { "merged" };
-                            let (value, detail, head_verified) = if state == ChangeRequestState::Closed {
-                                (ConditionValue::True, format!("PR #{number} {outcome}"), false)
-                            } else {
+                        let landing = match state {
+                            ChangeRequestState::Closed => Some(("closed", ConditionValue::True, format!("PR #{number} closed"), false)),
+                            ChangeRequestState::Merged => {
                                 let merged_head =
                                     item.get("headRefOid").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
                                 let revision_check = match merged_head {
                                     Some(head) => providers.vcs.head_in_history_of(head).await,
                                     None => Err("merged PR head revision is unavailable".to_string()),
                                 };
-                                match revision_check {
+                                let (value, detail, head_verified) = match revision_check {
                                     Ok(true) => {
-                                        (ConditionValue::True, format!("PR #{number} {outcome}; checkout HEAD is in merged PR head"), true)
+                                        (ConditionValue::True, format!("PR #{number} merged; checkout HEAD is in merged PR head"), true)
                                     }
                                     Ok(false) => (
                                         ConditionValue::False,
-                                        format!("PR #{number} {outcome}, but checkout HEAD is not in merged PR head"),
+                                        format!("PR #{number} merged, but checkout HEAD is not in merged PR head"),
                                         false,
                                     ),
                                     Err(error) => (
                                         ConditionValue::Unknown,
-                                        format!("PR #{number} {outcome}; checkout revision could not be verified: {error}"),
+                                        format!("PR #{number} merged; checkout revision could not be verified: {error}"),
                                         false,
                                     ),
-                                }
-                            };
+                                };
+                                Some(("merged", value, detail, head_verified))
+                            }
+                            ChangeRequestState::Open => None,
+                        };
+                        if let Some((outcome, value, detail, head_verified)) = landing {
                             (
                                 IntegrationCondition::builder()
                                     .value(value)
