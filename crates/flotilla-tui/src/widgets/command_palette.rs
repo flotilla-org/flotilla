@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_commands::{resolved::HostQueryKind, HostResolution, RepoContext, Resolved};
 use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector};
 use ratatui::{
@@ -11,21 +11,22 @@ use ratatui::{
     Frame,
 };
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
+use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
     app::{file_picker_start_dir, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
-    palette::{self, PaletteCompletion, PaletteEntry, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
+    palette::{self, PaletteCompletion, PaletteInputState, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
 };
 
 pub struct CommandPaletteWidget {
     input: Input,
-    entries: &'static [PaletteEntry],
     selected: usize,
     scroll_top: usize,
     target_node_id: Option<NodeId>,
+    overlay: Option<crate::ui_helpers::BottomAnchoredOverlayLayout>,
 }
 impl Default for CommandPaletteWidget {
     fn default() -> Self {
@@ -35,28 +36,21 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id: None }
+        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None, overlay: None }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, entries: palette::all_entries(), selected, scroll_top, target_node_id: None }
+        Self { input, selected, scroll_top, target_node_id: None, overlay: None }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self { input: Input::from(text.as_ref()), entries: palette::all_entries(), selected: 0, scroll_top: 0, target_node_id }
+        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id, overlay: None }
     }
 
     /// Current input text (for tests / introspection).
     pub fn input_value(&self) -> &str {
         self.input.value()
-    }
-
-    fn filtered(&self, interactions: crate::interaction::InteractionContext<'_>) -> Vec<&'static PaletteEntry> {
-        palette::filter_entries(self.entries, self.input.value())
-            .into_iter()
-            .filter(|entry| interactions.is_available(entry.action))
-            .collect()
     }
 
     /// Compute position-aware completions using model context.
@@ -106,25 +100,14 @@ impl CommandPaletteWidget {
 
     fn confirm(&mut self, ctx: &mut WidgetContext) -> Outcome {
         let text = self.input.value().to_string();
+        if palette::palette_input_state(&text) != PaletteInputState::Ready {
+            return Outcome::Consumed;
+        }
 
         match palette::parse_palette_input(&text) {
             Ok(PaletteParseResult::Local(local)) => self.dispatch_local(local, ctx),
             Ok(PaletteParseResult::Resolved(resolved)) => self.dispatch_resolved(resolved, ctx),
-            Err(err) => {
-                // If parse failed, fall back to the selected entry's action (fuzzy match)
-                let interactions = crate::interaction::InteractionContext::for_active_view(
-                    ctx.views.active_address(),
-                    ctx.views.active_table_state().selected(),
-                    ctx.model.active_repo_identity_opt().is_some(),
-                );
-                let filtered = self.filtered(interactions);
-                if let Some(entry) = filtered.get(self.selected) {
-                    let action = entry.action;
-                    return self.dispatch_palette_action(action, ctx);
-                }
-                ctx.app_actions.push(AppAction::ShowStatus(err));
-                Outcome::Finished
-            }
+            Err(_) => Outcome::Consumed,
         }
     }
 
@@ -416,6 +399,32 @@ impl InteractiveWidget for CommandPaletteWidget {
         Outcome::Consumed
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent, ctx: &mut WidgetContext) -> Outcome {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Outcome::Ignored;
+        }
+        let Some(overlay) = self.overlay else { return Outcome::Ignored };
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if !overlay.body.contains(position) && !overlay.status_row.contains(position) {
+            return Outcome::Finished;
+        }
+        if overlay.body.contains(position) {
+            let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
+            let interactions = crate::interaction::InteractionContext::for_active_view(
+                ctx.views.active_address(),
+                ctx.views.active_table_state().selected(),
+                has_repo_context,
+            );
+            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
+            let index = self.scroll_top + (mouse.row - overlay.body.y) as usize;
+            if let Some(completion) = completions.get(index) {
+                self.selected = index;
+                self.fill_completion(completion);
+            }
+        }
+        Outcome::Consumed
+    }
+
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
         let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
@@ -426,6 +435,7 @@ impl InteractiveWidget for CommandPaletteWidget {
         );
         let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
         let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
+        self.overlay = Some(overlay);
         let area = overlay.body;
 
         frame.render_widget(Clear, area);
@@ -463,6 +473,19 @@ impl InteractiveWidget for CommandPaletteWidget {
 
         // Cursor on the status bar row (computed via the same overlay layout)
         let cursor_x = overlay.status_row.x + 1 + self.input.visual_cursor() as u16;
+        let indicator = match palette::palette_input_state(self.input.value()) {
+            PaletteInputState::Ready => "ready",
+            PaletteInputState::Incomplete => "incomplete",
+            PaletteInputState::Unavailable => "CLI only",
+        };
+        let input_end_x = overlay.status_row.x.saturating_add(1).saturating_add(self.input.value().width() as u16);
+        let indicator_x = input_end_x.saturating_add(2);
+        if indicator_x.saturating_add(indicator.len() as u16) <= overlay.status_row.right() {
+            frame.render_widget(
+                Paragraph::new(indicator).style(Style::default().fg(theme.muted).bg(theme.bar_bg)),
+                Rect::new(indicator_x, overlay.status_row.y, indicator.len() as u16, 1),
+            );
+        }
         frame.set_cursor_position((cursor_x, overlay.status_row.y));
     }
 
@@ -489,8 +512,35 @@ impl InteractiveWidget for CommandPaletteWidget {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
     use super::*;
     use crate::app::test_support::TestWidgetHarness;
+
+    fn render_for_mouse(widget: &mut CommandPaletteWidget, harness: &mut TestWidgetHarness) {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
+        let mut ui = crate::app::UiState::new(&[]);
+        let theme = crate::theme::Theme::classic();
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: crossterm::event::KeyModifiers::NONE }
+    }
 
     #[test]
     fn binding_mode_is_command_palette() {
@@ -528,5 +578,102 @@ mod tests {
         assert_eq!(widget.selected, count - 1);
         widget.handle_action(Action::SelectNext, &mut harness.ctx());
         assert_eq!(widget.selected, 0);
+    }
+
+    #[test]
+    fn incomplete_input_keeps_palette_open_without_dispatch() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("cr"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        let outcome = widget.handle_action(Action::Confirm, &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(harness.commands.take_next().is_none());
+    }
+
+    #[test]
+    fn clicking_outside_palette_dismisses_it() {
+        let mut widget = CommandPaletteWidget::new();
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let outcome = widget.handle_mouse(left_click(5, 0), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Finished));
+    }
+
+    #[test]
+    fn clicking_completion_fills_that_suggestion() {
+        let mut widget = CommandPaletteWidget::new();
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            false,
+        );
+        let expected = widget.completions(&harness.model, &harness.namespaces, false, interactions)[1].value.clone();
+        let body = widget.overlay.expect("rendered overlay").body;
+        let outcome = widget.handle_mouse(left_click(body.x + 2, body.y + 1), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.input_value(), format!("{expected} "));
+        assert!(harness.commands.take_next().is_none());
+    }
+
+    #[test]
+    fn clicking_below_last_completion_keeps_input() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("theme cat"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let body = widget.overlay.expect("rendered overlay").body;
+        let outcome = widget.handle_mouse(left_click(body.x + 2, body.y + 3), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.input_value(), "theme cat");
+    }
+
+    #[test]
+    fn clicking_scrolled_completion_fills_visible_row() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from(""), 2, 2);
+        let mut harness = TestWidgetHarness::new();
+        render_for_mouse(&mut widget, &mut harness);
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            false,
+        );
+        let expected = widget.completions(&harness.model, &harness.namespaces, false, interactions)[2].value.clone();
+        let body = widget.overlay.expect("rendered overlay").body;
+        let outcome = widget.handle_mouse(left_click(body.x + 2, body.y), &mut harness.ctx());
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert_eq!(widget.input_value(), format!("{expected} "));
+    }
+
+    #[test]
+    fn readiness_indicator_preserves_input_when_cursor_moves_left() {
+        let mut widget = CommandPaletteWidget::with_state(Input::from("refresh"), 0, 0);
+        let mut harness = TestWidgetHarness::new();
+        for _ in 0..4 {
+            widget.handle_raw_key(KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE), &mut harness.ctx());
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
+        let mut ui = crate::app::UiState::new(&[]);
+        let theme = crate::theme::Theme::classic();
+        terminal
+            .draw(|frame| {
+                let status_row = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16).status_row;
+                frame.render_widget(Paragraph::new(":refresh"), status_row);
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+        let status_row = widget.overlay.expect("rendered overlay").status_row;
+        let buffer = terminal.backend().buffer();
+        let input: String = (0..8).map(|x| buffer[(x, status_row.y)].symbol()).collect();
+        assert_eq!(input, ":refresh");
     }
 }
