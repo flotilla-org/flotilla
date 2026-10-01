@@ -113,6 +113,80 @@ fn pipe_payload_is_the_tagged_compact_envelope() {
 }
 
 #[test]
+fn entity_refs_survive_the_pm_pipe_envelope() {
+    let refs = vec![
+        EntityRef::new("change_request", "github/flotilla-org/flotilla!2374"),
+        EntityRef::new("issue", "github/flotilla-org/flotilla#2374"),
+    ];
+    let patch = MetadataPatch {
+        target: MetadataTarget::Entity(EntityRef::new("convoy", "dev/entity-refs@fleet")),
+        source_id: "flotilla".to_owned(),
+        set: BTreeMap::from([(
+            "flotilla.subject.produces".to_owned(),
+            MetadataValueUpdate::new(MetadataValue::EntityRefs(refs.clone()), Some(30_000)),
+        )]),
+        unset: vec![],
+    };
+
+    let payload = patch.to_pipe_payload();
+    let decoded: WireMessage = serde_json::from_str(&payload).expect("decode pm pipe payload");
+    assert_eq!(decoded, WireMessage::MetadataPatch(patch));
+    let json: Value = serde_json::from_str(&payload).expect("payload is JSON");
+    assert_eq!(json["set"]["flotilla.subject.produces"]["value"]["type"], "entity-refs");
+    assert_eq!(json["set"]["flotilla.subject.produces"]["value"]["value"][0]["kind"], "change_request");
+}
+
+#[test]
+fn entity_refs_do_not_prevent_older_consumers_receiving_existing_facts() {
+    let patch = MetadataPatch {
+        target: MetadataTarget::Entity(EntityRef::new("convoy", "dev/entity-refs@fleet")),
+        source_id: "flotilla".to_owned(),
+        set: BTreeMap::from([
+            ("display.label".to_owned(), MetadataValueUpdate::new(MetadataValue::text("Entity refs"), Some(30_000))),
+            (
+                "flotilla.subject.produces".to_owned(),
+                MetadataValueUpdate::new(
+                    MetadataValue::EntityRefs(vec![EntityRef::new("change_request", "github/flotilla-org/flotilla!2374")]),
+                    Some(30_000),
+                ),
+            ),
+        ]),
+        unset: vec!["old.key".to_owned()],
+    };
+
+    let compatible = patch.compatibility_patches();
+    assert_eq!(compatible.len(), 2);
+    assert_eq!(compatible[0].set["display.label"].value, MetadataValue::text("Entity refs"));
+    assert_eq!(compatible[0].unset, vec!["old.key"]);
+    assert!(!compatible[0].set.contains_key("flotilla.subject.produces"));
+    assert!(compatible[1].set.contains_key("flotilla.subject.produces"));
+    assert!(compatible[1].unset.is_empty());
+}
+
+#[test]
+fn empty_patch_keeps_its_existing_delivery_behavior() {
+    let patch = MetadataPatch { target: MetadataTarget::Root, source_id: "flotilla".to_owned(), set: BTreeMap::new(), unset: vec![] };
+    assert_eq!(patch.compatibility_patches(), vec![patch]);
+}
+
+#[test]
+fn edge_only_patch_needs_one_delivery() {
+    let patch = MetadataPatch {
+        target: MetadataTarget::Root,
+        source_id: "flotilla".to_owned(),
+        set: BTreeMap::from([(
+            "flotilla.subject.produces".to_owned(),
+            MetadataValueUpdate::new(
+                MetadataValue::EntityRefs(vec![EntityRef::new("change_request", "github/flotilla-org/flotilla!2374")]),
+                None,
+            ),
+        )]),
+        unset: vec![],
+    };
+    assert_eq!(patch.compatibility_patches(), vec![patch]);
+}
+
+#[test]
 fn segment_identity_ignores_labels() {
     let plain = GroupSegment::text("flotilla.convoy", "dev/manifest-extraction");
     let labelled = GroupSegment::text("flotilla.convoy", "dev/manifest-extraction").with_label("manifest extraction");

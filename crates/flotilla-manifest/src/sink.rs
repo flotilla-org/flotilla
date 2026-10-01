@@ -158,36 +158,34 @@ impl ZellijPipeSink {
         };
         result.map_err(|error| format!("write {} metadata pipe: {error}", self.zellij_bin))
     }
+
+    async fn write_with_respawn(&self, state: &mut ZellijPipeState, payload: &[u8]) -> Result<(), String> {
+        let running = self.ensure_process(state).await?;
+        if let Err(error) = self.write_payload(running, payload).await {
+            state.mark_healthy_if_stable();
+            let delay = state.schedule_respawn();
+            warn!(%error, delay_ms = delay.as_millis(), "zellij metadata pipe write failed; respawning and retrying patch");
+            let running = self.ensure_process(state).await?;
+            if let Err(retry_error) = self.write_payload(running, payload).await {
+                state.schedule_respawn();
+                return Err(format!("{retry_error} after respawn (initial error: {error})"));
+            }
+        }
+        state.mark_healthy_if_stable();
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl PatchSink for ZellijPipeSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
-        let mut payload = patch.to_pipe_payload();
-        payload.push('\n');
-
         let mut state = self.state.lock().await;
-        let running = self.ensure_process(&mut state).await?;
-        let first_attempt = self.write_payload(running, payload.as_bytes()).await;
-        if let Err(error) = first_attempt {
-            state.mark_healthy_if_stable();
-            let delay = state.schedule_respawn();
-            warn!(%error, delay_ms = delay.as_millis(), "zellij metadata pipe write failed; respawning and retrying patch");
-            let running = self.ensure_process(&mut state).await?;
-            match self.write_payload(running, payload.as_bytes()).await {
-                Ok(()) => {
-                    state.mark_healthy_if_stable();
-                    Ok(())
-                }
-                Err(retry_error) => {
-                    state.schedule_respawn();
-                    Err(format!("{retry_error} after respawn (initial error: {error})"))
-                }
-            }
-        } else {
-            state.mark_healthy_if_stable();
-            Ok(())
+        for compatible in patch.compatibility_patches() {
+            let mut payload = compatible.to_pipe_payload();
+            payload.push('\n');
+            self.write_with_respawn(&mut state, payload.as_bytes()).await?;
         }
+        Ok(())
     }
 }
 
@@ -216,33 +214,35 @@ impl PatchSink for UnixSocketSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
         let _serial = self.serial.lock().await;
         let client = self.client.as_ref().map_err(Clone::clone)?;
-        let payload = patch.to_pipe_payload();
-        for attempt in 0..2 {
-            let response = client
-                .post("http://localhost/v1/metadata/patch")
-                .header("content-type", "application/json")
-                .body(payload.clone())
-                .send()
-                .await;
-            let error = match response {
-                Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => return Ok(()),
-                Ok(response) => {
-                    let status = response.status();
-                    let error = format!("Wheelhouse metadata POST returned {status}");
-                    if !status.is_server_error() {
-                        return Err(error);
+        for compatible in patch.compatibility_patches() {
+            let payload = compatible.to_pipe_payload();
+            for attempt in 0..2 {
+                let response = client
+                    .post("http://localhost/v1/metadata/patch")
+                    .header("content-type", "application/json")
+                    .body(payload.clone())
+                    .send()
+                    .await;
+                let error = match response {
+                    Ok(response) if response.status() == reqwest::StatusCode::NO_CONTENT => break,
+                    Ok(response) => {
+                        let status = response.status();
+                        let error = format!("Wheelhouse metadata POST returned {status}");
+                        if !status.is_server_error() {
+                            return Err(error);
+                        }
+                        error
                     }
-                    error
+                    Err(error) => format!("Wheelhouse metadata POST: {error}"),
+                };
+                if attempt == 1 {
+                    return Err(error);
                 }
-                Err(error) => format!("Wheelhouse metadata POST: {error}"),
-            };
-            if attempt == 1 {
-                return Err(error);
+                warn!(%error, "retrying Wheelhouse metadata patch");
+                tokio::time::sleep(HTTP_RETRY_DELAY).await;
             }
-            warn!(%error, "retrying Wheelhouse metadata patch");
-            tokio::time::sleep(HTTP_RETRY_DELAY).await;
         }
-        unreachable!("two attempts return a result")
+        Ok(())
     }
 }
 
@@ -255,7 +255,7 @@ mod tests {
     use super::*;
     use crate::{
         keys::SOURCE_ATTACH,
-        wire::{MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
+        wire::{EntityRef, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
     };
 
     fn stamp_patch() -> MetadataPatch {
@@ -266,6 +266,18 @@ mod tests {
                 .into(),
             unset: vec![],
         }
+    }
+
+    fn mixed_patch() -> MetadataPatch {
+        let mut patch = stamp_patch();
+        patch.set.insert(
+            "flotilla.subject.produces".to_owned(),
+            MetadataValueUpdate::new(
+                MetadataValue::EntityRefs(vec![EntityRef::new("change_request", "github/flotilla-org/flotilla!2374")]),
+                None,
+            ),
+        );
+        patch
     }
 
     fn write_fake_zellij(dir: &Path, script: &str) -> String {
@@ -383,6 +395,16 @@ done
     }
 
     #[tokio::test]
+    async fn zellij_pipe_sink_keeps_new_values_separate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::Stream));
+        let patch = mixed_patch();
+        sink.send(&patch).await.expect("send mixed patch");
+        let lines = wait_for_line_count(&dir.path().join("lines"), 2).await;
+        assert_eq!(lines, patch.compatibility_patches().iter().map(MetadataPatch::to_pipe_payload).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn zellij_pipe_sink_retries_patch_after_child_stdin_closes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::CloseFirstChildStdin));
@@ -433,7 +455,11 @@ done
         assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
     }
 
-    async fn http_sink_case(statuses: Vec<axum::http::StatusCode>, disconnect: bool) -> (Result<(), String>, Vec<Vec<u8>>) {
+    async fn http_sink_case(
+        patch: MetadataPatch,
+        statuses: Vec<axum::http::StatusCode>,
+        disconnect: bool,
+    ) -> (Result<(), String>, Vec<Vec<u8>>) {
         use std::{collections::VecDeque, sync::Arc};
 
         use axum::{body::Bytes, extract::State, routing::post, Router};
@@ -459,7 +485,7 @@ done
             }
             axum::serve(listener, app).await.expect("HTTP server");
         });
-        let result = UnixSocketSink::new(&path).send(&stamp_patch()).await;
+        let result = UnixSocketSink::new(&path).send(&patch).await;
         server.abort();
         let bodies = calls.lock().await.1.clone();
         (result, bodies)
@@ -467,7 +493,7 @@ done
 
     #[tokio::test]
     async fn unix_socket_sink_uses_http_and_preserves_shared_payload() {
-        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::NO_CONTENT], false).await;
+        let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::NO_CONTENT], false).await;
         result.expect("acknowledged patch");
         assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
     }
@@ -475,22 +501,32 @@ done
     #[tokio::test]
     async fn unix_socket_sink_retries_transient_response_with_identical_patch() {
         let (result, bodies) =
-            http_sink_case(vec![axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::http::StatusCode::NO_CONTENT], false).await;
+            http_sink_case(stamp_patch(), vec![axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::http::StatusCode::NO_CONTENT], false)
+                .await;
         result.expect("retry succeeds");
         assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes(); 2]);
     }
 
     #[tokio::test]
     async fn unix_socket_sink_does_not_retry_invalid_patch() {
-        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::UNPROCESSABLE_ENTITY], false).await;
+        let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::UNPROCESSABLE_ENTITY], false).await;
         assert!(result.expect_err("rejected patch").contains("422"));
         assert_eq!(bodies.len(), 1);
     }
     #[tokio::test]
     async fn unix_socket_sink_reconnects_after_lost_acknowledgement() {
-        let (result, bodies) = http_sink_case(vec![axum::http::StatusCode::NO_CONTENT], true).await;
+        let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::NO_CONTENT], true).await;
         result.expect("reconnected patch acknowledged");
         assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
+    }
+
+    #[tokio::test]
+    async fn unix_socket_sink_keeps_new_values_separate() {
+        let patch = mixed_patch();
+        let (result, bodies) = http_sink_case(patch.clone(), vec![axum::http::StatusCode::NO_CONTENT; 2], false).await;
+        result.expect("both patches acknowledged");
+        let expected = patch.compatibility_patches().iter().map(|patch| patch.to_pipe_payload().into_bytes()).collect::<Vec<_>>();
+        assert_eq!(bodies, expected);
     }
 
     #[tokio::test]

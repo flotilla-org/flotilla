@@ -1,8 +1,9 @@
 //! Mirror of andamento's metadata-patch wire types.
 //!
-//! These types replicate `andamento-shared`'s serde exactly (verified by the
-//! fixture round-trip tests in this module — fixtures are generated from
-//! andamento's real serde, see `fixtures/README.md`). They are a deliberate
+//! Existing value kinds replicate `andamento-shared`'s serde exactly (verified
+//! by the fixture round-trip tests in this module — fixtures are generated from
+//! andamento's real serde, see `fixtures/README.md`). `entity-refs` is the
+//! coordinated next wire kind for andamento and wheelhouse. They are a deliberate
 //! v0 stopgap: at the Leg-1 manifest extraction this module is deleted and
 //! replaced by a dependency on the shared `flotilla-org/manifest` crate.
 //! Never hand-tune a serde attribute here to make a test pass — regenerate
@@ -101,6 +102,7 @@ pub enum MetadataValue {
     Bool(bool),
     Integer(i64),
     StringList(Vec<String>),
+    EntityRefs(Vec<EntityRef>),
     GroupPath(Vec<MetadataPathSegmentValue>),
 }
 
@@ -184,7 +186,8 @@ impl GroupPath {
                     MetadataValue::Bool(value) => MetadataPathValue::Bool(*value),
                     MetadataValue::Integer(value) => MetadataPathValue::Integer(*value),
                     MetadataValue::StringList(values) => MetadataPathValue::StringList(values.clone()),
-                    MetadataValue::GroupPath(_) => return None,
+                    // Group paths express containment; entity edges are separate facts.
+                    MetadataValue::EntityRefs(_) | MetadataValue::GroupPath(_) => return None,
                 };
                 Some(MetadataPathSegmentValue { key: segment.key.clone(), value, label: segment.label.clone() })
             })
@@ -293,6 +296,30 @@ pub struct MetadataPatch {
 }
 
 impl MetadataPatch {
+    /// Send new edge values separately so a PM built before `entity-refs`
+    /// can reject that message without losing the familiar facts in this patch.
+    /// A mixed patch can be partially applied if the second delivery fails;
+    /// callers must treat a send error as uncertain delivery, not a rollback.
+    /// Empty patches keep their existing one-message delivery behavior.
+    pub fn compatibility_patches(&self) -> Vec<Self> {
+        if self.set.is_empty() && self.unset.is_empty() {
+            return vec![self.clone()];
+        }
+        let mut familiar = self.clone();
+        let mut edges = self.clone();
+        familiar.set.retain(|_, update| !matches!(update.value, MetadataValue::EntityRefs(_)));
+        edges.set.retain(|_, update| matches!(update.value, MetadataValue::EntityRefs(_)));
+        edges.unset.clear();
+        let mut patches = Vec::with_capacity(2);
+        if !familiar.set.is_empty() || !familiar.unset.is_empty() {
+            patches.push(familiar);
+        }
+        if !edges.set.is_empty() {
+            patches.push(edges);
+        }
+        patches
+    }
+
     /// The compact payload written to the apply-patch pipe — the
     /// patch wrapped in andamento's externally-visible message envelope.
     pub fn to_pipe_payload(&self) -> String {
