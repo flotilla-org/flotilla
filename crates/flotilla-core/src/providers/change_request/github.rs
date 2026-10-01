@@ -116,7 +116,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         // independent of convoy count. If a repository exceeds GitHub's query
         // limits, surface the forge error instead of silently omitting CRs.
         for number in numbers {
-            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
+            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }
         query.push_str(" } }");
         let argument = format!("query={query}");
@@ -149,7 +149,6 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             let truncated = ["comments", "reviews", "reviewThreads"]
                 .iter()
                 .any(|connection| request[connection]["pageInfo"]["hasPreviousPage"] == true)
-                || request["reviewRequests"]["pageInfo"]["hasNextPage"] == true
                 || request["reviewThreads"]["nodes"]
                     .as_array()
                     .is_some_and(|threads| threads.iter().any(|thread| thread["comments"]["pageInfo"]["hasPreviousPage"] == true));
@@ -346,6 +345,23 @@ mod tests {
         assert_eq!(statuses[&1].as_ref().expect("status").title.value.as_deref(), Some("Keep metadata current"));
         assert_eq!(statuses[&1].as_ref().expect("status").review_requested_from_owner.value, Some(true));
         assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_review_requests_keep_other_bound_observations() {
+        let request = serde_json::json!({
+            "title": "Keep metadata current", "state": "OPEN", "reviewDecision": null,
+            "reviewRequests": {"pageInfo": {"hasNextPage": true}, "nodes": []},
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner)
+            .with_operator_login("owner".into());
+        let statuses = provider.observe_bound(&[1]).await.expect("observe PR");
+        let status = statuses[&1].as_ref().expect("preserve PR status");
+        assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
+        assert_eq!(status.state.value, Some(flotilla_resources::ObservedChangeRequestState::Open));
+        assert_eq!(status.review_requested_from_owner.value, None);
     }
 
     #[tokio::test]

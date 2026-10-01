@@ -21,7 +21,7 @@ pub type BoundObservations = HashMap<u64, Result<ChangeRequestStatus, String>>;
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
     /// Observe bound requests together. The default uses individual provider
-    /// reads and reports only the state; GitHub overrides this with one query
+    /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA.
     async fn observe_bound(&self, numbers: &[u64]) -> Result<BoundObservations, String> {
         let mut statuses = HashMap::new();

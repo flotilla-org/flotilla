@@ -1,5 +1,6 @@
 // async_trait generates #[must_use] on boxed futures; Clippy 1.99 also treats
 // those future return types as must-use. The generated annotation is redundant.
+// Remove when async_trait or Clippy stops producing this warning.
 #![allow(clippy::double_must_use)]
 
 mod artifact;

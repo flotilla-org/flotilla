@@ -177,6 +177,14 @@ mod tests {
     use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
 
     use super::*;
+    use crate::providers::{
+        github_api::{GhApi, GhApiResponse},
+        github_test_support::{build_api_and_runner, repo_root_for_recording},
+        issue_tracker::{tests::assert_provider_contract, IssueProvider},
+        replay::{self, Masks},
+        testing::MockRunner,
+        ChannelLabel,
+    };
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -189,15 +197,6 @@ mod tests {
         assert_eq!(issue.assignees, ["alice", "bob"]);
         assert_eq!(issue.observed_at, Some(observed_at));
     }
-    use crate::providers::{
-        github_api::{GhApi, GhApiResponse},
-        github_test_support::{build_api_and_runner, repo_root_for_recording},
-        issue_tracker::{tests::assert_provider_contract, IssueProvider},
-        replay::{self, Masks},
-        testing::MockRunner,
-        ChannelLabel,
-    };
-
     struct MockGhApi {
         responses: Mutex<VecDeque<Result<GhApiResponse, String>>>,
         requests: Mutex<Vec<(String, PathBuf)>>,

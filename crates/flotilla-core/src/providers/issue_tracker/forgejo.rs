@@ -248,6 +248,12 @@ mod tests {
     };
 
     use super::*;
+    use crate::providers::{
+        issue_tracker::{tests::assert_provider_contract, IssueProvider},
+        replay::{self, Masks},
+        testing::MockRunner,
+        ChannelLabel,
+    };
 
     #[test]
     fn parses_issue_title_and_assignees_from_existing_rest_response() {
@@ -259,13 +265,6 @@ mod tests {
         assert_eq!(issue.assignees, ["alice"]);
         assert_eq!(issue.observed_at, Some(observed_at));
     }
-    use crate::providers::{
-        issue_tracker::{tests::assert_provider_contract, IssueProvider},
-        replay::{self, Masks},
-        testing::MockRunner,
-        ChannelLabel,
-    };
-
     type RecordedRequest = (String, String, HashMap<String, String>);
 
     struct MockHttp {

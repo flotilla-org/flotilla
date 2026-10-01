@@ -84,6 +84,7 @@ pub enum ObservedMergeability {
 pub enum ObservedReviewDecision {
     Approved,
     ChangesRequested,
+    Required,
     None,
 }
 

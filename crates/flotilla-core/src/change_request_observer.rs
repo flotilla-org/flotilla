@@ -224,20 +224,29 @@ pub(crate) fn parse_gh_observation_with_identity(
     let review_decision = match value["reviewDecision"].as_str() {
         Some("APPROVED") => Some(ObservedReviewDecision::Approved),
         Some("CHANGES_REQUESTED") => Some(ObservedReviewDecision::ChangesRequested),
-        Some("REVIEW_REQUIRED") => Some(ObservedReviewDecision::None),
+        Some("REVIEW_REQUIRED") => Some(ObservedReviewDecision::Required),
+        // An explicit null means GitHub has no review decision; an absent field
+        // means the provider did not observe that fact.
         None if value.get("reviewDecision").is_some() => Some(ObservedReviewDecision::None),
         _ => None,
     };
-    let requested = value["reviewRequests"]["nodes"].as_array().or_else(|| value["reviewRequests"].as_array());
+    let requested = value["reviewRequests"]["nodes"].as_array();
     let review_requested_from_owner = operator_login.and_then(|operator| {
-        requested.map(|requests| {
-            requests.iter().any(|request| {
-                request["requestedReviewer"]["login"]
-                    .as_str()
-                    .or_else(|| request["login"].as_str())
-                    .is_some_and(|login| login.eq_ignore_ascii_case(operator))
-            })
-        })
+        let requests = requested?;
+        if value["reviewRequests"]["pageInfo"]["hasNextPage"] == true {
+            return None;
+        }
+        let mut unidentified_reviewer = false;
+        for request in requests {
+            let login = request["requestedReviewer"]["login"].as_str();
+            match login {
+                Some(login) if login.eq_ignore_ascii_case(operator) => return Some(true),
+                Some(_) => {}
+                // A team request does not reveal whether the operator belongs to it.
+                None => unidentified_reviewer = true,
+            }
+        }
+        (!unidentified_reviewer).then_some(false)
     });
     Ok(ChangeRequestStatus {
         title: Observation { value: value["title"].as_str().map(str::to_string), observed_at },
@@ -916,6 +925,28 @@ mod tests {
     }
 
     #[test]
+    fn operator_request_is_unknown_without_identity_or_with_team_request() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        let request = r#"{"state":"OPEN","reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"Team"}}]}}"#;
+        let unset = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, None).expect("parse");
+        assert_eq!(unset.review_requested_from_owner.value, None);
+        let team = parse_gh_observation_with_identity(request, observed_at, DEFAULT_REVIEW_BOT_LOGIN, Some("owner")).expect("parse");
+        assert_eq!(team.review_requested_from_owner.value, None);
+    }
+
+    #[test]
+    fn review_decision_distinguishes_changes_requested_from_review_required() {
+        let observed_at = "2026-10-01T12:00:00Z".parse().expect("time");
+        for (decision, expected) in
+            [("CHANGES_REQUESTED", ObservedReviewDecision::ChangesRequested), ("REVIEW_REQUIRED", ObservedReviewDecision::Required)]
+        {
+            let request = serde_json::json!({"state": "OPEN", "reviewDecision": decision});
+            let status = parse_gh_observation(&request.to_string(), observed_at).expect("parse");
+            assert_eq!(status.review_decision.value, Some(expected));
+        }
+    }
+
+    #[test]
     fn draft_pr_is_not_ready_for_a_crew_claim() {
         let status = parse_gh_observation(
             r#"{"state":"OPEN","isDraft":true,"headRefOid":"abc","statusCheckRollup":[],"reviewDecision":null,"mergeable":"MERGEABLE"}"#,
@@ -943,6 +974,9 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(status.review.actionable_at_head.value, Some(false));
+        assert_eq!(status.review_decision.value, Some(ObservedReviewDecision::None));
+        let absent = parse_gh_observation(r#"{"state":"OPEN"}"#, "2026-08-03T20:00:00Z".parse().expect("time")).expect("parse");
+        assert_eq!(absent.review_decision.value, None);
     }
 
     #[tokio::test]

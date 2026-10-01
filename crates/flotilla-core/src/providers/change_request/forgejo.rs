@@ -2,9 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_resources::{
-    ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
-};
+use flotilla_resources::{ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState};
 
 use super::{ChangeRequestAdmission, ChangeRequestTracker};
 use crate::providers::{
@@ -48,16 +46,6 @@ impl ForgejoChangeRequestProvider {
         } else {
             None
         };
-        // Forgejo's standard pull response has no aggregate review decision.
-        // A forge extension may provide one; otherwise preserve Unknown.
-        let decision = match value["review_state"].as_str() {
-            Some("APPROVED" | "approved") => Some(ObservedReviewDecision::Approved),
-            Some("REQUEST_CHANGES" | "CHANGES_REQUESTED" | "request_changes" | "changes_requested") => {
-                Some(ObservedReviewDecision::ChangesRequested)
-            }
-            Some("PENDING" | "pending" | "none" | "NONE" | "review_required") => Some(ObservedReviewDecision::None),
-            _ => None,
-        };
         let requested = self.operator_login.as_deref().and_then(|operator| {
             value["requested_reviewers"].as_array().map(|reviewers| {
                 reviewers.iter().any(|reviewer| reviewer["login"].as_str().is_some_and(|login| login.eq_ignore_ascii_case(operator)))
@@ -66,7 +54,8 @@ impl ForgejoChangeRequestProvider {
         ObservedStatus {
             title: Observation { value: value["title"].as_str().map(str::to_string), observed_at },
             author: Observation { value: value["user"]["login"].as_str().map(str::to_string), observed_at },
-            review_decision: Observation { value: decision, observed_at },
+            // The standard Forgejo pull response has no aggregate review decision.
+            review_decision: Observation::unknown(observed_at),
             review_requested_from_owner: Observation { value: requested, observed_at },
             state: Observation { value: state, observed_at },
             head_sha: Observation { value: value["head"]["sha"].as_str().map(str::to_string), observed_at },
@@ -172,6 +161,9 @@ impl ForgejoChangeRequestProvider {
 
 #[async_trait]
 impl ChangeRequestTracker for ForgejoChangeRequestProvider {
+    /// The trait default converts only the presentation snapshot. Read the
+    /// same pull endpoint once per bound number to retain its author and
+    /// requested-reviewer facts without another request.
     async fn observe_bound(&self, numbers: &[u64]) -> Result<super::BoundObservations, String> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
@@ -242,6 +234,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::providers::{
+        replay::{self, Masks},
+        testing::MockRunner,
+        ChannelLabel,
+    };
 
     #[test]
     fn parses_pull_presentation_fields_from_existing_response() {
@@ -295,12 +292,6 @@ mod tests {
         assert_eq!(status.review_requested_from_owner.value, Some(true));
         assert_eq!(http.urls.lock().expect("urls").len(), 1);
     }
-    use crate::providers::{
-        replay::{self, Masks},
-        testing::MockRunner,
-        ChannelLabel,
-    };
-
     struct MockHttp {
         responses: Mutex<VecDeque<http::Response<bytes::Bytes>>>,
         urls: Mutex<Vec<String>>,
