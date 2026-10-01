@@ -462,7 +462,9 @@ mod tests {
             {"id": 1, "user": {"login": "alice"}, "state": "REQUEST_CHANGES"},
             {"id": 2, "user": {"login": "alice"}, "state": "APPROVED", "stale": true}
         ]);
-        assert_eq!(parse_review_decision(&stale_latest), Some(ObservedReviewDecision::ChangesRequested));
+        // The newer approval replaces the older request, but is not itself
+        // counted because it is stale.
+        assert_eq!(parse_review_decision(&stale_latest), Some(ObservedReviewDecision::None));
         assert_eq!(parse_review_decision(&serde_json::json!([])), Some(ObservedReviewDecision::None));
         assert_eq!(
             parse_review_decision(&serde_json::json!([
