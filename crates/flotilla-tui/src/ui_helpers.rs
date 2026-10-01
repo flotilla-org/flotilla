@@ -68,6 +68,9 @@ pub fn render_popup_frame(
 }
 
 /// Render a full-width section header with optional right-aligned metadata.
+/// Width of the `── ` prefix before the caller-provided label.
+pub const SECTION_HEADER_LABEL_START: usize = 3;
+
 pub fn render_section_header(
     frame: &mut ratatui::Frame,
     label: &str,
@@ -77,7 +80,7 @@ pub fn render_section_header(
     row_style: Style,
     label_style: Style,
 ) {
-    let dashes_left = 2;
+    let dashes_left = SECTION_HEADER_LABEL_START - 1;
     let left = "\u{2500}".repeat(dashes_left);
     let metadata_width = metadata.map_or(0, |value| value.chars().count() as u16 + 1);
     let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + metadata_width + 4);

@@ -553,6 +553,10 @@ pub struct OpenViewEntry {
     pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Root-first addresses left by in-place navigation. Added after the
+    /// original two-field record; default keeps previous files decodable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

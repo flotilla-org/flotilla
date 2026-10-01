@@ -1,8 +1,12 @@
-use std::time::{Duration, Instant};
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{QueryId, Salience, ViewAddress};
 use ratatui::{layout::Rect, style::Modifier, Frame};
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     describe::DescribeWidget, table_action_menu::TableActionMenuWidget, table_search::TableSearchWidget, AppAction, InteractiveWidget,
@@ -18,6 +22,21 @@ use crate::{
 };
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+fn header_label_and_target_range(panel: &ProjectPanel) -> (String, Range<usize>) {
+    let mut label = String::new();
+    if let Some(marker) = salience_marker(panel.table.meta.salience) {
+        label.push_str(marker);
+        label.push(' ');
+    }
+    label.push_str(&panel.table.title);
+    label.push_str("  ");
+    let target_start = ui_helpers::SECTION_HEADER_LABEL_START + label.width();
+    label.push_str("› ");
+    label.push_str(&panel.target.human_label());
+    let target_end = ui_helpers::SECTION_HEADER_LABEL_START + label.width();
+    (label, target_start..target_end)
+}
 
 #[derive(bon::Builder)]
 struct PanelLayout<'a> {
@@ -271,10 +290,7 @@ impl ProjectPageWidget {
         self.ensure_active_visible(&layouts, state);
         for (index, layout) in layouts.iter().enumerate() {
             if let Some(header_area) = self.line_area(layout.header_line, state) {
-                let mut label = format!("{}  › {}", layout.panel.table.title, layout.panel.target.human_label());
-                if let Some(marker) = salience_marker(layout.panel.table.meta.salience) {
-                    label = format!("{marker} {label}");
-                }
+                let (mut label, _) = header_label_and_target_range(layout.panel);
                 if layout.panel.table.meta.has_more {
                     let is_terminal = index + 1 == layouts.len();
                     label.push_str(if is_terminal { " · more available" } else { " · f fetch more" });
@@ -464,7 +480,13 @@ impl InteractiveWidget for ProjectPageWidget {
         };
         if line == layout.header_line {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-                ctx.app_actions.push(AppAction::DrillView(layout.panel.target.clone()));
+                let state = ctx.views.active_project_table_state_mut();
+                state.set_active(layout.panel.kind);
+                state.focus_header();
+                let (_, target_range) = header_label_and_target_range(layout.panel);
+                if target_range.contains(&(mouse.column.saturating_sub(self.area.x) as usize)) {
+                    ctx.app_actions.push(AppAction::DrillView(layout.panel.target.clone()));
+                }
             }
             return Outcome::Consumed;
         }
@@ -534,10 +556,40 @@ fn issue_start_is_pending(table_state: &table_view::TableState, row_id: &RowId) 
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyModifiers, MouseEvent};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint};
+    use crate::{
+        app::test_support::TestWidgetHarness,
+        table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint},
+    };
+
+    #[test]
+    fn header_click_focuses_panel_and_chevron_click_drills() {
+        let mut harness = TestWidgetHarness::new();
+        harness.views.open_or_focus("project/flotilla/roadmap".parse().expect("project address"));
+        let mut widget = ProjectPageWidget { area: Rect::new(0, 0, 90, 30), last_click: None };
+        let click = |column| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row: 0, modifiers: KeyModifiers::NONE };
+
+        let mut ctx = harness.ctx();
+        assert!(matches!(widget.handle_mouse(click(4), &mut ctx), Outcome::Consumed));
+        assert!(ctx.app_actions.is_empty(), "a header click should only focus its panel");
+        assert!(ctx.views.active_project_table_state().header_focused());
+
+        let mut ctx = harness.ctx();
+        assert!(matches!(widget.handle_mouse(click(13), &mut ctx), Outcome::Consumed));
+        assert!(ctx.app_actions.iter().any(|action| matches!(action, AppAction::DrillView(_))));
+    }
+
+    #[test]
+    fn salience_marker_keeps_chevron_hit_target_aligned_with_label() {
+        let mut panel = panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a");
+        panel.table.meta.salience = Salience::Attention;
+        let (label, target) = header_label_and_target_range(&panel);
+        assert_eq!(label, "! Convoys  › convoys/flotilla");
+        assert_eq!(target, 14..(14 + "› convoys/flotilla".width()));
+    }
 
     fn panel(kind: ProjectPanelKind, title: &str, target: &str, row: &str) -> ProjectPanel {
         ProjectPanel {
