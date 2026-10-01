@@ -22,11 +22,11 @@ use crate::{
 const INTERACTIVE_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 fn is_interactive_request(request: &Request) -> bool {
+    // SubscribeQueries registers interest before awaiting result sets, so a
+    // cancelled setup could leave a live subscription after an error response.
+    // FetchMore performs its side effect only after its last await.
     matches!(request, Request::Execute { command } if command.action.is_query())
-        || matches!(
-            request,
-            Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::SubscribeQueries { .. } | Request::FetchMore { .. }
-        )
+        || matches!(request, Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::FetchMore { .. })
 }
 
 fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {

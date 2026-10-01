@@ -75,6 +75,7 @@ pub(crate) async fn io_pressure_snapshot() -> Option<serde_json::Value> {
 }
 
 fn parse_io_pressure(raw: &str) -> Option<serde_json::Value> {
+    // Report a snapshot only when both Linux PSI categories are present.
     let avg10 = |kind: &str| {
         raw.lines()
             .find(|line| line.starts_with(kind))?

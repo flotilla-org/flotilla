@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -30,6 +30,7 @@ type WatchSender = mpsc::UnboundedSender<StoredEvent>;
 type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
 type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
+type CleanupKey = (StoreKey, &'static str);
 
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
@@ -53,6 +54,7 @@ pub struct SqliteBackend {
     // committed event cannot land between replay and live delivery.
     watchers: Arc<Mutex<WatchersByStore>>,
     replica_watchers: Arc<Mutex<ReplicaWatchersByStore>>,
+    pending_cleanups: Arc<Mutex<HashSet<CleanupKey>>>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
 }
@@ -61,6 +63,19 @@ pub struct SqliteBackend {
 struct StoredEvent {
     kind: StoredEventKind,
     object: Value,
+}
+
+struct CleanupClaim {
+    key: CleanupKey,
+    pending: Arc<Mutex<HashSet<CleanupKey>>>,
+}
+
+impl Drop for CleanupClaim {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.key);
+        }
+    }
 }
 
 struct ReplayedEvents<T: Resource> {
@@ -187,6 +202,7 @@ impl SqliteBackend {
             read_connection: None,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
         })
@@ -202,6 +218,7 @@ impl SqliteBackend {
             read_connection: None,
             watchers: Arc::new(Mutex::new(HashMap::new())),
             replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
         })
@@ -470,23 +487,31 @@ impl SqliteBackend {
         }
     }
 
-    async fn cleanup_call<F>(&self, operation_name: &'static str, operation: F)
+    fn cleanup_call<F>(&self, store_key: StoreKey, operation_name: &'static str, operation: F)
     where
         F: FnOnce(&mut RusqliteConnection) -> Result<(), ResourceError> + Send + 'static,
     {
+        let key = (store_key, operation_name);
+        let Ok(mut pending) = self.pending_cleanups.lock() else {
+            tracing::warn!(operation = operation_name, "sqlite cleanup queue lock poisoned");
+            return;
+        };
+        if !pending.insert(key.clone()) {
+            // A pending cleanup will recheck the row body before changing it.
+            // A later read can schedule another pass after that task finishes.
+            return;
+        }
+        drop(pending);
+        let claim = CleanupClaim { key, pending: Arc::clone(&self.pending_cleanups) };
         let backend = self.clone();
-        let task = tokio::spawn(async move {
+        // Cleanup uses the writer, which may be waiting on fsync. Do not hold
+        // up a successful read while the writer drains its queue.
+        tokio::spawn(async move {
+            let _claim = claim;
             if let Err(error) = backend.call(operation_name, operation).await {
                 tracing::warn!(operation = operation_name, %error, "sqlite store cleanup failed");
             }
         });
-        // Dropping the join handle on timeout detaches the cleanup; it still runs
-        // after the writer becomes available, without failing a successful read.
-        match tokio::time::timeout(READ_DEADLINE, task).await {
-            Ok(Err(error)) => tracing::warn!(operation = operation_name, %error, "sqlite store cleanup task failed"),
-            Err(_) => tracing::warn!(operation = operation_name, "sqlite store cleanup queued behind a busy writer"),
-            Ok(Ok(())) => {}
-        }
     }
 
     fn map_connection_error(error: tokio_rusqlite::Error<ResourceError>) -> ResourceError {
@@ -893,7 +918,7 @@ impl SqliteBackend {
         let items =
             items.into_iter().filter_map(|(origin_root, item)| (!invalid_partitions.contains_key(&origin_root)).then_some(item)).collect();
         if !invalid_partitions.is_empty() {
-            self.cleanup_call("drop invalid replica partition", move |connection| {
+            self.cleanup_call(cleanup_key.clone(), "drop invalid replica partition", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
                 for (origin_root, failures) in &invalid_partitions {
                     // A changed bad row no longer justifies deleting its partition.
@@ -937,8 +962,7 @@ impl SqliteBackend {
                 }
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))?;
                 Ok(())
-            })
-            .await;
+            });
         }
         Ok(items)
     }
@@ -1001,7 +1025,7 @@ impl SqliteBackend {
             .await?;
         if !invalid.is_empty() {
             let requested_name = name.to_string();
-            self.cleanup_call("drop invalid replica partition", move |connection| {
+            self.cleanup_call(cleanup_key.clone(), "drop invalid replica partition", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin invalid replica cache cleanup"))?;
                 for (origin_root, body, error) in invalid {
                     // Preserve full-partition resync only while the bad row is unchanged.
@@ -1028,8 +1052,7 @@ impl SqliteBackend {
                         "dropping undecodable cached replica partition; origin will be fully resynced");
                 }
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit invalid replica cache cleanup"))
-            })
-            .await;
+            });
         }
         Ok(items)
     }
@@ -1443,7 +1466,7 @@ impl SqliteBackend {
             .await?;
         let (invalid, failures) = failures;
         if !invalid.is_empty() {
-            self.cleanup_call("quarantine invalid resource", move |connection| {
+            self.cleanup_call(quarantine_key.clone(), "quarantine invalid resource", move |connection| {
                 let quarantined_at = Utc::now();
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource decode quarantine"))?;
                 for (name, body, error) in &invalid {
@@ -1475,8 +1498,7 @@ impl SqliteBackend {
                     .map_err(|err| Self::map_sqlite(err, "remove quarantined sqlite resource object"))?;
                 }
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource decode quarantine"))
-            })
-            .await;
+            });
         }
         for (name, error) in failures {
             tracing::warn!(
@@ -2164,7 +2186,7 @@ mod latency_tests {
     }
 
     #[tokio::test]
-    async fn list_returns_valid_items_while_cleanup_waits_and_preserves_repaired_row() {
+    async fn list_returns_valid_items_without_waiting_or_queueing_duplicate_cleanups() {
         let directory = tempfile::tempdir().expect("store directory");
         let path = directory.path().join("resources.sqlite");
         let backend = SqliteBackend::open(&path).expect("open store");
@@ -2211,12 +2233,16 @@ mod latency_tests {
         });
         tokio::task::spawn_blocking(move || entered_rx.recv().expect("writer entered")).await.expect("wait for writer");
 
-        let listed = tokio::time::timeout(Duration::from_secs(3), hosts.list())
+        let listed = tokio::time::timeout(Duration::from_secs(1), hosts.list())
             .await
-            .expect("list returns before client timeout")
+            .expect("list returns without waiting for writer cleanup")
             .expect("valid item survives queued cleanup");
         assert_eq!(listed.items.len(), 1);
         assert_eq!(listed.items[0].metadata.name, "healthy");
+        for _ in 0..3 {
+            assert_eq!(hosts.list().await.expect("repeat list").items.len(), 1);
+        }
+        assert_eq!(backend.pending_cleanups.lock().expect("cleanup set").len(), 1);
 
         let repair = rusqlite::Connection::open(&path).expect("open independent writer");
         repair
@@ -2227,6 +2253,13 @@ mod latency_tests {
             .expect("repair row before queued cleanup");
         release_tx.send(()).expect("release writer");
         blocked_writer.await.expect("writer task");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !backend.pending_cleanups.lock().expect("cleanup set").is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued cleanup finishes");
         assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
         assert_eq!(hosts.get("repaired").await.expect("repaired row remains").metadata.name, "repaired");
     }
