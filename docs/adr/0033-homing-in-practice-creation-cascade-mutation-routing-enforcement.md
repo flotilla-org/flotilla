@@ -77,6 +77,20 @@ demands the home be elsewhere.
 
 ## Mutation: route to the home; refuse when it is unreachable
 
+### Command targeting amendment (2026-10-01, #2338)
+
+The command domain resolves the execution target before delivery. Admission
+targets the primary placement host; mutations of existing records, including
+crew settlement claims, target the record's home; session operations target
+the session's home; and reads use the local query view or the addressed
+record's home. A caller-supplied node does not override an admission
+placement decision, including a local primary placement host. The resolver
+returns a typed target and a reason, or a named resolution error.
+The remote command router translates that target to a live route and delivers
+the command. It must not infer command ownership from an ordered set of
+action-specific transport rules. Router and request-dispatch tests over
+in-memory transport sessions enforce this boundary.
+
 A mutating verb (`convoy delete`, force-complete, resume) issued anywhere
 resolves the record's home and executes **there** — finalizers and
 teardown run at the home, and the deletion propagates outward as

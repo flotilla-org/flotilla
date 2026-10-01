@@ -2010,6 +2010,76 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
 }
 
 #[tokio::test]
+async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery() {
+    use flotilla_core::command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason};
+
+    let (_tmp, daemon) = empty_daemon().await;
+    let read = daemon.resolve_command_target(&CommandAction::QueryHostList {}, None).await.expect("resolve read");
+    assert_eq!(read.host, TargetHost::Local);
+    assert_eq!(read.reason, TargetReason::LocalRead);
+
+    let remote = node("feta");
+    let mutation = daemon
+        .resolve_command_target(&CommandAction::TrackRepoPath { path: "/tmp/repo".into() }, Some(&remote))
+        .await
+        .expect("resolve explicit remote mutation");
+    assert_eq!(mutation.host, TargetHost::Node(remote.clone()));
+    assert_eq!(mutation.reason, TargetReason::Explicit);
+    assert_eq!(mutation.delivery, RemoteDelivery::Steps);
+
+    let legacy_session = daemon
+        .resolve_command_target(&CommandAction::ArchiveSession { session_id: "external-session".into() }, Some(&remote))
+        .await
+        .expect("explicit archive target");
+    assert_eq!(legacy_session.host, TargetHost::Node(remote.clone()));
+    assert_eq!(legacy_session.reason, TargetReason::Explicit);
+    assert_eq!(legacy_session.delivery, RemoteDelivery::Steps);
+
+    let admission = daemon
+        .resolve_command_target(
+            &CommandAction::ConvoyCreate {
+                name: "new-work".into(),
+                workflow_ref: "scratch".into(),
+                inputs: vec![],
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+            Some(&remote),
+        )
+        .await
+        .expect("resolve admission with a local primary host");
+    assert_eq!(admission.host, TargetHost::Local, "the caller cannot override admission placement");
+    assert_eq!(admission.reason, TargetReason::Admission);
+    assert_eq!(admission.delivery, RemoteDelivery::Command);
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(daemon.node_id().clone())));
+    let router = empty_remote_command_router(&daemon, &peer_manager);
+    let unreachable = router
+        .target_node_id(&TargetHost::Placement(flotilla_protocol::qualified_path::HostId::new("missing-host")))
+        .await
+        .expect_err("disconnected placement host has no delivery route");
+    assert!(matches!(unreachable, TargetError::Unreachable(_)));
+
+    let unresolved = daemon
+        .resolve_command_target(
+            &CommandAction::CrewComplete {
+                context: CrewCommandContext::default(),
+                message: None,
+                disposition: None,
+                decision_ledger_ref: None,
+                force: false,
+            },
+            None,
+        )
+        .await
+        .expect_err("crew settlement needs a convoy home");
+    assert!(matches!(unresolved, TargetError::RecordHome(_)));
+}
+
+#[tokio::test]
 async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;

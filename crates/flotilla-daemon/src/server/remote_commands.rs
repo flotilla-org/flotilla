@@ -10,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_core::{
+    command_target::{RemoteDelivery, TargetError, TargetHost, TargetReason},
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
@@ -222,6 +223,25 @@ impl RemoteCommandRouter {
         self.blob_store.get().cloned().ok_or_else(|| "blob store is not running".to_string())
     }
 
+    pub(super) async fn target_node_id(&self, target: &TargetHost) -> Result<NodeId, TargetError> {
+        match target {
+            TargetHost::Local => Ok(self.daemon.node_id().clone()),
+            TargetHost::Node(node) => Ok(node.clone()),
+            TargetHost::ConvoyHome(home) => Ok(home.node_id.clone()),
+            TargetHost::Placement(host_id) => {
+                let peer_manager = self.peer_manager.lock().await;
+                let environment_id = EnvironmentId::host(host_id.clone());
+                let (node_id, host_name) = peer_manager
+                    .node_for_host_environment(&environment_id)
+                    .map_err(|_| TargetError::Unreachable(format!("peer host {host_id} is not connected")))?;
+                peer_manager
+                    .resolve_sender(&node_id)
+                    .map_err(|_| TargetError::Unreachable(format!("peer host {host_name} is not connected")))?;
+                Ok(node_id)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) async fn dispatch_execute(&self, command: Command) -> Result<u64, String> {
         self.dispatch_execute_for_caller(command, None).await
@@ -247,7 +267,12 @@ impl RemoteCommandRouter {
         if let Some(completion) = &mut crew_completion {
             completion.principal_ref = dispatching_principal_ref.clone();
         }
-        let existing_convoy_target = self.daemon.resolve_existing_convoy_target(&command.action).await?;
+        let target =
+            self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
+        let existing_convoy_target = match &target.host {
+            TargetHost::ConvoyHome(home) => Some(home.clone()),
+            _ => None,
+        };
         if let (Some(completion), Some(target)) = (&mut crew_completion, &existing_convoy_target) {
             completion.authority = Some(target.home.clone());
         }
@@ -260,66 +285,16 @@ impl RemoteCommandRouter {
                 return Err(format!("completion pending: {message}"));
             }
         }
-        if let Some(target) = existing_convoy_target.as_ref() {
-            command.node_id = Some(target.node_id.clone());
-        }
-        let resource_origin = self.daemon.resource_mutation_origin(&command.action).await?;
-        if let Some(origin) = &resource_origin {
-            command.node_id = Some(origin.clone());
-        }
-        let remote_placement_host = match &command.action {
-            CommandAction::ConvoyStart { intent } => {
-                let namespace = intent.namespace.clone().unwrap_or(self.daemon.provisioning_namespace().await);
-                self.daemon.convoy_start_placement_host(&namespace, intent).await?
-            }
-            CommandAction::ConvoyCreate { placement_policy, .. } => {
-                let namespace = self.daemon.provisioning_namespace().await;
-                self.daemon.remote_placement_host(&namespace, placement_policy.as_deref()).await?
-            }
-            _ => None,
-        };
-        if let Some(host_id) = remote_placement_host {
-            let peer_manager = self.peer_manager.lock().await;
-            let environment_id = EnvironmentId::host(host_id.clone());
-            let (node_id, host_name) =
-                peer_manager.node_for_host_environment(&environment_id).map_err(|_| format!("peer host {host_id} is not connected"))?;
-            peer_manager.resolve_sender(&node_id).map_err(|_| format!("peer host {host_name} is not connected"))?;
-            command.node_id = Some(node_id);
-        }
-        let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
+        let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
+        command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
         let local = self.daemon.node_id();
         let desc = command.description();
         let action = command_action_name(&command);
         let subject = command_subject(&command.action);
         let caller_label = caller.as_ref().map(ToString::to_string).unwrap_or_else(|| "unattributed".to_string());
-        info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, "dispatch_execute");
+        info!(%target_node_id, %local, %caller_label, %action, %subject, %desc, reason = ?target.reason, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
-            if command.action.is_query()
-                || matches!(
-                    command.action,
-                    CommandAction::ConvoyStart { .. }
-                        | CommandAction::ConvoyCreate { .. }
-                        | CommandAction::ConvoyDelete { .. }
-                        | CommandAction::ConvoyLink { .. }
-                        | CommandAction::ConvoyUnlink { .. }
-                        | CommandAction::ConvoyAbandon { .. }
-                        | CommandAction::ConvoyResume { .. }
-                        | CommandAction::ConvoyWithdrawPendingBrief { .. }
-                        | CommandAction::ConvoyWorkForceComplete { .. }
-                        | CommandAction::CrewComplete { .. }
-                        | CommandAction::CrewFail { .. }
-                        | CommandAction::CrewStall { .. }
-                        | CommandAction::CrewSupervise { .. }
-                        | CommandAction::CrewHandoff { .. }
-                        | CommandAction::ResourceApply { .. }
-                        | CommandAction::ResourceManifestResolve { .. }
-                        | CommandAction::ResourceReconcileNow { .. }
-                        | CommandAction::ResourceDelete { .. }
-                        | CommandAction::ResourceStatusPatch { .. }
-                        | CommandAction::RepositoryRemoteRemove { .. }
-                        | CommandAction::ResourceWatch { .. }
-                )
-            {
+            if target.delivery == RemoteDelivery::Command {
                 if let (Some(completion), Some(target)) = (&crew_completion, &existing_convoy_target) {
                     self.persist_crew_completion(
                         completion,
@@ -357,9 +332,14 @@ impl RemoteCommandRouter {
                     Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
                     None => self.send_routed_to(&target_node_id, routed).await,
                 }
-                .map_err(|error| match &resource_origin {
-                    Some(origin) => format!("resource origin {origin} is unreachable: {error}"),
-                    None => error,
+                .map_err(|error| match &target.host {
+                    TargetHost::Node(origin) if target.reason == TargetReason::RecordHome => {
+                        format!("resource origin {origin} is unreachable: {error}")
+                    }
+                    TargetHost::Node(origin) if target.reason == TargetReason::CrewSessionHome => {
+                        format!("session origin {origin} is unreachable: {error}")
+                    }
+                    _ => error,
                 });
 
                 match send_result {
@@ -395,15 +375,18 @@ impl RemoteCommandRouter {
     /// broadcast is synthesised.
     pub(super) async fn dispatch_query(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
-        let existing_convoy_target = self.daemon.resolve_existing_convoy_target(&command.action).await?;
+        let target =
+            self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
+        let existing_convoy_target = match &target.host {
+            TargetHost::ConvoyHome(home) => Some(home.clone()),
+            _ => None,
+        };
         let crew_convoy = match &command.action {
             CommandAction::QueryCrewList { context } => context.convoy.clone(),
             _ => None,
         };
-        if let Some(target) = &existing_convoy_target {
-            command.node_id = Some(target.node_id.clone());
-        }
-        let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
+        let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
+        command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
 
         if target_node_id == *self.daemon.node_id() {
             return self.execute_projected_query(command, session_id).await;
