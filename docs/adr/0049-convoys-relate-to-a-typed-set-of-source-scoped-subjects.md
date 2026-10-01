@@ -56,7 +56,11 @@ So a crew publishing from a branch other than `spec.ref` never shows a PR in the
 
 ### 4. Disagreement surfaces
 
-When sources disagree (for example, the branch lookup finds `cleat!281` and the claim names `cleat!282`), both are recorded. A conflict marker raises attention (a controller-maker terminal row, ADR 0045), and it is resolved with a verb: link one as `supersedes`, or unlink. Nothing wins silently.
+A convoy may produce or adopt **any number of change requests**, in one repository or several. Follow-up PRs, split PRs and multi-repo work are normal, and several `produces` subjects are not a disagreement. When the branch lookup finds `cleat!281` and the claim names `cleat!282`, both are recorded as subjects and both count toward settlement (§5). Nothing is dropped and nothing raises attention merely for being plural. (Amended 2026-10-01: the original text treated two produced change requests as a conflict needing `supersedes` or `unlink`; the owner ruled the one-change-request limit out.)
+
+What remains a disagreement is a **contradiction about a single subject**: for example, a source rediscovers a subject an operator explicitly unlinked (the unlink wins and suppresses it), or two sources assert incompatible relationships for the same change request. Those are recorded and resolved by verb, and nothing wins silently.
+
+`supersedes` keeps its meaning: one change request **replaces** another, so the replaced one no longer has to reach a terminal state for the convoy to land.
 
 ### 5. Settlement reads the set, per repository
 
