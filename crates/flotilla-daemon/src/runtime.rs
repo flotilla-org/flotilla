@@ -362,7 +362,6 @@ struct DaemonHealthIdentity {
 struct RuntimeHealth {
     failures: Arc<StdMutex<BTreeMap<String, HostCondition>>>,
     restart_history_dir: Option<Arc<PathBuf>>,
-    fulfilment_facts: Arc<RwLock<BTreeMap<String, FulfilmentFacts>>>,
     issue_polling: IssuePollingHealth,
 }
 
@@ -627,7 +626,6 @@ impl DaemonRuntime {
                 Arc::clone(&daemon),
                 options.namespace.clone(),
                 profile.clone(),
-                runtime_health.clone(),
                 config.state_dir().as_path().join("probe-cwd"),
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
@@ -2501,14 +2499,12 @@ fn spawn_local_fulfilment_probe_task(
     daemon: Arc<InProcessDaemon>,
     namespace: String,
     profile: LocalProvisioningProfile,
-    runtime_health: RuntimeHealth,
     scratch: PathBuf,
 ) -> JoinHandle<()> {
     spawn_periodic_task(FULFILMENT_CHANGE_CHECK_INTERVAL, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
         let namespace = namespace.clone();
         let profile = profile.clone();
-        let runtime_health = runtime_health.clone();
         let scratch = scratch.clone();
         async move {
             let discovery = daemon.discovery_runtime();
@@ -2528,7 +2524,6 @@ fn spawn_local_fulfilment_probe_task(
             .await
             {
                 Ok(facts) if facts != previous || model_probes != status.model_probes => {
-                    *runtime_health.fulfilment_facts.write().await = facts.clone();
                     if let Err(error) =
                         flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::FulfilmentFacts {
                             facts,
@@ -11817,13 +11812,7 @@ mod tests {
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
         assert!(hosts.get(&host_id).await.expect("host").status.expect("status").fulfilment_facts.is_empty());
 
-        let task = spawn_local_fulfilment_probe_task(
-            Arc::clone(&daemon),
-            NAMESPACE.to_string(),
-            profile,
-            runtime_health.clone(),
-            temp.path().join("probe-cwd"),
-        );
+        let task = spawn_local_fulfilment_probe_task(Arc::clone(&daemon), NAMESPACE.to_string(), profile, temp.path().join("probe-cwd"));
         wait_until_with_timeout(Duration::from_secs(5), || {
             let hosts = hosts.clone();
             let host_id = host_id.clone();
@@ -11837,7 +11826,6 @@ mod tests {
             }
         })
         .await;
-        assert!(runtime_health.fulfilment_facts.read().await.contains_key(kind_name));
         task.abort();
         let _ = task.await;
     }
@@ -11931,7 +11919,6 @@ mod tests {
 
         release.notify_one();
         let observed_facts = probe.await.expect("probe task");
-        *runtime_health.fulfilment_facts.write().await = observed_facts.clone();
         flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::FulfilmentFacts {
             facts: observed_facts,
             model_probes: ModelProbeState::default(),
