@@ -9588,6 +9588,13 @@ impl InProcessDaemon {
             delivery: CrewMessageDelivery::Queued,
             following: Vec::new(),
         };
+        let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+        if message.as_ref().is_some_and(|head| head.delivered_through(delivered_id, &delivery_message.id)) {
+            return Ok(match plan {
+                TurnDeliverySessionPlan::QueueWarm => TurnDeliveryRung::WarmSession,
+                TurnDeliverySessionPlan::QueueFresh | TurnDeliverySessionPlan::RestartFresh => TurnDeliveryRung::FreshAgent,
+            });
+        }
         let reopened = apply_resource_status_patch(
             &convoys,
             &request.convoy,
@@ -9625,9 +9632,8 @@ impl InProcessDaemon {
                     *message = Some(delivery_message);
                 }
                 if let Some(head) = message {
-                    brief.content = head
-                        .mark_next_for_launch(session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()))
-                        .expect("new turn is pending");
+                    brief.content =
+                        head.mark_next_for_launch(delivered_id).ok_or_else(|| "turn delivery has no pending message".to_string())?;
                     brief.artifact_digest = None;
                 }
             }

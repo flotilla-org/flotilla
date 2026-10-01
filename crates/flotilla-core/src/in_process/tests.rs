@@ -1300,6 +1300,47 @@ async fn fresh_turn_replaces_the_old_brief_digest() {
 }
 
 #[tokio::test]
+async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery() {
+    let (daemon, backend, probe) = resume_staging_fixture().await;
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let mut spec = session.spec.clone();
+    let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent session") };
+    *message = Some(flotilla_resources::TerminalCrewMessage {
+        id: "turn-delivery:review:same-head".into(),
+        text: "previously delivered".into(),
+        sender: CrewMessageSender::FlotillaTurn { source: "review".into() },
+        delivery: flotilla_resources::CrewMessageDelivery::Queued,
+        following: Vec::new(),
+    });
+    let session =
+        sessions.update(&input_meta_from_resource(&session), &session.metadata.resource_version, &spec).await.expect("stored turn");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Lost,
+            delivered_message_id: Some("turn-delivery:review:same-head".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("lost after delivery");
+    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
+        .namespace("flotilla".to_string())
+        .convoy("resume-staging".to_string())
+        .source("review".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .brief("same turn".to_string())
+        .subject_revision("same-head".to_string())
+        .sender(CrewMessageSender::FlotillaTurn { source: "review".to_string() })
+        .build();
+    assert_eq!(daemon.deliver_standing_turn(&request).await.expect("duplicate is already delivered"), TurnDeliveryRung::FreshAgent);
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    assert_eq!(session.spec, spec);
+    assert_eq!(session.status.expect("status").phase, ResourceTerminalSessionPhase::Lost);
+}
+
+#[tokio::test]
 async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_rung() {
     for phase in [ResourceTerminalSessionPhase::Running, ResourceTerminalSessionPhase::Starting, ResourceTerminalSessionPhase::Stopped] {
         let temp = tempfile::tempdir().expect("tempdir");

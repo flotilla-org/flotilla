@@ -1248,6 +1248,11 @@ impl ReconcilerWake {
                         .filter(|work| work.phase == flotilla_resources::CrewWorkPhase::Working)
                         .and_then(|work| work.resumed_at.zip(work.resume_brief_id.as_deref()))
                         .is_some_and(|(resumed_at, brief_id)| {
+                            // A missing or recreated session must not suppress
+                            // supervision indefinitely while its brief is unconfirmed.
+                            if now.signed_duration_since(resumed_at) >= chrono::Duration::minutes(2) {
+                                return false;
+                            }
                             let operator_brief_delivered = session.is_some_and(|session| {
                                 let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
                                 matches!(&session.spec.source, TerminalSessionSource::Agent { message: Some(message), .. }
@@ -1329,6 +1334,7 @@ impl ReconcilerWake {
                 }
                 let needs_supervisor = matches!(condition.maker, Some(LeafMaker::Supervisor { .. }))
                     || condition.source == StallEvidenceSource::Crew
+                    || condition.source == StallEvidenceSource::Session
                     || matches!(&condition.maker, Some(LeafMaker::Actor { vessel, role }) if status.crew_work.get(vessel)
                         .and_then(|crew| crew.get(role)).and_then(|work| work.completion_refusal.as_ref())
                         .is_some_and(|refusal| refusal.consecutive_count >= refusal_limit(status, vessel, role)))
@@ -2490,6 +2496,41 @@ mod tests {
         let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
         wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge after turn");
         assert_eq!(delivery.requests.lock().expect("nudge requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_resumed_session_does_not_suppress_supervision_forever() {
+        let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            "stalled-work",
+            &flotilla_resources::external_patches::resume_crew_work(
+                "work".into(),
+                "coder".into(),
+                Utc::now() - chrono::Duration::minutes(3),
+                "Continue with the operator's guidance".into(),
+                Some("lost-resume-brief".into()),
+            ),
+        )
+        .await
+        .expect("resume declared stall");
+        let row_id = *wake.subscriptions.inner.rows.lock().await.keys().next().expect("actor row");
+        wake.subscriptions
+            .inner
+            .unable_since
+            .lock()
+            .await
+            .insert(row_id, (UnableEvidenceKey::Absent, Utc::now() - chrono::Duration::minutes(3)));
+        let source = convoys.get("stalled-work").await.expect("resumed convoy");
+        let governor = convoys.get("governor").await.expect("governor");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source), ("governor".into(), governor)]))
+            .await
+            .expect("judge missing session");
+        let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
+        let requests = delivery.requests.lock().expect("supervisor requests");
+        assert!(!requests.is_empty(), "missing session should be supervised: {:?}", status.stalled);
+        assert_eq!(requests[0].convoy, "governor");
     }
 
     async fn create_governor_ensure(backend: &ResourceBackend, convoy_ref: &str) {
