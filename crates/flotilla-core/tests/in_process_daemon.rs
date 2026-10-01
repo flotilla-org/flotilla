@@ -6278,6 +6278,56 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
 }
 
 #[tokio::test]
+async fn forge_identity_sweep_merges_records_whose_bookkeeping_annotations_differ() {
+    use flotilla_resources::Forge;
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("katzensteg-ops");
+    std::fs::create_dir_all(&repo).expect("create repository path");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon
+        .set_repository_inspector(Arc::new(ForgeAliasInspector {
+            path: repo.clone(),
+            remote: "https://manchego.lab.flotilla.work/robert/katzensteg-ops.git",
+            host_ref: "host-test",
+        }))
+        .await;
+    daemon
+        .resource_backend()
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &lab_forge_spec())
+        .await
+        .expect("declare forge");
+    let front = RepositorySpec::remote("https://forgejo.lab.flotilla.work/robert/katzensteg-ops").expect("front");
+    let ssh = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/katzensteg-ops").expect("ssh");
+    let target = ssh.clone().on_forge(&lab_forge_spec()).expect("forge identity").key();
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    // Each record was bootstrapped and synced separately, so its bookkeeping annotations
+    // differ (live incident 2026-10-01: feta governors refused re-admission after a reboot).
+    for (spec, commit, synced) in [(&front, "98acd5b1", "2026-09-25T10:00:00Z"), (&ssh, "04d84fe0", "2026-09-24T09:00:00Z")] {
+        repositories
+            .create(
+                &InputMeta::builder()
+                    .name(spec.key().to_string())
+                    .annotations(BTreeMap::from([
+                        ("flotilla.work/project-bootstrap-commit".to_string(), commit.to_string()),
+                        ("flotilla.work/last-synced-at".to_string(), synced.to_string()),
+                    ]))
+                    .build(),
+                spec,
+            )
+            .await
+            .expect("legacy Repository");
+    }
+
+    daemon.inspect_repository_path(&repo, None).await.expect("bookkeeping annotation differences must not block the sweep");
+    let merged = repositories.get(&target.to_string()).await.expect("forge-identity Repository created");
+    let commit = merged.metadata.annotations.get("flotilla.work/project-bootstrap-commit").expect("bootstrap commit carried");
+    assert!(commit == "98acd5b1" || commit == "04d84fe0", "{commit}");
+}
+
+#[tokio::test]
 async fn forge_identity_sweep_includes_replica_only_legacy_repository() {
     use flotilla_resources::{Forge, InMemoryBackend};
 

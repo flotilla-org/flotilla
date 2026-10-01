@@ -2860,13 +2860,14 @@ impl InProcessDaemon {
                     return Err(format!("Repository metadata label `{label}` conflicts during forge identity sweep"));
                 }
             }
+            // Annotations are bookkeeping about each record (bootstrap commit, last sync,
+            // authoring root), so split records routinely disagree. The surviving record's
+            // values win; a source only fills annotations the survivor lacks.
             for (annotation, value) in &source.metadata.annotations {
                 if annotation == SUPERSEDED_BY_ANNOTATION {
                     continue;
                 }
-                if target_meta.annotations.insert(annotation.clone(), value.clone()).is_some_and(|previous| previous != *value) {
-                    return Err(format!("Repository metadata annotation `{annotation}` conflicts during forge identity sweep"));
-                }
+                target_meta.annotations.entry(annotation.clone()).or_insert_with(|| value.clone());
             }
         }
         let projects = self.resource_backend.clone().definitions::<Project>(namespace);
