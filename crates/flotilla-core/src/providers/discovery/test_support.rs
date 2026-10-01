@@ -80,8 +80,13 @@ impl MergedPrProcessRunner {
         Self { pr_number }
     }
 
-    fn response(&self) -> String {
-        format!(r#"[{{"number":{},"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","baseRefName":"main"}}]"#, self.pr_number)
+    async fn response(&self, cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        let head = ProcessCommandRunner.run("git", &["rev-parse", "HEAD"], cwd, label).await?;
+        Ok(format!(
+            r#"[{{"number":{},"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z","baseRefName":"main","headRefOid":"{}"}}]"#,
+            self.pr_number,
+            head.trim()
+        ))
     }
 }
 
@@ -89,7 +94,7 @@ impl MergedPrProcessRunner {
 impl CommandRunner for MergedPrProcessRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         if cmd == "gh" {
-            Ok(self.response())
+            self.response(cwd, label).await
         } else {
             ProcessCommandRunner.run(cmd, args, cwd, label).await
         }
@@ -97,7 +102,7 @@ impl CommandRunner for MergedPrProcessRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         if cmd == "gh" {
-            Ok(CommandOutput { stdout: self.response(), stderr: String::new(), success: true })
+            Ok(CommandOutput { stdout: self.response(cwd, label).await?, stderr: String::new(), success: true })
         } else {
             ProcessCommandRunner.run_output(cmd, args, cwd, label).await
         }

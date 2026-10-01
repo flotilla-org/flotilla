@@ -4068,7 +4068,9 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         clean: condition(flotilla_resources::ConditionValue::True),
         pushed: condition(flotilla_resources::ConditionValue::False),
         landed: condition(flotilla_resources::ConditionValue::True),
-        landed_evidence: Some(flotilla_resources::LandedEvidence::builder().change_request_id("127".to_string()).build()),
+        landed_evidence: Some(
+            flotilla_resources::LandedEvidence::builder().change_request_id("127".to_string()).checkout_head_in_merged_head(true).build(),
+        ),
         change_request: Some(
             flotilla_resources::ChangeRequestObservation::builder()
                 .id("127".to_string())
@@ -4091,6 +4093,18 @@ async fn landed_convoy_teardown_accepts_clean_squash_merge_after_branch_deletion
         .verify_convoy_teardown_gate_for_checkouts(&convoy, std::slice::from_ref(&checkout), false)
         .await
         .expect("merged PR makes deleted branch safe to reclaim");
+
+    let mut advanced = checkout.clone();
+    advanced
+        .status
+        .as_mut()
+        .expect("checkout status")
+        .integration
+        .landed_evidence
+        .as_mut()
+        .expect("landing evidence")
+        .checkout_head_in_merged_head = false;
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[advanced], false).await.is_err());
 
     let mut mismatched = checkout.clone();
     mismatched
