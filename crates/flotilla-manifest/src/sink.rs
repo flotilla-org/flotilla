@@ -158,6 +158,22 @@ impl ZellijPipeSink {
         };
         result.map_err(|error| format!("write {} metadata pipe: {error}", self.zellij_bin))
     }
+
+    async fn write_with_respawn(&self, state: &mut ZellijPipeState, payload: &[u8]) -> Result<(), String> {
+        let running = self.ensure_process(state).await?;
+        if let Err(error) = self.write_payload(running, payload).await {
+            state.mark_healthy_if_stable();
+            let delay = state.schedule_respawn();
+            warn!(%error, delay_ms = delay.as_millis(), "zellij metadata pipe write failed; respawning and retrying patch");
+            let running = self.ensure_process(state).await?;
+            if let Err(retry_error) = self.write_payload(running, payload).await {
+                state.schedule_respawn();
+                return Err(format!("{retry_error} after respawn (initial error: {error})"));
+            }
+        }
+        state.mark_healthy_if_stable();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -167,23 +183,7 @@ impl PatchSink for ZellijPipeSink {
         for compatible in patch.compatibility_patches() {
             let mut payload = compatible.to_pipe_payload();
             payload.push('\n');
-            let running = self.ensure_process(&mut state).await?;
-            let first_attempt = self.write_payload(running, payload.as_bytes()).await;
-            if let Err(error) = first_attempt {
-                state.mark_healthy_if_stable();
-                let delay = state.schedule_respawn();
-                warn!(%error, delay_ms = delay.as_millis(), "zellij metadata pipe write failed; respawning and retrying patch");
-                let running = self.ensure_process(&mut state).await?;
-                match self.write_payload(running, payload.as_bytes()).await {
-                    Ok(()) => state.mark_healthy_if_stable(),
-                    Err(retry_error) => {
-                        state.schedule_respawn();
-                        return Err(format!("{retry_error} after respawn (initial error: {error})"));
-                    }
-                }
-            } else {
-                state.mark_healthy_if_stable();
-            }
+            self.write_with_respawn(&mut state, payload.as_bytes()).await?;
         }
         Ok(())
     }

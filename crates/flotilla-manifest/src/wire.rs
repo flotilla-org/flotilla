@@ -297,7 +297,13 @@ pub struct MetadataPatch {
 impl MetadataPatch {
     /// Send new edge values separately so a PM built before `entity-refs`
     /// can reject that message without losing the familiar facts in this patch.
+    /// A mixed patch can be partially applied if the second delivery fails;
+    /// callers must treat a send error as uncertain delivery, not a rollback.
+    /// Empty patches keep their existing one-message delivery behavior.
     pub fn compatibility_patches(&self) -> Vec<Self> {
+        if self.set.is_empty() && self.unset.is_empty() {
+            return vec![self.clone()];
+        }
         let mut familiar = self.clone();
         let mut edges = self.clone();
         familiar.set.retain(|_, update| !matches!(update.value, MetadataValue::EntityRefs(_)));

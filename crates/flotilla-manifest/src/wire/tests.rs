@@ -164,6 +164,29 @@ fn entity_refs_do_not_prevent_older_consumers_receiving_existing_facts() {
 }
 
 #[test]
+fn empty_patch_keeps_its_existing_delivery_behavior() {
+    let patch = MetadataPatch { target: MetadataTarget::Root, source_id: "flotilla".to_owned(), set: BTreeMap::new(), unset: vec![] };
+    assert_eq!(patch.compatibility_patches(), vec![patch]);
+}
+
+#[test]
+fn edge_only_patch_needs_one_delivery() {
+    let patch = MetadataPatch {
+        target: MetadataTarget::Root,
+        source_id: "flotilla".to_owned(),
+        set: BTreeMap::from([(
+            "flotilla.subject.produces".to_owned(),
+            MetadataValueUpdate::new(
+                MetadataValue::EntityRefs(vec![EntityRef::new("change_request", "github/flotilla-org/flotilla!2374")]),
+                None,
+            ),
+        )]),
+        unset: vec![],
+    };
+    assert_eq!(patch.compatibility_patches(), vec![patch]);
+}
+
+#[test]
 fn segment_identity_ignores_labels() {
     let plain = GroupSegment::text("flotilla.convoy", "dev/manifest-extraction");
     let labelled = GroupSegment::text("flotilla.convoy", "dev/manifest-extraction").with_label("manifest extraction");
