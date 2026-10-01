@@ -186,6 +186,7 @@ impl GroupPath {
                     MetadataValue::Bool(value) => MetadataPathValue::Bool(*value),
                     MetadataValue::Integer(value) => MetadataPathValue::Integer(*value),
                     MetadataValue::StringList(values) => MetadataPathValue::StringList(values.clone()),
+                    // Group paths express containment; entity edges are separate facts.
                     MetadataValue::EntityRefs(_) | MetadataValue::GroupPath(_) => return None,
                 };
                 Some(MetadataPathSegmentValue { key: segment.key.clone(), value, label: segment.label.clone() })
