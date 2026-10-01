@@ -3182,7 +3182,7 @@ async fn apply_host_heartbeat_with_credentials(
         conditions.push(condition);
     }
     let mut capabilities = host_capabilities(&summary, profile, &held_credentials, &credential_expiry);
-    if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot() {
+    if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
         capabilities.insert("io_pressure".to_string(), snapshot);
     }
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);

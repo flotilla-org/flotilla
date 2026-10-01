@@ -19,6 +19,16 @@ use crate::{
     blob_store::BlobDigest,
 };
 
+const INTERACTIVE_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+fn is_interactive_request(request: &Request) -> bool {
+    matches!(request, Request::Execute { command } if command.action.is_query())
+        || matches!(
+            request,
+            Request::ListRepos | Request::GetStatus | Request::GetTopology | Request::SubscribeQueries { .. } | Request::FetchMore { .. }
+        )
+}
+
 fn absolute_crew_path(path: &Path, cwd: &str) -> std::path::PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -296,21 +306,11 @@ impl<'a> RequestDispatcher<'a> {
 
     pub(super) fn dispatch(&self, id: u64, request: Request) -> std::pin::Pin<Box<impl Future<Output = Message> + '_>> {
         Box::pin(async move {
-            let interactive = matches!(
-                &request,
-                Request::Execute { command }
-                    if command.action.is_query()
-                        || matches!(&command.action, CommandAction::Attach { .. } | CommandAction::AttachTransient { .. })
-            ) || matches!(
-                &request,
-                Request::ListRepos
-                    | Request::GetStatus
-                    | Request::GetTopology
-                    | Request::SubscribeQueries { .. }
-                    | Request::FetchMore { .. }
-            );
-            if interactive {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), self.dispatch_inner(id, request)).await {
+            if is_interactive_request(&request) {
+                // Attach queries resolve a plan; terminal creation happens after
+                // the client receives that plan, so cancellation cannot leave
+                // a half-created local terminal or session.
+                match tokio::time::timeout(INTERACTIVE_REQUEST_DEADLINE, self.dispatch_inner(id, request)).await {
                     Ok(response) => response,
                     Err(_) => Message::error_response(id, "resource store busy: interactive request deadline exceeded"),
                 }

@@ -69,8 +69,8 @@ pub(crate) fn open_file_descriptor_count() -> Option<u64> {
     }
 }
 
-pub(crate) fn io_pressure_snapshot() -> Option<serde_json::Value> {
-    let raw = std::fs::read_to_string("/proc/pressure/io").ok()?;
+pub(crate) async fn io_pressure_snapshot() -> Option<serde_json::Value> {
+    let raw = tokio::fs::read_to_string("/proc/pressure/io").await.ok()?;
     parse_io_pressure(&raw)
 }
 
