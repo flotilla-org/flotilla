@@ -1,0 +1,3 @@
+[env]
+# Generated multi-host async tests need more than Rust's default test-thread stack.
+RUST_MIN_STACK = "8388608"
