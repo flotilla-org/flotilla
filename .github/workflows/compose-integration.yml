@@ -39,10 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # A plain debug flotillad overflows tokio's 2 MiB worker stacks during
-      # the wedge regressions (unoptimized futures are huge); opt-level 1
-      # shrinks them while building far faster than release.
-      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      # Plain debug profile: flotillad sizes its own tokio worker stacks for
+      # unoptimized futures (src/bin/flotillad.rs; issue #2346, fixed by
+      # PR #2347), so no opt-level override is needed here.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
