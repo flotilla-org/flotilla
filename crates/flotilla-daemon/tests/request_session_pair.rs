@@ -414,6 +414,24 @@ async fn assert_no_orphaned_finalizers(hosts: &[Arc<InProcessDaemon>]) {
     }
 }
 
+async fn wait_for_host_resource_visibility(hosts: &[Arc<InProcessDaemon>], name: &str, should_exist: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut settled = true;
+            for host in hosts {
+                let read = host.resource_backend().including_replicas::<Host>("flotilla").get(name).await;
+                settled &= if should_exist { read.is_ok() } else { matches!(read, Err(ResourceError::NotFound { .. })) };
+            }
+            if settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Host {name} did not become {} on every host", if should_exist { "visible" } else { "absent" }));
+}
+
 #[tokio::test]
 async fn finalizer_oracle_detects_a_stuck_registered_resource() {
     let host = empty_daemon_named("orphaned-finalizer").await;
@@ -489,12 +507,29 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
         .expect("pair start dispatch");
     let (node, result) = await_command_finished(&mut events, id).await;
     assert_eq!(node, *home.node_id());
-    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
-    trace.push("started".into());
+    let started_name = match result {
+        CommandValue::ConvoyStarted { name, attach_plan, binding } => {
+            trace.push(format!("started:attach_plan={}:binding={}", attach_plan.is_some(), binding.is_some()));
+            name
+        }
+        other => panic!("admission failed: {other:?}"),
+    };
     for host in &mesh.hosts {
-        trace.push(host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys").items.len().to_string());
+        let convoys = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("convoys");
+        trace.push(format!(
+            "authored={:?}",
+            convoys
+                .items
+                .iter()
+                .map(|convoy| (
+                    convoy.metadata.labels.get(ROLE_LABEL).cloned(),
+                    convoy.status.as_ref().map(|status| format!("{:?}", status.phase)),
+                ))
+                .collect::<Vec<_>>()
+        ));
     }
     let name = convoy_record_name(&home.resource_backend(), "paired-work").await;
+    trace.push(format!("started-name={started_name}"));
     for (index, host) in mesh.hosts.iter().enumerate() {
         if index != home_index {
             apply_convoy_replica_feed(host, "flotilla", &name, home.host_name().clone()).await;
@@ -518,8 +553,11 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
             .expect("pair delivery dispatch");
         let (node, result) = await_command_finished(&mut events, id).await;
         assert_eq!(node, *home.node_id());
-        assert!(matches!(result, CommandValue::Error { .. }), "{result:?}");
-        trace.push(if nudge { "nudge refused at home" } else { "resume refused at home" }.into());
+        let message = match result {
+            CommandValue::Error { message } => message,
+            other => panic!("delivery unexpectedly succeeded: {other:?}"),
+        };
+        trace.push(format!("{}: {}", if nudge { "nudge" } else { "resume" }, message.replace(&name, "<convoy>")));
     }
     let mut events = mesh.hosts[issuer_index].subscribe();
     let id = mesh.clients[issuer_index]
@@ -566,13 +604,21 @@ async fn paired_world_trace(home_index: usize, issuer_index: usize) -> Vec<Strin
         .expect("pair resource delete dispatch");
     let (node, result) = await_command_finished(&mut events, id).await;
     assert_eq!(node, *home.node_id());
-    assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
-    trace.push("resource deleted".into());
+    let deleted = match result {
+        CommandValue::ResourceDeleted(deleted) => deleted,
+        other => panic!("resource deletion failed: {other:?}"),
+    };
+    trace.push(format!("resource-deleted:{}:{}:{}", deleted.kind, deleted.namespace, deleted.value["metadata"]["name"]));
+    for host in &mesh.hosts {
+        let remaining = host.resource_backend().using::<Convoy>("flotilla").list().await.expect("remaining convoys");
+        trace.push(format!("remaining-convoys={}", remaining.items.len()));
+    }
+    wait_for_host_resource_visibility(&mesh.hosts, "pair-resource", false).await;
     assert_no_orphaned_finalizers(&mesh.hosts).await;
     trace
 }
 
-#[hegel::test(seed = Some(236801))]
+#[hegel::test]
 fn generated_paired_world_host_independence(tc: hegel::TestCase) {
     let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let offset = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
@@ -600,6 +646,8 @@ async fn three_host_request_mesh_connects_every_client_and_peer() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
+    // Dropping the mesh cuts peer sessions; rebuilding sub-meshes models a
+    // stable network partition and a fresh request runtime, not packet loss.
     let hosts = vec![empty_daemon_named("home").await, empty_daemon_named("peer-b").await, empty_daemon_named("peer-c").await];
     let mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("full mesh");
     let name = "deleted-during-partition";
@@ -609,20 +657,7 @@ async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent
         .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
         .await
         .expect("create home resource");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let mut visible = true;
-            for host in &hosts {
-                visible &= host.resource_backend().including_replicas::<Host>("flotilla").get(name).await.is_ok();
-            }
-            if visible {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("resource reaches every host");
+    wait_for_host_resource_visibility(&hosts, name, true).await;
     drop(mesh);
     let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[0])]).await.expect("isolated authority client");
     let other_component =
@@ -645,23 +680,7 @@ async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent
     drop(isolated);
     drop(other_component);
     let healed = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal full mesh");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let mut absent = true;
-            for host in &hosts {
-                absent &= matches!(
-                    host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
-                    Err(ResourceError::NotFound { .. })
-                );
-            }
-            if absent {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("healed replicas remove the tombstoned resource");
+    wait_for_host_resource_visibility(&hosts, name, false).await;
     drop(healed);
     let restarted = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart request runtimes");
     for host in &restarted.hosts {
@@ -672,11 +691,13 @@ async fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent
     }
 }
 
-#[hegel::test(seed = Some(236802))]
+#[hegel::test]
 fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
+    // Each drawn step authors and deletes a new record across either a cut
+    // peer session or a full-mesh runtime restart.
     let home_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let restart_before_delete = tc.draw(gs::booleans());
-    let step_count = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let step_count = tc.draw(gs::integers::<usize>().min_value(1).max_value(2));
     let transitions = (0..step_count).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
     runtime.block_on(async {
@@ -693,20 +714,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
             .create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default())
             .await
             .expect("create at home");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let mut visible = true;
-                for host in &hosts {
-                    visible &= host.resource_backend().including_replicas::<Host>("flotilla").get(name).await.is_ok();
-                }
-                if visible {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("resource visible before partition");
+        wait_for_host_resource_visibility(&hosts, name, true).await;
         if restart_before_delete {
             drop(mesh);
             mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
@@ -733,39 +741,61 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
         drop(isolated);
         drop(other_component);
         let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let mut absent = true;
-                for host in &hosts {
-                    absent &= matches!(
-                        host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
-                        Err(ResourceError::NotFound { .. })
-                    );
-                }
-                if absent {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("tombstone converges after heal");
-        for partition_again in transitions {
+        wait_for_host_resource_visibility(&hosts, name, false).await;
+        for (step, partition_again) in transitions.into_iter().enumerate() {
+            let step_name = format!("transition-step-{step}");
+            hosts[home_index]
+                .resource_backend()
+                .using::<Host>("flotilla")
+                .create(&InputMeta::builder().name(step_name.clone()).build(), &HostSpec::default())
+                .await
+                .expect("create next resource at home");
+            wait_for_host_resource_visibility(&hosts, &step_name, true).await;
             drop(mesh);
             if partition_again {
                 let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
                 let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
                 let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
+                let mut events = hosts[home_index].subscribe();
+                let id = isolated.clients[0]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("delete during repeated partition");
+                assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
                 drop(isolated);
                 drop(other_component);
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal repeated partition");
+            } else {
+                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart full mesh");
+                let mut events = hosts[home_index].subscribe();
+                let id = mesh.clients[home_index]
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ResourceDelete {
+                                namespace: "flotilla".into(),
+                                kind: "hosts".into(),
+                                name: step_name.clone(),
+                                replica_origin: None,
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("delete after restart");
+                let (node, result) = await_command_finished(&mut events, id).await;
+                assert_eq!(node, *hosts[home_index].node_id());
+                assert!(matches!(result, CommandValue::ResourceDeleted(_)));
             }
-            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal or restart");
-            for host in &hosts {
-                assert!(matches!(
-                    host.resource_backend().including_replicas::<Host>("flotilla").get(name).await,
-                    Err(ResourceError::NotFound { .. })
-                ));
-            }
+            wait_for_host_resource_visibility(&hosts, &step_name, false).await;
+            wait_for_host_resource_visibility(&hosts, name, false).await;
             assert_no_orphaned_finalizers(&hosts).await;
         }
         drop(mesh);
@@ -773,7 +803,9 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
 }
 
 #[test]
-fn generated_session_lookup_oracle_detects_local_only_fault() {
+fn generated_session_lookup_covers_remote_home_for_local_only_fault_model() {
+    // Generator coverage control: a local-only lookup fails for a drawn remote home.
+    // The request-level session rows exercise production routing separately.
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hegel::Hegel::new(|tc: hegel::TestCase| {
             let home = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
@@ -823,7 +855,9 @@ fn generated_session_lookup_oracle_detects_local_only_fault() {
 }
 
 #[test]
-fn generated_admission_oracle_detects_origin_before_placement_fault() {
+fn generated_admission_covers_remote_placement_for_origin_first_fault_model() {
+    // Generator coverage control: origin-first targeting differs from production
+    // placement targeting for a drawn remote issuer.
     let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hegel::Hegel::new(|tc: hegel::TestCase| {
             let placement_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
@@ -1018,9 +1052,8 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     convoy_task.abort();
 }
 
-#[hegel::test(seed = Some(2368))]
+#[hegel::test]
 fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
-    eprintln!("replay seed: HEGEL_SEED=2368");
     let placement_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let issuing_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
     let deleting_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));

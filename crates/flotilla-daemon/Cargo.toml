@@ -46,13 +46,13 @@ http = "1"
 libc = "0.2"
 
 [dev-dependencies]
-hegeltest = "=0.48.1"
 bytes = "1"
-http = "1"
-flotilla-test-support = { path = "../flotilla-test-support" }
-indexmap = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"] }
 flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }
+flotilla-test-support = { path = "../flotilla-test-support" }
+hegeltest = "=0.48.1"
+http = "1"
+indexmap = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }

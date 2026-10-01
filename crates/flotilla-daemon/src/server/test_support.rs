@@ -168,7 +168,7 @@ pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> R
             if ready {
                 return Ok::<(), String>(());
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
