@@ -338,7 +338,7 @@ mod tests {
     };
 
     fn parse_review_decision(value: &serde_json::Value) -> Option<ObservedReviewDecision> {
-        review_decision(value.as_array()?)
+        review_decision(value.as_array().expect("review array"))
     }
 
     struct MockHttp {
@@ -439,6 +439,11 @@ mod tests {
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_REVIEW"}
         ]);
         assert_eq!(parse_review_decision(&requested), Some(ObservedReviewDecision::Required));
+        let rerequested = serde_json::json!([
+            {"id": 1, "user": {"login": "alice"}, "state": "APPROVED"},
+            {"id": 2, "user": {"login": "alice"}, "state": "REQUEST_REVIEW"}
+        ]);
+        assert_eq!(parse_review_decision(&rerequested), Some(ObservedReviewDecision::Required));
         let changes = serde_json::json!([
             {"id": 1, "user": {"login": "alice"}, "state": "APPROVED"},
             {"id": 2, "user": {"login": "bob"}, "state": "REQUEST_CHANGES"}
@@ -477,7 +482,15 @@ mod tests {
             Some(ObservedReviewDecision::None)
         );
         assert_eq!(parse_review_decision(&serde_json::json!([{"id": 1, "user": {"login": "alice"}, "state": "NEW_STATE"}])), None);
-        assert_eq!(parse_review_decision(&serde_json::json!({"invalid": true})), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_review_body_is_rejected() {
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!({"invalid": true}))])),
+            urls: Mutex::new(Vec::new()),
+        });
+        assert!(provider(http).read_review_decision(7).await.expect_err("malformed reviews").contains("not an array"));
     }
 
     #[tokio::test]
