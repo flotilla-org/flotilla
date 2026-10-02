@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, command_timeout_message, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
     CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
@@ -88,13 +88,10 @@ impl CommandRunner for DockerEnvironmentRunner {
     ) -> Result<String, String> {
         let docker_args = self.docker_exec_args(cmd, args, cwd, false);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
-        self.inner.run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout).await.map_err(|error| {
-            if error == command_timeout_message("docker", timeout) {
-                command_timeout_message(cmd, timeout)
-            } else {
-                error
-            }
-        })
+        self.inner
+            .run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout)
+            .await
+            .map_err(|error| rename_command_timeout(error, "docker", cmd, timeout))
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {

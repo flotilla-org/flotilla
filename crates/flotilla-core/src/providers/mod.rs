@@ -375,6 +375,14 @@ pub(crate) fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
     format!("{cmd} timed out after {timeout:?}")
 }
 
+pub(crate) fn rename_command_timeout(error: String, from: &str, to: &str, timeout: Duration) -> String {
+    if error == command_timeout_message(from, timeout) {
+        command_timeout_message(to, timeout)
+    } else {
+        error
+    }
+}
+
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 

@@ -484,6 +484,7 @@ impl CommandRunner for ReplayRunner {
         label: &ChannelLabel,
         _timeout: std::time::Duration,
     ) -> Result<String, String> {
+        // Replay consumes the recorded outcome immediately, independent of wall time.
         self.run(cmd, args, cwd, label).await
     }
 

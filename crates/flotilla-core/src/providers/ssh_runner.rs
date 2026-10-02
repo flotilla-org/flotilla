@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, command_timeout_message, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
     CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
@@ -108,13 +108,10 @@ impl CommandRunner for SshCommandRunner {
     ) -> Result<String, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout).await.map_err(|error| {
-            if error == command_timeout_message("ssh", timeout) {
-                command_timeout_message(cmd, timeout)
-            } else {
-                error
-            }
-        })
+        self.runner
+            .run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout)
+            .await
+            .map_err(|error| rename_command_timeout(error, "ssh", cmd, timeout))
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
