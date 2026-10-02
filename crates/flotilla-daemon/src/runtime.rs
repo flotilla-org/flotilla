@@ -617,6 +617,8 @@ impl DaemonRuntime {
                 (Err(error), _) => warn!(%error, "could not list environments for Docker credential cache sweep"),
                 (_, Err(error)) => warn!(%error, "could not list running Docker backings for credential cache sweep"),
             }
+        } else if config.state_dir().as_path().join("credential-runtime").exists() {
+            warn!("Docker credential cache sweep deferred because Docker backing liveness is unavailable");
         }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
