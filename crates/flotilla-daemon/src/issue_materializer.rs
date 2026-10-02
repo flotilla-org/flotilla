@@ -35,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 const PAGE_SIZE: usize = 50;
 const MAX_CONCURRENT_SOURCES: usize = 8;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const GOVERNED_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const QUIET_VIEWED_INTERVAL: Duration = Duration::from_secs(120);
+const QUIET_GOVERNED_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_JITTER: Duration = Duration::from_secs(5);
 
 fn is_github_source(source: &IssueSource) -> bool {
@@ -150,6 +153,51 @@ struct SourceRefresh {
     cursors: StdMutex<HashMap<QueryId, DateTime<Utc>>>,
     last: Mutex<Option<SourceRefreshResult>>,
     pages: Mutex<Vec<SourcePage>>,
+    activity: StdMutex<SourceActivity>,
+}
+
+#[derive(Default)]
+struct SourceActivity {
+    quiet_polls: u32,
+    sampled_at: Option<tokio::time::Instant>,
+    demand: Option<SourceDemand>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceDemand {
+    Viewed,
+    Governed,
+}
+
+impl SourceRefresh {
+    // Explicit issue-query demand is a viewed source; implicit fleet-awareness
+    // windows are governed demand. A source uses the strongest live demand.
+    fn interval(&self, state: &AggregatorProjectionState) -> Duration {
+        let viewed = state.subscribed_queries();
+        let is_viewed = self.cursors.lock().expect("shared issue cursors lock poisoned").keys().any(|query| viewed.contains(query));
+        let (base, cap) =
+            if is_viewed { (REFRESH_INTERVAL, QUIET_VIEWED_INTERVAL) } else { (GOVERNED_REFRESH_INTERVAL, QUIET_GOVERNED_INTERVAL) };
+        let demand = if is_viewed { SourceDemand::Viewed } else { SourceDemand::Governed };
+        let mut activity = self.activity.lock().expect("source activity lock poisoned");
+        if demand == SourceDemand::Viewed && activity.demand == Some(SourceDemand::Governed) {
+            activity.quiet_polls = 0;
+        }
+        activity.demand = Some(demand);
+        base.saturating_mul(1 << activity.quiet_polls.min(4)).min(cap)
+    }
+
+    fn note_activity(&self, active: bool) {
+        let mut activity = self.activity.lock().expect("source activity lock poisoned");
+        if active {
+            activity.quiet_polls = 0;
+            activity.sampled_at = Some(tokio::time::Instant::now());
+        } else if activity.sampled_at.is_none_or(|sample| sample.elapsed() >= REFRESH_INTERVAL) {
+            // Several filtered windows can observe the same quiet source in one
+            // cycle. Count that cycle once rather than multiplying backoff.
+            activity.quiet_polls = activity.quiet_polls.saturating_add(1);
+            activity.sampled_at = Some(tokio::time::Instant::now());
+        }
+    }
 }
 
 #[derive(bon::Builder)]
@@ -158,6 +206,7 @@ struct SourcePage {
     page: u32,
     fetched_at: tokio::time::Instant,
     cursor: String,
+    interval: Duration,
     result: IssueResultPage,
 }
 
@@ -179,6 +228,7 @@ impl SharedIssueRefresh {
                     .cursors(StdMutex::new(HashMap::new()))
                     .last(Mutex::new(None))
                     .pages(Mutex::new(Vec::new()))
+                    .activity(StdMutex::new(SourceActivity::default()))
                     .build(),
             )
         });
@@ -192,6 +242,7 @@ impl SharedIssueRefresh {
         params: &IssueQuery,
         page: u32,
         provider: &Arc<dyn IssueProvider>,
+        state: &AggregatorProjectionState,
     ) -> Result<(String, IssueResultPage), String> {
         let entry = self
             .sources
@@ -210,9 +261,13 @@ impl SharedIssueRefresh {
         if replaced {
             pages.clear();
         }
-        pages.retain(|cached| cached.fetched_at.elapsed() < REFRESH_INTERVAL);
+        let interval = entry.interval(state);
+        pages.retain(|cached| {
+            (cached.params == *params && cached.page == page) || cached.fetched_at.elapsed() < cached.interval.min(interval)
+        });
+        let previous = pages.iter().find(|cached| cached.params == *params && cached.page == page).map(|cached| cached.result.clone());
         for cached in pages.iter() {
-            if cached.page != page {
+            if cached.page != page || cached.fetched_at.elapsed() >= cached.interval.min(interval) {
                 continue;
             }
             if cached.params == *params {
@@ -236,12 +291,26 @@ impl SharedIssueRefresh {
         }
         let cursor = Utc::now().to_rfc3339();
         let result = provider.query(source, params, page, PAGE_SIZE).await?;
+        if let Some(mut previous) = previous {
+            let mut current = result.clone();
+            // A fresh observation timestamp is not issue activity.
+            for item in previous.items.iter_mut().chain(current.items.iter_mut()) {
+                item.observed_at = None;
+            }
+            entry.note_activity(previous != current);
+        } else if page > 1 {
+            entry.note_activity(true);
+        } else {
+            entry.activity.lock().expect("source activity lock poisoned").sampled_at.get_or_insert_with(tokio::time::Instant::now);
+        }
+        pages.retain(|cached| cached.params != *params || cached.page != page);
         pages.push(
             SourcePage::builder()
                 .params(params.clone())
                 .page(page)
                 .fetched_at(tokio::time::Instant::now())
                 .cursor(cursor.clone())
+                .interval(entry.interval(state))
                 .result(result.clone())
                 .build(),
         );
@@ -282,6 +351,7 @@ impl SharedIssueRefresh {
         query: &QueryId,
         since: &str,
         resolver: &dyn IssueMaterializationResolver,
+        state: &AggregatorProjectionState,
     ) -> (String, Result<IssueChangeset, String>) {
         if is_github_source(source) {
             if let Some(message) = self.health.active_error() {
@@ -301,7 +371,7 @@ impl SharedIssueRefresh {
         };
         *entry.provider.lock().expect("source provider lock poisoned") = provider.clone();
         let mut last = entry.last.lock().await;
-        if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < REFRESH_INTERVAL) {
+        if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < entry.interval(state)) {
             if since_time >= cached.since {
                 if since_time >= cached.next_cursor {
                     return (since.to_string(), Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false }));
@@ -327,6 +397,9 @@ impl SharedIssueRefresh {
         let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
         let next_cursor = Utc::now();
         let result = provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
+        entry.note_activity(
+            result.as_ref().map_or(true, |changes| !changes.updated.is_empty() || !changes.closed.is_empty() || changes.has_more),
+        );
         // A new observation invalidates pages once; all query reloads caused by
         // that observation then share the replacement pages.
         entry.pages.lock().await.clear();
@@ -561,8 +634,10 @@ async fn load_window(
             // update that arrived during the request is not.
             let refresh_cursor = Utc::now().to_rfc3339();
             shared_refresh.register(&source, query, &refresh_cursor, &provider);
-            let (refresh_cursor, page) =
-                shared_refresh.page(&source, &params, 1, &provider).await.map_err(|message| unavailable(Some(source.clone()), message))?;
+            let (refresh_cursor, page) = shared_refresh
+                .page(&source, &params, 1, &provider, state)
+                .await
+                .map_err(|message| unavailable(Some(source.clone()), message))?;
             let rows = page.items.into_iter().map(issue_row).collect::<Vec<_>>();
             let source_rows = rows.iter().cloned().map(|row| (row.reference.clone(), row)).collect::<HashMap<_, _>>();
             let loaded_count = source_rows.len();
@@ -638,7 +713,7 @@ async fn fetch_more(
     let results = stream::iter(requests.into_iter().map(|(index, source, params, page)| async move {
         let result = async {
             let provider = resolver.issue_provider_for(&source).await?;
-            shared_refresh.page(&source, &params, page, &provider).await.map(|(_, result)| result)
+            shared_refresh.page(&source, &params, page, &provider, state).await.map(|(_, result)| result)
         }
         .await;
         (index, result)
@@ -715,7 +790,7 @@ async fn refresh_window(
         .map(|(index, source)| (index, source.source.clone(), source.refresh_cursor.clone()))
         .collect::<Vec<_>>();
     let results = stream::iter(requests.into_iter().map(|(index, source, since)| async move {
-        let (next_cursor, result) = shared_refresh.changed_since(&source, query, &since, resolver).await;
+        let (next_cursor, result) = shared_refresh.changed_since(&source, query, &since, resolver, state).await;
         (index, next_cursor, result)
     }))
     .buffer_unordered(MAX_CONCURRENT_SOURCES)
@@ -980,6 +1055,52 @@ mod tests {
     struct FixedResolver {
         sources: Vec<IssueSource>,
         provider: Arc<dyn IssueProvider>,
+    }
+
+    #[derive(Default)]
+    struct ActivityProvider {
+        polls: StdMutex<HashMap<String, usize>>,
+    }
+
+    #[async_trait]
+    impl IssueProvider for ActivityProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            let mut item = issue("1");
+            item.reference.source = source.clone();
+            Ok(IssueResultPage { items: vec![item], total: None, has_more: false })
+        }
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!()
+        }
+        async fn list_changed_since(&self, source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            *self.polls.lock().expect("polls").entry(source.scope.clone()).or_default() += 1;
+            let updated = if source.scope == "busy" {
+                let mut item = issue("2");
+                item.reference.source = source.clone();
+                item.as_of = Utc::now() + ChronoDuration::seconds(1);
+                vec![item]
+            } else {
+                vec![]
+            };
+            Ok(IssueChangeset { updated, closed: vec![], has_more: false })
+        }
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    struct ActivityResolver(Arc<ActivityProvider>);
+    #[async_trait]
+    impl IssueMaterializationResolver for ActivityResolver {
+        async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<ResolvedIssueSourceBinding>, String> {
+            Ok(vec![resolved_binding(IssueSource { service: "fake".into(), scope: scope.name.split('-').next().expect("source").into() })])
+        }
+        async fn issue_provider_for(&self, _source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
+            Ok(self.0.clone())
+        }
     }
 
     struct FilteredResolver {
@@ -1361,6 +1482,113 @@ mod tests {
         for query in [&first, &second] {
             assert_eq!(state.result_set_for(query).await.expect("window").rows.as_issues().expect("issues")[0].reference.id, "2");
         }
+    }
+
+    async fn next_issue_event(events: &mut broadcast::Receiver<DaemonEvent>, query: &QueryId) {
+        loop {
+            match next_event(events).await {
+                DaemonEvent::ResultSet(set) if &set.query() == query => return,
+                DaemonEvent::ResultDelta(delta) if &delta.query() == query => return,
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_view_preempts_governed_cadence_without_restarting_source_demand() {
+        let state = AggregatorProjectionState::new();
+        let scope = QueryScope::new("flotilla", "busy");
+        state.replace_store_catalog(HashMap::new(), HashMap::from([(scope.clone(), vec![])])).await;
+        let awareness = QueryId::Awareness { scope: None, grouping: Default::default(), limit: Default::default() };
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]);
+        let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
+        let provider = Arc::new(ActivityProvider::default());
+        let (event_tx, mut events) = broadcast::channel(32);
+        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        materializer.reconcile(state.subscribe_demand().borrow().clone());
+        next_issue_event(&mut events, &query).await;
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        next_issue_event(&mut events, &query).await;
+        assert_eq!(provider.polls.lock().expect("polls")["busy"], 1);
+        let viewer = Uuid::new_v4();
+        state.replace_subscriber(viewer, &[QueryCursor { query: query.clone(), since: None }]);
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        next_issue_event(&mut events, &query).await;
+        assert_eq!(provider.polls.lock().expect("polls")["busy"], 2, "viewed demand shortens the governed interval");
+        state.remove_subscriber(viewer);
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        next_issue_event(&mut events, &query).await;
+        assert_eq!(provider.polls.lock().expect("polls")["busy"], 2, "governed demand remains and resumes its longer cadence");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opening_a_quiet_governed_source_restores_prompt_viewed_polling() {
+        let state = AggregatorProjectionState::new();
+        let scope = QueryScope::new("flotilla", "quiet");
+        state.replace_store_catalog(HashMap::new(), HashMap::from([(scope.clone(), vec![])])).await;
+        let awareness = QueryId::Awareness { scope: None, grouping: Default::default(), limit: Default::default() };
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]);
+        let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
+        let provider = Arc::new(ActivityProvider::default());
+        let (event_tx, mut events) = broadcast::channel(32);
+        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        materializer.reconcile(state.subscribe_demand().borrow().clone());
+        next_issue_event(&mut events, &query).await;
+        for _ in 0..23 {
+            tokio::time::advance(REFRESH_INTERVAL).await;
+            next_issue_event(&mut events, &query).await;
+        }
+        assert_eq!(provider.polls.lock().expect("polls")["quiet"], 4, "governed silence reaches the five-minute cap");
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        next_issue_event(&mut events, &query).await;
+        assert_eq!(provider.polls.lock().expect("polls")["quiet"], 5, "a newly opened view resets quiet-source backoff");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_search_windows_adapt_their_reload_cadence() {
+        let state = AggregatorProjectionState::new();
+        let QueryId::Issues { scope, .. } = project_query("quiet-search") else { unreachable!() };
+        let query = QueryId::Issues { scope, search: Some("text".into()), label: None };
+        let provider = Arc::new(ScriptedProvider::new(std::iter::repeat_n(page(&["1"], false), 4).collect(), vec![]));
+        let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
+        let (_materializer, mut events) = manager(&state, &query, vec![source], provider.clone());
+        next_issue_event(&mut events, &query).await;
+        for _ in 0..3 {
+            tokio::time::advance(REFRESH_INTERVAL).await;
+            next_issue_event(&mut events, &query).await;
+        }
+        assert_eq!(provider.seen_queries.lock().await.len(), 3, "initial load and two due quiet reloads");
+        assert!(provider.seen_since.lock().await.is_empty(), "search filtering stays provider-side");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_viewed_sources_poll_more_often_and_alias_demand_shares_each_due_fetch() {
+        let state = AggregatorProjectionState::new();
+        let busy = project_query("busy");
+        let alias = project_query("busy-alias");
+        let quiet = project_query("quiet");
+        let provider = Arc::new(ActivityProvider::default());
+        let (event_tx, mut events) = broadcast::channel(32);
+        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        let demand = [&busy, &alias, &quiet].into_iter().map(|query| (query.clone(), subscribe(&state, query))).collect();
+        materializer.reconcile(demand);
+        for _ in 0..3 {
+            next_event(&mut events).await;
+        }
+        for _ in 0..3 {
+            tokio::time::advance(REFRESH_INTERVAL).await;
+            for _ in 0..3 {
+                next_event(&mut events).await;
+            }
+        }
+        let polls = provider.polls.lock().expect("polls").clone();
+        assert_eq!(polls["busy"], 3, "one poll per source despite two viewed queries");
+        assert_eq!(polls["quiet"], 2, "quiet source skips the middle interval");
+        materializer.reconcile(HashMap::new());
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(*provider.polls.lock().expect("polls"), polls, "no polling without demand");
     }
 
     #[tokio::test]
