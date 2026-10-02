@@ -41,6 +41,7 @@ use flotilla_core::{
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
+    vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
@@ -933,7 +934,7 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                             &*runner,
                             &root.path,
                             archive_sweep.retention_days,
-                            Duration::from_secs(5 * 60),
+                            REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
                         )
                         .await
                     };

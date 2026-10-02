@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -386,6 +387,11 @@ pub async fn prune_checkout_archives(runner: &dyn CommandRunner, archive_root: &
     Ok(())
 }
 
+/// Per-root remote sweep budget used by the hourly retention task.
+pub const REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REMOTE_ARCHIVE_KILL_GRACE: Duration = Duration::from_secs(5);
+const REMOTE_ARCHIVE_CLIENT_GRACE: Duration = Duration::from_secs(10);
+
 /// Bound a remote root's entire sweep in its execution environment. GNU
 /// `timeout` supervises the shell, find, and rm in one process group, including
 /// a hard kill if a child ignores TERM. A client deadline alone can orphan
@@ -394,20 +400,24 @@ pub async fn prune_remote_checkout_archives(
     runner: &dyn CommandRunner,
     archive_root: &Path,
     retention_days: u64,
-    deadline: std::time::Duration,
+    deadline: Duration,
 ) -> Result<(), String> {
+    if deadline.is_zero() {
+        return Err("remote archive sweep deadline must be positive; GNU timeout disables its deadline at zero".to_string());
+    }
     let root = archive_root.to_str().ok_or_else(|| "archive root is not UTF-8".to_string())?;
     let minutes = retention_days.saturating_mul(24 * 60).to_string();
     let seconds = format!("{}s", deadline.as_secs_f64());
+    let kill_after = format!("--kill-after={}s", REMOTE_ARCHIVE_KILL_GRACE.as_secs());
     let script = r#"[ -d "$1" ] || exit 0
 find "$1" ! -path "$1" -type d -prune -mmin "+$2" -exec rm -rf -- {} +"#;
     runner
         .run_with_timeout(
             "timeout",
-            &["--kill-after=5s", &seconds, "sh", "-c", script, "flotilla-archive-sweep", root, &minutes],
+            &[&kill_after, &seconds, "sh", "-c", script, "flotilla-archive-sweep", root, &minutes],
             Path::new("/"),
             &crate::providers::ChannelLabel::Default,
-            deadline + std::time::Duration::from_secs(10),
+            deadline + REMOTE_ARCHIVE_CLIENT_GRACE,
         )
         .await
         .map_err(|error| {
@@ -2190,6 +2200,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_archive_retention_rejects_a_deadline_that_disables_the_supervisor() {
+        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Ok(String::new()));
+        assert!(prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::ZERO).await.is_err());
+        assert!(runner.calls.lock().expect("calls").is_empty(), "GNU timeout treats zero as an unbounded operation");
+    }
+
+    #[tokio::test]
     async fn archive_retention_removes_expired_directories_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive_root = dir.path().join(".flotilla-archives");
@@ -2247,7 +2264,7 @@ mod tests {
             std::fs::write(
                 &shim,
                 format!(
-                    "#!/bin/sh\nprintf started > {}\nsleep 0.6\nprintf orphan > {}\n",
+                    "#!/bin/sh\nprintf started > {}\nsleep 2\nprintf orphan > {}\n",
                     flotilla_protocol::arg::shell_quote(started.to_str().expect("started path")),
                     flotilla_protocol::arg::shell_quote(marker.to_str().expect("marker path"))
                 ),
@@ -2257,9 +2274,9 @@ mod tests {
             let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
             assert!(std::process::Command::new("touch").args(["-t", &past]).arg(&old).status().expect("age archive").success());
             let runner = SshCommandRunner::new("loopback", false, Arc::new(LoopbackSshRunner(bin.clone())));
-            assert!(prune_remote_checkout_archives(&runner, &root, 14, std::time::Duration::from_millis(150)).await.is_err());
+            assert!(prune_remote_checkout_archives(&runner, &root, 14, Duration::from_secs(1)).await.is_err());
             assert!(started.exists(), "the {blocked_command} command must actually have started before cancellation");
-            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            tokio::time::sleep(Duration::from_millis(2200)).await;
             assert!(!marker.exists(), "timed-out {blocked_command} must not continue on the remote host");
             std::fs::remove_file(shim).expect("unblock commands");
             prune_remote_checkout_archives(&runner, &root, 14, std::time::Duration::from_secs(5)).await.expect("next sweep succeeds");
