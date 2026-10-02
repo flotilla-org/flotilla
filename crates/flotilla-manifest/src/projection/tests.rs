@@ -2018,7 +2018,14 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         if with_role && index == 0 {
             convoy.ensured_from = Some("ensure".into());
         }
-        convoys.push(convoy);
+        // Every generated linker has a twin on the other host origin. Their
+        // identical project must deduplicate rather than become ambiguity.
+        let mut twin = convoy.clone();
+        twin.resource.name = format!("peer-{index}");
+        twin.name = format!("peer-{index}");
+        twin.resource.host = if convoy.resource.host.is_some() { None } else { Some(HostName::new("kiwi")) };
+        twin.ensured_from = None;
+        convoys.extend([convoy, twin]);
     }
     let roles = if with_role && count > 0 {
         let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
@@ -2054,14 +2061,19 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         input.standing_roles = &roles;
         input.awareness = nodes;
         let patches = project_catalog(&input, &mint()).reassert_patches();
+        // Unlinked records are outside subject projection; awareness may
+        // independently publish the issue, but must not publish a request.
+        if count == 0 {
+            assert!(!patches
+                .iter()
+                .any(|patch| patch.target == MetadataTarget::Entity(entity::change_request("github", "org/repo", "42"))));
+            continue;
+        }
         for subject in &subjects {
             let target = match subject.kind {
                 SubjectKind::ChangeRequest => entity::change_request("github", "org/repo", "42"),
                 SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: "42".into() }),
             };
-            if count == 0 {
-                continue;
-            } // Unlinked records are outside subject projection.
             let actual = find_entity(&patches, &target).set.get(SEGMENT_PROJECT).map(|value| &value.value);
             let wanted = (expected.len() == 1).then(|| MetadataValue::text(expected.first().expect("unique project")));
             assert_eq!(actual, wanted.as_ref());

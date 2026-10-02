@@ -35,6 +35,16 @@ fn subject_entity(subject: &Subject) -> EntityRef {
     }
 }
 
+fn assert_subject(catalog: &mut Catalog, subject: &Subject, facts: Vec<(&'static str, MetadataValue)>) {
+    let target = subject_entity(subject);
+    // Subject links own this fact, including absence when ambiguous; an
+    // awareness entry must not leave an inherited project behind.
+    if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(target.clone())) {
+        prior.remove(SEGMENT_PROJECT);
+    }
+    catalog.assert_entity(target, facts, None);
+}
+
 fn forward_key(relationship: Relationship) -> &'static str {
     match relationship {
         Relationship::Produces => KEY_SUBJECT_PRODUCES,
@@ -265,13 +275,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         let mut facts = identity_facts(&subject);
         facts.extend(change_request_facts(status, landed.contains(&subject)));
-        // Subject links own this fact, including absence when ambiguous; an
-        // awareness entry must not leave an inherited project behind.
-        if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(subject_entity(&subject))) {
-            prior.remove(SEGMENT_PROJECT);
-        }
-
-        catalog.assert_entity(subject_entity(&subject), facts, None);
+        assert_subject(catalog, &subject, facts);
     }
     for record in &observations.issues {
         let subject = Subject {
@@ -290,12 +294,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             observe(&mut facts, KEY_ISSUE_ASSIGNEES, KEY_ISSUE_ASSIGNEES_OBSERVED_AT, &status.assignees);
             observe(&mut facts, KEY_ISSUE_UPDATED_AT, KEY_ISSUE_UPDATED_AT_OBSERVED_AT, &status.updated_at);
         }
-        // Subject links own this fact, including absence when ambiguous; an
-        // awareness entry must not leave an inherited project behind.
-        if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(subject_entity(&subject))) {
-            prior.remove(SEGMENT_PROJECT);
-        }
-        catalog.assert_entity(subject_entity(&subject), facts, None);
+        assert_subject(catalog, &subject, facts);
     }
 }
 

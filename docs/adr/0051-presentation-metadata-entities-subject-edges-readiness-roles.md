@@ -30,7 +30,7 @@ Meanwhile ADR 0049's **subjects** (since #2321, discovered at the convoy's home 
 Raw observed facts, each with its observation time so managers can show staleness:
 - **`change_request`:**
   - identity: `scope` and `number`, an edge to its **forge** entity, and the short form `repo!n`;
-  - `flotilla.project`: Text project entity id when linking convoys and roles identify exactly one project; absent when ambiguous;
+  - `flotilla.project`: Text project entity id when linking convoys and roles identify exactly one project; absent when ambiguous (including disagreement between a standing role and its current convoy);
   - **title**;
   - state (open, draft, merged, closed);
   - checks (pass, fail, pending), mergeability, head SHA;
@@ -38,7 +38,7 @@ Raw observed facts, each with its observation time so managers can show stalenes
   - **author**, and whether review is requested from the owner.
 - **`issue`:**
   - identity: `scope` and `number`, an edge to its **forge** entity, and the short form `repo#n`;
-  - `flotilla.project`: Text project entity id when linking convoys and roles identify exactly one project; absent when ambiguous;
+  - `flotilla.project`: Text project entity id when linking convoys and roles identify exactly one project; absent when ambiguous (including disagreement between a standing role and its current convoy);
   - **title**;
   - state;
   - labels (including triage state);
