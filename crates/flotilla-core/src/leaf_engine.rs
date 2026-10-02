@@ -1516,7 +1516,8 @@ impl ReconcilerWake {
                                     Err(error) => {
                                         tracing::warn!(
                                             convoy = %convoy.metadata.name,
-                                            target = %format!("{role}@{vessel}"),
+                                            target = %role,
+                                            %vessel,
                                             reason = %error,
                                             "stall nudge fell back to operator"
                                         );
@@ -1681,7 +1682,9 @@ impl ReconcilerWake {
                                     {
                                         tracing::warn!(
                                             convoy = %convoy.metadata.name,
-                                            target = %format!("{target_role}@{target_vessel}/{target_convoy}"),
+                                            target = %target_convoy,
+                                            %target_vessel,
+                                            %target_role,
                                             reason = %error,
                                             "stall escalation fell back to operator"
                                         );
@@ -3144,18 +3147,34 @@ mod tests {
             .expect("set owned attempt");
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum GovernorUnavailable {
+        DeliveryError,
+        NoLiveGeneration,
+        CrewMissing,
+    }
+
+    impl GovernorUnavailable {
+        const ALL: [Self; 3] = [Self::DeliveryError, Self::NoLiveGeneration, Self::CrewMissing];
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FallbackRecord {
+        Current,
+        LegacyExhausted,
+    }
+
     // #2488: unavailable delivery, missing live convoy, and missing crew must recover
     // in one pass once reachable. Repeated reconciliation must neither freeze nor duplicate delivery.
-    async fn unavailable_governor_scenario(unavailable: u8, restarts: &[bool], legacy: bool) {
+    async fn unavailable_governor_scenario(unavailable: GovernorUnavailable, restarts: &[bool], record: FallbackRecord) {
         let (backend, mut wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
         let convoys = backend.using::<Convoy>("flotilla");
         let governor = convoys.get("governor").await.expect("governor");
         let mut unavailable_status = governor.status.clone().expect("status");
         match unavailable {
-            0 => delivery.unavailable.store(true, Ordering::SeqCst),
-            1 => unavailable_status.phase = ConvoyPhase::Abandoned,
-            2 => unavailable_status.crew_work.clear(),
-            _ => unreachable!(),
+            GovernorUnavailable::DeliveryError => delivery.unavailable.store(true, Ordering::SeqCst),
+            GovernorUnavailable::NoLiveGeneration => unavailable_status.phase = ConvoyPhase::Abandoned,
+            GovernorUnavailable::CrewMissing => unavailable_status.crew_work.clear(),
         }
         convoys.update_status("governor", &governor.metadata.resource_version, &unavailable_status).await.expect("unavailable");
         let now = Utc::now();
@@ -3173,14 +3192,21 @@ mod tests {
             assert!(stalled.supervisor.is_none());
             assert!(stalled.evidence.starts_with("needs decision"));
             assert_eq!(
-                stalled.evidence.matches(if unavailable == 0 { "supervisor delivery failed" } else { "no live governor" }).count(),
+                stalled
+                    .evidence
+                    .matches(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
+                        "supervisor delivery failed"
+                    } else {
+                        "no live governor"
+                    })
+                    .count(),
                 1
             );
             assert!(delivery.requests.lock().expect("deliveries").is_empty());
         }
         let fallback = convoys.get("stalled-work").await.expect("source");
         let began_at = fallback.status.as_ref().expect("status").stalled.as_ref().expect("stall").began_at;
-        if legacy {
+        if matches!(record, FallbackRecord::LegacyExhausted) {
             // Previous generation persisted temporary unavailability as exhausted.
             let mut status = fallback.status.expect("status");
             status.stalled.as_mut().expect("stall").supervision_exhausted = true;
@@ -3188,8 +3214,8 @@ mod tests {
             wake = supervision_wake(&backend);
             wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
         }
-        let reachable_name = if unavailable == 1 { "governor-ready" } else { "governor" };
-        let current = if unavailable == 1 {
+        let reachable_name = if matches!(unavailable, GovernorUnavailable::NoLiveGeneration) { "governor-ready" } else { "governor" };
+        let current = if matches!(unavailable, GovernorUnavailable::NoLiveGeneration) {
             // An abandoned generation stays terminal. Startup eventually reveals
             // a new live generation rather than resurrecting the old one.
             let mut spec = governor.spec.clone();
@@ -3209,7 +3235,7 @@ mod tests {
             wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
             wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge reachable governor");
             let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
-            assert_eq!(stalled.rung, StallRung::Governor, "unavailability mode {unavailable}");
+            assert_eq!(stalled.rung, StallRung::Governor, "unavailability {unavailable:?}");
             assert_eq!(stalled.began_at, began_at);
             assert_eq!(stalled.supervisor.expect("supervisor").convoy, reachable_name);
             assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
@@ -3218,9 +3244,9 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_governor_recovers_in_one_pass() {
-        for unavailable in 0..3 {
-            unavailable_governor_scenario(unavailable, &[false, true], false).await;
-            unavailable_governor_scenario(unavailable, &[true], true).await;
+        for unavailable in GovernorUnavailable::ALL {
+            unavailable_governor_scenario(unavailable, &[false, true], FallbackRecord::Current).await;
+            unavailable_governor_scenario(unavailable, &[true], FallbackRecord::LegacyExhausted).await;
         }
     }
 
@@ -3327,7 +3353,7 @@ mod tests {
                 Ok(())
             }
         }
-        for unavailable in 0..3 {
+        for unavailable in GovernorUnavailable::ALL {
             let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
             let writer = LogWriter(logs.clone());
             let subscriber = tracing_subscriber::fmt()
@@ -3338,7 +3364,7 @@ mod tests {
                 .finish();
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
             tracing::subscriber::with_default(subscriber, || {
-                runtime.block_on(unavailable_governor_scenario(unavailable, &[false, true], false));
+                runtime.block_on(unavailable_governor_scenario(unavailable, &[false, true], FallbackRecord::Current));
             });
             let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
             let warnings = text.lines().collect::<Vec<_>>();
@@ -3349,7 +3375,11 @@ mod tests {
                 assert!(warning.contains("target="), "{warning}");
                 assert!(warning.contains("reason="), "{warning}");
                 assert!(
-                    warning.contains(if unavailable == 0 { "supervisor reconnecting" } else { "no live supervisor found" }),
+                    warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
+                        "supervisor reconnecting"
+                    } else {
+                        "no live supervisor found"
+                    }),
                     "{warning}"
                 );
             }
@@ -3361,12 +3391,13 @@ mod tests {
     #[hegel::test]
     fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let unavailable = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let unavailable =
+            GovernorUnavailable::ALL[tc.draw(gs::integers::<usize>().min_value(0).max_value(GovernorUnavailable::ALL.len() - 1))];
         let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
         let restarts = (0..steps).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
-        let legacy = tc.draw(gs::booleans());
+        let record = if tc.draw(gs::booleans()) { FallbackRecord::LegacyExhausted } else { FallbackRecord::Current };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        runtime.block_on(unavailable_governor_scenario(unavailable, &restarts, legacy));
+        runtime.block_on(unavailable_governor_scenario(unavailable, &restarts, record));
     }
 
     #[tokio::test]
