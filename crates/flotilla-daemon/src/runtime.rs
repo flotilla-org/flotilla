@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -61,7 +62,7 @@ use flotilla_resources::{
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -782,6 +783,7 @@ impl DaemonRuntime {
                     local_repo_root,
                     profile.host_direct_environment_name(),
                 )
+                .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(credential_store)
@@ -1303,6 +1305,8 @@ struct ControllerRuntimeState {
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
     archive_catalog_lock: Mutex<()>,
+    checkout_removal_concurrency: NonZeroUsize,
+    checkout_removals: Semaphore,
 }
 
 /// Cargo invokes this with the rustc path as its first argument. Keeping the
@@ -1491,7 +1495,15 @@ impl ControllerRuntimeState {
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
             archive_catalog_lock: Mutex::new(()),
+            checkout_removal_concurrency: NonZeroUsize::new(2).expect("positive default removal limit"),
+            checkout_removals: Semaphore::new(2),
         }
+    }
+
+    fn with_checkout_removal_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
+        self.checkout_removal_concurrency = concurrency;
+        self.checkout_removals = Semaphore::new(concurrency.get());
+        self
     }
 
     async fn register_checkout_archive_roots(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<(), String> {
@@ -3852,6 +3864,7 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let state = Arc::clone(&state);
+                let removal_concurrency = state.checkout_removal_concurrency;
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
                     CheckoutReconciler::new(
@@ -3862,6 +3875,7 @@ fn spawn_controller_loops(
                         backend.clone(),
                         &namespace_string,
                     )
+                    .with_background_removal_limit(removal_concurrency)
                     .with_federated_convoys(&backend, &namespace_string),
                 )
             }
@@ -4895,6 +4909,10 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        // Shared by every namespace and execution environment on this daemon.
+        // Hold capacity through archive creation and every deletion in the
+        // removal, releasing it on success, failure, or cancellation.
+        let _permit = self.state.checkout_removals.acquire().await.map_err(|error| error.to_string())?;
         if let Err(error) = self.state.register_checkout_archive_roots(env_ref, removal).await {
             warn!(%error, "could not record checkout archive root for retention sweep");
         }
@@ -6698,6 +6716,82 @@ mod tests {
     }
 
     struct NoPrProcessRunner;
+
+    #[tokio::test]
+    async fn checkout_removals_queue_across_environments_and_release_capacity() {
+        struct GatedRemovalRunner {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl CommandRunner for GatedRemovalRunner {
+            async fn run(&self, cmd: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if cmd == "rm" {
+                    self.started.send(()).expect("removal observer");
+                    self.release.acquire().await.expect("removal gate").forget();
+                    Ok(String::new())
+                } else {
+                    Err(format!("command unavailable: {cmd}"))
+                }
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false })
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        for concurrency in [1, 2, 3] {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("daemon.toml"), "machine_id = \"removal-queue-test\"\n").expect("daemon config");
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+            let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let runner = Arc::new(GatedRemovalRunner { started, release: tokio::sync::Semaphore::new(0) });
+            for env in ["teardown-a", "teardown-b"] {
+                daemon
+                    .register_direct_environment_for_test(
+                        EnvironmentId::new(env),
+                        runner.clone(),
+                        EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
+                        None,
+                    )
+                    .expect("register environment");
+            }
+            let state = ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), None, "local-env".into());
+            let state = Arc::new(if concurrency == 2 {
+                state
+            } else {
+                state.with_checkout_removal_concurrency(NonZeroUsize::new(concurrency).expect("positive limit"))
+            });
+            let removal = CheckoutRemoval::OrphanedWorktree { target_path: "/checkouts/queued".into() };
+            let runtime = RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None };
+            assert!(runtime.remove_checkout_in("missing-environment", &removal).await.is_err(), "failed removals release capacity");
+            let mut tasks = Vec::new();
+            for index in 0..=concurrency {
+                let env = if index % 2 == 0 { "teardown-a" } else { "teardown-b" };
+                let runtime = RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None };
+                let removal = removal.clone();
+                tasks.push(tokio::spawn(async move { runtime.remove_checkout_in(env, &removal).await }));
+            }
+            for _ in 0..concurrency {
+                tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .expect("admitted removals start")
+                    .expect("observer open");
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(200), observed.recv()).await.is_err(), "excess removal must queue");
+            runner.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .expect("queued removal starts after capacity is released")
+                .expect("observer open");
+            runner.release.add_permits(concurrency);
+            for task in tasks {
+                assert_eq!(task.await.expect("removal task").expect("removal succeeds"), CheckoutRemovalOutcome::Removed);
+            }
+        }
+    }
 
     struct SshProvisioningRecordingRunner {
         commands: Arc<StdMutex<Vec<String>>>,
@@ -9051,7 +9145,9 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repository() {
-        let temp = TempDir::new().expect("tempdir");
+        // This scenario requires a non-repository parent. A repo-local TMPDIR
+        // otherwise lets Git discover the vessel checkout above the fixture.
+        let temp = TempDir::new_in("/tmp").expect("isolated non-repository tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
         TestGitRepo::init(target.join("embedded")).with_initial_commit();

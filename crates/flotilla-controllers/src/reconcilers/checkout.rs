@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,7 +18,6 @@ use tracing::warn;
 
 const CHECKOUT_INTEGRATION_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
-const MAX_BACKGROUND_CHECKOUT_ARCHIVES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
@@ -119,6 +118,7 @@ pub struct CheckoutReconciler<R> {
     clock: Arc<dyn Clock>,
     backend: ResourceBackend,
     finalizers: Mutex<BTreeMap<String, JoinHandle<Result<CheckoutRemovalOutcome, String>>>>,
+    background_removal_limit: NonZeroUsize,
 }
 
 impl<R> CheckoutReconciler<R> {
@@ -145,7 +145,14 @@ impl<R> CheckoutReconciler<R> {
             clock,
             backend: backend.clone(),
             finalizers: Mutex::new(BTreeMap::new()),
+            background_removal_limit: NonZeroUsize::new(2).expect("positive background removal limit"),
         }
+    }
+
+    /// Bound background task admission as well as the runtime's active removals.
+    pub fn with_background_removal_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.background_removal_limit = limit;
+        self
     }
 
     async fn observe_clone_retry(
@@ -513,7 +520,7 @@ where
                 }
                 Some(_) => return Err(ResourceError::FinalizerPending),
                 None => {
-                    if finalizers.len() >= MAX_BACKGROUND_CHECKOUT_ARCHIVES {
+                    if finalizers.len() >= self.background_removal_limit.get() {
                         return Err(ResourceError::FinalizerPending);
                     }
                     let runtime = Arc::clone(&self.runtime);

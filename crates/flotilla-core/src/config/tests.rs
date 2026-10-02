@@ -395,6 +395,20 @@ fn load_daemon_config_from_file() {
 }
 
 #[test]
+fn checkout_removal_concurrency_defaults_to_two_and_accepts_positive_limits() {
+    for (text, expected) in [("", 2), ("checkout_removal_concurrency = 1", 1), ("checkout_removal_concurrency = 3", 3)] {
+        let config: DaemonConfig = toml::from_str(text).expect("valid daemon config");
+        let stored = serde_json::to_value(config).expect("serialize config");
+        assert_eq!(stored["checkout_removal_concurrency"], expected);
+    }
+    assert!(toml::from_str::<DaemonConfig>("checkout_removal_concurrency = 0").is_err(), "zero must not deadlock removals");
+    assert!(
+        toml::from_str::<DaemonConfig>(&format!("checkout_removal_concurrency = {}", tokio::sync::Semaphore::MAX_PERMITS + 1)).is_err(),
+        "oversized limits must not panic at daemon startup"
+    );
+}
+
+#[test]
 fn load_daemon_manifest_directory() {
     let dir = tempdir().unwrap();
     std::fs::write(
