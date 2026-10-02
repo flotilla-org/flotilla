@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use flotilla_resources::{
-    DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta,
-    PlacementPolicySpec, ResourceBackend, SqliteBackend,
+    DockerCheckoutStrategy, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, FulfilmentCostClass, FulfilmentGrant,
+    FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    InMemoryBackend, InputMeta, PlacementPolicySpec, ResourceBackend, SqliteBackend,
 };
 
 async fn contract(backend: ResourceBackend) {
@@ -63,4 +63,20 @@ fn live_policy_set_migrates_to_kinds() {
     assert!(kind.grants.contains(&FulfilmentGrant::HostAccountReach));
     assert!(kind.grants.contains(&FulfilmentGrant::Platform("macos".to_string())));
     assert!(kind.grants.contains(&FulfilmentGrant::GuiSession));
+}
+
+#[test]
+fn cost_class_names_match_their_serialized_form() {
+    // Adding a variant breaks this match; add it to `FulfilmentCostClass::ALL` too.
+    let position = |class: FulfilmentCostClass| match class {
+        FulfilmentCostClass::OwnedIdle => 0,
+        FulfilmentCostClass::SubscriptionIncluded => 1,
+        FulfilmentCostClass::Metered => 2,
+    };
+    for (index, class) in FulfilmentCostClass::ALL.into_iter().enumerate() {
+        assert_eq!(position(class), index, "{class} is listed out of place");
+        assert_eq!(serde_json::to_value(class).expect("serialize cost class"), serde_json::json!(class.as_str()));
+        assert_eq!(serde_json::from_value::<FulfilmentCostClass>(serde_json::json!(class.as_str())).expect("decode cost class"), class);
+        assert_eq!(class.to_string(), class.as_str());
+    }
 }

@@ -569,7 +569,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
 #[test]
 fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
     let now = chrono::Utc::now();
-    for platform in ["macos", "windows"] {
+    for platform in flotilla_resources::Platform::ALL {
         let kind = ResourceObject::<FulfilmentKind> {
             metadata: flotilla_resources::ObjectMeta {
                 name: platform.to_string(),
@@ -604,7 +604,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
             sleeping_until: None,
         };
         let no_need = BTreeSet::new();
-        assert!(PlacementTieBreak { needs: &no_need, now }.reserved(&candidate));
+        assert_eq!(PlacementTieBreak { needs: &no_need, now }.reserved(&candidate), platform.is_reserved(), "{platform}");
         let named = BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]);
         assert!(!PlacementTieBreak { needs: &named, now }.reserved(&candidate));
     }

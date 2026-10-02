@@ -62,10 +62,10 @@ use flotilla_resources::{
     ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
     CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
     DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
-    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
+    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec, Platform,
     Presentation as ResourcePresentation, Project, ProjectSpec, ReadResourceObject, ReplicaReadResolver, Repository, RepositoryIdentity,
     RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject,
     ResourceProvenance, RetryBackoff, RoleHandoff, SupervisionTarget, SystemClock, TerminalAttentionState, TerminalBrief,
@@ -927,7 +927,7 @@ async fn validate_docker_placement_host(
             policy.metadata.name, target.display_name
         ));
     }
-    if capabilities.and_then(|capabilities| capabilities.get("os")).and_then(serde_json::Value::as_str) != Some("linux") {
+    if capabilities.and_then(|capabilities| capabilities.get("os")).and_then(serde_json::Value::as_str) != Some(Platform::Linux.as_str()) {
         return Err(format!(
             "placement `{}` host `{}` is missing Linux host capability required for daemon-adjacent injection",
             policy.metadata.name, target.display_name

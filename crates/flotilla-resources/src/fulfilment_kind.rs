@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     resource::define_resource, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicySpec, NoStatusPatch, PlacementPolicySpec,
-    ReplicationClass,
+    Platform, ReplicationClass,
 };
 
 // A1 keeps policy snapshots for already admitted convoys. Kinds are authored
@@ -59,7 +59,7 @@ impl FromStr for CapabilityNeed {
             "container_runtime" => Ok(Self::ContainerRuntime),
             _ if parameter("platform:").is_some() => {
                 let platform = parameter("platform:").expect("checked above");
-                if !matches!(platform.as_str(), "linux" | "macos" | "windows" | "$matrix") {
+                if platform != Platform::MATRIX_PLACEHOLDER && platform.parse::<Platform>().is_err() {
                     return Err(format!("unknown platform capability `{platform}`"));
                 }
                 Ok(Self::Platform(platform))
@@ -109,6 +109,11 @@ impl<'de> Deserialize<'de> for CapabilityNeed {
 }
 
 impl CapabilityNeed {
+    /// The role need that admission expands over the Project's platform matrix.
+    pub fn matrix_placeholder() -> Self {
+        Self::Platform(Platform::MATRIX_PLACEHOLDER.to_string())
+    }
+
     pub fn covered_by(&self, grants: &BTreeSet<FulfilmentGrant>, facts: Option<&crate::FulfilmentFacts>) -> bool {
         match self {
             Self::Platform(value) => grants.contains(&FulfilmentGrant::Platform(value.clone())),
@@ -175,6 +180,26 @@ pub enum FulfilmentCostClass {
     Metered,
 }
 
+impl FulfilmentCostClass {
+    pub const ALL: [Self; 3] = [Self::OwnedIdle, Self::SubscriptionIncluded, Self::Metered];
+
+    /// The serialized name, which `convoy explain` also displays. A contract
+    /// test keeps it equal to serde's `snake_case` name for every variant.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnedIdle => "owned_idle",
+            Self::SubscriptionIncluded => "subscription_included",
+            Self::Metered => "metered",
+        }
+    }
+}
+
+impl fmt::Display for FulfilmentCostClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "realisation", rename_all = "snake_case")]
 pub enum FulfilmentRealisation {
@@ -188,8 +213,10 @@ impl FulfilmentKindSpec {
     pub fn from_policy(policy: &PlacementPolicySpec, host_platform: &str) -> Result<Self, String> {
         let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct) {
             (Some(DockerPerVesselPlacementPolicySpec { host_ref, image, .. }), None) => {
-                let grants =
-                    BTreeSet::from([FulfilmentGrant::Platform("linux".to_string()), FulfilmentGrant::Network("scoped".to_string())]);
+                let grants = BTreeSet::from([
+                    FulfilmentGrant::Platform(Platform::Linux.to_string()),
+                    FulfilmentGrant::Network("scoped".to_string()),
+                ]);
                 (host_ref.clone(), FulfilmentRealisation::DockerPerVessel { image: image.clone() }, grants)
             }
             (None, Some(HostDirectPlacementPolicySpec { host_ref, .. })) => {

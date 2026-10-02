@@ -51,7 +51,7 @@ use flotilla_resources::{
     EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec,
-    Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
+    Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
     ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
     VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
@@ -1151,14 +1151,14 @@ async fn agentless_platform(runner: &dyn CommandRunner) -> String {
     let uname = tokio::time::timeout(Duration::from_secs(15), runner.run("uname", &["-s"], Path::new("/"), &ChannelLabel::Default)).await;
     match uname {
         Ok(Ok(output)) => match output.trim() {
-            "Darwin" => "macos".to_string(),
-            "Linux" => "linux".to_string(),
+            "Darwin" => Platform::Macos.to_string(),
+            "Linux" => Platform::Linux.to_string(),
             other => other.to_ascii_lowercase(),
         },
         _ => match tokio::time::timeout(Duration::from_secs(15), runner.run("cmd", &["/c", "ver"], Path::new("/"), &ChannelLabel::Default))
             .await
         {
-            Ok(Ok(output)) if output.contains("Windows") => "windows".to_string(),
+            Ok(Ok(output)) if output.contains("Windows") => Platform::Windows.to_string(),
             _ => "unknown".to_string(),
         },
     }

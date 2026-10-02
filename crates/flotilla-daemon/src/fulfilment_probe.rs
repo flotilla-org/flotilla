@@ -4,7 +4,7 @@ use chrono::Utc;
 use flotilla_core::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
 use flotilla_resources::{
     CachedModelProbe, FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact,
-    ModelFactSource, ModelProbeState,
+    ModelFactSource, ModelProbeState, Platform,
 };
 use sha2::{Digest, Sha256};
 
@@ -182,7 +182,7 @@ pub(crate) async fn probe_kind(
     }
     if matches!(spec.realisation, FulfilmentRealisation::HostDirect) {
         facts.gui_session_logged_in = env.get("DISPLAY").is_some() || env.get("WAYLAND_DISPLAY").is_some();
-        if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::Platform("macos".to_string())) {
+        if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::Platform(Platform::Macos.to_string())) {
             // Aqua does not advertise a display variable. A logged-in user's
             // launchd GUI domain is the host-native signal for that session.
             if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, "id", &["-u"], scratch).await {
