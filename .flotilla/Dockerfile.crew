@@ -31,7 +31,7 @@ RUN case "${TARGETARCH}" in \
 
 # Builder stage: generate xterm-ghostty terminfo from cleat's pinned source.
 FROM zig-toolchain AS ghostty-builder
-ARG CLEAT_REF=2f154566eb0e5ea3e70abbda2327f211ea183c2b
+ARG CLEAT_REF=e233d6d244da0ba495858582c9364ad062572159
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git build-essential ncurses-bin \
     && rm -rf /var/lib/apt/lists/*
@@ -185,8 +185,8 @@ ENV CARGO_HOME=/tmp/flotilla-config/cargo
 ENV PATH="/tmp/flotilla-config/cargo/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # 4. Agent adapters. Keep this fastest-moving layer last.
-ARG CLAUDE_CODE_VERSION=2.1.280
-ARG CODEX_VERSION=0.156.1
+ARG CLAUDE_CODE_VERSION=2.1.287
+ARG CODEX_VERSION=0.160.0
 
 RUN npm install --global \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
