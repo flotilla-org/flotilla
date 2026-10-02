@@ -7,14 +7,78 @@ use flotilla_resources::{
     ChangeRequest, Forge, Issue, K8sResourceObject, Project, Repository, RepositoryIdentity, Resource, ResourceObject,
 };
 use serde_json::Value;
+use tracing::warn;
 
 pub(super) const KINDS: &[&str] = &["changerequests", "issues", "forges", "repositories", "projects"];
+
+// Decode at admission, retaining typed records so projection cannot panic
+// while trying to decode an already accepted JSON value again.
+enum SubjectRecord {
+    ChangeRequest(ResourceObject<ChangeRequest>),
+    Issue(ResourceObject<Issue>),
+    Forge(ResourceObject<Forge>),
+    Repository(ResourceObject<Repository>),
+    Project(ResourceObject<Project>),
+}
+impl SubjectRecord {
+    fn observed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::ChangeRequest(record) => record.status.as_ref().and_then(|status| {
+                [
+                    status.title.observed_at,
+                    status.author.observed_at,
+                    status.state.observed_at,
+                    status.head_sha.observed_at,
+                    status.checks.observed_at,
+                    status.mergeable.observed_at,
+                    status.review.actionable_at_head.observed_at,
+                    status.review_decision.observed_at,
+                    status.review_requested_from_owner.observed_at,
+                ]
+                .into_iter()
+                .max()
+            }),
+            Self::Issue(record) => record.status.as_ref().and_then(|status| {
+                [
+                    status.title.observed_at,
+                    status.state.observed_at,
+                    status.labels.observed_at,
+                    status.assignees.observed_at,
+                    status.updated_at.observed_at,
+                ]
+                .into_iter()
+                .max()
+            }),
+            _ => None,
+        }
+    }
+}
+trait RecordType: Resource + Clone {
+    fn from_record(record: &SubjectRecord) -> Option<&ResourceObject<Self>>;
+}
+macro_rules! record_type {
+    ($type:ty, $variant:ident) => {
+        impl RecordType for $type {
+            fn from_record(record: &SubjectRecord) -> Option<&ResourceObject<Self>> {
+                match record {
+                    SubjectRecord::$variant(object) => Some(object),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+record_type!(ChangeRequest, ChangeRequest);
+record_type!(Issue, Issue);
+record_type!(Forge, Forge);
+record_type!(Repository, Repository);
+record_type!(Project, Project);
 
 #[derive(Default)]
 pub(super) struct Records {
     // Retain each source separately: deleting one replica must not erase the
     // same observation still held by another root.
-    objects: BTreeMap<(String, String, String, String), Value>,
+    objects: BTreeMap<(String, String, String, String), SubjectRecord>,
 }
 
 fn decode<T: Resource>(value: &Value) -> Result<ResourceObject<T>, String> {
@@ -24,7 +88,9 @@ fn decode<T: Resource>(value: &Value) -> Result<ResourceObject<T>, String> {
 
 impl Records {
     pub(super) fn apply(&mut self, envelope: &ResourceReadEnvelope) -> Result<(), String> {
-        let mut updates = Vec::new();
+        if !KINDS.contains(&envelope.plural.as_str()) {
+            return Err(format!("unexpected subject catalog resource {}", envelope.plural));
+        }
         for record in &envelope.records {
             if record.record_type == ResourceRecordType::Bookmark {
                 continue;
@@ -34,66 +100,53 @@ impl Records {
                 ResourceRecordProvenance::Local { node_id } => node_id.to_string(),
                 ResourceRecordProvenance::Replica { origin_root, .. } => origin_root.to_string(),
             };
+            let Some(name) = object.pointer("/metadata/name").and_then(Value::as_str) else {
+                warn!(kind = %envelope.plural, "ignoring subject resource without a name");
+                continue;
+            };
+            let namespace = object.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or(&envelope.namespace);
+            let key = (envelope.plural.clone(), namespace.to_owned(), name.to_owned(), root);
             if record.record_type == ResourceRecordType::Deleted {
-                let name = object.pointer("/metadata/name").and_then(Value::as_str).ok_or("resource tombstone has no name")?;
-                let namespace = object.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or(&envelope.namespace);
-                updates.push(((envelope.plural.clone(), namespace.to_owned(), name.to_owned(), root), record.record_type, object.clone()));
+                self.objects.remove(&key);
                 continue;
             }
-            let (namespace, name) = match envelope.plural.as_str() {
-                "changerequests" => {
-                    let object = decode::<ChangeRequest>(object)?;
-                    (object.metadata.namespace, object.metadata.name)
-                }
-                "issues" => {
-                    let object = decode::<Issue>(object)?;
-                    (object.metadata.namespace, object.metadata.name)
-                }
-                "forges" => {
-                    let object = decode::<Forge>(object)?;
-                    (object.metadata.namespace, object.metadata.name)
-                }
-                "repositories" => {
-                    let object = decode::<Repository>(object)?;
-                    (object.metadata.namespace, object.metadata.name)
-                }
-                "projects" => {
-                    let object = decode::<Project>(object)?;
-                    (object.metadata.namespace, object.metadata.name)
-                }
-                _ => return Err(format!("unexpected subject catalog resource {}", envelope.plural)),
+            let decoded = match envelope.plural.as_str() {
+                "changerequests" => decode::<ChangeRequest>(object).map(SubjectRecord::ChangeRequest),
+                "issues" => decode::<Issue>(object).map(SubjectRecord::Issue),
+                "forges" => decode::<Forge>(object).map(SubjectRecord::Forge),
+                "repositories" => decode::<Repository>(object).map(SubjectRecord::Repository),
+                "projects" => decode::<Project>(object).map(SubjectRecord::Project),
+                _ => Err(format!("unexpected subject catalog resource {}", envelope.plural)),
             };
-
-            updates.push(((envelope.plural.clone(), namespace, name, root), record.record_type, object.clone()));
-        }
-        for (key, kind, object) in updates {
-            match kind {
-                ResourceRecordType::Deleted => {
-                    self.objects.remove(&key);
-                }
-                ResourceRecordType::Bookmark => {}
-                _ => {
+            match decoded {
+                Ok(object) => {
                     self.objects.insert(key, object);
+                }
+                Err(error) => {
+                    warn!(kind = %envelope.plural, %name, %error, "ignoring undecodable subject resource");
+                    // A broken update must not keep reasserting an older value
+                    // from this root as if it were still a valid observation.
+                    self.objects.remove(&key);
                 }
             }
         }
         Ok(())
     }
 
-    fn typed<T: Resource>(&self, kind: &str) -> Vec<ResourceObject<T>> {
+    fn typed<T: RecordType>(&self, kind: &str) -> Vec<ResourceObject<T>> {
         let mut objects = BTreeMap::new();
-        for ((plural, namespace, name, _), value) in &self.objects {
+        for ((plural, namespace, name, root), record) in &self.objects {
             if plural != kind {
                 continue;
             }
-            // Select consistently across roots, using observation time first.
-            // Definitions/convergent facts have already been merged by the
-            // resource API; a deterministic serialized tie-break keeps the
-            // projection independent of which root is local.
+            let Some(object) = T::from_record(record) else { continue };
+            // Admission parsed timestamps into UTC. Choose the freshest observed
+            // field, then origin root; never use receiving-host resourceVersion
+            // or serialized object fields. Definitions use the root tie-break.
             let key = (namespace.clone(), name.clone());
-            let stamp = (value.pointer("/status/state/observed_at").and_then(Value::as_str).unwrap_or(""), value.to_string());
+            let stamp = (record.observed_at(), root);
             if objects.get(&key).is_none_or(|(prior, _)| &stamp > prior) {
-                objects.insert(key, (stamp, decode::<T>(value).expect("validated resource object")));
+                objects.insert(key, (stamp, object.clone()));
             }
         }
         objects.into_values().map(|(_, object)| object).collect()
@@ -178,6 +231,6 @@ impl Records {
                 });
             }
         }
-        SubjectCatalogInput { change_requests, issues, forges, references, now: Some(chrono::Utc::now()) }
+        SubjectCatalogInput { change_requests, issues, forges, references, now: None }
     }
 }

@@ -249,12 +249,18 @@ impl ConnectorState {
     /// Reproject the catalog from the held rows and return the patches that
     /// move the PM from the previously published catalog to the new one.
     pub fn rebuild(&mut self, mint: &dyn RecipeMint) -> Vec<MetadataPatch> {
+        self.rebuild_at(mint, chrono::Utc::now())
+    }
+
+    /// Reproject at a supplied clock instant for expiry, replay and tests.
+    pub fn rebuild_at(&mut self, mint: &dyn RecipeMint, now: flotilla_protocol::result_set::Timestamp) -> Vec<MetadataPatch> {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
         let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
         let standing_roles: Vec<StandingRoleRow> = self.standing_roles.values().cloned().collect();
         let project_repositories: Vec<ProjectRepositoriesRow> = self.project_repositories.values().cloned().collect();
         let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
-        let subjects = self.resources.projection();
+        let mut subjects = self.resources.projection();
+        subjects.now = Some(now);
         let next = project_catalog(
             &CatalogInput {
                 subjects: Some(&subjects),
@@ -326,6 +332,8 @@ async fn ensure_resource_watches(
     updates: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, String>>,
 ) -> Result<(), String> {
     use flotilla_client::resource::{ResourceClient, ResourceListRequest, ResourceWatchRequest};
+    // Scope follows the named-query graph. Namespaces with no convoy, role or
+    // project membership are intentionally outside this subject projection.
     let namespaces: BTreeSet<_> = ["flotilla".to_string()]
         .into_iter()
         .chain(
@@ -372,6 +380,8 @@ async fn ensure_resource_watches(
                 }
             });
         }
+        // A setup error returns to run_reconnecting, dropping this JoinSet;
+        // this function never retries a partially admitted namespace in place.
         watched.insert(namespace);
     }
     Ok(())
@@ -410,6 +420,9 @@ pub async fn run_connector(
                 send_patches(&*sink, state.reassert()).await;
             }
             update = resource_rx.recv() => {
+                // Watch end/gap/error restarts the whole snapshot via run_reconnecting.
+                // Dropping resource_tasks aborts sibling tasks and ResourceWatch::drop
+                // cancels their commands; no partial subscription survives a retry.
                 let envelope = update.ok_or_else(|| "subject catalog watch channel ended".to_string())??;
                 state.apply_resource_records(&envelope)?;
                 send_patches(&*sink, state.rebuild(&*mint)).await;
@@ -424,7 +437,7 @@ pub async fn run_connector(
                     Applied::Gap(query) => {
                         debug!(%query, "result stream gap; resubscribing");
                         resubscribe(&*daemon, &mut state, &*mint, &*sink).await?;
-                    ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
+                        ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
                         send_patches(&*sink, state.rebuild(&*mint)).await;
                     }
                 },
