@@ -2386,11 +2386,19 @@ mod tests {
             ("HOME".to_string(), temp.path().to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV.to_string(), skills.to_string_lossy().into_owned()),
         ])))));
-        let results = futures::future::join_all((0..6).map(|index| {
+        // The fake Git executable is a process-boundary fixture. Finish every
+        // constructor before spawning: each constructor rewrites the shared
+        // binary, and a shell can fall through to real Git while it is open.
+        let runners = (0..6)
+            .map(|index| {
+                let mut runner = promisor_runner(temp.path());
+                runner.config_base = temp.path().join(format!("config-{index}"));
+                runner
+            })
+            .collect::<Vec<_>>();
+        let results = futures::future::join_all(runners.into_iter().enumerate().map(|(index, runner)| {
             let store = Arc::clone(&store);
             let registry = Arc::clone(&registry);
-            let mut runner = promisor_runner(temp.path());
-            runner.config_base = temp.path().join(format!("config-{index}"));
             tokio::spawn(async move {
                 let token_file = store
                     .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
