@@ -382,6 +382,15 @@ pub struct ProcessCommandRunner;
 struct ProcessGroupGuard(i32);
 
 #[cfg(unix)]
+impl ProcessGroupGuard {
+    fn for_child(child: &tokio::process::Child) -> Result<Self, String> {
+        let pid = child.id().expect("spawned child has pid");
+        let pgid = i32::try_from(pid).map_err(|_| format!("child PID {pid} exceeds pid_t range"))?;
+        Ok(Self(pgid))
+    }
+}
+
+#[cfg(unix)]
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         // The child was placed in a new process group at spawn. Never send a
@@ -412,7 +421,7 @@ impl ProcessCommandRunner {
             .spawn()
             .map_err(|e| e.to_string())?;
         #[cfg(unix)]
-        let mut guard = ProcessGroupGuard(child.id().expect("spawned child has pid") as i32);
+        let mut guard = ProcessGroupGuard::for_child(&child)?;
         let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -491,7 +500,7 @@ impl CommandRunner for ProcessCommandRunner {
             .spawn()
             .map_err(|e| e.to_string())?;
         #[cfg(unix)]
-        let mut guard = ProcessGroupGuard(child.id().expect("spawned child has pid") as i32);
+        let mut guard = ProcessGroupGuard::for_child(&child)?;
         let mut stdin = child.stdin.take().expect("piped stdin should be available");
         let write_input = async move {
             stdin.write_all(input).await.map_err(|e| e.to_string())?;
