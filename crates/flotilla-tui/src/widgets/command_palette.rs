@@ -292,6 +292,9 @@ pub(crate) fn tui_dispatch(
     active_repo: Option<&RepoIdentity>,
     provisioning_target: &ProvisioningTarget,
 ) -> Result<Command, String> {
+    if !flotilla_commands::applicability::tui_actionable_resolved(&resolved) {
+        return Err("Command has no TUI-visible effect".into());
+    }
     match resolved {
         Resolved::HostQuery { subject, kind } => {
             let host = model.resolve_host(&subject)?;
@@ -548,6 +551,14 @@ mod tests {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     use super::*;
+
+    #[test]
+    fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
+        let harness = TestWidgetHarness::new();
+        let command = Command::builder().action(CommandAction::QueryFleetReplicaSnapshot {}).build();
+        let result = tui_dispatch(Resolved::Ready(command), &harness.model, None, &harness.provisioning_target);
+        assert!(result.is_err());
+    }
     use crate::app::test_support::TestWidgetHarness;
 
     fn render_for_mouse(widget: &mut CommandPaletteWidget, harness: &mut TestWidgetHarness) {
