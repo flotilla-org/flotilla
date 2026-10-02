@@ -763,9 +763,14 @@ impl WorkCredentialReconciler for SessionStagingProbe {
 }
 
 async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
+    resume_staging_fixture_with_backend(ResourceBackend::InMemory(InMemoryBackend::default())).await
+}
+
+async fn resume_staging_fixture_with_backend(
+    backend: ResourceBackend,
+) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
@@ -913,7 +918,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         }
     }
 
-    let (daemon, backend, probe) = resume_staging_fixture().await;
+    let database_dir = tempfile::tempdir().expect("resource database");
+    let database_path = database_dir.path().join("resources.db");
+    let (mut daemon, mut backend, probe) = resume_staging_fixture_with_backend(ResourceBackend::Sqlite(
+        flotilla_resources::SqliteBackend::open(&database_path).expect("resource store"),
+    ))
+    .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let supervision = Arc::new(AcceptSupervision::default());
     daemon.leaf_subscriptions.set_turn_delivery_actuator(supervision.clone()).await;
@@ -1010,7 +1020,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         .await
         .expect("governor working");
     let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
-    let task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
+    let mut task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     let patch = convoy_external_patches::mark_crew_stalled(
         "resume-staging".to_string(),
         "work".to_string(),
@@ -1059,6 +1069,41 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     })
     .await
     .expect("governor row");
+    // #2488: restarting the daemon rebuilds its leaf rows from stored status.
+    // The already assigned governor retains authority to resume this same stall.
+    task.abort();
+    let _ = task.await;
+    drop(daemon);
+    backend = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(&database_path).expect("reopen stored resources"));
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let restart_config = tempfile::tempdir().expect("restart config");
+    std::fs::write(restart_config.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
+    daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(restart_config.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon.set_work_credential_reconciler(probe.clone()).await;
+    daemon.leaf_subscriptions.set_turn_delivery_actuator(supervision.clone()).await;
+    let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
+    task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if daemon.leaf_subscriptions.rows().await.iter().any(|row| {
+                matches!(&row.maker, flotilla_resources::LeafMaker::Supervisor { convoy, role, .. }
+                    if convoy == "governor" && role == "governor")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor row restored after restart");
     daemon
         .crew_supervise_internal(
             CrewSupervisionRequest::builder()

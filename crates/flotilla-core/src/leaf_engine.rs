@@ -1349,7 +1349,9 @@ impl ReconcilerWake {
                     }
                 };
             }
-            if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted)
+            // Previous-generation fallback records were marked exhausted with no
+            // consumed rung. Retry those too; only a consumed ladder stays exhausted.
+            if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted && stalled.supervision_index.is_some())
                 && !able
                 && !progress_changed
                 && status.phase == ConvoyPhase::Active
@@ -1388,7 +1390,10 @@ impl ReconcilerWake {
                     .as_ref()
                     .filter(|stalled| stalled.source == StallEvidenceSource::Crew && stalled.leaves == condition.leaves);
                 if let Some(declared) = declared {
-                    condition.evidence = declared.evidence.clone();
+                    // Keep the crew's evidence, rather than accumulating prior delivery diagnostics.
+                    condition.evidence = stalled_source_actor(declared)
+                        .and_then(|(vessel, role)| status.crew_work.get(vessel)?.get(role)?.message.clone())
+                        .unwrap_or_else(|| declared.evidence.clone());
                     condition.source = StallEvidenceSource::Crew;
                     condition.reason = declared.reason;
                     condition.proposed_disposition = declared.proposed_disposition;
@@ -1509,6 +1514,12 @@ impl ReconcilerWake {
                                         }
                                     }
                                     Err(error) => {
+                                        tracing::warn!(
+                                            convoy = %convoy.metadata.name,
+                                            target = %format!("{role}@{vessel}"),
+                                            reason = %error,
+                                            "stall nudge fell back to operator"
+                                        );
                                         condition.rung = StallRung::Operator;
                                         condition.evidence = format!("nudge delivery failed: {error}");
                                     }
@@ -1561,13 +1572,17 @@ impl ReconcilerWake {
                     } else {
                         condition.rung = StallRung::Operator;
                         condition.supervisor = None;
-                        condition.supervision_index = None;
+                        // The cursor records consumed rungs, not failed delivery attempts.
+                        // Retain it so retrying a higher rung cannot route back to a lower one.
+                        condition.supervision_index = prior.and_then(|stalled| stalled.supervision_index);
                         condition.maker = condition.leaves.first().and_then(|leaf| {
                             let LeafAddress::Work { work, .. } = &leaf.address else { return None };
                             let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
                             Some(LeafMaker::Actor { vessel: work.clone(), role: role.to_string() })
                         });
                         condition.supervision_exhausted = true;
+                        let mut unavailable_target = None;
+                        let mut delivery_failed = false;
                         for (index, target) in policy.iter().enumerate().skip(start) {
                             let candidate = match target {
                                 SupervisionTarget::ConvoyCrew { vessel, role } => {
@@ -1629,6 +1644,7 @@ impl ReconcilerWake {
                                     && stalled_source_actor(&condition)
                                         .is_some_and(|(vessel, role)| vessel == target_vessel && role == target_role)
                                 {
+                                    unavailable_target = Some(target);
                                     continue;
                                 }
                                 let proposal = condition.proposed_disposition.map_or(String::new(), |disposition| {
@@ -1663,7 +1679,15 @@ impl ReconcilerWake {
                                 if convoys.contains_key(&target_convoy) {
                                     if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await
                                     {
-                                        condition.evidence = format!("supervisor delivery failed: {error}");
+                                        tracing::warn!(
+                                            convoy = %convoy.metadata.name,
+                                            target = %format!("{target_role}@{target_vessel}/{target_convoy}"),
+                                            reason = %error,
+                                            "stall escalation fell back to operator"
+                                        );
+                                        condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
+                                        condition.supervision_exhausted = false;
+                                        delivery_failed = true;
                                         break;
                                     }
                                 }
@@ -1680,7 +1704,28 @@ impl ReconcilerWake {
                                 break;
                             }
                             if matches!(target, SupervisionTarget::Operator) {
+                                if unavailable_target.is_none() {
+                                    condition.supervision_index = Some(index);
+                                }
                                 break;
+                            }
+                            unavailable_target = Some(target);
+                        }
+                        if condition.supervisor.is_none() && !delivery_failed {
+                            let target = unavailable_target.unwrap_or(&SupervisionTarget::Operator);
+                            tracing::warn!(
+                                convoy = %convoy.metadata.name,
+                                ?target,
+                                reason = "no live supervisor found",
+                                "stall escalation fell back to operator"
+                            );
+                            if unavailable_target.is_some() {
+                                // Operator attention is a backstop while supervisors reconnect,
+                                // not a consumed ladder. Try the same unconsumed rungs next pass.
+                                condition.supervision_exhausted = false;
+                            } else {
+                                // An empty or fully consumed policy ends at the operator.
+                                condition.supervision_index.get_or_insert(policy.len());
                             }
                         }
                     }
@@ -2422,11 +2467,16 @@ mod tests {
     struct RecordingTurnDelivery {
         requests: std::sync::Mutex<Vec<TurnDeliveryRequest>>,
         holds: AtomicUsize,
+        // Boundary fake: turn delivery may fail while the agent session reconnects.
+        unavailable: AtomicBool,
     }
 
     #[async_trait]
     impl TurnDeliveryActuator for RecordingTurnDelivery {
         async fn deliver(&self, request: &TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+            if self.unavailable.load(Ordering::SeqCst) {
+                return Err("supervisor reconnecting".into());
+            }
             let mut requests = self.requests.lock().expect("record turn-delivery request");
             let rung = if requests.is_empty() { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
             requests.push(request.clone());
@@ -2505,10 +2555,7 @@ mod tests {
         convoys.update_status(name, &created.metadata.resource_version, &status).await.expect("write convoy status");
     }
 
-    async fn project_supervision_case(
-        governors: &[(&str, u64, ConvoyPhase)],
-    ) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    fn supervision_wake(backend: &ResourceBackend) -> ReconcilerWake {
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
             backend.clone(),
@@ -2516,10 +2563,14 @@ mod tests {
             Arc::new(UnavailableChangeRequests),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
-        let wake = ReconcilerWake {
-            subscriptions: LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher),
-            _marker: PhantomData,
-        };
+        ReconcilerWake { subscriptions: LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher), _marker: PhantomData }
+    }
+
+    async fn project_supervision_case(
+        governors: &[(&str, u64, ConvoyPhase)],
+    ) -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
         let delivery = Arc::new(RecordingTurnDelivery::default());
         wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
         let convoys = backend.using::<Convoy>("flotilla");
@@ -2533,6 +2584,25 @@ mod tests {
         convoys
             .update_status("stalled-work", &source.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![flotilla_resources::VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![flotilla_resources::CrewSpec::builder()
+                            .role("coder".into())
+                            .source(flotilla_resources::CrewSource::Tool { command: "test".into() })
+                            .completion_conditions(vec![flotilla_resources::CrewCompletionExpectation::artifact_exists(
+                                "coder",
+                                "decision-ledger",
+                                flotilla_resources::ArtifactSubjectBinding::Convoy,
+                            )])
+                            .build()])
+                        .build()],
+                }),
                 crew_work: BTreeMap::from([(
                     "work".into(),
                     BTreeMap::from([(
@@ -3074,6 +3144,231 @@ mod tests {
             .expect("set owned attempt");
     }
 
+    // #2488: unavailable delivery, missing live convoy, and missing crew must recover
+    // in one pass once reachable. Repeated reconciliation must neither freeze nor duplicate delivery.
+    async fn unavailable_governor_scenario(unavailable: u8, restarts: &[bool], legacy: bool) {
+        let (backend, mut wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let governor = convoys.get("governor").await.expect("governor");
+        let mut unavailable_status = governor.status.clone().expect("status");
+        match unavailable {
+            0 => delivery.unavailable.store(true, Ordering::SeqCst),
+            1 => unavailable_status.phase = ConvoyPhase::Abandoned,
+            2 => unavailable_status.crew_work.clear(),
+            _ => unreachable!(),
+        }
+        convoys.update_status("governor", &governor.metadata.resource_version, &unavailable_status).await.expect("unavailable");
+        let now = Utc::now();
+        for restart in restarts {
+            if *restart {
+                wake = supervision_wake(&backend);
+                wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+            }
+            let objects =
+                convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
+            wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge unavailable governor");
+            let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+            assert_eq!(stalled.rung, StallRung::Operator);
+            assert!(stalled.supervisor.is_none());
+            assert!(stalled.evidence.starts_with("needs decision"));
+            assert_eq!(
+                stalled.evidence.matches(if unavailable == 0 { "supervisor delivery failed" } else { "no live governor" }).count(),
+                1
+            );
+            assert!(delivery.requests.lock().expect("deliveries").is_empty());
+        }
+        let fallback = convoys.get("stalled-work").await.expect("source");
+        let began_at = fallback.status.as_ref().expect("status").stalled.as_ref().expect("stall").began_at;
+        if legacy {
+            // Previous generation persisted temporary unavailability as exhausted.
+            let mut status = fallback.status.expect("status");
+            status.stalled.as_mut().expect("stall").supervision_exhausted = true;
+            convoys.update_status("stalled-work", &fallback.metadata.resource_version, &status).await.expect("legacy fallback");
+            wake = supervision_wake(&backend);
+            wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+        }
+        let reachable_name = if unavailable == 1 { "governor-ready" } else { "governor" };
+        let current = if unavailable == 1 {
+            // An abandoned generation stays terminal. Startup eventually reveals
+            // a new live generation rather than resurrecting the old one.
+            let mut spec = governor.spec.clone();
+            spec.generation += 1;
+            convoys.create(&InputMeta::builder().name(reachable_name.into()).build(), &spec).await.expect("live governor generation")
+        } else {
+            convoys.get(reachable_name).await.expect("governor")
+        };
+        convoys
+            .update_status(reachable_name, &current.metadata.resource_version, &governor.status.expect("original status"))
+            .await
+            .expect("reachable");
+        delivery.unavailable.store(false, Ordering::SeqCst);
+        for _ in 0..2 {
+            let objects =
+                convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
+            wake.judge_stalls_at("flotilla", &objects, now).await.expect("judge reachable governor");
+            let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+            assert_eq!(stalled.rung, StallRung::Governor, "unavailability mode {unavailable}");
+            assert_eq!(stalled.began_at, began_at);
+            assert_eq!(stalled.supervisor.expect("supervisor").convoy, reachable_name);
+            assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_governor_recovers_in_one_pass() {
+        for unavailable in 0..3 {
+            unavailable_governor_scenario(unavailable, &[false, true], false).await;
+            unavailable_governor_scenario(unavailable, &[true], true).await;
+        }
+    }
+
+    // A governor retry after an explicit escalation must not revisit the Bosun
+    // rung that the supervisor already consumed, even across a restart.
+    #[tokio::test]
+    async fn unavailable_governor_preserves_consumed_bosun_rung() {
+        let (backend, mut wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let mut status = source.status.expect("status");
+        status
+            .crew_work
+            .get_mut("work")
+            .expect("crew")
+            .insert("bosun".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
+        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("bosun available");
+        let now = Utc::now();
+        let objects =
+            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+        wake.sync_rows("flotilla", &objects).await.expect("rows");
+        wake.judge_stalls_at("flotilla", &objects, now).await.expect("route to bosun");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let mut status = source.status.expect("status");
+        let condition = status.stalled.as_mut().expect("stall");
+        assert_eq!(condition.rung, StallRung::Bosun);
+        // Same persisted transition as crew supervise ... escalate: clear ownership,
+        // preserve the consumed index, and restore the original actor as maker.
+        condition.supervisor = None;
+        condition.maker = Some(LeafMaker::Actor { vessel: "work".into(), role: "coder".into() });
+        condition.rung = StallRung::Operator;
+        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("escalate");
+        delivery.unavailable.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            wake = supervision_wake(&backend);
+            wake.subscriptions.set_turn_delivery_actuator(delivery.clone()).await;
+            let objects =
+                convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            wake.sync_rows("flotilla", &objects).await.expect("rebuild rows");
+            wake.judge_stalls_at("flotilla", &objects, now).await.expect("retry governor");
+            let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+            assert_eq!(stalled.rung, StallRung::Operator);
+            assert_eq!(stalled.supervision_index, Some(0));
+            assert!(!stalled.supervision_exhausted);
+        }
+        delivery.unavailable.store(false, Ordering::SeqCst);
+        let objects =
+            convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+        wake.sync_rows("flotilla", &objects).await.expect("rows");
+        wake.judge_stalls_at("flotilla", &objects, now).await.expect("recover governor");
+        let stalled = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        assert_eq!(stalled.rung, StallRung::Governor);
+        assert_eq!(stalled.supervision_index, Some(1));
+        let requests = delivery.requests.lock().expect("deliveries");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].role, "bosun");
+        assert_eq!(requests[1].role, "governor");
+    }
+
+    // Deliberate operator-only or empty policies consume the ladder. Routine
+    // reconciles must not rewrite the condition or repeatedly retry that decision.
+    #[tokio::test]
+    async fn operator_only_supervision_is_consumed_once() {
+        for policy in [Vec::new(), vec![SupervisionTarget::Operator]] {
+            let (backend, wake, delivery) = project_supervision_case(&[]).await;
+            let convoys = backend.using::<Convoy>("flotilla");
+            let source = convoys.get("stalled-work").await.expect("source");
+            let mut status = source.status.expect("status");
+            status.workflow_snapshot.as_mut().expect("snapshot").supervision = Some(policy);
+            convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("operator policy");
+            let mut previous_version = None;
+            for _ in 0..3 {
+                let objects =
+                    convoys.list().await.expect("convoys").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+                wake.sync_rows("flotilla", &objects).await.expect("rows");
+                wake.judge_stalls("flotilla", &objects).await.expect("judge operator policy");
+                let source = convoys.get("stalled-work").await.expect("source");
+                let stalled = source.status.expect("status").stalled.expect("stall");
+                assert!(stalled.supervision_exhausted);
+                assert!(stalled.supervision_index.is_some());
+                assert!(stalled.supervisor.is_none());
+                assert_eq!(stalled.rung, StallRung::Operator);
+                if let Some(version) = previous_version {
+                    assert_eq!(source.metadata.resource_version, version);
+                }
+                previous_version = Some(source.metadata.resource_version);
+                assert!(delivery.requests.lock().expect("deliveries").is_empty());
+            }
+        }
+    }
+
+    // WARN events must expose routing failures as structured convoy/target/reason
+    // fields; skipped lower candidates must not warn when a governor accepts delivery.
+    #[test]
+    fn unavailable_governor_warns_with_routing_fields() {
+        #[derive(Clone)]
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("logs").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for unavailable in 0..3 {
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = LogWriter(logs.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            tracing::subscriber::with_default(subscriber, || {
+                runtime.block_on(unavailable_governor_scenario(unavailable, &[false, true], false));
+            });
+            let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
+            let warnings = text.lines().collect::<Vec<_>>();
+            assert_eq!(warnings.len(), 2, "only unavailable passes should warn: {text}");
+            for warning in warnings {
+                assert!(warning.contains("WARN"), "{warning}");
+                assert!(warning.contains("convoy=stalled-work"), "{warning}");
+                assert!(warning.contains("target="), "{warning}");
+                assert!(warning.contains("reason="), "{warning}");
+                assert!(
+                    warning.contains(if unavailable == 0 { "supervisor reconnecting" } else { "no live supervisor found" }),
+                    "{warning}"
+                );
+            }
+        }
+    }
+
+    // Draw failure modes and sequences of reconciles/restarts. Check fallback after
+    // every step and require one-pass recovery and exactly one delivery after healing.
+    #[hegel::test]
+    fn generated_unavailable_governor_recovers(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let unavailable = tc.draw(gs::integers::<u8>().min_value(0).max_value(2));
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let restarts = (0..steps).map(|_| tc.draw(gs::booleans())).collect::<Vec<_>>();
+        let legacy = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(unavailable_governor_scenario(unavailable, &restarts, legacy));
+    }
+
     #[tokio::test]
     async fn stalled_work_routes_to_live_governor_after_abandoned_generation() {
         let (backend, wake, delivery) =
@@ -3112,7 +3407,7 @@ mod tests {
             .stalled
             .expect("stalled");
         assert_eq!(stalled.rung, StallRung::Operator);
-        assert!(stalled.supervision_exhausted);
+        assert!(!stalled.supervision_exhausted);
         assert!(stalled.evidence.contains("no live governor for project wheelhouse"), "{}", stalled.evidence);
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }
