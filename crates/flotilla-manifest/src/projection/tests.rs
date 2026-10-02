@@ -1853,6 +1853,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
             .name("ship-it")
             .workflow_ref("dev")
             .phase(ConvoyPhase::Active)
+            .project_ref("project/dev/platform")
             .subjects(convoy_subject_rows(convoy, &references))
             .build()];
         let mut input = catalog_input(&rows);
@@ -1910,6 +1911,8 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         ])
     );
     let first = find_entity(&patches, &entity::change_request("github.com", "org/flotilla", "42"));
+    // Replicated subjects join the same shared project on every host.
+    assert_eq!(text(first, SEGMENT_PROJECT), "dev/platform@fleet");
     assert_eq!(text(first, KEY_DISPLAY_LABEL), "flotilla/c!42");
     assert_eq!(text(first, "flotilla.change_request.title"), "Ship first");
     assert_eq!(text(first, "flotilla.change_request.readiness"), "ready_to_merge");
@@ -1920,6 +1923,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         &patches,
         &entity::issue(&IssueRef { source: IssueSource { service: "lab".into(), scope: "team/cleat".into() }, id: "7".into() }),
     );
+    assert_eq!(text(issue, SEGMENT_PROJECT), "dev/platform@fleet");
     assert_eq!(text(issue, KEY_DISPLAY_LABEL_SHORT), "wheelhouse/c#7");
     assert_eq!(issue.set["flotilla.issue.labels"].value, MetadataValue::StringList(vec!["ready".into()]));
     assert_eq!(issue.set["flotilla.issue.assignees"].value, MetadataValue::StringList(vec!["alice".into()]));
@@ -1930,4 +1934,150 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     let forge = find_entity(&patches, &entity::forge("lab"));
     assert_eq!(text(forge, "flotilla.forge.web_url"), "https://forge.example/git");
     assert_eq!(text(forge, "flotilla.forge.change_request_url_template"), "{web_url}/{scope}/pulls/{number}");
+}
+
+// Behaviour (#2454): both subject kinds publish the unique linking project,
+// independently of awareness and host; zero or multiple projects publish none.
+#[hegel::test]
+fn subject_project_is_unambiguous(tc: hegel::TestCase) {
+    use flotilla_protocol::{result_set::ConvoySubjectRow, Relationship, Subject, SubjectKind};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, Issue, IssueSpec, ResourceBackend};
+    use hegel::generators as gs;
+
+    // Empty through repeated and conflicting projects, missing project refs,
+    // all relationship kinds, remote/local origins, and role disagreement.
+    // Convoy project 3 means no reference; roles always name a project in 0..=2.
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+    let with_role = tc.draw(gs::booleans());
+    let source = IssueSource { service: "github".into(), scope: "org/repo".into() };
+    let subjects = [Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() }, Subject {
+        kind: SubjectKind::Issue,
+        source: source.clone(),
+        id: "42".into(),
+    }];
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let observations = runtime.block_on(async {
+        SubjectCatalogInput {
+            change_requests: vec![backend
+                .using::<ChangeRequest>("dev")
+                .create(
+                    &InputMeta::builder().name("cr".into()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github".into())
+                        .scope("org/repo".into())
+                        .number(42)
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("request")],
+            issues: vec![backend
+                .using::<Issue>("dev")
+                .create(
+                    &InputMeta::builder().name("issue".into()).build(),
+                    &IssueSpec::builder()
+                        .service("github".into())
+                        .scope("org/repo".into())
+                        .number(42)
+                        .observing_authority("kiwi".into())
+                        .build(),
+                )
+                .await
+                .expect("issue")],
+            ..Default::default()
+        }
+    });
+    let mut expected = std::collections::BTreeSet::new();
+    let mut convoys = Vec::new();
+    for index in 0..count {
+        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let relationship =
+            [Relationship::Produces, Relationship::Adopts, Relationship::WorksOn, Relationship::Supersedes, Relationship::References]
+                [tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
+        let mut resource = convoy_ref("dev", &format!("convoy-{index}"));
+        if tc.draw(gs::booleans()) {
+            resource.host = None;
+        }
+        let mut convoy =
+            ConvoyRow::builder().resource(resource).name(format!("convoy-{index}")).workflow_ref("dev").phase(ConvoyPhase::Active).build();
+        if project < 3 {
+            convoy.project_ref = Some(format!("project/dev/p{project}"));
+            expected.insert(format!("dev/p{project}@fleet"));
+        }
+        convoy.subjects = subjects
+            .iter()
+            .map(|subject| ConvoySubjectRow {
+                subject: subject.clone(),
+                relationship,
+                declared: false,
+                short: "42".into(),
+                url: None,
+                repository_key: None,
+            })
+            .collect();
+        if with_role && index == 0 {
+            convoy.ensured_from = Some("ensure".into());
+        }
+        // Every generated linker has a twin on the other host origin. Their
+        // identical project must deduplicate rather than become ambiguity.
+        let mut twin = convoy.clone();
+        twin.resource.name = format!("peer-{index}");
+        twin.name = format!("peer-{index}");
+        twin.resource.host = if convoy.resource.host.is_some() { None } else { Some(HostName::new("kiwi")) };
+        twin.ensured_from = None;
+        convoys.extend([convoy, twin]);
+    }
+    let roles = if with_role && count > 0 {
+        let project = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        expected.insert(format!("dev/p{project}@fleet"));
+        vec![StandingRoleRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "ConvoyEnsure", "dev", "ensure"))
+            .project_ref(format!("project/dev/p{project}"))
+            .role("governor")
+            .strikes(0)
+            .build()]
+    } else {
+        vec![]
+    };
+    let awareness = [AwarenessNode::builder()
+        .id("project/dev/p0".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("p0".to_owned())
+        .state(AwarenessState::Waiting)
+        .as_of(Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(1).issues(1).build())
+        .entries(vec![AwarenessEntry::builder()
+            .id("issue/org/repo/42".to_owned())
+            .kind(AwarenessKind::Issue)
+            .label("issue".to_owned())
+            .state(AwarenessState::Waiting)
+            .as_of(Timestamp::UNIX_EPOCH)
+            .issue_refs(vec![IssueRef { source, id: "42".into() }])
+            .build()])
+        .build()];
+    for nodes in [None, Some(&[][..]), Some(&awareness[..])] {
+        let mut input = catalog_input(&convoys);
+        input.subjects = Some(&observations);
+        input.standing_roles = &roles;
+        input.awareness = nodes;
+        let patches = project_catalog(&input, &mint()).reassert_patches();
+        // Unlinked records are outside subject projection; awareness may
+        // independently publish the issue, but must not publish a request.
+        if count == 0 {
+            assert!(!patches
+                .iter()
+                .any(|patch| patch.target == MetadataTarget::Entity(entity::change_request("github", "org/repo", "42"))));
+            continue;
+        }
+        for subject in &subjects {
+            let target = match subject.kind {
+                SubjectKind::ChangeRequest => entity::change_request("github", "org/repo", "42"),
+                SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: "42".into() }),
+            };
+            let actual = find_entity(&patches, &target).set.get(SEGMENT_PROJECT).map(|value| &value.value);
+            let wanted = (expected.len() == 1).then(|| MetadataValue::text(expected.first().expect("unique project")));
+            assert_eq!(actual, wanted.as_ref());
+        }
+    }
 }
