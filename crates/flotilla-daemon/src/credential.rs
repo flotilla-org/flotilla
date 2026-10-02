@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use async_trait::async_trait;
@@ -220,6 +220,7 @@ struct AmbientClaudeOauthMetadata {
 }
 
 type LedgerDeliveryRecord = BTreeMap<String, BTreeMap<String, String>>;
+type GithubAppDeliveryLocks = BTreeMap<(String, String), Weak<Mutex<()>>>;
 
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
@@ -237,6 +238,7 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
     cleaned_delivery_environments: Mutex<BTreeMap<String, Arc<OnceCell<()>>>>,
@@ -510,6 +512,7 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
             cleaned_delivery_environments: Mutex::new(BTreeMap::new()),
@@ -624,6 +627,17 @@ fn parse_ambient_claude_expiry(contents: &[u8], path: &Path) -> Option<Credentia
 }
 
 impl CredentialStore {
+    async fn github_app_delivery_lock(&self, key: &(String, String)) -> Arc<Mutex<()>> {
+        let mut locks = self.github_app_delivery_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
     #[cfg(test)]
     pub(crate) async fn prepare(
         &self,
@@ -745,6 +759,11 @@ impl CredentialStore {
         let mut prepared_cache_keys = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
+            let _delivery_guard = if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                Some(self.github_app_delivery_lock(&cache_key).await.lock_owned().await)
+            } else {
+                None
+            };
             if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
                 let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
                 if self.github_app_deliveries.lock().await.get(&cache_key).is_some_and(|existing| existing.request.permissions != requested)
@@ -778,9 +797,8 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            let mut github_app_deliveries =
-                if resolved.github_app.is_some() { Some(self.github_app_deliveries.lock().await) } else { None };
-            if let (Some(deliveries), Some((request, _))) = (&github_app_deliveries, &resolved.github_app) {
+            if let Some((request, _)) = &resolved.github_app {
+                let deliveries = self.github_app_deliveries.lock().await;
                 if deliveries.get(&cache_key).is_some_and(|existing| existing.request.permissions != request.permissions) {
                     return Err(bounded_adapter_error(
                         name,
@@ -809,24 +827,21 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some((request, expires_at)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-                github_app_deliveries.as_mut().expect("GitHub App delivery holds the write lock").insert(
-                    cache_key.clone(),
-                    GithubAppDelivery {
-                        generation: uuid::Uuid::new_v4(),
-                        request,
-                        runner: Arc::clone(&runner),
-                        token_file: github_app_token_file(paths, name),
-                        issued_at: self.clock.now(),
-                        expires_at,
-                        refresh_failures: 0,
-                        next_refresh_attempt_at: None,
-                        installation_repository: match &spec.consumer {
-                            CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
-                            _ => None,
-                        },
-                        scope: None,
+                self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
+                    generation: uuid::Uuid::new_v4(),
+                    request,
+                    runner: Arc::clone(&runner),
+                    token_file: github_app_token_file(paths, name),
+                    issued_at: self.clock.now(),
+                    expires_at,
+                    refresh_failures: 0,
+                    next_refresh_attempt_at: None,
+                    installation_repository: match &spec.consumer {
+                        CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
+                        _ => None,
                     },
-                );
+                    scope: None,
+                });
             }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -1274,12 +1289,14 @@ impl CredentialStore {
                 });
                 continue;
             }
-            let mut deliveries = self.github_app_deliveries.lock().await;
-            let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) else {
+            let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
+            let current =
+                { self.github_app_deliveries.lock().await.get(&key).filter(|current| current.generation == delivery.generation).cloned() };
+            let Some(current) = current else {
                 continue;
             };
             if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                let should_surface = current.record_refresh_failure(self.clock.now());
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
                     credential_name: Some(key.1.clone()),
@@ -1296,11 +1313,14 @@ impl CredentialStore {
                     should_surface: true,
                 });
             }
-            current.expires_at = token.expires_at;
-            current.issued_at = self.clock.now();
-            current.refresh_failures = 0;
-            current.next_refresh_attempt_at = None;
-            current.request = request;
+            let mut deliveries = self.github_app_deliveries.lock().await;
+            if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
+                current.expires_at = token.expires_at;
+                current.issued_at = self.clock.now();
+                current.refresh_failures = 0;
+                current.next_refresh_attempt_at = None;
+                current.request = request;
+            }
         }
         errors
     }
@@ -3697,6 +3717,121 @@ interactions:
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
         assert_eq!(token_writes.iter().map(|(_, token)| token.as_str()).collect::<Vec<_>>(), ["initial-token", "reprepared-token"]);
+    }
+
+    #[tokio::test]
+    async fn slow_github_app_preflight_does_not_delay_an_independent_environment() {
+        struct PausedPreflightRunner {
+            inner: RecordingRunner,
+            first_preflight: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl CommandRunner for PausedPreflightRunner {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                if args.iter().any(|arg| arg.contains("api installation/repositories"))
+                    && self.first_preflight.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.run(cmd, args, cwd, label).await
+            }
+
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.inner.run_output(cmd, args, cwd, label).await
+            }
+
+            async fn run_with_input(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &ChannelLabel,
+                input: &[u8],
+            ) -> Result<String, String> {
+                self.inner.run_with_input(cmd, args, cwd, label, input).await
+            }
+
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                self.inner.exists(cmd, args).await
+            }
+
+            async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+                self.inner.write_file(path, content).await
+            }
+
+            async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+                self.inner.write_file_with_mode(path, content, mode).await
+            }
+        }
+
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: "/host/app.id".to_string(),
+                    private_key_path: "/host/app.pem".to_string(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("credential");
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { value: "first-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "second-token".to_string(), expires_at: now + Duration::hours(1) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(PausedPreflightRunner {
+            inner: RecordingRunner::default(),
+            first_preflight: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: Arc::new(VirtualClock::new(now)), minter },
+            PathBuf::from("/state"),
+        ));
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+        let first_store = Arc::clone(&store);
+        let first_runner = Arc::clone(&runner);
+        let first_refs = refs.clone();
+        let first_scopes = scopes.clone();
+        let first = tokio::spawn(async move { first_store.prepare_scoped("env-a", &first_refs, &first_scopes, first_runner).await });
+        runner.started.notified().await;
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.prepare_scoped("env-b", &refs, &scopes, runner.clone())).await;
+        runner.release.notify_one();
+        first.await.expect("first task").expect("first delivery");
+        second.expect("independent delivery must finish during another preflight").expect("second delivery");
     }
 
     #[tokio::test]
