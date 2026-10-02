@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -75,6 +76,19 @@ impl CommandRunner for DockerEnvironmentRunner {
         let docker_args = self.docker_exec_args(cmd, args, cwd, false);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
         self.inner.run("docker", &arg_refs, Path::new("/"), label).await
+    }
+
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let docker_args = self.docker_exec_args(cmd, args, cwd, false);
+        let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner.run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout).await
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {

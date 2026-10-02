@@ -98,6 +98,19 @@ impl CommandRunner for SshCommandRunner {
         self.execute(cmd, args, cwd, label).await
     }
 
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        let script = self.remote_exec_script(cmd, args, cwd);
+        let ssh_args = self.ssh_shell_args(&script);
+        self.runner.run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout).await
+    }
+
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);

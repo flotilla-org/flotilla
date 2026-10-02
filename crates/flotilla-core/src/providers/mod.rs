@@ -13,7 +13,10 @@ pub mod terminal;
 pub mod types;
 pub mod vcs;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -231,6 +234,21 @@ pub trait CommandRunner: Send + Sync {
     /// Run a command and return stdout on success, stderr on failure.
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String>;
 
+    /// Run a command with a deadline. Dropping the command future must stop
+    /// its child processes; wrappers must forward the deadline to their inner runner.
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label))
+            .await
+            .map_err(|_| format!("{cmd} timed out after {}s", timeout.as_secs()))?
+    }
+
     /// Run a command and return full output regardless of exit status.
     /// `Err` only if the process could not be spawned at all.
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
@@ -356,12 +374,47 @@ pub trait CommandRunner: Send + Sync {
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 
+#[cfg(unix)]
+struct ProcessGroupGuard(i32);
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        // The child was placed in a new process group at spawn. Never send a
+        // negative PID to a shell utility: killpg targets exactly this group.
+        if self.0 != 0 {
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+}
+
 impl ProcessCommandRunner {
     async fn checked_command(cmd: &str, args: &[&str], cwd: &Path) -> Result<tokio::process::Command, String> {
         crate::vcs::guard_host_git_config_async(cmd, args, cwd).await?;
         let mut command = tokio::process::Command::new(cmd);
         command.args(args).current_dir(cwd);
+        #[cfg(unix)]
+        command.process_group(0);
         Ok(command)
+    }
+
+    async fn command_output(cmd: &str, args: &[&str], cwd: &Path) -> Result<std::process::Output, String> {
+        let child = Self::checked_command(cmd, args, cwd)
+            .await?
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let mut guard = ProcessGroupGuard(child.id().expect("spawned child has pid") as i32);
+        let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            guard.0 = 0;
+        }
+        Ok(output)
     }
 }
 
@@ -387,8 +440,7 @@ impl CommandProcess for TokioCommandProcess {
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-        let output =
-            Self::checked_command(cmd, args, cwd).await?.stdin(std::process::Stdio::null()).output().await.map_err(|e| e.to_string())?;
+        let output = Self::command_output(cmd, args, cwd).await?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
@@ -396,14 +448,21 @@ impl CommandRunner for ProcessCommandRunner {
         }
     }
 
-    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-        let output = Self::checked_command(cmd, args, cwd)
-            .await?
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .output()
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| format!("{cmd} timed out after {}s", timeout.as_secs()))?
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        let output = Self::command_output(cmd, args, cwd).await?;
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -434,11 +493,14 @@ impl CommandRunner for ProcessCommandRunner {
 
         let mut child = Self::checked_command(cmd, args, cwd)
             .await?
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let mut guard = ProcessGroupGuard(child.id().expect("spawned child has pid") as i32);
         let mut stdin = child.stdin.take().expect("piped stdin should be available");
         let write_input = async move {
             stdin.write_all(input).await.map_err(|e| e.to_string())?;
@@ -446,6 +508,10 @@ impl CommandRunner for ProcessCommandRunner {
         };
         let wait_for_output = async move { child.wait_with_output().await.map_err(|e| e.to_string()) };
         let ((), output) = tokio::try_join!(write_input, wait_for_output)?;
+        #[cfg(unix)]
+        {
+            guard.0 = 0;
+        }
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
@@ -894,6 +960,31 @@ pub(crate) mod testing {
         .expect("child command");
 
         assert_eq!(output.len(), 131_072);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_command_kills_its_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_path = dir.path().join("child.pid");
+        let pid_path_arg = pid_path.to_string_lossy();
+        let runner = super::ProcessCommandRunner;
+        let args = ["-c", "sleep 30 & echo $! > \"$1\"; wait", "sh", &pid_path_arg];
+        let command = runner.run_with_timeout("sh", &args, Path::new("/"), &ChannelLabel::Default, std::time::Duration::from_secs(1));
+        let result = command.await;
+        assert!(result.expect_err("command must time out").contains("timed out"));
+        let pid: i32 = std::fs::read_to_string(&pid_path).expect("child pid").trim().parse().expect("numeric pid");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("grandchild must terminate");
     }
 
     #[tokio::test]
