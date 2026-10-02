@@ -1009,6 +1009,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
     }
 
     output.push_str("\nCrew delivery:\n");
+    for (crew, skills) in &explanation.skills {
+        writeln!(output, "Skills {crew}: {skills}").expect("write skill explanation");
+    }
     if explanation.crew_deliveries.is_empty() {
         output.push_str("  (none)\n");
     } else {

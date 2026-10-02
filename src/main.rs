@@ -415,6 +415,9 @@ enum ResourceSubCommand {
         /// Validate the running daemon's stored records using this binary's schema
         #[arg(long)]
         from_daemon: bool,
+        /// Resolve every CrewDefaults role and Project against this candidate skill catalog
+        #[arg(long)]
+        skill_catalog: Option<PathBuf>,
         /// Read a peer's forwarded resource socket instead of the local daemon
         #[arg(long, requires = "from_daemon")]
         host: Option<String>,
@@ -1719,7 +1722,7 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     match command {
-        ResourceSubCommand::Validate { path, from_daemon, host } => {
+        ResourceSubCommand::Validate { path, from_daemon, host, skill_catalog } => {
             if from_daemon {
                 let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
                 let socket = if let Some(host) = host {
@@ -1730,9 +1733,9 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket).await.map(|_| ())
+                resource_validate::validate_daemon(&socket, skill_catalog.as_deref()).await.map(|_| ())
             } else {
-                resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"))
+                resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"), skill_catalog.as_deref())
             }
         }
         ResourceSubCommand::List(args) => {
@@ -3254,12 +3257,12 @@ mod tests {
         let file = Cli::try_parse_from(["flotilla", "resource", "validate", "resource.yaml"]).expect("path validation should parse");
         assert!(matches!(
             file.command,
-            Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: Some(_), from_daemon: false, host: None } })
+            Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: Some(_), from_daemon: false, host: None, .. } })
         ));
         let daemon = Cli::try_parse_from(["flotilla", "resource", "validate", "--from-daemon", "--host", "feta"])
             .expect("peer validation should parse");
         assert!(
-            matches!(daemon.command, Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: true, host: Some(host) } }) if host == "feta")
+            matches!(daemon.command, Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: true, host: Some(host), .. } }) if host == "feta")
         );
         for args in [vec!["flotilla", "resource", "validate"], vec!["flotilla", "resource", "validate", "--host", "feta"], vec![
             "flotilla",

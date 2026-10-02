@@ -479,6 +479,7 @@ mod tests {
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
                 platform_matrix: Vec::new(),
                 role_needs: Default::default(),
+                skills: BTreeMap::new(),
                 display_name: "Widgets".to_string(),
                 default_workflow_ref: "implement".to_string(),
                 supervision: None,

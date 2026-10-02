@@ -17,10 +17,13 @@ fn deployed_stored_records_still_decode() {
             continue;
         }
         generation_count += 1;
-        // ManifestRoot was introduced after this deployed generation; the corpus
+        // ManifestRoot and CrewDefaults were introduced after this deployed generation; the corpus
         // is refreshed only after the next fleet roll (ADR 0047).
-        let expected: BTreeSet<_> =
-            REGISTERED_RESOURCE_KINDS.iter().filter(|kind| kind.kind != "ManifestRoot").map(|kind| format!("{}.json", kind.kind)).collect();
+        let expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
+            .iter()
+            .filter(|kind| !matches!(kind.kind, "ManifestRoot" | "CrewDefaults"))
+            .map(|kind| format!("{}.json", kind.kind))
+            .collect();
         let actual: BTreeSet<_> = fs::read_dir(&generation)
             .expect("read generation")
             .map(|entry| entry.expect("read corpus file").file_name().into_string().expect("UTF-8 corpus file name"))
@@ -28,7 +31,7 @@ fn deployed_stored_records_still_decode() {
         assert_eq!(actual, expected, "{} must cover every registered resource kind", generation.display());
         let mut document_count = 0;
         let mut status_count = 0;
-        for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| kind.kind != "ManifestRoot") {
+        for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| !matches!(kind.kind, "ManifestRoot" | "CrewDefaults")) {
             let file = generation.join(format!("{}.json", kind.kind));
             let content = fs::read_to_string(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
             let documents: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|error| panic!("{}: {error}", file.display()));

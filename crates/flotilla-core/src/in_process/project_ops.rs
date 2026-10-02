@@ -67,6 +67,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
         display_name,
         default_workflow_ref: "single-agent".to_string(),
         role_needs: BTreeMap::new(),
+        skills: BTreeMap::new(),
         supervision: None,
         issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
@@ -407,6 +408,7 @@ impl ProjectService<'_> {
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent".to_string()),
             role_needs: declaration.role_needs,
+            skills: declaration.skills,
             platform_matrix: declaration.platform_matrix,
             supervision: existing_project.as_ref().and_then(|project| project.spec.supervision.clone()),
             issue_source_bindings: Vec::new(),

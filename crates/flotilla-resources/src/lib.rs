@@ -14,6 +14,11 @@ mod controller_retry;
 mod convoy;
 mod convoy_ensure;
 mod credential;
+pub mod crew_defaults;
+pub use crew_defaults::{
+    resolve_skills, skill_layers, validate_skill_ref, CrewDefaults, CrewDefaultsSpec, ResolvedSkills, SkillCatalogEntry, SkillDecision,
+    SkillLayer, SkillOutcome, SkillRefusal,
+};
 mod crew_image_baseline;
 mod definition;
 mod dispatch_observation;
@@ -217,6 +222,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::CrewImageBaseline>($($argument),*);
+        $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);

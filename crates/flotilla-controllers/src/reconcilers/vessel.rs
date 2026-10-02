@@ -496,7 +496,17 @@ impl Reconciler for VesselReconciler {
                                     pull_policy: *pull_policy,
                                     mounts: Vec::new(),
                                     env: environment_with_credentials(
-                                        env.clone(),
+                                        {
+                                            let mut env = env.clone();
+                                            env.insert(
+                                                "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                                                serde_json::to_string(
+                                                    &requirement.crew.iter().flat_map(|crew| &crew.skills.selected).collect::<Vec<_>>(),
+                                                )
+                                                .expect("serialize resolved skills"),
+                                            );
+                                            env
+                                        },
                                         &requirement.credential_refs,
                                         &requirement.credential_scopes,
                                         &requirement.credential_permissions,
@@ -894,7 +904,17 @@ impl Reconciler for VesselReconciler {
                                     pull_policy: *pull_policy,
                                     mounts,
                                     env: environment_with_credentials(
-                                        env.clone(),
+                                        {
+                                            let mut env = env.clone();
+                                            env.insert(
+                                                "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                                                serde_json::to_string(
+                                                    &requirement.crew.iter().flat_map(|crew| &crew.skills.selected).collect::<Vec<_>>(),
+                                                )
+                                                .expect("serialize resolved skills"),
+                                            );
+                                            env
+                                        },
                                         &requirement.credential_refs,
                                         &requirement.credential_scopes,
                                         &requirement.credential_permissions,

@@ -88,6 +88,19 @@ while [ "$#" -gt 0 ]; do
     shift
     path_count=$((path_count - 1))
   done
+  selected_file="$sources/$name.selected"
+  selected_count=$1
+  shift
+  : >"$selected_file"
+  while [ "$selected_count" -gt 0 ]; do
+    printf '%s\t%s\n' "$1" "$2" >>"$selected_file"
+    shift 2
+    selected_count=$((selected_count - 1))
+  done
+  if [ ! -s "$selected_file" ]; then
+    if [ -n "$token_file" ]; then token_files="$token_files $token_file"; fi
+    continue
+  fi
   if [ -n "$token_file" ]; then
     token_files="$token_files $token_file"
     marker="$token_file.in-use.$$"
@@ -204,18 +217,25 @@ while [ "$#" -gt 0 ]; do
       echo "${diagnostic_prefix}skill source $name declared path $path has no SKILL.md at pinned revision $revision" >&2
       exit 1
     fi
-    while IFS= read -r skill_file; do
-      skill_dir=${skill_file%/SKILL.md}
-      skill_name=${skill_dir##*/}
-      target="$staged/$skill_name"
-      if [ -e "$target" ]; then
-        echo "${diagnostic_prefix}duplicate skill name $skill_name from $repository" >&2
-        exit 1
-      fi
-      mkdir -p "$target"
-      cp -R "$skill_dir"/. "$target"/
-    done <"$sources/skill-files"
   done <"$paths_file"
+  # Frontmatter names and source-relative directories were resolved from this
+  # exact pin when the catalog was produced. Install those facts, never rediscover
+  # by directory basename or union in other available skills at provisioning.
+  tab=$(printf '\t')
+  while IFS="$tab" read -r skill_name skill_path; do
+    skill_dir="$checkout/$skill_path"
+    if [ ! -f "$skill_dir/SKILL.md" ]; then
+      echo "${diagnostic_prefix}selected skill $skill_name missing from $repository at $skill_path" >&2
+      exit 1
+    fi
+    target="$staged/$skill_name"
+    if [ -e "$target" ]; then
+      echo "${diagnostic_prefix}duplicate skill name $skill_name from $repository" >&2
+      exit 1
+    fi
+    mkdir -p "$target"
+    cp -R "$skill_dir"/. "$target"/
+  done <"$selected_file"
 done
 cp "$manifest" "$staged/.flotilla-sources.json"
 rm -rf "$destination"

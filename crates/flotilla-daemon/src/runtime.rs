@@ -4300,6 +4300,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         if let Some(agent_material) = &self.state.agent_material {
             let mut environment = resolved_agent_environment.environment.clone();
             environment.extend(delivered_credential_environment.iter().cloned());
+            if let Some(selection) = spec.env.get("FLOTILLA_RESOLVED_SKILLS") {
+                environment.push(("FLOTILLA_RESOLVED_SKILLS".to_string(), selection.clone()));
+            }
             let mut source_token_files = BTreeMap::new();
             let will_stage_skills =
                 match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
@@ -4316,7 +4319,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     }
                 };
             if will_stage_skills {
-                let requests = match agent_material.skill_source_credentials().await {
+                let requests = match agent_material.selected_skill_source_credentials(&environment).await {
                     Ok(requests) => requests,
                     Err(error) => {
                         return Err(discard_failed_environment(
@@ -8034,10 +8037,21 @@ mod tests {
             required_agent_adapters: BTreeSet::from(["claude-code".to_string()]),
             pull_policy: Default::default(),
             mounts: Vec::new(),
-            env: BTreeMap::from([(
-                CREDENTIAL_REFS_ENV.to_string(),
-                serde_json::to_string(&credential_refs).expect("encode credential refs"),
-            )]),
+            // Intended: provisioning mints only the explicitly selected source's token.
+            env: BTreeMap::from([
+                (CREDENTIAL_REFS_ENV.to_string(), serde_json::to_string(&credential_refs).expect("encode credential refs")),
+                (
+                    "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                    serde_json::to_string(&vec![flotilla_resources::SkillCatalogEntry {
+                        source: "mattpocock-skills".to_string(),
+                        repository: "flotilla-org/mattpocock-skills".to_string(),
+                        revision: "1".repeat(40),
+                        name: "research".to_string(),
+                        path: "skills/research".to_string(),
+                    }])
+                    .expect("encode frozen skill selection"),
+                ),
+            ]),
         };
 
         DockerControllerRuntime { state }.provision("contained-claude", &spec).await.expect("provision Claude vessel");

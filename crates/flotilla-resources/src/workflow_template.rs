@@ -382,6 +382,10 @@ impl std::fmt::Display for Stance {
 #[serde(from = "CrewSpecRecord")]
 pub struct CrewSpec {
     pub role: String,
+    // Decoder default for pre-selection snapshots; remove after one roll.
+    #[builder(default)]
+    #[serde(default)]
+    pub skills: crate::ResolvedSkills,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub needs: BTreeSet<CapabilityNeed>,
@@ -401,6 +405,8 @@ pub struct CrewSpec {
 #[derive(Deserialize)]
 struct CrewSpecRecord {
     role: String,
+    #[serde(default)]
+    skills: crate::ResolvedSkills,
     #[serde(default)]
     needs: BTreeSet<CapabilityNeed>,
     #[serde(flatten)]
@@ -422,7 +428,14 @@ impl From<CrewSpecRecord> for CrewSpec {
                 condition => condition,
             })
             .collect();
-        Self { role: record.role, needs: record.needs, source: record.source, completion_conditions, labels: record.labels }
+        Self {
+            role: record.role,
+            skills: record.skills,
+            needs: record.needs,
+            source: record.source,
+            completion_conditions,
+            labels: record.labels,
+        }
     }
 }
 

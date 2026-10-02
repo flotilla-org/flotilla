@@ -346,6 +346,8 @@ pub struct ConvoyExplanation {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub role_needs: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub skills: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allocation: Vec<ExplainedAllocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -552,6 +554,9 @@ pub struct ConvoyStartIntent {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_overrides: Vec<AgentOverride>,
+    #[builder(default)]
+    #[serde(default)]
+    pub skills: Vec<String>,
     #[builder(default)]
     #[serde(default)]
     pub auto_attach: ConvoyAutoAttach,

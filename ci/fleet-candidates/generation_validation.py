@@ -125,7 +125,8 @@ def validate_skill_bundle(document, sources):
     return entries
 
 
-def validate_skill_source_paths(document):
+def validate_skill_source_paths(document, catalog_output=None):
+    catalog = []
     entries = document.get("sources") if isinstance(document, dict) else None
     pins = {source.get("name"): source.get("revision") for source in entries or [] if isinstance(source, dict)}
     if set(pins) != set(SOURCE_NAMES):
@@ -155,7 +156,15 @@ def validate_skill_source_paths(document):
             git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/usr/bin/false", GCM_INTERACTIVE="never")
             for command, stdin in commands:
                 if command[0] == "git":
-                    command = command[:1] + ("-c", "credential.helper=") + command[1:]
+                    config = ("-c", "credential.helper=")
+                    # Catalog production must authenticate private sources with an
+                    # explicit one-shot read credential, never an ambient helper.
+                    if catalog_output is not None and source.get("credential"):
+                        if not os.environ.get("GH_TOKEN") and not os.environ.get("GITHUB_TOKEN_FILE"):
+                            raise ValidationError(f"catalog source {name} needs injected read credentials")
+                        helper = '!f() { [ "$1" = get ] || exit 0; token="$GH_TOKEN"; if [ -n "$GITHUB_TOKEN_FILE" ]; then IFS= read -r token <"$GITHUB_TOKEN_FILE" || :; fi; [ -n "$token" ] || exit 1; printf "username=x-access-token\\npassword=%s\\n" "$token"; }; f'
+                        config += ("-c", f"credential.helper={helper}")
+                    command = command[:1] + config + command[1:]
                 try:
                     subprocess.run(command, input=stdin, text=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_env)
                 except subprocess.CalledProcessError as error:
@@ -175,6 +184,8 @@ def validate_skill_source_paths(document):
                         break
                     raise ValidationError(f"skill source {name} at pinned revision {revision} could not be fetched: {detail}") from error
             if skipped:
+                if catalog_output is not None:
+                    raise ValidationError(f"skill catalog requires credentialed verification of {name}")
                 continue
             resolved = subprocess.run(("git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"), text=True,
                                       check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
@@ -186,6 +197,34 @@ def validate_skill_source_paths(document):
                     raise ValidationError(f"skill source {name} declared path {declared_path} is missing at pinned revision {revision}")
                 if not any(path.rglob("SKILL.md")):
                     raise ValidationError(f"skill source {name} declared path {declared_path} has no SKILL.md at pinned revision {revision}")
+                if catalog_output is None:
+                    continue
+                for skill_file in sorted(path.rglob("SKILL.md")):
+                    if not skill_file.resolve().is_relative_to(checkout.resolve()):
+                        raise ValidationError(f"skill escapes source checkout: {skill_file}")
+                    lines = skill_file.read_text().splitlines()
+                    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+                        raise ValidationError(f"skill lacks frontmatter: {skill_file}")
+                    fields = lines[1:lines[1:].index("---") + 1]
+                    names = [line.split(":", 1)[1].split("#", 1)[0].strip().strip("\"'") for line in fields if line.startswith("name:")]
+                    if len(names) != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", names[0]):
+                        raise ValidationError(f"invalid skill frontmatter name: {skill_file}")
+                    from urllib.parse import urlparse
+                    repo = urlparse(source["repository"]).path.strip("/").removesuffix(".git")
+                    if "://" not in source["repository"] and ":" in source["repository"]:
+                        repo = source["repository"].split(":", 1)[1].strip("/").removesuffix(".git")
+                    if len(repo.split("/")) != 2:
+                        raise ValidationError(f"skill repository must have owner/repo identity: {source['repository']}")
+                    if any(character in str(skill_file.parent.relative_to(checkout)) for character in "\r\n\t"):
+                        raise ValidationError(f"unsafe skill catalog path: {skill_file}")
+                    entry = {"source": name, "repository": repo, "revision": revision, "name": names[0],
+                             "path": str(skill_file.parent.relative_to(checkout))}
+                    if entry in catalog:
+                        continue
+                    catalog.append(entry)
+    if catalog_output is not None:
+        Path(catalog_output).write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
+
 
 
 def validate_codex_home_template(root):
@@ -354,6 +393,7 @@ def main():
     fixture.add_argument("path")
     skill_sources = sub.add_parser("skill-sources")
     skill_sources.add_argument("manifest")
+    skill_sources.add_argument("--catalog-output")
     codex_home = sub.add_parser("codex-home")
     codex_home.add_argument("root")
     args = parser.parse_args()
@@ -361,7 +401,7 @@ def main():
         if args.command == "fixture":
             validate_fixture(args.path)
         elif args.command == "skill-sources":
-            validate_skill_source_paths(json.loads(Path(args.manifest).read_text()))
+            validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)
         elif args.command == "codex-home":
             validate_codex_home_template(args.root)
         else:

@@ -906,6 +906,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Missing repository".into(),
             default_workflow_ref: "wf".into(),
             supervision: None,
@@ -1901,6 +1902,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -1979,6 +1981,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Zellij".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -2016,6 +2019,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    skills: Vec::new(),
                     auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             })
@@ -2110,6 +2114,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".to_string(),
             default_workflow_ref: "single-agent".to_string(),
             supervision: None,
@@ -2145,6 +2150,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3008,6 +3014,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -3046,6 +3053,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3075,6 +3083,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3132,6 +3141,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -3167,6 +3177,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3257,6 +3268,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -3304,6 +3316,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                             needs: Vec::new(),
                             escalation_reason: None,
                             agent_overrides: Vec::new(),
+                            skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     })
@@ -3347,6 +3360,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3408,6 +3422,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -3455,6 +3470,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3539,6 +3555,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                             needs: Vec::new(),
                             escalation_reason: None,
                             agent_overrides: Vec::new(),
+                            skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     })
@@ -3575,6 +3592,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3604,6 +3622,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 })
@@ -3649,6 +3668,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3696,6 +3716,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3729,6 +3750,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Explicit workflow".into(),
             default_workflow_ref: "missing-default".into(),
             supervision: None,
@@ -3780,6 +3802,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3822,6 +3845,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3864,6 +3888,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -3918,6 +3943,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent".into(),
             supervision: None,
@@ -3953,6 +3979,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                     }),
                 })
@@ -4346,6 +4373,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                                 needs: Vec::new(),
                                 escalation_reason: None,
                                 agent_overrides: Vec::new(),
+                                skills: Vec::new(),
                                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                             }),
                         })
@@ -4412,6 +4440,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 needs: Vec::new(),
                 escalation_reason: None,
                 agent_overrides: Vec::new(),
+                skills: Vec::new(),
                 auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
         })
@@ -4505,6 +4534,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
                     }),
                 })
@@ -5833,6 +5863,7 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "repo suite".to_string(),
             default_workflow_ref: "single-agent".to_string(),
             supervision: None,
@@ -6051,6 +6082,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent".to_string(),
             supervision: None,
@@ -6280,6 +6312,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "ghostty".to_string(),
             default_workflow_ref: "single-agent".to_string(),
             supervision: None,

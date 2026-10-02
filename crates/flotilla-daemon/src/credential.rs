@@ -2397,7 +2397,7 @@ mod tests {
                     .await
                     .map_err(|error| format!("skill source private-skills credential github-skills-fork mint failed: {error}"))?;
                 let outcome = registry
-                    .stage_skills(
+                    .stage_test_skills(
                         &format!("crew-{index}"),
                         &BTreeSet::from(["claude-code".to_string()]),
                         &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],

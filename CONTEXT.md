@@ -156,6 +156,15 @@ phases — hull-prep (at rest) and crew-launch (runtime). Verbs: prepare,
 launch, deliver_brief, re_prompt, stance.
 _Avoid_: Provider (that is the Fleet Observer's word), driver, plugin.
 
+**Crew defaults**:
+Standing, role-specific choices shared across a fleet. A project's choices and
+a dispatcher's explicit choices can add to them or explicitly remove them.
+
+**Skill selection**:
+The exact set of skills a crew is given, resolved from its declared choices when
+work is admitted. Its provenance includes additions, removals, and warnings.
+_Avoid_: skill requirement (selection is an import, not a capability need)
+
 **CrewSpec**:
 The normalised, harness-agnostic declaration of one crew member — role, agent
 selector, model tier, brief ref, skills, credential names — that a Leg's

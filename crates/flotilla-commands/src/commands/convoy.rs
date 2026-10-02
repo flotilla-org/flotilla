@@ -118,6 +118,9 @@ pub enum ConvoyVerb {
         /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
         #[arg(long = "agent", value_parser = parse_agent_override)]
         agent_overrides: Vec<AgentOverride>,
+        /// Explicit skill import or -name removal (repeatable)
+        #[arg(long = "skill", allow_hyphen_values = true)]
+        skills: Vec<String>,
         /// Create the convoy without attaching the caller to its first crew session
         #[arg(long, conflicts_with = "attach")]
         no_attach: bool,
@@ -332,6 +335,7 @@ impl ConvoyNoun {
                 needs,
                 escalation_reason,
                 agent_overrides,
+                skills,
                 no_attach,
                 attach,
             } => {
@@ -380,6 +384,7 @@ impl ConvoyNoun {
                                 needs,
                                 escalation_reason,
                                 agent_overrides,
+                                skills,
                                 auto_attach: match (attach, no_attach) {
                                     (true, false) => ConvoyAutoAttach::Always,
                                     (false, true) => ConvoyAutoAttach::Never,
@@ -416,6 +421,7 @@ impl ConvoyNoun {
                                     needs: Vec::new(),
                                     escalation_reason: None,
                                     agent_overrides: Vec::new(),
+                                    skills: Vec::new(),
                                     auto_attach: ConvoyAutoAttach::Never,
                                 }),
                             },
@@ -516,6 +522,7 @@ impl std::fmt::Display for ConvoyNoun {
                 needs,
                 escalation_reason,
                 agent_overrides,
+                skills,
                 no_attach,
                 attach,
             } => {
@@ -555,6 +562,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 if let Some(reason) = escalation_reason {
                     write!(f, " --escalation-reason {}", quote_value(reason))?;
+                }
+                for skill in skills {
+                    write!(f, " --skill {}", quote_value(skill))?;
                 }
                 for choice in agent_overrides {
                     let model = choice.model.as_ref().map(|model| format!(":{model}")).unwrap_or_default();
@@ -858,6 +868,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
             },
@@ -889,6 +900,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
             },
@@ -918,6 +930,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Default,
                 }),
             },
@@ -956,6 +969,7 @@ mod tests {
                     needs: Vec::new(),
                     escalation_reason: None,
                     agent_overrides: Vec::new(),
+                    skills: Vec::new(),
                     auto_attach: ConvoyAutoAttach::Never,
                 }),
             },
@@ -1069,6 +1083,7 @@ mod tests {
                 needs: Vec::new(),
                 escalation_reason: None,
                 agent_overrides: Vec::new(),
+                skills: Vec::new(),
                 auto_attach: ConvoyAutoAttach::Never,
             }),
         });
@@ -1163,5 +1178,16 @@ mod tests {
         let displayed = parsed.to_string();
         assert!(displayed.contains("--input \"topic=my work\""), "expected quoted input in {displayed:?}");
         assert!(displayed.contains("--repo \"https://example.com/path with space.git\""), "expected quoted repo in {displayed:?}");
+    }
+    #[test]
+    fn explicit_skills_round_trip_into_the_dispatch_intent() {
+        // Intended: repeated --skill preserves order, including explicit removal.
+        let args = ["convoy", "start", "--project", "demo", "--skill", "a/b@testing", "--skill", "-research"];
+        assert_round_trip::<ConvoyNoun>(&args);
+        let resolved = parse(&args).resolve().expect("resolve skills");
+        let Resolved::NeedsContext { command: Command { action: CommandAction::ConvoyStart { intent }, .. }, .. } = resolved else {
+            panic!("start intent");
+        };
+        assert_eq!(intent.skills, ["a/b@testing", "-research"]);
     }
 }

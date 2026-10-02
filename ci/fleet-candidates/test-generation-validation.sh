@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fixtures="$root/fixtures"
+python3 "$root/test_skill_catalog.py"
 tools=(
   "$root/lab-fleet-promote"
   "$root/lab-fleet-finalize-darwin"
