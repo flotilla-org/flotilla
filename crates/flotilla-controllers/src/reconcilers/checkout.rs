@@ -449,6 +449,17 @@ where
             CheckoutSpec::Observed(_) => return Ok(()),
         };
         let outcome = if matches!(removal, CheckoutRemoval::ForcedWorktree { .. } | CheckoutRemoval::LandedWorktree { .. }) {
+            // A deleted Checkout can disappear before its completed task is collected.
+            // Reclaim those slots without discarding results for live resources.
+            let finished = {
+                let finalizers = self.finalizers.lock().await;
+                finalizers.iter().filter(|(_, handle)| handle.is_finished()).map(|(name, _)| name.clone()).collect::<Vec<_>>()
+            };
+            for finished_name in finished {
+                if matches!(self.checkouts.get(&finished_name).await, Err(ResourceError::NotFound { .. })) {
+                    self.finalizers.lock().await.remove(&finished_name);
+                }
+            }
             let mut finalizers = self.finalizers.lock().await;
             let name = obj.metadata.name.clone();
             match finalizers.get(&name) {

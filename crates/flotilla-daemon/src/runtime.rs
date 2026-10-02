@@ -580,6 +580,7 @@ impl DaemonRuntime {
         }];
         match config.load_observation_roots() {
             Ok(roots) => {
+                // Observed roots are checkout paths; worktree archives live beside their parent clones.
                 archive_roots.extend(roots.into_iter().filter_map(|root| {
                     root.as_path().parent().map(|parent| CheckoutArchiveRoot {
                         env_ref: host_direct_environment_name.clone(),
@@ -648,18 +649,14 @@ impl DaemonRuntime {
                 config.state_dir().as_path().join("probe-cwd"),
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
-            tokio::spawn(run_artifact_gc(
-                daemon.resource_backend(),
-                options.namespace.clone(),
-                Arc::clone(&blob_store),
-                CheckoutArchiveSweep {
-                    daemon: Arc::clone(&daemon),
-                    catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
-                    host_direct_environment_name,
-                    roots: archive_roots,
-                    retention_days: daemon_config.checkout_archive_retention_days,
-                },
-            )),
+            tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
+            tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), options.namespace.clone(), CheckoutArchiveSweep {
+                daemon: Arc::clone(&daemon),
+                catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
+                host_direct_environment_name,
+                roots: archive_roots,
+                retention_days: daemon_config.checkout_archive_retention_days,
+            })),
             spawn_blob_sync_status_task(
                 Arc::clone(&blob_store),
                 daemon.resource_backend(),
@@ -853,7 +850,7 @@ async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<CheckoutArc
     }
 }
 
-async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>, archive_sweep: CheckoutArchiveSweep) {
+async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc<TieredBlobStore>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -867,6 +864,14 @@ async fn run_artifact_gc(backend: ResourceBackend, namespace: String, blobs: Arc
             }
             Err(error) => warn!(%error, "artifact retention sweep failed"),
         }
+    }
+}
+
+async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, archive_sweep: CheckoutArchiveSweep) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
         {
             let mut roots = archive_sweep.roots.iter().cloned().collect::<BTreeSet<_>>();
             match load_checkout_archive_roots(&archive_sweep.catalog_path).await {
@@ -1478,8 +1483,15 @@ impl ControllerRuntimeState {
             .map_err(|error| format!("create checkout archive catalog parent: {error}"))?;
         let temporary = catalog.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         let bytes = serde_json::to_vec(&roots).map_err(|error| format!("encode checkout archive catalog: {error}"))?;
-        tokio::fs::write(&temporary, bytes).await.map_err(|error| format!("write checkout archive catalog: {error}"))?;
-        tokio::fs::rename(&temporary, &catalog).await.map_err(|error| format!("replace checkout archive catalog: {error}"))?;
+        let write_result = async {
+            tokio::fs::write(&temporary, bytes).await.map_err(|error| format!("write checkout archive catalog: {error}"))?;
+            tokio::fs::rename(&temporary, &catalog).await.map_err(|error| format!("replace checkout archive catalog: {error}"))
+        }
+        .await;
+        if write_result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        write_result?;
         Ok(())
     }
 
@@ -4799,7 +4811,9 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
-        self.state.register_checkout_archive_roots(env_ref, removal).await?;
+        if let Err(error) = self.state.register_checkout_archive_roots(env_ref, removal).await {
+            warn!(%error, "could not record checkout archive root for retention sweep");
+        }
         self.runtime_for(env_ref, removal_source_path(removal)).await?.remove_checkout(removal).await
     }
 }
