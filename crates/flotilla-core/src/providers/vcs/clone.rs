@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
-    vcs::{CheckoutMaterialisation, VcsBackend},
+    vcs::{CheckoutMaterialisation, GitCliBackend, VcsBackend},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -72,7 +72,7 @@ impl ReferenceCloneStrategy {
         let reference_dir = self.ref_dir_str()?;
         let target_path = std::path::Path::new(target);
         if self.runner.path_exists(target_path).await? {
-            let backend = crate::vcs::GitCliBackend::explicit_checkout(target_path, &*self.runner);
+            let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
             if backend.current_branch().await?.trim() != branch {
                 return Err(format!("checkout target {target} already exists on a different branch"));
             }
@@ -137,7 +137,7 @@ impl ReferenceCloneStrategy {
                 .await?;
             CheckoutBranchProvenance::CreatedForConvoy
         };
-        let backend = crate::vcs::GitCliBackend::explicit_checkout(target_path, &*self.runner);
+        let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
         let commit = backend.head_commit_text().await?.trim().to_string();
         if provenance == CheckoutBranchProvenance::CreatedForConvoy {
             self.runner

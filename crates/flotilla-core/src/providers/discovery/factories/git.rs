@@ -47,6 +47,10 @@ impl Factory for GitVcsFactory {
             let checkout_config = config.resolve_checkout_config(repo_root);
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(checkout_config.path, Arc::clone(&runner))))
         };
+        // Despite its name, repo_root can be an inspection subdirectory: the
+        // CheckoutVcsResolver constructs this provider before resolving the top level.
+        // Preserve Git discovery, including bare repositories; target probes use
+        // GitCliBackend::checkout_root separately.
         Ok(Arc::new(FlotillaVcs::new(repo_root.clone(), runner, strategy)))
     }
 }

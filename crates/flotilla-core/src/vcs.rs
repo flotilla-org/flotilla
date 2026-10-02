@@ -698,6 +698,9 @@ pub struct FlotillaVcs {
 }
 
 impl FlotillaVcs {
+    /// Address a repository through Git discovery: `checkout` may be a subdirectory
+    /// or a bare repository. Factory callers include repository inspection before
+    /// the non-bare top-level path is known, so this is not an exact-root contract.
     pub fn new(checkout: ExecutionEnvironmentPath, runner: Arc<dyn CommandRunner>, strategy: GitCheckoutStrategy) -> Self {
         Self { checkout, runner, strategy, explicit_checkout: false }
     }
@@ -756,6 +759,8 @@ impl FlotillaVcs {
         backend.with_strategy(&self.strategy)
     }
 
+    // The base provider has the same discovery contract for controller operations.
+    // Explicit -C keeps transport cwd independent; it does not assert a checkout root.
     fn controller_cli(&self) -> GitCliBackend<'_> {
         GitCliBackend::explicit_checkout(self.checkout.as_path(), &*self.runner).with_strategy(&self.strategy)
     }
@@ -2037,6 +2042,61 @@ mod tests {
             .await
             .expect("detached worktree");
         session.finish();
+    }
+
+    // Base providers intentionally discover enclosing repositories from subdirectories
+    // and accept bare repositories. Exact target addressing must reject both.
+    // Exhaustive addressing-mode matrix: directory, linked .git file, subdirectory,
+    // and nested bare repository, using real Git because its discovery is the contract.
+    #[tokio::test]
+    async fn base_repository_discovery_and_exact_checkout_roots_have_distinct_contracts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let subdir = root.join("subdir");
+        std::fs::create_dir(&subdir).expect("subdirectory");
+        let bare = root.join("bare.git");
+        git(root, &["clone", "--bare", ".", bare.to_str().expect("bare path")]);
+        let linked = root.join("linked");
+        git(root, &["worktree", "add", "-b", "linked", linked.to_str().expect("linked path")]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        for (path, branch, exact) in
+            [(root, "main", true), (linked.as_path(), "linked", true), (subdir.as_path(), "main", false), (bare.as_path(), "main", false)]
+        {
+            for explicit in [false, true] {
+                let provider = test_fl(path, Arc::clone(&runner), explicit);
+                assert_eq!(provider.current_branch().await.expect("provider discovery").trim(), branch);
+                assert_eq!(provider.controller_cli().current_branch().await.expect("controller discovery").trim(), branch);
+            }
+            let target_branch = GitCliBackend::checkout_root(path, &*runner).current_branch().await;
+            if exact {
+                assert_eq!(target_branch.expect("exact checkout").trim(), branch);
+            } else {
+                assert!(target_branch.is_err(), "exact addressing must not discover {path:?}");
+            }
+        }
+    }
+
+    // Reusing a reference-clone target requires its own .git entry; a missing
+    // entry beneath a valid enclosing repository must never adopt the parent's branch.
+    #[tokio::test]
+    async fn reference_clone_materialisation_rejects_missing_git_entry_under_enclosing_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let target = root.join("stale-target");
+        std::fs::create_dir(&target).expect("stale target");
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let strategy = GitCheckoutStrategy::ReferenceClone(ReferenceCloneStrategy::new(
+            Arc::clone(&runner),
+            ExecutionEnvironmentPath::new(root.join(".git")),
+        ));
+        let provider = FlotillaVcs::new(ExecutionEnvironmentPath::new(root), runner, strategy);
+        assert!(provider.materialise_checkout("main", None, target.to_str().expect("target path")).await.is_err());
+        assert!(!target.join(".git").exists(), "failed adoption must leave the target untouched");
+        assert_eq!(provider.current_branch().await.expect("parent branch").trim(), "main");
     }
 
     #[tokio::test]
