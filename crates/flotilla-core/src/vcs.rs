@@ -2044,10 +2044,10 @@ mod tests {
         session.finish();
     }
 
-    // Base providers intentionally discover enclosing repositories from subdirectories
-    // and accept bare repositories. Exact target addressing must reject both.
-    // Exhaustive addressing-mode matrix: directory, linked .git file, subdirectory,
-    // and nested bare repository, using real Git because its discovery is the contract.
+    // Base providers discover enclosing repositories from subdirectories and accept bare
+    // repositories, while exact target addressing rejects both. This exhaustive matrix
+    // covers directory roots, linked .git files, subdirectories, and nested bare repositories
+    // using real Git because its discovery behavior is the contract.
     #[tokio::test]
     async fn base_repository_discovery_and_exact_checkout_roots_have_distinct_contracts() {
         let dir = tempfile::tempdir().expect("tempdir");
