@@ -80,7 +80,7 @@ pub enum SupervisionTarget {
     Operator,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct StallNudgePolicy {
     /// Maximum nudges for one unmet actor obligation (the historical field name is retained).

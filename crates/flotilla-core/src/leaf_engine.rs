@@ -143,19 +143,22 @@ fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
 }
 
 const DEFAULT_REFUSAL_LIMIT: u32 = 2;
+const DEFAULT_IDLE_GRACE_SECONDS: u32 = 180;
+
+fn nudge_policy<'a>(status: &'a ConvoyStatus, vessel: &str, role: &str) -> Option<&'a flotilla_resources::StallNudgePolicy> {
+    status.workflow_snapshot.as_ref()?.stall_nudges.get(&format!("{vessel}/{role}"))
+}
+
+fn idle_grace_seconds(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
+    nudge_policy(status, vessel, role).and_then(|policy| policy.idle_grace_seconds).unwrap_or(DEFAULT_IDLE_GRACE_SECONDS)
+}
 
 fn is_conflict_probe(leaf: &Leaf) -> bool {
     leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
 }
 
 fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
-    status
-        .workflow_snapshot
-        .as_ref()
-        .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
-        .and_then(|policy| policy.max_refusals)
-        .unwrap_or(DEFAULT_REFUSAL_LIMIT)
-        .max(1)
+    nudge_policy(status, vessel, role).and_then(|policy| policy.max_refusals).unwrap_or(DEFAULT_REFUSAL_LIMIT).max(1)
 }
 
 impl LeafSubscriptionTable {
@@ -921,13 +924,15 @@ impl ReconcilerWake {
                                 obligation.quiet_since = None;
                             }
                         }
-                        flotilla_resources::apply_status_patch(
-                            &backend.clone().using::<Convoy>(namespace),
-                            &convoy.metadata.name,
-                            &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
+                        if status.nudge_obligations != obligations {
+                            flotilla_resources::apply_status_patch(
+                                &backend.clone().using::<Convoy>(namespace),
+                                &convoy.metadata.name,
+                                &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        }
                         flotilla_resources::apply_status_patch(
                             &backend.clone().using::<Convoy>(namespace),
                             &convoy.metadata.name,
@@ -1010,10 +1015,7 @@ impl ReconcilerWake {
                         let mut progress = BTreeMap::new();
                         for checkout in selected_checkouts.values() {
                             if checkout_refs.contains(&checkout.metadata.name) {
-                                if let Some(commit) = checkout
-                                    .status
-                                    .as_ref()
-                                    .and_then(|status| status.integration.head_revision.as_ref().or(status.commit.as_ref()))
+                                if let Some(commit) = checkout.status.as_ref().and_then(|status| status.integration.head_revision.as_ref())
                                 {
                                     progress.insert(format!("checkout/{}", checkout.metadata.name), commit.clone());
                                 }
@@ -1105,14 +1107,7 @@ impl ReconcilerWake {
                         let awaiting_reply_observation = obligation.reply_after.is_some_and(|after| {
                             session_status.and_then(|status| status.attention.as_ref()).is_none_or(|attention| attention.as_of <= after)
                         });
-                        let idle_grace = chrono::Duration::seconds(i64::from(
-                            status
-                                .workflow_snapshot
-                                .as_ref()
-                                .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
-                                .and_then(|policy| policy.idle_grace_seconds)
-                                .unwrap_or(180),
-                        ));
+                        let idle_grace = chrono::Duration::seconds(i64::from(idle_grace_seconds(status, vessel, role)));
                         let lost_reason = session
                             .and_then(|session| session.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Lost)
@@ -1450,17 +1445,9 @@ impl ReconcilerWake {
                             refusal.map_or("", |refusal| refusal.expectation.as_str())
                         );
                     } else if idle_at.is_some() && declared.is_none() && !resume_grace {
-                        let limit = status
-                            .workflow_snapshot
-                            .as_ref()
-                            .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
-                            .map_or(2, |policy| policy.max_per_episode) as usize;
-                        let grace_seconds = status
-                            .workflow_snapshot
-                            .as_ref()
-                            .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
-                            .and_then(|policy| policy.idle_grace_seconds)
-                            .unwrap_or(180);
+                        let limit = nudge_policy(status, vessel, role).map_or(2, |policy| policy.max_per_episode) as usize;
+                        let grace_seconds = idle_grace_seconds(status, vessel, role);
+                        // Initial grace is 1x; intervals after delivered nudges are 1x, 2x, 4x, ...
                         let backoff = chrono::Duration::seconds(
                             i64::from(grace_seconds.max(1))
                                 .saturating_mul(1_i64 << condition.nudge_history.len().saturating_sub(1).min(20)),
@@ -2612,7 +2599,7 @@ mod tests {
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
         convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("working crew");
         let sessions = backend.clone().using::<TerminalSession>("flotilla");
-        let session = sessions
+        sessions
             .create(
                 &InputMeta::builder()
                     .name("resumed-coder".into())
@@ -2638,13 +2625,7 @@ mod tests {
                             convoy: "stalled-work".into(),
                             vessel_ref: "work".into(),
                         }),
-                        message: Some(flotilla_resources::TerminalCrewMessage {
-                            id: "resume-brief".into(),
-                            text: "Continue with the operator's guidance".into(),
-                            sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
-                            delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                            following: Vec::new(),
-                        }),
+                        message: None,
                     },
                     cwd: "/workspace".into(),
                     pool: "cleat".into(),
@@ -2652,17 +2633,6 @@ mod tests {
             )
             .await
             .expect("crew session");
-        let mut spec = session.spec.clone();
-        let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
-        *message = None;
-        sessions
-            .update(
-                &InputMeta::builder().name(session.metadata.name.clone()).labels(session.metadata.labels.clone()).build(),
-                &session.metadata.resource_version,
-                &spec,
-            )
-            .await
-            .expect("no pending brief");
         (backend, wake, delivery)
     }
 

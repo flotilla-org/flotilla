@@ -153,3 +153,10 @@ remain compatible, so no companion manifest edit is required. Convoy status and
 Checkout integration status and TerminalSession status are daemon/controller-authored; no external manifest
 source authors the new status fields. New stored fields decode with defaults
 under ADR 0047; the stored-record corpus must not be regenerated for this change.
+
+Claude tool subscriptions take effect when crew settings are regenerated; already
+running crews retain their previous hooks and use attention-only evidence until
+restarted. The hook client parses one payload and sends one daemon RPC, waiting
+for acknowledgement. It performs no provider refresh, but it is synchronous and
+currently has no dedicated RPC timeout. Measure the PreToolUse critical-path
+latency and daemon-unavailable behavior during host-direct acceptance testing.

@@ -230,13 +230,13 @@ async fn inspect_checkout_integration_with_association(
     } else {
         BTreeMap::new()
     };
-    let head_revision = providers
-        .vcs
-        .read_repository(checkout_path, RepositoryRead::HeadRevision)
-        .await
-        .ok()
-        .map(|revision| revision.trim().to_string())
-        .filter(|revision| !revision.is_empty());
+    let head_revision = match providers.vcs.read_repository(checkout_path, RepositoryRead::HeadRevision).await {
+        Ok(revision) => Some(revision.trim().to_string()).filter(|revision| !revision.is_empty()),
+        Err(error) => {
+            tracing::debug!(checkout = %checkout_path.display(), %error, "checkout HEAD observation unavailable");
+            None
+        }
+    };
     CheckoutIntegrationStatus { head_revision, clean, pushed, landed, landed_evidence, change_request, remote_refs }
 }
 
