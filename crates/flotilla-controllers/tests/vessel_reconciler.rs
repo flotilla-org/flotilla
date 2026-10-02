@@ -388,6 +388,16 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         "later vessels should reuse the convoy checkout"
     );
 
+    flotilla_resources::apply_status_patch(&checkouts, &checkout_meta.name, &flotilla_resources::CheckoutStatusPatch::MarkGone)
+        .await
+        .expect("observe removed worktree");
+    let gone_outcome = reconciler.reconcile(&review, &reconciler.prepare(&review).await.expect("gone checkout dependencies"), Utc::now());
+    assert!(gone_outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == &checkout_meta.name)));
+    assert!(gone_outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })));
+
     reconciler.run_finalizer(&implement).await.expect("vessel finalization");
     checkouts.get(&checkout_meta.name).await.expect("vessel finalization must preserve convoy checkout");
     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))

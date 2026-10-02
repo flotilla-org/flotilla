@@ -105,6 +105,7 @@ pub enum CheckoutPhase {
     Ready,
     Terminating,
     Failed,
+    Gone,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +243,7 @@ pub enum CheckoutStatusPatch {
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
     MarkFailed { message: String },
+    MarkGone,
     UpdateIntegration { integration: Box<CheckoutIntegrationStatus> },
 }
 
@@ -283,6 +285,10 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
             Self::MarkFailed { message } => {
                 status.phase = CheckoutPhase::Failed;
                 status.message = Some(message.clone());
+            }
+            Self::MarkGone => {
+                status.phase = CheckoutPhase::Gone;
+                status.message = Some("worktree absent on its host".to_string());
             }
             Self::UpdateIntegration { integration } => {
                 // The shared patch is the authority-side latch point for every

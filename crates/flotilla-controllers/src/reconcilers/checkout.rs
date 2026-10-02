@@ -71,6 +71,10 @@ pub trait CheckoutRuntime: Send + Sync {
         convoy: Option<&ResourceObject<Convoy>>,
     ) -> Result<CheckoutIntegrationStatus, String>;
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
+    /// `Some(false)` is authoritative only when checked by the worktree's host.
+    async fn checkout_path_exists_in(&self, _env_ref: &str, _path: &str) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
     async fn create_worktree_in(
         &self,
         _env_ref: &str,
@@ -222,6 +226,7 @@ fn convoy_claims_checkout(convoy: &ResourceObject<Convoy>, checkout_name: &str) 
 
 pub enum CheckoutPrepared {
     None,
+    Gone,
     OwnerTerminal,
     Ready { prepared: PreparedCheckout },
     Integration { status: Box<CheckoutIntegrationStatus> },
@@ -270,6 +275,16 @@ where
         }
 
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
+            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+                if let CheckoutSpec::Worktree(worktree) = &obj.spec {
+                    let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(&worktree.target_path);
+                    match self.runtime.checkout_path_exists_in(&worktree.env_ref, path).await {
+                        Ok(Some(false)) => return Ok(CheckoutPrepared::Gone),
+                        Ok(Some(true) | None) => {}
+                        Err(error) => return Ok(CheckoutPrepared::Failed(error)),
+                    }
+                }
+            }
             let delete_evidence = convoy_needs_delete_evidence(convoy.as_ref());
             let refresh_after = if delete_evidence { LANDING_EVIDENCE_TTL } else { CHECKOUT_INTEGRATION_REFRESH_AFTER };
             let forges = self.forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>();
@@ -364,13 +379,14 @@ where
                     commit: prepared.commit.clone(),
                     branch_provenance: prepared.branch_provenance,
                 }),
-                CheckoutPrepared::Integration { .. } | CheckoutPrepared::OwnerTerminal => None,
+                CheckoutPrepared::Integration { .. } | CheckoutPrepared::OwnerTerminal | CheckoutPrepared::Gone => None,
                 CheckoutPrepared::RetryClone { .. } => None,
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutPrepared::Waiting | CheckoutPrepared::None => None,
             }
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
             match prepared {
+                CheckoutPrepared::Gone => Some(CheckoutStatusPatch::MarkGone),
                 CheckoutPrepared::Integration { status } => {
                     Some(CheckoutStatusPatch::UpdateIntegration { integration: Box::new(status.as_ref().clone()) })
                 }

@@ -310,7 +310,9 @@ async fn reconcile_once_with_resources(
         templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
     }
 
-    let created = convoys.create(&convoy_meta(&convoy.metadata.name), &convoy.spec).await.expect("convoy create should succeed");
+    let mut meta = convoy_meta(&convoy.metadata.name);
+    meta.annotations = convoy.metadata.annotations.clone();
+    let created = convoys.create(&meta, &convoy.spec).await.expect("convoy create should succeed");
     if let Some(status) = convoy.status.as_ref() {
         convoys
             .update_status(&convoy.metadata.name, &created.metadata.resource_version, status)
@@ -2221,6 +2223,72 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
         Some(ConvoyStatusPatch::MarkWorkFailed { ref work, finished_at, ref message })
             if work == "implement" && finished_at == timestamp(21) && message == "terminal session crashed"
     ));
+}
+
+#[tokio::test]
+async fn ensured_work_with_lost_vessel_interrupts_and_replaces_it_without_failing() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Running;
+    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+    convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
+
+    let failed = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![vessel_object("standing", "implement", VesselPhase::Failed, Some("container stopped after reboot"))],
+        Vec::new(),
+        timestamp(21),
+    )
+    .await;
+    assert!(matches!(&failed.patch, Some(ConvoyStatusPatch::WorkInterrupted { .. })));
+    assert!(failed
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "standing-implement")));
+
+    failed.patch.expect("interrupted work").apply(convoy.status.as_mut().expect("status"));
+    assert_ne!(convoy.status.as_ref().expect("status").phase, ConvoyPhase::Failed);
+    let absent = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    assert_eq!(absent.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 1);
+    assert!(!matches!(absent.patch, Some(ConvoyStatusPatch::MarkWorkFailed { .. })));
+
+    let provisioning = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![vessel_object("standing", "implement", VesselPhase::Pending, None)],
+        Vec::new(),
+        timestamp(23),
+    )
+    .await;
+    assert_eq!(provisioning.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 0);
+    let recovered = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![vessel_object("standing", "implement", VesselPhase::Ready, None)],
+        Vec::new(),
+        timestamp(24),
+    )
+    .await;
+    assert!(matches!(recovered.patch, Some(ConvoyStatusPatch::WorkRunning { .. })));
+    assert_eq!(recovered.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(), 0);
+}
+
+#[tokio::test]
+async fn ensured_work_with_missing_vessel_observation_stalls_without_admitting_a_duplicate() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.work.get_mut("implement").expect("work").phase = WorkPhase::Running;
+    let mut convoy = convoy_object("standing", task_provisioning_convoy_spec(), Some(status));
+    convoy.metadata.annotations.insert("flotilla.work/ensured-from".to_string(), "governor".to_string());
+
+    let first = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(21)).await;
+    assert!(matches!(first.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Stalled, .. })));
+    assert!(!first.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
+    first.patch.expect("stall patch").apply(convoy.status.as_mut().expect("status"));
+    let second = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(22)).await;
+    assert!(second.patch.is_none(), "missing observation stays stalled");
+    assert!(!second.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
 }
 
 #[tokio::test]
