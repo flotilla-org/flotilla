@@ -58,7 +58,7 @@ fn catalog_input(convoys: &[ConvoyRow]) -> CatalogInput<'_> {
 
 #[test]
 fn change_request_readiness_precedence_and_unknown_evidence() {
-    use ChangeRequestReadiness as Ready;
+    use ChangeRequestReadiness as Readiness;
     use ObservedChangeRequestState as State;
     use ObservedChecks as Checks;
     use ObservedMergeability as Mergeability;
@@ -73,7 +73,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(true),
             false,
-            Ready::Closed,
+            Readiness::Closed,
         ),
         (
             "merged awaiting landing",
@@ -83,7 +83,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(true),
             false,
-            Ready::MergedNotLanded,
+            Readiness::MergedNotLanded,
         ),
         (
             "merged and landed",
@@ -93,7 +93,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             true,
-            Ready::Closed,
+            Readiness::Closed,
         ),
         (
             "draft beats conflict",
@@ -103,7 +103,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(true),
             false,
-            Ready::Draft,
+            Readiness::Draft,
         ),
         (
             "conflict beats failing CI",
@@ -113,7 +113,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(true),
             false,
-            Ready::Conflicting,
+            Readiness::Conflicting,
         ),
         (
             "failing CI beats review",
@@ -123,7 +123,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(true),
             false,
-            Ready::CiFailing,
+            Readiness::CiFailing,
         ),
         (
             "actionable feedback",
@@ -133,7 +133,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(true),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "changes requested",
@@ -143,7 +143,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::ChangesRequested),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "review required",
@@ -153,7 +153,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Required),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "approved",
@@ -163,7 +163,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             false,
-            Ready::ReadyToMerge,
+            Readiness::ReadyToMerge,
         ),
         (
             "no review required",
@@ -173,7 +173,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::None),
             Some(false),
             false,
-            Ready::ReadyToMerge,
+            Readiness::ReadyToMerge,
         ),
         (
             "pending checks",
@@ -183,7 +183,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "unknown checks",
@@ -193,7 +193,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "unknown mergeability",
@@ -203,7 +203,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "unknown review decision",
@@ -213,7 +213,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             None,
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "unknown feedback",
@@ -223,7 +223,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             None,
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
         (
             "unknown state",
@@ -233,7 +233,7 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
             Some(Review::Approved),
             Some(false),
             false,
-            Ready::AwaitingReviewResponse,
+            Readiness::AwaitingReviewResponse,
         ),
     ];
     for (name, state, checks, mergeable, review_decision, actionable, landed, expected) in cases {
@@ -254,16 +254,16 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
 
 #[test]
 fn change_request_readiness_uses_adr_wire_values() {
-    use ChangeRequestReadiness as Ready;
+    use ChangeRequestReadiness as Readiness;
 
     for (readiness, expected) in [
-        (Ready::ReadyToMerge, "ready_to_merge"),
-        (Ready::AwaitingReviewResponse, "awaiting_review_response"),
-        (Ready::CiFailing, "ci_failing"),
-        (Ready::Conflicting, "conflicting"),
-        (Ready::Draft, "draft"),
-        (Ready::MergedNotLanded, "merged_not_landed"),
-        (Ready::Closed, "closed"),
+        (Readiness::ReadyToMerge, "ready_to_merge"),
+        (Readiness::AwaitingReviewResponse, "awaiting_review_response"),
+        (Readiness::CiFailing, "ci_failing"),
+        (Readiness::Conflicting, "conflicting"),
+        (Readiness::Draft, "draft"),
+        (Readiness::MergedNotLanded, "merged_not_landed"),
+        (Readiness::Closed, "closed"),
     ] {
         assert_eq!(readiness.as_str(), expected);
     }

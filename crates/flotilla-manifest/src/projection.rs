@@ -79,22 +79,24 @@ impl ChangeRequestReadiness {
 /// positive observation to be known. Pending checks and unknown observations
 /// use the waiting state because the wire vocabulary has no pending/unknown
 /// readiness variant; consumers can distinguish them through the raw fields.
-/// `landed` means a linked convoy has reached its terminal landed phase.
+/// A merged change request whose linked convoy has landed maps to `closed`:
+/// there is no separate landed value. `landed` means a linked convoy has
+/// reached its terminal landed phase.
 pub fn change_request_readiness(status: &ChangeRequestStatus, landed: bool) -> ChangeRequestReadiness {
-    use ChangeRequestReadiness as Ready;
+    use ChangeRequestReadiness as Readiness;
 
     match status.state.value {
-        Some(ObservedChangeRequestState::Closed) => return Ready::Closed,
-        Some(ObservedChangeRequestState::Merged) => return if landed { Ready::Closed } else { Ready::MergedNotLanded },
-        Some(ObservedChangeRequestState::Draft) => return Ready::Draft,
+        Some(ObservedChangeRequestState::Closed) => return Readiness::Closed,
+        Some(ObservedChangeRequestState::Merged) => return if landed { Readiness::Closed } else { Readiness::MergedNotLanded },
+        Some(ObservedChangeRequestState::Draft) => return Readiness::Draft,
         _ => {}
     }
 
     if status.mergeable.value == Some(ObservedMergeability::Conflicting) {
-        return Ready::Conflicting;
+        return Readiness::Conflicting;
     }
     if status.checks.value == Some(ObservedChecks::Fail) {
-        return Ready::CiFailing;
+        return Readiness::CiFailing;
     }
     if status.state.value != Some(ObservedChangeRequestState::Open)
         || status.checks.value != Some(ObservedChecks::Pass)
@@ -102,9 +104,9 @@ pub fn change_request_readiness(status: &ChangeRequestStatus, landed: bool) -> C
         || status.review.actionable_at_head.value != Some(false)
         || !matches!(status.review_decision.value, Some(ObservedReviewDecision::Approved | ObservedReviewDecision::None))
     {
-        return Ready::AwaitingReviewResponse;
+        return Readiness::AwaitingReviewResponse;
     }
-    Ready::ReadyToMerge
+    Readiness::ReadyToMerge
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
