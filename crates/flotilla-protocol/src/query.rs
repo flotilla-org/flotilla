@@ -154,6 +154,11 @@ pub struct ProjectListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectListEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_refused: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub declaration_stale: bool,
     pub namespace: String,
     pub name: String,
     pub display_name: String,
@@ -372,9 +377,33 @@ pub enum FleetObservationAgreement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetListResponse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declaration_attention: Vec<DeclarationAttentionRow>,
     pub rows: Vec<FleetListRow>,
     #[serde(default)]
     pub replicas: Vec<FleetReplicaStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationAttentionRow {
+    pub resource: crate::ResourceRef,
+    pub condition: DeclarationAttentionKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclarationAttentionKind {
+    DeclarationRefused,
+    ConfigDrift,
+}
+
+impl std::fmt::Display for DeclarationAttentionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DeclarationRefused => "DeclarationRefused",
+            Self::ConfigDrift => "ConfigDrift",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

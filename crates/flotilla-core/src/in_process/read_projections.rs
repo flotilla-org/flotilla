@@ -7,12 +7,13 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    ConvoyExplanation, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest,
-    ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement,
-    ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
-    FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel,
-    FulfilmentRow, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ViewAddress,
+    ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
+    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
+    FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
+    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -38,6 +39,10 @@ use crate::{
     },
     host_registry::HostCounts,
     leaf_engine::{LeafSubscriptionTable, LeafWatcher},
+    ops_entry::{
+        DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
+        DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
+    },
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
 
@@ -374,7 +379,11 @@ impl ReadProjections<'_> {
         Ok(FleetHealthResponse { hosts: rows, dispatch_queue })
     }
 
-    pub(super) async fn list_projects(backend: &ResourceBackend, namespace: &str) -> Result<ProjectListResponse, String> {
+    pub(super) async fn list_projects(
+        backend: &ResourceBackend,
+        namespace: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProjectListResponse, String> {
         let projects = backend.clone().definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = backend.clone().using::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = repositories
@@ -414,6 +423,20 @@ impl ReadProjections<'_> {
                 .collect::<Vec<_>>();
             entries.push(
                 ProjectListEntry::builder()
+                    .maybe_declaration_refused(
+                        project
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.declaration_refused.as_ref())
+                            .map(|refusal| refusal.message.clone()),
+                    )
+                    .declaration_stale(
+                        project
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.declaration_refused.as_ref())
+                            .is_some_and(|refusal| now - refusal.since >= DECLARATION_STALE_AFTER),
+                    )
                     .namespace(project.metadata.namespace.clone())
                     .name(project.metadata.name.clone())
                     .display_name(project.spec.display_name)
@@ -543,7 +566,45 @@ impl ReadProjections<'_> {
             ))
         });
         replicas.sort_by(|left, right| left.host.as_str().cmp(right.host.as_str()));
-        Ok(FleetListResponse { rows, replicas })
+        let mut declaration_attention = Vec::new();
+        for source in self.backend.including_replicas::<ResourceDemand>(namespace).list().await.map_err(|error| error.to_string())?.items {
+            let demand = source.object;
+            if demand.status.as_ref().is_some_and(|status| !matches!(status.state, DemandState::Raised | DemandState::Escalated)) {
+                continue;
+            }
+            let condition = if demand.metadata.name.starts_with(DECLARATION_REFUSAL_ATTENTION_PREFIX) {
+                DeclarationAttentionKind::DeclarationRefused
+            } else if demand.metadata.name.starts_with(ENSURE_DRIFT_ATTENTION_PREFIX) {
+                DeclarationAttentionKind::ConfigDrift
+            } else {
+                continue;
+            };
+            let mut message = demand
+                .metadata
+                .annotations
+                .get(DECLARATION_REFUSAL_REASON_ANNOTATION)
+                .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
+                .cloned()
+                .unwrap_or_default();
+            if demand
+                .metadata
+                .annotations
+                .get(DECLARATION_REFUSED_SINCE_ANNOTATION)
+                .and_then(|since| DateTime::parse_from_rfc3339(since).ok())
+                .is_some_and(|since| self.clock.now() - since.with_timezone(&Utc) >= DECLARATION_STALE_AFTER)
+            {
+                message.push_str(" (stale)");
+            }
+            declaration_attention.push(DeclarationAttentionRow { resource: demand.spec.originating_work_ref, condition, message });
+        }
+        declaration_attention.sort_by(|left, right| {
+            (&left.resource.namespace, &left.resource.kind, &left.resource.name).cmp(&(
+                &right.resource.namespace,
+                &right.resource.kind,
+                &right.resource.name,
+            ))
+        });
+        Ok(FleetListResponse { rows, replicas, declaration_attention })
     }
 
     pub(super) async fn scoped_fleet_list(
@@ -598,6 +659,11 @@ impl ReadProjections<'_> {
             .map(|source| source.object.metadata.name.as_str())
             .collect();
         fleet.rows.retain(|row| row.convoy_ref.as_deref().is_some_and(|reference| matching.contains(reference)));
+        fleet.declaration_attention.retain(|row| match row.resource.kind.as_str() {
+            "Project" => row.resource.name == selected_project,
+            "Convoy" => matching.contains(row.resource.name.as_str()),
+            _ => false,
+        });
         fleet.replicas.clear();
         Ok(fleet)
     }
@@ -1196,7 +1262,7 @@ mod tests {
             .await
             .expect("project");
 
-        let response = ReadProjections::list_projects(&fixture.backend, "flotilla").await.expect("project list");
+        let response = ReadProjections::list_projects(&fixture.backend, "flotilla", fixture.clock.now()).await.expect("project list");
         assert_eq!(response.projects[0].issue_sources, vec![active, second]);
     }
 
@@ -1646,7 +1712,7 @@ mod tests {
             .await
             .expect("publish dispatch status");
 
-        let listed = ReadProjections::list_projects(&backend, "flotilla").await.expect("project list");
+        let listed = ReadProjections::list_projects(&backend, "flotilla", Utc::now()).await.expect("project list");
         assert_eq!(listed.projects.len(), 1);
         assert_eq!(listed.projects[0].name, "app");
         assert_eq!(listed.projects[0].display_name, "App");

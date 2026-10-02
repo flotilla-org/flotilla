@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
     in_process::InProcessDaemon,
-    ops_entry::ENSURED_FROM_ANNOTATION,
+    ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION},
     path_context::canonical_or_original,
     salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact, SalienceFacts},
 };
@@ -2291,6 +2291,7 @@ impl Aggregator {
                     && target.namespace == resource.namespace
                     && target.name == resource.name
                     && (demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                        || demand.metadata.annotations.contains_key(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION)
                         || demand.metadata.annotations.contains_key("flotilla.work/credential-refresh-reason"))
             })
             .min_by_key(|demand| {
@@ -2331,6 +2332,7 @@ impl Aggregator {
                             .metadata
                             .annotations
                             .get(RECLAIM_REFUSAL_REASON_ANNOTATION)
+                            .or_else(|| demand.metadata.annotations.get(ENSURE_CONFIG_DRIFT_REASON_ANNOTATION))
                             .or_else(|| demand.metadata.annotations.get("flotilla.work/credential-refresh-reason"))
                             .cloned()
                     })
@@ -2578,7 +2580,13 @@ fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
         }))
         .strikes(status.restart_count)
         .maybe_next_attempt(status.retry_at)
-        .maybe_last_failure(status.last_failure)
+        .maybe_last_failure(
+            status
+                .declaration_refused
+                .map(|refusal| format!("DeclarationRefused: {}", refusal.message))
+                .or_else(|| status.config_drift.map(|drift| format!("ConfigDrift: {}", drift.changes.join("; "))))
+                .or(status.last_failure),
+        )
         .build()
 }
 

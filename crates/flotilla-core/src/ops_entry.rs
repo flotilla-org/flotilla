@@ -11,6 +11,12 @@ pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-co
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
+pub const DECLARATION_REFUSAL_ATTENTION_PREFIX: &str = "declaration-refused-";
+pub const DECLARATION_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/refusal-reason";
+pub const DECLARATION_REFUSED_SINCE_ANNOTATION: &str = "flotilla.work/refused-since";
+pub const DECLARATION_STALE_AFTER: chrono::Duration = chrono::Duration::hours(24);
+pub const ENSURE_DRIFT_ATTENTION_PREFIX: &str = "ensure-config-drift-";
+pub const ENSURE_CONFIG_DRIFT_REASON_ANNOTATION: &str = "flotilla.work/ensure-config-drift-reason";
 
 /// Store identity for a project-owned workflow template.
 ///
@@ -20,7 +26,7 @@ pub fn materialized_workflow_name(project: &str, workflow: &str) -> String {
     format!("{project}--{workflow}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperationalEntryFile {
     pub path: String,
     pub contents: String,
@@ -53,6 +59,10 @@ pub struct EnsureEntry {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnsureBody {
+    // ADR 0047: accept and drop the retired ops field for one generation.
+    // Remove after the roll following this compatibility repair.
+    #[serde(default, rename = "stance")]
+    _retired_stance: Option<serde::de::IgnoredAny>,
     workflow: String,
     #[serde(default)]
     placement: Option<String>,
@@ -167,6 +177,15 @@ mod tests {
     use std::process::Command;
 
     use super::{parse_operational_entry, OperationalEntryDefinition};
+
+    #[test]
+    fn retired_stance_is_accepted_and_dropped_for_one_generation() {
+        let entry = parse_operational_entry("---\nkind: ensure\nrole: governor\n---\nworkflow: govern\nstance: trusted\n")
+            .expect("previous-generation ops entry remains decodable")
+            .expect("ensure entry");
+        let OperationalEntryDefinition::Ensure(ensure) = entry.definition else { panic!("expected ensure") };
+        assert_eq!(ensure.workflow, "govern");
+    }
 
     #[test]
     fn parses_entry_kind_and_alias_scope_from_frontmatter() {

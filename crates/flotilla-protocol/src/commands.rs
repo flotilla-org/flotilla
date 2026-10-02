@@ -923,6 +923,10 @@ pub enum CommandAction {
         #[serde(default)]
         requested_by: String,
     },
+    ConvoyEnsureRoll {
+        namespace: String,
+        name: String,
+    },
     ResourceReconcileNow {
         namespace: String,
         kind: String,
@@ -1055,6 +1059,7 @@ impl Command {
                 ManifestResolution::Sync => "sync manifest resource",
                 ManifestResolution::Adopt => "adopt manifest resource",
             },
+            CommandAction::ConvoyEnsureRoll { .. } => "roll changed ensure configuration",
             CommandAction::ResourceReconcileNow { .. } => "reconcile resource now",
             CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
@@ -1682,6 +1687,7 @@ mod tests {
                 visible_environments: vec![],
             })),
             CommandValue::FleetList(Box::new(FleetListResponse {
+                declaration_attention: Vec::new(),
                 rows: vec![FleetListRow::builder()
                     .convoy("convoy-a")
                     .vessel("vessel-a")

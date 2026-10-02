@@ -14,7 +14,17 @@ use tokio::{
 
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 
-pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, backend: ResourceBackend) -> Result<(), String> {
+#[cfg(test)]
+pub(super) async fn serve_resource_http(stream: UnixStream, first_byte: u8, backend: ResourceBackend) -> Result<(), String> {
+    serve_resource_http_with_daemon(stream, first_byte, backend, None).await
+}
+
+pub(super) async fn serve_resource_http_with_daemon(
+    mut stream: UnixStream,
+    first_byte: u8,
+    backend: ResourceBackend,
+    daemon: Option<std::sync::Arc<flotilla_core::in_process::InProcessDaemon>>,
+) -> Result<(), String> {
     let mut request = vec![first_byte];
     while !request.ends_with(b"\r\n\r\n") {
         if request.len() >= MAX_REQUEST_HEADER_BYTES {
@@ -56,6 +66,19 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind, name] => (*namespace, *kind, Some(*name)),
         _ => return write_error(&mut stream, 404, "unknown resource API path").await,
     };
+    // Administrative read-only inventory, alongside kind discovery on the
+    // same trusted local resource socket. Return raw bytes so only the candidate
+    // applies its parser. The optional daemon is solely a resource-handler test
+    // seam; production always supplies it.
+    if kind == "operationalentries" && name.is_none() {
+        let Some(daemon) = daemon else {
+            return write_error(&mut stream, 404, "ops inventory unavailable").await;
+        };
+        return match daemon.project_operational_entry_inventory(namespace).await {
+            Ok(entries) => write_json(&mut stream, 200, &serde_json::json!({ "entries": entries })).await,
+            Err(error) => write_error(&mut stream, 422, &error).await,
+        };
+    }
     let query = parse_query(raw_query);
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
@@ -204,6 +227,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         410 => "Gone",
         431 => "Request Header Fields Too Large",
+        422 => "Unprocessable Entity",
         _ => "Internal Server Error",
     }
 }

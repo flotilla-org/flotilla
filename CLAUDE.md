@@ -14,6 +14,7 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
 
   Write only the new shape. For a rename add a serde `alias`, for a new field a `default`, and for a retired field a deserialize-only record type that accepts and drops it (see `VesselRequirement`'s `stance`). Comment each shim with when it can be removed (one roll later). There is still no migration framework.
 - **Out-of-repo manifests**: stay compatible, or ship the project-map/ops manifest update in the same roll.
+  Operational entries in ops repositories follow the same N→N+1 rule: retired fields are accepted and dropped for one generation, while genuinely unknown fields remain errors. The candidate pre-roll validation must parse registered projects' operational entries as well as decode stored records; a refusal fails the gate.
 - **Enforcement**: `cargo test` decodes a golden corpus of real stored records (#2169). If it fails, fix the decoder with an alias, default, or record type. **Never regenerate the corpus to make a PR pass**; it is refreshed only after a fleet roll. Before each roll, the candidate decodes every host's live store (#2167).
 
 ### Plane-A freeze (transition in progress)

@@ -95,8 +95,8 @@ pub use convoy::{
     VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
-    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch,
-    DRIVER_ADMISSION_CONDITION_TYPE,
+    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
+    ConvoyEnsureStatusPatch, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 pub use credential::{
     capped_github_app_permissions, permission_level_rank, CredentialConsumer, CredentialGrant, CredentialGrantSelector,
@@ -157,10 +157,10 @@ pub use principal_attention::{
     Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
-    normalize_issue_source, normalize_project_spec, resolve_project_issue_sources, DispatchPolicy, DispatchQueueAttention,
-    DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable,
-    OperationalEntriesCondition, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch,
-    ResolvedIssueSourceBinding, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
+    normalize_issue_source, normalize_project_spec, resolve_project_issue_sources, DeclarationRefusedCondition, DispatchPolicy,
+    DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution,
+    IssueSourceUnavailable, OperationalEntriesCondition, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus,
+    ProjectStatusPatch, ResolvedIssueSourceBinding, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
 pub use registry::{

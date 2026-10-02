@@ -9,13 +9,14 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    ProviderData,
+    PrincipalRef, ProviderData, ResourceRef,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, ensure_repository, normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec,
-    ConvoyRepositorySpec, EventRecorder, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-    ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    ConvoyEnsureStatusPatch, ConvoyRepositorySpec, DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, EventRecorder, Forge,
+    InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository,
+    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
+    WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -26,9 +27,9 @@ use super::{
 use crate::{
     event_sink::EventSink,
     ops_entry::{
-        parse_operational_entry, OperationalEntryDefinition, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
-        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION,
-        VERIFICATION_PROVENANCE_ANNOTATION,
+        parse_operational_entry, OperationalEntryDefinition, DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION,
+        DECLARATION_REFUSED_SINCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
+        SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION, VERIFICATION_PROJECT_ANNOTATION, VERIFICATION_PROVENANCE_ANNOTATION,
     },
     project_declaration::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
@@ -36,6 +37,18 @@ use crate::{
     },
     repository_inspection::{OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
 };
+
+/// A refresh refusal preserves file identity independently of its display text.
+struct OperationalEntryRefusal {
+    entry_path: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for OperationalEntryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
 
 pub(super) fn validate_project_name(name: &str) -> Result<(), String> {
     let normalized = normalize_project_name(name)?;
@@ -429,15 +442,18 @@ impl ProjectService<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
-        let (operational_changes, operational_entries) =
-            match self.materialize_project_operational_entries(&declaration.name, &bootstrap_inspection).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.patch_project_operational_entries(&namespace, &declaration.name, false, &error).await?;
-                    self.record_project_operational_refusal(&namespace, &declaration.name, &error).await;
-                    return Err(format!("operational entry refused: {error}"));
-                }
-            };
+        let (operational_changes, operational_entries) = match self
+            .materialize_project_operational_entries(&declaration.name, &bootstrap_inspection)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.patch_project_operational_entries(&namespace, &declaration.name, false, error.entry_path.as_deref(), &error.message)
+                    .await?;
+                self.record_project_operational_refusal(&namespace, &declaration.name, &error.message).await;
+                return Err(format!("operational entry refused: {error}"));
+            }
+        };
         changes.extend(operational_changes);
         Ok((changes, operational_entries))
     }
@@ -459,6 +475,18 @@ impl ProjectService<'_> {
         &self,
         project_name: &str,
         bootstrap: &ProjectDeclarationInspection,
+    ) -> Result<(Vec<String>, Vec<String>), OperationalEntryRefusal> {
+        let mut entry_path = None;
+        self.materialize_project_operational_entries_inner(project_name, bootstrap, &mut entry_path)
+            .await
+            .map_err(|message| OperationalEntryRefusal { entry_path, message })
+    }
+
+    async fn materialize_project_operational_entries_inner(
+        &self,
+        project_name: &str,
+        bootstrap: &ProjectDeclarationInspection,
+        refused_entry_path: &mut Option<String>,
     ) -> Result<(Vec<String>, Vec<String>), String> {
         let namespace = self.provisioning_namespace();
         let project =
@@ -524,7 +552,7 @@ impl ProjectService<'_> {
         // previous refresh on a host that had the checkout.
         if unavailable_source {
             let message = "operational entries refused: an ops member has no local checkout on this host".to_string();
-            self.patch_project_operational_entries(&namespace, project_name, false, &message).await?;
+            self.patch_project_operational_entries(&namespace, project_name, false, None, &message).await?;
             return Ok((Vec::new(), vec![message]));
         }
 
@@ -544,12 +572,14 @@ impl ProjectService<'_> {
                 &mut commands,
                 &mut command_provenance,
                 &mut outcomes,
+                refused_entry_path,
             )?;
         }
 
         let templates = self.resource_backend.clone().definitions::<WorkflowTemplate>(&namespace);
         let mut changes = Vec::new();
         for (name, (meta, spec)) in &workflows {
+            *refused_entry_path = meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned();
             let stored_name = crate::ops_entry::materialized_workflow_name(project_name, name);
             let mut stored_meta = meta.clone();
             stored_meta.name.clone_from(&stored_name);
@@ -570,6 +600,7 @@ impl ProjectService<'_> {
                 changes.push(format!("WorkflowTemplate/{name}"));
             }
         }
+        *refused_entry_path = None;
         let desired_workflow_names =
             workflows.keys().map(|name| crate::ops_entry::materialized_workflow_name(project_name, name)).collect::<BTreeSet<_>>();
         let project_workflow_prefix = format!("{project_name}--");
@@ -584,6 +615,7 @@ impl ProjectService<'_> {
 
         let convoy_ensures = self.resource_backend.clone().definitions::<ConvoyEnsure>(&namespace);
         for (name, (meta, spec)) in &ensures {
+            *refused_entry_path = meta.annotations.get(SOURCE_ENTRY_PATH_ANNOTATION).cloned();
             let stored_workflow_ref = crate::ops_entry::materialized_workflow_name(project_name, &spec.workflow_ref);
             let workflow = match templates.get(&stored_workflow_ref).await {
                 Ok(workflow) => Ok(workflow),
@@ -629,6 +661,7 @@ impl ProjectService<'_> {
                 changes.push(format!("ConvoyEnsure/{name}"));
             }
         }
+        *refused_entry_path = None;
         for stale in convoy_ensures.list().await.map_err(|error| error.to_string())?.into_iter().filter(|ensure| {
             ensure.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).map(String::as_str) == Some(project_name)
                 && !ensures.contains_key(&ensure.metadata.name)
@@ -698,7 +731,7 @@ impl ProjectService<'_> {
             changes.push(format!("Repository/{} verification commands", stale.metadata.name));
         }
         changes.sort();
-        self.patch_project_operational_entries(&namespace, project_name, true, &outcomes.join("; ")).await?;
+        self.patch_project_operational_entries(&namespace, project_name, true, None, &outcomes.join("; ")).await?;
         Ok((changes, outcomes))
     }
 
@@ -707,16 +740,81 @@ impl ProjectService<'_> {
         namespace: &str,
         project_name: &str,
         ready: bool,
+        entry_path: Option<&str>,
         message: &str,
     ) -> Result<(), String> {
-        apply_resource_status_patch(
-            &self.resource_backend.clone().using::<Project>(namespace),
-            project_name,
-            &ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
-        )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        let projects = self.resource_backend.using::<Project>(namespace);
+        let project = projects.get(project_name).await.map_err(|error| error.to_string())?;
+        let now = self.clock.now();
+        let condition = (!ready).then(|| DeclarationRefusedCondition {
+            // Source-level refusals have no entry; never manufacture a path from prose.
+            entry_path: entry_path.unwrap_or_default().to_string(),
+            message: message.to_string(),
+            since: project.status.as_ref().and_then(|status| status.declaration_refused.as_ref()).map_or(now, |old| old.since),
+            observed_at: now,
+        });
+        let mut errors = Vec::new();
+        // Raise attention before fan-out, then attempt every condition patch.
+        // One failed status write must not hide the refusal from the governor.
+        let attention = async {
+            let demands = self.resource_backend.using::<Demand>(namespace);
+            let name = format!("{DECLARATION_REFUSAL_ATTENTION_PREFIX}{project_name}");
+            if ready {
+                return match demands.delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+            }
+            let target = ResourceRef::new("flotilla.work/v1", "Project", namespace, project_name);
+            let spec =
+                DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
+            let mut annotations = BTreeMap::from([(DECLARATION_REFUSAL_REASON_ANNOTATION.into(), message.into())]);
+            if let Some(condition) = &condition {
+                annotations.insert(DECLARATION_REFUSED_SINCE_ANNOTATION.into(), condition.since.to_rfc3339());
+            }
+            let meta = InputMeta::builder().name(name).annotations(annotations).build();
+            match demands.create(&meta, &spec).await {
+                Ok(_) => Ok(()),
+                Err(ResourceError::Conflict { .. }) => {
+                    let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
+                    demands.update(&meta, &current.metadata.resource_version, &spec).await.map(|_| ()).map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        .await;
+        if let Err(error) = attention {
+            errors.push(error);
+        }
+        for patch in [
+            ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
+            ProjectStatusPatch::DeclarationRefused { condition: condition.clone() },
+        ] {
+            if let Err(error) = apply_resource_status_patch(&projects, project_name, &patch).await {
+                errors.push(error.to_string());
+            }
+        }
+        match self.resource_backend.definitions::<ConvoyEnsure>(namespace).list().await {
+            Ok(ensures) => {
+                for ensure in ensures.into_iter().filter(|ensure| ensure.spec.project_ref == project_name) {
+                    if let Err(error) = apply_resource_status_patch(
+                        &self.resource_backend.using::<ConvoyEnsure>(namespace),
+                        &ensure.metadata.name,
+                        &ConvoyEnsureStatusPatch::DeclarationRefused { condition: condition.clone() },
+                    )
+                    .await
+                    {
+                        errors.push(format!("ConvoyEnsure/{}: {error}", ensure.metadata.name));
+                    }
+                }
+            }
+            Err(error) => errors.push(error.to_string()),
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -730,10 +828,13 @@ impl ProjectService<'_> {
         commands: &mut BTreeMap<RepositoryKey, BTreeMap<String, String>>,
         command_provenance: &mut BTreeMap<RepositoryKey, Vec<serde_json::Value>>,
         outcomes: &mut Vec<String>,
+        refused_entry_path: &mut Option<String>,
     ) -> Result<(), String> {
         let source_repository = source.repository.key();
         for file in source.files {
+            *refused_entry_path = Some(file.path.clone());
             let Some(entry) = parse_operational_entry(&file.contents).map_err(|error| format!("{}: {error}", file.path))? else {
+                *refused_entry_path = None;
                 continue;
             };
             let requires_code_role = matches!(&entry.definition, OperationalEntryDefinition::VerificationCommand { .. });
@@ -830,6 +931,7 @@ impl ProjectService<'_> {
                 }
             }
         }
+        *refused_entry_path = None;
         Ok(())
     }
 
@@ -1188,6 +1290,20 @@ mod tests {
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());
         assert_eq!(project.metadata.annotations[BOOTSTRAP_COMMIT_ANNOTATION], "abc123");
+        service
+            .patch_project_operational_entries("flotilla", "app", false, None, "source unavailable: no checkout")
+            .await
+            .expect("source-level refusal");
+        let refused = backend
+            .using::<Project>("flotilla")
+            .get("app")
+            .await
+            .expect("project")
+            .status
+            .expect("status")
+            .declaration_refused
+            .expect("refusal");
+        assert!(refused.entry_path.is_empty(), "a source error must not invent an entry path");
     }
 
     #[test]
@@ -1236,6 +1352,7 @@ mod tests {
                 &mut commands,
                 &mut provenance,
                 &mut outcomes,
+                &mut None,
             )
             .expect("collect operational entries");
             assert_eq!(commands.keys().cloned().collect::<Vec<_>>(), members);

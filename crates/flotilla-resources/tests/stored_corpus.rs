@@ -7,6 +7,30 @@ use flotilla_resources::{
 use serde_json::Value;
 
 #[test]
+fn frozen_ensure_admission_snapshot_stays_decodable() {
+    // A fixed embedded shape supplements the deployed corpus until the next
+    // fleet roll captures ensure_admission records. Do not regenerate either
+    // fixture to accommodate a spec rename; preserve its decoder instead.
+    let status: flotilla_resources::ConvoyStatus = serde_json::from_str(
+        r#"{
+        "phase": "Active",
+        "ensure_admission": {
+            "project_ref": "wheelhouse", "role": "governor",
+            "driver_ref": "desk", "workflow_ref": "govern",
+            "placement_policy": "local", "repositories": ["repo-key"],
+            "presents_as": "fleet",
+            "agent_overrides": [{"capability": "governor", "adapter": "codex", "model": "test-model"}]
+        }
+    }"#,
+    )
+    .expect("decode stored convoy admission snapshot");
+    let admitted = status.ensure_admission.expect("embedded baseline");
+    assert_eq!(admitted.project_ref, "wheelhouse");
+    assert_eq!(admitted.workflow_ref, "govern");
+    assert_eq!(admitted.agent_overrides[0].model.as_deref(), Some("test-model"));
+}
+
+#[test]
 fn deployed_stored_records_still_decode() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stored-records");
     let generations = fs::read_dir(&root).expect("read stored-record corpus generations");

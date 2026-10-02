@@ -796,6 +796,12 @@ pub enum InputValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
+    /// Frozen ensure configuration that admitted this generation. Previous
+    /// generations have no baseline; an explicit roll establishes one.
+    /// Future ConvoyEnsureSpec changes must also decode this embedded stored
+    /// snapshot for one generation (ADR 0047), even after the ensure is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensure_admission: Option<crate::ConvoyEnsureSpec>,
     pub phase: ConvoyPhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<DiscoveredSubject>,
@@ -1293,6 +1299,9 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    RecordEnsureAdmission {
+        config: crate::ConvoyEnsureSpec,
+    },
     DiscoverSubjects {
         subjects: Vec<(Subject, Relationship)>,
         source: SubjectDiscoverySource,
@@ -1503,6 +1512,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             return;
         }
         match self {
+            Self::RecordEnsureAdmission { config } => {
+                status.ensure_admission.get_or_insert_with(|| config.clone());
+            }
             Self::DiscoverSubjects { subjects, source, at } => {
                 for (subject, relationship) in subjects {
                     status.discover_subject(subject.clone(), *relationship, *source, *at);

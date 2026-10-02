@@ -1557,6 +1557,13 @@ impl ConvoyAdmission {
             annotations,
         )
         .await?;
+        apply_resource_status_patch(
+            &self.backend.using::<ResourceConvoy>(namespace),
+            &admission.name,
+            &ConvoyStatusPatch::RecordEnsureAdmission { config: ensure.spec.clone() },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(admission.name)
     }
 }

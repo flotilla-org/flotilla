@@ -131,11 +131,12 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
-        ConvoyStatusPatch::DiscoverSubjects { .. }
+        ConvoyStatusPatch::RecordEnsureAdmission { .. }
+        | ConvoyStatusPatch::DiscoverSubjects { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScanFailure { .. }
         | ConvoyStatusPatch::UnlinkSubject { .. } => {
-            panic!("subject patches are outside this lifecycle contract")
+            panic!("admission and subject patches are outside this lifecycle contract")
         }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
@@ -291,6 +292,7 @@ fn pending_brief() -> PendingBrief {
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,

@@ -95,6 +95,7 @@ pub fn convoy_spec(workflow_ref: &str) -> RealConvoySpec {
 
 pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus {
     RealConvoyStatus {
+        ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
@@ -325,6 +326,7 @@ pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     ]);
 
     RealConvoyStatus {
+        ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
@@ -434,6 +436,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let crew_work = BTreeMap::from([("implement".to_string(), BTreeMap::new()), ("review".to_string(), BTreeMap::new())]);
 
     RealConvoyStatus {
+        ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),
         branch_subject_scan_at: None,
