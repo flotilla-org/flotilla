@@ -33,7 +33,7 @@ pub(super) struct ConvoyAdmission {
     environment_manager: Arc<EnvironmentManager>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
-    repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
+    pub(super) repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
     change_request_port: Arc<dyn ChangeRequestQueryPort>,
     issue_port: Arc<dyn IssueQueryPort>,
     change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,

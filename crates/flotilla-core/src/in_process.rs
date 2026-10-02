@@ -2066,7 +2066,7 @@ impl InProcessDaemon {
                     }
                 };
                 let live = listed.items.iter().map(|repository| repository.metadata.name.as_str()).collect::<HashSet<_>>();
-                daemon.repository_change_requests.write().await.retain(|key, _| live.contains(key.to_string().as_str()));
+                daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| live.contains(key.to_string().as_str()));
                 let mut watch = match repositories.watch(WatchStart::resuming_from(&listed)).await {
                     Ok(watch) => watch,
                     Err(error) => {
@@ -2101,7 +2101,7 @@ impl InProcessDaemon {
                         None => break,
                     };
                     let Some(daemon) = weak.upgrade() else { return };
-                    daemon.repository_change_requests.write().await.retain(|key, _| key.to_string() != name);
+                    daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| key.to_string() != name);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
