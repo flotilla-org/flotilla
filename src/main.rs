@@ -1662,10 +1662,16 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
         for (key, state) in status.documents {
             let pending_resolution =
                 spec.resolutions.get(&key).filter(|resolution| state.resolved_token.as_deref() != Some(resolution.token.as_str()));
+            let resolution_action = spec
+                .resolutions
+                .get(&key)
+                .filter(|resolution| state.resolved_token.as_deref() == Some(resolution.token.as_str()))
+                .map(|resolution| resolution.action);
             rows.push(serde_json::json!({
                 "root": name,
                 "document": {"path": key.path, "kind": key.kind, "namespace": key.namespace, "name": key.name},
                 "state": state,
+                "resolution_action": resolution_action,
                 "pending_resolution": pending_resolution.map(|resolution| &resolution.action),
             }));
         }
@@ -1677,24 +1683,33 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
         println!("{}", flotilla_protocol::output::json_pretty(&rows));
     } else {
         for row in rows {
-            let key = &row["document"];
-            let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
-            let reason = row["state"]["reason"].as_str().unwrap_or("");
-            let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
-            println!(
-                "{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
-                row["root"].as_str().unwrap_or_default(),
-                key["path"].as_str().unwrap_or_default(),
-                key["kind"].as_str().unwrap_or_default(),
-                key["namespace"].as_str().unwrap_or_default(),
-                key["name"].as_str().unwrap_or_default(),
-                phase,
-                pending,
-                reason
-            );
+            println!("{}", format_manifest_status_row(&row));
         }
     }
     Ok(())
+}
+
+fn format_manifest_status_row(row: &serde_json::Value) -> String {
+    let key = &row["document"];
+    let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
+    let reason = row["state"]["reason"].as_str().unwrap_or("");
+    let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
+    let reason = if row["resolution_action"] == "adopt" && row["state"]["resolution_outcome"].get("failed").is_some() {
+        format!("{reason}; adoption may have rewritten the source file; inspect it before retrying with a new token")
+    } else {
+        reason.to_string()
+    };
+    format!(
+        "{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
+        row["root"].as_str().unwrap_or_default(),
+        key["path"].as_str().unwrap_or_default(),
+        key["kind"].as_str().unwrap_or_default(),
+        key["namespace"].as_str().unwrap_or_default(),
+        key["name"].as_str().unwrap_or_default(),
+        phase,
+        pending,
+        reason
+    )
 }
 
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
@@ -3038,6 +3053,27 @@ mod tests {
         assert!(matches!(cli.command, Some(SubCommand::Manifest {
             command: super::ManifestSubCommand::Status { root: Some(root), namespace, host: None }
         }) if root == "manifest-123" && namespace == "flotilla"));
+    }
+
+    #[test]
+    fn manifest_status_warns_that_failed_adoption_may_have_written_source() {
+        let row = serde_json::json!({
+            "root": "manifest-123",
+            "document": {"path": "policy.yaml", "kind": "PlacementPolicy", "namespace": "flotilla", "name": "adopt-me"},
+            "state": {
+                "phase": "refused",
+                "reason": "live spec changed while adopting",
+                "resolved_token": "token-1",
+                "resolution_outcome": {"failed": "live spec changed while adopting"}
+            },
+            "resolution_action": "adopt",
+            "pending_resolution": null
+        });
+
+        assert_eq!(
+            super::format_manifest_status_row(&row),
+            "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while adopting; adoption may have rewritten the source file; inspect it before retrying with a new token"
+        );
     }
 
     #[test]
