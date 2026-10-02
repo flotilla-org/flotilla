@@ -28,7 +28,12 @@ pub use attach::ResolvedAttach;
 use attach::{AttachResolver, CachedFleetRows};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use convoy_admission::RoleAddress;
-use convoy_admission::*;
+use convoy_admission::{
+    allocate_convoy_generation, convoy_address, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
+    normalize_convoy_start_intent, project_not_ready_error, resolve_and_validate_workflow_credentials, resolve_convoy_candidate_indices,
+    resolve_project_ref, validate_convoy_name, ConvoyAddressIdentity, ConvoyAdmission, ConvoyCreateAdmission, ConvoyStartKey,
+    ConvoyStartTask, PlacementResolution, PreparedConvoyAdmission, StaticFulfilmentDecider,
+};
 use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::QualifiedPath,
@@ -145,6 +150,7 @@ struct CachedObservation {
 }
 
 struct ProviderChangeRequestObservationSource {
+    backend: ResourceBackend,
     query_port: Arc<dyn ChangeRequestQueryPort>,
     cache: Mutex<HashMap<ObservationScope, Arc<Mutex<Option<CachedObservation>>>>>,
     warned_missing_identity: Mutex<HashSet<(String, String)>>,
@@ -153,7 +159,6 @@ struct ProviderChangeRequestObservationSource {
 
 #[async_trait]
 trait ChangeRequestQueryPort: Send + Sync {
-    fn resource_backend(&self) -> &ResourceBackend;
     async fn discover_repository_change_request(
         &self,
         namespace: &str,
@@ -329,10 +334,6 @@ fn convoy_change_request_credential_refs(
 
 #[async_trait]
 impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
-    fn resource_backend(&self) -> &ResourceBackend {
-        &self.resource_backend
-    }
-
     async fn discover_repository_change_request(
         &self,
         namespace: &str,
@@ -352,8 +353,9 @@ impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
 }
 
 impl ProviderChangeRequestObservationSource {
-    fn new(query_port: Arc<dyn ChangeRequestQueryPort>) -> Self {
+    fn new(backend: ResourceBackend, query_port: Arc<dyn ChangeRequestQueryPort>) -> Self {
         Self {
+            backend,
             query_port,
             cache: Mutex::new(HashMap::new()),
             warned_missing_identity: Mutex::new(HashSet::new()),
@@ -377,13 +379,8 @@ impl ProviderChangeRequestObservationSource {
         // Hold only this repository's lock through its forge read. Other
         // repositories can continue observing even when one query is slow.
         let mut cache = scope_cache.lock().await;
-        let repositories = self
-            .query_port
-            .resource_backend()
-            .including_replicas::<Repository>(&subject.namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?;
+        let repositories =
+            self.backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
         let repository =
             repositories
                 .items
@@ -395,14 +392,8 @@ impl ProviderChangeRequestObservationSource {
                 })
                 .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
-        let convoys = self
-            .query_port
-            .resource_backend()
-            .including_replicas::<ResourceConvoy>(&subject.namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items;
+        let convoys =
+            self.backend.including_replicas::<ResourceConvoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?.items;
         let missing_snapshots = convoys
             .iter()
             .filter(|convoy| {
@@ -463,7 +454,7 @@ impl ProviderChangeRequestObservationSource {
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
         } else {
-            match self.query_port.resource_backend().including_replicas::<CredentialSpec>(&subject.namespace).list().await {
+            match self.backend.including_replicas::<CredentialSpec>(&subject.namespace).list().await {
                 Ok(credentials) => credentials.items,
                 Err(error) => {
                     tracing::warn!(%error, "could not list crew credential declarations; change request markers remain unverified");
@@ -1942,7 +1933,7 @@ impl InProcessDaemon {
             environment_manager: Arc::clone(&environment_manager),
             local_environment_id: local_environment_id.clone(),
         });
-        let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(Arc::clone(&query_port)));
+        let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(resource_backend.clone(), Arc::clone(&query_port)));
         let change_request_refresher = crate::change_request_observer::ChangeRequestRefresher::new(
             resource_backend.clone(),
             local_node_id.to_string(),

@@ -15,7 +15,13 @@ use flotilla_resources::{
     PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
-use super::*;
+use super::{
+    convoy_admission::{
+        default_convoy_placement_policy, parse_role_address, resolve_workflow_credentials, validate_workflow_agent_adapters,
+        validate_workflow_credentials, validate_workflow_credentials_with_capabilities, KindCandidate, PlacementTieBreak,
+    },
+    *,
+};
 
 #[tokio::test]
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {

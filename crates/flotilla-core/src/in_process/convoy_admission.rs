@@ -3051,10 +3051,6 @@ mod tests {
 
     #[async_trait]
     impl ChangeRequestQueryPort for FakeQueryPort {
-        fn resource_backend(&self) -> &ResourceBackend {
-            &self.backend
-        }
-
         async fn discover_repository_change_request(
             &self,
             _namespace: &str,
@@ -3087,7 +3083,7 @@ mod tests {
             })])
             .await;
         let port = Arc::new(FakeQueryPort { backend, tracker, discoveries: AtomicUsize::new(0) });
-        let source = ProviderChangeRequestObservationSource::new(port.clone());
+        let source = ProviderChangeRequestObservationSource::new(port.backend.clone(), port.clone());
         let subject = ChangeRequestRef {
             namespace: "flotilla".to_string(),
             service: "github.com".to_string(),
