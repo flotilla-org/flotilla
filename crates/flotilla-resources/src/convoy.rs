@@ -798,6 +798,8 @@ pub enum InputValue {
 pub struct ConvoyStatus {
     /// Frozen ensure configuration that admitted this generation. Previous
     /// generations have no baseline; an explicit roll establishes one.
+    /// Future ConvoyEnsureSpec changes must also decode this embedded stored
+    /// snapshot for one generation (ADR 0047), even after the ensure is deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensure_admission: Option<crate::ConvoyEnsureSpec>,
     pub phase: ConvoyPhase,

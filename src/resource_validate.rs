@@ -132,6 +132,8 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             }
         }
     }
+    // Build the old-endpoint fallback lazily, once for all namespaces.
+    let mut local_inventory = None;
     for (namespace, registered) in projects {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/operationalentries")).send().await?;
         let result = if response.status().is_success() {
@@ -140,17 +142,25 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                 serde_json::from_value(document.get("entries").cloned().ok_or_else(|| eyre!("ops inventory has no entries"))?)?;
             validate_ops_files(&files)
         } else if response.status() == reqwest::StatusCode::NOT_FOUND {
-            // Old daemons cannot export raw ops entries. On-host validation
-            // reads the same committed sources through the candidate's VCS seam.
-            let roots = local_roots.ok_or_else(|| eyre!("peer does not export ops inputs; run the candidate validation on that host"))?;
-            let runner = Arc::new(ProcessCommandRunner);
-            let vcs = FlotillaVcs::new(
-                ExecutionEnvironmentPath::new("/"),
-                runner.clone(),
-                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
-            );
-            let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "validation");
-            validate_project_ops(&registered, roots, &inspector).await
+            // An absent endpoint (including on older daemons) does not prove
+            // a particular version. Candidate-side local inspection is still
+            // mandatory; never interpret a 404 as an empty input inventory.
+            let roots =
+                local_roots.ok_or_else(|| eyre!("ops inventory endpoint not found on peer; run the candidate validation on that host"))?;
+            if local_inventory.is_none() {
+                let runner = Arc::new(ProcessCommandRunner);
+                let vcs = FlotillaVcs::new(
+                    ExecutionEnvironmentPath::new("/"),
+                    runner.clone(),
+                    GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+                );
+                let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "validation");
+                let paths = inspect_validation_roots(roots, &inspector).await?;
+                local_inventory = Some((inspector, paths));
+            }
+            let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
+            let files = inspect_project_ops_entries(&registered, paths, inspector).await.map_err(|error| eyre!(error))?;
+            validate_ops_files(&files)
         } else {
             Err(eyre!("{namespace}: cannot inspect operational entries: {}", response.text().await?))
         };
@@ -190,16 +200,25 @@ fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
     }
 }
 
-async fn validate_project_ops(
-    projects: &[ResourceObject<Project>],
+async fn inspect_validation_roots(
     roots: &[PathBuf],
     inspector: &dyn RepositoryInspector,
-) -> Result<usize> {
+) -> Result<BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>> {
     let mut paths = BTreeMap::new();
     for root in roots {
         let inspection = inspector.inspect_path(root, None).await.map_err(|error| eyre!(error))?;
         paths.entry(inspection.spec.key()).or_insert_with(Vec::new).push(root.clone());
     }
+    Ok(paths)
+}
+
+#[cfg(test)]
+async fn validate_project_ops(
+    projects: &[ResourceObject<Project>],
+    roots: &[PathBuf],
+    inspector: &dyn RepositoryInspector,
+) -> Result<usize> {
+    let paths = inspect_validation_roots(roots, inspector).await?;
     let files = inspect_project_ops_entries(projects, &paths, inspector).await.map_err(|error| eyre!(error))?;
     validate_ops_files(&files)
 }
@@ -510,8 +529,8 @@ mod tests {
             vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
         };
         use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
-        let tmp = std::env::temp_dir().join(format!("flotilla-ops-validation-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&tmp).expect("temporary ops repository");
+        let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
+        let tmp = tmp_guard.path().to_path_buf();
         for args in [
             vec!["init", "-b", "main"],
             vec!["config", "user.email", "test@example.com"],
@@ -576,7 +595,8 @@ mod tests {
         unavailable.metadata.annotations.clear();
         let error = validate_project_ops(&[unavailable], &[], &inspector).await.expect_err("missing source fails the gate");
         assert!(error.to_string().contains("no checkout available"), "{error}");
-        let duplicate = tmp.with_extension("duplicate");
+        let duplicate_guard = tempfile::tempdir().expect("duplicate checkout directory");
+        let duplicate = duplicate_guard.path().to_path_buf();
         assert!(std::process::Command::new("git")
             .args(["clone", "--local"])
             .arg(&tmp)
@@ -594,8 +614,6 @@ mod tests {
             .await
             .expect_err("ambiguous main checkouts fail the gate");
         assert!(error.to_string().contains("no unambiguous main checkout"), "{error}");
-        std::fs::remove_dir_all(duplicate).expect("clean duplicate fixture");
-        std::fs::remove_dir_all(tmp).expect("clean fixture");
     }
 
     #[cfg(unix)]

@@ -190,6 +190,7 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             Self::DriverManaged => {
                 status.convoy_ref = None;
                 status.running_since = None;
+                // Keep the observed hash: driver changes must not erase drift evidence.
                 status.retry = None;
             }
             Self::DriverAdmission { condition } => {

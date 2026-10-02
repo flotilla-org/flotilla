@@ -1817,7 +1817,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     None
                 };
-                let socket = if let Some(host) = host {
+                let socket = if let Some(host) = &host {
                     if host.is_empty() || host.contains(['/', '\\', '\0']) || host == "." || host == ".." {
                         return Err(color_eyre::eyre::eyre!("invalid peer host name: {host}"));
                     }
@@ -1825,7 +1825,9 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ())
+                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ()).map_err(|error| {
+                    color_eyre::eyre::eyre!("resource validation on {}: {error:#}", host.as_deref().unwrap_or("local host"))
+                })
             } else {
                 resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"), skill_catalog.as_deref())
             }

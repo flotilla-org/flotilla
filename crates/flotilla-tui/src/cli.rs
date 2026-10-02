@@ -737,7 +737,10 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
         for row in &response.declaration_attention {
             table.add_row(vec![
                 Cell::new(format!("{}/{}/{}", row.resource.namespace, row.resource.kind, row.resource.name)),
-                Cell::new(format!("{:?}", row.condition)),
+                Cell::new(match row.condition {
+                    flotilla_protocol::DeclarationAttentionKind::DeclarationRefused => "DeclarationRefused",
+                    flotilla_protocol::DeclarationAttentionKind::ConfigDrift => "ConfigDrift",
+                }),
                 Cell::new(&row.message),
             ]);
         }
