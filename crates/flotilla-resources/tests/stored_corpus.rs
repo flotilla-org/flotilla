@@ -45,6 +45,21 @@ fn deployed_stored_records_still_decode() {
 }
 
 #[test]
+fn gone_checkout_status_decodes_as_a_stored_record() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stored-records");
+    let file = fs::read_dir(&root)
+        .expect("read stored-record corpus")
+        .map(|entry| entry.expect("read corpus generation").path().join("Checkout.json"))
+        .find(|path| path.is_file())
+        .expect("deployed Checkout records");
+    let content = fs::read_to_string(&file).expect("read deployed Checkout records");
+    let mut documents: Vec<Value> = serde_json::from_str(&content).expect("parse deployed Checkout records");
+    let mut checkout = documents.remove(0);
+    checkout["status"]["phase"] = Value::String("Gone".to_string());
+    decode_stored_resource_document(&checkout).expect("stored Checkout with Gone phase decodes");
+}
+
+#[test]
 fn prior_generation_crew_delivery_records_decode_without_sender() {
     let message: TerminalCrewMessage =
         serde_json::from_value(serde_json::json!({"id":"old", "text":"continue"})).expect("old terminal message");
