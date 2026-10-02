@@ -5344,16 +5344,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
         // recording for recovery and launch into the current generation under
         // a fresh ID so cleat cannot resolve the name ambiguously. #2254
         // tracks retention and cleanup of old-generation recordings.
-        let session_id = if matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_)) {
-            format!("{name}-{}", uuid::Uuid::new_v4())
-        } else {
-            name.to_string()
-        };
+        let recovered_from_lost = matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_));
+        let session_id = if recovered_from_lost { format!("{name}-{}", uuid::Uuid::new_v4()) } else { name.to_string() };
         if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == session_id) {
             pool.kill_session(&session_id).await?;
         }
         let initial_size = is_agent_session.then_some(CREW_SESSION_SIZE);
         pool.ensure_session_with_size(&session_id, &command, &cwd, &env, &pool_tags, initial_size).await?;
+        if recovered_from_lost {
+            if let Err(error) = pool.retain_recovered_recording(name).await {
+                tracing::warn!(%error, session = name, "retain old cleat recording after recovery failed");
+            }
+        }
         Ok(TerminalRuntimeState::builder()
             .session_id(session_id)
             .maybe_pid(None)

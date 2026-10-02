@@ -106,6 +106,10 @@ pub(crate) fn parse_managed_session_name(session_name: &str) -> Option<ManagedSe
 /// No store, no identity management — the `TerminalManager` handles those concerns.
 #[async_trait]
 pub trait TerminalPool: Send + Sync {
+    /// Retain a lost recording after its replacement session has launched.
+    async fn retain_recovered_recording(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Physical Cleat daemon hosting this session, when the pool can resolve it.
     async fn cleat_endpoint(&self, _session_id: &str) -> Result<Option<CleatEndpoint>, String> {
         Ok(None)

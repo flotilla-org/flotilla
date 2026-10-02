@@ -19,6 +19,21 @@ const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
 const DELIVERY_ENTER_DELAY: Duration = Duration::from_millis(100);
 const ENDPOINT_CACHE_TTL: Duration = Duration::from_secs(1);
+const RECORDING_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RECORDING_PRUNE_SCRIPT: &str = r#"[ -d "$1/$2/sessions" ] || exit 0
+pid=$(cat "$1/$2/daemon.pid" 2>/dev/null) || exit 0
+case "$pid" in *[!0-9]*|"") exit 0 ;; esac
+for marker in "$1/$2/sessions/"*/.flotilla-recovered; do
+  [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+  [ -n "$(find "$marker" -prune -mtime +6 -print)" ] || continue
+  # A reused PID delays cleanup. It can never turn a live daemon into a target.
+  if ! kill -0 "$pid" 2>/dev/null; then
+    session=${marker%/.flotilla-recovered}
+    rm -rf -- "$session"
+  fi
+done"#;
+const RECORDING_RETAIN_SCRIPT: &str = r#"session="$1/$2/sessions/$3"
+if [ -f "$session/session.cast" ]; then touch "$session/.flotilla-recovered"; fi"#;
 
 #[derive(Debug, Deserialize)]
 struct SessionInfo {
@@ -57,6 +72,7 @@ pub struct CleatTerminalPool {
     binary: String,
     attach_capability: tokio::sync::OnceCell<()>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
+    last_recording_prune: tokio::sync::Mutex<Instant>,
 }
 
 struct EndpointCache {
@@ -71,6 +87,35 @@ impl CleatTerminalPool {
             binary: binary.into(),
             attach_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
+            last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    async fn prune_retained_recordings(&self) -> Result<(), String> {
+        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
+        for daemon in daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)) {
+            self.runner
+                .run(
+                    "sh",
+                    &["-c", RECORDING_PRUNE_SCRIPT, "flotilla-prune-cleat-recordings", &daemon.runtime_root, &daemon.name],
+                    Path::new("/"),
+                    &crate::providers::ChannelLabel::Default,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn prune_recordings_if_due(&self) {
+        let mut last = self.last_recording_prune.lock().await;
+        if last.elapsed() < RECORDING_PRUNE_INTERVAL {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        if let Err(error) = self.prune_retained_recordings().await {
+            tracing::warn!(%error, "prune retained cleat recordings failed");
         }
     }
 
@@ -125,8 +170,34 @@ impl CleatTerminalPool {
     }
 }
 
+fn valid_recording_daemon(daemon: &DaemonInfo) -> bool {
+    Path::new(&daemon.runtime_root).is_absolute()
+        && !daemon.name.is_empty()
+        && daemon.name != "."
+        && daemon.name != ".."
+        && !daemon.name.contains('/')
+}
+
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
+    async fn retain_recovered_recording(&self, session_id: &str) -> Result<(), String> {
+        if session_id.is_empty() || session_id == "." || session_id == ".." || session_id.contains('/') {
+            return Err("invalid recovered cleat session id".to_string());
+        }
+        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
+        for daemon in daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)) {
+            self.runner
+                .run(
+                    "sh",
+                    &["-c", RECORDING_RETAIN_SCRIPT, "flotilla-retain-cleat-recording", &daemon.runtime_root, &daemon.name, session_id],
+                    Path::new("/"),
+                    &crate::providers::ChannelLabel::Default,
+                )
+                .await?;
+        }
+        Ok(())
+    }
     async fn session_liveness(&self, session_id: &str) -> Result<TerminalSessionLiveness, String> {
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
@@ -170,6 +241,7 @@ impl TerminalPool for CleatTerminalPool {
     }
 
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
+        self.prune_recordings_if_due().await;
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
         Ok(sessions
@@ -292,6 +364,59 @@ mod tests {
         path_context::ExecutionEnvironmentPath,
         providers::{testing::MockRunner, CommandRunner},
     };
+
+    #[tokio::test]
+    async fn recording_prune_never_targets_a_live_daemon_generation() {
+        let inventory = r#"[
+            {"name":"work@2","runtime_root":"/state/cleat","alive":false},
+            {"name":"work@3","runtime_root":"/state/cleat","alive":true}
+        ]"#;
+        let runner = Arc::new(MockRunner::new(vec![Ok(inventory.into()), Ok(String::new())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        pool.prune_retained_recordings().await.expect("prune retained recordings");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2, "only the dead generation receives cleanup");
+        assert_eq!(calls[0].1, vec!["daemons", "--json"]);
+        assert_eq!(calls[1].0, "sh");
+        assert!(calls[1].1.iter().any(|arg| arg == "work@2"));
+        assert!(!calls[1].1.iter().any(|arg| arg == "work@3"));
+    }
+
+    #[test]
+    fn expired_recovered_recordings_are_removed_only_after_the_daemon_pid_is_dead() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let daemon = temp.path().join("work@2");
+        for id in ["expired", "live", "recent"] {
+            let session = daemon.join("sessions").join(id);
+            std::fs::create_dir_all(&session).expect("session directory");
+            std::fs::write(session.join("session.cast"), "recovery evidence").expect("recording");
+            std::fs::write(session.join(".flotilla-recovered"), "").expect("retention marker");
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        for id in ["expired", "live"] {
+            std::fs::File::open(daemon.join("sessions").join(id).join(".flotilla-recovered"))
+                .expect("open marker")
+                .set_modified(old)
+                .expect("age marker");
+        }
+        std::fs::write(daemon.join("daemon.pid"), std::process::id().to_string()).expect("live pid");
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(RECORDING_PRUNE_SCRIPT)
+                .arg("flotilla-prune-cleat-recordings")
+                .arg(temp.path())
+                .arg("work@2")
+                .output()
+                .expect("run prune script")
+        };
+        assert!(run().status.success());
+        assert!(daemon.join("sessions/live/session.cast").exists(), "live daemon recording is retained");
+        std::fs::write(daemon.join("daemon.pid"), "999999999").expect("dead pid");
+        assert!(run().status.success());
+        assert!(!daemon.join("sessions/expired").exists(), "expired recovered recording is removed");
+        assert!(daemon.join("sessions/recent/session.cast").exists(), "recent recording is retained");
+    }
 
     #[tokio::test]
     async fn direct_endpoint_uses_physical_daemon_that_contains_session() {
