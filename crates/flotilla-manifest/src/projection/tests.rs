@@ -56,6 +56,18 @@ fn catalog_input(convoys: &[ConvoyRow]) -> CatalogInput<'_> {
     CatalogInput { awareness: None, convoys, independents: &[], standing_roles: &[], project_repositories: &[] }
 }
 
+#[derive(bon::Builder)]
+struct ReadinessCase {
+    name: &'static str,
+    state: Option<ObservedChangeRequestState>,
+    checks: Option<ObservedChecks>,
+    mergeable: Option<ObservedMergeability>,
+    review_decision: Option<ObservedReviewDecision>,
+    actionable: Option<bool>,
+    landed: bool,
+    expected: ChangeRequestReadiness,
+}
+
 #[test]
 fn change_request_readiness_precedence_and_unknown_evidence() {
     use ChangeRequestReadiness as Readiness;
@@ -65,190 +77,190 @@ fn change_request_readiness_precedence_and_unknown_evidence() {
     use ObservedReviewDecision as Review;
 
     let cases = [
-        (
-            "closed beats failures",
-            Some(State::Closed),
-            Some(Checks::Fail),
-            Some(Mergeability::Conflicting),
-            Some(Review::ChangesRequested),
-            Some(true),
-            false,
-            Readiness::Closed,
-        ),
-        (
-            "merged awaiting landing",
-            Some(State::Merged),
-            Some(Checks::Fail),
-            Some(Mergeability::Conflicting),
-            Some(Review::ChangesRequested),
-            Some(true),
-            false,
-            Readiness::MergedNotLanded,
-        ),
-        (
-            "merged and landed",
-            Some(State::Merged),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(false),
-            true,
-            Readiness::Closed,
-        ),
-        (
-            "draft beats conflict",
-            Some(State::Draft),
-            Some(Checks::Fail),
-            Some(Mergeability::Conflicting),
-            Some(Review::ChangesRequested),
-            Some(true),
-            false,
-            Readiness::Draft,
-        ),
-        (
-            "conflict beats failing CI",
-            Some(State::Open),
-            Some(Checks::Fail),
-            Some(Mergeability::Conflicting),
-            Some(Review::ChangesRequested),
-            Some(true),
-            false,
-            Readiness::Conflicting,
-        ),
-        (
-            "failing CI beats review",
-            Some(State::Open),
-            Some(Checks::Fail),
-            Some(Mergeability::Mergeable),
-            Some(Review::ChangesRequested),
-            Some(true),
-            false,
-            Readiness::CiFailing,
-        ),
-        (
-            "actionable feedback",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(true),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "changes requested",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::ChangesRequested),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "review required",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Required),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "approved",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(false),
-            false,
-            Readiness::ReadyToMerge,
-        ),
-        (
-            "no review required",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::None),
-            Some(false),
-            false,
-            Readiness::ReadyToMerge,
-        ),
-        (
-            "pending checks",
-            Some(State::Open),
-            Some(Checks::Pending),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "unknown checks",
-            Some(State::Open),
-            None,
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "unknown mergeability",
-            Some(State::Open),
-            Some(Checks::Pass),
-            None,
-            Some(Review::Approved),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "unknown review decision",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            None,
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "unknown feedback",
-            Some(State::Open),
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            None,
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
-        (
-            "unknown state",
-            None,
-            Some(Checks::Pass),
-            Some(Mergeability::Mergeable),
-            Some(Review::Approved),
-            Some(false),
-            false,
-            Readiness::AwaitingReviewResponse,
-        ),
+        ReadinessCase::builder()
+            .name("closed beats failures")
+            .maybe_state(Some(State::Closed))
+            .maybe_checks(Some(Checks::Fail))
+            .maybe_mergeable(Some(Mergeability::Conflicting))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::Closed)
+            .build(),
+        ReadinessCase::builder()
+            .name("merged awaiting landing")
+            .maybe_state(Some(State::Merged))
+            .maybe_checks(Some(Checks::Fail))
+            .maybe_mergeable(Some(Mergeability::Conflicting))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::MergedNotLanded)
+            .build(),
+        ReadinessCase::builder()
+            .name("merged and landed")
+            .maybe_state(Some(State::Merged))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(true)
+            .expected(Readiness::Closed)
+            .build(),
+        ReadinessCase::builder()
+            .name("draft beats conflict")
+            .maybe_state(Some(State::Draft))
+            .maybe_checks(Some(Checks::Fail))
+            .maybe_mergeable(Some(Mergeability::Conflicting))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::Draft)
+            .build(),
+        ReadinessCase::builder()
+            .name("conflict beats failing CI")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Fail))
+            .maybe_mergeable(Some(Mergeability::Conflicting))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::Conflicting)
+            .build(),
+        ReadinessCase::builder()
+            .name("failing CI beats review")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Fail))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::CiFailing)
+            .build(),
+        ReadinessCase::builder()
+            .name("actionable feedback")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(true))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("changes requested")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::ChangesRequested))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("review required")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Required))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("approved")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::ReadyToMerge)
+            .build(),
+        ReadinessCase::builder()
+            .name("no review required")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::None))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::ReadyToMerge)
+            .build(),
+        ReadinessCase::builder()
+            .name("pending checks")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pending))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("unknown checks")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(None)
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("unknown mergeability")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(None)
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("unknown review decision")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(None)
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("unknown feedback")
+            .maybe_state(Some(State::Open))
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(None)
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
+        ReadinessCase::builder()
+            .name("unknown state")
+            .maybe_state(None)
+            .maybe_checks(Some(Checks::Pass))
+            .maybe_mergeable(Some(Mergeability::Mergeable))
+            .maybe_review_decision(Some(Review::Approved))
+            .maybe_actionable(Some(false))
+            .landed(false)
+            .expected(Readiness::AwaitingReviewResponse)
+            .build(),
     ];
-    for (name, state, checks, mergeable, review_decision, actionable, landed, expected) in cases {
+    for case in cases {
         let status = ChangeRequestStatus {
             title: Observation::default(),
             author: Observation::default(),
-            review_decision: Observation { value: review_decision, ..Observation::default() },
+            review_decision: Observation { value: case.review_decision, ..Observation::default() },
             review_requested_from_owner: Observation::default(),
-            state: Observation { value: state, ..Observation::default() },
+            state: Observation { value: case.state, ..Observation::default() },
             head_sha: Observation::default(),
-            checks: Observation { value: checks, ..Observation::default() },
-            review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: actionable, ..Observation::default() } },
-            mergeable: Observation { value: mergeable, ..Observation::default() },
+            checks: Observation { value: case.checks, ..Observation::default() },
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: case.actionable, ..Observation::default() } },
+            mergeable: Observation { value: case.mergeable, ..Observation::default() },
         };
-        assert_eq!(change_request_readiness(&status, landed), expected, "{name}");
+        assert_eq!(change_request_readiness(&status, case.landed), case.expected, "{}", case.name);
     }
 }
 
