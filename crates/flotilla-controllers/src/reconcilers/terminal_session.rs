@@ -70,6 +70,7 @@ pub enum TerminalLiveness {
 }
 
 const LOST_RECHECK_AFTER: Duration = Duration::from_secs(5);
+const RECEIPT_RETIREMENT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
@@ -280,6 +281,12 @@ pub enum TerminalPrepared {
     Failed(String),
 }
 
+fn retirement_pending(obj: &ResourceObject<TerminalSession>) -> bool {
+    obj.status.as_ref().is_some_and(|status| {
+        status.phase != TerminalSessionPhase::Starting && status.crew.is_some() && !status.retired_launches.is_empty()
+    })
+}
+
 fn launch_brief_message_id(source: &TerminalSessionSource) -> Option<&str> {
     match source {
         TerminalSessionSource::Agent { message: Some(message), .. } => std::iter::once(message)
@@ -320,19 +327,26 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        if retirement_pending(obj) {
+            let status = obj.status.as_ref().expect("retirement requires status");
+            let mut retired = true;
+            for launch in &status.retired_launches {
+                if let Err(error) = self.runtime.remove_exit_receipt(&obj.spec, launch).await {
+                    // Keep the durable obligation, but never let housekeeping
+                    // suppress positive exit or liveness evidence for its replacement.
+                    tracing::warn!(%error, launch, session = %obj.metadata.name, "retired exit receipt cleanup will retry");
+                    retired = false;
+                }
+            }
+            if retired {
+                return Ok(TerminalPrepared::ReceiptsRetired);
+            }
+        }
         if phase == TerminalSessionPhase::Failed {
             self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
             return Ok(TerminalPrepared::None);
         }
         if phase == TerminalSessionPhase::Running {
-            if let Some(status) = &obj.status {
-                if !status.retired_launches.is_empty() {
-                    for launch in &status.retired_launches {
-                        self.runtime.remove_exit_receipt(&obj.spec, launch).await.map_err(ResourceError::other)?;
-                    }
-                    return Ok(TerminalPrepared::ReceiptsRetired);
-                }
-            }
             let session_id = obj
                 .status
                 .as_ref()
@@ -478,6 +492,7 @@ where
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let patch = match phase {
+            _ if matches!(prepared, TerminalPrepared::ReceiptsRetired) => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
             TerminalSessionPhase::Starting | TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::OwnerTerminal) => {
                 Some(TerminalSessionStatusPatch::MarkFailed {
                     message: "owning environment or convoy reached a terminal phase".to_string(),
@@ -531,7 +546,6 @@ where
                 })
             }
             TerminalSessionPhase::Running => match prepared {
-                TerminalPrepared::ReceiptsRetired => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
                 TerminalPrepared::Lost(reason) => Some(TerminalSessionStatusPatch::MarkLost { reason: reason.clone(), lost_at: now }),
                 TerminalPrepared::CleatEndpoint(endpoint) => {
                     Some(TerminalSessionStatusPatch::ObserveCleatEndpoint { endpoint: endpoint.clone() })
@@ -621,6 +635,10 @@ where
             || matches!(prepared, TerminalPrepared::BriefWaiting)
         {
             outcome.requeue_after = Some(LOST_RECHECK_AFTER);
+        }
+        if retirement_pending(obj) && !matches!(prepared, TerminalPrepared::ReceiptsRetired) {
+            let retry = RECEIPT_RETIREMENT_RETRY_AFTER;
+            outcome.requeue_after = Some(outcome.requeue_after.map_or(retry, |delay| delay.min(retry)));
         }
         outcome
     }

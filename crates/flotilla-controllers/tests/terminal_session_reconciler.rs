@@ -2148,6 +2148,21 @@ impl TerminalRuntime for ReceiptLifecycleRuntime {
             .maybe_delivered_message_id(None)
             .build())
     }
+    async fn agent_exit_code(
+        &self,
+        spec: &TerminalSessionSpec,
+        crew: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
+        use flotilla_core::{
+            agent_process::{exit_receipt, ExitReceiptObserver},
+            providers::ProcessCommandRunner,
+        };
+        ExitReceiptObserver::default()
+            .observe(&spec.env_ref, &ProcessCommandRunner, std::path::Path::new(&spec.cwd).join(exit_receipt(&crew.id)), || async {
+                Ok(Vec::new())
+            })
+            .await
+    }
     async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
         if self.fail_cleanup.swap(false, Ordering::SeqCst) {
             return Err("cleanup transport unavailable".into());
@@ -2250,10 +2265,18 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
     let restarted_runtime = Arc::new(ReceiptLifecycleRuntime::default());
     restarted_runtime.fail_cleanup.store(true, Ordering::SeqCst);
     let restarted = TerminalSessionReconciler::new(restarted_runtime.clone(), backend, "flotilla");
-    assert!(restarted.prepare(&running).await.is_err());
+    let prepared = restarted.prepare(&running).await.expect("cleanup outage does not block positive exit observation");
+    let outcome = restarted.reconcile(&running, &prepared, Utc::now());
+    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(1)), "retain a cleanup retry after process exit");
+    outcome.patch.expect("replacement exit observed").apply(&mut running_status);
+    assert_eq!(running_status.phase, TerminalSessionPhase::Stopped);
+    assert_eq!(running_status.inner_exit_code, Some(0));
+    assert!(running_status.retired_launches.contains("old"));
     assert!(cwd.path().join(exit_receipt("old")).exists());
-    let prepared = restarted.prepare(&running).await.expect("cleanup retry");
-    restarted.reconcile(&running, &prepared, Utc::now()).patch.expect("cleanup confirmed").apply(&mut running_status);
+    let stopped = ResourceObject { status: Some(running_status.clone()), ..running.clone() };
+    let prepared = restarted.prepare(&stopped).await.expect("cleanup retries even after replacement exits");
+    restarted.reconcile(&stopped, &prepared, Utc::now()).patch.expect("cleanup confirmed").apply(&mut running_status);
+    assert_eq!(running_status.phase, TerminalSessionPhase::Stopped);
     assert!(running_status.retired_launches.is_empty());
     assert!(!cwd.path().join(exit_receipt("old")).exists());
     assert!(cwd.path().join(exit_receipt("replacement")).exists());

@@ -21,6 +21,7 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
+    agent_process::ExitReceiptObserver,
     aggregator_projection::AggregatorProjectionState,
     checkout_integration::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
@@ -1306,7 +1307,7 @@ struct ControllerRuntimeState {
     local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
-    exit_receipts: flotilla_core::agent_process::ExitReceiptObserver,
+    exit_receipts: ExitReceiptObserver,
     archive_catalog_lock: Mutex<()>,
     checkout_removal_concurrency: NonZeroUsize,
     checkout_removals: Semaphore,
@@ -1499,7 +1500,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
-            exit_receipts: Default::default(),
+            exit_receipts: ExitReceiptObserver::default(),
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),

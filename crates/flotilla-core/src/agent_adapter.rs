@@ -542,6 +542,8 @@ pub trait AgentAdapter: Send + Sync {
     ) -> Result<(), String> {
         self.prepare(cwd, brief).await
     }
+    /// Managed crew startup uses this non-null VCS path to guarantee runtime
+    /// file exclusion. The terminal controller also uses it for brief copies.
     async fn prepare_with_vcs(
         &self,
         cwd: &ExecutionEnvironmentPath,
@@ -914,7 +916,7 @@ async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, vcs: &dyn crate
         .ok_or_else(|| "cannot guarantee .flotilla/ runtime-file exclusion: checkout has no exclude path".to_string())?;
 
     let script = format!(
-        "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; [ \"$(tail -n 1 \"$exclude\")\" = '.flotilla/' ] || printf '\\n%s\\n' '.flotilla/' >> \"$exclude\"",
+        "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; [ \"$(tail -n 1 \"$exclude\")\" = '.flotilla/' ] || {{ [ -z \"$(tail -c 1 \"$exclude\")\" ] || printf '\\n' >> \"$exclude\"; printf '%s\\n' '.flotilla/' >> \"$exclude\"; }}",
         flotilla_protocol::arg::shell_quote(&exclude_path.to_string_lossy()),
     );
     runner
@@ -2109,12 +2111,17 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for (existing, overridden) in [("previous-pattern", false), (".flotilla/\n!.flotilla/", false), ("", true)] {
+        for (existing, ignore, overridden) in [
+            ("previous-pattern", None, false),
+            (".flotilla/\n!.flotilla/", None, false),
+            ("", Some("!.flotilla/\n"), true),
+            ("", Some("!.flotilla/agent-exits/*\n!.flotilla/briefs/\n"), false),
+        ] {
             let repo = tempfile::tempdir().expect("checkout");
             assert!(ProcessCommand::new("git").args(["init", "-q"]).current_dir(repo.path()).status().expect("git init").success());
             std::fs::write(repo.path().join(".git/info/exclude"), existing).expect("existing exclusions");
-            if overridden {
-                std::fs::write(repo.path().join(".gitignore"), "!.flotilla/\n").expect("higher-priority override");
+            if let Some(ignore) = ignore {
+                std::fs::write(repo.path().join(".gitignore"), ignore).expect("higher-priority rules");
             }
             let runner = Arc::new(ProcessCommandRunner);
             let cwd = ExecutionEnvironmentPath::new(repo.path());
@@ -2123,14 +2130,21 @@ mod tests {
                 runner.clone(),
                 GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
             );
-            let result = super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()).await;
+            let (result, concurrent) = tokio::join!(
+                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()),
+                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()),
+            );
             if overridden {
                 assert!(result.is_err(), "refuse launch when Git does not ignore runtime files");
+                assert!(concurrent.is_err(), "concurrent preparation also refuses the override");
                 continue;
             }
             result.expect("install effective exclusion");
+            concurrent.expect("concurrent role installs effective exclusion");
             std::fs::create_dir_all(repo.path().join(".flotilla/agent-exits")).expect("receipt directory");
             std::fs::write(repo.path().join(crate::agent_process::exit_receipt("crew")), "0\n").expect("receipt");
+            std::fs::create_dir_all(repo.path().join(".flotilla/briefs")).expect("brief directory");
+            std::fs::write(repo.path().join(".flotilla/briefs/coder.md"), "brief").expect("runtime brief");
             assert!(ProcessCommand::new("git").args(["add", "-A"]).current_dir(repo.path()).status().expect("add all").success());
             let added = ProcessCommand::new("git")
                 .args(["diff", "--cached", "--name-only", "--", ".flotilla"])

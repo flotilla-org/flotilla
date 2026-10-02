@@ -12,6 +12,9 @@ use tokio::{sync::Mutex, time::Instant};
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
+const OBSERVATION_MAX_AGE: Duration = Duration::from_secs(1);
+const MAX_RECEIPTS_PER_CALL: usize = 128;
+
 /// Each launch gets a distinct receipt, so an earlier process cannot mark a
 /// replacement process as exited. Hashing also keeps the path shell-safe.
 pub fn exit_receipt(crew_id: &str) -> String {
@@ -55,7 +58,7 @@ impl ExitReceiptObserver {
     ) -> Result<Option<i32>, String> {
         let batch = self.environments.lock().await.entry(environment.to_string()).or_default().clone();
         let mut batch = batch.lock().await;
-        if batch.observed_at.is_some_and(|at| at.elapsed() < Duration::from_secs(1)) {
+        if batch.observed_at.is_some_and(|at| at.elapsed() < OBSERVATION_MAX_AGE) {
             if let Some(observation) = batch.observations.remove(&requested) {
                 return observation;
             }
@@ -67,7 +70,7 @@ impl ExitReceiptObserver {
         let paths = paths.into_iter().collect::<Vec<_>>();
         // Bound argv size and shell work: a promptly consumed batch takes
         // ceil(N/128) round trips. Paths travel as argv, not shell code.
-        for chunk in paths.chunks(128) {
+        for chunk in paths.chunks(MAX_RECEIPTS_PER_CALL) {
             let mut args = vec!["-c", RECEIPT_BATCH_SCRIPT, "flotilla-agent-exits"];
             let strings = chunk.iter().map(|path| path.to_str().ok_or("receipt path is not UTF-8")).collect::<Result<Vec<_>, _>>()?;
             args.extend(strings);
@@ -99,7 +102,7 @@ for path do
     if [ -e "$path" ]; then
         if value=$(cat -- "$path"); then
             case "$value" in
-                *[!0-9-]*|"") value=E ;;
+                *[!0-9]*|"") value=E ;;
             esac
         else
             value=E
@@ -168,6 +171,7 @@ mod tests {
     // Measure the old per-session observation and the batch with the same real
     // receipts and injected runner. Counts capture the remote round-trip cost.
     #[tokio::test]
+    #[ignore = "manual receipt-observation measurement; default round-trip coverage is the Hegel property"]
     async fn many_sessions_share_environment_round_trips() {
         for count in [1usize, 16, 128, 129] {
             let cwd = tempfile::tempdir().expect("checkout");
@@ -226,6 +230,11 @@ mod tests {
         assert_eq!(observer.observe("env", &runner, old.clone(), || async { Ok(paths.clone()) }).await.expect("old"), Some(130));
         assert!(observer.observe("env", &runner, other.clone(), || async { Ok(paths.clone()) }).await.is_err());
         assert_eq!(observer.observe("env", &runner, next.clone(), || async { Ok(paths.clone()) }).await.expect("new launch"), None);
+        std::fs::write(&other, "-\n").expect("malformed marker resembling absence");
+        assert!(
+            ExitReceiptObserver::default().observe("env", &runner, other.clone(), || async { Ok(paths.clone()) }).await.is_err(),
+            "a corrupt file cannot masquerade as an absent receipt"
+        );
         std::fs::write(&next, "0\n").expect("replacement exit");
         runner.fail.store(true, Ordering::SeqCst);
         assert!(observer.observe("env", &runner, next.clone(), || async { Ok(paths.clone()) }).await.is_err());
