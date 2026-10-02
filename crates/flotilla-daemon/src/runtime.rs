@@ -3867,6 +3867,9 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let state = Arc::clone(&state);
+                // Match background task admission to the shared daemon semaphore
+                // initialized from this value by with_checkout_removal_concurrency.
+                // A namespace-local task cap alone cannot pace all removals.
                 let removal_concurrency = state.checkout_removal_concurrency;
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
