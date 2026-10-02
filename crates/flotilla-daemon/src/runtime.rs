@@ -846,13 +846,12 @@ struct StartupRestoration {
 }
 
 impl StartupRestoration {
-    async fn run(&self) -> Result<(), ResourceError> {
+    async fn restore(&self) {
         let daemon = &self.daemon;
         let config = &self.config;
         let local_registry = &self.local_registry;
         let credential_store = &self.credential_store;
         let options = &self.options;
-        let runtime_health = &self.runtime_health;
         if let Some((_, provider)) = local_registry.environment_providers.get("docker") {
             let live =
                 phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())
@@ -877,13 +876,8 @@ impl StartupRestoration {
         if let Err(error) = phase("reconcile_adopted_checkouts", daemon.reconcile_adopted_checkouts(&options.namespace)).await {
             warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
         }
-        let mut controller_tasks = vec![AbortOnDropHandle::new(spawn_adopted_checkout_reconciliation_task(
-            Arc::clone(daemon),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        ))];
         let Some(state) = self.state.as_ref() else {
-            return futures::future::pending::<Result<(), ResourceError>>().await;
+            return;
         };
         if let Err(error) = phase("reconcile_provisioned_environments", reconcile_provisioned_environments(state, &options.namespace)).await
         {
@@ -892,6 +886,27 @@ impl StartupRestoration {
         if let Err(error) = phase("reconcile_work_credentials", reconcile_work_credentials(state, &options.namespace)).await {
             warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
         }
+    }
+
+    async fn run(&self) -> Result<(), ResourceError> {
+        // Preserve adoption -> credentials -> resource-controller ordering.
+        // Dispatch also waits so new work does not compete with initial recovery.
+        // Health and clients remain available while restoration is pending; the
+        // initial pass deliberately has no deadline: starting controllers after
+        // partial adoption could violate ownership and credential-staging order.
+        // Ordinary failures still let periodic reconciliation retry.
+        self.restore().await;
+        let daemon = &self.daemon;
+        let options = &self.options;
+        let runtime_health = &self.runtime_health;
+        let mut controller_tasks = vec![AbortOnDropHandle::new(spawn_adopted_checkout_reconciliation_task(
+            Arc::clone(daemon),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        ))];
+        let Some(state) = self.state.as_ref() else {
+            return futures::future::pending::<Result<(), ResourceError>>().await;
+        };
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
             Arc::clone(daemon),
             options.namespace.clone(),
@@ -934,12 +949,18 @@ impl StartupRestoration {
     }
 }
 
+pub(crate) async fn wait_for_listening(ready: Option<watch::Receiver<bool>>) -> Result<(), watch::error::RecvError> {
+    if let Some(mut ready) = ready {
+        ready.wait_for(|ready| *ready).await?;
+    }
+    Ok(())
+}
+
 fn spawn_startup_restoration(restoration: StartupRestoration) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Some(mut ready) = restoration.options.startup_ready.clone() {
-            if ready.wait_for(|ready| *ready).await.is_err() {
-                return; // Server failed before it could accept clients.
-            }
+        if let Err(error) = wait_for_listening(restoration.options.startup_ready.clone()).await {
+            debug!(%error, "startup restoration cancelled because the server did not listen");
+            return;
         }
         supervise_controller(
             "startup_restoration",
@@ -3344,10 +3365,10 @@ fn spawn_provisioned_environment_reconciliation_task(
         let state = Arc::clone(&state);
         let namespace = namespace.clone();
         async move {
-            if let Err(error) = phase("reconcile_provisioned_environments", reconcile_provisioned_environments(&state, &namespace)).await {
+            if let Err(error) = reconcile_provisioned_environments(&state, &namespace).await {
                 warn!(%error, "failed to reconcile provisioned environment registrations");
             }
-            if let Err(error) = phase("reconcile_work_credentials", reconcile_work_credentials(&state, &namespace)).await {
+            if let Err(error) = reconcile_work_credentials(&state, &namespace).await {
                 warn!(%error, "failed to reconcile work credentials");
             }
         }
@@ -10643,7 +10664,6 @@ mod tests {
             .find(|record| record["fields"]["phase"] == "reconcile_work_credentials" && record["fields"]["status"] == "completed")
             .unwrap_or_else(|| panic!("credential phase timing absent from log: {records}"));
         assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
-        println!("credential phase: {}", finish["fields"]);
         runtime.shutdown();
     }
 

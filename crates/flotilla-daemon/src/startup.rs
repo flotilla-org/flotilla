@@ -37,6 +37,22 @@ mod tests {
 
     use super::phase;
 
+    // Deferred restoration remains pending before readiness, starts after
+    // readiness, and is cancelled when the server closes without listening.
+    #[tokio::test]
+    async fn listening_gate_observes_readiness_and_closed_server_without_clock_deadlines() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let gate = crate::runtime::wait_for_listening(Some(receiver));
+        tokio::pin!(gate);
+        assert!(futures::poll!(gate.as_mut()).is_pending());
+        sender.send(true).expect("server ready");
+        assert!(gate.await.is_ok());
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        drop(sender);
+        assert!(crate::runtime::wait_for_listening(Some(receiver)).await.is_err());
+        assert!(crate::runtime::wait_for_listening(None).await.is_ok());
+    }
+
     // #2487: even a failed or interrupted await must leave its phase and elapsed
     // duration in the JSON log. Virtual time makes the 38-second gap inexpensive.
     #[tokio::test(start_paused = true)]

@@ -5038,10 +5038,6 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     .expect("startup must return while reconciliation is blocked")
     .expect("runtime");
     assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
-    assert!(
-        tokio::time::timeout(StdDuration::from_millis(20), provider.entered.notified()).await.is_err(),
-        "restoration waits for listening"
-    );
     let shutdown = server.shutdown_tx.clone();
     let task = tokio::spawn(server.run());
     tokio::time::timeout(StdDuration::from_secs(2), provider.entered.notified()).await.expect("background reconciliation starts");
@@ -5090,34 +5086,4 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     runtime.shutdown();
     shutdown.send(true).expect("shutdown");
     task.await.expect("server task").expect("server stops");
-}
-
-// #2487: if the listening server is lost, deferred restoration must be cancelled
-// rather than provisioning against a daemon clients cannot reach.
-#[tokio::test]
-async fn startup_restoration_is_cancelled_if_the_server_never_listens() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket_dir = TestSocketDir::new();
-    let socket_path = socket_dir.socket_path("failed-startup.sock");
-    let config = test_config_store(tmp.path().join("config"));
-    let provider = Arc::new(GatedStartupEnvironmentProvider {
-        entered: Notify::new(),
-        release: tokio::sync::Semaphore::new(2),
-        completed: AtomicUsize::new(0),
-    });
-    let mut discovery = fake_discovery(false);
-    discovery.factories.environment_providers.push(Box::new(GatedStartupEnvironmentFactory(provider.clone())));
-    let server =
-        DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");
-    let runtime =
-        crate::runtime::DaemonRuntime::start_with_options(server.daemon(), config, Some(socket_path), crate::runtime::RuntimeOptions {
-            startup_ready: Some(server.startup_ready()),
-            ..crate::runtime::RuntimeOptions::default()
-        })
-        .await
-        .expect("runtime");
-    drop(server);
-    assert!(tokio::time::timeout(StdDuration::from_millis(20), provider.entered.notified()).await.is_err());
-    assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
-    runtime.shutdown();
 }

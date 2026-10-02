@@ -465,6 +465,11 @@ impl DaemonServer {
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
 
+        // This only reads local pending records and registers asynchronous retry
+        // workers. Keep the snapshot before admission so replay cannot replace a
+        // newer client retry with stale completion data.
+        phase("resume_pending_crew_completions", remote_command_router.resume_pending_crew_completions()).await;
+
         let idle_client_count = Arc::clone(&client_count);
         let idle_shutdown_request_tx = shutdown_request_tx.clone();
         let idle_notify = Arc::clone(&client_notify);
@@ -506,14 +511,6 @@ impl DaemonServer {
         let mut accept_retry_at = None;
         let mut connection_tasks = JoinSet::new();
         self.startup_ready.send_replace(true);
-        let completion_router = remote_command_router.clone();
-        let mut completion_shutdown = shutdown_rx.clone();
-        connection_tasks.spawn(async move {
-            tokio::select! {
-                () = completion_router.resume_pending_crew_completions() => {},
-                _ = completion_shutdown.changed() => {},
-            }
-        });
         loop {
             tokio::select! {
                 accept_result = listener.accept(), if accept_retry_at.is_none() => {
