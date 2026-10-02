@@ -175,12 +175,16 @@ pub(crate) fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&s
     Ok(parts.join(" "))
 }
 
-pub(crate) fn atomic_write_script(path: &Path, temp_suffix: &str) -> Result<String, String> {
+pub(crate) fn atomic_write_script(path: &Path, temp_suffix: &str, mode: Option<u32>) -> Result<String, String> {
     let parent = path.parent().ok_or_else(|| format!("file path has no parent: {}", path.display()))?;
     let target = path.to_string_lossy();
     let temporary = format!("{target}.flotilla-tmp-{temp_suffix}");
+    if mode.is_some_and(|mode| mode > 0o777) {
+        return Err("file mode must contain only permission bits".to_string());
+    }
+    let protect = mode.map(|mode| format!("chmod {mode:o} \"$tmp\"; ")).unwrap_or_default();
     Ok(format!(
-        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; mv \"$tmp\" {}; trap - EXIT",
+        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; umask 077; cat > \"$tmp\"; {protect}mv \"$tmp\" {}; trap - EXIT",
         flotilla_protocol::arg::shell_quote(&parent.to_string_lossy()),
         flotilla_protocol::arg::shell_quote(&temporary),
         flotilla_protocol::arg::shell_quote(&target),
@@ -338,6 +342,12 @@ pub trait CommandRunner: Send + Sync {
     /// the content outside argv and command transcripts.
     async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
         Err("command runner does not support secure file writes".to_string())
+    }
+
+    /// Atomically publish content with its final Unix permissions. The
+    /// temporary file must be private while it is written.
+    async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
+        Err("command runner does not support protected file writes".to_string())
     }
 }
 
@@ -531,6 +541,40 @@ impl CommandRunner for ProcessCommandRunner {
         let temporary = path.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
         tokio::fs::write(&temporary, content).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
         tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+    }
+
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if mode > 0o777 {
+            return Err("file mode must contain only permission bits".to_string());
+        }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        let temporary = path.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .await
+                .map_err(|e| format!("open {}: {e}", temporary.display()))?;
+            use tokio::io::AsyncWriteExt;
+            file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+            file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await
+                .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
+            drop(file);
+            tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result
     }
 }
 
@@ -810,6 +854,19 @@ pub(crate) mod testing {
         runner.write_file(&path, "new secret brief").await.expect("write_file");
 
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new secret brief");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_runner_publishes_secret_with_requested_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/token");
+        let runner = super::ProcessCommandRunner;
+        runner.write_file_with_mode(&path, "secret", 0o600).await.expect("write secret");
+        assert_eq!(std::fs::read_to_string(&path).expect("read token"), "secret");
+        assert_eq!(std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]

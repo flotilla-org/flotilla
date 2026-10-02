@@ -1700,23 +1700,18 @@ impl CredentialStore {
                 let path = credential_dir.join("token").to_string_lossy().into_owned();
                 let helper_path = credential_dir.join("git-credential-forgejo").to_string_lossy().into_owned();
                 if !already_prepared {
-                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(Path::new(&path), material, 0o600)
                         .await
-                        .map_err(|error| format!("protect token file: {error}"))?;
+                        .map_err(|error| format!("write token file: {error}"))?;
                     let helper = format!(
                         "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {host}{} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
                         parsed_url.port().map(|port| format!(":{port}")).unwrap_or_default()
                     );
                     runner
-                        .write_file(Path::new(&helper_path), &helper)
+                        .write_file_with_mode(Path::new(&helper_path), &helper, 0o700)
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
-                    runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
-                        .await
-                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
                     let curl_config = format!(
                         "silent\nshow-error\nfail\nheader = \"Authorization: token {}\"\nurl = \"{}\"\n",
@@ -1755,11 +1750,10 @@ impl CredentialStore {
                 let path = credential_dir.join("token").to_string_lossy().into_owned();
                 let helper_path = credential_dir.join("git-credential-http-token").to_string_lossy().into_owned();
                 if !already_prepared {
-                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(Path::new(&path), material, 0o600)
                         .await
-                        .map_err(|error| format!("protect token file: {error}"))?;
+                        .map_err(|error| format!("write token file: {error}"))?;
                     let helper = format!(
                         "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nrequest_host=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) request_host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$request_host\" = {} ] || exit 0\nprintf 'username=%s\\n' {}\nprintf 'password='\ncat {}\nprintf '\\n'\n",
                         shell_single_quote(&host),
@@ -1767,13 +1761,9 @@ impl CredentialStore {
                         shell_single_quote(&path),
                     );
                     runner
-                        .write_file(Path::new(&helper_path), &helper)
+                        .write_file_with_mode(Path::new(&helper_path), &helper, 0o700)
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
-                    runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
-                        .await
-                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
                 }
                 git_credential = Some(GitCredentialContribution {
                     fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
@@ -1911,12 +1901,10 @@ impl CredentialStore {
                     .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
                 let credential_file = delivery_paths.credential_dir(name).join("review-bundle.json");
                 if !already_prepared {
-                    runner.write_file(&credential_file, material).await.map_err(|error| format!("write credential file: {error}"))?;
-                    let path = credential_file.to_string_lossy();
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(&credential_file, material, 0o600)
                         .await
-                        .map_err(|error| format!("protect credential file: {error}"))?;
+                        .map_err(|error| format!("write credential file: {error}"))?;
                 }
                 env.insert("FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE".to_string(), credential_file.to_string_lossy().into_owned());
                 env.insert("FLOTILLA_REVIEW_STORE_ENDPOINT".to_string(), endpoint.clone());
@@ -2015,7 +2003,11 @@ async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> 
     let mut errors = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
         let name = entry.file_name();
-        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
+        let Some(suffix) =
+            name.to_str().and_then(|name| name.strip_prefix("token.tmp-").or_else(|| name.strip_prefix("token.flotilla-tmp-")))
+        else {
+            continue;
+        };
         if uuid::Uuid::parse_str(suffix).is_err() {
             continue;
         }
@@ -2048,12 +2040,13 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
                 "failed=0; \
                 for directory in \"$1\"/credentials/*; do \
                     [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
-                    for file in \"$directory\"/token.tmp-*; do \
+                    for file in \"$directory\"/token.tmp-* \"$directory\"/token.flotilla-tmp-*; do \
                         [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
                         case \"${file##*/}\" in \
-                            token.tmp-????????-????-????-????-????????????) \
+                            token.tmp-????????-????-????-????-????????????|token.flotilla-tmp-????????-????-????-????-????????????) \
                                 name=${file##*/}; \
-                                hex=$(printf '%s' \"${name#token.tmp-}\" | tr -d '-'); \
+                                suffix=${name#token.tmp-}; suffix=${suffix#token.flotilla-tmp-}; \
+                                hex=$(printf '%s' \"$suffix\" | tr -d '-'); \
                                 case \"$hex\" in \
                                     ????????????????????????????????) \
                                         case \"$hex\" in *[!0123456789abcdefABCDEF]*) continue;; esac; \
@@ -2075,42 +2068,15 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
 }
 
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
-    runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
-    let path = path.to_string_lossy();
-    runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("protect token file: {error}"))
+    runner.write_file_with_mode(path, token, 0o600).await.map_err(|error| format!("write token file: {error}"))
 }
 
 async fn replace_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
-    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let result = async {
-        write_github_app_token_file(runner, &temporary, token).await?;
-        runner
-            .run("mv", &["-f", "--", &temporary.to_string_lossy(), &path.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("replace token file: {error}"))
-    }
-    .await;
-    if result.is_err() {
-        if let Err(error) = runner.run("rm", &["-f", "--", &temporary.to_string_lossy()], Path::new("/"), &ChannelLabel::Default).await {
-            tracing::warn!(path = %temporary.display(), %error, "failed to remove incomplete GitHub App token file");
-        }
-    }
-    result
+    write_github_app_token_file(runner, path, token).await
 }
 
 async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &str, context: &str) -> Result<(), String> {
-    runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
-    let path = path.to_string_lossy();
-    runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("protect {context}: {error}"))
+    runner.write_file_with_mode(path, contents, 0o700).await.map_err(|error| format!("write {context}: {error}"))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -2708,6 +2674,7 @@ mod tests {
     struct RecordingRunner {
         calls: StdMutex<Vec<RecordedCall>>,
         writes: StdMutex<Vec<(PathBuf, String)>>,
+        protected_writes: StdMutex<Vec<(PathBuf, u32)>>,
         runtime_dir_checks: StdMutex<VecDeque<bool>>,
     }
 
@@ -2763,6 +2730,12 @@ mod tests {
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
             self.writes.lock().expect("writes lock").push((path.to_path_buf(), content.to_string()));
             Ok(())
+        }
+
+        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+            assert!(matches!(mode, 0o600 | 0o700));
+            self.protected_writes.lock().expect("protected writes lock").push((path.to_path_buf(), mode));
+            self.write_file(path, content).await
         }
     }
 
@@ -2831,8 +2804,8 @@ mod tests {
             false
         }
 
-        async fn write_file(&self, path: &Path, _content: &str) -> Result<(), String> {
-            tokio::fs::write(path, "partial-new-token").await.map_err(|error| error.to_string())?;
+        async fn write_file_with_mode(&self, _path: &Path, _content: &str, mode: u32) -> Result<(), String> {
+            assert_eq!(mode, 0o600);
             Err("simulated interrupted credential write".to_string())
         }
     }
@@ -2858,14 +2831,16 @@ mod tests {
         let credential_dir = state.path().join("credentials/github-app");
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let unrelated = credential_dir.join("token.tmp-other");
-        for path in [&abandoned, &live, &unrelated] {
+        for path in [&abandoned, &current_abandoned, &live, &unrelated] {
             tokio::fs::write(path, "secret material").await.expect("write credential file");
         }
         cleanup_stale_github_app_token_files_in(state.path()).await.expect("clean staging files");
 
         assert!(!abandoned.exists());
+        assert!(!current_abandoned.exists());
         assert!(unrelated.exists());
         assert!(live.exists());
     }
@@ -2911,15 +2886,18 @@ mod tests {
         let credential_dir = base.path().join("credentials/github-app");
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let malformed = credential_dir.join("token.tmp-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
         tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
+        tokio::fs::write(&current_abandoned, "abandoned material").await.expect("write current staging file");
         tokio::fs::write(&live, "live material").await.expect("write live token");
         tokio::fs::write(&malformed, "unrelated material").await.expect("write unrelated file");
 
         cleanup_stale_github_app_token_files_with_runner(&ProcessCommandRunner, base.path()).await.expect("clean delivered staging file");
 
         assert!(!abandoned.exists());
+        assert!(!current_abandoned.exists());
         assert!(live.exists());
         assert!(malformed.exists());
     }
@@ -3602,10 +3580,13 @@ interactions:
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
         assert!(token_writes[2].1.contains("installation-token-three"));
-        assert_ne!(token_writes[0].0, token_writes[2].0, "rotation must stage at a separate path");
-        assert!(runner.calls.lock().expect("calls lock").iter().any(|(command, args, _)| {
-            command == "mv" && args == &["-f", "--", &token_writes[2].0.to_string_lossy(), &token_writes[0].0.to_string_lossy()]
-        }));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "runner atomically replaces the token at its stable path");
+        assert!(runner
+            .protected_writes
+            .lock()
+            .expect("protected writes lock")
+            .iter()
+            .any(|(path, mode)| { path == &token_writes[2].0 && *mode == 0o600 }));
         {
             let writes = runner.writes.lock().expect("writes lock");
             let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
@@ -4574,13 +4555,10 @@ interactions:
                 "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
+        let protected = runner.protected_writes.lock().expect("protected writes lock");
+        assert!(protected.contains(&(PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), 0o600)));
+        assert!(protected.contains(&(PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"), 0o700)));
         let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/tmp/flotilla-test-state/credentials/lab-forgejo/token"]));
-        assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"]
-        }));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh"
                 && args.iter().any(|arg| arg.contains("GIT_CONFIG_NOSYSTEM=1"))
@@ -4640,12 +4618,7 @@ interactions:
             .expect("writes lock")
             .iter()
             .any(|(path, contents)| path == Path::new(credential_file) && contents == material));
-        assert!(runner
-            .calls
-            .lock()
-            .expect("calls lock")
-            .iter()
-            .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
+        assert!(runner.protected_writes.lock().expect("protected writes lock").contains(&(PathBuf::from(credential_file), 0o600)));
     }
 
     async fn create_git_http_token_spec(backend: &ResourceBackend, name: &str, host: &str, source_env: &str) {

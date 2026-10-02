@@ -125,7 +125,13 @@ impl CommandRunner for DockerEnvironmentRunner {
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-        let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string(), None)?;
+        let args = ["exec", "-i", &self.container_name, "sh", "-c", script.as_str()];
+        self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
+    }
+
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string(), Some(mode))?;
         let args = ["exec", "-i", &self.container_name, "sh", "-c", script.as_str()];
         self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
@@ -136,7 +142,7 @@ impl CommandRunner for DockerEnvironmentRunner {
     }
 
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let script = atomic_write_script(destination, &Uuid::new_v4().to_string())?;
+        let script = atomic_write_script(destination, &Uuid::new_v4().to_string(), None)?;
         self.inner.run_from_file("docker", &["exec", "-i", &self.container_name, "sh", "-c", &script], Path::new("/"), source).await
     }
 }
@@ -361,6 +367,17 @@ mod tests {
         assert!(calls[0].1.iter().all(|arg| !arg.contains("secret assignment")));
         assert!(calls[0].1.contains(&"-i".to_string()));
         assert!(calls[0].1.last().expect("write script").contains("cat > \"$tmp\""));
+    }
+
+    #[tokio::test]
+    async fn protected_write_sets_mode_before_container_rename() {
+        let inner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
+        runner.write_file_with_mode(Path::new("/app/token"), "secret token", 0o600).await.expect("write token");
+        let calls = inner.calls();
+        let script = calls[0].1.last().expect("write script");
+        assert!(script.contains("chmod 600 \"$tmp\"; mv"), "script: {script}");
+        assert!(calls[0].1.iter().all(|arg| !arg.contains("secret token")));
     }
 
     #[tokio::test]
