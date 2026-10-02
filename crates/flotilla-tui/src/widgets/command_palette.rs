@@ -17,6 +17,7 @@ use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext}
 use crate::{
     app::{file_picker_start_dir, ProjectAddressState, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    interaction::InteractionContext,
     keymap::Action,
     palette::{self, PaletteCompletion, PaletteInputState, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
 };
@@ -109,7 +110,7 @@ impl CommandPaletteWidget {
         &self,
         model: &TuiModel,
         namespaces: &crate::app::NamespaceMap,
-        interactions: crate::interaction::InteractionContext<'_>,
+        interactions: InteractionContext<'_>,
     ) -> Vec<PaletteCompletion> {
         palette::palette_completions_with_availability(self.input.value(), model, namespaces, |action| interactions.is_available(action))
     }
@@ -196,8 +197,7 @@ impl CommandPaletteWidget {
     }
 
     fn dispatch_palette_action(&self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        let interactions =
-            crate::interaction::InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         if !interactions.is_available(action) {
             ctx.app_actions.push(AppAction::ShowStatus("That action is not available in this view".into()));
             return Outcome::Finished;
@@ -294,8 +294,7 @@ pub(crate) fn tui_dispatch(resolved: Resolved, model: &TuiModel, provisioning_ta
 
 impl InteractiveWidget for CommandPaletteWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        let interactions =
-            crate::interaction::InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         match action {
             Action::SelectNext => {
                 let count = self.completions(ctx.model, ctx.namespaces, interactions).len();
@@ -328,8 +327,7 @@ impl InteractiveWidget for CommandPaletteWidget {
     }
 
     fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
-        let interactions =
-            crate::interaction::InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         // Right arrow: fill selected completion into input (Tab goes through handle_action)
         if matches!(key.code, KeyCode::Right) {
             let completions = self.completions(ctx.model, ctx.namespaces, interactions);
@@ -362,10 +360,7 @@ impl InteractiveWidget for CommandPaletteWidget {
             return Outcome::Finished;
         }
         if overlay.body.contains(position) {
-            let interactions = crate::interaction::InteractionContext::for_active_view(
-                ctx.views.active_address(),
-                ctx.views.active_table_state().selected(),
-            );
+            let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
             let completions = self.completions(ctx.model, ctx.namespaces, interactions);
             let row = mouse.row - overlay.body.y;
             if row < self.hint_rows {
@@ -383,8 +378,7 @@ impl InteractiveWidget for CommandPaletteWidget {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
-        let interactions =
-            crate::interaction::InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         let completions = self.completions(ctx.model, ctx.namespaces, interactions);
         let show_failure = palette::is_open_address_completion(self.input.value())
             && matches!(ctx.model.project_address_state, ProjectAddressState::Failed);
@@ -489,7 +483,13 @@ mod tests {
     use flotilla_protocol::CommandAction;
 
     use super::*;
-    use crate::app::test_support::TestWidgetHarness;
+    use crate::{
+        app::{
+            test_support::{stub_app, TestWidgetHarness},
+            UiState,
+        },
+        theme::Theme,
+    };
 
     #[test]
     fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
@@ -500,8 +500,8 @@ mod tests {
     }
     fn render_for_mouse(widget: &mut CommandPaletteWidget, harness: &mut TestWidgetHarness) {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let mut ctx = RenderContext {
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn refresh_uses_active_project_and_checkout_queries_without_repository_context() {
         for address in ["project/flotilla/roadmap", "checkouts?project=flotilla%2Froadmap"] {
-            let mut app = crate::app::test_support::stub_app();
+            let mut app = stub_app();
             app.views.open_or_focus(address.parse().expect("view address"));
             app.sync_active_view();
             app.subscriptions_dirty = false;
@@ -566,10 +566,8 @@ mod tests {
     fn selection_wraps_in_both_directions() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-        );
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
         let count = widget.completions(&harness.model, &harness.namespaces, interactions).len();
         assert!(count > 1);
 
@@ -635,8 +633,8 @@ mod tests {
         harness.model.project_address_state = ProjectAddressState::Failed;
         let mut widget = CommandPaletteWidget::with_state(Input::from("open "), 0, 0);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let mut ctx = RenderContext {
@@ -664,8 +662,8 @@ mod tests {
             ProjectAddressState::Loaded(vec!["project/flotilla/r%C3%A9sum%C3%A9".parse().expect("project address")]);
         let mut widget = CommandPaletteWidget::with_state(Input::from("open project/"), 0, 0);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let mut ctx = RenderContext {
@@ -716,10 +714,8 @@ mod tests {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
         render_for_mouse(&mut widget, &mut harness);
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-        );
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
         let expected = widget.completions(&harness.model, &harness.namespaces, interactions)[1].value.clone();
         let body = widget.overlay.expect("rendered overlay").body;
         let outcome = widget.handle_mouse(left_click(body.x + 2, body.y + 1), &mut harness.ctx());
@@ -744,10 +740,8 @@ mod tests {
         let mut widget = CommandPaletteWidget::with_state(Input::from(""), 2, 2);
         let mut harness = TestWidgetHarness::new();
         render_for_mouse(&mut widget, &mut harness);
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-        );
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
         let expected = widget.completions(&harness.model, &harness.namespaces, interactions)[2].value.clone();
         let body = widget.overlay.expect("rendered overlay").body;
         let outcome = widget.handle_mouse(left_click(body.x + 2, body.y), &mut harness.ctx());
@@ -763,8 +757,8 @@ mod tests {
             widget.handle_raw_key(KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE), &mut harness.ctx());
         }
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let status_row = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16).status_row;

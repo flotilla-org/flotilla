@@ -739,6 +739,7 @@ mod tests {
     use flotilla_protocol::CommandAction;
 
     use super::*;
+    use crate::interaction::InteractionContext;
 
     #[test]
     fn parse_target_command() {
@@ -964,13 +965,13 @@ mod tests {
     fn contextual_completions_only_offer_find_when_the_active_view_supports_it() {
         let model = empty_model();
         let overview = flotilla_protocol::ViewAddress::Overview;
-        let overview_context = crate::interaction::InteractionContext::for_active_view(Some(&overview), None);
+        let overview_context = InteractionContext::for_active_view(Some(&overview), None);
         let overview_values =
             palette_completions_with_availability("", &model, &Default::default(), |action| overview_context.is_available(action));
         assert!(!overview_values.iter().any(|completion| completion.value == "find"));
 
         let table: flotilla_protocol::ViewAddress = "convoys/flotilla".parse().expect("table address");
-        let table_context = crate::interaction::InteractionContext::for_active_view(Some(&table), None);
+        let table_context = InteractionContext::for_active_view(Some(&table), None);
         let table_values =
             palette_completions_with_availability("", &model, &Default::default(), |action| table_context.is_available(action));
         assert!(table_values.iter().any(|completion| completion.value == "find"));

@@ -35,6 +35,7 @@ use crate::{
     keymap::Keymap,
     pm_open::PmConnector,
     theme::Theme,
+    widgets::file_picker::FilePickerWidget,
 };
 
 /// Per-provider auth/health status from last refresh.
@@ -1493,7 +1494,7 @@ impl App {
     pub(super) fn open_file_picker(&mut self) {
         let start_dir = file_picker_start_dir();
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
-        self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::open(input)));
+        self.screen.modal_stack.push(Box::new(FilePickerWidget::open(input)));
     }
 }
 

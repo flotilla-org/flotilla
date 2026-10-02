@@ -5,8 +5,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::Arc,
 };
+
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 pub struct Directory {
@@ -21,7 +23,7 @@ type ScanResult = Result<Vec<Directory>, String>;
 
 struct PendingScan {
     directory: PathBuf,
-    result: mpsc::Receiver<ScanResult>,
+    result: oneshot::Receiver<ScanResult>,
 }
 
 #[derive(bon::Builder)]
@@ -45,28 +47,45 @@ impl Default for DirectoryListing {
     }
 }
 
-/// This function only runs on a blocking worker. Directory entry errors are
-/// retained rather than silently turning inaccessible directories into empty lists.
+/// Top-level read failures are visible in the picker. Per-entry races and
+/// inaccessible paths are logged and tolerated so one bad entry cannot hide
+/// every accessible repository in the directory.
 fn scan_directory(directory: &Path) -> ScanResult {
-    let scan = || -> std::io::Result<Vec<Directory>> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+    let mut entries = Vec::new();
+    let listing = std::fs::read_dir(directory).map_err(|error| format!("Unable to read directory: {error} ({})", directory.display()))?;
+    for entry in listing {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(directory = %directory.display(), %error, "unable to read directory entry");
                 continue;
             }
-            let path = entry.path();
-            if !std::fs::metadata(&path)?.is_dir() {
-                continue;
-            }
-            let is_git_repo = path.join(".git").try_exists()?;
-            entries.push(Directory { name, path: std::fs::canonicalize(path)?, is_git_repo });
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    };
-    scan().map_err(|error| format!("Unable to read directory: {error} ({})", directory.display()))
+        let path = entry.path();
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "unable to inspect directory entry");
+                continue;
+            }
+        }
+        let is_git_repo = path.join(".git").try_exists().unwrap_or_else(|error| {
+            tracing::warn!(path = %path.display(), %error, "unable to inspect repository marker");
+            false
+        });
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|error| {
+            tracing::warn!(path = %path.display(), %error, "unable to resolve directory path");
+            path
+        });
+        entries.push(Directory { name, path: canonical, is_git_repo });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
 }
 
 impl DirectoryListing {
@@ -74,7 +93,7 @@ impl DirectoryListing {
         Self::builder().scanner(scanner).build()
     }
 
-    fn set_input(&mut self, input: &str) {
+    fn set_input(&mut self, input: &str) -> bool {
         let path = Path::new(input);
         let (directory, prefix) = if input.ends_with('/') {
             (path.to_path_buf(), String::new())
@@ -84,13 +103,22 @@ impl DirectoryListing {
                 path.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default(),
             )
         };
-        self.directory = if directory.as_os_str().is_empty() { PathBuf::from(".") } else { directory };
+        let directory = if directory.as_os_str().is_empty() { PathBuf::from(".") } else { directory };
+        let changed = self.directory != directory || self.prefix != prefix;
+        self.directory = directory;
         self.prefix = prefix;
+        changed
     }
 
-    pub fn update(&mut self, input: &str) {
-        self.set_input(input);
-        self.poll();
+    /// Returns whether the displayed listing changed, allowing surfaces to
+    /// retain their projection across frames with no input or result changes.
+    pub fn update(&mut self, input: &str) -> bool {
+        let input_changed = self.set_input(input);
+        let result_changed = self.poll();
+        if input_changed && !result_changed {
+            self.project_entries();
+        }
+        input_changed || result_changed
     }
 
     #[cfg(test)]
@@ -104,32 +132,41 @@ impl DirectoryListing {
 
     /// Drain worker results without waiting, then start the latest outstanding
     /// directory request. Stale results never appear under a newer input path.
-    pub fn poll(&mut self) {
-        if let Some(pending) = &self.pending {
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(pending) = &mut self.pending {
             let result = match pending.result.try_recv() {
                 Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Directory discovery interrupted".into())),
+                Err(oneshot::error::TryRecvError::Empty) => None,
+                Err(oneshot::error::TryRecvError::Closed) => Some(Err("Directory discovery interrupted".into())),
             };
             if let Some(result) = result {
                 let pending = self.pending.take().expect("pending scan exists");
                 if pending.directory == self.directory {
                     self.cached = Some((pending.directory, result));
+                    changed = true;
                 }
             }
         }
         if self.pending.is_none() && self.is_loading() {
             let scanner = Arc::clone(&self.scanner);
             let directory = self.directory.clone();
-            let (sender, result) = mpsc::channel();
-            tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || scanner(&directory))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("Directory discovery failed: {error}")));
-                let _ = sender.send(result);
+            let (sender, result) = oneshot::channel();
+            // A running blocking scan cannot be cancelled. Keep only the latest
+            // requested directory while it finishes, bounding filesystem work
+            // to one scan at a time even on slow mounts.
+            tokio::task::spawn_blocking(move || {
+                let _ = sender.send(scanner(&directory));
             });
             self.pending = Some(PendingScan { directory: self.directory.clone(), result });
         }
+        if changed {
+            self.project_entries();
+        }
+        changed
+    }
+
+    fn project_entries(&mut self) {
         self.entries = self
             .cached
             .as_ref()
@@ -211,6 +248,27 @@ mod tests {
         .expect("latest directory becomes available");
         assert_eq!(listing.entries()[0].path, PathBuf::from("/new/fresh"));
         assert_eq!(*requests.lock().expect("requests lock"), vec![PathBuf::from("/old/"), PathBuf::from("/new/")]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_symlinks_do_not_hide_accessible_directories() {
+        let tmp = tempfile::tempdir().expect("temporary directory");
+        std::fs::create_dir(tmp.path().join("healthy")).expect("healthy directory");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), tmp.path().join("broken")).expect("dangling symlink");
+        let mut listing = DirectoryListing::default();
+        listing.update(&format!("{}/", tmp.path().display()));
+        settle(&mut listing).await;
+        assert!(listing.error().is_none(), "{:?}", listing.error());
+        assert_eq!(listing.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), vec!["healthy"]);
+    }
+
+    #[tokio::test]
+    async fn worker_panics_report_an_error_instead_of_waiting_forever() {
+        let mut listing = DirectoryListing::with_scanner(Arc::new(|_: &Path| panic!("injected worker failure")));
+        listing.update("/failure/");
+        settle(&mut listing).await;
+        assert_eq!(listing.error(), Some("Directory discovery interrupted"));
     }
 
     #[tokio::test]

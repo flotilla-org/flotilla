@@ -1,4 +1,4 @@
-use std::{any::Any, path::PathBuf};
+use std::{any::Any, collections::HashSet, path::PathBuf};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{Command, CommandAction};
@@ -27,6 +27,8 @@ pub struct FilePickerWidget {
     #[builder(skip)]
     listing: DirectoryListing,
     #[builder(skip)]
+    tracked_paths: HashSet<PathBuf>,
+    #[builder(skip)]
     selected: usize,
     #[builder(skip)]
     picker_area: Rect,
@@ -42,7 +44,7 @@ impl FilePickerWidget {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(input: Input, dir_entries: Vec<DirEntry>) -> Self {
+    pub(crate) fn new(input: Input, mut dir_entries: Vec<DirEntry>) -> Self {
         use crate::file_picker_model::Directory;
 
         let base = if input.value().ends_with('/') {
@@ -50,9 +52,12 @@ impl FilePickerWidget {
         } else {
             PathBuf::from(input.value()).parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf()
         };
+        for entry in &mut dir_entries {
+            entry.path = base.join(&entry.name);
+        }
         let entries = dir_entries
             .iter()
-            .map(|entry| Directory { name: entry.name.clone(), path: base.join(&entry.name), is_git_repo: entry.is_git_repo })
+            .map(|entry| Directory { name: entry.name.clone(), path: entry.path.clone(), is_git_repo: entry.is_git_repo })
             .collect();
         let listing = DirectoryListing::seeded(input.value(), entries);
         let mut widget = Self::open(input);
@@ -68,20 +73,26 @@ impl FilePickerWidget {
     }
 
     fn refresh_dir_listing(&mut self, model: &TuiModel) {
-        self.listing.update(self.input.value());
-        let tracked: std::collections::HashSet<_> = model.repos.values().map(|repo| &repo.path).collect();
-        self.dir_entries = self
-            .listing
-            .entries()
-            .iter()
-            .map(|entry| DirEntry {
-                name: entry.name.clone(),
-                is_dir: true,
-                is_git_repo: entry.is_git_repo,
-                is_added: tracked.contains(&entry.path),
-            })
-            .collect();
-        self.selected = self.selected.min(self.dir_entries.len().saturating_sub(1));
+        let changed = self.listing.update(self.input.value());
+        let tracked: HashSet<_> = model.repos.values().map(|repo| repo.path.clone()).collect();
+        if changed || tracked != self.tracked_paths {
+            self.dir_entries = self
+                .listing
+                .entries()
+                .iter()
+                .map(|entry| {
+                    DirEntry::builder()
+                        .name(entry.name.clone())
+                        .path(entry.path.clone())
+                        .is_dir(true)
+                        .is_git_repo(entry.is_git_repo)
+                        .is_added(tracked.contains(&entry.path))
+                        .build()
+                })
+                .collect();
+            self.tracked_paths = tracked;
+            self.selected = self.selected.min(self.dir_entries.len().saturating_sub(1));
+        }
     }
 
     fn base_path(&self) -> String {
@@ -100,8 +111,7 @@ impl FilePickerWidget {
         let base = self.base_path();
 
         if entry.is_git_repo && !entry.is_added {
-            let path = PathBuf::from(format!("{}{}", base, entry.name));
-            let canonical = self.listing.entries().get(self.selected).map(|entry| entry.path.clone()).unwrap_or(path);
+            let canonical = entry.path;
             let cmd = Command {
                 node_id: None,
                 provisioning_target: None,
@@ -275,14 +285,71 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction};
 
     use super::*;
-    use crate::app::test_support::TestWidgetHarness;
+    use crate::{
+        app::{test_support::TestWidgetHarness, UiState},
+        theme::Theme,
+    };
 
     fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
-        DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
+        DirEntry::builder()
+            .name(name.to_string())
+            .path(PathBuf::from(name))
+            .is_dir(true)
+            .is_git_repo(is_git_repo)
+            .is_added(is_added)
+            .build()
     }
 
     fn picker_with_entries(path: &str, entries: Vec<DirEntry>) -> FilePickerWidget {
         FilePickerWidget::new(Input::from(path), entries)
+    }
+
+    fn render_picker(
+        widget: &mut FilePickerWidget,
+        harness: &mut TestWidgetHarness,
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+    ) -> String {
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render picker");
+        terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[tokio::test]
+    async fn loading_hint_and_results_render_without_keypresses() {
+        let tmp = tempfile::tempdir().expect("temporary directory");
+        std::fs::create_dir(tmp.path().join("loaded-child")).expect("child directory");
+        let input = format!("{}/", tmp.path().display());
+        let mut widget = FilePickerWidget::open(Input::from(input.as_str()));
+        let mut harness = TestWidgetHarness::new();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
+        assert!(render_picker(&mut widget, &mut harness, &mut terminal).contains("Loading directories..."));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let rendered = render_picker(&mut widget, &mut harness, &mut terminal);
+                if rendered.contains("loaded-child/") {
+                    assert!(!rendered.contains("Loading directories..."));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subsequent frames show worker results without input");
     }
 
     #[tokio::test]
@@ -292,8 +359,8 @@ mod tests {
         let mut widget = FilePickerWidget::open(Input::from(input.as_str()));
         let mut harness = TestWidgetHarness::new();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 terminal
@@ -411,7 +478,7 @@ mod tests {
         std::fs::create_dir(repo_dir.join(".git")).expect("create .git dir");
 
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
-        let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
+        let entries = vec![dir_entry("my-repo", true, false)];
         let mut widget = picker_with_entries(&parent_path, entries);
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
@@ -461,7 +528,7 @@ mod tests {
         std::fs::create_dir(sub.join(".git")).expect("create .git");
 
         let base = format!("{}/", tmp.path().display());
-        let entries = vec![DirEntry { name: "existing-repo".to_string(), is_dir: true, is_git_repo: true, is_added: true }];
+        let entries = vec![dir_entry("existing-repo", true, true)];
         let mut widget = picker_with_entries(&base, entries);
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();

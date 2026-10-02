@@ -155,7 +155,7 @@ pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
-    DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
+    DirEntry::builder().name(name.to_string()).path(PathBuf::from(name)).is_dir(true).is_git_repo(is_git_repo).is_added(is_added).build()
 }
 
 pub(crate) fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: RepoLabels) -> RepoInfo {

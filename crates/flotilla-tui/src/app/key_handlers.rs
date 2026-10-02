@@ -4,6 +4,7 @@ use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelecto
 use super::{ui_state::PendingActionContext, App};
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
+    interaction::InteractionContext,
     keymap::Action,
     table_view::{PendingRowContext, TableIntent},
     widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, dispatch_confirm::DispatchConfirmWidget, InteractiveWidget},
@@ -20,7 +21,7 @@ impl App {
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.views.is_scoped());
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key)).filter(|action| {
-            crate::interaction::InteractionContext::for_active_view(self.views.active_address(), self.views.active_table_state().selected())
+            InteractionContext::for_active_view(self.views.active_address(), self.views.active_table_state().selected())
                 .is_available(*action)
         })
     }

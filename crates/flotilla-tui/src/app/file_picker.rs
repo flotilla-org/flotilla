@@ -11,10 +11,7 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction};
 
     use crate::{
-        app::{
-            test_support::{dir_entry, enter_file_picker, key, stub_app},
-            DirEntry,
-        },
+        app::test_support::{dir_entry, enter_file_picker, key, stub_app},
         binding_table::{BindingModeId, KeyBindingMode},
     };
 
@@ -132,7 +129,7 @@ mod tests {
 
         let mut app = stub_app();
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
-        let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
+        let entries = vec![dir_entry("my-repo", true, false)];
         enter_file_picker(&mut app, &parent_path, entries);
 
         app.handle_key(key(KeyCode::Enter));
@@ -161,7 +158,7 @@ mod tests {
 
         let base = format!("{}/", tmp.path().display());
         let mut app = stub_app();
-        let entries = vec![DirEntry { name: "existing-repo".to_string(), is_dir: true, is_git_repo: true, is_added: true }];
+        let entries = vec![dir_entry("existing-repo", true, true)];
         enter_file_picker(&mut app, &base, entries);
 
         app.handle_key(key(KeyCode::Enter));
