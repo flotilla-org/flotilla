@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
-    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, command_timeout_message, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput,
+    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 /// Persistent writable base reserved inside provisioned containers. Unlike a
@@ -88,7 +88,13 @@ impl CommandRunner for DockerEnvironmentRunner {
     ) -> Result<String, String> {
         let docker_args = self.docker_exec_args(cmd, args, cwd, false);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
-        self.inner.run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout).await
+        self.inner.run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout).await.map_err(|error| {
+            if error == command_timeout_message("docker", timeout) {
+                command_timeout_message(cmd, timeout)
+            } else {
+                error
+            }
+        })
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -170,6 +176,7 @@ mod tests {
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
     use crate::providers::{
+        command_timeout_message,
         testing::{MockRunner, TimeoutOnlyRunner},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     };
@@ -187,6 +194,15 @@ mod tests {
             Path::new("/").to_path_buf(),
             Duration::from_secs(3),
         )]);
+    }
+
+    #[tokio::test]
+    async fn docker_timeout_names_the_requested_command() {
+        let timeout = Duration::from_millis(500);
+        let inner = Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("docker", timeout))));
+        let runner = DockerEnvironmentRunner::new("container".into(), inner);
+        let result = runner.run_with_timeout("zellij", &["action"], Path::new("/work"), &ChannelLabel::Default, timeout).await;
+        assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
     }
 
     struct DockerContainer(String);

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
-    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, command_timeout_message, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput,
+    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
@@ -108,7 +108,13 @@ impl CommandRunner for SshCommandRunner {
     ) -> Result<String, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
-        self.runner.run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout).await
+        self.runner.run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout).await.map_err(|error| {
+            if error == command_timeout_message("ssh", timeout) {
+                command_timeout_message(cmd, timeout)
+            } else {
+                error
+            }
+        })
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -192,7 +198,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
-    use crate::providers::{testing::TimeoutOnlyRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::providers::{
+        command_timeout_message, testing::TimeoutOnlyRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+    };
 
     #[tokio::test]
     async fn timeout_is_forwarded_to_ssh_client() {
@@ -209,6 +217,15 @@ mod tests {
         assert!(script.contains("exec"));
         assert!(script.contains("cmd"));
         assert!(script.contains("arg"));
+    }
+
+    #[tokio::test]
+    async fn ssh_timeout_names_the_requested_command() {
+        let timeout = Duration::from_millis(500);
+        let inner = std::sync::Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("ssh", timeout))));
+        let runner = SshCommandRunner::new("user@host", false, inner);
+        let result = runner.run_with_timeout("zellij", &["action"], Path::new("/work"), &ChannelLabel::Default, timeout).await;
+        assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
     }
 
     struct RecordingRunner {

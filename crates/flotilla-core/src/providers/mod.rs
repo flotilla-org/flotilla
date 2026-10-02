@@ -372,7 +372,7 @@ pub trait CommandRunner: Send + Sync {
 }
 
 pub(crate) fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
-    format!("{cmd} timed out after {}s", timeout.as_secs())
+    format!("{cmd} timed out after {timeout:?}")
 }
 
 /// Production implementation that delegates to `tokio::process::Command`.
