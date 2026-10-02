@@ -262,6 +262,7 @@ impl App {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));
@@ -285,6 +286,7 @@ impl App {
                             needs: Vec::new(),
                             escalation_reason: None,
                             agent_overrides: Vec::new(),
+                            skills: Vec::new(),
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     });
@@ -323,6 +325,7 @@ impl App {
                         needs: Vec::new(),
                         escalation_reason: None,
                         agent_overrides: Vec::new(),
+                        skills: Vec::new(),
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));

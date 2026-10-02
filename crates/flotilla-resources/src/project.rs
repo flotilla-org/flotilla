@@ -24,6 +24,10 @@ pub struct ProjectSpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
+    // Previous-generation declarations omit skills (ADR 0047).
+    #[builder(default)]
+    #[serde(default)]
+    pub skills: BTreeMap<String, Vec<String>>,
     /// Platforms used to expand a role with `platform:$matrix` at admission.
     #[builder(default)]
     #[serde(default)]
@@ -330,6 +334,11 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
     }
 }
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
+    for refs in spec.skills.values() {
+        for reference in refs {
+            crate::validate_skill_ref(reference)?;
+        }
+    }
     let mut platforms = BTreeSet::new();
     for platform in &spec.platform_matrix {
         if platform.parse::<Platform>().is_err() {
@@ -510,6 +519,7 @@ mod tests {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
             role_needs: BTreeMap::new(),
+            skills: BTreeMap::new(),
             supervision: None,
             issue_source_bindings: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
             repositories: vec![ProjectRepositorySpec {
@@ -543,6 +553,7 @@ mod tests {
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
             role_needs: BTreeMap::new(),
+            skills: BTreeMap::new(),
             supervision: None,
             issue_source_bindings: Vec::new(),
             repositories: vec![member("ghostty"), member("ghostty-ops")],

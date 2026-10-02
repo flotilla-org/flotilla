@@ -191,6 +191,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         phase: "Landing".into(),
         message: Some("waiting for review evidence".into()),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         allocation: Vec::new(),
         vessel_placements: Default::default(),
         placement: None,
@@ -279,6 +280,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         stalled: None,
         message: None,
         role_needs: BTreeMap::new(),
+        skills: BTreeMap::new(),
         allocation: Vec::new(),
         placement: Some(PlacementDecision {
             policy_name: "macos-scarce".into(),

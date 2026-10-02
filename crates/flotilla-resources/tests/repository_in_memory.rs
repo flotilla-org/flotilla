@@ -58,6 +58,7 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
     let project = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent".into(),
         supervision: None,
@@ -90,6 +91,7 @@ async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let project = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Zellij".into(),
         default_workflow_ref: "single-agent".into(),
         supervision: None,
@@ -133,6 +135,7 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
     let spec = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
         supervision: None,
@@ -151,6 +154,7 @@ fn issue_bindings_reject_state_as_band_semantics() {
     let spec = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "App".into(),
         default_workflow_ref: "implement".into(),
         supervision: None,
@@ -178,6 +182,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     let project = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent".into(),
         supervision: None,
@@ -237,6 +242,7 @@ async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
     let project = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "ghostty".into(),
         default_workflow_ref: "single-agent".into(),
         supervision: None,
@@ -263,6 +269,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     let local_only = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Widgets".into(),
         default_workflow_ref: "single-agent".into(),
         supervision: None,
@@ -462,6 +469,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let normalized = normalize_project_spec(ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: " Example ".to_string(),
         default_workflow_ref: " single-agent ".to_string(),
         supervision: None,
@@ -489,6 +497,7 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let duplicate = ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Example".to_string(),
         default_workflow_ref: "single-agent".to_string(),
         supervision: None,
@@ -512,6 +521,7 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
         let spec = ProjectSpec {
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
+            skills: BTreeMap::new(),
             display_name: "Example".to_string(),
             default_workflow_ref: "single-agent".to_string(),
             supervision: None,

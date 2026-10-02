@@ -152,6 +152,32 @@ impl AgentMaterialRegistry {
         Ok(deliveries)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn stage_test_skills(
+        &self,
+        environment_ref: &str,
+        required_adapters: &BTreeSet<String>,
+        environment: &[(String, String)],
+        source_token_files: &BTreeMap<String, PathBuf>,
+        runner: &dyn CommandRunner,
+    ) -> Result<(), String> {
+        let inspection = inspect_skill_sources(self.skills.source.as_ref().expect("test source"))?;
+        let selected = inspection
+            .sources
+            .iter()
+            .map(|source| flotilla_resources::SkillCatalogEntry {
+                source: source.name.clone(),
+                repository: source.repository.clone(),
+                revision: source.revision.clone(),
+                name: "private-source".to_string(),
+                path: format!("{}/private-folder", source.paths[0]),
+            })
+            .collect::<Vec<_>>();
+        let mut environment = environment.to_vec();
+        environment.push(("FLOTILLA_RESOLVED_SKILLS".to_string(), serde_json::to_string(&selected).expect("test selection")));
+        self.stage_skills(environment_ref, required_adapters, &environment, source_token_files, runner).await
+    }
+
     pub(crate) async fn stage_skills(
         &self,
         environment_ref: &str,
@@ -185,6 +211,24 @@ impl AgentMaterialRegistry {
             }
         }
         result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
+    }
+
+    pub(crate) async fn selected_skill_source_credentials(
+        &self,
+        environment: &[(String, String)],
+    ) -> Result<Vec<SkillSourceCredentialRequest>, String> {
+        let selected: Vec<flotilla_resources::SkillCatalogEntry> = environment
+            .iter()
+            .find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS")
+            .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(self
+            .skill_source_credentials()
+            .await?
+            .into_iter()
+            .filter(|request| selected.iter().any(|entry| entry.source == request.source && entry.revision == request.revision))
+            .collect())
     }
 
     pub(crate) async fn skill_source_credentials(&self) -> Result<Vec<SkillSourceCredentialRequest>, String> {
@@ -502,6 +546,32 @@ impl SkillBundle {
         let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
             .await
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
+        let selected: Vec<flotilla_resources::SkillCatalogEntry> = environment
+            .iter()
+            .find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS")
+            .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")))
+            .transpose()?
+            .unwrap_or_default();
+        for entry in &selected {
+            flotilla_resources::validate_skill_ref(&entry.name)?;
+            if entry.path.is_empty()
+                || entry.path.starts_with('/')
+                || entry.path.contains(['\\', '\r', '\n', '\t'])
+                || entry.path.split('/').any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err(format!("invalid frozen skill path {}", entry.path));
+            }
+            if !inspection.sources.iter().any(|source| {
+                source.name == entry.source
+                    && source.revision == entry.revision
+                    && source
+                        .paths
+                        .iter()
+                        .any(|path| entry.path == *path || entry.path.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/')))
+            }) {
+                return Err(format!("frozen skill {}@{} is not supplied at revision {}", entry.repository, entry.name, entry.revision));
+            }
+        }
         let mut args = vec![
             "flotilla-stage-skills".to_string(),
             format!("{CONTAINER_SKILLS_SOURCE}/{SKILL_BUNDLE_MANIFEST}"),
@@ -520,6 +590,12 @@ impl SkillBundle {
                 source.paths.len().to_string(),
             ]);
             args.extend(source.paths.clone());
+            let entries =
+                selected.iter().filter(|entry| entry.source == source.name && entry.revision == source.revision).collect::<Vec<_>>();
+            args.push(entries.len().to_string());
+            for entry in entries {
+                args.extend([entry.name.clone(), entry.path.clone()]);
+            }
         }
         let destination_count = destinations.len();
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
@@ -538,7 +614,7 @@ impl SkillBundle {
                     Err(error) => return Err(skill_stage_error(environment_ref, &error)),
                 }
             }
-            info!(environment = environment_ref, adapter, sources = ?inspection.sources, "staged generation-pinned contained agent skills");
+            info!(environment = environment_ref, adapter, selected = ?selected, "staged generation-pinned contained agent skills");
         }
         Ok(())
     }
@@ -585,8 +661,8 @@ struct SkillBundleInspection {
 /// arbitrary, well-formed set of sources and may attach a named credential to
 /// each source.
 /// There is deliberately no required-skill assertion here — what a given crew
-/// must have is a per-project/role demand declaration (#1790), validated per
-/// crew when that model lands, never a universal list.
+/// receives is resolved at admission from CrewDefaults, Project, and dispatch
+/// declarations, and checked against the candidate catalog before a roll.
 fn inspect_skill_sources(source: &Path) -> Result<SkillBundleInspection, String> {
     let manifest_path = source.join(SKILL_BUNDLE_MANIFEST);
     let manifest = std::fs::read_to_string(&manifest_path)
@@ -788,7 +864,15 @@ pub(crate) mod tests {
             let source_manifest = self.skills_source.join(SKILL_BUNDLE_MANIFEST).to_string_lossy().into_owned();
             let args = args
                 .iter()
-                .map(|arg| if *arg == container_manifest { source_manifest.clone() } else { (*arg).to_string() })
+                .map(|arg| {
+                    if *arg == container_manifest {
+                        source_manifest.clone()
+                    } else if *arg == format!("{CONTAINER_CODEX_HOME}/skills") {
+                        self.config_base.join("codex/skills").display().to_string()
+                    } else {
+                        (*arg).to_string()
+                    }
+                })
                 .collect::<Vec<_>>();
             let output = Command::new(cmd)
                 .args(&args)
@@ -910,10 +994,12 @@ case "$1" in
       echo "fatal: could not fetch promised blob from promisor remote" >&2
       exit 1
     fi
-    mkdir -p "$checkout/skills/private-source"
-    printf '%s\n' '# Private source' >"$checkout/skills/private-source/SKILL.md"
-    mkdir -p "$checkout/plugins/private-source"
-    printf '%s\n' '# Private source' >"$checkout/plugins/private-source/SKILL.md"
+    mkdir -p "$checkout/skills/private-folder"
+    printf '%s\n' '---' 'name: private-source' 'description: test skill' '---' '# Private source' >"$checkout/skills/private-folder/SKILL.md"
+    mkdir -p "$checkout/skills/unselected"
+    printf '%s\n' '---' 'name: unselected' 'description: test skill' '---' >"$checkout/skills/unselected/SKILL.md"
+    mkdir -p "$checkout/plugins/private-folder"
+    printf '%s\n' '---' 'name: private-source' 'description: test skill' '---' '# Private source' >"$checkout/plugins/private-folder/SKILL.md"
     ;;
   *)
     echo "unexpected fake git command: $*" >&2
@@ -1084,7 +1170,7 @@ esac
         let runner = RecordingRunner::default();
 
         registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-alice",
                 &required,
                 &environment,
@@ -1177,7 +1263,7 @@ esac
                 AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([(FLOTILLA_SKILLS_DIR_ENV, skills.to_string_lossy().into_owned())])));
             let environment = vec![("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())];
             let error = registry
-                .stage_skills("crew-fetch", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &environment, &tokens, &runner)
+                .stage_test_skills("crew-fetch", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]), &environment, &tokens, &runner)
                 .await
                 .expect_err("fetch of an absent revision must fail");
             assert!(!error.is_empty(), "fetch failure must produce a diagnostic");
@@ -1209,7 +1295,7 @@ esac
         std::fs::write(&token_file, "secret-token").expect("write source token");
 
         registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1245,7 +1331,7 @@ esac
             let tokens = BTreeMap::from([("private-skills".to_string(), token_file)]);
             tokio::spawn(async move {
                 registry
-                    .stage_skills(
+                    .stage_test_skills(
                         &format!("crew-{index}"),
                         &required,
                         &[("CLAUDE_CONFIG_DIR".to_string(), destination.to_string_lossy().into_owned())],
@@ -1263,7 +1349,7 @@ esac
             assert!(runner.config_base.join(format!("claude-{index}/skills/private-source/SKILL.md")).is_file());
         }
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-without-private-credential",
                 &required,
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("unauthorized").to_string_lossy().into_owned())],
@@ -1294,7 +1380,7 @@ esac
             std::fs::write(&token_file, format!("token-{index}\n")).expect("unique minted token");
             tokio::spawn(async move {
                 let result = registry
-                    .stage_skills(
+                    .stage_test_skills(
                         &format!("crew-{index}"),
                         &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                         &[(
@@ -1333,7 +1419,7 @@ esac
         std::fs::write(&token_file, "test-token").expect("token");
         std::fs::write(temp.path().join("fetches.drop-token"), token_file.to_string_lossy().as_bytes()).expect("drop marker");
         registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1345,7 +1431,7 @@ esac
         let empty_token = temp.path().join("empty.token");
         std::fs::write(&empty_token, "").expect("empty token fixture");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-with-empty-token",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("empty").to_string_lossy().into_owned())],
@@ -1375,7 +1461,7 @@ esac
             let marker = if should_recover { "fetches.transient" } else { "fetches.fail" };
             std::fs::write(temp.path().join(marker), "").expect("write fake fetch marker");
             let result = registry
-                .stage_skills(
+                .stage_test_skills(
                     "crew-private",
                     &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                     &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1413,7 +1499,7 @@ esac
         let token_file = temp.path().join("source.token");
         std::fs::write(&token_file, "secret-for-redaction\n").expect("token");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1431,7 +1517,7 @@ esac
         std::fs::write(temp.path().join("fetches.auth"), "403").expect("authorization marker");
         std::fs::write(&token_file, "secret-for-redaction\n").expect("second token");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private-403",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude-403").to_string_lossy().into_owned())],
@@ -1459,7 +1545,7 @@ esac
         let token_file = temp.path().join("source.token");
         std::fs::write(&token_file, "test-token").expect("token");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1488,7 +1574,7 @@ esac
         let token_file = temp.path().join("source.token");
         std::fs::write(&token_file, "secret\\for-redaction\n").expect("token");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1529,7 +1615,7 @@ esac
             let token_file = temp.path().join(format!("source-{index}.token"));
             std::fs::write(&token_file, "test-token").expect("token");
             registry
-                .stage_skills(
+                .stage_test_skills(
                     &format!("crew-{index}"),
                     &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                     &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(format!("claude-{index}")).to_string_lossy().into_owned())],
@@ -1558,7 +1644,7 @@ esac
         let token_file = temp.path().join("source.token");
         std::fs::write(&token_file, "test-token").expect("token");
         let error = registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-private",
                 &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                 &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
@@ -1587,7 +1673,7 @@ esac
             let token_file = root.join(format!("{name}.token"));
             std::fs::write(&token_file, "test-token").expect("token");
             registry
-                .stage_skills(
+                .stage_test_skills(
                     name,
                     &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.to_string()]),
                     &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join(name).to_string_lossy().into_owned())],
@@ -1634,7 +1720,7 @@ esac
         ];
         let runner = RecordingRunner::default();
 
-        registry.stage_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
+        registry.stage_test_skills("crew-codex", &required, &environment, &BTreeMap::new(), &runner).await.expect("stage pinned skills");
 
         let calls = runner.0.lock().expect("recording runner lock should be healthy");
         assert_eq!(calls.len(), 1);
@@ -1660,7 +1746,7 @@ esac
         let runner = RecordingRunner::default();
 
         registry
-            .stage_skills("crew-mixed", &required, &environment, &BTreeMap::new(), &runner)
+            .stage_test_skills("crew-mixed", &required, &environment, &BTreeMap::new(), &runner)
             .await
             .expect("stage pinned skills for both adapters");
 
@@ -1686,7 +1772,7 @@ esac
         assert!(!registry.will_stage_skills(&required, &environment, &runner).await.expect("resolve external Codex skill staging"));
 
         registry
-            .stage_skills(
+            .stage_test_skills(
                 "crew-codex",
                 &required,
                 &environment,
@@ -2040,5 +2126,59 @@ esac
             .await
             .expect("existing home")
             .is_empty());
+    }
+    #[tokio::test]
+    async fn only_frozen_skills_land_in_both_agent_homes() {
+        // Intended: both adapters install exactly the selected frontmatter names,
+        // even when the pinned source also supplies an unrelated skill.
+        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let registry = registry(temp.path());
+            let bundle = registry.skills.source.as_ref().expect("source");
+            std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
+            let runner = promisor_runner(temp.path());
+            let token = temp.path().join("token");
+            std::fs::write(&token, "test-token").expect("token");
+            let selection = vec![flotilla_resources::SkillCatalogEntry {
+                source: "private-skills".into(),
+                repository: "example/private-skills".into(),
+                revision: "1".repeat(40),
+                name: "private-source".into(),
+                path: "skills/private-folder".into(),
+            }];
+            let config_home = if adapter == CODEX_ADAPTER_ID {
+                CONTAINER_CODEX_HOME.to_string()
+            } else {
+                runner.config_base.join("claude").display().to_string()
+            };
+            let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
+            let environment = vec![
+                (variable.to_string(), config_home.clone()),
+                ("FLOTILLA_RESOLVED_SKILLS".to_string(), serde_json::to_string(&selection).expect("selection")),
+            ];
+            registry
+                .stage_skills(
+                    "selected",
+                    &BTreeSet::from([adapter.to_string()]),
+                    &environment,
+                    &BTreeMap::from([("private-skills".to_string(), token)]),
+                    &runner,
+                )
+                .await
+                .expect("stage selected");
+            let destination = if adapter == CODEX_ADAPTER_ID {
+                runner.config_base.join("codex/skills")
+            } else {
+                PathBuf::from(config_home).join("skills")
+            };
+            let names = std::fs::read_dir(&destination)
+                .expect("staged directory")
+                .filter_map(|entry| {
+                    let entry = entry.expect("entry");
+                    entry.file_type().expect("file type").is_dir().then(|| entry.file_name())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, [std::ffi::OsString::from("private-source")], "{adapter} installs only the frozen selection");
+        }
     }
 }

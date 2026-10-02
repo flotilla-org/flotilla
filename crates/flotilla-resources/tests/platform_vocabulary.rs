@@ -8,6 +8,7 @@ fn project_with_matrix(platforms: &[&str]) -> ProjectSpec {
         display_name: "Widgets".to_string(),
         default_workflow_ref: "implement".to_string(),
         role_needs: BTreeMap::new(),
+        skills: BTreeMap::new(),
         supervision: None,
         issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {

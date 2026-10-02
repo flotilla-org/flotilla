@@ -16,6 +16,9 @@ pub struct ProjectDeclaration {
     pub default_workflow: Option<String>,
     #[serde(default)]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
+    // Previous-generation declarations omit skills (ADR 0047).
+    #[serde(default)]
+    pub skills: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub platform_matrix: Vec<String>,
     pub members: Vec<ProjectDeclarationMember>,
@@ -35,6 +38,11 @@ pub fn parse_project_declaration(yaml: &str) -> Result<ProjectDeclaration, Strin
     declaration.default_workflow = declaration.default_workflow.map(|workflow| required(workflow, "default_workflow")).transpose()?;
     if declaration.members.is_empty() {
         return Err("project declaration must contain at least one member".to_string());
+    }
+    for refs in declaration.skills.values() {
+        for reference in refs {
+            flotilla_resources::validate_skill_ref(reference)?;
+        }
     }
     let mut aliases = BTreeMap::new();
     for member in &mut declaration.members {
@@ -107,5 +115,15 @@ mod tests {
         assert!(parse_project_declaration("name: demo\nmembers:\n  - alias: app\n    url: https://github.com/o/a\n    roles: []\n",)
             .unwrap_err()
             .contains("at least one role"));
+    }
+    #[test]
+    fn project_skill_layer_is_optional_and_explicit() {
+        // Intended: old declarations still materialize an empty layer; the new
+        // section preserves additions/removals per role and rejects invalid refs.
+        let base = "name: example\nmembers:\n  - alias: app\n    url: https://github.com/o/app\n    roles: [code]\n";
+        assert!(parse_project_declaration(base).expect("old declaration").skills.is_empty());
+        let declaration = parse_project_declaration(&format!("{base}skills:\n  coder: [research, '-testing']\n")).expect("skill layer");
+        assert_eq!(declaration.skills["coder"], ["research", "-testing"]);
+        assert!(parse_project_declaration(&format!("{base}skills:\n  coder: ['../bad']\n")).is_err());
     }
 }

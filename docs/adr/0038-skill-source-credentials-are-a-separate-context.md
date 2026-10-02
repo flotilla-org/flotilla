@@ -57,3 +57,10 @@ Treat the two as separate credential contexts.
 - A referenced skill-source credential must exist in each host's resource store before a
   generation referencing it deploys — a provider-before-config rollout ordering.
 - Demand-side per-crew skill requirements (#1790) remain unaddressed and orthogonal.
+
+## Amendment (2026-10-02)
+
+[ADR 0052](0052-crew-skill-selection-is-explicit-layered-and-resolved-at-admission.md)
+resolves #1790: staging installs only the admission-frozen selection, rather
+than all supplied skills. The separate one-shot source credential context
+remains; unselected sources do not require a provisioning token.

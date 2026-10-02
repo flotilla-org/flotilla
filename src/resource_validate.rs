@@ -7,7 +7,9 @@ use serde_json::Value;
 
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
-pub async fn validate_daemon(socket: &Path) -> Result<usize> {
+pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Result<usize> {
+    let catalog = skill_catalog.map(load_catalog).transpose()?;
+    let mut skill_documents = Vec::new();
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
     let base = "http://flotilla.local";
     let discovery = client.get(format!("{base}/apis/flotilla.work/v1")).send().await?;
@@ -77,6 +79,9 @@ pub async fn validate_daemon(socket: &Path) -> Result<usize> {
             let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
             for item in items {
                 count += 1;
+                if catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
+                    skill_documents.push(item.clone());
+                }
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
                 if let Err(error) = validate_resource_document(item) {
                     eprintln!("{label}/{name}: {error}");
@@ -88,12 +93,17 @@ pub async fn validate_daemon(socket: &Path) -> Result<usize> {
     if failed {
         Err(eyre!("resource validation failed after checking {count} stored records"))
     } else {
+        if let Some(catalog) = &catalog {
+            validate_skill_documents(catalog, &skill_documents)?;
+        }
         println!("validated {count} stored records");
         Ok(count)
     }
 }
 
-pub fn validate_path(path: &Path) -> Result<()> {
+pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
+    let catalog = skill_catalog.map(load_catalog).transpose()?;
+    let mut skill_documents = Vec::new();
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
     if files.is_empty() {
@@ -115,6 +125,9 @@ pub fn validate_path(path: &Path) -> Result<()> {
             Ok(documents) => {
                 for (index, document) in documents.iter().enumerate() {
                     let label = format!("{}#{}", file.display(), index + 1);
+                    if catalog.is_some() && matches!(document["kind"].as_str(), Some("Project" | "CrewDefaults")) {
+                        skill_documents.push(document.clone());
+                    }
                     match validate_resource_document(document) {
                         Ok(()) => println!("{label}: valid"),
                         Err(error) => {
@@ -133,8 +146,50 @@ pub fn validate_path(path: &Path) -> Result<()> {
     if failed {
         Err(eyre!("resource validation failed"))
     } else {
+        if let Some(catalog) = &catalog {
+            validate_skill_documents(catalog, &skill_documents)?;
+        }
         Ok(())
     }
+}
+
+fn load_catalog(path: &Path) -> Result<Vec<flotilla_resources::SkillCatalogEntry>> {
+    let catalog: Vec<flotilla_resources::SkillCatalogEntry> = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let manifest = serde_json::from_str(&std::fs::read_to_string(path.with_file_name(".flotilla-sources.json"))?)?;
+    flotilla_resources::crew_defaults::validate_catalog(&catalog, &manifest).map_err(|error| eyre!(error))?;
+    Ok(catalog)
+}
+
+fn validate_skill_documents(catalog: &[flotilla_resources::SkillCatalogEntry], documents: &[Value]) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    use flotilla_resources::{crew_defaults::check_skill_declarations, CrewDefaultsSpec, ProjectSpec};
+    let mut namespaces = BTreeMap::<String, (BTreeMap<String, Vec<CrewDefaultsSpec>>, Vec<ProjectSpec>)>::new();
+    for document in documents {
+        let namespace = document["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string();
+        let (defaults, projects) = namespaces.entry(namespace).or_default();
+        match document["kind"].as_str() {
+            Some("CrewDefaults") => {
+                defaults
+                    .entry(document["metadata"]["name"].as_str().ok_or_else(|| eyre!("CrewDefaults name missing"))?.to_string())
+                    .or_default()
+                    .push(serde_json::from_value(document["spec"].clone())?);
+            }
+            Some("Project") => projects.push(serde_json::from_value(document["spec"].clone())?),
+            _ => {}
+        }
+    }
+    for (namespace, (defaults, projects)) in namespaces {
+        if defaults.len() > 1 {
+            return Err(eyre!("{namespace}: skill admission requires at most one CrewDefaults"));
+        }
+        let defaults = if defaults.is_empty() { vec![CrewDefaultsSpec::default()] } else { defaults.into_values().flatten().collect() };
+        for defaults in &defaults {
+            check_skill_declarations(catalog, defaults, &projects).map_err(|error| eyre!("{namespace}: {error}"))?;
+        }
+    }
+    println!("validated crew skill declarations against the candidate catalog");
+    Ok(())
 }
 
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -290,7 +345,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let checked = validate_daemon(&socket).await.expect("candidate decodes all served kinds and namespaces");
+        let checked = validate_daemon(&socket, None).await.expect("candidate decodes all served kinds and namespaces");
         assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
@@ -310,5 +365,23 @@ mod tests {
         assert_eq!(files, vec![manifest]);
 
         std::fs::remove_dir_all(&root).expect("remove test directory");
+    }
+    #[test]
+    fn pre_roll_resolves_all_projects_with_their_namespace_defaults() {
+        // Intended: a valid project cannot mask another project's missing import;
+        // defaults in one namespace never apply to a project in another.
+        let catalog = vec![flotilla_resources::SkillCatalogEntry::builder()
+            .source("source".into())
+            .repository("owner/repo".into())
+            .revision("1".repeat(40))
+            .name("research".into())
+            .path("skills/research".into())
+            .build()];
+        let defaults = serde_json::json!({"kind":"CrewDefaults", "metadata":{"name":"fleet", "namespace":"first"}, "spec":{"skills":{"coder":["research"]}}});
+        let good = serde_json::json!({"kind":"Project", "metadata":{"name":"good", "namespace":"first"}, "spec":{"display_name":"good","default_workflow_ref":"work"}});
+        let bad = serde_json::json!({"kind":"Project", "metadata":{"name":"bad", "namespace":"second"}, "spec":{"display_name":"bad","default_workflow_ref":"work", "skills":{"coder":["missing"]}}});
+        assert!(super::validate_skill_documents(&catalog, &[defaults.clone(), good.clone()]).is_ok());
+        let error = super::validate_skill_documents(&catalog, &[defaults, good, bad]).expect_err("every registered project is checked");
+        assert!(error.to_string().contains("second") && error.to_string().contains("missing"));
     }
 }

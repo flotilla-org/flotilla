@@ -99,6 +99,48 @@ impl ConvoyAdmission {
 }
 
 impl ConvoyAdmission {
+    async fn resolve_convoy_skills(
+        &self,
+        namespace: &str,
+        project: &ProjectSpec,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        workflow: &mut WorkflowTemplateSpec,
+    ) -> Result<(), String> {
+        use flotilla_resources::{resolve_skills, skill_layers, CrewDefaults, CrewDefaultsSpec, SkillCatalogEntry};
+        let definitions = self.backend.definitions::<CrewDefaults>(namespace).list().await.map_err(|error| error.to_string())?;
+        if definitions.len() > 1 {
+            return Err("skill admission requires at most one CrewDefaults per namespace".to_string());
+        }
+        let defaults = definitions.first().map(|object| object.spec.clone()).unwrap_or_else(CrewDefaultsSpec::default);
+        let required = !defaults.skills.is_empty() || !project.skills.is_empty() || !intent.skills.is_empty();
+        let catalog: Vec<SkillCatalogEntry> = if required {
+            let bundle =
+                self.discovery.env.get("FLOTILLA_SKILLS_DIR").ok_or_else(|| "skill admission requires FLOTILLA_SKILLS_DIR".to_string())?;
+            let path = PathBuf::from(bundle).join(".flotilla-skill-catalog.json");
+            let contents =
+                tokio::fs::read_to_string(&path).await.map_err(|error| format!("read pinned skill catalog {}: {error}", path.display()))?;
+            let catalog: Vec<SkillCatalogEntry> =
+                serde_json::from_str(&contents).map_err(|error| format!("decode pinned skill catalog: {error}"))?;
+            let manifest = tokio::fs::read_to_string(path.with_file_name(".flotilla-sources.json"))
+                .await
+                .map_err(|error| format!("read pinned skill sources: {error}"))?;
+            flotilla_resources::crew_defaults::validate_catalog(
+                &catalog,
+                &serde_json::from_str(&manifest).map_err(|error| format!("decode pinned skill sources: {error}"))?,
+            )?;
+            catalog
+        } else {
+            Vec::new()
+        };
+        for crew in workflow.roles.iter_mut().chain(workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
+            if matches!(crew.source, CrewSource::Agent { .. }) {
+                crew.skills = resolve_skills(&catalog, &skill_layers(&defaults, &project.skills, &crew.role, &intent.skills))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn resolve_convoy_change_request_admission(
         &self,
         repository_keys: &[RepositoryKey],
@@ -467,6 +509,7 @@ impl ConvoyAdmission {
             return Err(format!("workflow template {workflow_ref} is materialized by another project"));
         }
         apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
+        self.resolve_convoy_skills(namespace, project, intent, &mut workflow.spec).await?;
         validate_fork_workflow_admission(&self.backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
         Ok((workflow_ref, workflow.spec))
     }
@@ -845,6 +888,7 @@ impl ConvoyAdmission {
             let resolved = &one.vessels[0];
             role.credential_signature = serde_json::to_string(&(
                 grant_set,
+                &role.crew.skills.selected,
                 &resolved.credential_refs,
                 &resolved.credential_scopes,
                 &resolved.credential_permissions,
@@ -3048,6 +3092,95 @@ mod tests {
         discovery::test_support::{fake_discovery, FakeChangeRequest},
         types::ChangeRequest,
     };
+
+    #[tokio::test]
+    async fn admission_freezes_role_selections_and_refuses_missing_imports() {
+        // Intended: admission resolves declarations once into the workflow that
+        // will be persisted. Later defaults cannot alter that admitted snapshot.
+        use flotilla_resources::{CrewDefaults, CrewDefaultsSpec, Selector, SkillCatalogEntry};
+
+        use crate::providers::discovery::test_support::TestEnvVars;
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"admission-skills-test\"\n").expect("config");
+        let catalog = ["research", "testing", "implement", "wayfinder", "review"]
+            .into_iter()
+            .map(|name| SkillCatalogEntry {
+                source: "source".into(),
+                repository: "owner/repo".into(),
+                revision: "1".repeat(40),
+                name: name.into(),
+                path: format!("skills/{name}"),
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(temp.path().join(".flotilla-skill-catalog.json"), serde_json::to_string(&catalog).expect("catalog"))
+            .expect("catalog file");
+        std::fs::write(temp.path().join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source", "repository":"https://github.com/owner/repo.git", "revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
+        let mut discovery = fake_discovery(false);
+        discovery.env = Arc::new(TestEnvVars::new([("FLOTILLA_SKILLS_DIR", temp.path().display().to_string())]));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            discovery,
+            HostName::new("test-host"),
+            backend.clone(),
+        )
+        .await;
+        let defaults = CrewDefaultsSpec {
+            skills: BTreeMap::from([
+                ("*".into(), vec!["research".into()]),
+                ("coder".into(), vec!["testing".into(), "implement".into()]),
+                ("governor".into(), vec!["wayfinder".into()]),
+            ]),
+        };
+        let meta = InputMeta::builder().name("fleet".to_string()).build();
+        backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &defaults).await.expect("defaults");
+        let crew = |role: &str| {
+            CrewSpec::builder()
+                .role(role.into())
+                .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+                .build()
+        };
+        let template = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder().name("work".into()).crew(vec![crew("coder"), crew("governor")]).build()])
+            .build();
+        backend
+            .definitions::<WorkflowTemplate>("flotilla")
+            .apply(&InputMeta::builder().name("work".into()).build(), &template)
+            .await
+            .expect("template");
+        let project = ProjectSpec::builder()
+            .display_name("Example".into())
+            .default_workflow_ref("work".into())
+            .skills(BTreeMap::from([("coder".into(), vec!["-testing".into()])]))
+            .build();
+        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).skills(vec!["review".into()]).build();
+        let (_, frozen) = daemon
+            .convoy_admission
+            .resolve_convoy_admission_workflow("flotilla", "example", &project, &[], &intent)
+            .await
+            .expect("admission");
+        assert_eq!(frozen.vessels[0].crew[0].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), [
+            "implement",
+            "research",
+            "review"
+        ]);
+        assert_eq!(frozen.vessels[0].crew[1].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), [
+            "research",
+            "review",
+            "wayfinder"
+        ]);
+        backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &CrewDefaultsSpec::default()).await.expect("change defaults");
+        assert_eq!(frozen.vessels[0].crew[0].skills.selected.len(), 3);
+        let mut invalid = intent;
+        invalid.skills = vec!["missing".into()];
+        let error = daemon
+            .convoy_admission
+            .resolve_convoy_admission_workflow("flotilla", "example", &project, &[], &invalid)
+            .await
+            .expect_err("missing import refuses admission");
+        assert!(error.contains("missing") && error.contains("dispatch") && error.contains("owner/repo"), "{error}");
+    }
 
     struct FakeQueryPort {
         backend: ResourceBackend,

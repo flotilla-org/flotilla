@@ -896,6 +896,25 @@ impl ReadProjections<'_> {
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
         Ok(ConvoyExplanation {
+            skills: convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .map(|workflow| {
+                    workflow
+                        .vessels
+                        .iter()
+                        .flat_map(|vessel| {
+                            vessel.crew.iter().map(move |crew| {
+                                (
+                                    format!("{}/{}", vessel.name, crew.role),
+                                    serde_json::to_value(&crew.skills).expect("serialize skill explanation"),
+                                )
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             namespace: namespace.to_string(),
             convoy: name.to_string(),
             phase: convoy.status.as_ref().map_or_else(|| "Unknown".to_string(), |status| format!("{:?}", status.phase)),

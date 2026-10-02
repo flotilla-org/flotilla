@@ -28,6 +28,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 credential_permissions: Default::default(),
                 crew: vec![
                     CrewSpec {
+                        skills: Default::default(),
                         needs: Default::default(),
                         role: "coder".to_string(),
                         source: CrewSource::Agent {
@@ -39,6 +40,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                         completion_conditions: Vec::new(),
                     },
                     CrewSpec {
+                        skills: Default::default(),
                         needs: Default::default(),
                         role: "build".to_string(),
                         source: CrewSource::Tool { command: "cargo test".to_string() },
@@ -55,6 +57,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 credential_scopes: Default::default(),
                 credential_permissions: Default::default(),
                 crew: vec![CrewSpec {
+                    skills: Default::default(),
                     needs: Default::default(),
                     role: "reviewer".to_string(),
                     source: CrewSource::Agent {

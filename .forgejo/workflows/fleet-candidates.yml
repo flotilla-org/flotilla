@@ -71,6 +71,9 @@ jobs:
             fleet-linux-v1-
 
       - name: Build and verify the coordinated candidate
+        env:
+          # Read-only access to private pinned skill sources; no project write scope.
+          GH_TOKEN: ${{ secrets.SKILL_SOURCES_READ_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -99,7 +102,8 @@ jobs:
           # validate with the binary from the archive that will be promoted.
           candidate_root="$(mktemp -d)"
           tar -C "$candidate_root" -xzf dist/fleet-candidate-linux-x86_64-gnu2.36.tar.gz
-          "$candidate_root/fleet-candidate-linux-x86_64-gnu2.36/bin/flotilla" resource validate project-map/flotilla-manifests/
+          "$candidate_root/fleet-candidate-linux-x86_64-gnu2.36/bin/flotilla" resource validate project-map/flotilla-manifests/ \
+            --skill-catalog "$candidate_root/fleet-candidate-linux-x86_64-gnu2.36/share/flotilla/skills/.flotilla-skill-catalog.json"
 
       - name: Upload seven-day Linux candidate
         uses: https://code.forgejo.org/actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32
@@ -147,6 +151,9 @@ jobs:
           test -z "${FORGEJO_ADMIN_TOKEN:-}"
 
       - name: Build and verify the coordinated candidate
+        env:
+          # Read-only access to private pinned skill sources; no project write scope.
+          GH_TOKEN: ${{ secrets.SKILL_SOURCES_READ_TOKEN }}
         shell: /bin/bash -e {0}
         run: orchestration/ci/fleet-candidates/build-candidate.sh
 

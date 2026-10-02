@@ -1588,6 +1588,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let custom_spec = flotilla_resources::ProjectSpec {
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
+        skills: BTreeMap::new(),
         display_name: "Shared product".to_string(),
         default_workflow_ref: "custom-workflow".to_string(),
         supervision: None,
@@ -1617,6 +1618,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
             .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
                 platform_matrix: Vec::new(),
                 role_needs: Default::default(),
+                skills: BTreeMap::new(),
                 display_name: name.to_string(),
                 default_workflow_ref: "custom-workflow".to_string(),
                 supervision: None,

@@ -133,7 +133,7 @@ manifest = {
 (bundle / ".flotilla-sources.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 PY
 
-python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle/.flotilla-sources.json"
+python3 "$(dirname "$0")/generation_validation.py" skill-sources "$skills_bundle/.flotilla-sources.json" --catalog-output "$skills_bundle/.flotilla-skill-catalog.json"
 
 # The credential-free CODEX_HOME template each crew's scratch is seeded from
 # (flotilla-org/flotilla#1913). It ships as generation payload, pinned to the
