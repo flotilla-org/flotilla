@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use flotilla_protocol::{Message, Request};
 use flotilla_transport::message::{message_session_pair, stream_message_session, stream_message_session_with_prefix, MessageSession};
-use tokio::io::{duplex, split, AsyncWriteExt};
+use tokio::io::{duplex, split, AsyncReadExt, AsyncWriteExt};
 
 // Behaviour: every transport preserves message ordering in both directions,
 // flushes each write, and reports EOF after the opposite endpoint is dropped.
@@ -24,7 +24,14 @@ async fn run_session_contract((left, right): (MessageSession, MessageSession)) {
     }
     drop(right);
     assert!(left.read().await.expect("clean EOF").is_none());
-    assert!(left.write(Message::Request { id: 2, request: Request::GetTopology }).await.is_err());
+    // Stream implementations may observe closure after a buffered write.
+    for _ in 0..32 {
+        if left.write(Message::Request { id: 2, request: Request::GetTopology }).await.is_err() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("writes must eventually observe the closed peer");
 }
 
 #[tokio::test]
@@ -68,7 +75,6 @@ async fn run_prefix_and_wire_contract() {
         remote.write_all(b"invalid\n").await.expect("write malformed message");
         assert!(session.read().await.expect_err("invalid JSON").contains("failed to parse message"));
         session.write(message.clone()).await.expect("write message");
-        use tokio::io::AsyncReadExt;
         let mut actual = vec![0; bytes.len()];
         remote.read_exact(&mut actual).await.expect("read wire bytes");
         assert_eq!(actual, bytes);

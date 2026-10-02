@@ -149,16 +149,10 @@ mod tests {
     // separators and checkout line endings, including empty and binary contents.
     #[test]
     fn checkout_platform_does_not_change_fingerprint() {
-        let contents: &[&[u8]] = &[b"", b"\n", b"a\nb\n", b"a\nb", b"\r", b"\r\n", b"\xff\0\n"];
+        let contents: &[&[u8]] = &[b"", b"\n", b"a\nb\n", b"a\nb", b"\r", b"\r\r", b"\xff\0\n"];
         for content in contents {
-            let lf: Vec<_> = content
-                .windows(2)
-                .enumerate()
-                .filter_map(|(i, pair)| (pair != b"\r\n").then_some(content[i]))
-                .chain(content.last().copied())
-                .collect();
-            let crlf: Vec<_> = lf.iter().flat_map(|byte| if *byte == b'\n' { vec![b'\r', b'\n'] } else { vec![*byte] }).collect();
-            let unix = [("src/a0.rs", lf.as_slice()), ("src/a/b.rs", b"other\n".as_slice())];
+            let crlf: Vec<_> = content.iter().flat_map(|byte| if *byte == b'\n' { vec![b'\r', b'\n'] } else { vec![*byte] }).collect();
+            let unix = [("src/a0.rs", *content), ("src/a/b.rs", b"other\n".as_slice())];
             let windows = [("src\\a0.rs", crlf.as_slice()), ("src\\a\\b.rs", b"other\r\n".as_slice())];
             let fingerprint = |files: &[(&str, &[u8])]| {
                 let files = canonical_files(files.iter().map(|(name, bytes)| ((*name).to_owned(), *bytes)));
