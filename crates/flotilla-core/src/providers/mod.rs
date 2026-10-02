@@ -235,7 +235,9 @@ pub trait CommandRunner: Send + Sync {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String>;
 
     /// Run a command with a deadline. Dropping the command future must stop
-    /// its child processes; wrappers must forward the deadline to their inner runner.
+    /// its local child processes; wrappers must forward the deadline to their
+    /// inner runner. Killing an SSH or Docker client cannot guarantee that a
+    /// command on the remote host or inside the container has stopped.
     async fn run_with_timeout(
         &self,
         cmd: &str,
@@ -244,9 +246,7 @@ pub trait CommandRunner: Send + Sync {
         label: &ChannelLabel,
         timeout: Duration,
     ) -> Result<String, String> {
-        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label))
-            .await
-            .map_err(|_| format!("{cmd} timed out after {}s", timeout.as_secs()))?
+        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label)).await.map_err(|_| command_timeout_message(cmd, timeout))?
     }
 
     /// Run a command and return full output regardless of exit status.
@@ -371,6 +371,10 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
+pub(crate) fn command_timeout_message(cmd: &str, timeout: Duration) -> String {
+    format!("{cmd} timed out after {}s", timeout.as_secs())
+}
+
 /// Production implementation that delegates to `tokio::process::Command`.
 pub struct ProcessCommandRunner;
 
@@ -446,19 +450,6 @@ impl CommandRunner for ProcessCommandRunner {
         } else {
             Err(String::from_utf8_lossy(&output.stderr).to_string())
         }
-    }
-
-    async fn run_with_timeout(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: &Path,
-        label: &ChannelLabel,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        tokio::time::timeout(timeout, self.run(cmd, args, cwd, label))
-            .await
-            .map_err(|_| format!("{cmd} timed out after {}s", timeout.as_secs()))?
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -815,6 +806,52 @@ pub(crate) mod testing {
 
     use super::*;
 
+    pub type TimeoutCall = (String, Vec<String>, PathBuf, Duration);
+
+    /// Stub that proves decorators use the timeout seam rather than `run`.
+    pub struct TimeoutOnlyRunner {
+        pub calls: std::sync::Mutex<Vec<TimeoutCall>>,
+        result: Result<String, String>,
+    }
+
+    impl TimeoutOnlyRunner {
+        pub fn new(result: Result<String, String>) -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()), result }
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for TimeoutOnlyRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            panic!("run called instead of run_with_timeout")
+        }
+
+        async fn run_with_timeout(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            _label: &ChannelLabel,
+            timeout: Duration,
+        ) -> Result<String, String> {
+            self.calls.lock().expect("calls mutex").push((
+                cmd.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd.to_path_buf(),
+                timeout,
+            ));
+            self.result.clone()
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("run_output not expected")
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
     /// A mock command runner that returns canned responses in order.
     /// Each call to `run()` pops the next response from the queue.
     pub struct MockRunner {
@@ -977,7 +1014,14 @@ pub(crate) mod testing {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let alive = unsafe { libc::kill(pid, 0) } == 0;
-                if !alive {
+                #[cfg(target_os = "linux")]
+                let zombie = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| stat.rsplit_once(')').and_then(|(_, tail)| tail.trim().chars().next()))
+                    == Some('Z');
+                #[cfg(not(target_os = "linux"))]
+                let zombie = false;
+                if !alive || zombie {
                     break;
                 }
                 tokio::task::yield_now().await;

@@ -169,7 +169,25 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
-    use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::providers::{
+        testing::{MockRunner, TimeoutOnlyRunner},
+        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+    };
+
+    #[tokio::test]
+    async fn timeout_is_forwarded_to_docker_exec() {
+        let inner = Arc::new(TimeoutOnlyRunner::new(Ok("done".into())));
+        let runner = DockerEnvironmentRunner::new("container".into(), inner.clone());
+        let result = runner.run_with_timeout("cmd", &["arg"], Path::new("/work"), &ChannelLabel::Default, Duration::from_secs(3)).await;
+        assert_eq!(result.expect("command result"), "done");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls.as_slice(), &[(
+            "docker".into(),
+            vec!["exec".into(), "-w".into(), "/work".into(), "container".into(), "cmd".into(), "arg".into()],
+            Path::new("/").to_path_buf(),
+            Duration::from_secs(3),
+        )]);
+    }
 
     struct DockerContainer(String);
 

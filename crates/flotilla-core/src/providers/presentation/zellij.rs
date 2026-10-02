@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::providers::{command_channel_label, run, types::*, CommandRunner};
+use crate::providers::{command_channel_label, command_timeout_message, run, types::*, CommandRunner};
 
 /// Deadline for individual `zellij action` calls.
 const ZELLIJ_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,7 +37,7 @@ impl ZellijPresentationManager {
         let label = command_channel_label("zellij", &cmd_args);
         match self.runner.run_with_timeout("zellij", &cmd_args, Path::new("."), &label, ZELLIJ_ACTION_TIMEOUT).await {
             Ok(output) => Ok(output.trim().to_string()),
-            Err(error) if error.contains("timed out") => {
+            Err(error) if error == command_timeout_message("zellij", ZELLIJ_ACTION_TIMEOUT) => {
                 warn!(action = %action_desc, timeout_secs = ZELLIJ_ACTION_TIMEOUT.as_secs(), "zellij action timed out");
                 Err(format!("zellij action '{action_desc}' timed out after {}s", ZELLIJ_ACTION_TIMEOUT.as_secs()))
             }
@@ -227,5 +227,30 @@ impl super::PresentationManager for ZellijPresentationManager {
             Ok(session) => format!("{session}:"),
             Err(_) => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::ZellijPresentationManager;
+    use crate::providers::{command_timeout_message, testing::TimeoutOnlyRunner};
+
+    #[tokio::test]
+    async fn action_uses_runner_deadline_and_reports_its_timeout() {
+        let inner = Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("zellij", Duration::from_secs(5)))));
+        let manager = ZellijPresentationManager::new(inner.clone());
+        assert_eq!(manager.zellij_action(&["list-tabs"]).await.expect_err("deadline"), "zellij action 'list-tabs' timed out after 5s");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls[0].0, "zellij");
+        assert_eq!(calls[0].1, ["action", "list-tabs"]);
+        assert_eq!(calls[0].3, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn action_preserves_non_deadline_stderr() {
+        let manager = ZellijPresentationManager::new(Arc::new(TimeoutOnlyRunner::new(Err("server timed out internally".into()))));
+        assert_eq!(manager.zellij_action(&["list-tabs"]).await.expect_err("command error"), "server timed out internally");
     }
 }

@@ -186,12 +186,30 @@ mod tests {
         collections::VecDeque,
         path::{Path, PathBuf},
         sync::Mutex,
+        time::Duration,
     };
 
     use async_trait::async_trait;
 
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
-    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::providers::{testing::TimeoutOnlyRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+
+    #[tokio::test]
+    async fn timeout_is_forwarded_to_ssh_client() {
+        let inner = std::sync::Arc::new(TimeoutOnlyRunner::new(Ok("done".into())));
+        let runner = SshCommandRunner::new("user@host", false, inner.clone());
+        let result = runner.run_with_timeout("cmd", &["arg"], Path::new("/work"), &ChannelLabel::Default, Duration::from_secs(4)).await;
+        assert_eq!(result.expect("command result"), "done");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "ssh");
+        assert_eq!(calls[0].2, Path::new("/"));
+        assert_eq!(calls[0].3, Duration::from_secs(4));
+        let script = calls[0].1.last().expect("remote script");
+        assert!(script.contains("exec"));
+        assert!(script.contains("cmd"));
+        assert!(script.contains("arg"));
+    }
 
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
