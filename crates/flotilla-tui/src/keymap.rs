@@ -45,8 +45,6 @@ pub enum Action {
     OpenContextualPalette,
     Describe,
     FillSelected,
-    /// Open the command palette pre-filled to complete the selected convoy work.
-    /// Attach the active workspace manager to the selected convoy vessel's workspace.
     /// Materialize or focus the selected convoy/vessel in the connected PM.
     OpenInPm,
 }

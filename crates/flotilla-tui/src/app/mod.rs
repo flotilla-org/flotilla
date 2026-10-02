@@ -104,6 +104,7 @@ pub struct TuiRepoModel {
     pub providers: Arc<ProviderData>,
     pub labels: RepoLabels,
     pub provider_names: HashMap<String, Vec<String>>,
+    /// Health captured in RepoInfo on connect or reconnect; no live event updates this field.
     pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub loading: bool,
     /// Whether this inactive tab has received data updates since last viewed.

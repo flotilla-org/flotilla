@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_commands::{resolved::HostQueryKind, HostResolution, RepoContext, Resolved};
+use flotilla_commands::{HostResolution, RepoContext, Resolved};
 use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector};
 use ratatui::{
     layout::Rect,
@@ -296,19 +296,7 @@ pub(crate) fn tui_dispatch(
         return Err("Command has no TUI-visible effect".into());
     }
     match resolved {
-        Resolved::HostQuery { subject, kind } => {
-            let host = model.resolve_host(&subject)?;
-            let action = match kind {
-                HostQueryKind::Status => CommandAction::QueryHostStatus { target_environment_id: host.environment_id.clone() },
-                HostQueryKind::Providers => CommandAction::QueryHostProviders { target_environment_id: host.environment_id.clone() },
-            };
-            Ok(Command {
-                node_id: Some(host.summary.node.node_id.clone()),
-                provisioning_target: Some(ProvisioningTarget::Host { host: subject }),
-                context_repo: None,
-                action,
-            })
-        }
+        Resolved::HostQuery { .. } => Err("Command has no TUI-visible effect".into()),
         Resolved::Ready(cmd) => Ok(cmd),
         Resolved::NeedsContext { mut command, repo, host } => {
             // Repo context from the active tab (None on non-repo views)
@@ -551,6 +539,7 @@ mod tests {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
     use super::*;
+    use crate::app::test_support::TestWidgetHarness;
 
     #[test]
     fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
@@ -559,8 +548,6 @@ mod tests {
         let result = tui_dispatch(Resolved::Ready(command), &harness.model, None, &harness.provisioning_target);
         assert!(result.is_err());
     }
-    use crate::app::test_support::TestWidgetHarness;
-
     fn render_for_mouse(widget: &mut CommandPaletteWidget, harness: &mut TestWidgetHarness) {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
         let mut ui = crate::app::UiState::new(&[]);
