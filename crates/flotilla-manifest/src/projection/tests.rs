@@ -2163,6 +2163,13 @@ fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
         records.push(record);
     }
     let selected = select_change_requests(&records);
+    // The returned source tag is the exact winner, even when observations tie.
+    for (_, (object, index)) in
+        flotilla_resources::select_change_request_sources(records.iter().enumerate().map(|(index, object)| (object, index)))
+    {
+        assert_eq!(object.metadata.name, records[index].metadata.name);
+        assert_eq!(object.status, records[index].status);
+    }
     for (subject, record) in &selected {
         let number = subject.id.parse::<u64>().expect("number");
         assert_eq!(record.status, expected[&number].1);

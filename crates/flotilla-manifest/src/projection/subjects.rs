@@ -236,12 +236,12 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         {
             continue;
         }
-        for history in &record.spec.subject_of {
-            let convoy = entity::convoy(&history.namespace, &history.convoy, &history.origin);
-            if history.relationship == Relationship::Produces && !present_convoys.contains(&convoy) {
-                orphaned.insert(subject.clone());
-            }
-            // Historical links are projected only for actual orphans below.
+        let departed_producer = record.spec.subject_of.iter().any(|history| {
+            history.relationship == Relationship::Produces
+                && !present_convoys.contains(&entity::convoy(&history.namespace, &history.convoy, &history.origin))
+        });
+        if departed_producer {
+            orphaned.insert(subject.clone());
         }
         if orphaned.contains(subject) {
             for history in &record.spec.subject_of {

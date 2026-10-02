@@ -777,10 +777,10 @@ impl ReadProjections<'_> {
             .map_err(|error| error.to_string())?
             .items;
         let selected_change_requests =
-            flotilla_resources::select_change_requests(change_request_sources.iter().map(|source| &source.object));
+            flotilla_resources::select_change_request_sources(change_request_sources.iter().map(|source| (&source.object, source)));
         let change_request_objects = selected_change_requests
             .values()
-            .map(|object| {
+            .map(|(object, _)| {
                 (
                     flotilla_resources::change_request_record_name(&object.spec.service, &object.spec.scope, object.spec.number),
                     object.clone(),
@@ -796,8 +796,10 @@ impl ReadProjections<'_> {
             .flat_map(|source| convoy_subject_rows(&source.object, &reference_context))
             .map(|row| row.subject)
             .collect::<BTreeSet<_>>();
-        let observations_by_subject =
-            selected_change_requests.iter().map(|(subject, object)| (subject.clone(), object.status.as_ref())).collect::<BTreeMap<_, _>>();
+        let observations_by_subject = selected_change_requests
+            .iter()
+            .map(|(subject, (object, _))| (subject.clone(), object.status.as_ref()))
+            .collect::<BTreeMap<_, _>>();
         let subject_observations = subjects
             .iter()
             .filter(|row| row.subject.kind == SubjectKind::ChangeRequest)
@@ -831,15 +833,13 @@ impl ReadProjections<'_> {
             .iter()
             .map(|record_name| {
                 let selected = change_request_objects.get(record_name);
-                let provenance = selected
-                    .and_then(|object| {
-                        change_request_sources.iter().find(|source| {
-                            source.object.metadata.name == object.metadata.name
-                                && source.object.status == object.status
-                                && source.object.spec.observing_authority == object.spec.observing_authority
-                        })
+                let provenance = selected_change_requests
+                    .values()
+                    .find(|(object, _)| {
+                        flotilla_resources::change_request_record_name(&object.spec.service, &object.spec.scope, object.spec.number)
+                            == *record_name
                     })
-                    .map(|source| explained_provenance(&source.provenance, self.node_id));
+                    .map(|(_, source)| explained_provenance(&source.provenance, self.node_id));
                 let observed_at = selected.and_then(|source| source.status.as_ref()).map(|status| status.state.observed_at);
                 ExplainedChangeRequest {
                     name: record_name.clone(),
@@ -1260,6 +1260,7 @@ mod tests {
             let registry = crate::host_registry::HostRegistry::new(node, summary);
             let environments = EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new());
             let refresher = ChangeRequestRefresher::new(
+                "fleet".to_string(),
                 backend.clone(),
                 node_id.to_string(),
                 Arc::new(GhChangeRequestObservationSource::new(Arc::clone(&runner))),

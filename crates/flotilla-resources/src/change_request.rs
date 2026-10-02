@@ -68,7 +68,18 @@ pub fn change_request_subject(spec: &ChangeRequestSpec) -> Subject {
 pub fn select_change_requests<'a>(
     records: impl IntoIterator<Item = &'a ResourceObject<ChangeRequest>>,
 ) -> BTreeMap<Subject, ResourceObject<ChangeRequest>> {
-    let mut selected: BTreeMap<Subject, ResourceObject<ChangeRequest>> = BTreeMap::new();
+    select_change_request_sources(records.into_iter().map(|record| (record, ())))
+        .into_iter()
+        .map(|(subject, (object, ()))| (subject, object))
+        .collect()
+}
+
+/// Preserve the exact winning source alongside the merged subject record.
+/// Callers may carry a read envelope/provenance reference without reconstructing it.
+pub fn select_change_request_sources<'a, T>(
+    records: impl IntoIterator<Item = (&'a ResourceObject<ChangeRequest>, T)>,
+) -> BTreeMap<Subject, (ResourceObject<ChangeRequest>, T)> {
+    let mut selected: BTreeMap<Subject, (ResourceObject<ChangeRequest>, T)> = BTreeMap::new();
     let rank = |record: &ResourceObject<ChangeRequest>| {
         (
             record.status.as_ref().map(|status| status.state.observed_at),
@@ -79,20 +90,20 @@ pub fn select_change_requests<'a>(
             serde_json::to_string(&record.status).expect("ChangeRequest status serializes"),
         )
     };
-    for record in records {
+    for (record, source) in records {
         let subject = change_request_subject(&record.spec);
         if let Some(prior) = selected.get_mut(&subject) {
-            let mut history = prior.spec.subject_of.clone();
+            let mut history = prior.0.spec.subject_of.clone();
             merge_change_request_history(&mut history, &record.spec.subject_of);
-            if rank(record) > rank(prior) {
-                *prior = record.clone();
+            if rank(record) > rank(&prior.0) {
+                *prior = (record.clone(), source);
             }
-            prior.spec.subject_of = history;
+            prior.0.spec.subject_of = history;
         } else {
             let mut record = record.clone();
             let history = std::mem::take(&mut record.spec.subject_of);
             merge_change_request_history(&mut record.spec.subject_of, &history);
-            selected.insert(subject, record);
+            selected.insert(subject, (record, source));
         }
     }
     selected
