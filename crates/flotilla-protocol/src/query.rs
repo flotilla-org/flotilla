@@ -159,8 +159,9 @@ pub struct ProjectListEntry {
     pub display_name: String,
     pub address: ViewAddress,
     pub repositories: Vec<ProjectListRepository>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue_source: Option<IssueSource>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_sources: Vec<IssueSource>,
     pub default_workflow_ref: String,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -196,7 +197,7 @@ mod project_list_tests {
                     slug: Some("flotilla-org/flotilla".into()),
                     subpaths: vec![],
                 }])
-                .maybe_issue_source(Some(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }))
+                .issue_sources(vec![IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }])
                 .default_workflow_ref("single-agent".to_string())
                 .build()],
         };
@@ -210,7 +211,7 @@ mod project_list_tests {
                     "display_name": "Platform",
                     "address": "project/flotilla/platform",
                     "repositories": [{"key": "repo-key", "slug": "flotilla-org/flotilla"}],
-                    "issue_source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"},
+                    "issue_sources": [{"service": "https://github.com", "scope": "flotilla-org/flotilla"}],
                     "default_workflow_ref": "single-agent"
                 }]
             })
@@ -434,16 +435,8 @@ pub struct FleetReplicaStatus {
     pub last_sync: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub skipped_records: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_parse_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

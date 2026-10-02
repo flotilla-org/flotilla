@@ -237,13 +237,14 @@ pub(crate) mod test_helpers {
 }
 
 pub use commands::{
-    AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command,
-    CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard, ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction,
-    EvidenceFreshness, ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery,
-    ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription,
-    ExplainedUnclaimedWork, ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace,
-    RepoSelector, ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord,
-    ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition, StallReason, StepStatus,
+    AgentOverride, AttachBinding, CheckoutArchiveOutcome, CheckoutArchiveStatus, CheckoutSelector, CheckoutStatus, CheckoutTarget,
+    CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard,
+    ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction, EvidenceFreshness, ExplainedArtifact, ExplainedChangeRequest,
+    ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring,
+    ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor,
+    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition,
+    StallReason, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

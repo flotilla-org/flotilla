@@ -8,10 +8,10 @@ use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
-    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow,
-    HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse,
-    StatusResponse, StreamKey, TopologyResponse,
+    output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo,
+    EnvironmentStatus, FleetHealthResponse, FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness,
+    FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState,
+    ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -351,11 +351,11 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         } else {
             format!("{repository_count} repositories")
         };
-        let issue_source = project
-            .issue_source
-            .as_ref()
-            .map(|source| format!("{} / {}", source.service.trim_end_matches('/'), source.scope))
-            .unwrap_or_else(|| "-".to_string());
+        let issue_source = match project.issue_sources.as_slice() {
+            [] => "-".to_string(),
+            [source] => format!("{} / {}", source.service.trim_end_matches('/'), source.scope),
+            sources => format!("{} sources", sources.len()),
+        };
         table.add_row(vec![
             Cell::new(format!("{}/{}", project.namespace, project.name)),
             Cell::new(&project.display_name),
@@ -367,6 +367,52 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         ]);
     }
     format!("{table}\n")
+}
+
+fn format_cli_list_human(response: &CliListResponse) -> String {
+    if response.items.is_empty() {
+        return match response.list_kind {
+            CliListKind::Repo => "No repos tracked.\n".into(),
+            CliListKind::Checkout => "No active checkouts found.\n".into(),
+            CliListKind::Cr => "No open change requests found.\n".into(),
+            CliListKind::Agent => "No active agent sessions found.\n".into(),
+            CliListKind::Workspace => "No active workspaces found.\n".into(),
+        };
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Repository", "Reference", "Name", "Status", "Provider"]);
+    for item in &response.items {
+        table.add_row(vec![
+            Cell::new(item.repo.as_deref().unwrap_or("-")),
+            Cell::new(&item.reference),
+            Cell::new(&item.name),
+            Cell::new(&item.status),
+            Cell::new(item.provider.as_deref().unwrap_or("-")),
+        ]);
+    }
+    format!("{table}\n")
+}
+
+fn format_issue_page_human(page: &flotilla_protocol::issue_query::IssueResultPage) -> String {
+    if page.items.is_empty() {
+        return "No open issues found.\n".into();
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Issue", "Title", "Labels"]);
+    for issue in &page.items {
+        table.add_row(vec![
+            Cell::new(format!("{}#{}", issue.reference.source.scope, issue.reference.id)),
+            Cell::new(&issue.title),
+            Cell::new(issue.labels.join(", ")),
+        ]);
+    }
+    let mut output = format!("{table}\n");
+    if page.has_more {
+        output.push_str("More issues available.\n");
+    }
+    output
 }
 
 fn format_host_status_human(response: &HostStatusResponse) -> String {
@@ -680,32 +726,15 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
         out.push('\n');
     }
 
-    if response.replicas.iter().any(|replica| !replica.reachable || replica.skipped_records > 0) {
+    if response.replicas.iter().any(|replica| !replica.reachable) {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
         table.set_header(vec!["Replica", "Status", "Last Sync", "Generation"]);
         for replica in &response.replicas {
-            if replica.reachable && replica.skipped_records == 0 {
+            if replica.reachable {
                 continue;
             }
-            let parse_skew = || {
-                let noun = if replica.skipped_records == 1 { "record" } else { "records" };
-                format!(
-                    "skipped {} {noun}: {}",
-                    replica.skipped_records,
-                    replica.first_parse_error.as_deref().unwrap_or("unknown parse error")
-                )
-            };
-            let status = if !replica.reachable {
-                let unreachable = replica.message.as_deref().unwrap_or("unreachable");
-                if replica.skipped_records > 0 {
-                    format!("{unreachable}; last sync {}", parse_skew())
-                } else {
-                    unreachable.to_string()
-                }
-            } else {
-                parse_skew()
-            };
+            let status = replica.message.as_deref().unwrap_or("unreachable");
             table.add_row(vec![
                 Cell::new(replica.host.as_str()),
                 Cell::new(status),
@@ -1081,6 +1110,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         // even though `host list` now presents the richer fleet-health view.
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
+        CommandValue::CliList(items) => format_cli_list_human(items),
         CommandValue::DispatchQueue(queue) => format_dispatch_queue_human(queue),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
@@ -1132,7 +1162,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
-        CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
+        CommandValue::IssuePage(page) => format_issue_page_human(page),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
         CommandValue::ConvoyAbandoned { name, archives } => {

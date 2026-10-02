@@ -2214,8 +2214,10 @@ fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
             *repo = repo_selector.ok_or_else(|| color_eyre::eyre::eyre!("checkout create requires --repo or FLOTILLA_REPO"))?;
         }
         CommandAction::QueryIssues { repo, .. } if *repo == RepoSelector::Query(String::new()) => {
-            *repo = repo_selector.clone().ok_or_else(|| color_eyre::eyre::eyre!("issue search requires --repo or FLOTILLA_REPO"))?;
-            cmd.context_repo = repo_selector;
+            if let Some(selector) = repo_selector {
+                *repo = selector.clone();
+                cmd.context_repo = Some(selector);
+            }
         }
         _ => {
             if cmd.context_repo.is_none() {
@@ -3487,6 +3489,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_bare_list_nouns_with_json_output() {
+        for noun in ["repo", "checkout", "cr", "issue", "agent", "workspace"] {
+            let cli = Cli::try_parse_from(["flotilla", noun, "--json"]).expect("bare noun should parse");
+            assert!(cli.json, "{noun} must keep the global JSON flag");
+            assert!(cli.command.is_some());
+        }
+    }
+
+    #[test]
+    fn issue_list_without_repo_keeps_unique_repo_resolution_available() {
+        let cli = Cli::try_parse_from(["flotilla", "issue"]).expect("issue list");
+        let Some(SubCommand::Issue(noun)) = &cli.command else { panic!("issue noun") };
+        let flotilla_commands::Resolved::NeedsContext { mut command, .. } = noun.clone().resolve().expect("issue list command") else {
+            panic!("issue list requires repo context");
+        };
+        super::inject_repo_context(&mut command, &cli).expect("defer unique repository resolution to daemon");
+        assert!(
+            matches!(command.action, super::CommandAction::QueryIssues { repo: super::RepoSelector::Query(ref query), .. } if query.is_empty())
+        );
+    }
+
+    #[test]
     fn cli_parses_checkout_noun() {
         let cli = Cli::try_parse_from(["flotilla", "checkout", "my-feature", "remove"]).expect("checkout cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Checkout(_))));
@@ -3583,7 +3607,8 @@ mod tests {
     #[test]
     fn cli_parses_agent_noun() {
         let cli = Cli::try_parse_from(["flotilla", "agent", "claude-1", "teleport"]).expect("agent cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Agent(_))));
+        let Some(SubCommand::Agent(noun)) = cli.command else { panic!("expected agent command") };
+        assert!(matches!(noun.verb, Some(flotilla_commands::commands::agent::AgentVerb::Teleport { .. })));
     }
 
     #[test]

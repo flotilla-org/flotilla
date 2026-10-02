@@ -18,6 +18,31 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliListKind {
+    Repo,
+    Checkout,
+    Cr,
+    Agent,
+    Workspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliListRow {
+    pub repo: Option<String>,
+    pub reference: String,
+    pub name: String,
+    pub status: String,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliListResponse {
+    pub list_kind: CliListKind,
+    pub items: Vec<CliListRow>,
+}
+
 pub const CREW_FOLLOW_UP_INSTRUCTION: &str =
     "Completion received, but a follow-up brief was delivered. Address it and run `flotilla crew complete` again when done.";
 #[cfg(test)]
@@ -838,6 +863,9 @@ pub enum CommandAction {
     },
     QueryHostList {},
     QueryProjectList {},
+    QueryCliList {
+        kind: CliListKind,
+    },
     QueryDispatchQueue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
@@ -930,6 +958,7 @@ impl CommandAction {
             CommandAction::QueryRepoProviders { .. }
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryProjectList {}
+                | CommandAction::QueryCliList { .. }
                 | CommandAction::QueryDispatchQueue { .. }
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
@@ -1003,6 +1032,7 @@ impl Command {
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
             CommandAction::QueryHostList {} => "query host list",
             CommandAction::QueryProjectList {} => "query project list",
+            CommandAction::QueryCliList { .. } => "query cli list",
             CommandAction::QueryDispatchQueue { .. } => "query dispatch queue",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
@@ -1144,6 +1174,7 @@ pub enum CommandValue {
     RepoProviders(Box<RepoProvidersResponse>),
     HostList(Box<HostListResponse>),
     ProjectList(Box<ProjectListResponse>),
+    CliList(Box<CliListResponse>),
     DispatchQueue(Box<DispatchQueueResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
@@ -1661,8 +1692,6 @@ mod tests {
                     reachable: false,
                     last_sync: None,
                     generation: None,
-                    skipped_records: 0,
-                    first_parse_error: None,
                     message: Some("not synced".into()),
                 }],
             })),

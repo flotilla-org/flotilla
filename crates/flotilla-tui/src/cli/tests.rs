@@ -9,6 +9,108 @@ use flotilla_protocol::{
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
 
 #[test]
+fn project_list_displays_zero_one_and_multiple_resolved_issue_sources() {
+    use flotilla_protocol::{IssueSource, ProjectListEntry, ProjectListResponse, ViewAddress};
+
+    let source = IssueSource { service: "https://github.com".into(), scope: "team/one".into() };
+    let entry = |name: &str, issue_sources: Vec<IssueSource>| {
+        ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name(name.to_string())
+            .display_name(name.to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: name.into() })
+            .repositories(vec![])
+            .issue_sources(issue_sources)
+            .default_workflow_ref("single-agent".to_string())
+            .build()
+    };
+    let response = ProjectListResponse {
+        projects: vec![
+            entry("none", vec![]),
+            entry("one", vec![source.clone()]),
+            entry("many", vec![source, IssueSource { service: "https://gitlab.com".into(), scope: "team/two".into() }]),
+        ],
+    };
+
+    let output = super::format_project_list_human(&response);
+    assert!(output.lines().any(|line| line.contains("flotilla/none") && line.contains("┆ - ")), "{output}");
+    assert!(output.contains("https://github.com / team/one"), "{output}");
+    assert!(output.contains("2 sources"), "{output}");
+}
+
+#[test]
+fn fleet_list_displays_replication_failure_and_last_successful_sync() {
+    use chrono::{TimeZone, Utc};
+    use flotilla_protocol::{FleetListResponse, FleetReplicaStatus};
+
+    let last_sync = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).single().expect("timestamp");
+    let response = FleetListResponse {
+        rows: vec![],
+        replicas: vec![FleetReplicaStatus {
+            host: HostName::new("remote"),
+            reachable: false,
+            last_sync: Some(last_sync),
+            generation: Some("generation-1".into()),
+            message: Some("resource replication failed: convoys: connection lost".into()),
+        }],
+    };
+
+    let output = super::format_fleet_list_human(&response);
+    assert!(output.contains("resource replication failed: convoys: connection lost"), "{output}");
+    assert!(output.contains("2026-09-30T12:00:00+00:00"), "{output}");
+    assert!(!output.contains("skipped"), "{output}");
+    let json = serde_json::to_value(&response).expect("serialize fleet list");
+    assert!(json["replicas"][0].get("skipped_records").is_none());
+    assert!(json["replicas"][0].get("first_parse_error").is_none());
+}
+
+#[test]
+fn provider_lists_show_active_sessions_and_workspaces() {
+    use flotilla_protocol::{CliListKind, CliListResponse, CliListRow};
+
+    let row = CliListRow {
+        repo: Some("team/repo".into()),
+        reference: "session-42".into(),
+        name: "Implement feature".into(),
+        status: "running".into(),
+        provider: Some("Claude".into()),
+    };
+    let agents = CliListResponse { list_kind: CliListKind::Agent, items: vec![row] };
+    let value = CommandValue::CliList(Box::new(agents.clone()));
+    let json = serde_json::to_value(&value).expect("serialize list");
+    assert_eq!(json["kind"], "cli_list");
+    assert_eq!(json["list_kind"], "agent");
+    assert_eq!(serde_json::from_value::<CommandValue>(json).expect("decode list"), value);
+    let output = format_command_result(&CommandValue::CliList(Box::new(agents)));
+    assert!(output.contains("session-42") && output.contains("Implement feature") && output.contains("running"), "{output}");
+
+    let workspaces = CliListResponse { list_kind: CliListKind::Workspace, items: vec![] };
+    assert_eq!(format_command_result(&CommandValue::CliList(Box::new(workspaces))), "No active workspaces found.\n");
+}
+
+#[test]
+fn issue_list_shows_open_issue_details() {
+    use chrono::Utc;
+    use flotilla_protocol::{issue_query::IssueResultPage, Issue, IssueRef, IssueSource, IssueState};
+
+    let issue = Issue {
+        reference: IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "team/repo".into() }, id: "42".into() },
+        title: "Repair the parser".into(),
+        body: None,
+        state: IssueState::Open,
+        labels: vec!["bug".into()],
+        assignees: vec![],
+        as_of: Utc::now(),
+        observed_at: None,
+        provider_name: "github".into(),
+        provider_display_name: "GitHub".into(),
+    };
+    let page = IssueResultPage { items: vec![issue], total: Some(1), has_more: false };
+    let output = format_command_result(&CommandValue::IssuePage(page));
+    assert!(output.contains("team/repo#42") && output.contains("Repair the parser") && output.contains("bug"), "{output}");
+}
+
+#[test]
 fn crew_follow_up_result_tells_the_crew_to_complete_again() {
     let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
     assert!(output.contains("Completion received"));

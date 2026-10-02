@@ -87,7 +87,12 @@ impl RepoNoun {
             })),
             (None, Some(RepoVerb::Providers)) => Err("providers requires a repository subject".into()),
             (Some(_), None) => Err("missing repo verb".into()),
-            (None, None) => Err("missing repo arguments".into()),
+            (None, None) => Ok(Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Repo },
+            })),
         }
     }
 }
@@ -134,6 +139,12 @@ mod tests {
     fn repo_add() {
         let resolved = parse(&["repo", "add", "/tmp/test"]).resolve().unwrap();
         crate::test_utils::assert_ready(resolved, CommandAction::TrackRepoPath { path: PathBuf::from("/tmp/test") });
+    }
+
+    #[test]
+    fn repo_without_verb_lists_tracked_repositories() {
+        let resolved = parse(&["repo"]).resolve().expect("default list");
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Repo });
     }
 
     #[test]

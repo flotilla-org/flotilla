@@ -785,6 +785,7 @@ pub struct FakeChangeRequest {
 pub struct FakePresentationManager {
     pub workspaces: Arc<TokioMutex<Vec<(String, Workspace)>>>,
     pub selected: Arc<TokioMutex<Vec<String>>>,
+    pub list_error: Arc<TokioMutex<Option<String>>>,
 }
 
 impl Default for FakePresentationManager {
@@ -795,7 +796,11 @@ impl Default for FakePresentationManager {
 
 impl FakePresentationManager {
     pub fn new() -> Self {
-        Self { workspaces: Arc::new(TokioMutex::new(Vec::new())), selected: Arc::new(TokioMutex::new(Vec::new())) }
+        Self {
+            workspaces: Arc::new(TokioMutex::new(Vec::new())),
+            selected: Arc::new(TokioMutex::new(Vec::new())),
+            list_error: Arc::new(TokioMutex::new(None)),
+        }
     }
 
     pub async fn add_workspaces(&self, workspaces: Vec<(String, Workspace)>) {
@@ -806,6 +811,9 @@ impl FakePresentationManager {
 #[async_trait::async_trait]
 impl PresentationManager for FakePresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        if let Some(error) = self.list_error.lock().await.clone() {
+            return Err(error);
+        }
         Ok(self.workspaces.lock().await.clone())
     }
 
