@@ -676,6 +676,11 @@ pub trait Vcs: Send + Sync {
         Err("checkout exclude path is unavailable".into())
     }
 
+    /// Whether the checkout's effective ignore rules exclude this path.
+    async fn path_is_ignored(&self, _path: &Path) -> Result<bool, String> {
+        Err("checkout ignore inspection is unavailable".into())
+    }
+
     async fn clean_revision(&self) -> Result<String, String> {
         Err("clean revision inspection is unavailable".into())
     }
@@ -1159,6 +1164,15 @@ impl Vcs for FlotillaVcs {
     async fn exclude_file_path(&self) -> Result<Option<PathBuf>, String> {
         let output = self.cli().git_path("info/exclude").await?;
         Ok((output.success && !output.stdout.trim().is_empty()).then(|| PathBuf::from(output.stdout.trim())))
+    }
+
+    async fn path_is_ignored(&self, path: &Path) -> Result<bool, String> {
+        let path = path.to_str().ok_or("ignore path is not UTF-8")?;
+        let output = self.cli().output(&["check-ignore", "--quiet", "--", path]).await?;
+        if !output.success && !output.stderr.trim().is_empty() {
+            return Err(format!("checkout ignore inspection failed: {}", output.stderr.trim()));
+        }
+        Ok(output.success)
     }
 
     async fn clean_revision(&self) -> Result<String, String> {

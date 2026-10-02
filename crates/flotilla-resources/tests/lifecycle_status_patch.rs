@@ -104,6 +104,7 @@ define_patch_kinds! {
     ConvoyRefuseTurnDelivery => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
     TerminalMarkStarting => NEW_ATTEMPT,
+    TerminalClearRetiredLaunches => NONE,
     TerminalMarkRunning => DUPLICATE,
     TerminalObserveCleatEndpoint => NONE,
     TerminalMarkMessageDelivered => NONE,
@@ -178,6 +179,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
 fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind {
     match patch {
         TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
+        TerminalSessionStatusPatch::ClearRetiredLaunches => PatchKind::TerminalClearRetiredLaunches,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
         TerminalSessionStatusPatch::ObserveCleatEndpoint { .. } => PatchKind::TerminalObserveCleatEndpoint,
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
@@ -671,6 +673,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     inner_exit_code: None,
                     message: None,
                     crew: None,
+                    retired_launches: Default::default(),
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
                     attention: None,

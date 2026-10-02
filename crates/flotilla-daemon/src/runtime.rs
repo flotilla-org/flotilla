@@ -54,11 +54,12 @@ use flotilla_resources::{
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec,
     Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
-    VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
-    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
+    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
+    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
+    MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS,
+    TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -1305,6 +1306,7 @@ struct ControllerRuntimeState {
     local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
+    exit_receipts: flotilla_core::agent_process::ExitReceiptObserver,
     archive_catalog_lock: Mutex<()>,
     checkout_removal_concurrency: NonZeroUsize,
     checkout_removals: Semaphore,
@@ -1497,6 +1499,7 @@ impl ControllerRuntimeState {
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
+            exit_receipts: Default::default(),
             archive_catalog_lock: Mutex::new(()),
             checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
             checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
@@ -5419,20 +5422,39 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
-        let marker = flotilla_core::agent_process::exit_receipt(&crew.id);
         let runner = self.runner_for_env(&spec.env_ref)?;
-        let output = runner
-            .run(
-                "sh",
-                &["-c", "if [ -f \"$1\" ]; then cat -- \"$1\"; fi", "flotilla-agent-exit", &marker],
-                Path::new(&spec.cwd),
-                &ChannelLabel::Default,
-            )
-            .await?;
-        if output.trim().is_empty() {
-            return Ok(None);
-        }
-        output.trim().parse().map(Some).map_err(|error| format!("invalid agent exit receipt: {error}"))
+        self.state
+            .exit_receipts
+            .observe(&spec.env_ref, &*runner, Path::new(&spec.cwd).join(flotilla_core::agent_process::exit_receipt(&crew.id)), || async {
+                let sessions = self
+                    .state
+                    .daemon
+                    .resource_backend()
+                    .using::<TerminalSession>(&self.state.namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(sessions
+                    .items
+                    .into_iter()
+                    .filter_map(|session| {
+                        if session.spec.env_ref != spec.env_ref || !matches!(session.spec.source, TerminalSessionSource::Agent { .. }) {
+                            return None;
+                        }
+                        let status = session.status?;
+                        if status.phase != TerminalSessionPhase::Running {
+                            return None;
+                        }
+                        status.crew.map(|crew| Path::new(&session.spec.cwd).join(flotilla_core::agent_process::exit_receipt(&crew.id)))
+                    })
+                    .collect())
+            })
+            .await
+    }
+
+    async fn remove_exit_receipt(&self, spec: &flotilla_resources::TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+        let runner = self.runner_for_env(&spec.env_ref)?;
+        flotilla_core::agent_process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
 
     async fn observe_attention(
@@ -13842,6 +13864,11 @@ mod tests {
         std::fs::create_dir_all(&session_cwd).expect("session cwd");
         let durable_checkout = temp.path().join("durable-checkout");
         std::fs::create_dir_all(&durable_checkout).expect("durable checkout dir");
+        // Production crew roots are Git checkouts. The exclusion guarantee
+        // must also hold when replacing an adopted terminal after restart.
+        for root in [&session_cwd, &durable_checkout] {
+            assert!(ProcessCommand::new("git").args(["init", "-q"]).current_dir(root).status().expect("git init crew checkout").success());
+        }
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: profile.host_direct_environment_name(),
             role: "coder".to_string(),

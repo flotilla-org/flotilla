@@ -749,6 +749,10 @@ impl CliAgentAdapter {
         environment: &TerminalEnvVars,
         vcs: Option<&dyn crate::vcs::Vcs>,
     ) -> Result<(), String> {
+        // Install the exclusion before writing any runtime files or launching an agent.
+        if let Some(vcs) = vcs {
+            ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path()).await?;
+        }
         match &self.flavor {
             AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
                 if *contained && !environment.iter().any(|(name, _)| name == "CLAUDE_CODE_OAUTH_TOKEN") {
@@ -788,9 +792,6 @@ impl CliAgentAdapter {
             }
         }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
-        if let Some(vcs) = vcs {
-            ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path()).await?;
-        }
         Ok(())
     }
 }
@@ -907,15 +908,22 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, vcs: &dyn crate::vcs::Vcs, cwd: &Path) -> Result<(), String> {
-    let Ok(Some(exclude_path)) = vcs.exclude_file_path().await else {
-        return Ok(());
-    };
+    let exclude_path = vcs
+        .exclude_file_path()
+        .await?
+        .ok_or_else(|| "cannot guarantee .flotilla/ runtime-file exclusion: checkout has no exclude path".to_string())?;
 
     let script = format!(
-        "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; grep -qxF '.flotilla/' \"$exclude\" || printf '%s\\n' '.flotilla/' >> \"$exclude\"",
+        "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; [ \"$(tail -n 1 \"$exclude\")\" = '.flotilla/' ] || printf '\\n%s\\n' '.flotilla/' >> \"$exclude\"",
         flotilla_protocol::arg::shell_quote(&exclude_path.to_string_lossy()),
     );
-    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Default).await;
+    runner
+        .run("sh", &["-lc", &script], cwd, &ChannelLabel::Default)
+        .await
+        .map_err(|error| format!("cannot install .flotilla/ runtime-file exclusion: {error}"))?;
+    if !vcs.path_is_ignored(Path::new(".flotilla/")).await? {
+        return Err("cannot guarantee .flotilla/ runtime-file exclusion: checkout ignore rules override it".to_string());
+    }
     Ok(())
 }
 
@@ -2092,6 +2100,110 @@ mod tests {
         assert_eq!(codex.classify_screen_failure("› Ask Codex to do something"), None);
     }
 
+    // Real Git must ignore runtime files even with an unterminated existing
+    // exclude file or a later negation. Higher-priority .gitignore overrides
+    // must refuse launch rather than silently expose runtime files.
+    #[tokio::test]
+    async fn runtime_exclusion_handles_existing_patterns_and_refuses_overrides() {
+        use crate::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        for (existing, overridden) in [("previous-pattern", false), (".flotilla/\n!.flotilla/", false), ("", true)] {
+            let repo = tempfile::tempdir().expect("checkout");
+            assert!(ProcessCommand::new("git").args(["init", "-q"]).current_dir(repo.path()).status().expect("git init").success());
+            std::fs::write(repo.path().join(".git/info/exclude"), existing).expect("existing exclusions");
+            if overridden {
+                std::fs::write(repo.path().join(".gitignore"), "!.flotilla/\n").expect("higher-priority override");
+            }
+            let runner = Arc::new(ProcessCommandRunner);
+            let cwd = ExecutionEnvironmentPath::new(repo.path());
+            let vcs = FlotillaVcs::new(
+                cwd,
+                runner.clone(),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+            );
+            let result = super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()).await;
+            if overridden {
+                assert!(result.is_err(), "refuse launch when Git does not ignore runtime files");
+                continue;
+            }
+            result.expect("install effective exclusion");
+            std::fs::create_dir_all(repo.path().join(".flotilla/agent-exits")).expect("receipt directory");
+            std::fs::write(repo.path().join(crate::agent_process::exit_receipt("crew")), "0\n").expect("receipt");
+            assert!(ProcessCommand::new("git").args(["add", "-A"]).current_dir(repo.path()).status().expect("add all").success());
+            let added = ProcessCommand::new("git")
+                .args(["diff", "--cached", "--name-only", "--", ".flotilla"])
+                .current_dir(repo.path())
+                .output()
+                .expect("index");
+            assert!(added.status.success());
+            assert!(added.stdout.is_empty(), "runtime files must stay out of the index");
+        }
+    }
+
+    // Exclusion discovery and write failures are errors, never permission to
+    // expose runtime files to git add -A. This is the lowest falsifying seam.
+    #[tokio::test]
+    async fn runtime_exclusion_refuses_discovery_and_write_failures() {
+        use crate::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
+            Ok(".git/info/exclude\n".to_string()),
+            Err("exclude is read-only".to_string()),
+        ]] {
+            let runner = Arc::new(MockRunner::new(responses));
+            let cwd = ExecutionEnvironmentPath::new("/checkout");
+            let vcs = FlotillaVcs::new(
+                cwd.clone(),
+                runner.clone(),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+            );
+            assert!(super::ensure_flotilla_git_exclude(&*runner, &vcs, cwd.as_path()).await.is_err());
+            assert_eq!(runner.remaining(), 0);
+        }
+    }
+
+    // Failure to discover or install the exclusion refuses preparation before
+    // any runtime file is written. This example covers the two subprocess edges.
+    #[tokio::test]
+    async fn preparation_refuses_unavailable_runtime_file_exclusion() {
+        use crate::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
+            Ok(".git/info/exclude\n".to_string()),
+            Err("exclude is read-only".to_string()),
+        ]] {
+            let runner = Arc::new(MockRunner::new(responses));
+            let env = EnvironmentBag::new()
+                .with(EnvironmentAssertion::env_var("CODEX_HOME", "/codex"))
+                .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+            let registry = AgentAdapterRegistry::discover(&env, runner.clone());
+            let cwd = ExecutionEnvironmentPath::new("/checkout");
+            let vcs = FlotillaVcs::new(
+                cwd.clone(),
+                runner.clone(),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+            );
+            let brief = flotilla_resources::TerminalBrief {
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "assignment".into(),
+                artifact_digest: None,
+                copies: Vec::new(),
+            };
+            assert!(registry.get("codex").expect("adapter").prepare_with_vcs(&cwd, &brief, &Vec::new(), &vcs).await.is_err());
+            assert_eq!(runner.remaining(), 0);
+            assert!(
+                runner.calls().iter().all(|(cmd, args)| cmd == "git" || (cmd == "sh" && args.iter().any(|arg| arg.contains("exclude=")))),
+                "no runtime files written after exclusion failure"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn prepare_excludes_flotilla_brief_from_git_status() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2149,6 +2261,37 @@ mod tests {
             .prepare_with_vcs(&ExecutionEnvironmentPath::new(repo.to_str().expect("utf-8 repo path")), &brief, &Vec::new(), vcs.as_ref())
             .await
             .expect("prepare brief");
+
+        // Adopted linked worktrees have a .git file, not a directory. Multiple
+        // crew roles must share exclusion safely and git add -A must omit receipts.
+        let adopted = temp.path().join("adopted checkout");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("repo"), "worktree", "add", "-q", "-b", "adopted", adopted.to_str().expect("adopted")])
+            .status()
+            .expect("adopted worktree")
+            .success());
+        let adopted_path = ExecutionEnvironmentPath::new(&adopted);
+        let adopted_vcs = GitVcsFactory
+            .probe(&env, &crate::config::ConfigStore::with_base(temp.path()), &adopted_path, Arc::new(ProcessCommandRunner))
+            .await
+            .expect("adopted vcs");
+        for role in ["coder", "reviewer"] {
+            let role_brief = flotilla_resources::TerminalBrief { path: format!(".flotilla/briefs/{role}.md"), ..brief.clone() };
+            registry
+                .get("codex")
+                .expect("adapter")
+                .prepare_with_vcs(&adopted_path, &role_brief, &Vec::new(), adopted_vcs.as_ref())
+                .await
+                .expect("adopted crew preparation");
+            let receipt = crate::agent_process::exit_receipt(role);
+            std::fs::create_dir_all(adopted.join(".flotilla/agent-exits")).expect("receipt dir");
+            std::fs::write(adopted.join(receipt), "0\n").expect("receipt");
+        }
+        assert!(ProcessCommand::new("git").args(["-C", adopted.to_str().expect("path"), "add", "-A"]).status().expect("add all").success());
+        let adopted_status =
+            ProcessCommand::new("git").args(["-C", adopted.to_str().expect("path"), "status", "--short"]).output().expect("adopted status");
+        assert!(adopted_status.status.success());
+        assert!(adopted_status.stdout.is_empty(), "runtime receipts and briefs cannot enter a commit");
 
         let status = ProcessCommand::new("git")
             .args(["-C", repo.to_str().expect("utf-8 repo path"), "status", "--short"])
