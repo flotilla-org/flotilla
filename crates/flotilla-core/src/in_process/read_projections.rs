@@ -14,7 +14,7 @@ use flotilla_manifest::{
         KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE,
         KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
     },
-    projection::change_request_facts,
+    projection::{change_request_facts, evaluate_change_request_readiness},
     wire::MetadataValue,
 };
 use flotilla_protocol::{
@@ -1191,18 +1191,7 @@ fn explain_subject_observation(
     };
     // Unknown observations retain timestamps and count toward the oldest input age,
     // matching readiness's waiting state for incomplete evidence.
-    let readiness_at = status.map(|status| {
-        [
-            status.state.observed_at,
-            status.checks.observed_at,
-            status.mergeable.observed_at,
-            status.review_decision.observed_at,
-            status.review.actionable_at_head.observed_at,
-        ]
-        .into_iter()
-        .min()
-        .expect("five readiness inputs")
-    });
+    let readiness_at = status.map(|status| evaluate_change_request_readiness(status, landed).observed_at);
     ExplainedSubjectObservation {
         subject: subject.clone(),
         state: field(KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT),
@@ -1223,11 +1212,14 @@ fn explain_subject_observation(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone};
-    use flotilla_protocol::{qualified_path::HostId, HostSummary, NodeInfo, SystemInfo};
+    use flotilla_protocol::{qualified_path::HostId, EvidenceFreshness, HostSummary, NodeInfo, Relationship, SystemInfo};
     use flotilla_resources::{
-        ConvoyPhase, ConvoySpec, CrewWorkState, DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend,
-        InputMeta, ProjectSpec, ProjectStatus, SystemClock, TerminalSessionSource, TerminalSessionSpec,
+        ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyPhase, ConvoySpec, CrewWorkState, DeclaredSubject,
+        DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend, InputMeta, Observation,
+        ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision, ProjectSpec, ProjectStatus, SystemClock,
+        TerminalSessionSource, TerminalSessionSpec,
     };
+    use hegel::generators as gs;
 
     use super::*;
     use crate::{
@@ -1690,10 +1682,6 @@ mod tests {
     }
 
     fn subject_status(now: DateTime<Utc>) -> ChangeRequestStatus {
-        use flotilla_resources::{
-            ChangeRequestReviewObservation, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
-            ObservedReviewDecision,
-        };
         ChangeRequestStatus {
             title: Observation::unknown(now),
             author: Observation::unknown(now),
@@ -1711,9 +1699,6 @@ mod tests {
     // ages independently and readiness uses its oldest evidence, including at TTL.
     #[hegel::test]
     fn subject_explanation_preserves_values_and_independent_age(tc: hegel::TestCase) {
-        use flotilla_protocol::{EvidenceFreshness, IssueSource, Subject, SubjectKind};
-        use flotilla_resources::ObservedChangeRequestState;
-        use hegel::generators as gs;
         // All request states, unknown values, missing status, and ages either side of TTL.
         let state_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(61));
@@ -1725,7 +1710,7 @@ mod tests {
             id: "42".into(),
         };
         // Pin the exact TTL boundary in every case as well as drawing surrounding ages.
-        for age in [age, 60] {
+        for (age_input, age) in (0..5).flat_map(|input| [age, 60].map(|age| (input, age))) {
             let mut status = subject_status(now);
             let states = [
                 Some(ObservedChangeRequestState::Open),
@@ -1735,7 +1720,15 @@ mod tests {
                 None,
             ];
             status.state.value = states[state_index];
-            status.checks.observed_at = now - ChronoDuration::seconds(age);
+            let observed_at = now - ChronoDuration::seconds(age);
+            match age_input {
+                0 => status.state.observed_at = observed_at,
+                1 => status.checks.observed_at = observed_at,
+                2 => status.mergeable.observed_at = observed_at,
+                3 => status.review_decision.observed_at = observed_at,
+                4 => status.review.actionable_at_head.observed_at = observed_at,
+                _ => unreachable!("five inputs"),
+            }
             let observation = explain_subject_observation(&subject, (!missing).then_some(&status), false, now, Duration::from_secs(60));
             // The JSON explain wire shape round-trips every generated value and age.
             let json = serde_json::to_value(&observation).expect("encode observation");
@@ -1745,7 +1738,16 @@ mod tests {
                 observation.state.value.as_deref(),
                 if missing { None } else { [Some("open"), Some("draft"), Some("merged"), Some("closed"), None][state_index] }
             );
-            assert_eq!(observation.state.freshness, if missing { EvidenceFreshness::Missing } else { EvidenceFreshness::Fresh });
+            assert_eq!(
+                observation.state.freshness,
+                if missing {
+                    EvidenceFreshness::Missing
+                } else if age_input == 0 && age >= 60 {
+                    EvidenceFreshness::Stale
+                } else {
+                    EvidenceFreshness::Fresh
+                }
+            );
             let aged = if missing {
                 EvidenceFreshness::Missing
             } else if age < 60 {
@@ -1753,7 +1755,7 @@ mod tests {
             } else {
                 EvidenceFreshness::Stale
             };
-            assert_eq!(observation.checks.freshness, aged);
+            assert_eq!(observation.checks.freshness, if age_input == 1 || missing { aged } else { EvidenceFreshness::Fresh });
             assert_eq!(observation.readiness.freshness, aged);
             assert_eq!(
                 observation.readiness.value.as_deref(),
@@ -1773,8 +1775,6 @@ mod tests {
     // an unrelated observed request must not appear and an unobserved subject stays visible.
     #[tokio::test]
     async fn convoy_explanation_joins_plural_subjects_to_observations() {
-        use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
-        use flotilla_resources::{ChangeRequest, ChangeRequestSpec, DeclaredSubject, ObservedChangeRequestState};
         let now = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).single().expect("time");
         let mut fixture = ProjectionFixture::new();
         fixture.clock = Arc::new(flotilla_resources::VirtualClock::new(now));

@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement,
-    ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState,
-    PlacementDecision, PlacementTargetHost, StreamKey, TopologyResponse, TopologyRoute,
+    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    result_set::ConvoySubjectRow,
+    CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, EvidenceFreshness, ExplainedDecisionLedger,
+    ExplainedSettlement, ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, IssueSource, NodeId, NodeInfo,
+    PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject, SubjectKind, TopologyResponse,
+    TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -482,10 +485,6 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
 // Glue: a single formatting scenario covers the fixed presentation layout.
 #[test]
 fn convoy_explanation_subject_observations_snapshot() {
-    use flotilla_protocol::{
-        commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
-        EvidenceFreshness, IssueSource, Relationship, Subject, SubjectKind,
-    };
     let mut explanation: ConvoyExplanation = serde_json::from_value(serde_json::json!({
         "namespace": "flotilla", "convoy": "plural", "phase": "Landing",
         "evidence_ttl_seconds": 30, "change_request_stale_after_seconds": 60,
@@ -509,7 +508,7 @@ fn convoy_explanation_subject_observations_snapshot() {
             source: IssueSource { service: "github.com".into(), scope: "owner/repo".into() },
             id: number.to_string(),
         };
-        explanation.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+        explanation.subjects.push(ConvoySubjectRow {
             subject: subject.clone(),
             relationship: Relationship::Produces,
             declared: false,
