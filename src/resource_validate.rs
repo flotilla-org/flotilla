@@ -79,14 +79,30 @@ pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Res
             let items = document.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: daemon list has no items array"))?;
             for item in items {
                 count += 1;
-                if catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
-                    skill_documents.push(item.clone());
-                }
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
                 if let Err(error) = validate_resource_document(item) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
                 }
+            }
+            if catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
+                // Schema validation checks every stored provenance above. Skill
+                // policy must use the merged definition view, just like admission.
+                let merged: Value = client
+                    .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                skill_documents.extend(
+                    merged
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| eyre!("{label}: merged list has no items"))?
+                        .iter()
+                        .cloned(),
+                );
             }
         }
     }
