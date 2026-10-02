@@ -2527,14 +2527,14 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
     migrate_listed_placement_policies(backend, namespace, host_ref, platform, &hosts.items, policies.items).await
 }
 
-fn kind_belongs_to_host(hosts: &[ResourceObject<Host>], kind: &ResourceObject<FulfilmentKind>, host_ref: &str) -> bool {
+fn kind_belongs_to_host(hosts: &[ResourceObject<Host>], kind: &ResourceObject<FulfilmentKind>, host_ref: &str, site: &'static str) -> bool {
     if kind.spec.host_ref == host_ref {
         return true;
     }
     match canonical_host_id(hosts, &kind.spec.host_ref) {
         Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
         Err(error) => {
-            warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind host");
+            warn!(kind = %kind.metadata.name, %site, %error, "skipping ambiguous fulfilment kind host");
             false
         }
     }
@@ -2573,7 +2573,7 @@ async fn migrate_listed_placement_policies(
             // leave the policy itself for existing convoy references.
             match kinds.get(&policy.metadata.name).await {
                 Ok(kind) => {
-                    if kind_belongs_to_host(hosts, &kind, host_ref) {
+                    if kind_belongs_to_host(hosts, &kind, host_ref, "snapshot cleanup") {
                         kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
                     }
                 }
@@ -2651,7 +2651,7 @@ async fn migrate_listed_placement_policies(
         if kind.metadata.deletion_timestamp.is_some() || kind.spec.host_ref == host_ref {
             continue;
         }
-        if kind_belongs_to_host(hosts, &kind, host_ref) {
+        if kind_belongs_to_host(hosts, &kind, host_ref, "kind canonicalization") {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds
@@ -2685,7 +2685,7 @@ async fn observe_fulfilment_facts(
         if kind.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        if kind_belongs_to_host(&hosts.items, &kind, host_ref) {
+        if kind_belongs_to_host(&hosts.items, &kind, host_ref, "fact observation") {
             kinds.push(kind);
         }
     }
