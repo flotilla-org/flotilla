@@ -170,6 +170,17 @@ enum SourceDemand {
 }
 
 impl SourceRefresh {
+    // Call while holding pages so replacement and invalidation are atomic.
+    fn replace_provider(&self, provider: &Arc<dyn IssueProvider>, pages: &mut Vec<SourcePage>) -> bool {
+        let mut current = self.provider.lock().expect("source provider lock poisoned");
+        let replaced = !Arc::ptr_eq(&current, provider);
+        if replaced {
+            pages.clear();
+            *current = provider.clone();
+        }
+        replaced
+    }
+
     // Explicit issue-query demand is a viewed source; implicit fleet-awareness
     // windows are governed demand. A source uses the strongest live demand.
     fn interval(&self, state: &AggregatorProjectionState) -> Duration {
@@ -251,16 +262,8 @@ impl SharedIssueRefresh {
             .get(source)
             .cloned()
             .ok_or_else(|| format!("issue source {} is no longer registered", source.scope))?;
-        let replaced = {
-            let mut current = entry.provider.lock().expect("source provider lock poisoned");
-            let replaced = !Arc::ptr_eq(&current, provider);
-            *current = provider.clone();
-            replaced
-        };
         let mut pages = entry.pages.lock().await;
-        if replaced {
-            pages.clear();
-        }
+        entry.replace_provider(provider, &mut pages);
         let interval = entry.interval(state);
         pages.retain(|cached| {
             (cached.params == *params && cached.page == page) || cached.fetched_at.elapsed() < cached.interval.min(interval)
@@ -369,8 +372,10 @@ impl SharedIssueRefresh {
             Ok(provider) => provider,
             Err(message) => return (since.to_string(), Err(message)),
         };
-        *entry.provider.lock().expect("source provider lock poisoned") = provider.clone();
         let mut last = entry.last.lock().await;
+        if entry.replace_provider(&provider, &mut *entry.pages.lock().await) {
+            *last = None;
+        }
         if let Some(cached) = last.as_ref().filter(|cached| cached.fetched_at.elapsed() < entry.interval(state)) {
             if since_time >= cached.since {
                 if since_time >= cached.next_cursor {
@@ -397,6 +402,8 @@ impl SharedIssueRefresh {
         let oldest = entry.cursors.lock().expect("shared issue cursors lock poisoned").values().min().copied().unwrap_or(since_time);
         let next_cursor = Utc::now();
         let result = provider.list_changed_since(source, &oldest.to_rfc3339(), PAGE_SIZE).await;
+        // Errors reset quiet backoff for prompt recovery; forge reset-time
+        // health backoff still suppresses requests when quota is exhausted.
         entry.note_activity(
             result.as_ref().map_or(true, |changes| !changes.updated.is_empty() || !changes.closed.is_empty() || changes.has_more),
         );
@@ -1419,6 +1426,44 @@ mod tests {
             assert_eq!(rows[0].reference.id, "1");
             assert!(!result.state.demand.expect("demand").has_more);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_turnover_during_cached_refresh_invalidates_shared_pages() {
+        let state = AggregatorProjectionState::new();
+        let first = project_query("turnover-first");
+        let second = project_query("turnover-second");
+        let third = project_query("turnover-third");
+        let old = Arc::new(ScriptedProvider::new(vec![page(&["1"], false), page(&["retired"], false)], vec![IssueChangeset {
+            updated: vec![],
+            closed: vec![],
+            has_more: false,
+        }]));
+        let replacement = Arc::new(ScriptedProvider::new(vec![page(&["2"], false)], vec![]));
+        let resolver = Arc::new(TurnoverResolver {
+            source: IssueSource { service: "github".into(), scope: "owner/repo".into() },
+            provider: StdMutex::new(old.clone()),
+        });
+        let (event_tx, mut events) = broadcast::channel(16);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver.clone(), event_tx);
+        let first_generation = subscribe(&state, &first);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
+        next_event(&mut events).await;
+        materializer.refresh(&first);
+        next_event(&mut events).await;
+        let second_generation = subscribe(&state, &second);
+        materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
+        next_event(&mut events).await;
+        *resolver.provider.lock().expect("provider") = replacement.clone();
+        materializer.refresh(&first);
+        next_event(&mut events).await;
+        let third_generation = subscribe(&state, &third);
+        materializer.reconcile(HashMap::from([(first, first_generation), (second, second_generation), (third.clone(), third_generation)]));
+        next_event(&mut events).await;
+        let result = state.result_set_for(&third).await.expect("replacement window");
+        let ids = result.rows.as_issues().expect("issues").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["2"], "a cached refresh must retire pages from the previous provider");
+        assert_eq!(replacement.seen_queries.lock().await.len(), 1);
     }
 
     #[tokio::test]

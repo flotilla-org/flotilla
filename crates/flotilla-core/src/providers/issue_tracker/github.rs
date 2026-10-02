@@ -13,6 +13,8 @@ use crate::providers::{
     run, CommandRunner,
 };
 
+const INCREMENTAL_PAGE_SIZE: usize = 100;
+
 pub struct GitHubIssueProvider {
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
@@ -128,7 +130,7 @@ impl super::IssueProvider for GitHubIssueProvider {
     async fn list_changed_since(&self, source: &IssueSource, since: &str, _count: usize) -> Result<IssueChangeset, String> {
         // Incremental pages include PRs. Use the REST maximum independently
         // of the demanded window size to avoid needless overflow reloads.
-        let per_page = 100;
+        let per_page = INCREMENTAL_PAGE_SIZE;
         // Keep the URI stable so the GhApi ETag cache can validate every poll.
         // Filter the sorted page locally and reload if relevant changes may
         // continue onto another page.
