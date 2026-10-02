@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,14 +9,16 @@ use flotilla_resources::{
     apply_status_patch,
     controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
-    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, Forge, IntegrationCondition,
-    LifecycleAuthority, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SystemClock,
-    TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
+    CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, EventRecorder, Forge,
+    IntegrationCondition, LifecycleAuthority, ObjectEvent, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
+use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::warn;
 
 const CHECKOUT_INTEGRATION_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
+const MAX_BACKGROUND_CHECKOUT_ARCHIVES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
@@ -37,6 +39,7 @@ pub enum BranchPreservationReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemovalOutcome {
     Removed,
+    ArchivedAndRemoved { archive_path: String },
     PreservedBranch { branch: String, reason: BranchPreservationReason },
 }
 
@@ -110,6 +113,8 @@ pub struct CheckoutReconciler<R> {
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     local_root: Option<flotilla_protocol::NodeId>,
     clock: Arc<dyn Clock>,
+    backend: ResourceBackend,
+    finalizers: Mutex<BTreeMap<String, JoinHandle<Result<CheckoutRemovalOutcome, String>>>>,
 }
 
 impl<R> CheckoutReconciler<R> {
@@ -134,6 +139,8 @@ impl<R> CheckoutReconciler<R> {
             federated_convoys: None,
             local_root,
             clock,
+            backend: backend.clone(),
+            finalizers: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -441,7 +448,54 @@ where
             CheckoutSpec::FreshClone(spec) => CheckoutRemoval::FreshClone { target_path: spec.target_path.clone() },
             CheckoutSpec::Observed(_) => return Ok(()),
         };
-        let outcome = self.runtime.remove_checkout_in(obj.spec.env_ref().unwrap_or(""), &removal).await.map_err(ResourceError::other)?;
+        let outcome = if matches!(removal, CheckoutRemoval::ForcedWorktree { .. } | CheckoutRemoval::LandedWorktree { .. }) {
+            // A deleted Checkout can disappear before its completed task is collected.
+            // Reclaim those slots without discarding results for live resources.
+            let finished = {
+                let finalizers = self.finalizers.lock().await;
+                finalizers.iter().filter(|(_, handle)| handle.is_finished()).map(|(name, _)| name.clone()).collect::<Vec<_>>()
+            };
+            for finished_name in finished {
+                if matches!(self.checkouts.get(&finished_name).await, Err(ResourceError::NotFound { .. })) {
+                    self.finalizers.lock().await.remove(&finished_name);
+                }
+            }
+            let mut finalizers = self.finalizers.lock().await;
+            let name = obj.metadata.name.clone();
+            match finalizers.get(&name) {
+                Some(handle) if handle.is_finished() => {
+                    let handle = finalizers.remove(&name).expect("finished finalizer present");
+                    drop(finalizers);
+                    handle
+                        .await
+                        .map_err(|error| ResourceError::other(format!("checkout finalizer task failed: {error}")))?
+                        .map_err(ResourceError::other)?
+                }
+                Some(_) => return Err(ResourceError::FinalizerPending),
+                None => {
+                    if finalizers.len() >= MAX_BACKGROUND_CHECKOUT_ARCHIVES {
+                        return Err(ResourceError::FinalizerPending);
+                    }
+                    let runtime = Arc::clone(&self.runtime);
+                    let env_ref = obj.spec.env_ref().unwrap_or("").to_string();
+                    finalizers.insert(name, tokio::spawn(async move { runtime.remove_checkout_in(&env_ref, &removal).await }));
+                    return Err(ResourceError::FinalizerPending);
+                }
+            }
+        } else {
+            self.runtime.remove_checkout_in(obj.spec.env_ref().unwrap_or(""), &removal).await.map_err(ResourceError::other)?
+        };
+        if let CheckoutRemovalOutcome::ArchivedAndRemoved { archive_path } = &outcome {
+            if let Err(error) = EventRecorder::new(self.backend.clone())
+                .record(
+                    ObjectEvent::for_object(obj, "CheckoutArchived", format!("checkout archive saved at {archive_path}")),
+                    self.clock.now(),
+                )
+                .await
+            {
+                warn!(%error, %archive_path, "could not record checkout archive location event");
+            }
+        }
         if let CheckoutRemovalOutcome::PreservedBranch { branch, reason } = outcome {
             warn!(%branch, ?reason, "preserved branch during checkout cleanup");
         }

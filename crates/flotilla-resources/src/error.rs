@@ -4,13 +4,31 @@ use crate::FieldOwnershipViolation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
-    NotFound { name: String },
-    Conflict { name: String, message: String },
-    Invalid { message: String },
-    WatchExpired { requested_version: String, compacted_through: Option<String> },
-    Unauthorized { message: String },
-    FieldOwnership { violations: Vec<FieldOwnershipViolation> },
-    Other { message: String },
+    NotFound {
+        name: String,
+    },
+    Conflict {
+        name: String,
+        message: String,
+    },
+    Invalid {
+        message: String,
+    },
+    WatchExpired {
+        requested_version: String,
+        compacted_through: Option<String>,
+    },
+    Unauthorized {
+        message: String,
+    },
+    FieldOwnership {
+        violations: Vec<FieldOwnershipViolation>,
+    },
+    /// An asynchronous finalizer is still running; retry without marking failure.
+    FinalizerPending,
+    Other {
+        message: String,
+    },
 }
 
 impl ResourceError {
@@ -68,6 +86,7 @@ impl fmt::Display for ResourceError {
                 }
                 Ok(())
             }
+            Self::FinalizerPending => f.write_str("finalizer pending"),
             Self::Other { message } => f.write_str(message),
         }
     }

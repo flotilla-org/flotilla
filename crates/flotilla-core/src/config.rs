@@ -336,6 +336,9 @@ pub struct DaemonConfig {
     /// Retention in days by artifact kind. Unknown kinds use 30 days.
     #[serde(default = "default_artifact_retention_days")]
     pub artifact_retention_days: BTreeMap<String, u64>,
+    /// Retention for forced checkout archives, in days.
+    #[serde(default = "default_checkout_archive_retention_days")]
+    pub checkout_archive_retention_days: u64,
 }
 
 impl Default for DaemonConfig {
@@ -351,8 +354,13 @@ impl Default for DaemonConfig {
             relay: None,
             blob_stores: Vec::new(),
             artifact_retention_days: default_artifact_retention_days(),
+            checkout_archive_retention_days: default_checkout_archive_retention_days(),
         }
     }
+}
+
+fn default_checkout_archive_retention_days() -> u64 {
+    14
 }
 
 fn default_artifact_retention_days() -> BTreeMap<String, u64> {
