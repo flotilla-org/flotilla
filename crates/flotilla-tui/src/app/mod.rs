@@ -1180,7 +1180,7 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_) => {}
+            DaemonEvent::RepoDelta(_) => {}
             DaemonEvent::RepoRefreshCompleted { .. } => {}
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),

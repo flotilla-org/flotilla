@@ -307,7 +307,7 @@ impl SurfaceDeclaration {
     }
 }
 
-pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels, RepoSnapshot};
+pub use snapshot::{CategoryLabels, ProviderError, RepoInfo, RepoKey, RepoLabels};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
@@ -544,9 +544,6 @@ impl Message {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
-    /// Provider snapshot retained for convoy change-request refresh.
-    #[serde(rename = "repo_snapshot")]
-    RepoSnapshot(Box<RepoSnapshot>),
     /// Provider delta retained for convoy change-request refresh.
     #[serde(rename = "repo_delta")]
     RepoDelta(Box<RepoDelta>),

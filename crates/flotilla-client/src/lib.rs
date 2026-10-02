@@ -901,8 +901,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
                 }
             }
         }
-        DaemonEvent::RepoSnapshot(_)
-        | DaemonEvent::RepoDelta(_)
+        DaemonEvent::RepoDelta(_)
         | DaemonEvent::RepoTracked(_)
         | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::RepoRefreshCompleted { .. }
@@ -1060,8 +1059,7 @@ impl DaemonHandle for SocketDaemon {
                 let (stream_key, seq) = match event {
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq),
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
-                    DaemonEvent::RepoSnapshot(_)
-                    | DaemonEvent::RepoDelta(_)
+                    DaemonEvent::RepoDelta(_)
                     | DaemonEvent::RepoTracked(_)
                     | DaemonEvent::RepoRefreshCompleted { .. }
                     | DaemonEvent::RepoUntracked { .. }

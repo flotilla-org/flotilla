@@ -1221,13 +1221,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
 pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> String {
     use flotilla_protocol::{DaemonEvent, PeerConnectionState};
     match event {
-        DaemonEvent::RepoSnapshot(snapshot) => {
-            format!(
-                "[repo]     {}: provider snapshot (seq {})",
-                repo_label(snapshot.repo.as_deref(), &snapshot.repo_identity),
-                snapshot.seq
-            )
-        }
         DaemonEvent::RepoDelta(delta) => {
             format!("[repo]     {}: provider delta (seq {})", repo_label(delta.repo.as_deref(), &delta.repo_identity), delta.seq)
         }
@@ -1309,8 +1302,7 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
         DaemonEvent::ResultSet(result_set) => Some((StreamKey::Query { query: result_set.query() }, result_set.seq)),
         DaemonEvent::ResultDelta(delta) => Some((StreamKey::Query { query: delta.query() }, delta.seq)),
-        DaemonEvent::RepoSnapshot(_)
-        | DaemonEvent::RepoDelta(_)
+        DaemonEvent::RepoDelta(_)
         | DaemonEvent::RepoTracked(_)
         | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::RepoUntracked { .. }

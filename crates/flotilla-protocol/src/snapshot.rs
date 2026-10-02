@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{host::RepoIdentity, NodeId, ProviderData};
+use crate::host::RepoIdentity;
 
 /// Opaque repo identifier used as a filter hint on convoy wire types.
 /// Populated from a `flotilla.work/repo` label on the convoy resource when present.
@@ -58,19 +58,6 @@ pub struct RepoInfo {
     pub provider_names: HashMap<String, Vec<String>>,
     pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub loading: bool,
-}
-
-/// Provider snapshot retained for convoy change-request refresh.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoSnapshot {
-    pub seq: u64,
-    pub repo_identity: RepoIdentity,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<PathBuf>,
-    pub node_id: NodeId,
-    pub providers: ProviderData,
-    pub provider_health: HashMap<String, HashMap<String, bool>>,
-    pub errors: Vec<ProviderError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
