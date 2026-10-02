@@ -23,7 +23,11 @@ pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
 pub trait ChangeRequestTracker: Send + Sync {
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
-    /// that also includes checks, review, mergeability, and head SHA.
+    /// that also includes checks, review, mergeability, and head SHA. Feedback
+    /// uses a matching force-push event when available, then the head's GitHub
+    /// push time. When GitHub exposes neither, it falls back to committedDate;
+    /// delayed or edited commit timestamps can then over- or under-report
+    /// feedback until an explicit response or a newer head is observed.
     /// Crew identities are GraphQL App logins, scoped by PR number and derived
     /// from bound convoys' credential declarations. Other forges can ignore them.
     async fn observe_bound(&self, numbers: &[u64], crew_logins: &CrewGithubLoginsByRequest) -> Result<BoundObservations, String> {

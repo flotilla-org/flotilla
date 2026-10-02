@@ -183,8 +183,19 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
         })
         .collect::<HashSet<_>>();
     // GitHub returns these timestamps in UTC ISO-8601 form, so lexical order is chronological.
-    // Commit time can precede the push that introduced this head; see the follow-up on push-time cutoff.
-    let head_at = value["commits"]["nodes"][0]["commit"]["committedDate"].as_str();
+    // pushedDate is often null. A force-push event identifies the current head only
+    // when its afterCommit matches headRefOid. If neither is available, retain the
+    // committedDate fallback for ordinary pushes; it can over-report feedback for
+    // a delayed push, so callers must still handle such feedback explicitly.
+    let commit = &value["commits"]["nodes"][0]["commit"];
+    let force_push_at = value["timelineItems"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|event| event["afterCommit"]["oid"] == value["headRefOid"])
+        .and_then(|event| event["createdAt"].as_str());
+    let head_at = force_push_at.or_else(|| commit["pushedDate"].as_str()).or_else(|| commit["committedDate"].as_str());
     let reviews = value["reviews"]["nodes"].as_array();
     let actionable_at_head = value.get("reviewDecision").map(|decision| {
         let unaddressed = |item: &serde_json::Value| {
