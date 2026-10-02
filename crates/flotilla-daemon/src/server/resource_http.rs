@@ -74,8 +74,12 @@ pub(super) async fn serve_resource_http_with_daemon(
         let Some(daemon) = daemon else {
             return write_error(&mut stream, 404, "ops inventory unavailable").await;
         };
-        return match daemon.project_operational_entry_inventory(namespace).await {
-            Ok(entries) => write_json(&mut stream, 200, &serde_json::json!({ "entries": entries })).await,
+        return match daemon
+            .project_operational_entry_inventory(namespace)
+            .await
+            .and_then(|inventory| serde_json::to_value(inventory).map_err(|error| format!("serialize ops inventory: {error}")))
+        {
+            Ok(inventory) => write_json(&mut stream, 200, &inventory).await,
             Err(error) => write_error(&mut stream, 422, &error).await,
         };
     }

@@ -87,11 +87,35 @@ pub trait RepositoryInspector: Send + Sync {
 
     async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
         let repository = self.inspect_path(path, None).await?;
+        let (commit, files) = self.operational_entry_files_at(&repository.checkout.path).await?;
+        Ok(OperationalEntriesInspection { commit, repository, files })
+    }
+
+    /// Read the committed operational entry candidates of a checkout whose
+    /// repository identity the caller has already established. Returns the
+    /// commit read and its files.
+    ///
+    /// Non-git inspectors walk the checkout's files; git-backed inspection
+    /// overrides this to read blobs at `HEAD`.
+    async fn operational_entry_files_at(&self, checkout: &Path) -> Result<(String, Vec<OperationalEntryFile>), String> {
+        let repository = self.inspect_path(checkout, None).await?;
         let mut files = Vec::new();
         collect_operational_entry_files(&repository.checkout.path, &repository.checkout.path, &mut files)?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(OperationalEntriesInspection { commit: repository.checkout.git_ref.clone(), repository, files })
+        Ok((repository.checkout.git_ref, files))
     }
+}
+
+/// Committed ops declarations readable on this host, for candidate-side
+/// pre-roll validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperationalEntryInventory {
+    pub entries: Vec<OperationalEntryFile>,
+    /// Ops members with no checkout on this host. The daemon refuses to load
+    /// these sources here, so their entries cannot change this host's behaviour;
+    /// they are validated on the hosts that hold a checkout.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
 }
 
 /// Export the committed declaration inputs without parsing them with the running
@@ -100,15 +124,19 @@ pub async fn inspect_project_ops_entries(
     projects: &[ResourceObject<Project>],
     paths: &BTreeMap<RepositoryKey, Vec<PathBuf>>,
     inspector: &dyn RepositoryInspector,
-) -> Result<Vec<OperationalEntryFile>, String> {
+) -> Result<OperationalEntryInventory, String> {
     use crate::project_declaration::{BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION};
-    let mut files = Vec::new();
+    let mut inventory = OperationalEntryInventory::default();
     for project in projects {
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
             let mut candidates = paths.get(&member.repo).cloned().unwrap_or_default();
             if project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&member.repo.to_string()) {
-                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION) {
-                    candidates.push(PathBuf::from(path));
+                // The annotation travels with the replicated Project, so it may
+                // name another host's checkout.
+                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION).map(PathBuf::from) {
+                    if path.is_dir() {
+                        candidates.push(path);
+                    }
                 }
             }
             candidates.sort();
@@ -116,10 +144,12 @@ pub async fn inspect_project_ops_entries(
             let path = match candidates.as_slice() {
                 [path] => path.clone(),
                 [] => {
-                    return Err(format!(
-                        "Project/{}: ops member {} has no checkout available for candidate validation",
-                        project.metadata.name, member.repo
-                    ))
+                    inventory.unavailable.push(format!(
+                        "Project/{}: ops member {} has no checkout on this host",
+                        project.metadata.name,
+                        member.alias.as_deref().unwrap_or(&member.repo.0)
+                    ));
+                    continue;
                 }
                 _ => {
                     let mut main_paths = Vec::new();
@@ -139,11 +169,14 @@ pub async fn inspect_project_ops_entries(
                     }
                 }
             };
-            let source = inspector
-                .inspect_operational_entries(&path)
+            // The member's identity already selected this checkout, so read its
+            // committed entries without re-deriving identity, which refuses a
+            // checkout whose remotes are ambiguous without a tracked branch.
+            let (_, source) = inspector
+                .operational_entry_files_at(&path)
                 .await
                 .map_err(|error| format!("Project/{} ops member {}: {error}", project.metadata.name, member.repo))?;
-            for mut file in source.files {
+            for mut file in source {
                 file.path = format!(
                     "{}/{}/{}/{}",
                     project.metadata.namespace,
@@ -151,11 +184,11 @@ pub async fn inspect_project_ops_entries(
                     member.alias.as_deref().unwrap_or(&member.repo.0),
                     file.path
                 );
-                files.push(file);
+                inventory.entries.push(file);
             }
         }
     }
-    Ok(files)
+    Ok(inventory)
 }
 
 fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Vec<OperationalEntryFile>) -> Result<(), String> {
@@ -376,35 +409,34 @@ impl RepositoryInspector for GitRepositoryInspector {
         Ok(ProjectDeclarationInspection { repository, yaml, commit })
     }
 
-    async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
-        let repository = self.inspect_path(path, None).await?;
-        let commit = self.read(&repository.checkout.path, RepositoryRead::HeadRevision).await?;
+    async fn operational_entry_files_at(&self, checkout: &Path) -> Result<(String, Vec<OperationalEntryFile>), String> {
+        let commit = self.read(checkout, RepositoryRead::HeadRevision).await?;
         // Use one tree-wide grep to find content candidates. Operational entry
         // kind and scope remain content-authoritative; this only avoids one
         // `git show` subprocess for every unrelated file in a large ops+code
         // repository.
         let grep = self
-            .provider(&repository.checkout.path)
+            .provider(checkout)
             .await?
-            .operational_entry_paths(&repository.checkout.path, &commit)
+            .operational_entry_paths(checkout, &commit)
             .await
-            .map_err(|error| format!("git grep operational entries in {}: {error}", repository.checkout.path.display()))?;
+            .map_err(|error| format!("git grep operational entries in {}: {error}", checkout.display()))?;
         let paths = if grep.success || grep.stderr.trim().is_empty() {
             grep.stdout
         } else {
-            return Err(format!("git grep operational entries in {}: {}", repository.checkout.path.display(), grep.stderr.trim()));
+            return Err(format!("git grep operational entries in {}: {}", checkout.display(), grep.stderr.trim()));
         };
         let prefix = format!("{commit}:");
         let mut files = Vec::new();
         for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
             let object_ref = format!("{commit}:{entry_path}");
             let contents = self
-                .read(&repository.checkout.path, RepositoryRead::FileAtRevision(&object_ref))
+                .read(checkout, RepositoryRead::FileAtRevision(&object_ref))
                 .await
                 .map_err(|error| format!("read operational entry {entry_path}: {error}"))?;
             files.push(OperationalEntryFile { path: entry_path.to_string(), contents });
         }
-        Ok(OperationalEntriesInspection { repository, commit, files })
+        Ok((commit, files))
     }
 
     async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
