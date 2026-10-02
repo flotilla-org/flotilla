@@ -141,10 +141,28 @@ struct CachedObservation {
 }
 
 struct ProviderChangeRequestObservationSource {
-    daemon: Arc<OnceLock<Weak<InProcessDaemon>>>,
+    query_port: Arc<dyn ChangeRequestQueryPort>,
     cache: Mutex<HashMap<ObservationScope, Arc<Mutex<Option<CachedObservation>>>>>,
     warned_missing_identity: Mutex<HashSet<(String, String)>>,
     warned_missing_snapshot: Mutex<HashSet<(String, String)>>,
+}
+
+#[async_trait]
+trait ChangeRequestQueryPort: Send + Sync {
+    fn resource_backend(&self) -> &ResourceBackend;
+    async fn discover_repository_change_request(
+        &self,
+        namespace: &str,
+        repository: &RepositorySpec,
+    ) -> Result<Arc<dyn ChangeRequestTracker>, String>;
+}
+
+struct ProviderChangeRequestQueryPort {
+    resource_backend: ResourceBackend,
+    config: Arc<ConfigStore>,
+    discovery: Arc<DiscoveryRuntime>,
+    environment_manager: Arc<EnvironmentManager>,
+    local_environment_id: EnvironmentId,
 }
 
 struct ProviderIssueObservationSource {
@@ -253,10 +271,34 @@ fn convoy_change_request_credential_refs(
     Ok(BoundConvoyCredentialRefs { numbers: bound_numbers, credentials_by_number: by_number })
 }
 
+#[async_trait]
+impl ChangeRequestQueryPort for ProviderChangeRequestQueryPort {
+    fn resource_backend(&self) -> &ResourceBackend {
+        &self.resource_backend
+    }
+
+    async fn discover_repository_change_request(
+        &self,
+        namespace: &str,
+        repository: &RepositorySpec,
+    ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        discover_repository_change_request_with(
+            &self.resource_backend,
+            &self.config,
+            &self.discovery,
+            &self.environment_manager,
+            &self.local_environment_id,
+            namespace,
+            repository,
+        )
+        .await
+    }
+}
+
 impl ProviderChangeRequestObservationSource {
-    fn new(daemon: Arc<OnceLock<Weak<InProcessDaemon>>>) -> Self {
+    fn new(query_port: Arc<dyn ChangeRequestQueryPort>) -> Self {
         Self {
-            daemon,
+            query_port,
             cache: Mutex::new(HashMap::new()),
             warned_missing_identity: Mutex::new(HashSet::new()),
             warned_missing_snapshot: Mutex::new(HashSet::new()),
@@ -279,9 +321,13 @@ impl ProviderChangeRequestObservationSource {
         // Hold only this repository's lock through its forge read. Other
         // repositories can continue observing even when one query is slow.
         let mut cache = scope_cache.lock().await;
-        let daemon = self.daemon.get().and_then(Weak::upgrade).ok_or("change request observation daemon unavailable")?;
-        let repositories =
-            daemon.resource_backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+        let repositories = self
+            .query_port
+            .resource_backend()
+            .including_replicas::<Repository>(&subject.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
         let repository =
             repositories
                 .items
@@ -293,8 +339,9 @@ impl ProviderChangeRequestObservationSource {
                 })
                 .ok_or_else(|| format!("repository {}/{} has no discovered change request provider", subject.service, subject.scope))?;
         let mut credential_refs_by_number = BTreeMap::<u64, BTreeSet<String>>::new();
-        let convoys = daemon
-            .resource_backend
+        let convoys = self
+            .query_port
+            .resource_backend()
             .including_replicas::<ResourceConvoy>(&subject.namespace)
             .list()
             .await
@@ -360,7 +407,7 @@ impl ProviderChangeRequestObservationSource {
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
         } else {
-            match daemon.resource_backend.including_replicas::<CredentialSpec>(&subject.namespace).list().await {
+            match self.query_port.resource_backend().including_replicas::<CredentialSpec>(&subject.namespace).list().await {
                 Ok(credentials) => credentials.items,
                 Err(error) => {
                     tracing::warn!(%error, "could not list crew credential declarations; change request markers remain unverified");
@@ -397,7 +444,7 @@ impl ProviderChangeRequestObservationSource {
                 }
             }
         }
-        let provider = daemon.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
+        let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
         let delay = result
@@ -2041,6 +2088,63 @@ struct RepositoryChangeRequestProvider {
     provider: Arc<dyn ChangeRequestTracker>,
 }
 
+async fn discover_repository_change_request_with(
+    resource_backend: &ResourceBackend,
+    config: &ConfigStore,
+    discovery: &DiscoveryRuntime,
+    environment_manager: &EnvironmentManager,
+    local_environment_id: &EnvironmentId,
+    namespace: &str,
+    repository: &RepositorySpec,
+) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+    let identity = repository.forge().ok_or("no forge identity")?;
+    let remote = repository.live_remote().ok_or("no repository remote")?;
+    let forge = match repository.identity() {
+        RepositoryIdentity::Forge { forge_ref, .. } => Some(
+            resource_backend
+                .including_replicas::<Forge>(namespace)
+                .get(forge_ref)
+                .await
+                .map_err(|error| format!("Forge {forge_ref}: {error}"))?
+                .object
+                .spec,
+        ),
+        _ => forge_for_remote(resource_backend, namespace, remote).await?,
+    };
+    let remote_assertion = crate::providers::discovery::detectors::git::remote_assertion(remote, "origin")
+        .ok_or_else(|| format!("invalid repository remote {remote}"))?;
+    let mut bag = environment_manager.environment_bag(local_environment_id).unwrap_or_default().with(remote_assertion);
+    if let Some(forge) = &forge {
+        bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
+        if forge.kind == ForgeKind::Forgejo {
+            let credentials = resource_backend.definitions::<CredentialSpec>(namespace).list().await.map_err(|error| error.to_string())?;
+            let paths = credentials
+                .into_iter()
+                .filter_map(|credential| match (&credential.spec.consumer, &credential.spec.source) {
+                    (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            match paths.as_slice() {
+                [path] => bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path)),
+                [] => {}
+                _ => return Err(format!("multiple Forgejo credentials for Forge {}", forge.forge_id)),
+            }
+        }
+    }
+    let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
+    let mut unmet = Vec::new();
+    for factory in &discovery.factories.change_requests {
+        match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
+            Ok(provider) => return Ok(provider),
+            Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
+        }
+    }
+    Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
+}
+
 fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
     let role = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
     let identity = convoy.spec.project_ref.as_ref().map_or_else(|| role.clone(), |project| format!("{role}@{project}"));
@@ -2237,7 +2341,7 @@ pub struct InProcessDaemon {
     environment_manager: Arc<EnvironmentManager>,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
-    discovery: DiscoveryRuntime,
+    discovery: Arc<DiscoveryRuntime>,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_vcs: Mutex<CheckoutVcsCache>,
     /// Running commands, keyed by command ID, for cancellation.
@@ -2472,6 +2576,7 @@ impl InProcessDaemon {
     ) -> Arc<Self> {
         use crate::providers::discovery::DiscoveryResult;
 
+        let discovery = Arc::new(discovery);
         let (event_tx, _) = broadcast::channel(256);
         let event_sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(event_tx.clone()));
         let mut repos: HashMap<flotilla_protocol::RepoIdentity, RepoState> = HashMap::new();
@@ -2603,7 +2708,14 @@ impl InProcessDaemon {
         .await;
 
         let observer_daemon = Arc::new(OnceLock::new());
-        let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(Arc::clone(&observer_daemon)));
+        let query_port: Arc<dyn ChangeRequestQueryPort> = Arc::new(ProviderChangeRequestQueryPort {
+            resource_backend: resource_backend.clone(),
+            config: Arc::clone(&config),
+            discovery: Arc::clone(&discovery),
+            environment_manager: Arc::clone(&environment_manager),
+            local_environment_id: local_environment_id.clone(),
+        });
+        let observation_source = Arc::new(ProviderChangeRequestObservationSource::new(query_port));
         let change_request_refresher = crate::change_request_observer::ChangeRequestRefresher::new(
             resource_backend.clone(),
             local_node_id.to_string(),
@@ -4279,55 +4391,16 @@ impl InProcessDaemon {
         namespace: &str,
         repository: &RepositorySpec,
     ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
-        let identity = repository.forge().ok_or("no forge identity")?;
-        let remote = repository.live_remote().ok_or("no repository remote")?;
-        let forge = match repository.identity() {
-            RepositoryIdentity::Forge { forge_ref, .. } => Some(
-                self.resource_backend
-                    .including_replicas::<Forge>(namespace)
-                    .get(forge_ref)
-                    .await
-                    .map_err(|error| format!("Forge {forge_ref}: {error}"))?
-                    .object
-                    .spec,
-            ),
-            _ => forge_for_remote(&self.resource_backend, namespace, remote).await?,
-        };
-        let remote_assertion = crate::providers::discovery::detectors::git::remote_assertion(remote, "origin")
-            .ok_or_else(|| format!("invalid repository remote {remote}"))?;
-        let mut bag = self.local_environment_bag().unwrap_or_default().with(remote_assertion);
-        if let Some(forge) = &forge {
-            bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
-            if forge.kind == ForgeKind::Forgejo {
-                let credentials =
-                    self.resource_backend.definitions::<CredentialSpec>(namespace).list().await.map_err(|error| error.to_string())?;
-                let paths = credentials
-                    .into_iter()
-                    .filter_map(|credential| match (&credential.spec.consumer, &credential.spec.source) {
-                        (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path })
-                            if forge_ref == &forge.forge_id =>
-                        {
-                            Some(path.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                match paths.as_slice() {
-                    [path] => bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path)),
-                    [] => {}
-                    _ => return Err(format!("multiple Forgejo credentials for Forge {}", forge.forge_id)),
-                }
-            }
-        }
-        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
-        let mut unmet = Vec::new();
-        for factory in &self.discovery.factories.change_requests {
-            match factory.probe(&bag, &self.config, &probe_root, Arc::clone(&self.discovery.runner)).await {
-                Ok(provider) => return Ok(provider),
-                Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
-            }
-        }
-        Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
+        discover_repository_change_request_with(
+            &self.resource_backend,
+            &self.config,
+            &self.discovery,
+            &self.environment_manager,
+            &self.local_environment_id,
+            namespace,
+            repository,
+        )
+        .await
     }
 
     /// Persist every branch-matching PR across the convoy's repositories.
