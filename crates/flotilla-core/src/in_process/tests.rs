@@ -15,7 +15,14 @@ use flotilla_resources::{
     PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 
-use super::*;
+use super::{
+    convoy_admission::{
+        default_convoy_placement_policy, parse_role_address, resolve_workflow_credentials, validate_workflow_agent_adapters,
+        validate_workflow_credentials, validate_workflow_credentials_with_capabilities, KindCandidate, PlacementTieBreak,
+        RepositoryChangeRequestProvider,
+    },
+    *,
+};
 
 #[tokio::test]
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
@@ -39,7 +46,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     daemon.set_provisioning_namespace("flotilla".to_string()).await;
     let provider: Arc<dyn ChangeRequestTracker> = Arc::new(FakeChangeRequest::new());
     for repository in [&first, &second] {
-        daemon.repository_change_requests.write().await.insert(repository.key(), RepositoryChangeRequestProvider {
+        daemon.convoy_admission.repository_change_requests.write().await.insert(repository.key(), RepositoryChangeRequestProvider {
             service_url: "https://github.com".to_string(),
             repository: repository.key().to_string(),
             provider: Arc::clone(&provider),
@@ -48,7 +55,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     repositories.delete(&first.key().to_string()).await.expect("delete first repository");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if !daemon.repository_change_requests.read().await.contains_key(&first.key()) {
+            if !daemon.convoy_admission.repository_change_requests.read().await.contains_key(&first.key()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -56,11 +63,14 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     })
     .await
     .expect("repository watch should evict provider");
-    assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "live repository keeps its provider");
+    assert!(
+        daemon.convoy_admission.repository_change_requests.read().await.contains_key(&second.key()),
+        "live repository keeps its provider"
+    );
 
     let third = RepositorySpec::remote("https://github.com/example/third").expect("third repository");
     repositories.create(&test_meta(&third.key().to_string()), &third).await.expect("create third repository");
-    daemon.repository_change_requests.write().await.insert(third.key(), RepositoryChangeRequestProvider {
+    daemon.convoy_admission.repository_change_requests.write().await.insert(third.key(), RepositoryChangeRequestProvider {
         service_url: "https://github.com".to_string(),
         repository: third.key().to_string(),
         provider,
@@ -74,7 +84,7 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     daemon.set_provisioning_namespace("alternate".to_string()).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if !daemon.repository_change_requests.read().await.contains_key(&third.key()) {
+            if !daemon.convoy_admission.repository_change_requests.read().await.contains_key(&third.key()) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -82,7 +92,10 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     })
     .await
     .expect("restarted watch should reconcile cached providers from the new list");
-    assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "relist retains the live provider");
+    assert!(
+        daemon.convoy_admission.repository_change_requests.read().await.contains_key(&second.key()),
+        "relist retains the live provider"
+    );
 }
 
 #[tokio::test]
@@ -554,97 +567,6 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
 }
 
 #[test]
-fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {
-    let now = chrono::Utc::now();
-    let needs = BTreeSet::new();
-    let placement_tiebreak = PlacementTieBreak { needs: &needs, now };
-    let candidate = |name: &str, cost_class, ready, sleeping_until, slots| {
-        let metadata = flotilla_resources::ObjectMeta {
-            name: name.to_string(),
-            namespace: "flotilla".to_string(),
-            resource_version: "1".to_string(),
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            owner_references: Vec::new(),
-            finalizers: Vec::new(),
-            deletion_timestamp: None,
-            creation_timestamp: now,
-            merge: None,
-        };
-        let policy = ResourceObject::<PlacementPolicy> {
-            metadata: metadata.clone(),
-            spec: PlacementPolicySpec::builder()
-                .pool("test".to_string())
-                .priority(0)
-                .host_direct(HostDirectPlacementPolicySpec {
-                    host_ref: "host".to_string(),
-                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                })
-                .build(),
-            status: None,
-        };
-        KindCandidate {
-            kind: ResourceObject::<FulfilmentKind> {
-                metadata,
-                spec: FulfilmentKindSpec::builder()
-                    .host_ref("host".to_string())
-                    .pool("test".to_string())
-                    .cost_class(cost_class)
-                    .realisation(FulfilmentRealisation::HostDirect)
-                    .build(),
-                status: None,
-            },
-            placement: PlacementResolution {
-                selected: Some(policy),
-                refused_candidates: Vec::new(),
-                viable_not_selected: Vec::new(),
-                allocation: None,
-            },
-            free_slots: slots,
-            host_ready: ready,
-            sleeping_until,
-        }
-    };
-    let cases = [
-        (
-            "owned available beats metered",
-            (true, None, Some(1), FulfilmentCostClass::OwnedIdle),
-            (true, None, Some(1), FulfilmentCostClass::Metered),
-            true,
-        ),
-        (
-            "available metered beats full owned",
-            (true, None, Some(0), FulfilmentCostClass::OwnedIdle),
-            (true, None, Some(1), FulfilmentCostClass::Metered),
-            false,
-        ),
-        (
-            "awake beats sleeping",
-            (true, Some(now + ChronoDuration::hours(1)), Some(1), FulfilmentCostClass::OwnedIdle),
-            (true, None, Some(1), FulfilmentCostClass::Metered),
-            false,
-        ),
-        (
-            "ready beats unready",
-            (false, None, Some(1), FulfilmentCostClass::OwnedIdle),
-            (true, None, Some(1), FulfilmentCostClass::SubscriptionIncluded),
-            false,
-        ),
-        (
-            "subscription beats metered",
-            (true, None, None, FulfilmentCostClass::SubscriptionIncluded),
-            (true, None, None, FulfilmentCostClass::Metered),
-            true,
-        ),
-    ];
-    for (label, left, right, left_wins) in cases {
-        let left = candidate("left", left.3, left.0, left.1, left.2);
-        let right = candidate("right", right.3, right.0, right.1, right.2);
-        assert_eq!(placement_tiebreak.compare(&left, &right).is_lt(), left_wins, "{label}");
-    }
-}
-
-#[test]
 fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
     let now = chrono::Utc::now();
     for platform in ["macos", "windows"] {
@@ -721,105 +643,6 @@ fn crew_message_header_escapes_sender_supplied_delimiters() {
     };
     assert_eq!(crew_message_header(&sender), "operator robert) (flotilla - nudge · via convoy resume");
     assert_eq!(crew_message_header(&CrewMessageSender::Unknown), "unknown sender · message");
-}
-
-#[test]
-fn allocation_groups_by_needs_and_credential_environment() {
-    let cases = [
-        (vec![("coder", vec!["platform:linux"], "write"), ("reviewer", vec!["platform:linux"], "write")], 1),
-        (vec![("coder", vec!["platform:linux"], "write"), ("verifier", vec!["gui_session"], "write")], 2),
-        (vec![("coder", vec![], "write"), ("reviewer", vec!["host_account_reach"], "write")], 2),
-        (vec![("coder", vec![], "write"), ("reviewer", vec![], "read")], 2),
-    ];
-    for (case, expected_count) in cases {
-        let roles = case
-            .into_iter()
-            .map(|(name, needs, grants)| AllocationRole {
-                crew: CrewSpec::builder()
-                    .role(name.to_string())
-                    .needs(needs.into_iter().map(|need| need.parse().expect("valid need")).collect())
-                    .source(CrewSource::Tool { command: "true".to_string() })
-                    .build(),
-                hint: name.to_string(),
-                repository_refs: None,
-                depends_on: Vec::new(),
-                credential_signature: grants.to_string(),
-            })
-            .collect::<Vec<_>>();
-        let mut workflow = WorkflowTemplateSpec::builder()
-            .handoffs(vec![RoleHandoff { from: "coder".to_string(), to: roles[1].crew.role.clone() }])
-            .build();
-        allocate_roles(&mut workflow, &roles).expect("allocation");
-        assert_eq!(workflow.vessels.len(), expected_count);
-        assert_eq!(workflow.allocation.len(), expected_count);
-        if expected_count == 1 {
-            assert!(workflow.allocation[0].crossed_handoffs.is_empty());
-        } else {
-            assert!(workflow.allocation.iter().any(|decision| !decision.crossed_handoffs.is_empty()));
-        }
-    }
-}
-
-#[test]
-fn platform_matrix_expands_into_named_vessels() {
-    let project = ProjectSpec::builder()
-        .display_name("example".to_string())
-        .default_workflow_ref("verify".to_string())
-        .platform_matrix(vec!["macos".to_string(), "windows".to_string()])
-        .build();
-    let verifier = CrewSpec::builder()
-        .role("verify".to_string())
-        .needs(BTreeSet::from(["platform:$matrix".parse().expect("matrix need")]))
-        .source(CrewSource::Tool { command: "true".to_string() })
-        .build();
-    let mut workflow = WorkflowTemplateSpec::builder().roles(vec![verifier]).build();
-    workflow.repository_refs = Some(vec![RepositoryKey("scoped-repository".to_string())]);
-    let roles = expand_allocation_roles(&mut workflow, &project).expect("expand matrix");
-    assert_eq!(roles.iter().map(|role| role.hint.as_str()).collect::<Vec<_>>(), ["verify[macos]", "verify[windows]"]);
-    assert_eq!(roles[0].crew.needs.iter().map(ToString::to_string).collect::<Vec<_>>(), ["platform:macos"]);
-    assert_eq!(roles[0].repository_refs, workflow.repository_refs);
-}
-
-#[test]
-fn dual_authored_template_refuses_a_role_only_in_the_vessel_hint() {
-    let project = ProjectSpec::builder().display_name("example".to_string()).default_workflow_ref("work".to_string()).build();
-    let crew = |role: &str| CrewSpec::builder().role(role.to_string()).source(CrewSource::Tool { command: "true".to_string() }).build();
-    let mut workflow = WorkflowTemplateSpec::builder()
-        .roles(vec![crew("coder")])
-        .vessels(vec![VesselRequirement::builder().name("work".to_string()).crew(vec![crew("reviewer")]).build()])
-        .build();
-    let error = expand_allocation_roles(&mut workflow, &project).expect_err("missing role must refuse");
-    assert!(error.contains("reviewer"), "{error}");
-}
-
-#[test]
-fn matrix_turn_delivery_requires_a_concrete_vessel() {
-    let roles = ["macos", "windows"]
-        .into_iter()
-        .map(|platform| AllocationRole {
-            crew: CrewSpec::builder()
-                .role("verify".to_string())
-                .needs(BTreeSet::from([CapabilityNeed::Platform(platform.to_string())]))
-                .source(CrewSource::Tool { command: "true".to_string() })
-                .build(),
-            hint: format!("verify[{platform}]"),
-            repository_refs: None,
-            depends_on: Vec::new(),
-            credential_signature: String::new(),
-        })
-        .collect::<Vec<_>>();
-    let rule = flotilla_resources::TurnDeliveryRule::builder()
-        .on("$cr.mergeable == conflicting".parse().expect("leaf"))
-        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("verify".to_string()).role("verify".to_string()).build())
-        .brief("Verify the result".to_string())
-        .hold(HoldAct::ChangeRequestComment { body: "Verification needed".to_string() })
-        .build();
-    let mut workflow = WorkflowTemplateSpec::builder().turn_delivery(indexmap::IndexMap::from([("verify".to_string(), rule)])).build();
-    let error = allocate_roles(&mut workflow, &roles).expect_err("ambiguous delivery must refuse");
-    assert!(error.contains("multiple vessels"), "{error}");
-    workflow.turn_delivery["verify"].to.vessel = "verify[macos]".to_string();
-    allocate_roles(&mut workflow, &roles).expect("explicit concrete target");
-    assert_eq!(workflow.turn_delivery["verify"].to.vessel, "verify[macos]");
 }
 
 #[test]

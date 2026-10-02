@@ -210,19 +210,7 @@ impl ProjectService<'_> {
     }
 
     pub(super) async fn repository_transport_url(&self, namespace: &str, repository: &RepositorySpec) -> Result<String, String> {
-        match repository.identity() {
-            RepositoryIdentity::Forge { forge_ref, owner, repo_name } => {
-                let forge = self
-                    .resource_backend
-                    .including_replicas::<Forge>(namespace)
-                    .get(forge_ref)
-                    .await
-                    .map_err(|error| format!("Forge {forge_ref}: {error}"))?;
-                Ok(format!("{}/{owner}/{repo_name}", forge.object.spec.https_url.trim_end_matches('/')))
-            }
-            RepositoryIdentity::Remote { .. } => repository.live_remote().map(str::to_string).ok_or("no transport remote".to_string()),
-            RepositoryIdentity::Local { .. } => Err("local Repository has no transport URL".to_string()),
-        }
+        repository_transport_url_with_backend(self.resource_backend, namespace, repository).await
     }
 
     pub(super) async fn snapshot_project_repositories(
@@ -231,94 +219,7 @@ impl ProjectService<'_> {
         project_ref: &str,
         selected: Option<&[RepositoryKey]>,
     ) -> Result<Vec<ConvoyRepositorySpec>, String> {
-        let project = self
-            .resource_backend
-            .clone()
-            .including_replicas::<Project>(namespace)
-            .get(project_ref)
-            .await
-            .map(|project| project.object)
-            .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
-        let repositories = self.resource_backend.including_replicas::<Repository>(namespace);
-        let repository_sources = repositories.list_replica_sources().await.map_err(|error| error.to_string())?;
-        let mut unresolved = Vec::new();
-        let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
-        for entry in &project.spec.repositories {
-            if !entry.roles.is_empty()
-                && !entry.roles.contains(&ProjectRepositoryRole::Code)
-                && selected.is_none_or(|selected| !selected.contains(&entry.repo))
-            {
-                continue;
-            }
-            match repositories.get(&entry.repo.to_string()).await {
-                Ok(repository) => {
-                    let repository = repository.object;
-                    if let Err(error) = repository.spec.verify_key(&entry.repo) {
-                        unresolved.push(error);
-                        continue;
-                    }
-                    let url = match self.repository_transport_url(namespace, &repository.spec).await {
-                        Ok(url) => url,
-                        Err(error) => {
-                            unresolved.push(format!("repository {}: {error}", entry.repo));
-                            continue;
-                        }
-                    };
-                    let observed_default_refs = repository_sources
-                        .items
-                        .iter()
-                        .filter(|source| source.object.metadata.name == entry.repo.to_string())
-                        .filter_map(|source| source.object.status.as_ref()?.default_branch.clone())
-                        .collect::<BTreeSet<_>>();
-                    let default_ref = if let Some(default_branch) = &entry.default_branch {
-                        Some(default_branch.clone())
-                    } else if observed_default_refs.len() == 1 {
-                        observed_default_refs.into_iter().next()
-                    } else {
-                        if observed_default_refs.len() > 1 {
-                            unresolved.push(format!("repository {} has conflicting observed default branches", entry.repo));
-                        }
-                        None
-                    };
-                    let snapshot = snapshots
-                        .entry(entry.repo.clone())
-                        .or_insert_with(|| (url, repository.spec.clone(), default_ref.clone(), BTreeSet::new()));
-                    if snapshot.2 != default_ref {
-                        unresolved.push(format!("repository {} has conflicting project default branches", entry.repo));
-                    }
-                    if let Some(subpath) = &entry.subpath {
-                        snapshot.3.insert(subpath.clone());
-                    }
-                }
-                Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
-            }
-        }
-        for (repo_ref, (_, _, default_ref, _)) in &snapshots {
-            if default_ref.is_none() {
-                unresolved.push(format!("repository {repo_ref} has no resolved default branch"));
-            }
-        }
-        if !unresolved.is_empty() {
-            return Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")));
-        }
-
-        let workspace_slugs = flotilla_resources::repository_workspace_slugs(snapshots.iter().map(|(key, (_, spec, _, _))| (key, spec)));
-        let mut repositories = snapshots
-            .into_iter()
-            .map(|(repo_ref, (url, _, default_ref, subpaths))| {
-                let default_ref = default_ref.expect("missing default refs were rejected");
-                ConvoyRepositorySpec {
-                    url,
-                    workspace_slug: workspace_slugs[&repo_ref].clone(),
-                    repo_ref,
-                    source_ref: default_ref.clone(),
-                    target_ref: default_ref,
-                    subpaths: subpaths.into_iter().collect(),
-                }
-            })
-            .collect::<Vec<_>>();
-        repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
-        Ok(repositories)
+        snapshot_project_repositories_with_backend(self.resource_backend, namespace, project_ref, selected).await
     }
 
     pub(super) async fn project_register(&self, target: &str) -> Result<(String, usize), String> {
@@ -1068,6 +969,120 @@ impl ProjectService<'_> {
         .await
         .map_err(|error| error.to_string())
     }
+}
+
+pub(super) async fn repository_transport_url_with_backend(
+    backend: &ResourceBackend,
+    namespace: &str,
+    repository: &RepositorySpec,
+) -> Result<String, String> {
+    match repository.identity() {
+        RepositoryIdentity::Forge { forge_ref, owner, repo_name } => {
+            let forge = backend
+                .including_replicas::<Forge>(namespace)
+                .get(forge_ref)
+                .await
+                .map_err(|error| format!("Forge {forge_ref}: {error}"))?;
+            Ok(format!("{}/{owner}/{repo_name}", forge.object.spec.https_url.trim_end_matches('/')))
+        }
+        RepositoryIdentity::Remote { .. } => repository.live_remote().map(str::to_string).ok_or("no transport remote".to_string()),
+        RepositoryIdentity::Local { .. } => Err("local Repository has no transport URL".to_string()),
+    }
+}
+
+pub(super) async fn snapshot_project_repositories_with_backend(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: &str,
+    selected: Option<&[RepositoryKey]>,
+) -> Result<Vec<ConvoyRepositorySpec>, String> {
+    let project = backend
+        .clone()
+        .including_replicas::<Project>(namespace)
+        .get(project_ref)
+        .await
+        .map(|project| project.object)
+        .map_err(|error| project_not_ready_error(namespace, project_ref, error))?;
+    let repositories = backend.including_replicas::<Repository>(namespace);
+    let repository_sources = repositories.list_replica_sources().await.map_err(|error| error.to_string())?;
+    let mut unresolved = Vec::new();
+    let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
+    for entry in &project.spec.repositories {
+        if !entry.roles.is_empty()
+            && !entry.roles.contains(&ProjectRepositoryRole::Code)
+            && selected.is_none_or(|selected| !selected.contains(&entry.repo))
+        {
+            continue;
+        }
+        match repositories.get(&entry.repo.to_string()).await {
+            Ok(repository) => {
+                let repository = repository.object;
+                if let Err(error) = repository.spec.verify_key(&entry.repo) {
+                    unresolved.push(error);
+                    continue;
+                }
+                let url = match repository_transport_url_with_backend(backend, namespace, &repository.spec).await {
+                    Ok(url) => url,
+                    Err(error) => {
+                        unresolved.push(format!("repository {}: {error}", entry.repo));
+                        continue;
+                    }
+                };
+                let observed_default_refs = repository_sources
+                    .items
+                    .iter()
+                    .filter(|source| source.object.metadata.name == entry.repo.to_string())
+                    .filter_map(|source| source.object.status.as_ref()?.default_branch.clone())
+                    .collect::<BTreeSet<_>>();
+                let default_ref = if let Some(default_branch) = &entry.default_branch {
+                    Some(default_branch.clone())
+                } else if observed_default_refs.len() == 1 {
+                    observed_default_refs.into_iter().next()
+                } else {
+                    if observed_default_refs.len() > 1 {
+                        unresolved.push(format!("repository {} has conflicting observed default branches", entry.repo));
+                    }
+                    None
+                };
+                let snapshot = snapshots
+                    .entry(entry.repo.clone())
+                    .or_insert_with(|| (url, repository.spec.clone(), default_ref.clone(), BTreeSet::new()));
+                if snapshot.2 != default_ref {
+                    unresolved.push(format!("repository {} has conflicting project default branches", entry.repo));
+                }
+                if let Some(subpath) = &entry.subpath {
+                    snapshot.3.insert(subpath.clone());
+                }
+            }
+            Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
+        }
+    }
+    for (repo_ref, (_, _, default_ref, _)) in &snapshots {
+        if default_ref.is_none() {
+            unresolved.push(format!("repository {repo_ref} has no resolved default branch"));
+        }
+    }
+    if !unresolved.is_empty() {
+        return Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")));
+    }
+
+    let workspace_slugs = flotilla_resources::repository_workspace_slugs(snapshots.iter().map(|(key, (_, spec, _, _))| (key, spec)));
+    let mut repositories = snapshots
+        .into_iter()
+        .map(|(repo_ref, (url, _, default_ref, subpaths))| {
+            let default_ref = default_ref.expect("missing default refs were rejected");
+            ConvoyRepositorySpec {
+                url,
+                workspace_slug: workspace_slugs[&repo_ref].clone(),
+                repo_ref,
+                source_ref: default_ref.clone(),
+                target_ref: default_ref,
+                subpaths: subpaths.into_iter().collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
+    Ok(repositories)
 }
 
 #[cfg(test)]
