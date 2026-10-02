@@ -182,9 +182,13 @@ impl ReferenceCloneStrategy {
             let dir = format!("{WORKSPACE_ROOT}/{entry}");
             let dir_path = std::path::Path::new(&dir);
 
-            // Check if it's a git repo
-            let is_git =
-                self.runner.run("git", &["-C", &dir, "rev-parse", "--is-inside-work-tree"], dir_path, &ChannelLabel::Default).await.is_ok();
+            // Require a checkout root; a child of another repository is not a clone.
+            // Keep the explicit gitdir aligned with GitCliBackend::checkout_root.
+            let is_git = self
+                .runner
+                .run("git", &["-C", &dir, "--git-dir=.git", "rev-parse", "--is-inside-work-tree"], dir_path, &ChannelLabel::Default)
+                .await
+                .is_ok();
 
             if !is_git {
                 continue;
@@ -193,7 +197,7 @@ impl ReferenceCloneStrategy {
             // Get the branch name
             let branch = self
                 .runner
-                .run("git", &["-C", &dir, "rev-parse", "--abbrev-ref", "HEAD"], dir_path, &ChannelLabel::Default)
+                .run("git", &["-C", &dir, "--git-dir=.git", "rev-parse", "--abbrev-ref", "HEAD"], dir_path, &ChannelLabel::Default)
                 .await
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.to_string());

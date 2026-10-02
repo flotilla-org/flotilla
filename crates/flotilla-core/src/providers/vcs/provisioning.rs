@@ -39,15 +39,27 @@ impl CloneProvisioner for GitCloneProvisioner {
 
     async fn inspect_clone(&self, target_path: &ExecutionEnvironmentPath) -> Result<CloneInspection, String> {
         let cwd = target_path.as_path();
+        // Keep the explicit gitdir aligned with GitCliBackend::checkout_root:
+        // clone inspection must not discover a repository above this target.
         let default_branch = match self
             .runner
-            .run("git", &["-C", &cwd.to_string_lossy(), "symbolic-ref", "refs/remotes/origin/HEAD", "--short"], cwd, &ChannelLabel::Default)
+            .run(
+                "git",
+                &["-C", &cwd.to_string_lossy(), "--git-dir=.git", "symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+                cwd,
+                &ChannelLabel::Default,
+            )
             .await
         {
             Ok(head) => Some(head.trim().strip_prefix("origin/").unwrap_or(head.trim()).to_string()),
             Err(_) => match self
                 .runner
-                .run("git", &["-C", &cwd.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"], cwd, &ChannelLabel::Default)
+                .run(
+                    "git",
+                    &["-C", &cwd.to_string_lossy(), "--git-dir=.git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd,
+                    &ChannelLabel::Default,
+                )
                 .await
             {
                 Ok(branch) => {
