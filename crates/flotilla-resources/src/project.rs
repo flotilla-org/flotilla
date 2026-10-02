@@ -8,7 +8,8 @@ pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, CapabilityNeed, ReplicaReadResolver, ReplicationClass, Repository, RepositoryKey,
+    resource::define_resource, status_patch::StatusPatch, CapabilityNeed, Platform, ReplicaReadResolver, ReplicationClass, Repository,
+    RepositoryKey,
 };
 
 define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
@@ -331,7 +332,7 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
     let mut platforms = BTreeSet::new();
     for platform in &spec.platform_matrix {
-        if !matches!(platform.as_str(), "linux" | "macos" | "windows") {
+        if platform.parse::<Platform>().is_err() {
             return Err(format!("unknown platform in project matrix `{platform}`"));
         }
         if !platforms.insert(platform) {

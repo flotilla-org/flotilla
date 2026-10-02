@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     resource::define_resource, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicySpec, NoStatusPatch, PlacementPolicySpec,
-    ReplicationClass,
+    Platform, ReplicationClass,
 };
 
 // A1 keeps policy snapshots for already admitted convoys. Kinds are authored
@@ -59,7 +59,7 @@ impl FromStr for CapabilityNeed {
             "container_runtime" => Ok(Self::ContainerRuntime),
             _ if parameter("platform:").is_some() => {
                 let platform = parameter("platform:").expect("checked above");
-                if !matches!(platform.as_str(), "linux" | "macos" | "windows" | "$matrix") {
+                if platform != Platform::MATRIX_PLACEHOLDER && platform.parse::<Platform>().is_err() {
                     return Err(format!("unknown platform capability `{platform}`"));
                 }
                 Ok(Self::Platform(platform))
@@ -188,8 +188,10 @@ impl FulfilmentKindSpec {
     pub fn from_policy(policy: &PlacementPolicySpec, host_platform: &str) -> Result<Self, String> {
         let (host_ref, realisation, grants) = match (&policy.docker_per_vessel, &policy.host_direct) {
             (Some(DockerPerVesselPlacementPolicySpec { host_ref, image, .. }), None) => {
-                let grants =
-                    BTreeSet::from([FulfilmentGrant::Platform("linux".to_string()), FulfilmentGrant::Network("scoped".to_string())]);
+                let grants = BTreeSet::from([
+                    FulfilmentGrant::Platform(Platform::Linux.to_string()),
+                    FulfilmentGrant::Network("scoped".to_string()),
+                ]);
                 (host_ref.clone(), FulfilmentRealisation::DockerPerVessel { image: image.clone() }, grants)
             }
             (None, Some(HostDirectPlacementPolicySpec { host_ref, .. })) => {

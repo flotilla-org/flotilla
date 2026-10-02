@@ -33,6 +33,7 @@ mod leaf;
 mod manifest_root;
 mod owner_gc;
 mod placement_policy;
+mod platform;
 mod prepared_snapshot;
 mod presentation;
 mod principal_attention;
@@ -139,6 +140,7 @@ pub use placement_policy::{
     DockerCheckoutStrategy, DockerImagePullPolicy, DockerImageSource, DockerPerVesselPlacementPolicySpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, PlacementPolicy, PlacementPolicySpec,
 };
+pub use platform::Platform;
 pub use prepared_snapshot::{
     content_hash, is_prepared_snapshot, PreparedSnapshotGarbageCollector, PreparedSnapshotGcResult, PLACEMENT_SNAPSHOT_KIND,
     PREPARED_SNAPSHOT_LABEL, WORKFLOW_SNAPSHOT_KIND,

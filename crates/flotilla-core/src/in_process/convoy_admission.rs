@@ -1,5 +1,7 @@
 //! Convoy admission state and transaction boundary.
 
+use flotilla_resources::Platform;
+
 use super::*;
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
@@ -497,7 +499,12 @@ impl ConvoyAdmission {
             for crew in &mut vessel.crew {
                 crew.needs.extend(common.iter().cloned());
                 if let Some(standing) = project.role_needs.get(&crew.role) {
-                    crew.needs.extend(standing.iter().filter(|need| **need != CapabilityNeed::Platform("$matrix".to_string())).cloned());
+                    crew.needs.extend(
+                        standing
+                            .iter()
+                            .filter(|need| **need != CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
+                            .cloned(),
+                    );
                 }
                 if let CrewSource::Agent { selector, .. } = &crew.source {
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
@@ -1644,8 +1651,11 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
     };
     for vessel in authored {
         for crew in vessel.crew {
-            let matrix = crew.needs.contains(&CapabilityNeed::Platform("$matrix".to_string()))
-                || project.role_needs.get(&crew.role).is_some_and(|needs| needs.contains(&CapabilityNeed::Platform("$matrix".to_string())));
+            let matrix = crew.needs.contains(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
+                || project
+                    .role_needs
+                    .get(&crew.role)
+                    .is_some_and(|needs| needs.contains(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string())));
             if matrix {
                 if project.platform_matrix.is_empty() {
                     return Err(format!("role `{}` needs platform:$matrix but Project has no platform_matrix", crew.role));
@@ -1657,12 +1667,15 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
                         continue;
                     }
                     let mut expanded = crew.clone();
-                    expanded.needs.remove(&CapabilityNeed::Platform("$matrix".to_string()));
+                    expanded.needs.remove(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()));
                     expanded.needs.insert(need);
                     if let Some(standing) = project.role_needs.get(&crew.role) {
-                        expanded
-                            .needs
-                            .extend(standing.iter().filter(|need| **need != CapabilityNeed::Platform("$matrix".to_string())).cloned());
+                        expanded.needs.extend(
+                            standing
+                                .iter()
+                                .filter(|need| **need != CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
+                                .cloned(),
+                        );
                     }
                     roles.push(AllocationRole {
                         crew: expanded,
@@ -2232,11 +2245,9 @@ pub(super) struct PlacementTieBreak<'a> {
 impl PlacementTieBreak<'_> {
     pub(super) fn reserved(&self, candidate: &KindCandidate) -> bool {
         candidate.kind.spec.grants.iter().any(|grant| {
-            matches!(grant, FulfilmentGrant::Platform(platform) if matches!(platform.as_str(), "macos" | "windows"))
-                && !self
-                    .needs
-                    .iter()
-                    .any(|need| matches!(need, CapabilityNeed::Platform(need_platform) if grant == &FulfilmentGrant::Platform(need_platform.clone())))
+            let FulfilmentGrant::Platform(platform) = grant else { return false };
+            platform.parse::<Platform>().is_ok_and(Platform::is_reserved)
+                && !self.needs.contains(&CapabilityNeed::Platform(platform.clone()))
         })
     }
 
@@ -3025,7 +3036,7 @@ pub(super) fn validate_convoy_branch(branch: &str) -> Result<(), String> {
 
 pub(super) fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed, String> {
     let need = value.parse::<CapabilityNeed>()?;
-    if matches!(&need, CapabilityNeed::Platform(platform) if platform == "$matrix") {
+    if matches!(&need, CapabilityNeed::Platform(platform) if platform == Platform::MATRIX_PLACEHOLDER) {
         return Err("platform:$matrix is only valid on workflow roles or Project role needs".to_string());
     }
     Ok(need)
