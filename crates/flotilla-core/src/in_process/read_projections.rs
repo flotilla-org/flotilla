@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -23,16 +24,16 @@ use flotilla_protocol::{
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
-    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
-    IssueSource, Subject, SubjectKind, ViewAddress,
+    HostStatusResponse, HostSummary, IssueSource, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, Subject, SubjectKind, ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, Checkout as ResourceCheckout, Clock, ConditionValue,
-    Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, Forge,
-    FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
-    IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, ChangeRequestStatus, Checkout as ResourceCheckout,
+    Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState,
+    EventRecorder, Forge, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend,
+    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
     CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -814,7 +815,7 @@ impl ReadProjections<'_> {
             .collect::<BTreeMap<_, _>>();
         let subject_observations = subjects
             .iter()
-            .filter(|row| row.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest)
+            .filter(|row| row.subject.kind == SubjectKind::ChangeRequest)
             .map(|row| {
                 let status = observations_by_subject.get(&row.subject).copied().flatten();
                 explain_subject_observation(&row.subject, status, landed_subjects.contains(&row.subject), now, change_request_stale_after)
@@ -1172,10 +1173,10 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
 
 fn explain_subject_observation(
     subject: &Subject,
-    status: Option<&flotilla_resources::ChangeRequestStatus>,
+    status: Option<&ChangeRequestStatus>,
     landed: bool,
     now: DateTime<Utc>,
-    change_request_stale_after: std::time::Duration,
+    change_request_stale_after: Duration,
 ) -> ExplainedSubjectObservation {
     let facts = change_request_facts(status, landed).into_iter().collect::<BTreeMap<_, _>>();
     let text = |key| match facts.get(key) {
@@ -1688,12 +1689,12 @@ mod tests {
         assert!(matches!(merged_rows[0].staleness, flotilla_protocol::FleetStaleness::Stale { .. }));
     }
 
-    fn subject_status(now: DateTime<Utc>) -> flotilla_resources::ChangeRequestStatus {
+    fn subject_status(now: DateTime<Utc>) -> ChangeRequestStatus {
         use flotilla_resources::{
             ChangeRequestReviewObservation, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
             ObservedReviewDecision,
         };
-        flotilla_resources::ChangeRequestStatus {
+        ChangeRequestStatus {
             title: Observation::unknown(now),
             author: Observation::unknown(now),
             state: Observation::known(ObservedChangeRequestState::Open, now),
@@ -1735,8 +1736,7 @@ mod tests {
             ];
             status.state.value = states[state_index];
             status.checks.observed_at = now - ChronoDuration::seconds(age);
-            let observation =
-                explain_subject_observation(&subject, (!missing).then_some(&status), false, now, std::time::Duration::from_secs(60));
+            let observation = explain_subject_observation(&subject, (!missing).then_some(&status), false, now, Duration::from_secs(60));
             // The JSON explain wire shape round-trips every generated value and age.
             let json = serde_json::to_value(&observation).expect("encode observation");
             assert_eq!(serde_json::from_value::<ExplainedSubjectObservation>(json).expect("decode observation"), observation);
@@ -1775,7 +1775,9 @@ mod tests {
     async fn convoy_explanation_joins_plural_subjects_to_observations() {
         use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
         use flotilla_resources::{ChangeRequest, ChangeRequestSpec, DeclaredSubject, ObservedChangeRequestState};
-        let fixture = ProjectionFixture::new();
+        let now = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).single().expect("time");
+        let mut fixture = ProjectionFixture::new();
+        fixture.clock = Arc::new(flotilla_resources::VirtualClock::new(now));
         let subject = |scope: &str| Subject {
             kind: SubjectKind::ChangeRequest,
             source: IssueSource { service: "github.com".into(), scope: scope.into() },
@@ -1810,7 +1812,7 @@ mod tests {
                 )
                 .await
                 .expect("request");
-            let mut status = subject_status(Utc::now());
+            let mut status = subject_status(now);
             if scope == "owner/two" {
                 status.state.value = Some(ObservedChangeRequestState::Merged);
             }
@@ -1832,6 +1834,8 @@ mod tests {
             .await
             .expect("landed");
         let explanation = fixture.projections().explain_convoy("flotilla", "subjects").await.expect("explain");
+        // Subject rows preserve declaration order: one, two, missing. Resource
+        // list/map order does not choose these identities or their order.
         assert_eq!(explanation.subject_observations.len(), 3);
         assert_eq!(explanation.subject_observations[0].state.value.as_deref(), Some("open"));
         assert_eq!(explanation.subject_observations[1].state.value.as_deref(), Some("merged"));
