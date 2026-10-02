@@ -64,7 +64,10 @@ use super::{
     AcceptErrorBackoff, BoundSocketGuard, DaemonServer, PeerConnectionEvent, ACCEPT_ERROR_INITIAL_BACKOFF, ACCEPT_ERROR_MAX_BACKOFF,
     CONNECTION_PREFACE_TIMEOUT, HELLO_HANDSHAKE_TIMEOUT,
 };
-use crate::peer::{ConnectionDirection, ConnectionMeta};
+use crate::{
+    peer::{ConnectionDirection, ConnectionMeta},
+    startup::test_support::GatedCredentialPreflight,
+};
 
 #[tokio::test(start_paused = true)]
 async fn peer_reconnect_survives_sustained_failures_and_recovers() {
@@ -4825,4 +4828,296 @@ async fn cancel_before_execute_registration_finds_entry() {
         }
         other => panic!("expected cancel response, got {other:?}"),
     }
+}
+
+// The fake stands in for Docker's process boundary: its inventory call stays
+// blocked until the test explicitly releases it, independently of wall time.
+struct GatedStartupEnvironmentProvider {
+    entered: Notify,
+    release: tokio::sync::Semaphore,
+    completed: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl flotilla_core::providers::environment::EnvironmentProvider for GatedStartupEnvironmentProvider {
+    async fn ensure_image(
+        &self,
+        _spec: &flotilla_protocol::EnvironmentSpec,
+        _root: &std::path::Path,
+    ) -> Result<flotilla_protocol::ImageId, String> {
+        Err("unused".into())
+    }
+    async fn create(
+        &self,
+        _id: EnvironmentId,
+        _image: &flotilla_protocol::ImageId,
+        _opts: flotilla_core::providers::environment::CreateOpts,
+    ) -> Result<flotilla_core::providers::environment::EnvironmentHandle, String> {
+        Err("unused".into())
+    }
+    async fn list(&self) -> Result<Vec<flotilla_core::providers::environment::EnvironmentHandle>, String> {
+        self.entered.notify_one();
+        self.release.acquire().await.expect("release reconciliation").forget();
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+    async fn destroy(&self, _id: &str) -> Result<(), String> {
+        Err("unused".into())
+    }
+}
+
+struct GatedStartupEnvironmentFactory(Arc<GatedStartupEnvironmentProvider>);
+
+#[async_trait::async_trait]
+impl flotilla_core::providers::discovery::Factory for GatedStartupEnvironmentFactory {
+    type Descriptor = flotilla_core::providers::discovery::ProviderDescriptor;
+    type Output = dyn flotilla_core::providers::environment::EnvironmentProvider;
+    fn descriptor(&self) -> Self::Descriptor {
+        flotilla_core::providers::discovery::ProviderDescriptor::named(
+            flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+            "docker",
+        )
+    }
+    async fn probe(
+        &self,
+        _env: &flotilla_core::providers::discovery::EnvironmentBag,
+        _config: &ConfigStore,
+        _root: &flotilla_core::path_context::ExecutionEnvironmentPath,
+        _runner: Arc<dyn flotilla_core::providers::CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<flotilla_core::providers::discovery::UnmetRequirement>> {
+        Ok(self.0.clone())
+    }
+}
+
+// #2487: stalled restoration must not hold up the listening socket or the
+// local fleet heartbeat. Releasing the process call must still finish recovery.
+#[tokio::test]
+async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() {
+    use flotilla_resources::{
+        ConvoyPhase, ConvoyStatus, CredentialConsumer, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+        CredentialSpec, CredentialSpecSpec, TerminalSessionPhase, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
+        WorkflowSnapshot,
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_dir = TestSocketDir::new();
+    let socket_path = socket_dir.socket_path("startup.sock");
+    let config = test_config_store(tmp.path().join("config"));
+    let provider = Arc::new(GatedStartupEnvironmentProvider {
+        entered: Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+        completed: AtomicUsize::new(0),
+    });
+    let credential_runner = Arc::new(GatedCredentialPreflight::new());
+    let mut discovery = fake_discovery(false);
+    discovery.runner = credential_runner.clone();
+    discovery.env = Arc::new(flotilla_core::providers::discovery::test_support::TestEnvVars::new([
+        ("TEST_WORK_TOKEN", "fake-test-token"),
+        ("FLOTILLA_PROBE_MODELS", ""),
+    ]));
+    discovery.factories.environment_providers.push(Box::new(GatedStartupEnvironmentFactory(provider.clone())));
+    let server =
+        DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");
+    let daemon = server.daemon();
+    // Match feta's stored convoy count without making wall time the slow-work oracle.
+    for index in 0..143 {
+        let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+        let convoy = convoys
+            .create(
+                &InputMeta::builder().name(format!("stored-{index}")).build(),
+                &ConvoySpec::builder().workflow_ref("finished-workflow".to_string()).build(),
+            )
+            .await
+            .expect("stored convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Landed,
+                ..flotilla_resources::ConvoyStatus::default()
+            })
+            .await
+            .expect("settled stored convoy");
+    }
+    let backend = daemon.resource_backend();
+    let env_ref = format!("host-direct-{}", daemon.local_host_id().expect("local host"));
+    backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("work-token".into()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Claude,
+            source: CredentialSource::Env { name: "TEST_WORK_TOKEN".into() },
+            lifecycle: CredentialLifecycle::Issued,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("credential declaration");
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(
+            &InputMeta::builder().name("live-credential-work".into()).build(),
+            &ConvoySpec::builder().workflow_ref("test".into()).build(),
+        )
+        .await
+        .expect("live convoy");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: Default::default(),
+                supervision: None,
+                exit: None,
+                turn_delivery: Default::default(),
+                vessels: vec![VesselRequirement::builder()
+                    .name("work".into())
+                    .credential_refs(std::collections::BTreeSet::from(["work-token".into()]))
+                    .crew(Vec::new())
+                    .build()],
+            }),
+            ..ConvoyStatus::default()
+        })
+        .await
+        .expect("live credential requirement");
+    let vessels = backend.using::<Vessel>("flotilla");
+    let vessel = vessels
+        .create(&InputMeta::builder().name("live-work-vessel".into()).build(), &VesselSpec {
+            convoy_ref: "live-credential-work".into(),
+            vessel_name: "work".into(),
+            placement_policy_ref: "test".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("live vessel");
+    vessels
+        .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
+            phase: VesselPhase::Ready,
+            environment_ref: Some(env_ref.clone()),
+            ..VesselStatus::default()
+        })
+        .await
+        .expect("placed vessel");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(&InputMeta::builder().name("live-crew".into()).build(), &TerminalSessionSpec {
+            env_ref,
+            role: "coder".into(),
+            cwd: "/workspace".into(),
+            pool: "passthrough".into(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "code".into(), adapter: None, model: None },
+                brief: TerminalBrief {
+                    artifact_digest: None,
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "test".into(),
+                    copies: Vec::new(),
+                },
+                context: Box::new(TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "live-credential-work".into(),
+                    vessel_ref: "live-work-vessel".into(),
+                }),
+                message: None,
+            },
+        })
+        .await
+        .expect("live crew");
+    sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            ..TerminalSessionStatus::default()
+        })
+        .await
+        .expect("running crew");
+    let runtime = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        crate::runtime::DaemonRuntime::start_with_options(
+            daemon.clone(),
+            config,
+            Some(socket_path.clone()),
+            crate::runtime::RuntimeOptions { startup_ready: Some(server.startup_ready()), ..crate::runtime::RuntimeOptions::default() },
+        ),
+    )
+    .await
+    .expect("startup must return while reconciliation is blocked")
+    .expect("runtime");
+    assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
+    assert!(
+        tokio::time::timeout(StdDuration::from_millis(20), provider.entered.notified()).await.is_err(),
+        "restoration waits for listening"
+    );
+    let shutdown = server.shutdown_tx.clone();
+    let task = tokio::spawn(server.run());
+    tokio::time::timeout(StdDuration::from_secs(2), provider.entered.notified()).await.expect("background reconciliation starts");
+    assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
+    let client = tokio::time::timeout(StdDuration::from_secs(2), flotilla_client::SocketDaemon::connect(&socket_path))
+        .await
+        .expect("accept while reconciliation is blocked")
+        .expect("client");
+    let health = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        client.execute_query(Command::builder().action(CommandAction::QueryFleetHealth {}).build(), uuid::Uuid::nil()),
+    )
+    .await
+    .expect("fleet responds while reconciliation is blocked")
+    .expect("fleet query");
+    let CommandValue::FleetHealth(health) = health else { panic!("unexpected fleet result: {health:?}") };
+    let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+    assert!(local.heartbeat_at.is_some(), "heartbeat publishes before reconciliation completes");
+    provider.release.add_permits(2);
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while provider.completed.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("startup inventory and adoption complete after release");
+    tokio::time::timeout(StdDuration::from_secs(2), credential_runner.entered.notified())
+        .await
+        .expect("background startup stages live crew credentials");
+    let health = tokio::time::timeout(
+        StdDuration::from_secs(2),
+        client.execute_query(Command::builder().action(CommandAction::QueryFleetHealth {}).build(), uuid::Uuid::nil()),
+    )
+    .await
+    .expect("fleet also responds during blocked credential staging")
+    .expect("fleet query");
+    assert!(matches!(health, CommandValue::FleetHealth(_)));
+    credential_runner.release.add_permits(1);
+    tokio::time::timeout(StdDuration::from_secs(2), async {
+        while credential_runner.completed.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background startup completes credential delivery");
+    runtime.shutdown();
+    shutdown.send(true).expect("shutdown");
+    task.await.expect("server task").expect("server stops");
+}
+
+// #2487: if the listening server is lost, deferred restoration must be cancelled
+// rather than provisioning against a daemon clients cannot reach.
+#[tokio::test]
+async fn startup_restoration_is_cancelled_if_the_server_never_listens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket_dir = TestSocketDir::new();
+    let socket_path = socket_dir.socket_path("failed-startup.sock");
+    let config = test_config_store(tmp.path().join("config"));
+    let provider = Arc::new(GatedStartupEnvironmentProvider {
+        entered: Notify::new(),
+        release: tokio::sync::Semaphore::new(2),
+        completed: AtomicUsize::new(0),
+    });
+    let mut discovery = fake_discovery(false);
+    discovery.factories.environment_providers.push(Box::new(GatedStartupEnvironmentFactory(provider.clone())));
+    let server =
+        DaemonServer::new(Vec::new(), config.clone(), discovery, socket_path.clone(), StdDuration::from_secs(60)).await.expect("server");
+    let runtime =
+        crate::runtime::DaemonRuntime::start_with_options(server.daemon(), config, Some(socket_path), crate::runtime::RuntimeOptions {
+            startup_ready: Some(server.startup_ready()),
+            ..crate::runtime::RuntimeOptions::default()
+        })
+        .await
+        .expect("runtime");
+    drop(server);
+    assert!(tokio::time::timeout(StdDuration::from_millis(20), provider.entered.notified()).await.is_err());
+    assert_eq!(provider.completed.load(Ordering::SeqCst), 0);
+    runtime.shutdown();
 }

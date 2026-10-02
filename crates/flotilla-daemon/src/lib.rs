@@ -17,6 +17,7 @@ mod resource_limits;
 pub mod resource_manifest;
 mod restart_history;
 mod sleep_inhibitor;
+mod startup;
 pub mod vessel_config;
 pub use aggregator::{Aggregator, AggregatorResolvers};
 

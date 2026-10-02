@@ -16,7 +16,10 @@ use tracing::{info, Subscriber};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
-    resource_limits::raise_file_descriptor_limit, restart_history::DaemonLifecycle, runtime::DaemonRuntime, server::DaemonServer,
+    resource_limits::raise_file_descriptor_limit,
+    restart_history::DaemonLifecycle,
+    runtime::{DaemonRuntime, RuntimeOptions},
+    server::DaemonServer,
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -64,7 +67,11 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     )
     .await?;
     let daemon = server.daemon();
-    let runtime = DaemonRuntime::start(daemon, Arc::clone(&config), Some(socket_path.to_path_buf())).await?;
+    let runtime = DaemonRuntime::start_with_options(daemon, Arc::clone(&config), Some(socket_path.to_path_buf()), RuntimeOptions {
+        startup_ready: Some(server.startup_ready()),
+        ..RuntimeOptions::default()
+    })
+    .await?;
     server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 
     let result = server.run().await;
