@@ -85,6 +85,177 @@ async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_pro
     assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "relist retains the live provider");
 }
 
+#[tokio::test]
+async fn cli_lists_include_observed_checkouts_and_only_open_change_requests() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository = RepositorySpec::remote("https://github.com/team/repo.git").expect("repository");
+    let key = repository.key();
+    backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository record");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    daemon
+        .observed_resource_backend()
+        .using::<ResourceCheckout>("flotilla")
+        .create(
+            &test_meta("observed-checkout"),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "feature".into(),
+                path: "/tmp/repo-feature".into(),
+                repo_ref: key,
+                host_ref: "local".into(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("observed checkout");
+    let change_requests = backend.using::<ResourceChangeRequest>("flotilla");
+    for (name, number, state) in [("open-pr", 42, ObservedChangeRequestState::Open), ("closed-pr", 43, ObservedChangeRequestState::Closed)]
+    {
+        let created = change_requests
+            .create(
+                &test_meta(name),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("https://github.com".to_string())
+                    .scope("team/repo".to_string())
+                    .number(number)
+                    .observing_authority("github".to_string())
+                    .build(),
+            )
+            .await
+            .expect("change request");
+        let observed_at = Utc::now();
+        change_requests
+            .update_status(name, &created.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
+                title: flotilla_resources::Observation::known(format!("PR {number}"), observed_at),
+                author: Default::default(),
+                review_decision: Default::default(),
+                review_requested_from_owner: Default::default(),
+                state: flotilla_resources::Observation::known(state, observed_at),
+                head_sha: flotilla_resources::Observation::unknown(observed_at),
+                checks: flotilla_resources::Observation::unknown(observed_at),
+                review: flotilla_resources::ChangeRequestReviewObservation {
+                    actionable_at_head: flotilla_resources::Observation::unknown(observed_at),
+                },
+                mergeable: flotilla_resources::Observation::unknown(observed_at),
+            })
+            .await
+            .expect("change request status");
+    }
+
+    let list = |kind| Command::builder().action(CommandAction::QueryCliList { kind }).build();
+    let CommandValue::CliList(repos) = daemon.execute_query(list(CliListKind::Repo), uuid::Uuid::new_v4()).await.expect("repos") else {
+        panic!("expected repo list");
+    };
+    assert_eq!(repos.items.len(), 1);
+    let CommandValue::CliList(checkouts) =
+        daemon.execute_query(list(CliListKind::Checkout), uuid::Uuid::new_v4()).await.expect("checkouts")
+    else {
+        panic!("expected checkout list");
+    };
+    assert_eq!(checkouts.items.len(), 1);
+    assert_eq!(checkouts.items[0].name, "feature");
+    let CommandValue::CliList(crs) = daemon.execute_query(list(CliListKind::Cr), uuid::Uuid::new_v4()).await.expect("change requests")
+    else {
+        panic!("expected change request list");
+    };
+    assert_eq!(crs.items.len(), 1);
+    assert_eq!(crs.items[0].name, "PR 42");
+}
+
+#[tokio::test]
+async fn cli_lists_include_active_provider_sessions_and_workspaces() {
+    use crate::providers::{
+        coding_agent::CloudAgentService,
+        discovery::{test_support::FakePresentationManager, ProviderCategory, ProviderDescriptor},
+        types::RepoCriteria,
+    };
+
+    struct Sessions;
+
+    #[async_trait::async_trait]
+    impl CloudAgentService for Sessions {
+        async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, flotilla_protocol::CloudAgentSession)>, String> {
+            let session = |title: &str, status| flotilla_protocol::CloudAgentSession {
+                title: title.into(),
+                status,
+                model: None,
+                updated_at: None,
+                provider_name: "fake".into(),
+                provider_display_name: "Fake".into(),
+                item_noun: "session".into(),
+            };
+            Ok(vec![
+                ("active".into(), session("Active", flotilla_protocol::SessionStatus::Running)),
+                ("archived".into(), session("Archived", flotilla_protocol::SessionStatus::Archived)),
+            ])
+        }
+
+        async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+            Ok("true".into())
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+    let workspace_provider = Arc::new(FakePresentationManager::new());
+    workspace_provider
+        .add_workspaces(vec![("workspace:1".into(), flotilla_protocol::Workspace { name: "Current work".into(), attachable_set_id: None })])
+        .await;
+    let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("fake", ProviderDescriptor::named(ProviderCategory::CloudAgent, "fake"), Arc::new(Sessions));
+    registry.presentation_managers.insert(
+        "fake",
+        ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "fake"),
+        workspace_provider,
+    );
+    let identity = RepoIdentity { authority: "github.com".into(), path: "team/repo".into() };
+    daemon.repos.write().await.insert(
+        identity.clone(),
+        RepoState::new(identity, RepoRootState {
+            path: temp.path().join("repo"),
+            model: RepoModel::new(registry, None),
+            slug: Some("team/repo".into()),
+            repo_bag: EnvironmentBag::default(),
+            unmet: vec![],
+            is_local: true,
+        }),
+    );
+
+    let list = |kind| Command::builder().action(CommandAction::QueryCliList { kind }).build();
+    let CommandValue::CliList(agents) = daemon.execute_query(list(CliListKind::Agent), uuid::Uuid::new_v4()).await.expect("agents") else {
+        panic!("expected agent list");
+    };
+    assert_eq!(agents.items.len(), 1);
+    assert_eq!(agents.items[0].reference, "active");
+    let CommandValue::CliList(workspaces) =
+        daemon.execute_query(list(CliListKind::Workspace), uuid::Uuid::new_v4()).await.expect("workspaces")
+    else {
+        panic!("expected workspace list");
+    };
+    assert_eq!(workspaces.items.len(), 1);
+    assert_eq!(workspaces.items[0].name, "Current work");
+}
+
 #[test]
 fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
     let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };

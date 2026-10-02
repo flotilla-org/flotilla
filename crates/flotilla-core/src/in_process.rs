@@ -29,13 +29,13 @@ use flotilla_protocol::{
     commands::{AttachMode, RepositoryIdentityChange},
     qualified_path::QualifiedPath,
     result_set::{ConvoyChangeRequest, Rows},
-    AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, Command, CommandAction, CommandValue,
-    ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DispatchQueueResponse,
-    EntryOp, EnvironmentId, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot, FulfilmentAllocation,
-    FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
-    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
-    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData, ProviderInfo,
-    QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceCursor,
+    AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, CliListKind, CliListResponse, CliListRow,
+    Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListMember, CrewListResponse,
+    DaemonEvent, DispatchQueueResponse, EntryOp, EnvironmentId, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
+    FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus,
+    HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState,
+    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData,
+    ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceCursor,
     ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
     ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
@@ -8293,6 +8293,134 @@ impl InProcessDaemon {
         read_projections::ReadProjections::list_projects(&self.resource_backend, &self.provisioning_namespace().await).await
     }
 
+    pub async fn list_cli_items_internal(&self, kind: CliListKind) -> Result<CliListResponse, String> {
+        let namespace = self.provisioning_namespace().await;
+        let mut items = BTreeMap::new();
+        match kind {
+            CliListKind::Repo => {
+                for source in self
+                    .resource_backend
+                    .including_replicas::<Repository>(&namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                {
+                    let repository = source.object;
+                    let reference = repository.metadata.name;
+                    let name = repository.spec.leaf_slug();
+                    items.insert((String::new(), reference.clone()), CliListRow {
+                        repo: name.clone(),
+                        reference,
+                        name,
+                        status: "tracked".into(),
+                        provider: "-".into(),
+                    });
+                }
+            }
+            CliListKind::Checkout => {
+                let durable = self
+                    .resource_backend
+                    .including_replicas::<ResourceCheckout>(&namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let observed =
+                    self.observed_resource_backend.using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?;
+                for checkout in durable.items.into_iter().map(|source| source.object).chain(observed.items) {
+                    if checkout
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| matches!(status.phase, ResourceCheckoutPhase::Terminating | ResourceCheckoutPhase::Gone))
+                    {
+                        continue;
+                    }
+                    let reference = checkout.metadata.name;
+                    items.entry((String::new(), reference.clone())).or_insert(CliListRow {
+                        repo: checkout.spec.repo_ref().to_string(),
+                        reference,
+                        name: checkout.spec.branch().to_string(),
+                        status: checkout
+                            .status
+                            .map_or_else(|| "observed".to_string(), |status| format!("{:?}", status.phase).to_lowercase()),
+                        provider: "-".into(),
+                    });
+                }
+            }
+            CliListKind::Cr => {
+                for source in self
+                    .resource_backend
+                    .including_replicas::<ResourceChangeRequest>(&namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                {
+                    let change_request = source.object;
+                    let Some(status) = change_request.status else { continue };
+                    let state = match status.state.value {
+                        Some(ObservedChangeRequestState::Open) => "open",
+                        Some(ObservedChangeRequestState::Draft) => "draft",
+                        _ => continue,
+                    };
+                    let reference = change_request.metadata.name;
+                    items.insert((String::new(), reference.clone()), CliListRow {
+                        repo: change_request.spec.scope,
+                        reference,
+                        name: status.title.value.unwrap_or_else(|| format!("#{}", change_request.spec.number)),
+                        status: state.into(),
+                        provider: change_request.spec.service,
+                    });
+                }
+            }
+            CliListKind::Agent | CliListKind::Workspace => {}
+        }
+
+        let mut repositories =
+            self.repos.read().await.values().map(|state| (state.identity().path.clone(), state.registry())).collect::<Vec<_>>();
+        repositories.sort_by(|left, right| left.0.cmp(&right.0));
+        for (repo, registry) in repositories {
+            match kind {
+                CliListKind::Repo | CliListKind::Checkout | CliListKind::Cr => {}
+                CliListKind::Agent => {
+                    let criteria = RepoCriteria { repo_slug: Some(repo.clone()) };
+                    for (descriptor, provider) in registry.cloud_agents.iter() {
+                        for (reference, session) in provider.list_sessions(&criteria).await? {
+                            let status = match session.status {
+                                flotilla_protocol::SessionStatus::Running => "running",
+                                flotilla_protocol::SessionStatus::Idle => "idle",
+                                flotilla_protocol::SessionStatus::Archived | flotilla_protocol::SessionStatus::Expired => continue,
+                            };
+                            let provider_name = descriptor.display_name.clone();
+                            items.entry((provider_name.clone(), reference.clone())).or_insert(CliListRow {
+                                repo: repo.clone(),
+                                reference,
+                                name: session.title,
+                                status: status.to_string(),
+                                provider: provider_name,
+                            });
+                        }
+                    }
+                }
+                CliListKind::Workspace => {
+                    for (descriptor, provider) in registry.presentation_managers.iter() {
+                        for (reference, workspace) in provider.list_workspaces().await? {
+                            let provider_name = descriptor.display_name.clone();
+                            items.entry((provider_name.clone(), reference.clone())).or_insert(CliListRow {
+                                repo: repo.clone(),
+                                reference,
+                                name: workspace.name,
+                                status: "active".to_string(),
+                                provider: provider_name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(CliListResponse { list_kind: kind, items: items.into_values().collect() })
+    }
+
     pub async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String> {
         let local_summary = self.refresh_local_host_summary().await;
         self.read_projections()
@@ -12053,6 +12181,10 @@ impl DaemonHandle for InProcessDaemon {
             },
             CommandAction::QueryProjectList {} => match self.list_projects_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryCliList { kind } => match self.list_cli_items_internal(*kind).await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::CliList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryDispatchQueue { project } => match self.dispatch_queue_internal(project.as_deref()).await {

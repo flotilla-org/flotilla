@@ -72,7 +72,22 @@ impl IssueNoun {
                 repo: RepoContext::Required,
                 host: HostResolution::Local,
             }),
-            (_, None) => Err("missing issue verb".into()),
+            (None, None) => Ok(Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryIssues {
+                        repo: RepoSelector::Query("".into()),
+                        params: IssueQuery::default(),
+                        page: 1,
+                        count: 50,
+                    },
+                },
+                repo: RepoContext::Required,
+                host: HostResolution::Local,
+            }),
+            (Some(_), None) => Err("missing issue verb".into()),
         }
     }
 }
@@ -111,6 +126,22 @@ mod tests {
 
     fn parse(args: &[&str]) -> IssueNoun {
         IssueNoun::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn issue_without_verb_queries_open_issues() {
+        let resolved = parse(&["issue"]).resolve().expect("default list");
+        crate::test_utils::assert_needs_context(
+            resolved,
+            CommandAction::QueryIssues {
+                repo: RepoSelector::Query("".into()),
+                params: flotilla_protocol::issue_query::IssueQuery::default(),
+                page: 1,
+                count: 50,
+            },
+            RepoContext::Required,
+            HostResolution::Local,
+        );
     }
 
     #[test]

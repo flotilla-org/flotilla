@@ -99,6 +99,7 @@ impl InProcessDaemon {
             A::ArchiveSession { .. } | A::TeleportSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
             A::QueryHostList { .. }
             | A::QueryProjectList { .. }
+            | A::QueryCliList { .. }
             | A::QueryDispatchQueue { .. }
             | A::QueryHostStatus { .. }
             | A::QueryHostProviders { .. }

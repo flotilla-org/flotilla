@@ -82,7 +82,13 @@ impl CheckoutNoun {
                 host: HostResolution::SubjectHost,
             }),
             (None, Some(CheckoutVerb::Status { .. })) => Err("status requires a checkout subject".into()),
-            (_, None) => Err("missing checkout verb".into()),
+            (None, None) => Ok(Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Checkout },
+            })),
+            (Some(_), None) => Err("missing checkout verb".into()),
         }
     }
 }
@@ -131,6 +137,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> CheckoutNoun {
         CheckoutNoun::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn checkout_without_verb_lists_active_checkouts() {
+        let resolved = parse(&["checkout"]).resolve().expect("default list");
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Checkout });
     }
 
     #[test]

@@ -1138,7 +1138,7 @@ mod tests {
     #[test]
     fn palette_validation_distinguishes_ready_incomplete_and_tui_irrelevant_commands() {
         assert_eq!(palette_input_state("refresh"), PaletteInputState::Ready);
-        assert_eq!(palette_input_state("cr"), PaletteInputState::Incomplete);
+        assert_eq!(palette_input_state("cr"), PaletteInputState::Unavailable);
         assert_eq!(palette_input_state("host kiwi list"), PaletteInputState::Unavailable);
         assert_eq!(palette_input_state("repo example providers"), PaletteInputState::Unavailable);
         assert_eq!(palette_input_state("dispatch queue"), PaletteInputState::Unavailable);

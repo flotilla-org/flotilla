@@ -8,10 +8,10 @@ use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetHealthResponse,
-    FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow,
-    HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse,
-    StatusResponse, StreamKey, TopologyResponse,
+    output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo,
+    EnvironmentStatus, FleetHealthResponse, FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness,
+    FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState,
+    ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -367,6 +367,52 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         ]);
     }
     format!("{table}\n")
+}
+
+fn format_cli_list_human(response: &CliListResponse) -> String {
+    if response.items.is_empty() {
+        return match response.list_kind {
+            CliListKind::Repo => "No repos tracked.\n".into(),
+            CliListKind::Checkout => "No active checkouts found.\n".into(),
+            CliListKind::Cr => "No open change requests found.\n".into(),
+            CliListKind::Agent => "No active agent sessions found.\n".into(),
+            CliListKind::Workspace => "No active workspaces found.\n".into(),
+        };
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Repository", "Reference", "Name", "Status", "Provider"]);
+    for item in &response.items {
+        table.add_row(vec![
+            Cell::new(&item.repo),
+            Cell::new(&item.reference),
+            Cell::new(&item.name),
+            Cell::new(&item.status),
+            Cell::new(&item.provider),
+        ]);
+    }
+    format!("{table}\n")
+}
+
+fn format_issue_page_human(page: &flotilla_protocol::issue_query::IssueResultPage) -> String {
+    if page.items.is_empty() {
+        return "No open issues found.\n".into();
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Issue", "Title", "Labels"]);
+    for issue in &page.items {
+        table.add_row(vec![
+            Cell::new(format!("{}#{}", issue.reference.source.scope, issue.reference.id)),
+            Cell::new(&issue.title),
+            Cell::new(issue.labels.join(", ")),
+        ]);
+    }
+    let mut output = format!("{table}\n");
+    if page.has_more {
+        output.push_str("More issues available.\n");
+    }
+    output
 }
 
 fn format_host_status_human(response: &HostStatusResponse) -> String {
@@ -1064,6 +1110,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         // even though `host list` now presents the richer fleet-health view.
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
+        CommandValue::CliList(items) => format_cli_list_human(items),
         CommandValue::DispatchQueue(queue) => format_dispatch_queue_human(queue),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
@@ -1115,7 +1162,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(response),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
-        CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
+        CommandValue::IssuePage(page) => format_issue_page_human(page),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
         CommandValue::ConvoyAbandoned { name, archives } => {

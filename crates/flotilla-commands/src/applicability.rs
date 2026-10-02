@@ -31,6 +31,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryRepoProviders { .. }
         | CommandAction::QueryHostList {}
         | CommandAction::QueryProjectList {}
+        | CommandAction::QueryCliList { .. }
         | CommandAction::QueryDispatchQueue { .. }
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }

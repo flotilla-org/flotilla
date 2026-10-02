@@ -65,6 +65,52 @@ fn fleet_list_displays_replication_failure_and_last_successful_sync() {
 }
 
 #[test]
+fn provider_lists_show_active_sessions_and_workspaces() {
+    use flotilla_protocol::{CliListKind, CliListResponse, CliListRow};
+
+    let row = CliListRow {
+        repo: "team/repo".into(),
+        reference: "session-42".into(),
+        name: "Implement feature".into(),
+        status: "running".into(),
+        provider: "Claude".into(),
+    };
+    let agents = CliListResponse { list_kind: CliListKind::Agent, items: vec![row] };
+    let value = CommandValue::CliList(Box::new(agents.clone()));
+    let json = serde_json::to_value(&value).expect("serialize list");
+    assert_eq!(json["kind"], "cli_list");
+    assert_eq!(json["list_kind"], "agent");
+    assert_eq!(serde_json::from_value::<CommandValue>(json).expect("decode list"), value);
+    let output = format_command_result(&CommandValue::CliList(Box::new(agents)));
+    assert!(output.contains("session-42") && output.contains("Implement feature") && output.contains("running"), "{output}");
+
+    let workspaces = CliListResponse { list_kind: CliListKind::Workspace, items: vec![] };
+    assert_eq!(format_command_result(&CommandValue::CliList(Box::new(workspaces))), "No active workspaces found.\n");
+}
+
+#[test]
+fn issue_list_shows_open_issue_details() {
+    use chrono::Utc;
+    use flotilla_protocol::{issue_query::IssueResultPage, Issue, IssueRef, IssueSource, IssueState};
+
+    let issue = Issue {
+        reference: IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "team/repo".into() }, id: "42".into() },
+        title: "Repair the parser".into(),
+        body: None,
+        state: IssueState::Open,
+        labels: vec!["bug".into()],
+        assignees: vec![],
+        as_of: Utc::now(),
+        observed_at: None,
+        provider_name: "github".into(),
+        provider_display_name: "GitHub".into(),
+    };
+    let page = IssueResultPage { items: vec![issue], total: Some(1), has_more: false };
+    let output = format_command_result(&CommandValue::IssuePage(page));
+    assert!(output.contains("team/repo#42") && output.contains("Repair the parser") && output.contains("bug"), "{output}");
+}
+
+#[test]
 fn crew_follow_up_result_tells_the_crew_to_complete_again() {
     let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
     assert!(output.contains("Completion received"));

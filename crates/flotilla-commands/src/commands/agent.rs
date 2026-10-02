@@ -9,13 +9,13 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
-#[command(about = "Cloud agents")]
+#[command(about = "Cloud agents", subcommand_precedence_over_arg = true)]
 pub struct AgentNoun {
     /// Agent/session ID
-    pub subject: String,
+    pub subject: Option<String>,
 
     #[command(subcommand)]
-    pub verb: AgentVerb,
+    pub verb: Option<AgentVerb>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -33,36 +33,47 @@ pub enum AgentVerb {
 
 impl AgentNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        match self.verb {
-            AgentVerb::Teleport { branch, checkout } => Ok(Resolved::NeedsContext {
+        match (self.subject, self.verb) {
+            (None, None) => Ok(Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Agent },
+            })),
+            (Some(subject), Some(AgentVerb::Teleport { branch, checkout })) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::TeleportSession { session_id: self.subject, branch, checkout_key: checkout },
+                    action: CommandAction::TeleportSession { session_id: subject, branch, checkout_key: checkout },
                 },
                 repo: RepoContext::Inferred,
                 host: HostResolution::Local,
             }),
-            AgentVerb::Archive => Ok(Resolved::NeedsContext {
+            (Some(subject), Some(AgentVerb::Archive)) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ArchiveSession { session_id: self.subject },
+                    action: CommandAction::ArchiveSession { session_id: subject },
                 },
                 repo: RepoContext::Inferred,
                 host: HostResolution::ProviderHost,
             }),
+            (None, Some(_)) => Err("agent command requires a session subject".into()),
+            (Some(_), None) => Err("missing agent verb".into()),
         }
     }
 }
 
 impl std::fmt::Display for AgentNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "agent {}", self.subject)?;
+        write!(f, "agent")?;
+        if let Some(subject) = &self.subject {
+            write!(f, " {subject}")?;
+        }
         match &self.verb {
-            AgentVerb::Teleport { branch, checkout } => {
+            Some(AgentVerb::Teleport { branch, checkout }) => {
                 write!(f, " teleport")?;
                 if let Some(b) = branch {
                     write!(f, " --branch {b}")?;
@@ -71,7 +82,8 @@ impl std::fmt::Display for AgentNoun {
                     write!(f, " --checkout {}", c.display())?;
                 }
             }
-            AgentVerb::Archive => write!(f, " archive")?,
+            Some(AgentVerb::Archive) => write!(f, " archive")?,
+            None => {}
         }
         Ok(())
     }
@@ -92,6 +104,12 @@ mod tests {
 
     fn parse(args: &[&str]) -> AgentNoun {
         AgentNoun::try_parse_from(args).expect("should parse")
+    }
+
+    #[test]
+    fn agent_without_verb_lists_active_sessions() {
+        let resolved = parse(&["agent"]).resolve().expect("default list");
+        crate::test_utils::assert_ready(resolved, CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Agent });
     }
 
     #[test]
