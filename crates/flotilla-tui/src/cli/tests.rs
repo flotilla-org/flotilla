@@ -39,6 +39,32 @@ fn project_list_displays_zero_one_and_multiple_resolved_issue_sources() {
 }
 
 #[test]
+fn fleet_list_displays_replication_failure_and_last_successful_sync() {
+    use chrono::{TimeZone, Utc};
+    use flotilla_protocol::{FleetListResponse, FleetReplicaStatus};
+
+    let last_sync = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).single().expect("timestamp");
+    let response = FleetListResponse {
+        rows: vec![],
+        replicas: vec![FleetReplicaStatus {
+            host: HostName::new("remote"),
+            reachable: false,
+            last_sync: Some(last_sync),
+            generation: Some("generation-1".into()),
+            message: Some("resource replication failed: convoys: connection lost".into()),
+        }],
+    };
+
+    let output = super::format_fleet_list_human(&response);
+    assert!(output.contains("resource replication failed: convoys: connection lost"), "{output}");
+    assert!(output.contains("2026-09-30T12:00:00+00:00"), "{output}");
+    assert!(!output.contains("skipped"), "{output}");
+    let json = serde_json::to_value(&response).expect("serialize fleet list");
+    assert!(json["replicas"][0].get("skipped_records").is_none());
+    assert!(json["replicas"][0].get("first_parse_error").is_none());
+}
+
+#[test]
 fn crew_follow_up_result_tells_the_crew_to_complete_again() {
     let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
     assert!(output.contains("Completion received"));

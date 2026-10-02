@@ -10,9 +10,9 @@ use flotilla_protocol::{
     ConvoyExplanation, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest,
     ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement,
     ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
-    FleetListResponse, FleetListRow, FleetReplicaStatus, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
-    HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry,
-    ProjectListRepository, ProjectListResponse, ViewAddress,
+    FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel,
+    FulfilmentRow, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -501,15 +501,7 @@ impl ReadProjections<'_> {
                     (false, None, None, join_replica_errors(Some(&unsynced), replication_error.as_deref()))
                 }
             };
-            replicas.push(FleetReplicaStatus {
-                host,
-                reachable,
-                last_sync,
-                generation,
-                skipped_records: 0,
-                first_parse_error: None,
-                message,
-            });
+            replicas.push(FleetReplicaStatus { host, reachable, last_sync, generation, message });
         }
         for (host, (last_sync, generation)) in replicated_hosts {
             let replication_error =
@@ -519,8 +511,6 @@ impl ReadProjections<'_> {
                 reachable: replica_sync_is_fresh(last_sync, now) && replication_error.is_none(),
                 last_sync: Some(last_sync),
                 generation,
-                skipped_records: 0,
-                first_parse_error: None,
                 message: replication_error,
             });
         }
@@ -530,12 +520,17 @@ impl ReadProjections<'_> {
                 reachable: false,
                 last_sync: None,
                 generation: None,
-                skipped_records: 0,
-                first_parse_error: None,
                 message: format_resource_replication_failures(&failures),
             });
         }
 
+        for row in &mut rows {
+            if let Some(replica) = replicas.iter().find(|replica| replica.host == row.host && !replica.reachable) {
+                if let Some(message) = &replica.message {
+                    row.staleness = FleetStaleness::Unreachable { last_sync: replica.last_sync, message: message.clone() };
+                }
+            }
+        }
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,
@@ -1283,6 +1278,43 @@ mod tests {
         assert_eq!(response.replicas[0].host, HostName::new("remote"));
         assert!(!response.replicas[0].reachable);
         assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("not synced yet")));
+    }
+
+    #[tokio::test]
+    async fn fleet_list_marks_remote_rows_unreachable_after_replication_failure() {
+        let fixture = ProjectionFixture::new();
+        let now = Utc::now();
+        let last_sync = now - chrono::Duration::seconds(10);
+        fixture.register_remote_host("remote-node", "remote", "remote-id").await;
+        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
+        remote_hosts.create(&InputMeta::builder().name("remote-id".to_string()).build(), &HostSpec::default()).await.expect("host");
+        fixture
+            .backend
+            .replica_writer::<ResourceHost>(NodeId::new("remote-node"), "flotilla")
+            .replace(&remote_hosts.list().await.expect("remote hosts"), last_sync)
+            .await
+            .expect("replicate host");
+        fixture.fleet.report_resource_replication_failure(&NodeId::new("remote-node"), "convoys", "connection lost").await;
+        let row = FleetListRow::builder()
+            .convoy("example")
+            .vessel("work")
+            .crew("coder")
+            .crew_state("active")
+            .host(HostName::new("remote"))
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Fresh { last_sync })
+            .build();
+
+        let response = fixture.projections().fleet_list("flotilla", vec![row], now).await.expect("fleet list");
+        assert_eq!(response.replicas[0].last_sync, Some(last_sync));
+        assert!(!response.replicas[0].reachable);
+        assert!(response.replicas[0].message.as_deref().is_some_and(|message| message.contains("convoys: connection lost")));
+        assert!(matches!(
+            &response.rows[0].staleness,
+            FleetStaleness::Unreachable { last_sync: Some(sync), message }
+                if *sync == last_sync && message.contains("convoys: connection lost")
+        ));
     }
 
     #[tokio::test]
