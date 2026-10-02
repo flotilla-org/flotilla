@@ -477,7 +477,10 @@ mod tests {
         std::fs::create_dir(&repo_dir).expect("create repo dir");
         std::fs::create_dir(repo_dir.join(".git")).expect("create .git dir");
 
-        let parent_path = format!("{}/", tmp.path().to_string_lossy());
+        // The directory listing hands out canonical entry paths; macOS temp dirs
+        // sit behind the /var -> /private/var symlink.
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let parent_path = format!("{}/", root.to_string_lossy());
         let entries = vec![dir_entry("my-repo", true, false)];
         let mut widget = picker_with_entries(&parent_path, entries);
         let mut harness = TestWidgetHarness::new();
