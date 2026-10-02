@@ -2794,6 +2794,7 @@ mod tests {
             text: "Keep working on the fix".into(),
             sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
             delivery: flotilla_resources::CrewMessageDelivery::Queued,
+            acknowledged: Default::default(),
             following: Vec::new(),
         });
         sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.expect("owner guidance");
@@ -2948,6 +2949,7 @@ mod tests {
                             text: "Continue with the operator's guidance".into(),
                             sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
                             delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                            acknowledged: Default::default(),
                             following: Vec::new(),
                         }),
                     },

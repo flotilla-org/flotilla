@@ -2792,6 +2792,7 @@ mod tests {
                     text: "Supervise the stalled crew".to_string(),
                     sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
                     delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 },
             }),

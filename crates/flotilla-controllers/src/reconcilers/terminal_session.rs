@@ -547,7 +547,7 @@ where
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
-        let actuations = match prepared {
+        let mut actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
             TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
@@ -560,6 +560,12 @@ where
             }
             _ => Vec::new(),
         };
+        if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
+            let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+            if delivered.is_some_and(|id| head.contains_id(id) && !head.acknowledged.contains(id)) {
+                actuations.push(Actuation::PruneTerminalMessages { name: obj.metadata.name.clone() });
+            }
+        }
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
             outcome.requeue_after = Some(Duration::from_millis(200));

@@ -1272,6 +1272,7 @@ async fn repeated_standing_turn_does_not_restart_a_lost_session_after_delivery()
         text: "previously delivered".into(),
         sender: CrewMessageSender::FlotillaTurn { source: "review".into() },
         delivery: flotilla_resources::CrewMessageDelivery::Queued,
+        acknowledged: Default::default(),
         following: Vec::new(),
     });
     let session =

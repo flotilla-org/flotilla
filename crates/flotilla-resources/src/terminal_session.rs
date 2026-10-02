@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
@@ -155,24 +155,35 @@ pub struct TerminalCrewMessage {
     /// only the head message; remove the compatibility default after one roll.
     #[serde(default)]
     pub following: Vec<TerminalCrewMessage>,
+    /// Payload-free receipts preserve exact retry and supervisor acknowledgment
+    /// checks after pruning. Default accepts the previous generation's records;
+    /// remove the compatibility default after one fleet roll.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub acknowledged: BTreeSet<String>,
 }
 
 impl TerminalCrewMessage {
     pub fn contains_id(&self, id: &str) -> bool {
-        self.id == id || self.following.iter().any(|message| message.id == id)
+        self.acknowledged.contains(id) || self.id == id || self.following.iter().any(|message| message.id == id)
     }
 
     pub fn next_after(&self, delivered_id: Option<&str>) -> Option<&Self> {
         match delivered_id {
-            Some(id) if id == self.id => self.following.first(),
-            Some(id) => {
-                self.following.iter().position(|message| message.id == id).map_or(Some(self), |index| self.following.get(index + 1))
-            }
+            Some(id) if id == self.id || self.acknowledged.contains(id) => self.following.first(),
+            Some(id) => self.following.iter().position(|message| message.id == id).map_or_else(
+                || if self.acknowledged.contains(&self.id) { self.following.first() } else { Some(self) },
+                |index| self.following.get(index + 1),
+            ),
+            None if self.acknowledged.contains(&self.id) => self.following.first(),
             None => Some(self),
         }
     }
 
     pub fn pending_after(&self, delivered_id: Option<&str>) -> Vec<&Self> {
+        if delivered_id.is_some_and(|id| self.acknowledged.contains(id)) || (delivered_id.is_none() && self.acknowledged.contains(&self.id))
+        {
+            return self.following.iter().collect();
+        }
         let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
         let start = delivered_id.and_then(|id| messages.iter().position(|message| message.id == id).map(|index| index + 1)).unwrap_or(0);
         messages[start..].to_vec()
@@ -186,8 +197,9 @@ impl TerminalCrewMessage {
 
     pub fn mark_next_for_launch(&mut self, delivered_id: Option<&str>) -> Option<String> {
         let next_index = match delivered_id {
-            Some(id) if id == self.id => Some(0),
+            Some(id) if id == self.id || self.acknowledged.contains(id) => Some(0),
             Some(id) => self.following.iter().position(|message| message.id == id).map(|index| index + 1),
+            None if self.acknowledged.contains(&self.id) => Some(0),
             None => None,
         };
         if self.delivery == CrewMessageDelivery::LaunchBrief {
@@ -203,7 +215,32 @@ impl TerminalCrewMessage {
         Some(next.text.clone())
     }
 
+    /// Drop acknowledged payloads while retaining exact, payload-free receipts.
+    /// Pending operator briefs and nudges retain their order and attribution.
+    pub fn prune_acknowledged(&mut self, delivered_id: Option<&str>) -> bool {
+        let Some(id) = delivered_id else { return false };
+        if self.acknowledged.contains(id) {
+            return false;
+        }
+        let count = if id == self.id {
+            0
+        } else if let Some(index) = self.following.iter().position(|message| message.id == id) {
+            index + 1
+        } else {
+            return false;
+        };
+        self.acknowledged.insert(self.id.clone());
+        self.text.clear();
+        for message in self.following.drain(..count) {
+            self.acknowledged.insert(message.id);
+        }
+        true
+    }
+
     pub fn delivered_through(&self, delivered_id: Option<&str>, target_id: &str) -> bool {
+        if self.acknowledged.contains(target_id) {
+            return true;
+        }
         let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
         let Some(delivered_index) = messages.iter().position(|message| Some(message.id.as_str()) == delivered_id) else {
             return false;

@@ -184,6 +184,7 @@ pub enum Actuation {
     CreateDemand { meta: InputMeta, spec: crate::DemandSpec },
     DeleteDemand { name: String },
     RestartTerminalSession { name: String },
+    PruneTerminalMessages { name: String },
     DeleteTerminalSession { name: String },
     CreateVessel { meta: InputMeta, spec: VesselSpec },
     CreatePresentation { meta: InputMeta, spec: PresentationSpec },
@@ -572,6 +573,27 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::DeleteDemand { name } => {
                 let resolver = backend.using::<crate::Demand>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
+            }
+            Actuation::PruneTerminalMessages { name } => {
+                let resolver = backend.using::<crate::TerminalSession>(namespace);
+                // Re-read the acknowledgment and pending queue together on every
+                // conflict: never erase a concurrently enqueued operator brief.
+                for _ in 0..8 {
+                    let current = resolver.get(&name).await?;
+                    let mut spec = current.spec.clone();
+                    let crate::TerminalSessionSource::Agent { message: Some(head), .. } = &mut spec.source else {
+                        return Ok(());
+                    };
+                    if !head.prune_acknowledged(current.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
+                        return Ok(());
+                    }
+                    match resolver.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
+                        Ok(_) => return Ok(()),
+                        Err(ResourceError::Conflict { .. }) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(ResourceError::other("terminal message pruning contention persisted"))
             }
             Actuation::RestartTerminalSession { name } => {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
