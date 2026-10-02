@@ -945,8 +945,12 @@ async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_ve
         }
         .run(),
     );
+    // Restart replays the pending vessel from the primary list, then finalizes
+    // its terminal child and vessel through separate SQLite writes. Give that
+    // work a CI-load bound; the former one-second deadline measured scheduling
+    // delay as much as cleanup progress.
     harness
-        .wait_until(Duration::from_secs(1), || {
+        .wait_until(Duration::from_secs(10), || {
             let vessels = vessels.clone();
             let terminals = terminals.clone();
             async move {
