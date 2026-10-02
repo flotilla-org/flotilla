@@ -2738,14 +2738,14 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::{
         result_set::{ResultSet, ResultSetState},
-        PrincipalRef,
+        PrincipalRef, Subject,
     };
     use flotilla_resources::{
-        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition,
-        EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus,
-        PresentationPhase, PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource,
-        RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
-        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, DemandKind, DemandSpec, DemandStatus,
+        DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec,
+        PlacementStatus, PresentationPhase, PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec,
+        RegardSource, RegardSpec, RegardStatus, RepositorySpec, ResourceBackend, TerminalAttention, TerminalAttentionSource,
+        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -3055,6 +3055,35 @@ mod tests {
         let vessel = convoy.vessels.first().expect("vessel row");
         assert!(vessel.surface_state.needs_attention());
         assert_eq!(vessel.message.as_deref(), Some("completion pending: authority unreachable for convoy-a"));
+    }
+
+    #[tokio::test]
+    async fn adopted_change_request_claim_does_not_raise_attention() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("adopted-pr").await;
+        let subject = Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "2303".into(),
+        };
+        convoy.spec.subjects.push(DeclaredSubject {
+            subject: subject.clone(),
+            relationship: flotilla_protocol::Relationship::Adopts,
+            issue: None,
+            change_request: None,
+        });
+        let status = convoy.status.as_mut().expect("status");
+        status.phase = ResourceConvoyPhase::Landed;
+        for source in [flotilla_resources::SubjectDiscoverySource::Branch, flotilla_resources::SubjectDiscoverySource::Claim] {
+            status.discover_subject(subject.clone(), flotilla_protocol::Relationship::Produces, source, Utc::now());
+        }
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let result = state.result_set().await;
+        let row = &result.rows.as_convoys().expect("convoys")[0];
+        assert_ne!(row.surface_state, SurfaceState::NeedsYou);
+        assert!(!row.message.as_deref().is_some_and(|message| message.contains("conflicting relationships")));
     }
 
     #[tokio::test]

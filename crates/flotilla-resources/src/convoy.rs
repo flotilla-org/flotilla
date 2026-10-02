@@ -128,10 +128,9 @@ pub fn subject_relationship_conflicts(convoy: &ResourceObject<Convoy>) -> Vec<Su
         relationships.entry(entry.subject).or_default().insert(entry.relationship);
     }
     for entry in convoy.status.iter().flat_map(|status| &status.subjects) {
-        if entry.relationship == Relationship::Produces
-            && adopted.contains(&entry.subject)
-            && entry.sources.iter().all(|source| source.source == SubjectDiscoverySource::Branch)
-        {
+        // Working on a declared adopted request also produces work on it,
+        // regardless of how that work was discovered (including crew claims).
+        if entry.relationship == Relationship::Produces && adopted.contains(&entry.subject) {
             continue;
         }
         relationships.entry(entry.subject.clone()).or_default().insert(entry.relationship);
@@ -2263,6 +2262,21 @@ mod subject_tests {
             assert!(addresses.contains(&subject.leaf().expect("subject address")));
         }
         assert!(subject_relationship_conflicts(&convoy).is_empty(), "plural production is normal");
+        let mut adopted = convoy.clone();
+        adopted.spec.subjects.push(DeclaredSubject {
+            subject: first.clone(),
+            relationship: Relationship::Adopts,
+            issue: None,
+            change_request: None,
+        });
+        for source in
+            [SubjectDiscoverySource::Branch, SubjectDiscoverySource::Claim, SubjectDiscoverySource::Relay, SubjectDiscoverySource::Operator]
+        {
+            let status = adopted.status.as_mut().expect("status");
+            status.subjects.clear();
+            status.discover_subject(first.clone(), Relationship::Produces, source, Utc::now());
+            assert!(subject_relationship_conflicts(&adopted).is_empty(), "declared adoption permits production from {source:?}");
+        }
         let mut conflicting = convoy.clone();
         conflicting.status.as_mut().expect("status").discover_subject(
             first.clone(),
