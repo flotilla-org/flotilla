@@ -279,8 +279,8 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let observed_at = Utc::now();
         let mut statuses = HashMap::new();
         let (mut pages, mut nodes) = (0, 0);
-        // The source observer supplies a rotating priority order. Keep it here
-        // so fairness survives rediscovery of this stateless provider.
+        // The caller's order determines which PR receives history pagination
+        // priority when the shared follow-up budget is exhausted.
         for number in numbers {
             let request = &repository[format!("pr{number}")];
             if request.is_null() {

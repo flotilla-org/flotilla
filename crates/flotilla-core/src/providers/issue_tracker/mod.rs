@@ -57,6 +57,8 @@ pub trait IssueProvider: Send + Sync {
         Ok(issues)
     }
 
+    /// `count` is an advisory window size; providers may use larger pages to
+    /// reduce overflow reloads while reporting incomplete changes via `has_more`.
     async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String>;
 
     async fn open_in_browser(&self, reference: &IssueRef) -> Result<(), String>;
