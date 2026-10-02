@@ -26,6 +26,34 @@ use flotilla_resources::{
 struct AlwaysEligible;
 
 #[test]
+fn convoy_finalizer_does_not_treat_arbitrary_error_text_as_a_teardown_wait() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+    let error = flotilla_resources::ResourceError::other("teardown waiting on checkout misleading-error");
+    assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none());
+}
+
+#[test]
+fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"));
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+    let error = flotilla_resources::ResourceError::FinalizerWait {
+        reasons: vec![
+            flotilla_resources::FinalizerWaitReason::CheckoutAuthority { checkout: "first".into(), message: Some("archiving".into()) },
+            flotilla_resources::FinalizerWaitReason::CheckoutAuthority { checkout: "second".into(), message: None },
+        ],
+    };
+    let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("typed waits become status");
+    let mut status = ConvoyStatus::default();
+    patch.apply(&mut status);
+    assert_eq!(status.message.as_deref(), Some("teardown waiting on checkout first: archiving; teardown waiting on checkout second"));
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+    assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none(), "unchanged waits do not rewrite status");
+}
+
+#[test]
 fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     let now = timestamp(100);
     let mut spec = task_provisioning_convoy_spec();
@@ -677,6 +705,7 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
         .with_federated_checkouts(authority.clone().including_replicas::<Checkout>("flotilla"));
 
     let error = reconciler.run_finalizer(&convoy).await.expect_err("remote checkout should hold convoy finalization");
+    assert!(matches!(&error, flotilla_resources::ResourceError::FinalizerWait { reasons } if reasons.len() == 1));
     assert!(error.to_string().contains("teardown waiting on checkout checkout-convoy-a-feta: preserved (DirtyCheckout)"));
     let patch = reconciler.finalizer_error_patch(&convoy, &error).expect("waiting reason should reach convoy status");
     let mut status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };

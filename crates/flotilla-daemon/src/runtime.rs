@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -25,7 +26,7 @@ use flotilla_core::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
-    config::ConfigStore,
+    config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -40,6 +41,7 @@ use flotilla_core::{
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
+    vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
 };
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
@@ -61,7 +63,7 @@ use flotilla_resources::{
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -782,6 +784,7 @@ impl DaemonRuntime {
                     local_repo_root,
                     profile.host_direct_environment_name(),
                 )
+                .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(credential_store)
@@ -924,9 +927,18 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                     archive_sweep.daemon.command_runner_for_environment(&EnvironmentId::new(&root.env_ref))
                 };
                 if let Some(runner) = runner {
-                    if let Err(error) =
+                    let result = if root.env_ref == archive_sweep.host_direct_environment_name {
                         flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
-                    {
+                    } else {
+                        flotilla_core::vcs::prune_remote_checkout_archives(
+                            &*runner,
+                            &root.path,
+                            archive_sweep.retention_days,
+                            REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
+                        )
+                        .await
+                    };
+                    if let Err(error) = result {
                         warn!(archive_root = %root.path.display(), env_ref = %root.env_ref, %error, "checkout archive retention sweep failed");
                     }
                 }
@@ -1294,6 +1306,8 @@ struct ControllerRuntimeState {
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
     archive_catalog_lock: Mutex<()>,
+    checkout_removal_concurrency: NonZeroUsize,
+    checkout_removals: Semaphore,
 }
 
 /// Cargo invokes this with the rustc path as its first argument. Keeping the
@@ -1454,6 +1468,8 @@ impl ControllerRuntimeState {
         stage_local_rustc_wrapper_async(self.config.state_dir().as_path().to_path_buf()).await
     }
 
+    /// Construct an unstarted runtime with default limits. Consuming builders
+    /// configure it before it is shared with controller tasks through `Arc`.
     fn new(
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
@@ -1482,7 +1498,15 @@ impl ControllerRuntimeState {
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
             archive_catalog_lock: Mutex::new(()),
+            checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
+            checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
         }
+    }
+
+    fn with_checkout_removal_concurrency(mut self, concurrency: NonZeroUsize) -> Self {
+        self.checkout_removal_concurrency = concurrency;
+        self.checkout_removals = Semaphore::new(concurrency.get());
+        self
     }
 
     async fn register_checkout_archive_roots(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<(), String> {
@@ -3843,6 +3867,10 @@ fn spawn_controller_loops(
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
                 let state = Arc::clone(&state);
+                // Match background task admission to the shared daemon semaphore
+                // initialized from this value by with_checkout_removal_concurrency.
+                // A namespace-local task cap alone cannot pace all removals.
+                let removal_concurrency = state.checkout_removal_concurrency;
                 (
                     CheckoutReconciler::<RoutingCheckoutRuntime>::federated_secondary_watches(&backend, &namespace_string),
                     CheckoutReconciler::new(
@@ -3853,6 +3881,7 @@ fn spawn_controller_loops(
                         backend.clone(),
                         &namespace_string,
                     )
+                    .with_background_removal_limit(removal_concurrency)
                     .with_federated_convoys(&backend, &namespace_string),
                 )
             }
@@ -4886,6 +4915,10 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
     }
 
     async fn remove_checkout_in(&self, env_ref: &str, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        // Shared by every namespace and execution environment on this daemon.
+        // Hold capacity through archive creation and every deletion in the
+        // removal, releasing it on success, failure, or cancellation.
+        let _permit = self.state.checkout_removals.acquire().await.map_err(|error| error.to_string())?;
         if let Err(error) = self.state.register_checkout_archive_roots(env_ref, removal).await {
             warn!(%error, "could not record checkout archive root for retention sweep");
         }
@@ -6689,6 +6722,82 @@ mod tests {
     }
 
     struct NoPrProcessRunner;
+
+    #[tokio::test]
+    async fn checkout_removals_queue_across_environments_and_release_capacity() {
+        struct GatedRemovalRunner {
+            started: tokio::sync::mpsc::UnboundedSender<()>,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait]
+        impl CommandRunner for GatedRemovalRunner {
+            async fn run(&self, cmd: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if cmd == "rm" {
+                    self.started.send(()).expect("removal observer");
+                    self.release.acquire().await.expect("removal gate").forget();
+                    Ok(String::new())
+                } else {
+                    Err(format!("command unavailable: {cmd}"))
+                }
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false })
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        for concurrency in [1, 2, 3] {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("daemon.toml"), "machine_id = \"removal-queue-test\"\n").expect("daemon config");
+            let config = Arc::new(ConfigStore::with_base(temp.path()));
+            let daemon = in_memory_daemon(Vec::new(), Arc::clone(&config)).await;
+            let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+            let runner = Arc::new(GatedRemovalRunner { started, release: tokio::sync::Semaphore::new(0) });
+            for env in ["teardown-a", "teardown-b"] {
+                daemon
+                    .register_direct_environment_for_test(
+                        EnvironmentId::new(env),
+                        runner.clone(),
+                        EnvironmentBag::new().with(EnvironmentAssertion::binary("git", "/usr/bin/git")),
+                        None,
+                    )
+                    .expect("register environment");
+            }
+            let state = ControllerRuntimeState::new(daemon, config, passthrough_registry(), None, "local".into(), None, "local-env".into());
+            let state = Arc::new(if concurrency == 2 {
+                state
+            } else {
+                state.with_checkout_removal_concurrency(NonZeroUsize::new(concurrency).expect("positive limit"))
+            });
+            let removal = CheckoutRemoval::OrphanedWorktree { target_path: "/checkouts/queued".into() };
+            let runtime = RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None };
+            assert!(runtime.remove_checkout_in("missing-environment", &removal).await.is_err(), "failed removals release capacity");
+            let mut tasks = Vec::new();
+            for index in 0..=concurrency {
+                let env = if index % 2 == 0 { "teardown-a" } else { "teardown-b" };
+                let runtime = RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None };
+                let removal = removal.clone();
+                tasks.push(tokio::spawn(async move { runtime.remove_checkout_in(env, &removal).await }));
+            }
+            for _ in 0..concurrency {
+                tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .expect("admitted removals start")
+                    .expect("observer open");
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(200), observed.recv()).await.is_err(), "excess removal must queue");
+            runner.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .expect("queued removal starts after capacity is released")
+                .expect("observer open");
+            runner.release.add_permits(concurrency);
+            for task in tasks {
+                assert_eq!(task.await.expect("removal task").expect("removal succeeds"), CheckoutRemovalOutcome::Removed);
+            }
+        }
+    }
 
     struct SshProvisioningRecordingRunner {
         commands: Arc<StdMutex<Vec<String>>>,
@@ -9042,7 +9151,9 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repository() {
-        let temp = TempDir::new().expect("tempdir");
+        // This scenario requires a non-repository parent. A repo-local TMPDIR
+        // otherwise lets Git discover the vessel checkout above the fixture.
+        let temp = TempDir::new_in("/tmp").expect("isolated non-repository tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
         TestGitRepo::init(target.join("embedded")).with_initial_commit();
@@ -9224,6 +9335,59 @@ mod tests {
         }
         assert!(!expired.exists());
         assert!(recent.exists());
+    }
+
+    #[tokio::test]
+    async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
+        struct SweepRunner {
+            roots: StdMutex<Vec<String>>,
+            finished: Notify,
+        }
+        #[async_trait]
+        impl CommandRunner for SweepRunner {
+            async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                panic!("sweeps must use the deadline seam");
+            }
+            async fn run_with_timeout(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, _: Duration) -> Result<String, String> {
+                assert_eq!(cmd, "timeout");
+                let root = args[args.len() - 2].to_string();
+                let mut roots = self.roots.lock().expect("roots");
+                roots.push(root);
+                if roots.len() == 1 {
+                    Err("remote sweep timed out".into())
+                } else {
+                    self.finished.notify_one();
+                    Ok(String::new())
+                }
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                panic!("no unbounded probe before the deadline");
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-sweep-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let runner = Arc::new(SweepRunner { roots: StdMutex::new(Vec::new()), finished: Notify::new() });
+        daemon
+            .register_direct_environment_for_test(EnvironmentId::new("remote"), runner.clone(), EnvironmentBag::new(), None)
+            .expect("register remote sweep runner");
+        let task = tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), NAMESPACE.into(), CheckoutArchiveSweep {
+            daemon,
+            catalog_path: temp.path().join("missing-catalog"),
+            host_direct_environment_name: "local".into(),
+            roots: vec![CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() }, CheckoutArchiveRoot {
+                env_ref: "remote".into(),
+                path: "/archives/b".into(),
+            }],
+            retention_days: 14,
+        }));
+        tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
+        assert_eq!(*runner.roots.lock().expect("roots"), ["/archives/a", "/archives/b"]);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

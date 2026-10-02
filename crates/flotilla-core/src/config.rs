@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
@@ -340,7 +341,12 @@ pub struct DaemonConfig {
     /// Retention for forced checkout archives, in days.
     #[serde(default = "default_checkout_archive_retention_days")]
     pub checkout_archive_retention_days: u64,
+    /// Daemon-wide checkout removal concurrency, across execution environments.
+    #[serde(default = "default_checkout_removal_concurrency", deserialize_with = "deserialize_checkout_removal_concurrency")]
+    pub checkout_removal_concurrency: NonZeroUsize,
 }
+
+pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -356,12 +362,25 @@ impl Default for DaemonConfig {
             blob_stores: Vec::new(),
             artifact_retention_days: default_artifact_retention_days(),
             checkout_archive_retention_days: default_checkout_archive_retention_days(),
+            checkout_removal_concurrency: default_checkout_removal_concurrency(),
         }
     }
 }
 
 fn default_checkout_archive_retention_days() -> u64 {
     14
+}
+
+fn default_checkout_removal_concurrency() -> NonZeroUsize {
+    DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY
+}
+
+fn deserialize_checkout_removal_concurrency<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<NonZeroUsize, D::Error> {
+    let limit = NonZeroUsize::deserialize(deserializer)?;
+    if limit.get() > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(serde::de::Error::custom("checkout_removal_concurrency exceeds semaphore capacity"));
+    }
+    Ok(limit)
 }
 
 fn default_artifact_retention_days() -> BTreeMap<String, u64> {

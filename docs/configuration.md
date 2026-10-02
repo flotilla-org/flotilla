@@ -154,6 +154,33 @@ Set the age in each host's `~/.config/flotilla/daemon.toml`:
 checkout_archive_retention_days = 30
 ```
 
+Each remote archive root has a five-minute sweep deadline. The remote
+environment must provide GNU `timeout`; it supervises `find` and `rm` together
+and kills remaining children after a five-second grace period. The client
+deadline is ten seconds longer. A failed or timed-out root logs a warning and
+the sweep continues with the next root. Local sweeps retain their native path.
+If the environment lacks GNU `timeout`, the warning names the dependency and
+asks the operator to install coreutils; no unbounded fallback sweep starts.
+
+## Checkout removal concurrency
+
+Checkout teardown shares a daemon-wide queue across namespaces and execution
+environments. At most two removals run concurrently by default; a slot covers
+archive creation and all deletions belonging to that checkout. Other removals
+wait for capacity, and errors release their slot. Background archive task
+admission uses the same configured limit.
+
+Set a positive limit in each host's `~/.config/flotilla/daemon.toml`, then restart
+the daemon:
+
+```toml
+checkout_removal_concurrency = 2
+```
+
+The queue limits simultaneous removals, rather than deletion bandwidth. The
+operator compares filesystem I/O PSI during teardown bursts after deployment
+to decide whether this limit needs further tuning.
+
 ## Event relay
 
 To receive change-request hints, configure each daemon separately in its
