@@ -70,6 +70,7 @@ macro_rules! define_patch_kinds {
 
 define_patch_kinds! {
     ConvoySetStalled => NONE,
+    ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
     ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
@@ -108,6 +109,7 @@ define_patch_kinds! {
     TerminalMarkMessageDelivered => NONE,
     TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalObserveAttention => NONE,
+    TerminalObserveToolActivity => NONE,
     TerminalMarkCompletionPending => NONE,
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
@@ -136,6 +138,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
             panic!("subject patches are outside this lifecycle contract")
         }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
+        ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
         ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
@@ -185,6 +188,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
         TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
+        TerminalSessionStatusPatch::ObserveToolActivity { .. } => PatchKind::TerminalObserveToolActivity,
         TerminalSessionStatusPatch::Observe { .. } => PatchKind::TerminalObserveAttention,
         TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
         TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
@@ -292,6 +296,7 @@ fn active_convoy_status() -> ConvoyStatus {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -653,6 +658,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkRunning,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    last_tool_activity_at: None,
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("session-a".to_string()),
                     cleat_endpoint: None,

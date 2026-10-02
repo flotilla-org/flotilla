@@ -152,6 +152,11 @@ spec:
                 phase:
                   type: string
                   enum: [Pending, Active, Interrupted, Anchored, Landing, Landed, Failed, Cancelled, Abandoned]
+                nudge_obligations:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
                 stalled:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
@@ -218,6 +223,9 @@ spec:
                         required: [max_per_episode]
                         properties:
                           max_per_episode:
+                            type: integer
+                            minimum: 0
+                          idle_grace_seconds:
                             type: integer
                             minimum: 0
                           max_refusals:

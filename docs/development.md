@@ -113,3 +113,50 @@ With Cargo's default configuration the script acts only on that checkout's `targ
 ### CI cache decision
 
 GitHub Actions keeps target caches because compiled dependencies are expensive and reusable across runs with the same lockfile. Compiler incremental state is disabled with `CARGO_INCREMENTAL=0`; every target-caching job removes restored incremental directories before the cache post-action saves a new entry, so incremental generations are neither restored nor re-uploaded.
+
+## Crew idle supervision
+
+Actor obligations require three minutes of continuously confirmed idle before
+mechanical supervision sends a nudge. A workflow can configure this per crew row:
+
+```yaml
+stall_nudges:
+  work/coder:
+    max_per_episode: 2
+    idle_grace_seconds: 180
+```
+
+The historical `max_per_episode` field now bounds the unmet actor obligation,
+identified by its maker and leaves. Working attention clears the visible stall
+but preserves durable accounting in convoy status. A changed observed checkout
+HEAD or pushed revision, a settlement claim (including a refused claim), or a
+crew stall declaration resets the corresponding budget. Unknown or unchanged
+revision evidence does not. Nudges back off by the grace interval, then twice
+that interval, and so on. Exhausting the budget enters the supervision ladder
+only after the next backoff has elapsed.
+
+Claude Code's `Stop` remains a candidate `Idle` observation: it ends a response,
+not necessarily the assigned work. It is weaker evidence of inability than a
+sustained quiet period; a fresh Stop restarts grace rather than bypassing it.
+`PreToolUse` and `PostToolUse` report Working, and fresh screen confirmations
+establish quiet duration. Retaining Stop avoids depending exclusively on screen
+classification and preserves the existing attention consumers. A delivered
+nudge's reply and operator/owner message echoes preserve the existing idle
+clock and budget. Actual tool activity cancels idleness; if idle resumes after
+real work, it must satisfy grace again. Remaining continuously idle permits
+further nudges at the backed-off times, up to the obligation budget. Pending briefs remain
+protected by the existing delivery ordering.
+
+Schema authors: WorkflowTemplate manifests in the external project-map/ops
+repositories may specify `stall_nudges`; their existing field names and defaults
+remain compatible, so no companion manifest edit is required. Convoy status and
+Checkout integration status and TerminalSession status are daemon/controller-authored; no external manifest
+source authors the new status fields. New stored fields decode with defaults
+under ADR 0047; the stored-record corpus must not be regenerated for this change.
+
+Claude tool subscriptions take effect when crew settings are regenerated; already
+running crews retain their previous hooks and use attention-only evidence until
+restarted. The hook client parses one payload and sends one daemon RPC, waiting
+for acknowledgement. It performs no provider refresh, but it is synchronous and
+currently has no dedicated RPC timeout. Measure the PreToolUse critical-path
+latency and daemon-unavailable behavior during host-direct acceptance testing.

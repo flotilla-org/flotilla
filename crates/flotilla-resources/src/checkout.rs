@@ -143,6 +143,10 @@ pub struct CheckoutStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutIntegrationStatus {
+    /// Current checkout HEAD observed alongside integration evidence.
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_revision: Option<String>,
     #[builder(default)]
     #[serde(default)]
     pub clean: IntegrationCondition,
@@ -311,6 +315,7 @@ mod tests {
 
     fn integration(landed: ConditionValue, landed_evidence: Option<LandedEvidence>) -> CheckoutIntegrationStatus {
         CheckoutIntegrationStatus {
+            head_revision: None,
             clean: condition(ConditionValue::True),
             pushed: condition(ConditionValue::True),
             landed: condition(landed),

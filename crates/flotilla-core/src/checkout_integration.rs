@@ -14,7 +14,7 @@ use flotilla_resources::{
 
 use crate::{
     providers::{ChannelLabel, CommandRunner},
-    vcs::{Vcs, VcsCheck},
+    vcs::{RepositoryRead, Vcs, VcsCheck},
 };
 
 /// Maximum age of checkout evidence used to settle or tear down a convoy.
@@ -230,7 +230,14 @@ async fn inspect_checkout_integration_with_association(
     } else {
         BTreeMap::new()
     };
-    CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence, change_request, remote_refs }
+    let head_revision = match providers.vcs.read_repository(checkout_path, RepositoryRead::HeadRevision).await {
+        Ok(revision) => Some(revision.trim().to_string()).filter(|revision| !revision.is_empty()),
+        Err(error) => {
+            tracing::debug!(checkout = %checkout_path.display(), %error, "checkout HEAD observation unavailable");
+            None
+        }
+    };
+    CheckoutIntegrationStatus { head_revision, clean, pushed, landed, landed_evidence, change_request, remote_refs }
 }
 
 async fn inspect_remote_ref(vcs: &dyn Vcs, branch: &str, observed_at: &str) -> BTreeMap<String, RemoteRefObservation> {
@@ -597,6 +604,56 @@ mod tests {
             },
             mergeable: flotilla_resources::Observation::unknown(observed_at),
         }
+    }
+
+    struct HeadOnlyRunner;
+
+    #[async_trait::async_trait]
+    impl CommandRunner for HeadOnlyRunner {
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            if cmd == "git" && args == ["rev-parse", "HEAD"] {
+                Ok("new-commit\n".into())
+            } else {
+                Err("unavailable".into())
+            }
+        }
+        async fn run_output(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+        ) -> Result<crate::providers::CommandOutput, String> {
+            self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                success: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_observes_local_commit_even_when_other_evidence_is_unavailable() {
+        let runner = Arc::new(HeadOnlyRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new("/checkout"),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner.clone()))),
+        );
+        let spec = CheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref("topic".into())
+                .path("/checkout".into())
+                .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                .host_ref("host".into())
+                .is_main(false)
+                .build(),
+        );
+        let observed = inspect_checkout_integration(&*runner, &vcs, Path::new("/checkout"), &spec, None).await;
+        assert_eq!(observed.head_revision.as_deref(), Some("new-commit"));
     }
 
     #[tokio::test]

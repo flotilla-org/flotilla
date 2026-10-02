@@ -257,6 +257,10 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// Actual tool activity survives coalesced Working/Stop observations.
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_activity_at: Option<DateTime<Utc>>,
     /// Whether the principal currently occupies the terminal's controller
     /// seat. Cleat's attachment state is authoritative for this observation.
     #[serde(default)]
@@ -437,6 +441,9 @@ pub enum TerminalSessionStatusPatch {
         observed_at: DateTime<Utc>,
     },
     ClearReconcileDegraded,
+    ObserveToolActivity {
+        attention: TerminalAttention,
+    },
     ObserveAttention {
         attention: TerminalAttention,
     },
@@ -551,6 +558,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.message = None;
                 status.degraded = None;
             }
+            Self::ObserveToolActivity { attention } => {
+                status.last_tool_activity_at = Some(attention.as_of);
+                Self::ObserveAttention { attention: attention.clone() }.apply(status);
+            }
             Self::ObserveAttention { attention } => {
                 let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                 if replace {
@@ -614,6 +625,19 @@ mod tests {
         .apply(&mut status);
 
         assert_eq!(status.phase, TerminalSessionPhase::Running);
+        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
+    }
+
+    #[test]
+    fn tool_activity_survives_a_coalesced_idle_observation() {
+        let mut status = TerminalSessionStatus::default();
+        let tool = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 1);
+        TerminalSessionStatusPatch::ObserveToolActivity { attention: tool.clone() }.apply(&mut status);
+        TerminalSessionStatusPatch::ObserveAttention {
+            attention: attention(TerminalAttentionState::Idle, TerminalAttentionSource::Hook, 2),
+        }
+        .apply(&mut status);
+        assert_eq!(status.last_tool_activity_at, Some(tool.as_of));
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
     }
 

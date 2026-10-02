@@ -461,6 +461,7 @@ async fn reconcile_with_observed_change_request(
                 commit: None,
                 branch_provenance: Default::default(),
                 integration: CheckoutIntegrationStatus {
+                    head_revision: None,
                     clean: Default::default(),
                     pushed: Default::default(),
                     landed: IntegrationCondition::builder().value(value).observed_at(observed_at.to_rfc3339()).build(),

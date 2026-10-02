@@ -811,6 +811,10 @@ pub struct ConvoyStatus {
     pub unlinked_subjects: Vec<Subject>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled: Option<StalledCondition>,
+    /// Actor obligation budgets outlive transient attention and visible stalls.
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nudge_obligations: Vec<NudgeObligation>,
     /// Durable evidence of whether this convoy reached provisioning. An absent
     /// value means the evidence predates this field and must be treated as
     /// unknown rather than as `NotStarted`.
@@ -922,6 +926,27 @@ pub struct StallSupervisor {
 pub struct StallNudge {
     pub at: DateTime<Utc>,
     pub row: Leaf,
+}
+
+/// Durable supervision accounting for one actor row and its unmet leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct NudgeObligation {
+    pub maker: LeafMaker,
+    pub leaves: Vec<Leaf>,
+    #[builder(default)]
+    pub history: Vec<StallNudge>,
+    #[builder(default)]
+    pub progress: BTreeMap<String, String>,
+    pub quiet_since: Option<DateTime<Utc>>,
+    pub last_hook_at: Option<DateTime<Utc>>,
+    pub last_attention_at: Option<DateTime<Utc>>,
+    // Stored-data compatibility: defaults may be removed one fleet roll later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_activity_at: Option<DateTime<Utc>>,
+    pub message_id: Option<String>,
+    pub delivered_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1042,6 +1067,17 @@ fn clear_operator_pending_brief(status: &mut ConvoyStatus) {
     }
     if status.turn_deliveries.get(PENDING_BRIEF_DELIVERY_SOURCE).is_some_and(|delivery| delivery.episodes.is_empty()) {
         status.turn_deliveries.remove(PENDING_BRIEF_DELIVERY_SOURCE);
+    }
+}
+
+fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
+    for obligation in &mut status.nudge_obligations {
+        if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
+        {
+            obligation.history.clear();
+            obligation.quiet_since = None;
+            obligation.reply_after = None;
+        }
     }
 }
 
@@ -1274,6 +1310,9 @@ pub enum ConvoyStatusPatch {
     SetStalled {
         condition: Option<StalledCondition>,
     },
+    SetNudgeObligations {
+        obligations: Vec<NudgeObligation>,
+    },
     SetTeardownWait {
         message: String,
     },
@@ -1478,6 +1517,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::SetStalled { condition } => {
                 status.stalled = if status.phase.is_terminal() { None } else { condition.clone() };
             }
+            Self::SetNudgeObligations { obligations } => status.nudge_obligations = obligations.clone(),
             Self::SetTeardownWait { message } => status.message = Some(message.clone()),
             Self::RecordLifecycleMutation { mutation } => {
                 const RETAINED_MUTATIONS: usize = 32;
@@ -1727,6 +1767,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 completed_while_crew_active,
                 forced_by,
             } => {
+                clear_nudge_budget(status, vessel, role);
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.completion_refusal = None;
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
@@ -1760,6 +1801,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 enter_landing_if_completion_claims_settled(status);
             }
             Self::RefuseCrewCompletion { vessel, role, expectation, message } => {
+                clear_nudge_budget(status, vessel, role);
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     let new_expectation = state.completion_refusal.as_ref().is_none_or(|prior| prior.expectation != *expectation);
                     let consecutive_count = state
@@ -1798,6 +1840,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_stall_for_crew(status, vessel, role);
             }
             Self::MarkCrewStalled { convoy, vessel, role, at, reason, proposed_disposition, message } => {
+                clear_nudge_budget(status, vessel, role);
                 // A completion claim is settled work. A late stall cannot turn a
                 // world-owned landing wait back into a crew obligation.
                 if status.crew_work.get(vessel).and_then(|crew| crew.get(role)).is_some_and(|state| state.phase == CrewWorkPhase::Done) {

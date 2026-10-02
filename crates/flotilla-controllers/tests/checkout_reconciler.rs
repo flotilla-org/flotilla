@@ -80,6 +80,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
         *self.inspections.lock().expect("inspections lock") += 1;
         Ok(flotilla_resources::CheckoutIntegrationStatus {
+            head_revision: None,
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["1 unpushed commit".to_string()]).build(),
             landed: IntegrationCondition::builder()
@@ -754,6 +755,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
             commit: Some("base-commit".to_string()),
             branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
             integration: flotilla_resources::CheckoutIntegrationStatus {
+                head_revision: None,
                 clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                 pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                 landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),

@@ -80,10 +80,15 @@ pub enum SupervisionTarget {
     Operator,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct StallNudgePolicy {
+    /// Maximum nudges for one unmet actor obligation (the historical field name is retained).
     pub max_per_episode: u32,
+    /// Continuous idle required before nudging; defaults to three minutes.
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_grace_seconds: Option<u32>,
     /// Repeated claims with the same unmet expectation escalate at this count.
     /// The default for previous-generation snapshots is two. The default shim
     /// can be removed one fleet roll after this field lands.

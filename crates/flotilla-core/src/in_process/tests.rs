@@ -1437,12 +1437,10 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
         status.phase = flotilla_resources::ConvoyPhase::Active;
         status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Running;
         status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
-        status
-            .workflow_snapshot
-            .as_mut()
-            .expect("workflow")
-            .stall_nudges
-            .insert("work/coder".to_string(), flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None });
+        status.workflow_snapshot.as_mut().expect("workflow").stall_nudges.insert(
+            "work/coder".to_string(),
+            flotilla_resources::StallNudgePolicy { max_per_episode: limit, max_refusals: None, idle_grace_seconds: Some(0) },
+        );
         convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("active convoy");
         let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
         let session = sessions.get("resume-staging-session").await.expect("session");
@@ -1883,6 +1881,7 @@ async fn abandon_archive_skips_pushed_head_pushes_unpushed_head_and_reports_push
                     .phase(ResourceCheckoutPhase::Ready)
                     .path(format!("/checkouts/{name}"))
                     .integration(CheckoutIntegrationStatus {
+                        head_revision: None,
                         pushed: IntegrationCondition::builder().value(pushed).observed_at(observed_at.to_string()).build(),
                         ..CheckoutIntegrationStatus::default()
                     })
@@ -2228,7 +2227,11 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
         .update_status("refused-claim", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                stall_nudges: Default::default(),
+                stall_nudges: indexmap::IndexMap::from([("work/coder".to_string(), flotilla_resources::StallNudgePolicy {
+                    max_per_episode: 2,
+                    max_refusals: None,
+                    idle_grace_seconds: Some(0),
+                })]),
                 supervision: Some(vec![flotilla_resources::SupervisionTarget::ConvoyCrew {
                     vessel: "work".to_string(),
                     role: "bosun".to_string(),
@@ -6674,7 +6677,15 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     convoys
         .update_status("idle-crew", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(stall_workflow_snapshot(vec![claim_crew("coder")])),
+            workflow_snapshot: Some({
+                let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+                snapshot.stall_nudges.insert("work/coder".into(), flotilla_resources::StallNudgePolicy {
+                    max_per_episode: 2,
+                    max_refusals: None,
+                    idle_grace_seconds: Some(3),
+                });
+                snapshot
+            }),
             work: BTreeMap::from([(
                 "work".into(),
                 flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),

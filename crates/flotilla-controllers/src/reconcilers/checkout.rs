@@ -414,6 +414,7 @@ where
                 }
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
                     integration: Box::new(CheckoutIntegrationStatus {
+                        head_revision: None,
                         clean: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
                             .details(vec![message.clone()])
