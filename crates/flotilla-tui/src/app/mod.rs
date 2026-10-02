@@ -126,7 +126,6 @@ pub struct TuiModel {
     pub active_repo: Option<RepoIdentity>,
     /// Per-repo, per-provider auth status from last refresh.
     /// Key: (repo_identity, provider_category, provider_name)
-    pub provider_statuses: HashMap<(RepoIdentity, String, String), ProviderStatus>,
     pub status_message: Option<String>,
     /// All known host environments indexed by canonical environment identity.
     pub hosts: HashMap<EnvironmentId, TuiHostState>,
@@ -163,7 +162,6 @@ impl TuiModel {
             project_address_state: ProjectAddressState::Unloaded,
             repo_order: order,
             active_repo: None,
-            provider_statuses: HashMap::new(),
             status_message: None,
             hosts: HashMap::new(),
             fleet_health: flotilla_protocol::FleetHealthResponse::default(),
@@ -172,6 +170,15 @@ impl TuiModel {
 
     pub fn active(&self) -> &TuiRepoModel {
         self.active_opt().expect("active() requires the active tab to be a tracked repo view")
+    }
+
+    pub fn provider_status(&self, repo_identity: &RepoIdentity, category: &str, name: &str) -> Option<ProviderStatus> {
+        self.repos
+            .get(repo_identity)?
+            .provider_health
+            .get(category)?
+            .get(name)
+            .map(|healthy| if *healthy { ProviderStatus::Ok } else { ProviderStatus::Error })
     }
 
     pub fn active_opt(&self) -> Option<&TuiRepoModel> {
@@ -743,7 +750,6 @@ impl App {
         self.views.bind_repository_keys(&repository_keys);
         self.sync_active_view();
 
-        self.model.provider_statuses.clear();
         self.model.hosts.clear();
         self.model.fleet_health = flotilla_protocol::FleetHealthResponse::default();
         self.query_tables = QueryTableCache::default();
