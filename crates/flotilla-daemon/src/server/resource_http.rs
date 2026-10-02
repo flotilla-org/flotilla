@@ -185,7 +185,7 @@ async fn write_resource_error(stream: &mut UnixStream, error: ResourceError) -> 
         ResourceError::FieldOwnership { .. } => 409,
         ResourceError::Unauthorized { .. } => 403,
         // FinalizerPending is consumed by the controller loop and cannot reach this API.
-        ResourceError::Other { .. } | ResourceError::FinalizerPending => 500,
+        ResourceError::Other { .. } | ResourceError::FinalizerPending | ResourceError::FinalizerWait { .. } => 500,
     };
     write_error(stream, status, &error.to_string()).await
 }

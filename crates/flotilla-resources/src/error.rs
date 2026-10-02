@@ -2,6 +2,33 @@ use std::{error::Error, fmt};
 
 use crate::FieldOwnershipViolation;
 
+/// Internal finalization dependencies. These are rendered into status messages,
+/// never serialized as resource state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizerWaitReason {
+    CheckoutAuthority { checkout: String, message: Option<String> },
+}
+
+impl fmt::Display for FinalizerWaitReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckoutAuthority { checkout, message } => {
+                write!(f, "teardown waiting on checkout {checkout}")?;
+                if let Some(message) = message {
+                    // Legacy checkout statuses carry preservation detail in text.
+                    // This is presentation only; wait recognition uses the enum.
+                    if let Some((_, reason)) = message.rsplit_once(" preserved: ") {
+                        write!(f, ": preserved ({reason})")?;
+                    } else {
+                        write!(f, ": {message}")?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
     NotFound {
@@ -26,6 +53,9 @@ pub enum ResourceError {
     },
     /// An asynchronous finalizer is still running; retry without marking failure.
     FinalizerPending,
+    FinalizerWait {
+        reasons: Vec<FinalizerWaitReason>,
+    },
     Other {
         message: String,
     },
@@ -87,6 +117,15 @@ impl fmt::Display for ResourceError {
                 Ok(())
             }
             Self::FinalizerPending => f.write_str("finalizer pending"),
+            Self::FinalizerWait { reasons } => {
+                for (index, reason) in reasons.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{reason}")?;
+                }
+                Ok(())
+            }
             Self::Other { message } => f.write_str(message),
         }
     }
