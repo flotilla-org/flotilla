@@ -187,7 +187,7 @@ pub use review_bundle::{
     SettlementClaimEvidence, REVIEW_BUNDLE_INDEX_FILE, REVIEW_BUNDLE_ROOT,
 };
 pub use sqlite::SqliteBackend;
-pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
+pub use status_patch::{apply_status_patch, apply_status_patch_checked, apply_status_patch_with_before_update, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
     terminal_session_attach_target, terminal_session_attach_target_with_stale_status, CrewCompletionPending, CrewMessageDelivery,
     CrewMessageSender, CrewSessionStatus, InnerCommandStatus, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,

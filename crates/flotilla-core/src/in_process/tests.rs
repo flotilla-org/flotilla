@@ -2820,6 +2820,41 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
 }
 
 #[tokio::test]
+async fn concurrent_convoy_phase_change_prevents_operator_abandonment() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(&test_meta("abandon-race"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            ..Default::default()
+        })
+        .await
+        .expect("active convoy");
+
+    let racing_convoys = convoys.clone();
+    let error = daemon
+        .abandon_convoy_internal_with_hook("flotilla", "abandon-race", "operator abandons", None, || async move {
+            let current = racing_convoys.get("abandon-race").await.expect("convoy before concurrent completion");
+            let mut status = current.status.expect("active status");
+            status.phase = ConvoyPhase::Landed;
+            status.message = Some("concurrent landing won".to_string());
+            racing_convoys.update_status("abandon-race", &current.metadata.resource_version, &status).await.expect("concurrent completion");
+        })
+        .await
+        .expect_err("phase change must reject abandonment");
+
+    assert_eq!(error, "convoy phase changed while abandonment was being applied; retry the command");
+    let current = convoys.get("abandon-race").await.expect("convoy after race");
+    let status = current.status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert_eq!(status.message.as_deref(), Some("concurrent landing won"));
+}
+
+#[tokio::test]
 async fn gone_worktree_satisfies_teardown_gate_without_integration_observation() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");

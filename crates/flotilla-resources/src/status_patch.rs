@@ -53,6 +53,35 @@ where
             Ok((current.metadata.resource_version, current.status))
         },
         |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+        || async {},
+    )
+    .await
+}
+
+/// Apply a patch with an injected action between reading a version and writing it.
+/// This is used by callers testing a conflict and the subsequent optimistic retry.
+#[doc(hidden)]
+pub async fn apply_status_patch_with_before_update<T, F, Fut>(
+    resolver: &TypedResolver<T>,
+    name: &str,
+    patch: &T::StatusPatch,
+    before_update: F,
+) -> Result<ResourceObject<T>, ResourceError>
+where
+    T: Resource,
+    T::Status: Default,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    apply_status_patch_inner(
+        name,
+        patch,
+        || async {
+            let current = resolver.get(name).await?;
+            Ok((current.metadata.resource_version, current.status))
+        },
+        |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+        before_update,
     )
     .await
 }
@@ -81,15 +110,17 @@ where
             Ok((current.metadata.resource_version, current.status))
         },
         |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+        || async {},
     )
     .await
 }
 
-async fn apply_status_patch_inner<S, P, R, G, GFut, U, UFut>(
+async fn apply_status_patch_inner<S, P, R, G, GFut, U, UFut, B, BFut>(
     name: &str,
     patch: &P,
     mut get_current: G,
     mut update: U,
+    before_update: B,
 ) -> Result<R, ResourceError>
 where
     S: Clone + Default,
@@ -98,11 +129,17 @@ where
     GFut: Future<Output = Result<(String, Option<S>), ResourceError>>,
     U: FnMut(String, S) -> UFut,
     UFut: Future<Output = Result<R, ResourceError>>,
+    B: FnOnce() -> BFut,
+    BFut: Future<Output = ()>,
 {
+    let mut before_update = Some(before_update);
     for _ in 0..MAX_RETRIES {
         let (resource_version, current_status) = get_current().await?;
         let mut new_status = current_status.unwrap_or_default();
         patch.apply(&mut new_status);
+        if let Some(before_update) = before_update.take() {
+            before_update().await;
+        }
         match update(resource_version, new_status).await {
             Ok(updated) => return Ok(updated),
             Err(ResourceError::Conflict { .. }) => continue,
@@ -151,7 +188,7 @@ mod tests {
         ])));
         let writes = Arc::new(Mutex::new(Vec::new()));
 
-        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _>(
+        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _, _, _>(
             "counter-a",
             &CounterPatch::Increment,
             {
@@ -175,6 +212,7 @@ mod tests {
                     }
                 }
             },
+            || async {},
         )
         .await
         .expect("second attempt should succeed");
@@ -188,13 +226,14 @@ mod tests {
 
     #[tokio::test]
     async fn returns_conflict_after_retry_budget_is_exhausted() {
-        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _>(
+        let result = super::apply_status_patch_inner::<CounterStatus, _, CounterStatus, _, _, _, _, _, _>(
             "counter-b",
             &CounterPatch::Increment,
             || async { Ok(("1".to_string(), Some(CounterStatus { value: 1, note: None }))) },
             |_resource_version: String, _status: CounterStatus| async {
                 Err(ResourceError::conflict("counter-b", "stale resourceVersion"))
             },
+            || async {},
         )
         .await
         .expect_err("conflicts should exhaust retry budget");
