@@ -1946,6 +1946,7 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
 
     // Empty through repeated and conflicting projects, missing project refs,
     // all relationship kinds, remote/local origins, and role disagreement.
+    // Convoy project 3 means no reference; roles always name a project in 0..=2.
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let with_role = tc.draw(gs::booleans());
     let source = IssueSource { service: "github".into(), scope: "org/repo".into() };
