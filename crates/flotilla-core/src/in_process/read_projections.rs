@@ -6,14 +6,25 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use flotilla_manifest::{
+    keys::{
+        KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
+        KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
+        KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE,
+        KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
+    },
+    projection::change_request_facts,
+    wire::MetadataValue,
+};
 use flotilla_protocol::{
+    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
     ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
     ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
     HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
-    ViewAddress,
+    IssueSource, Subject, SubjectKind, ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -778,26 +789,35 @@ impl ReadProjections<'_> {
         }
         let change_request_objects =
             selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
+        // Match the shared catalog: any linked landed convoy makes a merged
+        // request closed, even when the convoy being explained is still live.
+        let landed_subjects = convoy_sources
+            .items
+            .iter()
+            .filter(|source| source.object.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed))
+            .flat_map(|source| convoy_subject_rows(&source.object, &reference_context))
+            .map(|row| row.subject)
+            .collect::<BTreeSet<_>>();
+        let observations_by_subject = selected_change_requests
+            .values()
+            .map(|source| {
+                let spec = &source.object.spec;
+                (
+                    Subject {
+                        kind: SubjectKind::ChangeRequest,
+                        source: IssueSource { service: spec.service.clone(), scope: spec.scope.clone() },
+                        id: spec.number.to_string(),
+                    },
+                    source.object.status.as_ref(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let subject_observations = subjects
             .iter()
             .filter(|row| row.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest)
             .map(|row| {
-                let status = selected_change_requests
-                    .values()
-                    .find(|source| {
-                        let spec = &source.object.spec;
-                        spec.service == row.subject.source.service
-                            && spec.scope == row.subject.source.scope
-                            && spec.number.to_string() == row.subject.id
-                    })
-                    .and_then(|source| source.object.status.as_ref());
-                explain_subject_observation(
-                    &row.subject,
-                    status,
-                    convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed),
-                    now,
-                    change_request_stale_after,
-                )
+                let status = observations_by_subject.get(&row.subject).copied().flatten();
+                explain_subject_observation(&row.subject, status, landed_subjects.contains(&row.subject), now, change_request_stale_after)
             })
             .collect();
         let expected_change_request_leaves = expected_change_request_leaves(&convoy, &selected_checkouts)
@@ -1151,23 +1171,12 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
 }
 
 fn explain_subject_observation(
-    subject: &flotilla_protocol::Subject,
+    subject: &Subject,
     status: Option<&flotilla_resources::ChangeRequestStatus>,
     landed: bool,
     now: DateTime<Utc>,
     change_request_stale_after: std::time::Duration,
-) -> flotilla_protocol::commands::ExplainedSubjectObservation {
-    use flotilla_manifest::{
-        keys::{
-            KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
-            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
-            KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE,
-            KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
-        },
-        projection::change_request_facts,
-        wire::MetadataValue,
-    };
-    use flotilla_protocol::commands::{ExplainedSubjectFact, ExplainedSubjectObservation};
+) -> ExplainedSubjectObservation {
     let facts = change_request_facts(status, landed).into_iter().collect::<BTreeMap<_, _>>();
     let text = |key| match facts.get(key) {
         Some(MetadataValue::Text(value)) => Some(value.clone()),
@@ -1179,7 +1188,8 @@ fn explain_subject_observation(
         let at = observed_at.as_deref().and_then(|at| DateTime::parse_from_rfc3339(at).ok()).map(|at| at.with_timezone(&Utc));
         ExplainedSubjectFact { value: text(key), observed_at, freshness: observed_freshness(at, now, change_request_stale_after) }
     };
-    // Readiness depends on every input, so its age is the oldest input age.
+    // Unknown observations retain timestamps and count toward the oldest input age,
+    // matching readiness's waiting state for incomplete evidence.
     let readiness_at = status.map(|status| {
         [
             status.state.observed_at,
@@ -1727,6 +1737,9 @@ mod tests {
             status.checks.observed_at = now - ChronoDuration::seconds(age);
             let observation =
                 explain_subject_observation(&subject, (!missing).then_some(&status), false, now, std::time::Duration::from_secs(60));
+            // The JSON explain wire shape round-trips every generated value and age.
+            let json = serde_json::to_value(&observation).expect("encode observation");
+            assert_eq!(serde_json::from_value::<ExplainedSubjectObservation>(json).expect("decode observation"), observation);
             assert_eq!(observation.subject, subject);
             assert_eq!(
                 observation.state.value.as_deref(),
@@ -1803,11 +1816,27 @@ mod tests {
             }
             requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("status");
         }
+        let convoys = fixture.backend.using::<ResourceConvoy>("flotilla");
+        let landed = convoys
+            .create(
+                &InputMeta::builder().name("previous".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review".to_string()).subjects(vec![declared[1].clone()]).build(),
+            )
+            .await
+            .expect("linked convoy");
+        convoys
+            .update_status(&landed.metadata.name, &landed.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landed,
+                ..Default::default()
+            })
+            .await
+            .expect("landed");
         let explanation = fixture.projections().explain_convoy("flotilla", "subjects").await.expect("explain");
         assert_eq!(explanation.subject_observations.len(), 3);
         assert_eq!(explanation.subject_observations[0].state.value.as_deref(), Some("open"));
         assert_eq!(explanation.subject_observations[1].state.value.as_deref(), Some("merged"));
         assert_eq!(explanation.subject_observations[2].state.value, None);
+        assert_eq!(explanation.subject_observations[1].readiness.value.as_deref(), Some("closed"));
         assert!(explanation.subject_observations.iter().all(|row| row.subject.source.scope != "owner/unrelated"));
     }
 

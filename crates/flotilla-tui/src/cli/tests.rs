@@ -493,11 +493,16 @@ fn convoy_explanation_subject_observations_snapshot() {
         "decision_ledgers": [], "settlement": {"mode": "world_terminal", "satisfied": false, "unmet": []}
     }))
     .expect("explanation");
-    let fact = |value: Option<&str>, freshness| ExplainedSubjectFact { value: value.map(str::to_owned), observed_at: None, freshness };
+    let fact = |value: Option<&str>, freshness| ExplainedSubjectFact {
+        value: value.map(str::to_owned),
+        observed_at: (freshness != EvidenceFreshness::Missing).then(|| "2026-10-02T12:00:00Z".into()),
+        freshness,
+    };
     for (number, state, checks, review, readiness, freshness) in [
         (1, Some("open"), Some("pass"), Some("approved"), "ready_to_merge", EvidenceFreshness::Fresh),
         (2, Some("merged"), Some("pending"), Some("none"), "merged_not_landed", EvidenceFreshness::Stale),
         (3, None, None, None, "awaiting_review_response", EvidenceFreshness::Missing),
+        (4, None, None, None, "awaiting_review_response", EvidenceFreshness::Fresh),
     ] {
         let subject = Subject {
             kind: SubjectKind::ChangeRequest,
@@ -528,12 +533,14 @@ fn convoy_explanation_subject_observations_snapshot() {
     let output = format_convoy_explanation_human(&explanation);
     let subjects = output.split("Subjects:\n").nth(1).expect("subjects").split("\nChange requests:").next().expect("section");
     insta::assert_snapshot!(subjects, @r###"
-      produces !1, !2, !3
+      produces !1, !2, !3, !4
         !1 state=open checks=pass review=approved actionable_at_head=false readiness=ready_to_merge
         !1 https://github.com/owner/repo/pull/1
         !2 state=merged (stale) checks=pending (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
         !2 https://github.com/owner/repo/pull/2
         !3 state=unknown (missing) checks=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=awaiting_review_response (missing)
         !3 https://github.com/owner/repo/pull/3
+        !4 state=unknown checks=unknown review=unknown actionable_at_head=unknown readiness=awaiting_review_response
+        !4 https://github.com/owner/repo/pull/4
     "###);
 }
