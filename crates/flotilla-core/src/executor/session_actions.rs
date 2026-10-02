@@ -117,17 +117,16 @@ impl<'a> ReadOnlySessionActionService<'a> {
 
     async fn resolve_branch_name_issues(&self, issue_keys: &[String]) -> Vec<(String, Issue)> {
         let mut resolved = HashMap::new();
-        let missing = issue_keys;
-        if !missing.is_empty() {
+        if !issue_keys.is_empty() {
             if let Some(tracker) = self.registry.issue_provider_for(&self.issue_source) {
-                match tracker.fetch_by_ids(&self.issue_source, missing).await {
+                match tracker.fetch_by_ids(&self.issue_source, issue_keys).await {
                     Ok(fetched) => {
                         for issue in fetched {
                             resolved.insert(issue.reference.id.clone(), issue);
                         }
                     }
                     Err(error) => {
-                        warn!(%error, missing_issue_count = missing.len(), "failed to fetch missing issues for branch naming");
+                        warn!(%error, missing_issue_count = issue_keys.len(), "failed to fetch missing issues for branch naming");
                     }
                 }
             }

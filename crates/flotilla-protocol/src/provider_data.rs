@@ -377,9 +377,8 @@ pub struct Workspace {
 /// Commands use checkout/session lookup inputs; checkout observation projects this
 /// data into resources consumed by the Aggregator. This is not a snapshot stream
 /// or correlation pipeline. Providers and discovery retain their own interfaces.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProviderData {
-    #[serde(with = "crate::qualified_path::qualified_path_map")]
     pub checkouts: IndexMap<QualifiedPath, Checkout>,
     pub sessions: IndexMap<String, CloudAgentSession>,
 }
