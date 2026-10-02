@@ -2318,11 +2318,12 @@ mod tests {
         release_refresh: tokio::sync::Notify,
     }
 
-    #[derive(Default)]
+    // Test double at the GitHub token-mint HTTP boundary.
     struct SlowFlakySkillMinter {
         calls: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        first_wave: tokio::sync::Barrier,
     }
 
     #[async_trait]
@@ -2335,7 +2336,9 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if call < 6 {
+                self.first_wave.wait().await;
+            }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             if matches!(call, 0 | 2) {
                 Err(GithubAppMintError::Transient("GitHub returned HTTP 500".to_string()))
@@ -2345,6 +2348,8 @@ mod tests {
         }
     }
 
+    // Six independent stagings must enter mint concurrently, recover transient failures,
+    // fetch with distinct nonempty tokens, and clean up their own token files.
     #[tokio::test(flavor = "multi_thread")]
     async fn six_concurrent_skill_stagings_each_use_own_nonempty_token_after_slow_flaky_mints() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2372,7 +2377,12 @@ mod tests {
             })
             .await
             .expect("credential declaration");
-        let minter = Arc::new(SlowFlakySkillMinter::default());
+        let minter = Arc::new(SlowFlakySkillMinter {
+            calls: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            first_wave: tokio::sync::Barrier::new(6),
+        });
         let store = Arc::new(CredentialStore::new_with_github_app_minter(
             backend,
             "flotilla",
@@ -2386,34 +2396,39 @@ mod tests {
             ("HOME".to_string(), temp.path().to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV.to_string(), skills.to_string_lossy().into_owned()),
         ])))));
-        let results = futures::future::join_all((0..6).map(|index| {
-            let store = Arc::clone(&store);
-            let registry = Arc::clone(&registry);
-            let mut runner = promisor_runner(temp.path());
-            runner.config_base = temp.path().join(format!("config-{index}"));
-            tokio::spawn(async move {
-                let token_file = store
-                    .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
-                    .await
-                    .map_err(|error| format!("skill source private-skills credential github-skills-fork mint failed: {error}"))?;
-                let outcome = registry
-                    .stage_test_skills(
-                        &format!("crew-{index}"),
-                        &BTreeSet::from(["claude-code".to_string()]),
-                        &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
-                        &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
-                        &runner,
-                    )
-                    .await;
-                assert!(!token_file.exists(), "crew {index} must clean its own token");
-                outcome
-            })
-        }))
-        .await;
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::join_all((0..6).map(|index| {
+                let store = Arc::clone(&store);
+                let registry = Arc::clone(&registry);
+                let mut runner = promisor_runner(temp.path());
+                runner.config_base = temp.path().join(format!("config-{index}"));
+                tokio::spawn(async move {
+                    let token_file = store
+                        .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
+                        .await
+                        .map_err(|error| format!("skill source private-skills credential github-skills-fork mint failed: {error}"))?;
+                    let outcome = registry
+                        .stage_test_skills(
+                            &format!("crew-{index}"),
+                            &BTreeSet::from(["claude-code".to_string()]),
+                            &[("CLAUDE_CONFIG_DIR".to_string(), runner.config_base.join("claude").to_string_lossy().into_owned())],
+                            &BTreeMap::from([("private-skills".to_string(), token_file.clone())]),
+                            &runner,
+                        )
+                        .await;
+                    assert!(!token_file.exists(), "crew {index} must clean its own token");
+                    outcome
+                })
+            })),
+        )
+        .await
+        .expect("all six stagings must enter mint concurrently and finish");
         for result in results {
             result.expect("staging task").expect("retryable mints should recover and stage");
         }
-        assert!(minter.max_in_flight.load(Ordering::SeqCst) >= 5, "minting must overlap across at least five stagings");
+        assert_eq!(minter.max_in_flight.load(Ordering::SeqCst), 6, "all six initial mints must overlap");
+        assert_eq!(minter.calls.load(Ordering::SeqCst), 8, "two transient failures must each be retried");
         let tokens = std::fs::read_to_string(temp.path().join("fetches.tokens")).expect("captured fetch tokens");
         let tokens = tokens.lines().collect::<BTreeSet<_>>();
         assert_eq!(tokens.len(), 6, "each fetch must use its own nonempty token");
