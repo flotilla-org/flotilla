@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_core::checkout_integration::{
-    checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL,
+use flotilla_core::{
+    checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
+    config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
 };
 use flotilla_resources::{
     apply_status_patch,
@@ -145,7 +146,7 @@ impl<R> CheckoutReconciler<R> {
             clock,
             backend: backend.clone(),
             finalizers: Mutex::new(BTreeMap::new()),
-            background_removal_limit: NonZeroUsize::new(2).expect("positive background removal limit"),
+            background_removal_limit: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
         }
     }
 

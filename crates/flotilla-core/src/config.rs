@@ -346,6 +346,8 @@ pub struct DaemonConfig {
     pub checkout_removal_concurrency: NonZeroUsize,
 }
 
+pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(2).expect("default removal limit is positive");
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -370,7 +372,7 @@ fn default_checkout_archive_retention_days() -> u64 {
 }
 
 fn default_checkout_removal_concurrency() -> NonZeroUsize {
-    NonZeroUsize::new(2).expect("default removal limit is positive")
+    DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY
 }
 
 fn deserialize_checkout_removal_concurrency<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<NonZeroUsize, D::Error> {

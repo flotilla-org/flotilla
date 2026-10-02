@@ -26,7 +26,7 @@ use flotilla_core::{
         checkout_path_from_status_and_spec, convoy_change_request_id_for_checkout, inspect_checkout_integration,
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
-    config::ConfigStore,
+    config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -1467,6 +1467,8 @@ impl ControllerRuntimeState {
         stage_local_rustc_wrapper_async(self.config.state_dir().as_path().to_path_buf()).await
     }
 
+    /// Construct an unstarted runtime with default limits. Consuming builders
+    /// configure it before it is shared with controller tasks through `Arc`.
     fn new(
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
@@ -1495,8 +1497,8 @@ impl ControllerRuntimeState {
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
             archive_catalog_lock: Mutex::new(()),
-            checkout_removal_concurrency: NonZeroUsize::new(2).expect("positive default removal limit"),
-            checkout_removals: Semaphore::new(2),
+            checkout_removal_concurrency: DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
+            checkout_removals: Semaphore::new(DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY.get()),
         }
     }
 
