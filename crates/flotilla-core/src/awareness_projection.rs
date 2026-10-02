@@ -81,7 +81,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             AwarenessEntry::builder()
                 .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.resource.name))
                 .kind(AwarenessKind::Convoy)
-                .label(convoy_label(convoy))
+                .label(convoy.name.clone())
                 .state(convoy_state(convoy.phase, convoy.initializing))
                 .phase(AwarenessPhase::Convoy(convoy.phase))
                 .as_of(as_of)
@@ -371,15 +371,6 @@ fn project_ref_key(default_namespace: &str, value: &str) -> GroupKey {
     GroupKey::scoped(QueryScope::new(default_namespace, value))
 }
 
-fn convoy_label(convoy: &ConvoyRow) -> String {
-    let subjects = convoy.subjects.iter().map(|entry| entry.short.as_str()).collect::<Vec<_>>();
-    if subjects.is_empty() {
-        convoy.name.clone()
-    } else {
-        format!("{} · {}", convoy.name, subjects.join(", "))
-    }
-}
-
 fn convoy_state(phase: ConvoyPhase, initializing: bool) -> AwarenessState {
     if initializing {
         return AwarenessState::Waiting;
@@ -532,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn composed_labels_retain_granular_convoy_annotations() {
+    fn convoy_labels_describe_only_the_convoy() {
         let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
         convoy.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
             subject: flotilla_protocol::Subject {
@@ -553,7 +544,7 @@ mod tests {
         });
 
         let convoy = nodes[0].entries.iter().find(|entry| entry.kind == AwarenessKind::Convoy).expect("convoy entry");
-        assert_eq!(convoy.label, "ship-it · flotilla!1044");
+        assert_eq!(convoy.label, "ship-it");
         assert_eq!(convoy.annotations.get("flotilla.convoy.name").map(String::as_str), Some("ship-it"));
         assert!(!convoy.annotations.contains_key("change_request.number"));
     }

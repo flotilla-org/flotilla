@@ -198,12 +198,26 @@ struct MockDaemon {
     tx: broadcast::Sender<DaemonEvent>,
     bootstrap: Mutex<Vec<DaemonEvent>>,
     subscribe_calls: AtomicUsize,
+    resource_lists: Mutex<HashMap<(String, String), flotilla_protocol::ResourceReadEnvelope>>,
+    watch_commands: Mutex<HashMap<(String, String), u64>>,
+    watch_starts: AtomicUsize,
+    cancelled: Mutex<Vec<u64>>,
+    list_failure: Mutex<Option<String>>,
 }
 
 impl MockDaemon {
     fn new(bootstrap: Vec<DaemonEvent>) -> Self {
         let (tx, _) = broadcast::channel(64);
-        Self { tx, bootstrap: Mutex::new(bootstrap), subscribe_calls: AtomicUsize::new(0) }
+        Self {
+            tx,
+            bootstrap: Mutex::new(bootstrap),
+            subscribe_calls: AtomicUsize::new(0),
+            resource_lists: Mutex::new(HashMap::new()),
+            watch_commands: Mutex::new(HashMap::new()),
+            watch_starts: AtomicUsize::new(0),
+            cancelled: Mutex::new(Vec::new()),
+            list_failure: Mutex::new(None),
+        }
     }
 }
 
@@ -217,15 +231,43 @@ impl DaemonHandle for MockDaemon {
         Ok(vec![])
     }
 
-    async fn execute(&self, _command: Command) -> Result<u64, String> {
-        Err("mock".into())
+    async fn execute(&self, command: Command) -> Result<u64, String> {
+        let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, cursor, .. } = command.action else {
+            return Err("mock".into());
+        };
+        assert!(include_replicas);
+        assert!(cursor.is_some(), "watch resumes from the list cursor");
+        let mut commands = self.watch_commands.lock().expect("watch commands");
+        let id = self.watch_starts.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        commands.insert((namespace, kind), id);
+        Ok(id)
     }
 
-    async fn execute_query(&self, _command: Command, _session_id: uuid::Uuid) -> Result<CommandValue, String> {
-        Err("mock".into())
+    async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        let flotilla_protocol::CommandAction::QueryResourceList { namespace, kind, include_replicas } = command.action else {
+            return Err("mock".into());
+        };
+        assert!(include_replicas);
+        if self.list_failure.lock().expect("list failure").as_ref() == Some(&kind) {
+            return Err("transient list failure".into());
+        }
+        if let Some(list) = self.resource_lists.lock().expect("resource lists").get(&(namespace.clone(), kind.clone())).cloned() {
+            return Ok(CommandValue::ResourceRead(Box::new(list)));
+        }
+        Ok(CommandValue::ResourceRead(Box::new(
+            flotilla_protocol::ResourceReadEnvelope::builder()
+                .api_version("flotilla.work/v1".into())
+                .resource_kind(kind.clone())
+                .plural(kind)
+                .namespace(namespace)
+                .cursor(flotilla_protocol::ResourceCursor::from_position("1", None))
+                .records(vec![])
+                .build(),
+        )))
     }
 
-    async fn cancel(&self, _command_id: u64) -> Result<(), String> {
+    async fn cancel(&self, command_id: u64) -> Result<(), String> {
+        self.cancelled.lock().expect("cancelled commands").push(command_id);
         Ok(())
     }
 
@@ -423,4 +465,331 @@ fn project_membership_full_refresh_and_delta_retract_without_activity() {
         Applied::Updated
     );
     assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == MetadataTarget::Entity(relation.clone())));
+}
+
+#[test]
+fn connector_projects_replicated_observations_and_removes_deleted_records() {
+    use flotilla_protocol::ResourceRecordType;
+    let mut state = ConnectorState::default();
+    let envelope = subject_envelope();
+    let convoy = linked_subject_convoy();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![convoy] },
+        state: Default::default(),
+    })));
+    state.apply_resource_records(&envelope).expect("replicated records");
+    let cr = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == cr));
+    let mut deleted = envelope;
+    deleted.records[0].record_type = ResourceRecordType::Deleted;
+    deleted.records[0].object = Some(serde_json::json!({"metadata": {"name": "cr-42", "namespace": "flotilla"}}));
+    state.apply_resource_records(&deleted).expect("deletion");
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == cr && patch.unset.contains(&"flotilla.subject_of".to_string())));
+}
+
+fn subject_envelope() -> flotilla_protocol::ResourceReadEnvelope {
+    use flotilla_protocol::{ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType};
+    ResourceReadEnvelope::builder()
+        .api_version("flotilla.work/v1".into())
+        .resource_kind("ChangeRequest".into())
+        .plural("changerequests".into())
+        .namespace("flotilla".into())
+        .cursor(ResourceCursor::from_position("1", None))
+        .records(vec![ResourceReadRecord {
+            record_type: ResourceRecordType::Current,
+            provenance: ResourceRecordProvenance::Replica {
+                origin_root: flotilla_protocol::NodeId::new("kiwi"),
+                last_synced_at: "2026-10-02T12:00:00Z".into(),
+            },
+            object: Some(serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"ChangeRequest",
+                "metadata":{"name":"cr-42", "namespace":"flotilla", "resourceVersion":"1", "creationTimestamp":"2026-10-02T12:00:00Z"},
+                "spec":{"service":"github.com", "scope":"org/flotilla", "number":42, "observing_authority":"kiwi"},
+                "status":{"state":{"value":"open", "observed_at":"2026-10-02T12:00:00Z"},
+                    "head_sha":{"value":null,"observed_at":"2026-10-02T12:00:00Z"},
+                    "checks":{"value":null,"observed_at":"2026-10-02T12:00:00Z"},
+                    "mergeable":{"value":null,"observed_at":"2026-10-02T12:00:00Z"},
+                    "review":{"actionable_at_head":{"value":null,"observed_at":"2026-10-02T12:00:00Z"}}}})),
+        }])
+        .build()
+}
+
+fn linked_subject_convoy() -> ConvoyRow {
+    ConvoyRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "ship-it").on_host(HostName::new("kiwi")))
+        .name("ship-it")
+        .workflow_ref("dev")
+        .phase(flotilla_protocol::result_set::ConvoyPhase::Active)
+        .subjects(vec![flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "org/flotilla".into() },
+                id: "42".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            declared: false,
+            short: "flotilla!42".into(),
+            url: None,
+            repository_key: None,
+        }])
+        .build()
+}
+
+#[tokio::test]
+async fn connector_lists_replicated_subjects_and_publishes_watch_updates() {
+    let daemon = Arc::new(MockDaemon::new(vec![DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+        state: Default::default(),
+    }))]));
+    daemon.resource_lists.lock().expect("resource lists").insert(("flotilla".into(), "changerequests".into()), subject_envelope());
+    let sink = Arc::new(RecordingSink::new());
+    let handle = tokio::spawn(run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(60)));
+    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    wait_until(|| {
+        sink.recorded().iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.change_request.readiness"))
+    })
+    .await;
+    let id = daemon.watch_commands.lock().expect("watch commands")[&("flotilla".into(), "changerequests".into())];
+    let mut changed = subject_envelope();
+    changed.records[0].record_type = flotilla_protocol::ResourceRecordType::Modified;
+    changed.records[0].object.as_mut().expect("object")["status"]["state"]["value"] = serde_json::json!("merged");
+    daemon
+        .tx
+        .send(DaemonEvent::CommandStepUpdate {
+            command_id: id,
+            node_id: flotilla_protocol::NodeId::new("kiwi"),
+            repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+            repo: None,
+            step_index: 0,
+            step_count: 1,
+            description: "observe change request".into(),
+            status: flotilla_protocol::StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(Box::new(changed))) },
+        })
+        .expect("watch update");
+    wait_until(|| {
+        sink.recorded().iter().any(|patch| {
+            patch.target == target
+                && patch
+                    .set
+                    .get("flotilla.change_request.readiness")
+                    .is_some_and(|update| update.value == MetadataValue::text("merged_not_landed"))
+        })
+    })
+    .await;
+    handle.abort();
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn connector_uses_project_aliases_for_previous_generation_remote_repositories() {
+    use flotilla_resources::{
+        Forge, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+        Repository, RepositorySpec, Resource, ResourceBackend,
+    };
+    async fn envelope<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> flotilla_protocol::ResourceReadEnvelope {
+        let object = backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("resource");
+        flotilla_protocol::ResourceReadEnvelope::builder()
+            .api_version("flotilla.work/v1".into())
+            .resource_kind(T::API_PATHS.kind.into())
+            .plural(T::API_PATHS.plural.into())
+            .namespace("flotilla".into())
+            .cursor(flotilla_protocol::ResourceCursor::from_position("1", None))
+            .records(vec![flotilla_protocol::ResourceReadRecord {
+                record_type: flotilla_protocol::ResourceRecordType::Current,
+                provenance: flotilla_protocol::ResourceRecordProvenance::Local { node_id: flotilla_protocol::NodeId::new("kiwi") },
+                object: Some(serde_json::to_value(object.to_k8s_object()).expect("object")),
+            }])
+            .build()
+    }
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let spec = RepositorySpec::remote("https://github.com/org/flotilla").expect("remote repository");
+    let repository = envelope::<Repository>(&backend, &spec.key().0, &spec).await;
+    let forge = envelope::<Forge>(
+        &backend,
+        "github",
+        &ForgeSpec::builder()
+            .forge_id("github".into())
+            .kind(ForgeKind::Github)
+            .hosts(["github.com".into()].into_iter().collect())
+            .https_url("https://github.com".into())
+            .git_ssh_host("github.com".into())
+            .build(),
+    )
+    .await;
+    let project = envelope::<Project>(
+        &backend,
+        "flotilla",
+        &ProjectSpec::builder()
+            .display_name("Flotilla".into())
+            .default_workflow_ref("dev".into())
+            .repositories(vec![ProjectRepositorySpec::builder()
+                .repo(spec.key())
+                .alias("f".into())
+                .roles([ProjectRepositoryRole::Code].into_iter().collect())
+                .build()])
+            .build(),
+    )
+    .await;
+    let mut state = ConnectorState::default();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+        state: Default::default(),
+    })));
+    for envelope in [subject_envelope(), forge, repository, project] {
+        state.apply_resource_records(&envelope).expect("apply resource");
+    }
+    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    let patches = state.rebuild(&mint());
+    let facts = patches.iter().find(|patch| patch.target == target).expect("request entity");
+    assert_eq!(facts.set["display.label"].value, MetadataValue::text("f!42"));
+}
+
+#[test]
+fn connector_skips_malformed_records_without_losing_valid_observations() {
+    let mut state = ConnectorState::default();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+        state: Default::default(),
+    })));
+    let mut envelope = subject_envelope();
+    let mut malformed = envelope.records[0].clone();
+    let object = malformed.object.as_mut().expect("object");
+    object["metadata"]["name"] = serde_json::json!("malformed");
+    object.as_object_mut().expect("resource").remove("spec");
+    envelope.records.insert(0, malformed);
+    state.apply_resource_records(&envelope).expect("bad record does not discard the good record");
+    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    assert!(state.rebuild(&mint()).iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.change_request.state")));
+}
+
+#[test]
+fn connector_orders_replica_observations_by_time_then_origin_root() {
+    use flotilla_protocol::{NodeId, ResourceRecordProvenance};
+    fn observation(root: &str, stamp: &str, status: &str, local: bool) -> flotilla_protocol::ResourceReadEnvelope {
+        fn stamps(value: &mut serde_json::Value, stamp: &str) {
+            if let Some(fields) = value.as_object_mut() {
+                for (key, value) in fields {
+                    if key == "observed_at" {
+                        *value = serde_json::json!(stamp);
+                    } else {
+                        stamps(value, stamp);
+                    }
+                }
+            }
+        }
+        let mut envelope = subject_envelope();
+        let record = &mut envelope.records[0];
+        record.provenance = if local {
+            ResourceRecordProvenance::Local { node_id: NodeId::new(root) }
+        } else {
+            ResourceRecordProvenance::Replica { origin_root: NodeId::new(root), last_synced_at: "2026-10-02T12:00:00Z".into() }
+        };
+        let object = record.object.as_mut().expect("object");
+        stamps(&mut object["status"], stamp);
+        object["status"]["state"]["value"] = serde_json::json!(status);
+        object["metadata"]["resourceVersion"] = serde_json::json!(if local { "999" } else { "1" });
+        envelope
+    }
+    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    for alpha_stamp in ["2026-10-02T14:00:00+03:00", "2026-10-02T12:00:00.000+00:00"] {
+        for local_zeta in [false, true] {
+            let mut state = ConnectorState::default();
+            state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+                seq: 1,
+                rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+                state: Default::default(),
+            })));
+            for record in
+                [observation("zeta", "2026-10-02T12:00:00Z", "open", local_zeta), observation("alpha", alpha_stamp, "closed", !local_zeta)]
+            {
+                state.apply_resource_records(&record).expect("apply observation");
+            }
+            let patches = state.rebuild(&mint());
+            assert_eq!(
+                patches.iter().find(|patch| patch.target == target).expect("request").set["flotilla.change_request.state"].value,
+                MetadataValue::text("open"),
+                "same root wins regardless of timestamp spelling and which root is local"
+            );
+            let mut deleted = observation("zeta", "2026-10-02T12:00:00Z", "open", local_zeta);
+            deleted.records[0].record_type = flotilla_protocol::ResourceRecordType::Deleted;
+            state.apply_resource_records(&deleted).expect("delete one root");
+            let patches = state.rebuild(&mint());
+            assert_eq!(
+                patches.iter().find(|patch| patch.target == target).expect("surviving root").set["flotilla.change_request.state"].value,
+                MetadataValue::text("closed")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn connector_watch_end_and_error_cancel_siblings_before_snapshot_restart() {
+    for result in [CommandValue::Ok, CommandValue::Error { message: "transient watch error".into() }] {
+        let daemon = Arc::new(MockDaemon::new(vec![convoys_set(1)]));
+        let sink = Arc::new(RecordingSink::new());
+        let handle = tokio::spawn(run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(30)));
+        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 5).await;
+        let command_id = daemon.watch_commands.lock().expect("watches")[&("flotilla".into(), "changerequests".into())];
+        daemon
+            .tx
+            .send(DaemonEvent::CommandFinished {
+                command_id,
+                node_id: flotilla_protocol::NodeId::new("kiwi"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+                repo: None,
+                result,
+            })
+            .expect("finish watch");
+        let error = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("connector returns")
+            .expect("task")
+            .expect_err("snapshot restart");
+        assert!(error.contains("watch"));
+        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 4).await;
+        let restarted = tokio::spawn(run_connector(daemon.clone(), sink, Arc::new(mint()), Duration::from_secs(30)));
+        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 10).await;
+        restarted.abort();
+        let _ = restarted.await;
+        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 9).await;
+    }
+}
+
+#[tokio::test]
+async fn connector_partial_list_failure_cancels_admitted_watches_before_retry() {
+    let daemon = Arc::new(MockDaemon::new(vec![convoys_set(1)]));
+    *daemon.list_failure.lock().expect("list failure") = Some("forges".into());
+    let sink = Arc::new(RecordingSink::new());
+    let error = run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(30)).await.expect_err("list fails");
+    assert!(error.contains("transient list failure"));
+    assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), 2);
+    wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 2).await;
+    *daemon.list_failure.lock().expect("list failure") = None;
+    let handle = tokio::spawn(run_connector(daemon.clone(), sink, Arc::new(mint()), Duration::from_secs(30)));
+    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 7).await;
+    handle.abort();
+    let _ = handle.await;
+    wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 7).await;
+}
+
+#[test]
+fn connector_clock_expires_landed_subjects_without_resource_updates() {
+    let mut state = ConnectorState::default();
+    let mut convoy = linked_subject_convoy();
+    convoy.phase = flotilla_protocol::result_set::ConvoyPhase::Landed;
+    convoy.finished_at = Some("2026-10-01T12:00:00Z".parse().expect("landing"));
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![convoy] },
+        state: Default::default(),
+    })));
+    state.apply_resource_records(&subject_envelope()).expect("observation");
+    let target = MetadataTarget::Entity(entity::change_request("github.com", "org/flotilla", "42"));
+    let before = state.rebuild_at(&mint(), "2026-10-02T11:59:59Z".parse().expect("within window"));
+    assert!(before.iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.subject_of")));
+    let after = state.rebuild_at(&mint(), "2026-10-02T12:00:00Z".parse().expect("boundary"));
+    assert!(after.iter().any(|patch| patch.target == target && patch.unset.contains(&"flotilla.subject_of".into())));
 }
