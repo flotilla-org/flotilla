@@ -16,13 +16,13 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
-    expected_checkout_refs, repository_display_labels, Checkout as ResourceCheckout, Clock, ConditionValue, Convoy as ResourceConvoy,
-    ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, Forge, FulfilmentGrant,
-    FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, ManifestRoot, Project,
-    ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, SettlementMode,
-    TerminalAttentionState, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate, CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, Checkout as ResourceCheckout, Clock, ConditionValue,
+    Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, Forge,
+    FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
+    ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use tracing::warn;
 
@@ -384,38 +384,43 @@ impl ReadProjections<'_> {
             .collect::<Vec<_>>();
         let repository_slugs = repository_display_labels(repositories.iter().map(|(key, repository)| (key, &repository.spec)));
 
-        let mut entries = projects
-            .into_iter()
-            .map(|project| {
-                let conflicts = project.metadata.merge.as_ref().map(|merge| merge.conflicts.keys().cloned().collect()).unwrap_or_default();
-                let mut project_repositories = BTreeMap::<RepositoryKey, BTreeSet<String>>::new();
-                for repository in project.spec.repositories {
-                    if let Some(subpath) = repository.subpath {
-                        project_repositories.entry(repository.repo).or_default().insert(subpath);
-                    } else {
-                        project_repositories.entry(repository.repo).or_default();
-                    }
+        let mut entries = Vec::new();
+        for project in projects {
+            let issue_sources =
+                match resolve_project_issue_sources(&backend.including_replicas::<Repository>(namespace), &project.spec).await {
+                    IssueSourceResolution::Available { bindings } => bindings.into_iter().map(|binding| binding.source).collect(),
+                    IssueSourceResolution::Unavailable(_) => Vec::new(),
+                };
+            let conflicts = project.metadata.merge.as_ref().map(|merge| merge.conflicts.keys().cloned().collect()).unwrap_or_default();
+            let mut project_repositories = BTreeMap::<RepositoryKey, BTreeSet<String>>::new();
+            for repository in project.spec.repositories {
+                if let Some(subpath) = repository.subpath {
+                    project_repositories.entry(repository.repo).or_default().insert(subpath);
+                } else {
+                    project_repositories.entry(repository.repo).or_default();
                 }
-                let repositories = project_repositories
-                    .into_iter()
-                    .map(|(key, subpaths)| ProjectListRepository {
-                        slug: repository_slugs.get(&key).cloned(),
-                        key,
-                        subpaths: subpaths.into_iter().collect(),
-                    })
-                    .collect::<Vec<_>>();
+            }
+            let repositories = project_repositories
+                .into_iter()
+                .map(|(key, subpaths)| ProjectListRepository {
+                    slug: repository_slugs.get(&key).cloned(),
+                    key,
+                    subpaths: subpaths.into_iter().collect(),
+                })
+                .collect::<Vec<_>>();
+            entries.push(
                 ProjectListEntry::builder()
                     .namespace(project.metadata.namespace.clone())
                     .name(project.metadata.name.clone())
                     .display_name(project.spec.display_name)
                     .address(ViewAddress::Project { namespace: project.metadata.namespace, name: project.metadata.name })
                     .repositories(repositories)
-                    .maybe_issue_source(project.spec.issue_source_bindings.first().map(|binding| binding.source.clone()))
+                    .issue_sources(issue_sources)
                     .default_workflow_ref(project.spec.default_workflow_ref)
                     .conflicts(conflicts)
-                    .build()
-            })
-            .collect::<Vec<_>>();
+                    .build(),
+            );
+        }
         entries.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
         Ok(ProjectListResponse { projects: entries })
     }
@@ -1148,6 +1153,34 @@ mod tests {
             self.registry.publish_peer_summary(summary, &|_| {}).await;
             assert_eq!(self.registry.host_name_for_node(&NodeId::new(node_id)).await, Some(HostName::new(host_name)));
         }
+    }
+
+    #[tokio::test]
+    async fn project_list_summarizes_resolved_issue_bindings() {
+        let fixture = ProjectionFixture::new();
+        let excluded = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "old/repo".into() };
+        let active = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "new/repo".into() };
+        let second = flotilla_protocol::IssueSource { service: "https://gitlab.com".into(), scope: "other/repo".into() };
+        fixture
+            .backend
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("sample".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Sample".to_string())
+                    .default_workflow_ref("single-agent".to_string())
+                    .issue_source_bindings(vec![
+                        flotilla_resources::IssueSourceBindingSpec::builder().source(excluded).exclude(true).build(),
+                        flotilla_resources::IssueSourceBindingSpec::builder().source(active.clone()).alias("new".to_string()).build(),
+                        flotilla_resources::IssueSourceBindingSpec::builder().source(second.clone()).alias("other".to_string()).build(),
+                    ])
+                    .build(),
+            )
+            .await
+            .expect("project");
+
+        let response = ReadProjections::list_projects(&fixture.backend, "flotilla").await.expect("project list");
+        assert_eq!(response.projects[0].issue_sources, vec![active, second]);
     }
 
     #[tokio::test]

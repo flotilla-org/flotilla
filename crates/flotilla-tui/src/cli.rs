@@ -351,11 +351,11 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         } else {
             format!("{repository_count} repositories")
         };
-        let issue_source = project
-            .issue_source
-            .as_ref()
-            .map(|source| format!("{} / {}", source.service.trim_end_matches('/'), source.scope))
-            .unwrap_or_else(|| "-".to_string());
+        let issue_source = match project.issue_sources.as_slice() {
+            [] => "-".to_string(),
+            [source] => format!("{} / {}", source.service.trim_end_matches('/'), source.scope),
+            sources => format!("{} sources", sources.len()),
+        };
         table.add_row(vec![
             Cell::new(format!("{}/{}", project.namespace, project.name)),
             Cell::new(&project.display_name),

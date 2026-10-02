@@ -9,6 +9,36 @@ use flotilla_protocol::{
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
 
 #[test]
+fn project_list_displays_zero_one_and_multiple_resolved_issue_sources() {
+    use flotilla_protocol::{IssueSource, ProjectListEntry, ProjectListResponse, ViewAddress};
+
+    let source = IssueSource { service: "https://github.com".into(), scope: "team/one".into() };
+    let entry = |name: &str, issue_sources: Vec<IssueSource>| {
+        ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name(name.to_string())
+            .display_name(name.to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: name.into() })
+            .repositories(vec![])
+            .issue_sources(issue_sources)
+            .default_workflow_ref("single-agent".to_string())
+            .build()
+    };
+    let response = ProjectListResponse {
+        projects: vec![
+            entry("none", vec![]),
+            entry("one", vec![source.clone()]),
+            entry("many", vec![source, IssueSource { service: "https://gitlab.com".into(), scope: "team/two".into() }]),
+        ],
+    };
+
+    let output = super::format_project_list_human(&response);
+    assert!(output.lines().any(|line| line.contains("flotilla/none") && line.contains("┆ - ")), "{output}");
+    assert!(output.contains("https://github.com / team/one"), "{output}");
+    assert!(output.contains("2 sources"), "{output}");
+}
+
+#[test]
 fn crew_follow_up_result_tells_the_crew_to_complete_again() {
     let output = format_command_result(&CommandValue::CrewFollowUpDelivered);
     assert!(output.contains("Completion received"));
