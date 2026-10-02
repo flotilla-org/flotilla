@@ -969,6 +969,7 @@ fn spawn_startup_restoration(restoration: StartupRestoration) -> JoinHandle<()> 
             || async {
                 // A panic must not silently lose environment/credential recovery.
                 // Owned controller handles are aborted before supervision retries.
+                // Each retry repeats the whole restoration, including the sweep.
                 std::panic::AssertUnwindSafe(restoration.run())
                     .catch_unwind()
                     .await
