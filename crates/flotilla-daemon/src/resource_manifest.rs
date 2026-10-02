@@ -494,6 +494,9 @@ impl ResourceManifestReconciler {
                                 return Err(format!("{identity}: adopt resolution changed while reconciling"));
                             }
                             self.adopt_live_spec(path, identity, &refreshed).await?;
+                            // The source may already be replaced if verification below fails.
+                            // The claimed token then records Failed; an operator must inspect
+                            // the file and issue a new token to retry.
                             let current = get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name)
                                 .await
                                 .map_err(|error| format!("{identity}: verify live spec after adoption: {error}"))?
